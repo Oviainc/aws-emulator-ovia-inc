@@ -181,10 +181,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // only thing the caller can act on: no model is addressable by it
                     // under this api. This is the sentence API Gateway answers a
                     // GetModelTemplate for an unaddressable model with, and the id in it
-                    // is the request's own.
-                    message: Some(format!(
-                        "Invalid model identifier specified: {}",
-                        input.model_id
+                    // is the request's own; it is the one every operation that addresses
+                    // a model answers (see
+                    // [`crate::state::invalid_model_identifier_message`]).
+                    message: Some(crate::state::invalid_model_identifier_message(
+                        &input.model_id,
                     )),
                     resource_type: ::std::option::Option::None,
                 },

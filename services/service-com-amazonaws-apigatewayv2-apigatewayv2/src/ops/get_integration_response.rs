@@ -180,9 +180,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .integration_responses
             .get(&input.integration_response_id)
         else {
-            return Err(not_found(crate::state::invalid_identifier_message(
-                crate::state::INTEGRATION_RESPONSE_RESOURCE,
-            )));
+            return Err(not_found(
+                crate::state::integration_response_not_found_message(
+                    &input.integration_response_id,
+                    &input.integration_id,
+                ),
+            ));
         };
 
         let stored = record.to_wire();

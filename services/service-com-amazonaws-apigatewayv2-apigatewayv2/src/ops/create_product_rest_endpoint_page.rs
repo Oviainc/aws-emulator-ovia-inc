@@ -193,8 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(product) = store.portal_products.get_mut(&input.portal_product_id) else {
             return Err(CreateProductRestEndpointPageErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::invalid_identifier_message(
-                        crate::state::PORTAL_PRODUCT_RESOURCE,
+                    message: Some(crate::state::portal_product_not_found_message(
+                        &input.portal_product_id,
                     )),
                     resource_type: ::std::option::Option::None,
                 },

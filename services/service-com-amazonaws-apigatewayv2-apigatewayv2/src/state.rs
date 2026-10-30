@@ -2003,11 +2003,15 @@ pub const UNRESOLVED_AUTHORIZER_MESSAGE: &str = "Invalid authorizer ID specified
 /// The sentence this service answers `NotFoundException` with for an identifier that
 /// names no resource of `resource`'s kind.
 ///
-/// API Gateway reports an unknown identifier of a resource that is ADDRESSED WITHIN
-/// another — a route, a deployment, a stage, an authorizer of an api, a response of a
-/// route — with the resource's kind alone: the sentence carries neither the identifier
-/// the request already holds nor the account the api is scoped to. Only the API's own
-/// identifier is reported account-qualified, by
+/// API Gateway words a not-found PER KIND OF RESOURCE, and for many of the kinds
+/// addressed within an api — a route, an integration, a deployment, a stage, an
+/// authorizer, a VPC link — the sentence is this one: the resource's kind alone,
+/// carrying neither the identifier the request already holds nor the account the api is
+/// scoped to. The kinds whose sentence is NOT this form have one of their own beside
+/// this function ([`ROUTE_RESPONSE_NOT_FOUND_MESSAGE`],
+/// [`integration_response_not_found_message`], [`invalid_model_identifier_message`],
+/// [`portal_product_not_found_message`], [`PRODUCT_PAGE_NOT_FOUND_MESSAGE`]), and the
+/// API's own identifier is the one reported account-qualified, by
 /// [`invalid_api_identifier_message`].
 ///
 /// Shared by every reader and writer of a child resource, so one kind of resource
@@ -2023,8 +2027,16 @@ pub fn invalid_identifier_message(resource: &str) -> String {
 /// every operation that addresses a route reports the same one.
 pub const ROUTE_RESOURCE: &str = "route";
 
-/// How [`invalid_identifier_message`] names a ROUTE RESPONSE of a route.
-pub const ROUTE_RESPONSE_RESOURCE: &str = "RouteResponse";
+/// The sentence this service answers `NotFoundException` with for a `RouteResponseId`
+/// the addressed route holds no response under — including one a `DeleteRouteResponse`
+/// has already removed.
+///
+/// A route response is reported by the RESOURCE it addressed rather than by the
+/// identifier it was addressed with, so the sentence is a constant for the whole class:
+/// it carries neither the id the request already holds nor the account — the wording
+/// AWS's own answer for an unresolved route response carries. Held here once, so the
+/// reader, the writer and the delete of one route response cannot word it three ways.
+pub const ROUTE_RESPONSE_NOT_FOUND_MESSAGE: &str = "Invalid route response specified";
 
 /// How [`invalid_identifier_message`] names a DEPLOYMENT of an api ("Invalid Deployment
 /// identifier specified").
@@ -2033,15 +2045,47 @@ pub const DEPLOYMENT_RESOURCE: &str = "Deployment";
 /// How [`invalid_identifier_message`] names an INTEGRATION of an api.
 pub const INTEGRATION_RESOURCE: &str = "Integration";
 
-/// How [`invalid_identifier_message`] names an INTEGRATION RESPONSE of an integration.
-pub const INTEGRATION_RESPONSE_RESOURCE: &str = "IntegrationResponse";
+/// The sentence this service answers `NotFoundException` with for an
+/// `IntegrationResponseId` the addressed integration holds no response under —
+/// including one a `DeleteIntegrationResponse` has already removed.
+///
+/// An integration response is resolvable only THROUGH the integration that owns it, and
+/// the sentence AWS answers states exactly that: it names both ids the request addressed
+/// the response with, so a caller learns which pair resolved to nothing. The ids are the
+/// REQUEST's — the template is the sentence, the values are each call's own.
+pub fn integration_response_not_found_message(
+    integration_response_id: &str,
+    integration_id: &str,
+) -> String {
+    format!(
+        "IntegrationResponse with ID {integration_response_id} is not present in \
+         integration with ID {integration_id}"
+    )
+}
 
 /// How [`invalid_identifier_message`] names a STAGE of an api, which API Gateway spells
 /// in lower case.
 pub const STAGE_RESOURCE: &str = "stage";
 
-/// How [`invalid_identifier_message`] names a MODEL of an api.
-pub const MODEL_RESOURCE: &str = "Model";
+/// How [`invalid_model_identifier_message`] names a MODEL of an api. API Gateway spells
+/// this kind in lower case, where it capitalises others — the sentence is per kind, so
+/// each kind's spelling lives in one place.
+pub const MODEL_RESOURCE: &str = "model";
+
+/// The sentence this service answers `NotFoundException` with for a `ModelId` the
+/// addressed api holds no model under — including one a `DeleteModel` has already
+/// removed.
+///
+/// A model's sentence is [`invalid_identifier_message`]'s, EXTENDED with the identifier
+/// the request supplied: that id is the only thing the caller can act on, since no model
+/// of that api is addressable by it. Shared by every operation that addresses one model,
+/// so `GetModel` and `GetModelTemplate` cannot word the same miss two ways.
+pub fn invalid_model_identifier_message(model_id: &str) -> String {
+    format!(
+        "{}: {model_id}",
+        invalid_identifier_message(MODEL_RESOURCE)
+    )
+}
 
 /// How [`invalid_identifier_message`] names an AUTHORIZER of an api ("Invalid Authorizer
 /// identifier specified").
@@ -2059,11 +2103,35 @@ pub const AUTHORIZER_RESOURCE: &str = "Authorizer";
 /// between the readers, the writers and the delete of one portal.
 pub const PORTAL_NOT_FOUND_MESSAGE: &str = "Portal not found";
 
-/// How [`invalid_identifier_message`] names a PORTAL PRODUCT.
-pub const PORTAL_PRODUCT_RESOURCE: &str = "PortalProduct";
+/// The sentence this service answers `NotFoundException` with for a `PortalProductId` the
+/// account holds no product under — including one a `DeletePortalProduct` has already
+/// removed.
+///
+/// A portal product is an ACCOUNT-level resource, so API Gateway reports an identifier
+/// that resolves to nothing account-qualified, the way it reports an unknown `ApiId`
+/// (see [`invalid_api_identifier_message`]): the account the lookup was made in, and the
+/// id the request supplied. Shared by every operation that addresses one product —
+/// its readers and writers, its delete, and the operations that work UNDER it — so the
+/// wording cannot drift between them.
+pub fn portal_product_not_found_message(portal_product_id: &str) -> String {
+    format!(
+        "Product not found in account {} with id {portal_product_id}",
+        ::engine::emulator_account_id()
+    )
+}
 
-/// How [`invalid_identifier_message`] names a PRODUCT PAGE of a portal product.
-pub const PRODUCT_PAGE_RESOURCE: &str = "ProductPage";
+/// The sentence this service answers `NotFoundException` with for a product page that
+/// resolves to nothing — an id the addressed product holds no page under (including one
+/// a `DeleteProductPage` has already removed), or a product that is itself unknown.
+///
+/// A product page is one of this API's PORTAL-plane resources, and those report an
+/// unresolved identifier by naming the resource TYPE alone — the form
+/// [`PORTAL_NOT_FOUND_MESSAGE`] and [`PRODUCT_REST_ENDPOINT_PAGE_NOT_FOUND_MESSAGE`]
+/// also take — so the sentence carries neither the account nor the ids the request
+/// already holds. This is the whole sentence AWS's own answer for an unresolved product
+/// page carries: fixed text with no variable part, as a recorded read of a page that had
+/// just been deleted shows.
+pub const PRODUCT_PAGE_NOT_FOUND_MESSAGE: &str = "ProductPage not found";
 
 /// How [`invalid_identifier_message`] names a VPC LINK ("Invalid Vpc Link identifier
 /// specified"). The casing is the service's own in THIS sentence — each word

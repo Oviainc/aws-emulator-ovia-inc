@@ -169,9 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(page) = stored else {
             return Err(UpdateProductPageErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::invalid_identifier_message(
-                        crate::state::PRODUCT_PAGE_RESOURCE,
-                    )),
+                    message: Some(
+                        crate::state::PRODUCT_PAGE_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                     resource_type: ::std::option::Option::None,
                 },
             )

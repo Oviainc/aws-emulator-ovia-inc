@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the [`crate::state::Model`] record its api holds under the
+//! requested `ModelId`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +152,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteModel"))
+        // Nothing this delete decides depends on the request's metadata: the model is
+        // addressed by the api that owns it and by its own id.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("DeleteModel"));
+        };
+        let mut store = state.lock();
+
+        let Some(api) = store.apis.get_mut(&input.api_id) else {
+            return Err(not_found(crate::state::invalid_api_identifier_message(
+                &input.api_id,
+            )));
+        };
+
+        // Taking the entry out IS the whole delete: the api OWNS its models, so a later
+        // `GetModel`, `GetModels` or `GetModelTemplate` of this id finds nothing, while
+        // every other model of the api is untouched. A model is referenced by NAME where
+        // it is referenced at all (a route's `RequestModels`, a route response's
+        // `ResponseModels`), never by this id, so the delete has no stored reference to
+        // this record to refuse over. A model is addressed by the api that owns it AND
+        // its own id, so an id naming a model of ANOTHER api resolves to nothing here —
+        // which is also what a SECOND delete of the same id meets, so that one refuses
+        // instead of removing anything again.
+        if api.models.remove(&input.model_id).is_none() {
+            return Err(not_found(crate::state::invalid_model_identifier_message(
+                &input.model_id,
+            )));
+        }
+        // A model is part of the configuration the api's routes are served under (a route
+        // selects one through its `RequestModels`), so removing one changes that
+        // configuration: every stage of the api that auto-deploys has the new one released
+        // to it, exactly as `CreateModel` releases the model it adds.
+        api.redeploy_auto_deploying_stages(::std::time::SystemTime::now());
+
+        Ok(DeleteModelOutput)
     }
+}
+
+/// This operation's "the resource specified in the request was not found" refusal: the
+/// modelled `NotFoundException`, carrying the sentence the kind of resource that resolved
+/// to nothing is reported with, so this delete and that kind's readers cannot word one
+/// miss two ways.
+fn not_found(message: String) -> DeleteModelError {
+    DeleteModelErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }

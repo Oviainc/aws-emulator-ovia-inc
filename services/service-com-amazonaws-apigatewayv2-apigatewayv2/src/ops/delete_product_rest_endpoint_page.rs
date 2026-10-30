@@ -179,12 +179,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 404 `NotFoundException` with the sentence every operation that works UNDER a
         // product refuses an unknown one with (`CreateProductRestEndpointPage`,
         // `DeletePortalProductSharingPolicy`; see
-        // [`crate::state::invalid_identifier_message`]).
+        // [`crate::state::portal_product_not_found_message`]).
         let Some(product) = store.portal_products.get_mut(&input.portal_product_id) else {
             return Err(DeleteProductRestEndpointPageErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::invalid_identifier_message(
-                        crate::state::PORTAL_PRODUCT_RESOURCE,
+                    message: Some(crate::state::portal_product_not_found_message(
+                        &input.portal_product_id,
                     )),
                     resource_type: ::std::option::Option::None,
                 },

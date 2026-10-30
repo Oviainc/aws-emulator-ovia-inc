@@ -567,8 +567,16 @@ async fn delete_product_rest_endpoint_page_refuses_only_an_unresolved_portal_pro
         body.get("message").and_then(Value::as_str),
         // The sentence `CreateProductRestEndpointPage` and
         // `DeletePortalProductSharingPolicy` already refuse an unresolved portal product
-        // with, written out here so the case asserts the rule.
-        Some("Invalid PortalProduct identifier specified"),
+        // with — a product is an account-level resource, so the account the lookup was
+        // made in and the id the request named are both in it — written out here so the
+        // case asserts the rule.
+        Some(
+            format!(
+                "Product not found in account {} with id nosuchproduct",
+                engine::emulator_account_id()
+            )
+            .as_str()
+        ),
         "case \"a portal product nothing minted\": expected the sentence this API refuses an \
          unresolved portal product with, got {body}"
     );

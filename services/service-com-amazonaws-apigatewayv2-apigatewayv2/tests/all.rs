@@ -39,6 +39,8 @@ mod authorizer_lifecycle;
 mod authorizer_update;
 #[path = "all/auto_deploy_republishes.rs"]
 mod auto_deploy_republishes;
+#[path = "all/child_resource_delete_is_applied.rs"]
+mod child_resource_delete_is_applied;
 #[path = "all/cors_configuration.rs"]
 mod cors_configuration;
 #[path = "all/constraint_refusal.rs"]

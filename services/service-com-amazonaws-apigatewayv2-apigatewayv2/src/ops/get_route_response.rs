@@ -174,9 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = route.route_responses.get(&input.route_response_id) else {
             return Err(GetRouteResponseErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::invalid_identifier_message(
-                        crate::state::ROUTE_RESPONSE_RESOURCE,
-                    )),
+                    message: Some(
+                        crate::state::ROUTE_RESPONSE_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                     resource_type: ::std::option::Option::None,
                 },
             )

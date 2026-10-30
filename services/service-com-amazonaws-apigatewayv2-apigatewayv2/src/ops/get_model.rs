@@ -153,8 +153,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|api| api.models.get(&input.model_id));
         let Some(stored) = stored.map(crate::state::Model::to_wire) else {
             return Err(GetModelErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::invalid_identifier_message(
-                    crate::state::MODEL_RESOURCE,
+                message: Some(crate::state::invalid_model_identifier_message(
+                    &input.model_id,
                 )),
                 resource_type: ::std::option::Option::None,
             })

@@ -6,13 +6,14 @@
 //! resolve, or which resources block an operation, so the rules below are about the
 //! IDENTITY the message conveys rather than its wording alone:
 //!
-//! * **A `NotFoundException` names the KIND of resource the call addressed, and carries
-//!   no account-qualified key**: every kind addressed WITHIN another (a route, a route
-//!   response, an integration, an integration response, a model, a stage, a deployment,
-//!   an authorizer, a VPC link, a portal product) gets one constant sentence for its
-//!   kind, whatever identifier the request carried; the API's own identifier is the one
-//!   API Gateway reports account-qualified, so that sentence — and only that one —
-//!   carries `{account}:{ApiId}`.
+//! * **A `NotFoundException` names the KIND of resource the call addressed, with that
+//!   kind's own sentence**: the kinds addressed WITHIN an api whose sentence is a
+//!   constant for their class (a route, a route response, an integration, a stage, a
+//!   deployment, an authorizer, a VPC link) get one sentence whatever identifier the
+//!   request carried; the kinds whose sentence is BUILT from the request (a model, an
+//!   integration response) name the identifiers they were addressed with; and the
+//!   ACCOUNT-level kinds (the api itself, a portal product) are reported
+//!   account-qualified.
 //! * **A minted identifier denotes ONE kind of resource**: no two kinds mint the same
 //!   id, so an id minted for one kind addresses nothing of another and reads back as that
 //!   other kind's `NotFoundException`.
@@ -35,10 +36,11 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
-    invalid_api_identifier_message, invalid_identifier_message, AUTHORIZER_RESOURCE,
-    DEPLOYMENT_RESOURCE, INTEGRATION_RESOURCE, INTEGRATION_RESPONSE_RESOURCE,
-    INVALID_NEXT_TOKEN_MESSAGE, MAX_PAGE_SIZE, MODEL_RESOURCE, PORTAL_PRODUCT_RESOURCE,
-    ROUTE_RESOURCE, ROUTE_RESPONSE_RESOURCE, STAGE_RESOURCE, VPC_LINK_RESOURCE,
+    integration_response_not_found_message, invalid_api_identifier_message,
+    invalid_identifier_message, invalid_model_identifier_message,
+    portal_product_not_found_message, AUTHORIZER_RESOURCE, DEPLOYMENT_RESOURCE,
+    INTEGRATION_RESOURCE, INVALID_NEXT_TOKEN_MESSAGE, MAX_PAGE_SIZE, ROUTE_RESOURCE,
+    ROUTE_RESPONSE_NOT_FOUND_MESSAGE, STAGE_RESOURCE, VPC_LINK_RESOURCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -316,6 +318,22 @@ struct Reader {
     uri: Box<dyn Fn(&str) -> String>,
     /// The sentence this kind's unknown identifier is refused with, for `id`.
     expected: Box<dyn Fn(&str) -> String>,
+    /// What this kind's sentence is built from.
+    sentence: Sentence,
+}
+
+/// What a kind's `NotFoundException` sentence is built from.
+#[derive(Debug, PartialEq, Eq)]
+enum Sentence {
+    /// A CONSTANT for the whole class: it carries neither the identifier the request
+    /// addressed nor the account, so nothing in it varies with the request.
+    Constant,
+    /// Built from the identifier(s) the request addressed, which is what a caller can
+    /// act on.
+    FromRequest,
+    /// Built from the identifier the request addressed AND the account the lookup was
+    /// made in — how API Gateway reports an identifier of an ACCOUNT-level resource.
+    AccountQualified,
 }
 
 /// Every kind's reader, over the fixture's api, route and integration.
@@ -327,9 +345,9 @@ fn readers(fixture: &Fixture) -> Vec<Reader> {
         Reader {
             kind: "Api",
             uri: Box::new(|id| format!("/v2/apis/{id}")),
-            // The one account-qualified sentence: API Gateway reports an unknown API
-            // identifier as `{account}:{ApiId}`.
+            // API Gateway reports an unknown API identifier as `{account}:{ApiId}`.
             expected: Box::new(invalid_api_identifier_message),
+            sentence: Sentence::AccountQualified,
         },
         Reader {
             kind: "Route",
@@ -338,6 +356,7 @@ fn readers(fixture: &Fixture) -> Vec<Reader> {
                 move |id| format!("/v2/apis/{api_id}/routes/{id}")
             }),
             expected: Box::new(|_| invalid_identifier_message(ROUTE_RESOURCE)),
+            sentence: Sentence::Constant,
         },
         Reader {
             kind: "RouteResponse",
@@ -345,7 +364,8 @@ fn readers(fixture: &Fixture) -> Vec<Reader> {
                 let api_id = api_id.clone();
                 move |id| format!("/v2/apis/{api_id}/routes/{route_id}/routeresponses/{id}")
             }),
-            expected: Box::new(|_| invalid_identifier_message(ROUTE_RESPONSE_RESOURCE)),
+            expected: Box::new(|_| ROUTE_RESPONSE_NOT_FOUND_MESSAGE.to_string()),
+            sentence: Sentence::Constant,
         },
         Reader {
             kind: "Integration",
@@ -354,11 +374,13 @@ fn readers(fixture: &Fixture) -> Vec<Reader> {
                 move |id| format!("/v2/apis/{api_id}/integrations/{id}")
             }),
             expected: Box::new(|_| invalid_identifier_message(INTEGRATION_RESOURCE)),
+            sentence: Sentence::Constant,
         },
         Reader {
             kind: "IntegrationResponse",
             uri: Box::new({
                 let api_id = api_id.clone();
+                let integration_id = integration_id.clone();
                 move |id| {
                     format!(
                         "/v2/apis/{api_id}/integrations/{integration_id}/\
@@ -366,7 +388,11 @@ fn readers(fixture: &Fixture) -> Vec<Reader> {
                     )
                 }
             }),
-            expected: Box::new(|_| invalid_identifier_message(INTEGRATION_RESPONSE_RESOURCE)),
+            // An integration response is reported by BOTH ids it was addressed with.
+            expected: Box::new(move |id| {
+                integration_response_not_found_message(id, &integration_id)
+            }),
+            sentence: Sentence::FromRequest,
         },
         Reader {
             kind: "Model",
@@ -374,7 +400,8 @@ fn readers(fixture: &Fixture) -> Vec<Reader> {
                 let api_id = api_id.clone();
                 move |id| format!("/v2/apis/{api_id}/models/{id}")
             }),
-            expected: Box::new(|_| invalid_identifier_message(MODEL_RESOURCE)),
+            expected: Box::new(invalid_model_identifier_message),
+            sentence: Sentence::FromRequest,
         },
         Reader {
             kind: "Stage",
@@ -383,6 +410,7 @@ fn readers(fixture: &Fixture) -> Vec<Reader> {
                 move |id| format!("/v2/apis/{api_id}/stages/{id}")
             }),
             expected: Box::new(|_| invalid_identifier_message(STAGE_RESOURCE)),
+            sentence: Sentence::Constant,
         },
         Reader {
             kind: "Deployment",
@@ -391,34 +419,40 @@ fn readers(fixture: &Fixture) -> Vec<Reader> {
                 move |id| format!("/v2/apis/{api_id}/deployments/{id}")
             }),
             expected: Box::new(|_| invalid_identifier_message(DEPLOYMENT_RESOURCE)),
+            sentence: Sentence::Constant,
         },
         Reader {
             kind: "Authorizer",
             uri: Box::new(move |id| format!("/v2/apis/{api_id}/authorizers/{id}")),
             expected: Box::new(|_| invalid_identifier_message(AUTHORIZER_RESOURCE)),
+            sentence: Sentence::Constant,
         },
         Reader {
             kind: "VpcLink",
             uri: Box::new(|id| format!("/v2/vpclinks/{id}")),
             expected: Box::new(|_| invalid_identifier_message(VPC_LINK_RESOURCE)),
+            sentence: Sentence::Constant,
         },
         Reader {
             kind: "PortalProduct",
+            // A portal product is an ACCOUNT-level resource, so its sentence names the
+            // account the lookup was made in beside the id, as the api's does.
             uri: Box::new(|id| format!("/v2/portalproducts/{id}")),
-            expected: Box::new(|_| invalid_identifier_message(PORTAL_PRODUCT_RESOURCE)),
+            expected: Box::new(portal_product_not_found_message),
+            sentence: Sentence::AccountQualified,
         },
     ]
 }
 
 #[tokio::test]
-async fn a_not_found_names_the_kind_it_addressed_and_only_the_api_sentence_is_account_qualified() {
+async fn a_not_found_names_the_kind_it_addressed_with_that_kinds_own_sentence() {
     let emulator = emulator();
     let fixture = fixture(&emulator, "refusal-identity").await;
     let account = engine::emulator_account_id();
 
     for reader in readers(&fixture) {
-        // What a kind's sentence must NOT vary with: for every kind addressed within
-        // another, one constant sentence for the whole class.
+        // What a kind's sentence must NOT vary with: where the sentence is a constant for
+        // its class, one sentence for every identifier of that kind.
         let mut constant: Option<String> = None;
         for id in unminted_identifiers() {
             let uri = (reader.uri)(&id);
@@ -434,29 +468,36 @@ async fn a_not_found_names_the_kind_it_addressed_and_only_the_api_sentence_is_ac
             )
             .await;
 
-            // Only the API's own sentence carries an account-qualified identifier; every
-            // kind addressed within another carries neither the account nor the id, so
-            // nothing in it varies with the request.
-            if reader.kind == "Api" {
-                assert!(
-                    expected.contains(&format!("{account}:{id}")),
-                    "case {case:?}: expected the api sentence to report the account-qualified \
-                     identifier, got {expected:?}"
-                );
-                continue;
-            }
-            assert!(
-                !expected.contains(account) && !expected.contains(':'),
-                "case {case:?}: expected a sentence carrying no account-qualified key, \
-                 got {expected:?}"
-            );
-            match &constant {
-                None => constant = Some(expected),
-                Some(first) => assert_eq!(
-                    &expected, first,
-                    "case {case:?}: expected every identifier of this kind to be refused \
-                     with one sentence, got {expected:?} beside {first:?}"
+            match reader.sentence {
+                // An account-level resource is reported account-qualified: the account
+                // the lookup was made in, and the identifier the request addressed.
+                Sentence::AccountQualified => assert!(
+                    expected.contains(account) && expected.contains(&id),
+                    "case {case:?}: expected the sentence to report the account \
+                     {account:?} and the identifier, got {expected:?}"
                 ),
+                // A sentence built from the request names what the caller can act on:
+                // the identifier it addressed, and no account.
+                Sentence::FromRequest => assert!(
+                    expected.contains(&id) && !expected.contains(account),
+                    "case {case:?}: expected the sentence to name the identifier the \
+                     request addressed and no account, got {expected:?}"
+                ),
+                Sentence::Constant => {
+                    assert!(
+                        !expected.contains(account),
+                        "case {case:?}: expected a sentence carrying no account, \
+                         got {expected:?}"
+                    );
+                    match &constant {
+                        None => constant = Some(expected),
+                        Some(first) => assert_eq!(
+                            &expected, first,
+                            "case {case:?}: expected every identifier of this kind to be \
+                             refused with one sentence, got {expected:?} beside {first:?}"
+                        ),
+                    }
+                }
             }
         }
     }

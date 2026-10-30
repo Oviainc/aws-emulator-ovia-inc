@@ -325,9 +325,12 @@ async fn deleting_a_page_of_a_product_nothing_minted_is_refused() {
     let emulator = emulator();
 
     // The sentence this API refuses an unresolved portal product with, the one
-    // `CreateProductPage` and `DeletePortalProductSharingPolicy` already answer. Written
-    // out here rather than taken from the service, so the table asserts the rule.
-    const PRODUCT_NOT_FOUND_MESSAGE: &str = "Invalid PortalProduct identifier specified";
+    // `CreateProductPage` and `DeletePortalProductSharingPolicy` already answer: a
+    // product is an account-level resource, so the account the lookup was made in and
+    // the id the request named are both in it. Written out here rather than taken from
+    // the service, so the table asserts the rule.
+    let product_not_found_message =
+        format!("Product not found in account {} with id nosuchproduct", engine::emulator_account_id());
 
     let owner = product(&emulator, "the holder of a real page").await;
 
@@ -352,7 +355,7 @@ async fn deleting_a_page_of_a_product_nothing_minted_is_refused() {
             );
             assert_eq!(
                 body.get("message").and_then(Value::as_str),
-                Some(PRODUCT_NOT_FOUND_MESSAGE),
+                Some(product_not_found_message.as_str()),
                 "case {case:?}: expected the sentence this API refuses an unresolved portal \
                  product with, got {body}"
             );

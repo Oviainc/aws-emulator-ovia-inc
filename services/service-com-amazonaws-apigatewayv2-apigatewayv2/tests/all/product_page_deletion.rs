@@ -37,9 +37,16 @@ use crate::product_page_lifecycle::{pages_of, BODY_MAX_LENGTH, TITLE_MAX_LENGTH}
 use crate::product_rest_endpoint_page_lifecycle::{product, PRODUCTS};
 
 /// The sentence this API refuses a portal product identifier that resolves to nothing with,
-/// the one `CreateProductPage` and `DeletePortalProductSharingPolicy` already answer.
-/// Written out here rather than taken from the service, so the table asserts the rule.
-const PRODUCT_NOT_FOUND_MESSAGE: &str = "Invalid PortalProduct identifier specified";
+/// the one `CreateProductPage` and `DeletePortalProductSharingPolicy` already answer: a
+/// product is an account-level resource, so the account the lookup was made in and the id
+/// the request named are both in it. Written out here rather than taken from the service,
+/// so the table asserts the rule.
+fn product_not_found_message(portal_product_id: &str) -> String {
+    format!(
+        "Product not found in account {} with id {portal_product_id}",
+        engine::emulator_account_id()
+    )
+}
 
 /// Create one product page under `portal_product_id` and answer its `ProductPageId`.
 async fn create_page(
@@ -506,7 +513,7 @@ async fn delete_product_page_refuses_only_an_unresolved_portal_product() {
     );
     assert_eq!(
         body.get("message").and_then(Value::as_str),
-        Some(PRODUCT_NOT_FOUND_MESSAGE),
+        Some(product_not_found_message("nosuchproduct").as_str()),
         "case \"a portal product nothing minted\": expected the sentence this API refuses an \
          unresolved portal product with, got {body}"
     );
