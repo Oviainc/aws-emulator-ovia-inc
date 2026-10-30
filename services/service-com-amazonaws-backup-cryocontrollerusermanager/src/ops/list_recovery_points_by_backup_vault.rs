@@ -176,6 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        let now = ::std::time::SystemTime::now();
         // A page size outside the model's `@range` is this service's own
         // `InvalidParameterValueException`, answered before the vault is
         // resolved so the body is the modelled shape carrying `Code` and
@@ -228,17 +229,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `BackupVaultAccountId` (the `backupVaultAccountId` query parameter, the
         // documented cross-account path), is refused with 403 `AccessDeniedException`
         // rather than reported as missing.
-        let vault = store
-            .visible_vault(
-                &input.backup_vault_name,
-                input.backup_vault_account_id.as_deref(),
-            )?
-            .clone();
+        store.visible_vault(
+            &input.backup_vault_name,
+            input.backup_vault_account_id.as_deref(),
+        )?;
 
         // Validated and resolved first, so a refused request writes nothing.
         // This is the one write a read performs: a recovery point whose settle
         // instant has passed completed then, whether or not anybody looked.
-        store.settle_recovery_points_in(&input.backup_vault_name, ::std::time::SystemTime::now());
+        store.settle_recovery_points_in(&input.backup_vault_name, now);
 
         // The two instant filters are closed over as `SystemTime`, the form the
         // stored creation date is held in.
@@ -316,33 +315,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let recovery_points: Vec<RecoveryPointByBackupVault> = matching[start..end]
             .iter()
             .map(|point| {
-                let calculated = point.calculated_lifecycle().map(|(cold, delete)| {
-                    CalculatedLifecycle {
-                        move_to_cold_storage_at: cold.map(::aws_smithy_types::DateTime::from),
-                        delete_at: delete.map(::aws_smithy_types::DateTime::from),
-                    }
-                });
+                // The ONE recovery-point read projection, so a point this page
+                // reports and the same point read one by one can never
+                // disagree about it.
+                let view = store.recovery_point_view(point, now);
                 RecoveryPointByBackupVault {
-                    recovery_point_arn: Some(point.arn.clone()),
-                    backup_vault_name: Some(point.backup_vault_name.clone()),
-                    backup_vault_arn: Some(point.backup_vault_arn.clone()),
-                    resource_arn: Some(point.resource_arn.clone()),
-                    resource_type: point.resource_type.clone(),
-                    iam_role_arn: Some(point.iam_role_arn.clone()),
-                    status: Some(point.status.clone()),
-                    creation_date: Some(::aws_smithy_types::DateTime::from(point.creation_date)),
-                    completion_date: point
+                    recovery_point_arn: Some(view.arn),
+                    backup_vault_name: Some(view.backup_vault_name),
+                    backup_vault_arn: Some(view.backup_vault_arn),
+                    resource_arn: Some(view.resource_arn),
+                    resource_type: view.resource_type,
+                    iam_role_arn: Some(view.iam_role_arn),
+                    status: Some(view.status),
+                    creation_date: Some(::aws_smithy_types::DateTime::from(view.creation_date)),
+                    completion_date: view
                         .completion_date
                         .map(::aws_smithy_types::DateTime::from),
-                    backup_size_in_bytes: Some(point.backup_size_in_bytes),
-                    lifecycle: point.lifecycle.clone(),
-                    calculated_lifecycle: calculated,
-                    encryption_key_arn: point.encryption_key_arn.clone(),
-                    encryption_key_type: Some(point.encryption_key_type().to_string()),
-                    is_encrypted: point.is_encrypted,
-                    is_parent: point.is_parent,
-                    vault_type: Some(vault.vault_type.clone()),
-                    index_status: point.index_status.clone(),
+                    backup_size_in_bytes: Some(view.backup_size_in_bytes),
+                    lifecycle: view.lifecycle,
+                    calculated_lifecycle: view.calculated_lifecycle,
+                    encryption_key_arn: view.encryption_key_arn,
+                    encryption_key_type: Some(view.encryption_key_type),
+                    is_encrypted: view.is_encrypted,
+                    is_parent: view.is_parent,
+                    vault_type: view.vault_type,
+                    index_status: view.index_status,
                     // Backup plans, composite recovery points, restores,
                     // malware scans and restore-access vaults are all reached
                     // only by operations still at 501, and a recovery point

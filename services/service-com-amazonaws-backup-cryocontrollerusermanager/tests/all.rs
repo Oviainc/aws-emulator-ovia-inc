@@ -29,6 +29,8 @@ mod legal_hold;
 mod logically_air_gapped_vault;
 #[path = "all/recovery_point_deletion.rs"]
 mod recovery_point_deletion;
+#[path = "all/recovery_point_read.rs"]
+mod recovery_point_read;
 #[path = "all/scheduled_runs_preview.rs"]
 mod scheduled_runs_preview;
 #[path = "all/state_roundtrip.rs"]

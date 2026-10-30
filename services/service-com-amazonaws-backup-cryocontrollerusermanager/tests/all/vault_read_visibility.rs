@@ -47,9 +47,11 @@ pub(crate) const DENIED_MESSAGE: &str = "Insufficient privileges to perform this
 /// operation="DescribeBackupVault,ListRecoveryPointsByBackupVault")`): both are GET
 /// with `BackupVaultName` bound into the URI — `/backup-vaults/{BackupVaultName}`
 /// and `/backup-vaults/{BackupVaultName}/recovery-points` — and both carry
-/// `BackupVaultAccountId` as the `backupVaultAccountId` query parameter. Every other
-/// operation that takes a vault name is either a mutation or still a 501 stub, so
-/// these two are the whole class today.
+/// `BackupVaultAccountId` as the `backupVaultAccountId` query parameter. These two
+/// are the vault-scoped reads whose path needs no stored resource;
+/// `DescribeRecoveryPoint` applies the same rule on a path that addresses one, and
+/// is covered for it in `recovery_point_read.rs`. Every other operation that takes a
+/// vault name is either a mutation or still a 501 stub.
 const VAULT_READS: &[(&str, &str)] = &[
     ("DescribeBackupVault", ""),
     ("ListRecoveryPointsByBackupVault", "/recovery-points"),

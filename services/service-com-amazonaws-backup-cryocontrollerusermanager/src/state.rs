@@ -26,7 +26,9 @@
 //! `ListRecoveryPointsByBackupVault`'s page and `DescribeBackupVault`'s
 //! `NumberOfRecoveryPoints` are derived from it, so the two can never disagree.
 //! [`VaultView`] is likewise the ONLY vault read projection: `DescribeBackupVault`
-//! and `ListBackupVaults` both answer from it.
+//! and `ListBackupVaults` both answer from it, and [`RecoveryPointView`] is the
+//! ONLY recovery-point read projection: `DescribeRecoveryPoint` and
+//! `ListRecoveryPointsByBackupVault` both answer from it.
 //!
 //! [`ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`] (and its
 //! `_mut` twin, for a call that writes the vault it resolves) is the resolution
@@ -40,9 +42,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupRule, BackupRuleInput,
-    BackupSelection, CopyJob, FrameworkControl, InvalidParameterValueException,
-    InvalidRequestException, LegalHold, Lifecycle, MissingParameterValueException,
-    RecoveryPointSelection, ResourceNotFoundException, ScanSetting,
+    BackupSelection, CalculatedLifecycle, CopyJob, FrameworkControl,
+    InvalidParameterValueException, InvalidRequestException, LegalHold, Lifecycle,
+    MissingParameterValueException, RecoveryPointSelection, ResourceNotFoundException, ScanSetting,
 };
 
 /// The ARN namespace this service stamps into every ARN it mints
@@ -108,6 +110,12 @@ pub const VAULT_LOCK_STATE_LOCKED: &str = "LOCKED";
 pub const RECOVERY_POINT_STATUS_CREATING: &str = "CREATING";
 /// `RecoveryPointStatus` of a recovery point whose job has settled.
 pub const RECOVERY_POINT_STATUS_COMPLETED: &str = "COMPLETED";
+/// `StorageClass` of a recovery point still in warm storage (model enum
+/// `StorageClass`, `WARM | COLD | DELETED`).
+pub const STORAGE_CLASS_WARM: &str = "WARM";
+/// `StorageClass` of a recovery point whose lifecycle has transitioned it to
+/// cold storage (same enum).
+pub const STORAGE_CLASS_COLD: &str = "COLD";
 /// `IndexStatus` of a recovery point whose index has not been built yet.
 pub const INDEX_STATUS_PENDING: &str = "PENDING";
 /// `IndexStatus` of a recovery point whose index is queryable.
@@ -1253,6 +1261,61 @@ impl RecoveryPoint {
             ENCRYPTION_KEY_TYPE_AWS_OWNED
         }
     }
+
+    /// Which storage class this recovery point is in at `now`, derived from the
+    /// stored lifecycle: "The lifecycle defines when a protected resource is
+    /// transitioned to cold storage" (model doc for `Lifecycle`), so a point is
+    /// in warm storage until the transition its lifecycle makes due has come and
+    /// in cold storage from that instant — the SAME instant
+    /// [`Self::calculated_lifecycle`] reports as `MoveToColdStorageAt`, so the
+    /// two can never disagree. A point whose lifecycle asks for no transition
+    /// stays warm.
+    ///
+    /// `DELETED` is not reachable from a read: a deleted recovery point is no
+    /// longer stored, so nothing can project it.
+    pub fn storage_class(&self, now: SystemTime) -> &'static str {
+        let moved = self
+            .calculated_lifecycle()
+            .and_then(|(move_to_cold_storage_at, _)| move_to_cold_storage_at)
+            .is_some_and(|due| now >= due);
+        if moved {
+            STORAGE_CLASS_COLD
+        } else {
+            STORAGE_CLASS_WARM
+        }
+    }
+}
+
+/// The members a recovery-point read projects, computed ONCE from the stored
+/// point and the vault holding it, so `DescribeRecoveryPoint` and
+/// `ListRecoveryPointsByBackupVault` can never disagree about the same point. A
+/// member the stored point does not carry stays `None` here, and so is absent
+/// from both responses.
+#[derive(Debug, Clone)]
+pub struct RecoveryPointView {
+    pub arn: String,
+    pub backup_vault_name: String,
+    pub backup_vault_arn: String,
+    pub resource_arn: String,
+    pub resource_type: Option<String>,
+    pub iam_role_arn: String,
+    pub status: String,
+    pub creation_date: SystemTime,
+    pub completion_date: Option<SystemTime>,
+    pub backup_size_in_bytes: i64,
+    pub lifecycle: Option<Lifecycle>,
+    pub calculated_lifecycle: Option<CalculatedLifecycle>,
+    pub encryption_key_arn: Option<String>,
+    pub encryption_key_type: String,
+    pub is_encrypted: bool,
+    pub is_parent: bool,
+    /// The type of the vault holding the point, read off that vault rather than
+    /// stored on the point; `None` when the account no longer holds it.
+    pub vault_type: Option<String>,
+    pub index_status: Option<String>,
+    /// Which storage class the point is in, as its lifecycle decides — see
+    /// [`RecoveryPoint::storage_class`].
+    pub storage_class: String,
 }
 
 /// A backup job: what `StartBackupJob` starts and `DescribeBackupJob` reports.
@@ -1859,6 +1922,41 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         }
     }
 
+    /// Project one stored recovery point for a read. The ONE place a recovery
+    /// point's wire view is computed; both recovery-point read operations go
+    /// through it.
+    pub fn recovery_point_view(&self, point: &RecoveryPoint, now: SystemTime) -> RecoveryPointView {
+        let calculated_lifecycle =
+            point
+                .calculated_lifecycle()
+                .map(|(move_to_cold_storage_at, delete_at)| CalculatedLifecycle {
+                    move_to_cold_storage_at: move_to_cold_storage_at
+                        .map(::aws_smithy_types::DateTime::from),
+                    delete_at: delete_at.map(::aws_smithy_types::DateTime::from),
+                });
+        RecoveryPointView {
+            arn: point.arn.clone(),
+            backup_vault_name: point.backup_vault_name.clone(),
+            backup_vault_arn: point.backup_vault_arn.clone(),
+            resource_arn: point.resource_arn.clone(),
+            resource_type: point.resource_type.clone(),
+            iam_role_arn: point.iam_role_arn.clone(),
+            status: point.status.clone(),
+            creation_date: point.creation_date,
+            completion_date: point.completion_date,
+            backup_size_in_bytes: point.backup_size_in_bytes,
+            lifecycle: point.lifecycle.clone(),
+            calculated_lifecycle,
+            encryption_key_arn: point.encryption_key_arn.clone(),
+            encryption_key_type: point.encryption_key_type().to_string(),
+            is_encrypted: point.is_encrypted,
+            is_parent: point.is_parent,
+            vault_type: self.vault_type_of(&point.backup_vault_name),
+            index_status: point.index_status.clone(),
+            storage_class: point.storage_class(now).to_string(),
+        }
+    }
+
     /// How many recovery points the named vault holds, derived from the index.
     pub fn recovery_point_count(&self, vault_name: &str) -> i64 {
         self.recovery_points_by_vault
@@ -1877,7 +1975,8 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// ([`recovery_point_not_found`]) and none of them tells the caller which it
     /// was. A point whose backup is still running is deliberately on that side of
     /// the line: the backup has reserved its ARN, but until the backup finishes
-    /// there is no stored recovery point to address.
+    /// there is no stored recovery point to address — so every call that names
+    /// one, the reads included, resolves it here.
     pub fn stored_recovery_point(
         &self,
         vault_name: &str,

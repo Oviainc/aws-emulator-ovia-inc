@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRecoveryPoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRecoveryPoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRecoveryPoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored recovery point the (`BackupVaultName`, `RecoveryPointArn`)
+//! pair addresses, projected through the ONE recovery-point read projection
+//! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::recovery_point_view`]),
+//! so this read and the vault's listing can never disagree about the same point.
+//!
+//! Three steps, in the order AWS Backup applies them:
+//!
+//! * a `RecoveryPointArn` that is not an ARN is a bad parameter value, not an
+//!   absent resource ([`crate::state::rejected_arn`]);
+//! * the named vault is resolved by the step every vault-scoped read shares
+//!   ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::visible_vault`]),
+//!   which decides access before existence, so a vault the caller cannot see is
+//!   never disclosed;
+//! * the point itself is resolved by the step every call that names one shares
+//!   ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::stored_recovery_point`]):
+//!   a pair that names no settled recovery point of that vault is the one
+//!   not-found refusal, and the only write this read performs is materialising
+//!   the `CREATING` -> `COMPLETED` transition the clock had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -245,18 +255,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRecoveryPoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRecoveryPointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRecoveryPoint"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // The model types `RecoveryPointArn` as `ARN` with no pattern, so the
+        // framework cannot refuse a malformed one; AWS does, rather than
+        // reporting a value that could never name a recovery point as merely
+        // absent. ONE check and one sentence for every such member in this
+        // service.
+        if let Some(refusal) =
+            crate::state::rejected_arn("RecoveryPointArn", &input.recovery_point_arn)
+        {
+            return Err(
+                DescribeRecoveryPointErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeRecoveryPointErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the backup vault store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // A vault-scoped read decides access before existence: see
+        // `state::visible_vault`, the step every vault-scoped read shares. A
+        // vault this account does not hold, or one addressed with another
+        // account's `BackupVaultAccountId` (the `backupVaultAccountId` query
+        // parameter, the documented cross-account path), is refused with 403
+        // `AccessDeniedException` rather than reported as missing.
+        store.visible_vault(
+            &input.backup_vault_name,
+            input.backup_vault_account_id.as_deref(),
+        )?;
+
+        // Resolved first, so a refused request writes nothing. This is the one
+        // write a read performs: a recovery point whose settle instant has
+        // passed completed at that instant, whether or not anybody looked.
+        store.settle_recovery_points_in(&input.backup_vault_name, now);
+
+        // The `Code` and the sentence belong to the CONDITION, not to this
+        // operation, so both come from the service's one error vocabulary; the
+        // sentence names no part of the request, because AWS's does not.
+        let point = store
+            .stored_recovery_point(&input.backup_vault_name, &input.recovery_point_arn)
+            .map_err(DescribeRecoveryPointErrorModeled::ResourceNotFoundException)?;
+        let view = store.recovery_point_view(point, now);
+
+        Ok(DescribeRecoveryPointOutput {
+            recovery_point_arn: Some(view.arn),
+            backup_vault_name: Some(view.backup_vault_name),
+            backup_vault_arn: Some(view.backup_vault_arn),
+            resource_arn: Some(view.resource_arn),
+            resource_type: view.resource_type,
+            iam_role_arn: Some(view.iam_role_arn),
+            status: Some(view.status),
+            creation_date: Some(::aws_smithy_types::DateTime::from(view.creation_date)),
+            completion_date: view
+                .completion_date
+                .map(::aws_smithy_types::DateTime::from),
+            backup_size_in_bytes: Some(view.backup_size_in_bytes),
+            lifecycle: view.lifecycle,
+            calculated_lifecycle: view.calculated_lifecycle,
+            encryption_key_arn: view.encryption_key_arn,
+            encryption_key_type: Some(view.encryption_key_type),
+            is_encrypted: view.is_encrypted,
+            is_parent: view.is_parent,
+            vault_type: view.vault_type,
+            index_status: view.index_status,
+            storage_class: Some(view.storage_class),
+            // A point this slice stores was backed up into the vault that holds
+            // it, in this account and Region, and `SourceBackupVaultArn` is
+            // `null` exactly then (its model doc). Backup plans, composite
+            // recovery points, restores, malware scans and index status
+            // messages are all reached only by operations still at 501, and a
+            // recovery point started directly has no initiation instant
+            // separate from its creation.
+            source_backup_vault_arn: None,
+            created_by: None,
+            status_message: None,
+            initiation_date: None,
+            last_restore_time: None,
+            parent_recovery_point_arn: None,
+            composite_member_identifier: None,
+            resource_name: None,
+            index_status_message: None,
+            scan_results: None,
+        })
     }
 }

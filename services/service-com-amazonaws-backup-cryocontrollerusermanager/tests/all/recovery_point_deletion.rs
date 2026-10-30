@@ -44,7 +44,11 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// The router plus the engine it was built on, so a case can age the state the
 /// handlers read. The shared `router()` keeps no handle on its engine.
-fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` so the sibling suite covering the recovery-point READ
+/// (`recovery_point_read.rs`) ages a stored point through the same seam rather
+/// than growing a second copy of it.
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -67,7 +71,7 @@ async fn delete_point(router: &MultiServiceRouter, vault: &str, arn: &str) -> (u
 }
 
 /// The recovery-point ARNs the vault reports, through the implemented list read.
-async fn listed_points(router: &MultiServiceRouter, vault: &str) -> Vec<Value> {
+pub(crate) async fn listed_points(router: &MultiServiceRouter, vault: &str) -> Vec<Value> {
     let (status, listed) = call(
         router,
         "GET",
@@ -95,7 +99,7 @@ async fn counted_points(router: &MultiServiceRouter, vault: &str) -> i64 {
 }
 
 /// Start one backup job in `vault` and return the recovery-point ARN it reserved.
-async fn start_point(
+pub(crate) async fn start_point(
     router: &MultiServiceRouter,
     vault: &str,
     resource_arn: &str,
@@ -121,7 +125,7 @@ async fn start_point(
 
 /// Move a stored recovery point's creation instant `days` into the past, so the
 /// retention its lifecycle sets has already elapsed.
-fn age_point(engine: &engine::InMemoryEngine, arn: &str, days: u64) {
+pub(crate) fn age_point(engine: &engine::InMemoryEngine, arn: &str, days: u64) {
     if days == 0 {
         return;
     }
