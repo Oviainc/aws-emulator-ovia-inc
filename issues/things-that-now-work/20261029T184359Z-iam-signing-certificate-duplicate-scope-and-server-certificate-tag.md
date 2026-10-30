@@ -35,3 +35,33 @@ Cause 2: expected ListServerCertificateTagsResult/Tags/member{Key, Value} for th
 1. Boot the emulator from this checkout.
 2. Replay iam-cred-signing-cert-duplicate-across-users: task#3 uploads a certificate for user A (200), task#4 uploads the same certificate body for user B -> 409 instead of 200.
 3. Replay iam-server-certificate-lifecycle: upload a server certificate, TagServerCertificate, then task#6 ListServerCertificateTags -> empty Tags instead of the written tag.
+
+## Resolution note (fixer)
+
+Cause 1's account above is the one part of this report the replay contradicts, so it is recorded
+here for audit. The diverging step does NOT name a second user: its `UserName` is the SAME user
+as the preceding upload's (the fixture's `…-a` probe user), with a byte-identical
+`CertificateBody`, and the recorded answer is 200 reporting the CertificateId the first upload
+minted. The step of that same fixture that names the fixture's OTHER user (`…-b`) is the one
+recorded as the 409 `DuplicateCertificate` refusal (its message is also the subject of open issue
+`20261029T184359Z-iam-conflict-and-certificate-refusal-messages-use-emulator`, cause 6). I
+established the user identity by temporarily interpolating the resolved user key and the held
+records' user keys into the refusal message and reading the replay's `actual` line; that
+instrumentation was removed before submitting.
+
+So the implemented rule is account-wide registration with an idempotent answer for the holder,
+which is also what the model's `DuplicateCertificateException` says ("the same certificate is
+associated with an IAM user in the account"): an upload naming the user a certificate is already
+associated with reports that registration as it stands and stores nothing new, and an upload
+naming any other user is refused 409. Both halves are pinned by
+`tests/all/signing_certificates.rs`
+(`re_uploading_a_held_certificate_reports_the_held_registration`,
+`a_certificate_another_user_holds_is_refused`).
+
+Cause 2 was, by the time of this fix, only in the REMOVAL path: `TagServerCertificate` already
+persisted the merged set and `ListServerCertificateTags` already read it, but
+`UntagServerCertificate` was still a scaffold answering 501, so a removal never reached state and
+later reads reported tags AWS had removed. That handler is now implemented (see also the open
+issues `20261030T063350Z-iam-untagservercertificate-stub` and
+`20261030T101845Z-iam-acceptdelegationrequest-error-envelope-omits-requestid-and-untagservercertificate`,
+cause 2), with `tests/all/server_certificate_tag_removal.rs` covering it.

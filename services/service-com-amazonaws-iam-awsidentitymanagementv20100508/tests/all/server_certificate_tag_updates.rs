@@ -50,7 +50,7 @@ use crate::user_lifecycle::{
 /// Upload the certificate `name` at `path` carrying `initial`, so a tag call has a
 /// persisted record to merge into. A real key pair and a real self-signed certificate are
 /// generated per upload, so nothing here depends on a canned PEM.
-async fn upload_certificate(
+pub(crate) async fn upload_certificate(
     router: &MultiServiceRouter,
     name: &str,
     path: Option<&str>,
@@ -79,7 +79,7 @@ async fn upload_certificate(
 }
 
 /// One `TagServerCertificate` call: the HTTP status and the XML body.
-async fn tag_certificate(
+pub(crate) async fn tag_certificate(
     router: &MultiServiceRouter,
     name: &str,
     list: &[(String, String)],
@@ -108,7 +108,7 @@ async fn tag_certificate_signed(
 /// The tag set `GetServerCertificate` reports for `name`, as a map, plus the tag keys in
 /// the order the response carried them — so a duplicated key cannot hide inside a map and
 /// the reported ORDER is assertable.
-async fn stored_tags(
+pub(crate) async fn stored_tags(
     router: &MultiServiceRouter,
     name: &str,
 ) -> (BTreeMap<String, String>, Vec<String>) {
@@ -128,7 +128,7 @@ async fn stored_tags(
 
 /// The tag set `ListServerCertificateTags` reports for `name` — the other reader of the
 /// same stored set, so both halves of the round trip are asserted on every row.
-async fn listed_tags(
+pub(crate) async fn listed_tags(
     router: &MultiServiceRouter,
     name: &str,
 ) -> (BTreeMap<String, String>, Vec<String>) {
@@ -147,7 +147,7 @@ async fn listed_tags(
 }
 
 /// Assert both readers report `expected`, sorted by tag key.
-async fn assert_reads(
+pub(crate) async fn assert_reads(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,

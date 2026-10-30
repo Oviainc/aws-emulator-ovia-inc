@@ -249,6 +249,8 @@ mod server_certificate_listing;
 mod server_certificate_renames;
 #[path = "all/server_certificate_tag_listing.rs"]
 mod server_certificate_tag_listing;
+#[path = "all/server_certificate_tag_removal.rs"]
+mod server_certificate_tag_removal;
 #[path = "all/server_certificate_tag_updates.rs"]
 mod server_certificate_tag_updates;
 #[path = "all/server_certificates.rs"]

@@ -7,6 +7,10 @@
 //! record this writes is what `ListSigningCertificates` reports,
 //! `UpdateSigningCertificate` moves and `DeleteSigningCertificate` removes.
 //!
+//! A certificate the account already registers is never stored twice: an upload naming the
+//! user it is already associated with reports that association as it stands, and one naming
+//! any other user is refused.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -276,18 +280,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let user_name = user.user_name.clone();
 
-        // One certificate is held once in the account: "the same certificate is
-        // associated with an IAM user in the account" is the modelled
-        // `DuplicateCertificateException`. Sameness is of the CERTIFICATE, not of the
-        // text that framed it, so the comparison is on the DER both bodies decode to — a
-        // re-framed PEM of a held certificate is the same certificate and is refused,
-        // and the held record is left as it stands.
+        // One certificate is registered ONCE in the account, and the registration is
+        // identified by the certificate itself: "the same certificate is associated with
+        // an IAM user in the account" is the modelled `DuplicateCertificateException`.
+        // Sameness is of the CERTIFICATE, not of the text that framed it, so the
+        // comparison is on the DER both bodies decode to — a re-framed PEM of a held
+        // certificate carries the same certificate.
+        //
+        // Which answer that registration earns depends on WHO already holds it. An upload
+        // naming the user the certificate is already associated with asks for the
+        // association that exists, so it is served with that association exactly as it
+        // stands — the id it was minted under, the body, the status and the date it was
+        // first uploaded — and stores nothing new; only an upload naming any OTHER user is
+        // refused, because the certificate is already registered elsewhere in the account.
+        // Either way the held record is left as it is.
         let held_already = store
             .signing_certificates
             .iter()
-            .find(|(_, record)| record.certificate_der == uploaded_der);
-        if let Some((certificate_id, _)) = held_already {
-            let certificate_id = certificate_id.clone();
+            .find(|(_, record)| record.certificate_der == uploaded_der)
+            .map(|(certificate_id, record)| (certificate_id.clone(), record.clone()));
+        if let Some((certificate_id, held)) = held_already {
+            if held.user_key == user_key {
+                ::tracing::info!(
+                    audit = true,
+                    operation = "UploadSigningCertificate",
+                    outcome = "already_registered",
+                    caller_akid = %caller_akid,
+                    certificate_id = %certificate_id,
+                    "the certificate was already associated with this user"
+                );
+                return Ok(UploadSigningCertificateOutput {
+                    certificate: held.report(&certificate_id, &user_name),
+                });
+            }
             ::tracing::info!(
                 audit = true,
                 operation = "UploadSigningCertificate",
@@ -299,9 +324,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UploadSigningCertificateErrorModeled::DuplicateCertificateException(
                     DuplicateCertificateException {
-                        message: Some(format!(
-                            "The Certificate with id {certificate_id} already exists."
-                        )),
+                        // Entirely fixed text: IAM names neither the certificate nor the
+                        // user that already holds it, and the id of the held record is
+                        // minted per upload, so it is kept out of the message and recorded
+                        // only in the audit line above.
+                        message: Some("Duplicate certificate uploaded.".to_string()),
                     },
                 )
                 .into(),

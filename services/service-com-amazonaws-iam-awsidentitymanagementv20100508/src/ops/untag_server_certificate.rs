@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagServerCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagServerCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagServerCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Drops from the named server certificate's persisted tag set exactly the tags whose
+//! keys the request names, so the surviving set is what `GetServerCertificate` and
+//! `ListServerCertificateTags` report afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagServerCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagServerCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagServerCertificate"))
+        // `ctx` carries request metadata only; what this operation reads out of it is the
+        // signing key id of the caller the request is authorized as. The certificate is
+        // named in the request — IAM is global, so no region is read.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagServerCertificateErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A mutation: it "removes the specified tags from the IAM server certificate", so
+        // the lock is held for write across the lookup and the removal.
+        let mut store = state.lock();
+
+        // IAM entity names are unique within the account and "are not distinguished by
+        // case", so the certificate is found under the case-folded name whatever case the
+        // request spells it in — the key `UploadServerCertificate` stored it under, which
+        // `TagServerCertificate` and `GetServerCertificate` resolve the same way.
+        let key = crate::state::name_key(&input.server_certificate_name);
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any tag is removed, and before the STORE's answer about the
+        // certificate is given away — so a caller that may not change a certificate's tags
+        // learns that it may not, never whether the account holds that certificate. The
+        // decision is made on the ARN the held certificate carries, or, for a name the
+        // account holds none under, on the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. The keys this call REMOVES are
+        // handed to the gate, because `aws:TagKeys` is part of the request a statement may
+        // be conditioned on; an untag call writes no tag values. Nothing is removed when it
+        // refuses.
+        let resource = store.server_certificates.get(&key).map_or_else(
+            || {
+                crate::state::server_certificate_arn(
+                    crate::state::DEFAULT_PATH,
+                    &input.server_certificate_name,
+                )
+            },
+            |certificate| certificate.metadata.arn.clone(),
+        );
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::UNTAG_SERVER_CERTIFICATE,
+            &resource,
+            &format!("server certificate {}", input.server_certificate_name),
+            crate::state::authorization::WrittenTags::Keys(&input.tag_keys),
+        )?;
+
+        // Only a certificate the account holds can be untagged: a name it holds none under
+        // "referenced a resource entity that does not exist" (`NoSuchEntityException`),
+        // worded as every operation naming a server certificate by name words that absence.
+        let Some(certificate) = store.server_certificates.get_mut(&key) else {
+            return Err(UntagServerCertificateErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The Server Certificate with name {} cannot be found.",
+                        input.server_certificate_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "The tags with matching keys are removed from the specified IAM server
+        // certificate" (`$TagKeys`): the removal, and the exact key comparison it makes,
+        // are the one shared rule in `crate::state`, so a named key the certificate does
+        // not hold drops nothing rather than failing the call, and every key the request
+        // does not name keeps its value and its position in the held order — the order
+        // sorted by tag key that `UploadServerCertificate` and `TagServerCertificate`
+        // store, because "the returned list of tags is sorted by tag key".
+        let remaining = crate::state::remove_tags(
+            certificate.tags.as_ref(),
+            input.tag_keys.iter().map(String::as_str),
+        );
+
+        // An empty tag set is the same as no tags, which is how `UploadServerCertificate`
+        // stores one: the member is reported only when the certificate carries a tag.
+        certificate.tags = (!remaining.is_empty()).then_some(remaining);
+        let server_certificate_name = certificate.metadata.server_certificate_name.clone();
+
+        // Audit record for the change: the acting principal, the operation and the keys it
+        // removed from which certificate, so a state-changing call leaves a local record —
+        // the same shape `TagServerCertificate` and `UntagPolicy` emit.
+        ::tracing::info!(
+            audit = true,
+            operation = "UntagServerCertificate",
+            outcome = "untagged",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            server_certificate_name = %server_certificate_name,
+            tag_keys = ?input.tag_keys,
+            "tags were removed from a server certificate"
+        );
+
+        // The output shape is `Unit`: the operation reports nothing, and the surviving set
+        // is read back through `GetServerCertificate` and `ListServerCertificateTags`.
+        Ok(UntagServerCertificateOutput)
     }
 }

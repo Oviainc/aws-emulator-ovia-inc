@@ -15,8 +15,10 @@
 //! key belongs to), with the body kept verbatim and the status `Active`; that the list
 //! REPORTS exactly what was persisted, one page at a time, for that user alone; that an
 //! update moves ONE record's status and nothing else; that a delete removes ONE record
-//! and nothing else; and that the same certificate twice, a body that is not a
-//! certificate, and an upload past the published quota are refused with nothing stored.
+//! and nothing else; that a certificate is registered ONCE in the account, so its holder
+//! re-uploading it is served the registration it already has while any other user is
+//! refused; and that a body that is not a certificate and an upload past the published
+//! quota are refused with nothing stored.
 //!
 //! Each suite is a TABLE whose rows differ along what those rules generalise over (the
 //! user name's alphabet and case, the case the request spells it in, the key algorithm,
@@ -476,11 +478,13 @@ async fn an_omitted_name_refuses_non_user_credentials() {
 // Refusals that store nothing
 // ---------------------------------------------------------------------------
 
-/// RULE: one certificate is held once in the account — a second upload of the SAME
-/// certificate is refused with `DuplicateCertificate`, whatever whitespace framed the PEM,
-/// and leaves the held record exactly as it stands.
+/// RULE: a certificate is registered ONCE in the account, and an upload naming the user it
+/// is already associated with asks for the registration that exists: it is served with that
+/// registration exactly as it stands — the same `CertificateId`, body, status and upload
+/// date — stores nothing new, and recognises the certificate whatever whitespace framed the
+/// PEM.
 #[tokio::test]
-async fn the_same_certificate_cannot_be_uploaded_twice() {
+async fn re_uploading_a_held_certificate_reports_the_held_registration() {
     let router = router();
 
     for case in CASES {
@@ -489,10 +493,11 @@ async fn the_same_certificate_cannot_be_uploaded_twice() {
         let certificate = case.certificate(1);
         let uploaded = upload(&router, &label, case.stored_name, &certificate).await;
         let certificate_id = element(&uploaded, "CertificateId");
+        let upload_date = element(&uploaded, "UploadDate");
 
         // The body as it was sent, the same certificate with the newline after its END
         // line added or removed, and the same certificate with whitespace around the
-        // framing: the same CERTIFICATE every time, which is what the refusal is about.
+        // framing: the same CERTIFICATE every time, which is what the registration is of.
         let repeats = [
             certificate.clone(),
             format!("{certificate}\n"),
@@ -504,22 +509,42 @@ async fn the_same_certificate_cannot_be_uploaded_twice() {
                 param("UserName", case.requested_name),
                 param("CertificateBody", repeat),
             ];
-            let (status, refused) =
-                call(&router, "UploadSigningCertificate", &borrowed(&params)).await;
+            let (status, again) = call(&router, "UploadSigningCertificate", &borrowed(&params)).await;
             assert_eq!(
-                status, 409,
-                "case {label:?}: repeat {index} must be refused with 409, got {status}: \
-                 {refused}"
+                status, 200,
+                "case {label:?}: repeat {index} must be served, got {status}: {again}"
             );
             assert_eq!(
-                error_code(&refused),
-                "DuplicateCertificate",
-                "case {label:?}: repeat {index} expected DuplicateCertificate, got {:?}",
-                error_code(&refused)
+                element(&again, "CertificateId"),
+                certificate_id,
+                "case {label:?}: repeat {index} must report the held registration's id, got \
+                 {again}"
+            );
+            assert_eq!(
+                element(&again, "UserName"),
+                case.stored_name,
+                "case {label:?}: repeat {index} must report the holder, got {again}"
+            );
+            assert_eq!(
+                element(&again, "Status"),
+                ACTIVE,
+                "case {label:?}: repeat {index} must report the held status, got {again}"
+            );
+            assert_eq!(
+                element(&again, "UploadDate"),
+                upload_date,
+                "case {label:?}: repeat {index} must report the date the certificate was \
+                 first uploaded, got {again}"
+            );
+            assert_eq!(
+                element(&again, "CertificateBody"),
+                certificate,
+                "case {label:?}: repeat {index} must report the body as it is held, got {again}"
             );
         }
 
-        // The held certificate is untouched, and still the only one.
+        // The held certificate is untouched, and still the only one: the repeats stored
+        // nothing, so the user's set did not grow past the one registration.
         let (_, listed) = call(
             &router,
             "ListSigningCertificates",
@@ -536,7 +561,7 @@ async fn the_same_certificate_cannot_be_uploaded_twice() {
                     certificate.clone(),
                 ),
             )]),
-            "case {label:?}: the refused repeats must leave the held certificate, got {listed}"
+            "case {label:?}: the repeats must leave the one held certificate, got {listed}"
         );
 
         // A DIFFERENT certificate for the same user is a different resource and is stored.
@@ -546,6 +571,290 @@ async fn the_same_certificate_cannot_be_uploaded_twice() {
             element(&stored, "CertificateId"),
             certificate_id,
             "case {label:?}: a different certificate must get an id of its own, got {stored}"
+        );
+    }
+}
+
+/// One user asking for a certificate: the name the account holds it under, the case its
+/// own request spells that name in, and whether the request names the user at all.
+struct Claimant {
+    /// The name the user is created with — the case IAM stores and reports.
+    stored: &'static str,
+    /// The case this user's upload spells its name in; the same entity, differing only in
+    /// case, because IAM entity names "are not distinguished by case".
+    spelled: &'static str,
+    /// When true the upload carries NO `UserName` and is signed by this user's own access
+    /// key, so the user is the implicitly resolved caller rather than a named one.
+    implicit: bool,
+}
+
+/// One row: the user that registers the certificate first, the users that then ask for the
+/// SAME certificate, and the shape of that certificate.
+struct ClaimCase {
+    label: &'static str,
+    holder: Claimant,
+    others: &'static [Claimant],
+    algorithm: &'static rcgen::SignatureAlgorithm,
+    validity: (i32, i32),
+}
+
+/// The message IAM refuses an upload of an already registered certificate with: entirely
+/// fixed text, naming neither the certificate nor the user that holds it.
+const DUPLICATE_MESSAGE: &str = "Duplicate certificate uploaded.";
+
+/// Create `user_name`, asserting the fixture call succeeds.
+async fn with_user_named(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    user_name: &str,
+) {
+    let (status, body) = call(router, "CreateUser", &[("UserName", user_name)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateUser {user_name:?} must succeed, got {status}: {body}"
+    );
+}
+
+/// The access key this claimant's uploads are signed by, or `None` when its uploads name
+/// the user outright. Minted ONCE per claimant, so a row that makes several uploads does
+/// not spend the per-user access-key quota.
+async fn signing_key_for(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    claimant: &Claimant,
+    row: usize,
+) -> Option<String> {
+    if !claimant.implicit {
+        return None;
+    }
+    let stored = format!("{}-{row}", claimant.stored);
+    let (status, key) = call(router, "CreateAccessKey", &[("UserName", &stored)]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the signing key for {stored:?} must be minted, got {status}: {key}"
+    );
+    Some(element(&key, "AccessKeyId"))
+}
+
+/// Upload `certificate` for `claimant` — naming the user, or, when the row leaves the name
+/// implicit, carrying no `UserName` and signed by that user's own access key.
+async fn upload_claim(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    claimant: &Claimant,
+    row: usize,
+    signing_key: Option<&String>,
+    certificate: &str,
+) -> (u16, String) {
+    match signing_key {
+        Some(key) => {
+            let params = vec![param("CertificateBody", certificate)];
+            call_signed_by(
+                router,
+                Some(key),
+                "UploadSigningCertificate",
+                &borrowed(&params),
+            )
+            .await
+        }
+        None => {
+            let spelled = format!("{}-{row}", claimant.spelled);
+            let params = vec![
+                param("UserName", &spelled),
+                param("CertificateBody", certificate),
+            ];
+            call(router, "UploadSigningCertificate", &borrowed(&params)).await
+        }
+    }
+}
+
+/// RULE: a certificate is registered ONCE in the account, so an upload of a certificate
+/// another IAM user already holds is refused with `DuplicateCertificate` (HTTP 409) and
+/// stores nothing — however that other user is named and whatever whitespace framed the
+/// PEM — while the user that holds it keeps its registration exactly as it stands.
+///
+/// Rows differ along what the rule generalises over: how many other users ask for the one
+/// certificate, the case each upload spells its user's name in, whether the upload names
+/// the user or leaves it to the signing key, and the algorithm and validity window the
+/// certificate was generated with.
+#[tokio::test]
+async fn a_certificate_another_user_holds_is_refused() {
+    const CASES: &[ClaimCase] = &[
+        ClaimCase {
+            label: "a second user naming itself",
+            holder: Claimant {
+                stored: "holder.one",
+                spelled: "holder.one",
+                implicit: false,
+            },
+            others: &[Claimant {
+                stored: "second.one",
+                spelled: "second.one",
+                implicit: false,
+            }],
+            algorithm: &rcgen::PKCS_ECDSA_P256_SHA256,
+            validity: (2020, 2030),
+        },
+        ClaimCase {
+            label: "a second user naming itself in another case",
+            holder: Claimant {
+                stored: "Holder_two",
+                spelled: "holder_TWO",
+                implicit: false,
+            },
+            others: &[Claimant {
+                stored: "second+two",
+                spelled: "SECOND+TWO",
+                implicit: false,
+            }],
+            algorithm: &rcgen::PKCS_ECDSA_P384_SHA384,
+            validity: (2024, 2044),
+        },
+        ClaimCase {
+            label: "two other users, one of them resolved from its signing key",
+            holder: Claimant {
+                stored: "holder=three",
+                spelled: "holder=three",
+                implicit: false,
+            },
+            others: &[
+                Claimant {
+                    stored: "second_three",
+                    spelled: "second_three",
+                    implicit: true,
+                },
+                Claimant {
+                    stored: "third@three",
+                    spelled: "THIRD@THREE",
+                    implicit: false,
+                },
+            ],
+            algorithm: &rcgen::PKCS_ED25519,
+            validity: (2029, 2039),
+        },
+        ClaimCase {
+            label: "a holder and a second user both resolved from their signing keys",
+            holder: Claimant {
+                stored: "holder-four",
+                spelled: "holder-four",
+                implicit: true,
+            },
+            others: &[Claimant {
+                stored: "second-four",
+                spelled: "second-four",
+                implicit: true,
+            }],
+            algorithm: &rcgen::PKCS_ECDSA_P256_SHA256,
+            validity: (2040, 2041),
+        },
+    ];
+
+    let router = router();
+    for (row, case) in CASES.iter().enumerate() {
+        let label = case.label;
+        // The one certificate every user of this row asks for, generated by `rcgen` —
+        // something other than the code under test.
+        let certificate = certificate_pem(
+            case.algorithm,
+            case.validity,
+            &format!("claimed-{row}.example.com"),
+        );
+
+        // The user that registers the certificate first holds it from here on.
+        let holder = format!("{}-{row}", case.holder.stored);
+        with_user_named(&router, label, &holder).await;
+        let holder_key = signing_key_for(&router, label, &case.holder, row).await;
+        let (status, registered) = upload_claim(
+            &router,
+            &case.holder,
+            row,
+            holder_key.as_ref(),
+            &certificate,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: the first upload must be served, got {status}: {registered}"
+        );
+        let certificate_id = element(&registered, "CertificateId");
+        let held = BTreeMap::from([(
+            certificate_id.clone(),
+            (holder.clone(), ACTIVE.to_string(), certificate.clone()),
+        )]);
+
+        for other in case.others {
+            let stored = format!("{}-{row}", other.stored);
+            with_user_named(&router, label, &stored).await;
+            let other_key = signing_key_for(&router, label, other, row).await;
+
+            // The body as it was sent, and the same certificate re-framed with whitespace:
+            // the same CERTIFICATE every time, which is what is already registered.
+            let repeats = [
+                certificate.clone(),
+                format!("{certificate}\n"),
+                format!("\n  {}  \n", certificate.trim()),
+            ];
+            for (index, repeat) in repeats.iter().enumerate() {
+                let (status, refused) =
+                    upload_claim(&router, other, row, other_key.as_ref(), repeat).await;
+                assert_eq!(
+                    status, 409,
+                    "case {label:?}: {stored:?} repeat {index} must be refused with 409, got \
+                     {status}: {refused}"
+                );
+                assert_eq!(
+                    error_code(&refused),
+                    "DuplicateCertificate",
+                    "case {label:?}: {stored:?} repeat {index} expected DuplicateCertificate, \
+                     got {:?}",
+                    error_code(&refused)
+                );
+                assert_eq!(
+                    element(&refused, "Message"),
+                    DUPLICATE_MESSAGE,
+                    "case {label:?}: {stored:?} repeat {index} expected the refusal \
+                     {DUPLICATE_MESSAGE:?}, got {refused}"
+                );
+                assert!(
+                    elements(&refused, "CertificateId").is_empty(),
+                    "case {label:?}: {stored:?} repeat {index} must report no certificate, got \
+                     {refused}"
+                );
+            }
+
+            // The refused user holds nothing: the refusal stored no association for it.
+            let (status, listed) =
+                call(&router, "ListSigningCertificates", &[("UserName", &stored)]).await;
+            assert_eq!(
+                status, 200,
+                "case {label:?}: the list for {stored:?} must be served, got {status}: {listed}"
+            );
+            assert!(
+                reported_certificates(&listed).is_empty(),
+                "case {label:?}: {stored:?} must hold nothing after the refusals, got {listed}"
+            );
+
+            // The refusal is about THAT certificate: a certificate of its own is stored for
+            // the very same user, under an id of its own.
+            let own = certificate_pem(
+                case.algorithm,
+                case.validity,
+                &format!("own-{row}-{}.example.com", other.stored.to_lowercase()),
+            );
+            let mine = upload(&router, label, &stored, &own).await;
+            assert_ne!(
+                element(&mine, "CertificateId"),
+                certificate_id,
+                "case {label:?}: {stored:?}'s own certificate must get an id of its own, got \
+                 {mine}"
+            );
+        }
+
+        // The holder's registration came through every refusal untouched.
+        let (_, again) = call(&router, "ListSigningCertificates", &[("UserName", &holder)]).await;
+        assert_eq!(
+            reported_certificates(&again),
+            held,
+            "case {label:?}: the refusals must leave {holder:?} as it stood, got {again}"
         );
     }
 }
