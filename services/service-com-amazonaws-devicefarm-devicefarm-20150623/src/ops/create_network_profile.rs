@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetworkProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNetworkProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNetworkProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a network profile inside an existing project: a fresh ARN plus every shaping
+//! member resolved to the value the request asked for or the service's default for an
+//! unshaped direction, all stored on the record in [`crate::state`] and read back out of
+//! it for the response, so every later `GetNetworkProfile` reports the identical values.
+//!
+//! The created profile's `type` is the service's own classification, not the request's: a
+//! profile created inside a caller's project is that caller's, so it is reported as
+//! `PRIVATE` whatever the request asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +163,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNetworkProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNetworkProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNetworkProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateNetworkProfileErrorModeled::ServiceAccountException(
+                ServiceAccountException {
+                    message: Some("the Device Farm state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The model constrains `projectArn` only to `^arn:aws:devicefarm:.+$`, so an ARN
+        // naming another Device Farm resource type reaches here. That is a bad argument,
+        // not a missing project.
+        if !crate::state::is_project_arn(&input.project_arn) {
+            return Err(CreateNetworkProfileErrorModeled::ArgumentException(
+                ArgumentException {
+                    message: Some(format!("{} is not a project ARN", input.project_arn)),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A network profile lives inside a project, so a profile cannot be minted for a
+        // project the store does not hold.
+        if !store.projects.contains_key(&input.project_arn) {
+            return Err(CreateNetworkProfileErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!("No project found for arn {}", input.project_arn)),
+                },
+            )
+            .into());
+        }
+        // The store's own bound: refuse rather than let an unbounded number of calls grow
+        // the state without end. Checked before anything is minted, so a refused call
+        // leaves the store exactly as it was.
+        if store.network_profiles.len() >= crate::state::NETWORK_PROFILE_QUOTA {
+            return Err(CreateNetworkProfileErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account has reached its limit of {} network profiles",
+                        crate::state::NETWORK_PROFILE_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The ARN is minted ONCE here and stored on the record; nothing recomputes it per
+        // response.
+        let arn = store.mint_network_profile_arn(&region, &input.project_arn);
+        let record = crate::state::NetworkProfileRecord {
+            arn: arn.clone(),
+            project_arn: input.project_arn,
+            name: input.name,
+            description: input.description,
+            // `CURATED` describes the profiles the service itself publishes; what a
+            // caller creates in its own project is its own, so the requested type is
+            // classified rather than echoed.
+            r#type: crate::state::NETWORK_PROFILE_TYPE_PRIVATE.to_string(),
+            uplink_bandwidth_bits: input
+                .uplink_bandwidth_bits
+                .unwrap_or(crate::state::DEFAULT_NETWORK_PROFILE_BANDWIDTH_BITS),
+            downlink_bandwidth_bits: input
+                .downlink_bandwidth_bits
+                .unwrap_or(crate::state::DEFAULT_NETWORK_PROFILE_BANDWIDTH_BITS),
+            uplink_delay_ms: input
+                .uplink_delay_ms
+                .unwrap_or(crate::state::DEFAULT_NETWORK_PROFILE_DELAY_MS),
+            downlink_delay_ms: input
+                .downlink_delay_ms
+                .unwrap_or(crate::state::DEFAULT_NETWORK_PROFILE_DELAY_MS),
+            uplink_jitter_ms: input
+                .uplink_jitter_ms
+                .unwrap_or(crate::state::DEFAULT_NETWORK_PROFILE_DELAY_MS),
+            downlink_jitter_ms: input
+                .downlink_jitter_ms
+                .unwrap_or(crate::state::DEFAULT_NETWORK_PROFILE_DELAY_MS),
+            // Both loss members carry the model's own default of 0, so the deserializer
+            // has already resolved an omitted one.
+            uplink_loss_percent: input.uplink_loss_percent,
+            downlink_loss_percent: input.downlink_loss_percent,
+        };
+
+        // The response is built from the record the store now HOLDS, through the entry the
+        // insert hands back, so it can never report a value the store does not have. A
+        // minted ARN the store already holds would mean the sequence repeated, which it
+        // cannot; that is an internal invariant breach, never someone else's profile
+        // returned under a 200.
+        let network_profile = match store.network_profiles.entry(arn) {
+            ::std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(record).to_network_profile()
+            }
+            ::std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(CreateNetworkProfileErrorModeled::ServiceAccountException(
+                    ServiceAccountException {
+                        message: Some(
+                            "the Device Farm state store minted a network profile id it \
+                             already holds"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+        Ok(CreateNetworkProfileOutput {
+            network_profile: Some(network_profile),
+        })
     }
 }

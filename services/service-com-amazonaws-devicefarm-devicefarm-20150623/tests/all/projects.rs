@@ -10,6 +10,10 @@
 //! The tables below span the classes the handlers generalise over (name length,
 //! presence/absence of each optional member, list size at both modelled bounds, signing
 //! region, page count), rather than re-asserting one recorded request.
+//!
+//! The wire harness here ([`Emulator`] and the small helpers beside it) is this crate's
+//! one test harness: a sibling suite under `tests/all/` reaches it as
+//! `crate::projects::<item>`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -24,19 +28,19 @@ use service_com_amazonaws_devicefarm_devicefarm_20150623::state::{
 use service_com_amazonaws_devicefarm_devicefarm_20150623::EmulatedService;
 
 /// The signing region most cases use; the create table varies it deliberately.
-const REGION: Option<&str> = Some("us-west-2");
+pub(crate) const REGION: Option<&str> = Some("us-west-2");
 
 /// The region an unsigned request's resources land in, per `state::request_region`.
-const DEFAULT_REGION: &str = "us-east-1";
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
 
 /// One emulator: a shared engine, the Device Farm service, and the router that
 /// dispatches to it — the same path `core/router` boots in production.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These cases exercise handler behaviour, not SigV4 verification, so requests
@@ -48,7 +52,7 @@ impl Emulator {
     }
 
     /// Call `op` with `body`, signed for `region` (`None` sends it unsigned).
-    async fn call(&self, op: &str, region: Option<&str>, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, op: &str, region: Option<&str>, body: &Value) -> (u16, Value) {
         let mut builder = ::http::Request::builder()
             .method("POST")
             .uri("/")
@@ -79,7 +83,7 @@ impl Emulator {
     }
 
     /// Create a project and return its stored `project` object.
-    async fn create(&self, body: &Value) -> Value {
+    pub(crate) async fn create(&self, body: &Value) -> Value {
         let (status, response) = self.call("CreateProject", REGION, body).await;
         assert_eq!(status, 200, "CreateProject({body}) answered {status}: {response}");
         response["project"].clone()
@@ -87,7 +91,7 @@ impl Emulator {
 }
 
 /// The wire error code of an awsJson1_1 error body (`__type`).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
 }
 
@@ -100,16 +104,16 @@ fn env_vars(n: usize) -> Value {
     )
 }
 
-/// The `arn` of a project object, as a `String`.
-fn arn_of(project: &Value) -> String {
-    project["arn"]
+/// The `arn` of a returned resource object, as a `String`.
+pub(crate) fn arn_of(resource: &Value) -> String {
+    resource["arn"]
         .as_str()
-        .unwrap_or_else(|| panic!("project carries no arn: {project}"))
+        .unwrap_or_else(|| panic!("resource carries no arn: {resource}"))
         .to_string()
 }
 
 /// A Device Farm ARN this emulator never minted, of resource type `resource_type`.
-fn foreign_arn(resource_type: &str) -> String {
+pub(crate) fn foreign_arn(resource_type: &str) -> String {
     format!(
         "arn:aws:devicefarm:us-west-2:{}:{resource_type}:11111111-2222-3333-4444-555555555555",
         engine::EMULATOR_ACCOUNT_ID

@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{EnvironmentVariable, Project, VpcConfig};
+use crate::ops::types::{EnvironmentVariable, NetworkProfile, Project, VpcConfig};
 
 /// The execution timeout a project gets when `CreateProject` is called without
 /// `defaultJobTimeoutMinutes`.
@@ -23,6 +23,32 @@ pub const DEFAULT_JOB_TIMEOUT_MINUTES: i32 = 150;
 
 /// The resource type a project ARN carries: `arn:aws:devicefarm:<region>:<account>:project:<id>`.
 pub const PROJECT_RESOURCE_TYPE: &str = "project";
+
+/// The resource type a network-profile ARN carries:
+/// `arn:aws:devicefarm:<region>:<account>:networkprofile:<project-id>/<profile-id>`.
+pub const NETWORK_PROFILE_RESOURCE_TYPE: &str = "networkprofile";
+
+/// The only type a network profile created through the API can have.
+///
+/// `NetworkProfileType` models two values: a `CURATED` profile is one the service itself
+/// publishes, and a profile a caller creates inside its own project is its own — so the
+/// created profile is reported as `PRIVATE` whatever type the request asked for.
+pub const NETWORK_PROFILE_TYPE_PRIVATE: &str = "PRIVATE";
+
+/// The throughput a network profile gets for a direction the request does not shape.
+///
+/// `CreateNetworkProfile`'s bandwidth members document the range "an integer from 0 to
+/// 104857600", and the top of that range is an unshaped link: a profile created without a
+/// bandwidth imposes no throughput limit. The value is therefore the modelled maximum
+/// rather than a figure of this emulator's own choosing, while which end of the range an
+/// omitted member lands on is the emulator's reading of "unshaped".
+pub const DEFAULT_NETWORK_PROFILE_BANDWIDTH_BITS: i64 = 104_857_600;
+
+/// The delay and jitter a network profile gets for a direction the request does not shape:
+/// none. Both members document milliseconds "from 0 to 2000", and an unshaped link adds
+/// neither — the same reading as [`DEFAULT_NETWORK_PROFILE_BANDWIDTH_BITS`], at the other
+/// end of the range because delay and jitter are impairments rather than capacity.
+pub const DEFAULT_NETWORK_PROFILE_DELAY_MS: i64 = 0;
 
 /// How many projects one `ListProjects` page carries.
 ///
@@ -40,6 +66,14 @@ pub const PROJECTS_PAGE_SIZE: usize = 50;
 /// above any workflow an emulator serves, and it is what stops the state growing without
 /// end: every record it holds is released by `DeleteProject`.
 pub const PROJECT_QUOTA: usize = 1_000;
+
+/// How many network profiles the store holds before `CreateNetworkProfile` refuses with
+/// the modelled `LimitExceededException`.
+///
+/// Like [`PROJECT_QUOTA`], this is the emulator's OWN bound on the store rather than a
+/// claim about any account's published quota, set far above any workflow an emulator
+/// serves: it is what stops repeated calls growing the state without end.
+pub const NETWORK_PROFILE_QUOTA: usize = 1_000;
 
 /// One stored project: the single source of truth every Project response is built from.
 ///
@@ -78,17 +112,69 @@ impl ProjectRecord {
     }
 }
 
+/// One stored network profile: the single source of truth every `NetworkProfile` response
+/// is built from.
+///
+/// Every shaping member is stored RESOLVED — the value the request asked for, or the
+/// default the service applies for a direction it did not shape — so no response has to
+/// re-derive one, and `type` is stored as the service classified the profile rather than
+/// as the request named it.
+#[derive(Debug, Clone)]
+pub struct NetworkProfileRecord {
+    pub arn: String,
+    /// The project the profile belongs to. Kept so `ListNetworkProfiles` can select the
+    /// profiles of one project without parsing the ARN back apart.
+    pub project_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub r#type: String,
+    pub uplink_bandwidth_bits: i64,
+    pub downlink_bandwidth_bits: i64,
+    pub uplink_delay_ms: i64,
+    pub downlink_delay_ms: i64,
+    pub uplink_jitter_ms: i64,
+    pub downlink_jitter_ms: i64,
+    pub uplink_loss_percent: i32,
+    pub downlink_loss_percent: i32,
+}
+
+impl NetworkProfileRecord {
+    /// The modelled `NetworkProfile` for this record. Every member is read off the
+    /// record, so a response can never carry a value the store does not hold.
+    pub fn to_network_profile(&self) -> NetworkProfile {
+        NetworkProfile {
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            r#type: Some(self.r#type.clone()),
+            uplink_bandwidth_bits: Some(self.uplink_bandwidth_bits),
+            downlink_bandwidth_bits: Some(self.downlink_bandwidth_bits),
+            uplink_delay_ms: Some(self.uplink_delay_ms),
+            downlink_delay_ms: Some(self.downlink_delay_ms),
+            uplink_jitter_ms: Some(self.uplink_jitter_ms),
+            downlink_jitter_ms: Some(self.downlink_jitter_ms),
+            uplink_loss_percent: self.uplink_loss_percent,
+            downlink_loss_percent: self.downlink_loss_percent,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-devicefarm-devicefarm-20150623. A handler reaches it through [`service_state`].
 ///
 /// `projects` is keyed by project ARN, so Get/Update/Delete are O(log n) and
-/// `ListProjects` has one deterministic (ARN-ordered) page sequence.
+/// `ListProjects` has one deterministic (ARN-ordered) page sequence. `network_profiles`
+/// is keyed by network-profile ARN for the same reasons.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDevicefarmDevicefarm20150623State {
     pub projects: BTreeMap<String, ProjectRecord>,
+    pub network_profiles: BTreeMap<String, NetworkProfileRecord>,
     /// The sequence the next minted project id comes from. Private, and only ever
     /// advanced by [`Self::mint_project_arn`], so no two projects can share an id and a
     /// released id is never handed out again.
     next_project_id: u64,
+    /// The sequence the next minted network-profile id comes from, with the same
+    /// guarantee as `next_project_id`.
+    next_network_profile_id: u64,
 }
 
 impl ComAmazonawsDevicefarmDevicefarm20150623State {
@@ -107,15 +193,36 @@ impl ComAmazonawsDevicefarmDevicefarm20150623State {
             region,
             &format!(
                 "{PROJECT_RESOURCE_TYPE}:{:016x}-{}",
-                self.next_project_id, PROJECT_ID_SUFFIX
+                self.next_project_id, RESOURCE_ID_SUFFIX
+            ),
+        )
+    }
+
+    /// Mint a fresh, unique network-profile ARN in `region` under `project_arn`,
+    /// advancing the store's sequence.
+    ///
+    /// A Device Farm resource that lives inside a project carries both ids:
+    /// `networkprofile:<project-id>/<profile-id>`, so the owning project is readable off
+    /// the ARN exactly as it is in the service's own ARNs. The project id is the one the
+    /// project ARN already holds, and the profile id comes from the store's never-reused
+    /// sequence. The ARN is stored on the record and never recomputed.
+    pub fn mint_network_profile_arn(&mut self, region: &str, project_arn: &str) -> String {
+        self.next_network_profile_id = self.next_network_profile_id.wrapping_add(1);
+        let project_id = devicefarm_resource_id(project_arn, PROJECT_RESOURCE_TYPE).unwrap_or("");
+        ::emulator_server::emulator_arn(
+            "devicefarm",
+            region,
+            &format!(
+                "{NETWORK_PROFILE_RESOURCE_TYPE}:{project_id}/{:016x}-{}",
+                self.next_network_profile_id, RESOURCE_ID_SUFFIX
             ),
         )
     }
 }
 
-/// The fixed tail every minted project id carries, so a project ARN is recognisable as
-/// one this emulator minted and comfortably clears the modelled minimum ARN length of 32.
-const PROJECT_ID_SUFFIX: &str = "emulated";
+/// The fixed tail every minted resource id carries, so an ARN is recognisable as one this
+/// emulator minted and comfortably clears the modelled minimum ARN length of 32.
+const RESOURCE_ID_SUFFIX: &str = "emulated";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
@@ -144,26 +251,25 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// The region an unsigned request's resources are placed in.
 const DEFAULT_REGION: &str = "us-east-1";
 
-/// Whether `arn` names a Device Farm resource of type `resource_type`.
+/// The resource id of `arn`, if `arn` names a Device Farm resource of type
+/// `resource_type`.
 ///
 /// Applies the ARN grammar: `arn:<partition>:<service>:<region>:<account>:<type>:<id>`,
-/// with a non-empty resource id. Device Farm's ARN members are modelled only as
-/// `^arn:aws:devicefarm:.+$`, so an ARN naming some OTHER Device Farm resource type (an
-/// upload, a run, a device pool) reaches a handler and must be refused as an invalid
-/// argument rather than reported as a missing project.
-pub fn is_devicefarm_arn_of_type(arn: &str, resource_type: &str) -> bool {
+/// with a non-empty resource id. A resource that lives inside a project carries both ids
+/// in that one field (`<project-id>/<profile-id>`), which is why the id is returned whole
+/// rather than split further.
+pub fn devicefarm_resource_id<'a>(arn: &'a str, resource_type: &str) -> Option<&'a str> {
     let mut fields = arn.split(':');
-    matches!(
-        (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-        ),
+    match (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) {
         (
             Some("arn"),
             Some(_partition),
@@ -173,13 +279,29 @@ pub fn is_devicefarm_arn_of_type(arn: &str, resource_type: &str) -> bool {
             Some(found_type),
             Some(id),
             None,
-        ) if found_type == resource_type && !id.is_empty()
-    )
+        ) if found_type == resource_type && !id.is_empty() => Some(id),
+        _ => None,
+    }
+}
+
+/// Whether `arn` names a Device Farm resource of type `resource_type`.
+///
+/// Device Farm's ARN members are modelled only as `^arn:aws:devicefarm:.+$`, so an ARN
+/// naming some OTHER Device Farm resource type (an upload, a run, a device pool) reaches a
+/// handler and must be refused as an invalid argument rather than reported as a missing
+/// resource of the type the operation expects.
+pub fn is_devicefarm_arn_of_type(arn: &str, resource_type: &str) -> bool {
+    devicefarm_resource_id(arn, resource_type).is_some()
 }
 
 /// Whether `arn` names a project.
 pub fn is_project_arn(arn: &str) -> bool {
     is_devicefarm_arn_of_type(arn, PROJECT_RESOURCE_TYPE)
+}
+
+/// Whether `arn` names a network profile.
+pub fn is_network_profile_arn(arn: &str) -> bool {
+    is_devicefarm_arn_of_type(arn, NETWORK_PROFILE_RESOURCE_TYPE)
 }
 
 /// The current wall-clock instant as a modelled timestamp, for the `created`-style
