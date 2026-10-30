@@ -149,6 +149,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The FORM of the identifier is decided before any lookup, ahead of the
+        // idempotency ledger and the status gate alike: a value that is no
+        // identifier this service could have minted names no cluster whose policy
+        // could be removed.
+        if let Err(invalid) = crate::state::validate_cluster_identifier(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+        ) {
+            return Err(DeleteClusterPolicyErrorModeled::ValidationException(invalid).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteClusterPolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -245,12 +256,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `expectedPolicyVersion` is the caller's claim about what it is deleting:
-        // a claim about another version must not delete this one.
+        // `expectedPolicyVersion` names the policy version this call DELETES, so
+        // a version the cluster does not hold is a target that is not there to
+        // delete: the same "no such policy version" the absent-policy branch above
+        // answers, and not the conflict a precondition on a replace would be.
         if let Some(expected) = input.expected_policy_version.as_deref() {
             if expected != attached {
-                return Err(DeleteClusterPolicyErrorModeled::ConflictException(
-                    crate::state::cluster_policy_version_conflict(&input.identifier, expected),
+                return Err(DeleteClusterPolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::cluster_policy_version_not_found(&input.identifier, expected),
                 )
                 .into());
             }

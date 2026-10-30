@@ -206,6 +206,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The FORM of the identifier is decided before any lookup: a value that is
+        // no identifier this service could have minted names no cluster to update,
+        // so the request is refused rather than answered as a cluster that is
+        // absent.
+        if let Err(invalid) = crate::state::validate_cluster_identifier(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+        ) {
+            return Err(UpdateClusterErrorModeled::ValidationException(invalid).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateClusterErrorModeled::InternalServerException(
                 InternalServerException {

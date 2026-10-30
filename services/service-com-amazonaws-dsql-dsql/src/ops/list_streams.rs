@@ -154,6 +154,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The FORM of the cluster identifier is decided before any lookup: a value
+        // that is no identifier this service could have minted names no cluster
+        // whose streams could be paged.
+        if let Err(invalid) = crate::state::validate_cluster_identifier(
+            crate::state::CLUSTER_IDENTIFIER_MEMBER,
+            &input.cluster_identifier,
+        ) {
+            return Err(ListStreamsErrorModeled::ValidationException(invalid).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListStreamsErrorModeled::InternalServerException(
                 InternalServerException {

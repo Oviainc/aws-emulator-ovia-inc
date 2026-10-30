@@ -1762,6 +1762,35 @@ pub fn is_resource_identifier(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
+/// The largest value the LEADING base32 symbol of a resource identifier may
+/// carry.
+///
+/// [`RESOURCE_ID_LEN`] base32 symbols hold 130 bits and an identifier renders
+/// 128 of them ([`new_resource_identifier`]), so the leading symbol contributes
+/// only its low three bits: a leading symbol above this is the rendering of no
+/// 128-bit value at all.
+const MAX_LEADING_SYMBOL: usize = 0b111;
+
+/// Whether `value` is a 26-character base32 rendering of a 128-bit value — the
+/// form every cluster and stream identifier of this service takes
+/// ([`new_resource_identifier`]), and so the form an identifier a request
+/// carries has to be in for there to be a resource it could name.
+///
+/// Stricter than the `@pattern` the model can express
+/// ([`is_resource_identifier`]): `^[a-z0-9]{26}$` also admits 26-character
+/// strings that are no base32 rendering — one carrying a symbol outside the
+/// alphabet, and one whose leading symbol overflows the 128 bits an identifier
+/// encodes ([`MAX_LEADING_SYMBOL`]).
+pub fn is_base32_resource_identifier(value: &str) -> bool {
+    value.len() == RESOURCE_ID_LEN
+        && value.bytes().enumerate().all(|(position, symbol)| {
+            CROCKFORD_SYMBOLS
+                .iter()
+                .position(|candidate| *candidate == symbol)
+                .is_some_and(|symbol_value| position > 0 || symbol_value <= MAX_LEADING_SYMBOL)
+        })
+}
+
 /// Encode a list operation's pagination cursor: the identifier of the last entry
 /// the page returned, hex-encoded so the `nextToken` a client round-trips is an
 /// opaque token rather than a resource name.
@@ -2113,6 +2142,69 @@ pub fn invalid_resource_arn(member: &str, value: &str) -> ValidationException {
         ),
         value,
     )
+}
+
+/// The member a CLUSTER identifier arrives in on the cluster routes
+/// (`smithy_query(query="operation", operation="GetCluster,DeleteCluster,UpdateCluster,
+/// GetClusterPolicy,PutClusterPolicy,DeleteClusterPolicy,GetVpcEndpointServiceName")`:
+/// `identifier`), which is the name a refusal of it has to state.
+pub const IDENTIFIER_MEMBER: &str = "identifier";
+
+/// The member a CLUSTER identifier arrives in on the stream routes, where the
+/// stream's own identifier needs a name of its own
+/// (`smithy_query(query="operation",
+/// operation="CreateStream,ListStreams,GetStream,DeleteStream")`:
+/// `clusterIdentifier`).
+pub const CLUSTER_IDENTIFIER_MEMBER: &str = "clusterIdentifier";
+
+/// The member a STREAM identifier arrives in (`smithy_query(query="operation",
+/// operation="GetStream,DeleteStream")`: `streamIdentifier`).
+pub const STREAM_IDENTIFIER_MEMBER: &str = "streamIdentifier";
+
+/// Check the cluster identifier `member` carries BEFORE anything is looked up by
+/// it.
+///
+/// An identifier that is no base32 rendering of a 128-bit value
+/// ([`is_base32_resource_identifier`]) names no cluster this service could ever
+/// have minted, so the request itself is refused — the caller has to fix the
+/// value it sent, which is a different thing from a well-formed identifier whose
+/// cluster is absent ([`cluster_not_found`]) or gone.
+///
+/// Aurora DSQL words this class around the rejected input: the member it arrived
+/// in and the value itself, then the fixed statement of what was wrong with it.
+pub fn validate_cluster_identifier(member: &str, value: &str) -> Result<(), ValidationException> {
+    if is_base32_resource_identifier(value) {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: format!(
+            "Invalid input '{member}: {value}'. The cluster identifier format is invalid. \
+             Provide a valid cluster identifier and try again."
+        ),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: None,
+    })
+}
+
+/// Check the stream identifier `member` carries, on the same terms and at the
+/// same point in a request's walk as [`validate_cluster_identifier`].
+///
+/// Aurora DSQL words this class around the FORMAT a stream identifier has to be
+/// in rather than around the value it rejected, so the member name is the only
+/// part of the sentence the request decides.
+pub fn validate_stream_identifier(member: &str, value: &str) -> Result<(), ValidationException> {
+    if is_base32_resource_identifier(value) {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: format!(
+            "Aurora DSQL can't process the request because the {member} that you specified \
+             isn't valid. Provide the {member} in the format 'a valid base32-encoded \
+             26-character string' and try again."
+        ),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: None,
+    })
 }
 
 /// The prefix that marks a tag key as belonging to AWS rather than to the caller.

@@ -107,12 +107,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // list the macro checks against does not repeat it.
 #[smithy_macros::operation_error(
     "com.amazonaws.dsql#DeleteStream",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum DeleteStreamErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
     InternalServerException(InternalServerException),
 }
 
@@ -167,6 +168,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The FORM of both identifiers is decided before any lookup and before the
+        // idempotency ledger, in the order the route carries them: a value that is
+        // no identifier this service could have minted names no resource, so the
+        // request is refused rather than answered as a stream that is absent —
+        // which a tear-down loop would read as "already deleted".
+        if let Err(invalid) = crate::state::validate_cluster_identifier(
+            crate::state::CLUSTER_IDENTIFIER_MEMBER,
+            &input.cluster_identifier,
+        ) {
+            return Err(DeleteStreamErrorModeled::ValidationException(invalid).into());
+        }
+        if let Err(invalid) = crate::state::validate_stream_identifier(
+            crate::state::STREAM_IDENTIFIER_MEMBER,
+            &input.stream_identifier,
+        ) {
+            return Err(DeleteStreamErrorModeled::ValidationException(invalid).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteStreamErrorModeled::InternalServerException(
                 InternalServerException {

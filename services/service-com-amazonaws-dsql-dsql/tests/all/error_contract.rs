@@ -125,7 +125,7 @@ async fn a_missing_resource_is_reported_by_the_arn_the_call_addressed() {
 
         // A stream of a cluster that DOES exist is addressed by the stream's own
         // ARN, so that is the ARN the refusal names.
-        let absent_stream = "yyyyyyyyyyyyyyyyyyyyyyyyyy";
+        let absent_stream = "1yyyyyyyyyyyyyyyyyyyyyyyyy";
         let answer = dsql.get_stream(&live, absent_stream).await;
         assert_eq!(
             answer.status, 404,
@@ -725,7 +725,9 @@ async fn the_cluster_policy_round_trips_and_reports_its_absence() {
     }
 
     // A stale `expectedPolicyVersion` names a version that is no longer attached,
-    // so neither a put nor a delete may act on it.
+    // so neither a put nor a delete may act on it: the put's claim is a
+    // precondition on the replace (409), the delete's names the version it was
+    // asked to remove, which is not there to remove (404).
     let stale = versions[0].clone();
     let current = versions.last().cloned().expect("a version was issued");
     let refused_put = dsql
@@ -743,8 +745,8 @@ async fn the_cluster_policy_round_trips_and_reports_its_absence() {
         .delete_policy(&identifier, &format!("?expected-policy-version={stale}"))
         .await;
     assert_eq!(
-        refused_delete.status, 409,
-        "a delete against a stale version must answer 409, got {} {:?}",
+        refused_delete.status, 404,
+        "a delete against a stale version must answer 404, got {} {:?}",
         refused_delete.status, refused_delete.body
     );
     assert_eq!(

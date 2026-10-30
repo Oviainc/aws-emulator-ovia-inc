@@ -49,6 +49,8 @@ mod incomplete_replay_record;
 mod inline_policy_validation;
 #[path = "all/input_verdict_precedes_the_token_ledger.rs"]
 mod input_verdict_precedes_the_token_ledger;
+#[path = "all/malformed_resource_identifier.rs"]
+mod malformed_resource_identifier;
 #[path = "all/modeled_validation_exception.rs"]
 mod modeled_validation_exception;
 #[path = "all/multi_region_cluster_status.rs"]

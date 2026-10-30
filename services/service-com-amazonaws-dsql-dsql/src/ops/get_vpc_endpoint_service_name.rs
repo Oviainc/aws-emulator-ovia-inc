@@ -149,6 +149,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The FORM of the identifier is decided before any lookup, exactly as
+        // `GetCluster` decides it: a value that is no identifier this service
+        // could have minted names no cluster whose endpoint service could be
+        // reported.
+        if let Err(invalid) = crate::state::validate_cluster_identifier(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+        ) {
+            return Err(
+                GetVpcEndpointServiceNameErrorModeled::ValidationException(invalid).into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetVpcEndpointServiceNameErrorModeled::InternalServerException(

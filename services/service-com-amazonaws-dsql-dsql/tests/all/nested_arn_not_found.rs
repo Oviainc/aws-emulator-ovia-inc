@@ -54,22 +54,23 @@ fn kinesis_target(region: &str) -> Value {
     }})
 }
 
-/// Two never-created stream identifiers, both spelled as `StreamArn`'s pattern
-/// requires (source: `smithy_query(query="shape", shape="StreamArn")` — the stream
-/// segment is `[a-z0-9]{26}`), so no assertion depends on one particular value.
+/// Two never-created stream identifiers, both spelled as a stream identifier is
+/// spelled — the 26-character base32 rendering of a 128-bit value, which
+/// `StreamArn`'s pattern admits (source: `smithy_query(query="shape",
+/// shape="StreamArn")` — the stream segment is `[a-z0-9]{26}`) — so no assertion
+/// depends on one particular value.
 fn absent_stream_identifiers() -> [String; 2] {
     [
         absent_identifier(),
-        "0123456789abcdefghijklmnop".to_string(),
+        "0123456789abcdefghjkmnpqrs".to_string(),
     ]
 }
 
-/// A never-created CLUSTER identifier, spelled as `ClusterArn`'s pattern requires
-/// (source: `smithy_query(query="shape", shape="ClusterArn")` — `[a-z0-9]{26}`), and
-/// distinct from every stream identifier in this suite: a row about a missing cluster
-/// must be able to tell the cluster's identity from the stream's.
+/// A never-created CLUSTER identifier, spelled the same way and distinct from
+/// every stream identifier in this suite: a row about a missing cluster must be
+/// able to tell the cluster's identity from the stream's.
 fn absent_cluster_identifier() -> String {
-    "nevercreatedcluster0000000".to_string()
+    "4zzzzzzzzzzzzzzzzzzzzzzzzz".to_string()
 }
 
 /// The resource identity an answer reports: the two `@required` members of

@@ -86,26 +86,35 @@ fn rows() -> Vec<Row> {
 
 /// What a policy write carrying `claim` must answer under a token of its own,
 /// against `attached` being the version currently attached: a claim about
-/// another version is the handler's own 409, anything else is served.
+/// another version is the handler's own refusal, anything else is served.
 enum OwnAnswer {
     Served,
-    VersionConflict,
+    VersionRefused,
 }
 
 fn own_answer(claim: Option<&str>, attached: &str) -> OwnAnswer {
     match claim {
         None => OwnAnswer::Served,
         Some(claimed) if claimed == attached => OwnAnswer::Served,
-        Some(_) => OwnAnswer::VersionConflict,
+        Some(_) => OwnAnswer::VersionRefused,
     }
 }
 
 /// Assert the handler's OWN refusal of a claim about a version that is not the
-/// attached one: the request-derived sentence, not the token's.
-fn assert_version_conflict(case: &str, answer: &crate::harness::Answer, cluster: &str, claim: &str) {
+/// attached one: the request-derived sentence, not the token's, under the status
+/// the entry point answers it with — 409 for `PutClusterPolicy`, whose claim is a
+/// precondition on the replace, and 404 for `DeleteClusterPolicy`, whose claim
+/// names the version it was asked to remove.
+fn assert_version_refusal(
+    case: &str,
+    answer: &crate::harness::Answer,
+    cluster: &str,
+    claim: &str,
+    expected_status: u16,
+) {
     assert_eq!(
-        answer.status, 409,
-        "case {case:?}: a claim about another version must answer 409, got {} {:?}",
+        answer.status, expected_status,
+        "case {case:?}: a claim about another version must answer {expected_status}, got {} {:?}",
         answer.status, answer.body
     );
     assert_eq!(
@@ -254,9 +263,9 @@ async fn a_put_cluster_policy_token_is_bound_to_whether_a_version_was_claimed() 
                     row.name
                 );
             }
-            OwnAnswer::VersionConflict => {
+            OwnAnswer::VersionRefused => {
                 let claimed = second_claim.as_deref().unwrap_or_default();
-                assert_version_conflict(row.name, &alone, cluster, claimed);
+                assert_version_refusal(row.name, &alone, cluster, claimed, 409);
                 assert_eq!(
                     attached_version(&dsql, cluster).await,
                     Some(issued.clone()),
@@ -365,9 +374,9 @@ async fn a_delete_cluster_policy_token_is_bound_to_whether_a_version_was_claimed
                     row.name
                 );
             }
-            OwnAnswer::VersionConflict => {
+            OwnAnswer::VersionRefused => {
                 let claimed = second_claim.as_deref().unwrap_or_default();
-                assert_version_conflict(row.name, &alone, cluster, claimed);
+                assert_version_refusal(row.name, &alone, cluster, claimed, 404);
                 assert_eq!(
                     attached_version(&dsql, cluster).await,
                     Some(current.clone()),

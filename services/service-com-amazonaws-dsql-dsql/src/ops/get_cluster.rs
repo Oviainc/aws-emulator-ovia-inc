@@ -4,7 +4,9 @@
 //!
 //! Reports the persisted cluster named by the `@httpLabel` `identifier`, or the
 //! modelled `ResourceNotFoundException` (404) when this service holds no such
-//! cluster. `@readonly`: the only write it performs is settling a status change the
+//! cluster. An `identifier` that is no identifier of this service at all is
+//! refused with the modelled `ValidationException` (400) before any lookup.
+//! `@readonly`: the only write it performs is settling a status change the
 //! clock already owed at this instant.
 //!
 //! ## Shape of an operation
@@ -77,6 +79,8 @@
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — The resource could not be found.
+//! * `ValidationException` (HTTP 400) — The input failed to satisfy the constraints
+//!   specified by an AWS service.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -98,11 +102,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // per-operation list the macro checks against does not repeat it.
 #[smithy_macros::operation_error(
     "com.amazonaws.dsql#GetCluster",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum GetClusterErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
     InternalServerException(InternalServerException),
 }
 
@@ -157,6 +162,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The FORM of the identifier is decided before any lookup: a value that is
+        // no identifier this service could have minted names no cluster, so the
+        // answer is the refusal of the request rather than a report that some
+        // cluster is absent.
+        if let Err(invalid) = crate::state::validate_cluster_identifier(
+            crate::state::IDENTIFIER_MEMBER,
+            &input.identifier,
+        ) {
+            return Err(GetClusterErrorModeled::ValidationException(invalid).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetClusterErrorModeled::InternalServerException(
                 InternalServerException {

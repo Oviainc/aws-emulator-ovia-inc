@@ -5,14 +5,17 @@
 //! * RULE A — every refusal of a call whose `expectedPolicyVersion` does not name
 //!   the version currently attached is worded with ONE request-derived sentence,
 //!   naming the version the caller claimed and the cluster it claimed it for,
-//!   whether the refusal is the 409 `ConflictException` (a policy is attached, at
-//!   another version) or the 404 `ResourceNotFoundException` (no policy is attached
-//!   at all), and whether the claim arrives on `PutClusterPolicy`'s body member or
-//!   `DeleteClusterPolicy`'s query parameter. The table spans the FORM of the
-//!   claimed token (a superseded version, a version never issued, a non-numeric
-//!   token, a token past a 64-bit counter) and the state of the cluster (nothing
-//!   attached, several versions deep, a policy since removed); one recorded
-//!   superseded-version case is a single row.
+//!   whether the claim arrives on `PutClusterPolicy`'s body member or
+//!   `DeleteClusterPolicy`'s query parameter. The CLASS of the refusal follows
+//!   what the claim IS: `DeleteClusterPolicy`'s names the policy version the call
+//!   removes, so a version the cluster does not hold is not there to remove (404
+//!   `ResourceNotFoundException`), while `PutClusterPolicy`'s is a precondition on
+//!   a replace, which conflicts with the version actually attached (409
+//!   `ConflictException`) and is a 404 only where no policy is attached at all.
+//!   The table spans the FORM of the claimed token (a superseded version, a
+//!   version never issued, a non-numeric token, a token past a 64-bit counter) and
+//!   the state of the cluster (nothing attached, several versions deep, a policy
+//!   since removed); one recorded superseded-version case is a single row.
 //!
 //! * RULE B — the policy-lockout safety check reads a statement's `Resource` set as
 //!   IAM resource patterns against the ARN of the cluster the policy is being
@@ -96,9 +99,23 @@ struct VersionCase {
     removed: bool,
     /// The version the caller claims, given the versions issued so far.
     claimed: fn(&[String]) -> String,
-    /// The status the class answers with, and the modelled error that carries it.
-    status: u16,
-    error: &'static str,
+}
+
+impl VersionCase {
+    /// Whether the cluster holds a policy at all when the conditional call arrives.
+    fn holds_a_policy(&self) -> bool {
+        self.attached > 0 && !self.removed
+    }
+
+    /// The status and the modelled error `entry` answers this row with, as RULE A
+    /// states them.
+    fn refusal(&self, entry: &str) -> (u16, &'static str) {
+        if entry == "PutClusterPolicy" && self.holds_a_policy() {
+            (409, "ConflictException")
+        } else {
+            (404, "ResourceNotFoundException")
+        }
+    }
 }
 
 fn version_cases() -> Vec<VersionCase> {
@@ -108,72 +125,54 @@ fn version_cases() -> Vec<VersionCase> {
             attached: 2,
             removed: false,
             claimed: |issued| issued[0].clone(),
-            status: 409,
-            error: "ConflictException",
         },
         VersionCase {
             name: "the version before the latest of three",
             attached: 3,
             removed: false,
             claimed: |issued| issued[1].clone(),
-            status: 409,
-            error: "ConflictException",
         },
         VersionCase {
             name: "a version this cluster has never issued",
             attached: 1,
             removed: false,
             claimed: |_| "99".to_string(),
-            status: 409,
-            error: "ConflictException",
         },
         VersionCase {
             name: "a token that is not a number at all",
             attached: 1,
             removed: false,
             claimed: |_| "notaversion".to_string(),
-            status: 409,
-            error: "ConflictException",
         },
         VersionCase {
             name: "a token past what a 64-bit counter reaches",
             attached: 1,
             removed: false,
             claimed: |_| "18446744073709551616".to_string(),
-            status: 409,
-            error: "ConflictException",
         },
         VersionCase {
             name: "zero, which is no version this service issues",
             attached: 1,
             removed: false,
             claimed: |_| "0".to_string(),
-            status: 409,
-            error: "ConflictException",
         },
         VersionCase {
             name: "a claim about a cluster with no policy attached",
             attached: 0,
             removed: false,
             claimed: |_| "1".to_string(),
-            status: 404,
-            error: "ResourceNotFoundException",
         },
         VersionCase {
             name: "a dotted token against a cluster with no policy attached",
             attached: 0,
             removed: false,
             claimed: |_| "v1.0".to_string(),
-            status: 404,
-            error: "ResourceNotFoundException",
         },
         VersionCase {
             name: "a claim about a policy that has since been removed",
             attached: 1,
             removed: true,
             claimed: |issued| issued[0].clone(),
-            status: 404,
-            error: "ResourceNotFoundException",
         },
     ]
 }
@@ -231,17 +230,17 @@ async fn a_claim_about_a_version_the_cluster_does_not_hold_is_worded_from_the_re
                 }
             };
 
+            let (expected_status, expected_error) = case.refusal(entry);
             assert_eq!(
-                answer.status, case.status,
-                "case {:?} on {entry}: expected status {}, got {} {:?}",
-                case.name, case.status, answer.status, answer.body
+                answer.status, expected_status,
+                "case {:?} on {entry}: expected status {expected_status}, got {} {:?}",
+                case.name, answer.status, answer.body
             );
             assert_eq!(
                 answer.error.as_deref(),
-                Some(case.error),
-                "case {:?} on {entry}: expected error {:?}, got {:?}",
+                Some(expected_error),
+                "case {:?} on {entry}: expected error {expected_error:?}, got {:?}",
                 case.name,
-                case.error,
                 answer.error
             );
             assert_eq!(

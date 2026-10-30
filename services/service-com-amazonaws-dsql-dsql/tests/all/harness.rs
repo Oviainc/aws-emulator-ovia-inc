@@ -360,9 +360,15 @@ pub async fn names_a_resource_of_its_own_type(
     }
 }
 
-/// A syntactically valid cluster id for a cluster that was never created.
+/// A well-formed cluster id for a cluster that was never created.
+///
+/// Well-formed means more than `ClusterId`'s `^[a-z0-9]{26}$`: an identifier is
+/// the 26-character base32 rendering of a 128-bit value, so the leading symbol
+/// carries only three bits (`state::is_base32_resource_identifier`). A value
+/// outside that form is refused as input instead of reported as an absent
+/// resource, which is what `tests/all/malformed_resource_identifier.rs` pins.
 pub fn absent_identifier() -> String {
-    "zzzzzzzzzzzzzzzzzzzzzzzzzz".to_string()
+    "0zzzzzzzzzzzzzzzzzzzzzzzzz".to_string()
 }
 
 /// The published bounds of this service's tag shapes, shared by every suite that

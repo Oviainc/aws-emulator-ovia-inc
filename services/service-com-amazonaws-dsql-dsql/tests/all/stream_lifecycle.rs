@@ -565,11 +565,12 @@ async fn a_client_token_reused_with_different_parameters_is_a_conflict() {
 async fn an_unknown_cluster_is_not_found() {
     let dsql = Dsql::new();
     let target = kinesis_target("us-east-1", "changes", "dsql-cdc");
-    // Well-formed `ClusterId`s (^[a-z0-9]{26}$) for clusters that were never created.
+    // Well-formed identifiers — 26-character base32 renderings of a 128-bit
+    // value — for clusters that were never created.
     let absent = [
         absent_identifier(),
         "00000000000000000000000000".to_string(),
-        "abcdefghijklmnopqrstuvwxyz".to_string(),
+        "7zzzzzzzzzzzzzzzzzzzzzzzzz".to_string(),
     ];
 
     for cluster in absent {
