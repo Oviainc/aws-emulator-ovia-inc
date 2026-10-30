@@ -1940,6 +1940,22 @@ fn constraint_refusal(
 ///   has to be a field a RUM event carries, a pattern filtering on `event_details` has to
 ///   filter on `event_type` too, and an array in its pattern carries one value
 ///   ([`custom_metric_refusal`]).
+///
+/// Which DESTINATION the request names is deliberately none of them, which is why this
+/// judge takes the definition alone. The destination scoping of `DimensionKeys` ("Use this
+/// field only if you are sending the metric to CloudWatch") bounds what the dimensions DO,
+/// not whether a definition may declare them: the member a read reports the stored map back
+/// through states the consequence outright — "The value of this field is used only if the
+/// metric destination is `CloudWatch`. If the metric destination is `Evidently`, the value
+/// of `DimensionKeys` is ignored" — which is a stored definition carrying the map under
+/// either destination, and the operation's own documentation has extended metrics, the
+/// metrics those additional dimensions belong to, going "to both Evidently and CloudWatch".
+/// `UnitLabel` is scoped the same way and reported the same way. The `Destination` pairings
+/// this service does refuse are the ones the model PROHIBITS outright — "If `Destination` is
+/// `CloudWatch`, do not use this parameter" for `DestinationArn` and the same sentence for
+/// `IamRoleArn` ([`metric_destination_choice_refusal`], [`metric_destination_role_refusal`])
+/// — so a definition is judged identically whichever destination it is sent to, and a
+/// member whose effect one destination ignores is still stored and reported as it was sent.
 pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option<String> {
     let namespace = definition.namespace.as_deref();
     if let Some(namespace) = namespace {

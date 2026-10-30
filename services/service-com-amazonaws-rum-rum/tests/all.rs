@@ -37,6 +37,8 @@ mod cw_log_delivery;
 mod cw_log_event_copies;
 #[path = "all/deobfuscation_source_maps.rs"]
 mod deobfuscation_source_maps;
+#[path = "all/destination_scoped_definition_members.rs"]
+mod destination_scoped_definition_members;
 #[path = "all/dimension_keys_constraints.rs"]
 mod dimension_keys_constraints;
 #[path = "all/event_instant_round_trip.rs"]
