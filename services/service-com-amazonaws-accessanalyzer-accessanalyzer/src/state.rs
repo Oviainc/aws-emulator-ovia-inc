@@ -195,8 +195,9 @@ pub const ARCHIVE_RULE_QUOTA_EXCEEDED_MESSAGE: &str =
 /// The fixed `message` of the `NotFoundException` that answers an ARN-addressed call
 /// (the tagging surface) naming a resource this account and Region does not hold.
 /// Same provenance as [`ANALYZER_NOT_FOUND_MESSAGE`]: ONE constant text for the refusal,
-/// whatever ARN was asked for.
-pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+/// whatever ARN was asked for — this is the recorded service's own wording for the
+/// refusal, so it is reproduced verbatim rather than paraphrased.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 
 /// The 404 for an analyzer that is not stored: fixed text, identifier in the modelled
 /// `resourceId`/`resourceType` members.

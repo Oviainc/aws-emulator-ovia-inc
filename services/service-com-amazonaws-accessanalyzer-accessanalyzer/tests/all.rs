@@ -51,5 +51,7 @@ mod resource_tags;
 mod response_vocabulary;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_path_not_found_text.rs"]
+mod tag_path_not_found_text;
 #[path = "all/update_analyzer.rs"]
 mod update_analyzer;

@@ -7,10 +7,12 @@
 //! rather than over one recorded request:
 //!
 //! 1. An ARN-addressed TAGGING call (`POST`/`GET`/`DELETE /tags/{resourceArn}`) naming no
-//!    resource this account and Region holds is refused with HTTP 404 and the error code
+//!    resource this account and Region holds is refused with HTTP 404, the error code
 //!    `NotFoundException` — the tagging path's own code, which this model declares for no
-//!    operation — while the analyzer-name-addressed operations keep the modelled
-//!    `ResourceNotFoundException` for the same dead identifier.
+//!    operation — and the service's fixed text for that refusal, while the
+//!    analyzer-name-addressed operations keep the modelled `ResourceNotFoundException`,
+//!    with its own text, for the same dead identifier. The generated-ARN half of this
+//!    rule is `tests/all/tag_path_not_found_text.rs`.
 //! 2. A refusal whose condition is one documented constraint, not one member's value,
 //!    carries the service's FIXED text for that condition: `CheckAccessNotGranted`'s
 //!    at-least-one-of rule on the `access` object,
@@ -55,6 +57,12 @@ const NOT_FOUND_EXCEPTION: &str = "NotFoundException";
 /// cannot resolve with: the modelled 404 of this service.
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
+/// AWS's fixed `NotFoundException` message for an ARN-addressed tagging call naming no
+/// resource this account and Region holds, as the recorded responses carry it. The whole
+/// string is fixed text: it names no ARN, resource, account or Region, so it is the same
+/// for every unresolvable ARN and every tagging operation.
+pub const RESOURCE_WAS_NOT_FOUND: &str = "Resource was not found";
+
 /// The analyzer `Type` values that have no `AnalyzerConfiguration` at all — the external
 /// access analyzers, which is what `CreateAnalyzer`'s `configuration` member documents
 /// ("Specifies the configuration of the analyzer. If the analyzer is an unused access
@@ -63,7 +71,7 @@ const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 const EXTERNAL_ACCESS_TYPES: &[&str] = &["ACCOUNT", "ORGANIZATION"];
 
 /// A `message` member read off a reply, or the empty string when it carries none.
-fn message(reply: &Reply) -> &str {
+pub fn message(reply: &Reply) -> &str {
     reply
         .body
         .get("message")
@@ -84,22 +92,23 @@ async fn create_analyzer(emulator: &Emulator, name: &str) -> String {
 }
 
 /// The three tagging operations, named by what they do, so one table row is asserted on
-/// each of them.
+/// each of them. Shared with `tests/all/tag_path_not_found_text.rs`, which drives the same
+/// three calls over a generated ARN space.
 #[derive(Debug, Clone, Copy)]
-enum TaggingCall {
+pub enum TaggingCall {
     Tag,
     ListTags,
     Untag,
 }
 
-const TAGGING_CALLS: &[TaggingCall] = &[
+pub const TAGGING_CALLS: &[TaggingCall] = &[
     TaggingCall::Tag,
     TaggingCall::ListTags,
     TaggingCall::Untag,
 ];
 
 impl TaggingCall {
-    async fn send(self, emulator: &Emulator, resource_arn: &str) -> Reply {
+    pub async fn send(self, emulator: &Emulator, resource_arn: &str) -> Reply {
         match self {
             TaggingCall::Tag => {
                 emulator
@@ -108,6 +117,15 @@ impl TaggingCall {
             }
             TaggingCall::ListTags => emulator.list_tags_for_resource(resource_arn).await,
             TaggingCall::Untag => emulator.untag_resource(resource_arn, &["probe"]).await,
+        }
+    }
+
+    /// The status this call answers when the ARN DOES resolve: the tag and the removal
+    /// report no content, the listing reports the tag set.
+    pub fn served_status(self) -> u16 {
+        match self {
+            TaggingCall::Tag | TaggingCall::Untag => 204,
+            TaggingCall::ListTags => 200,
         }
     }
 }
@@ -152,7 +170,6 @@ async fn a_tagging_call_on_an_absent_resource_is_a_not_found_exception() {
         ),
     ];
 
-    let mut messages: Vec<String> = Vec::new();
     for (row, resource_arn) in &rows {
         for call in TAGGING_CALLS {
             let case = format!("{call:?} on {row}");
@@ -167,9 +184,14 @@ async fn a_tagging_call_on_an_absent_resource_is_a_not_found_exception() {
                 "case {case:?}: expected the tagging path's code {NOT_FOUND_EXCEPTION:?}, got {:?}",
                 reply.code()
             );
-            assert!(
-                !message(&reply).is_empty(),
-                "case {case:?}: the refusal must carry a message, got {reply:?}"
+            // ONE constant for the refusal, and it is the service's own wording: a client,
+            // fixture or log scraper that matches the text sees the same string whatever
+            // it asked for.
+            assert_eq!(
+                message(&reply),
+                RESOURCE_WAS_NOT_FOUND,
+                "case {case:?}: expected the fixed text {RESOURCE_WAS_NOT_FOUND:?}, got {:?}",
+                message(&reply)
             );
             // The shape carries no structured identifier, so the ARN must not be echoed
             // in the text either.
@@ -178,18 +200,7 @@ async fn a_tagging_call_on_an_absent_resource_is_a_not_found_exception() {
                 "case {case:?}: the message must not echo the ARN, got {:?}",
                 message(&reply)
             );
-            messages.push(message(&reply).to_string());
         }
-    }
-
-    // One constant for the refusal: every row and every operation answered the same text.
-    let first = messages.first().cloned().unwrap_or_default();
-    for (index, text) in messages.iter().enumerate() {
-        assert_eq!(
-            *text, first,
-            "row {index}: every not-found refusal of the tagging path carries one text, \
-             expected {first:?}, got {text:?}"
-        );
     }
 
     // The boundary of the rule: the resource that IS there still tags, and a tagging call
@@ -249,6 +260,15 @@ async fn an_analyzer_name_addressed_call_keeps_the_modelled_not_found_code() {
             "case {case:?}: expected the modelled {RESOURCE_NOT_FOUND_EXCEPTION:?}, got {:?}",
             reply.code()
         );
+        // A different refusal with a different code carries its own constant, so the
+        // tagging path's text must not answer an analyzer-addressed call.
+        assert_ne!(
+            message(&reply),
+            RESOURCE_WAS_NOT_FOUND,
+            "case {case:?}: the tagging path's text must not answer an analyzer-addressed \
+             call, got {:?}",
+            message(&reply)
+        );
     }
 
     // And the tagging call against that same analyzer's ARN answers the other code.
@@ -256,10 +276,11 @@ async fn an_analyzer_name_addressed_call_keeps_the_modelled_not_found_code() {
         .tag_resource(&expected_arn("gone"), &json!({"probe": "post-delete"}))
         .await;
     assert_eq!(
-        (tagged.status, tagged.code()),
-        (404, NOT_FOUND_EXCEPTION),
-        "the tagging path must answer {NOT_FOUND_EXCEPTION:?} for the ARN whose analyzer \
-         lookup answers {RESOURCE_NOT_FOUND_EXCEPTION:?}, got {tagged:?}"
+        (tagged.status, tagged.code(), message(&tagged)),
+        (404, NOT_FOUND_EXCEPTION, RESOURCE_WAS_NOT_FOUND),
+        "the tagging path must answer {NOT_FOUND_EXCEPTION:?} with {RESOURCE_WAS_NOT_FOUND:?} \
+         for the ARN whose analyzer lookup answers {RESOURCE_NOT_FOUND_EXCEPTION:?}, got \
+         {tagged:?}"
     );
 }
 
