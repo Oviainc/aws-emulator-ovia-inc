@@ -65,8 +65,12 @@ fn past_the_settle_span() -> Duration {
 }
 
 /// An app with one branch on it, and the branch's ARN (which every `jobArn` extends).
+///
+/// The app is CONNECTED TO A REPOSITORY, because every case here starts jobs to list:
+/// `StartJob` runs a build of the app's repository, so an app with no repository
+/// provider refuses it (see `start_job_repository_precondition.rs`).
 async fn app_with_branch(emulator: &Emulator, name: &str, branch: &str) -> (String, String) {
-    let app_id = emulator.app_id_of_new_app(name).await;
+    let app_id = emulator.app_id_of_new_repository_app(name).await;
     let created = emulator
         .create_branch(&app_id, &json!({ "branchName": branch }))
         .await;
@@ -365,7 +369,7 @@ async fn list_jobs_reports_only_the_named_branch_of_the_named_app() {
         ("scoped-a", [("main", 3_usize), ("dev", 1)]),
         ("scoped-b", [("main", 2), ("feature-x", 0)]),
     ] {
-        let app_id = emulator.app_id_of_new_app(app_name).await;
+        let app_id = emulator.app_id_of_new_repository_app(app_name).await;
         for (branch, count) in branches {
             let created = emulator
                 .create_branch(&app_id, &json!({ "branchName": branch }))

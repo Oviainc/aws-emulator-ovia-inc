@@ -97,6 +97,24 @@ async fn app_with_branch(emulator: &Emulator, name: &str, branch: &str) -> Strin
     app_id
 }
 
+/// An app with one branch on it, CONNECTED TO A REPOSITORY PROVIDER.
+///
+/// For the case whose second half starts a JOB on that branch: `StartJob` runs a build
+/// of the app's connected repository, so it is served only for an app that has one
+/// (see `start_job_repository_precondition.rs`). Reserving a deployment takes no view
+/// of the app's repository, so the reservations below are the same ones any app gets.
+async fn repository_app_with_branch(emulator: &Emulator, name: &str, branch: &str) -> String {
+    let app_id = emulator.app_id_of_new_repository_app(name).await;
+    let created = emulator
+        .create_branch(&app_id, &json!({ "branchName": branch }))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {name:?}: expected HTTP 200 from CreateBranch, got {created:?}"
+    );
+    app_id
+}
+
 /// The `fileUploadUrls` of a reply, as the map a client reads: the empty map when the
 /// body carries no destination per file.
 fn file_upload_urls(reply: &Reply) -> BTreeMap<String, String> {
@@ -286,7 +304,7 @@ async fn reserves_one_upload_destination_per_thing_to_upload() {
 #[tokio::test]
 async fn a_reserved_job_id_is_spent_and_is_not_a_job() {
     let emulator = Emulator::new();
-    let app_id = app_with_branch(&emulator, "deployment-ids", "main").await;
+    let app_id = repository_app_with_branch(&emulator, "deployment-ids", "main").await;
 
     // Three reservations, differing in what each asked to upload.
     let mut reserved: Vec<String> = Vec::new();

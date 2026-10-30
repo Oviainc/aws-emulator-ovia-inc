@@ -80,6 +80,19 @@ impl Emulator {
         Self { router }
     }
 
+    /// The same emulator, handing back the engine it is mounted on.
+    ///
+    /// For a suite that has to read what NO modelled operation reports — the asset
+    /// paths a deployment published onto a branch — after driving every call that
+    /// produced it over the wire.
+    pub(crate) fn with_state() -> (Self, Arc<engine::InMemoryEngine>) {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        (Self { router }, engine)
+    }
+
     /// The same emulator with the S3 service mounted BESIDE Amplify on the one shared
     /// engine — what the assembled router does — handing back that engine too.
     ///
@@ -212,6 +225,22 @@ impl Emulator {
     /// Create an app and return its minted `appId`.
     pub(crate) async fn app_id_of_new_app(&self, name: &str) -> String {
         let reply = self.create_app(&json!({ "name": name })).await;
+        assert_eq!(reply.status, 200, "CreateApp {name}: {:?}", reply);
+        string_member(&reply.member("app"), "appId")
+    }
+
+    /// Create an app CONNECTED TO A REPOSITORY PROVIDER and return its minted `appId`.
+    ///
+    /// `StartJob` starts a build of the app's connected repository, so it is served
+    /// only for an app that has one: a suite that starts jobs creates its app this way,
+    /// and one that reserves manual deployments uses [`Self::app_id_of_new_app`].
+    pub(crate) async fn app_id_of_new_repository_app(&self, name: &str) -> String {
+        let reply = self
+            .create_app(&json!({
+                "name": name,
+                "repository": format!("https://example.invalid/org/{name}"),
+            }))
+            .await;
         assert_eq!(reply.status, 200, "CreateApp {name}: {:?}", reply);
         string_member(&reply.member("app"), "appId")
     }

@@ -75,6 +75,65 @@ pub fn addressed_port(host: Option<&str>) -> Option<i32> {
     after_host.rsplit_once(':')?.1.parse::<i32>().ok()
 }
 
+/// The host a request ADDRESSED, which is what a plane compares its resource's published
+/// name against: the `Host` header, or the authority of an absolute-form URI for a
+/// request that carries its endpoint there (HTTP/2, or an SDK-built request).
+///
+/// Both are passed in rather than a whole request, because the framework hands
+/// `Service::can_handle` the request's PARTS and the other seams a runtime-API request:
+/// each has these two things and no common type.
+///
+/// `None` when the request names no host at all, which addresses nothing.
+#[must_use]
+pub fn addressed_host(uri: &str, host_header: Option<&str>) -> Option<String> {
+    if let Some(host) = host_header.filter(|host| !host.is_empty()) {
+        return Some(host.to_string());
+    }
+    let after_scheme = uri.split_once("://")?.1;
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    (!authority.is_empty()).then(|| authority.to_string())
+}
+
+/// The endpoint host a request REACHED this emulator on, as a URL the service hands
+/// back has to name: the host the request addressed when it is shaped like one, and the
+/// service's published endpoint for `region` otherwise.
+///
+/// A URL an operation announces — an upload destination, a published document, a site —
+/// has to resolve back to where the caller is already talking, or it names a host this
+/// emulator does not serve. Only a value SHAPED like a host is taken ([`is_host_shaped`]),
+/// so a caller cannot get an arbitrary string of its own into a URL a service reports.
+///
+/// Services still carrying their own copy of this reading, to be MIGRATED onto it (they
+/// predate this function):
+/// `services/service-com-amazonaws-wisdom-wisdomservice/src/state.rs` and
+/// `services/service-com-amazonaws-qconnect-wisdomservice/src/state.rs`. Nothing new
+/// inlines it again — call this module.
+#[must_use]
+pub fn reached_endpoint_host(
+    uri: &str,
+    host_header: Option<&str>,
+    endpoint_prefix: &str,
+    region: &str,
+) -> String {
+    addressed_host(uri, host_header)
+        .filter(|host| is_host_shaped(host))
+        .unwrap_or_else(|| format!("{endpoint_prefix}.{region}.amazonaws.com"))
+}
+
+/// Whether `host` is a non-empty `host[:port]` written with the characters a hostname, an
+/// IP literal and a port carry, and no longer than a DNS name may be.
+#[must_use]
+pub fn is_host_shaped(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'[' | b']')
+        })
+}
+
 /// Whether `host` names some SERVICE: a service's own endpoint, control plane or data
 /// plane. Such a host keeps answering as the service it names, so an addressing that reads
 /// the EMULATOR's own endpoint is read only when it names none.
@@ -116,6 +175,51 @@ mod tests {
             assert_eq!(
                 split, *expected,
                 "case {path:?}: expected {expected:?}, got {split:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_reaches_an_endpoint_host_or_the_published_one() {
+        // The rows span what the reading generalises over: the host a caller addressed,
+        // a loopback endpoint with a port, a host-shaped value on the URI, a value no
+        // host is shaped like, and a request naming no host at all.
+        let published = "amplify.us-east-1.amazonaws.com";
+        let cases: &[(&str, Option<&str>, &str)] = &[
+            ("/apps", Some("amplify.us-east-1.amazonaws.com"), published),
+            ("/apps", Some("127.0.0.1:9297"), "127.0.0.1:9297"),
+            ("https://localhost:9297/apps", None, "localhost:9297"),
+            ("/apps", Some("host with spaces"), published),
+            ("/apps", None, published),
+        ];
+        for (uri, header, expected) in cases {
+            let answered = reached_endpoint_host(uri, *header, "amplify", "us-east-1");
+            assert_eq!(
+                answered, *expected,
+                "case ({uri:?}, {header:?}): expected {expected:?}, got {answered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_addresses_the_host_it_names() {
+        // The rows span where a host can travel: the header, an absolute-form URI with
+        // and without a path or query, an empty header falling back to the URI, and a
+        // request naming no host at all.
+        let cases: &[(&str, Option<&str>, Option<&str>)] = &[
+            ("/apps/d1", Some("main.d1.amplifyapp.com"), Some("main.d1.amplifyapp.com")),
+            ("https://main.d1.amplifyapp.com/index.html", None, Some("main.d1.amplifyapp.com")),
+            ("https://127.0.0.1:9297", None, Some("127.0.0.1:9297")),
+            ("https://host.example/p?q=a://b", None, Some("host.example")),
+            ("https://host.example/p", Some(""), Some("host.example")),
+            ("/apps/d1", None, None),
+        ];
+        for (uri, header, expected) in cases {
+            let answered = addressed_host(uri, *header);
+            assert_eq!(
+                answered.as_deref(),
+                *expected,
+                "case ({uri:?}, {header:?}): expected {expected:?}, got {answered:?}"
             );
         }
     }

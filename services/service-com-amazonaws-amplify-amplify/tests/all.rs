@@ -27,18 +27,26 @@ mod branch_deployments;
 mod branch_duplicate_refusal;
 #[path = "all/branch_job_listing.rs"]
 mod branch_job_listing;
+#[path = "all/branch_job_stopping.rs"]
+mod branch_job_stopping;
 #[path = "all/branch_jobs.rs"]
 mod branch_jobs;
 #[path = "all/branch_revision_echo.rs"]
 mod branch_revision_echo;
+#[path = "all/deployment_upload_plane.rs"]
+mod deployment_upload_plane;
 #[path = "all/domain_association_certificate_lifecycle.rs"]
 mod domain_association_certificate_lifecycle;
 #[path = "all/domain_associations.rs"]
 mod domain_associations;
+#[path = "all/hosted_branch_site.rs"]
+mod hosted_branch_site;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/s3_sourced_deployments.rs"]
 mod s3_sourced_deployments;
+#[path = "all/start_job_repository_precondition.rs"]
+mod start_job_repository_precondition;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/webhook_lifecycle.rs"]

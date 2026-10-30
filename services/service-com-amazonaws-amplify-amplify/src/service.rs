@@ -39,10 +39,56 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The deployment-upload plane
+//!
+//! `CreateDeployment` hands out upload destinations, and a URL is a promise that it can
+//! be FOLLOWED: the documented manual-deployment contract is that the caller uploads
+//! the site to the URL that call returned and then calls `StartDeployment` with the
+//! `jobId` it returned. The destinations it mints
+//! (`crate::state::deployment_upload_url`) therefore address the endpoint the reserving
+//! caller reached, under the reservation's own path
+//! (`/apps/<appId>/deployments/<jobId>/uploads/<token>`) — a path the model binds no
+//! operation to, so it reaches this file twice:
+//!
+//! - [`Service::can_handle`] also claims a request to an upload path naming a
+//!   reservation THIS store holds, so following the URL routes back here even when
+//!   nothing else in the request names a service (an upload URL is followed WITHOUT a
+//!   signature, as a presigned URL is, and a loopback endpoint host names no service at
+//!   all).
+//! - [`Service::override_routing_error`] serves it: that seam is reached BEFORE
+//!   authentication precisely for requests that name no modelled operation, which is
+//!   what makes an unsigned `PUT` to a minted URL work.
+//!
+//! The plane writes ONLY the one upload the URL names — the bytes, bounded per
+//! reservation by `crate::ops::start_deployment::MAX_ARCHIVE_BYTES` and across the whole
+//! store by `crate::state::MAX_STORED_DEPLOYMENT_BYTES` — onto the reservation, which is
+//! where `StartDeployment` reads what a reserved deployment deploys. It refuses a write
+//! whose reservation's window has closed (the 8 hours between `CreateDeployment` and
+//! `StartDeployment` that `crate::state::DEPLOYMENT_WINDOW_MILLIS` carries). Nothing else
+//! about the service is reachable through it.
+//!
+//! ## The hosting edge
+//!
+//! A deployed branch is VISITED, at the default domain the control plane reports for it:
+//! `Branch$displayName` "is used as the default domain prefix" and `App$defaultDomain`
+//! is "the default domain for the Amplify app", so the site of a branch answers at
+//! `<displayName>.<defaultDomain>`. The first label of such a host names a branch rather
+//! than a service, so the framework resolves no service from it and nothing would claim
+//! the request — which is why [`Service::can_handle`] claims a request whose HOST names
+//! a branch THIS store holds, and [`Service::override_routing_error`] answers it with
+//! the files that branch's latest successful deployment published
+//! (`crate::state::AmplifyBranch::site`).
+//!
+//! The edge READS: a request for a path the site carries is answered with those bytes
+//! and that file's own media type, a request for the root (or for a directory) with the
+//! site's root document, and anything else with a 404. The only state it touches is the
+//! settling the clock already owes the branch (`crate::state::AmplifyBranch::settle`),
+//! which publishes the site of a deployment whose job the clock has finished.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_types::body::SdkBody;
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-amplify-amplify` emulated service: the generated [`ServiceDefinition`] plus
@@ -52,6 +98,13 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the deployment-upload plane and the hosting edge are served
+    /// from [`Service::can_handle`] and [`Service::override_routing_error`], neither of
+    /// which is an operation with a `self.engine` of its own; both must read the one
+    /// store `CreateDeployment` and `StartDeployment` wrote to, not a second copy.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,8 +113,163 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
+    }
+
+    /// Whether this request FOLLOWS an upload URL this service handed out: its path is
+    /// one the upload plane publishes and it names a reservation THIS store holds.
+    ///
+    /// The token in the path is the receipt: it was minted by this store, is
+    /// unguessable, and stops being usable when the reservation's window closes. An
+    /// upload URL this emulator never handed out is claimed by nobody and gets the
+    /// router's own unknown-endpoint refusal, which is what a destination that does not
+    /// exist should answer.
+    fn holds_deployment_upload(&self, target: &crate::state::DeploymentUploadTarget) -> bool {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return false;
+        };
+        let store = state.lock();
+        store.holds_deployment_upload(target)
+    }
+
+    /// Serve one request to a published deployment-upload URL.
+    ///
+    /// A `PUT` writes the bytes into the one upload the URL names — the only thing this
+    /// plane can touch — and is refused when the reservation's window has already
+    /// closed or when the body is larger than this emulator reads from one deployment.
+    fn serve_deployment_upload(
+        &self,
+        req: &RtRequest,
+        target: &crate::state::DeploymentUploadTarget,
+    ) -> RtResponse {
+        if req.method() != "PUT" {
+            return plane_error(
+                405,
+                "MethodNotAllowed",
+                "This upload destination is written by a single PUT",
+            );
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return plane_error(
+                500,
+                "InternalFailureException",
+                "the Amplify deployment-upload store is unavailable",
+            );
+        };
+        // The body is what this plane STORES, so a request whose body this process
+        // cannot read is refused rather than stored as an empty upload: answering 200 to
+        // a write that kept nothing would tell the caller its site had landed and leave
+        // `StartDeployment` to fail the job for an upload that never arrived.
+        let Some(body) = req.body().bytes() else {
+            return plane_error(400, "IncompleteBody", UPLOAD_UNREADABLE_MESSAGE);
+        };
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        // What the whole store already holds, apart from the slot this write replaces:
+        // the per-reservation clamp below bounds ONE deployment, and this bounds the
+        // TOTAL kept in this process, so no number of reservations, branches or apps
+        // grows it without limit.
+        let stored = store.retained_deployment_bytes_apart_from_upload(&target.token);
+        let Some(reservation) = store.reservation_of_upload_mut(target) else {
+            return plane_error(404, "NoSuchKey", UPLOAD_NOT_FOUND_MESSAGE);
+        };
+        // The reservation's window closes [`crate::state::DEPLOYMENT_WINDOW_MILLIS`]
+        // after it was created whether or not anybody called, so a write after it is
+        // refused: the deployment it would feed can no longer be started.
+        if reservation.has_expired(now) {
+            return plane_error(403, "AccessDenied", UPLOAD_EXPIRED_MESSAGE);
+        }
+        // What ONE reservation may hold is bounded as a whole — by the bytes
+        // `StartDeployment` reads from one deployment — because the content is caller
+        // content kept in this process and how many files a reservation names is the
+        // caller's own choice. Both bounds are applied BEFORE the body is kept.
+        let held = reservation.uploaded_bytes_apart_from(&target.token);
+        if held.saturating_add(body.len()) > crate::ops::start_deployment::MAX_ARCHIVE_BYTES {
+            return plane_error(413, "EntityTooLarge", UPLOAD_TOO_LARGE_MESSAGE);
+        }
+        if stored.saturating_add(body.len()) > crate::state::MAX_STORED_DEPLOYMENT_BYTES {
+            return plane_error(
+                413,
+                "EntityTooLarge",
+                crate::state::STORED_DEPLOYMENT_BYTES_EXCEEDED,
+            );
+        }
+        let Some(upload) = reservation.upload_mut(&target.token) else {
+            // Unreachable: the lookup above found the reservation by this same token
+            // while this lock is held.
+            return plane_error(404, "NoSuchKey", UPLOAD_NOT_FOUND_MESSAGE);
+        };
+        // A destination is written by ONE caller and may be re-written until the
+        // deployment is started, exactly as an object store's key is: the last write is
+        // what the deployment deploys.
+        upload.content = Some(body.to_vec());
+
+        let mut resp = RtResponse::new(
+            StatusCode::try_from(200u16).expect("200 is a valid status"),
+            SdkBody::empty(),
+        );
+        resp.headers_mut().insert("content-length", "0");
+        resp
+    }
+
+    /// Whether this request is addressed to a BRANCH's default domain — the hosting edge
+    /// of a branch this store holds — rather than to this service's endpoint.
+    fn hosts_a_branch(&self, host: &str) -> bool {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return false;
+        };
+        let store = state.lock();
+        store.hosts_a_branch(host)
+    }
+
+    /// Serve one request to a branch's hosting edge from what that branch's latest
+    /// successful deployment published.
+    ///
+    /// A `GET` (or a `HEAD`, which is the same answer without the body) is answered with
+    /// the file the path names, the site's root document for the root or a directory,
+    /// and a 404 for a path the deployment did not publish — including every path of a
+    /// branch nothing has been deployed to yet. Any other method is refused: a hosting
+    /// edge serves a site, it does not take writes.
+    fn serve_hosted_site(&self, req: &RtRequest, host: &str) -> RtResponse {
+        let method = req.method();
+        if method != "GET" && method != "HEAD" {
+            return plane_error(405, "MethodNotAllowed", SITE_METHOD_MESSAGE);
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return plane_error(500, "InternalFailureException", SITE_STORE_MESSAGE);
+        };
+        let path = ::service_common::request_path(req.uri()).to_string();
+        let mut store = state.lock();
+        let Some(branch) = store.hosted_branch_mut(host) else {
+            return plane_error(404, "NotFound", SITE_NOT_FOUND_MESSAGE);
+        };
+        // What the clock already owes this branch — its jobs' status changes, and the
+        // site a finished deployment publishes — is materialised before the answer, so a
+        // visitor sees the deployment that has finished rather than the one before it.
+        branch.settle();
+        let served = crate::state::hosted_site_key(&path)
+            .and_then(|key| branch.site.get(&key).map(|file| (key, file.clone())));
+        let Some((key, content)) = served else {
+            return plane_error(404, "NotFound", SITE_NOT_FOUND_MESSAGE);
+        };
+        let length = content.len();
+        let mut resp = RtResponse::new(
+            StatusCode::try_from(200u16).expect("200 is a valid status"),
+            // A HEAD is the same answer as the GET without the body, so the length it
+            // reports is the file's.
+            if method == "HEAD" {
+                SdkBody::empty()
+            } else {
+                SdkBody::from(content)
+            },
+        );
+        resp.headers_mut()
+            .insert("content-type", crate::state::hosted_file_media_type(&key));
+        resp.headers_mut()
+            .insert("content-length", length.to_string());
+        resp
     }
 }
 
@@ -74,6 +282,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
+        // A request addressed to a BRANCH's default domain is this service's, because
+        // that is the host the control plane told the caller its site is at: the host's
+        // first label names a branch, so the framework resolves no service from it and
+        // nothing else would claim the request. The host a request addressed is read by
+        // the workspace's one reader of data-plane addressing. See
+        // [`Self::hosts_a_branch`].
+        if let Some(host) = ::service_common::data_plane_addressing::addressed_host(
+            &parts.uri.to_string(),
+            parts
+                .headers
+                .get(::http::header::HOST)
+                .and_then(|value| value.to_str().ok()),
+        ) {
+            if self.hosts_a_branch(&host) {
+                return true;
+            }
+        }
+        // A request that FOLLOWS an upload destination this service handed out is
+        // claimed by the store that minted it, whatever else the request carries: it
+        // has no signature and its endpoint host may name no service at all, so the
+        // route key cannot route it. The upload path binds no modelled operation, so
+        // nothing modelled is diverted here. See [`Self::holds_deployment_upload`].
+        if let Some(target) = crate::state::parse_deployment_upload_path(parts.uri.path()) {
+            return self.holds_deployment_upload(&target);
+        }
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
@@ -117,10 +350,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // A request to an upload destination this service handed out is exactly that
+        // case by construction — the model binds no operation to the upload path — so
+        // this is where `CreateDeployment`'s destinations are served, and a request to a
+        // branch's default domain the same way: the site's paths are the DEPLOYMENT's,
+        // and the model binds no operation to any of them. Anything else keeps the
+        // framework's default.
+        let uri = req.uri().to_string();
+        if let Some(host) = ::service_common::data_plane_addressing::addressed_host(
+            &uri,
+            req.headers().get("host"),
+        ) {
+            if self.hosts_a_branch(&host) {
+                return Some(self.serve_hosted_site(req, &host));
+            }
+        }
+        let target =
+            crate::state::parse_deployment_upload_path(::service_common::request_path(req.uri()))?;
+        Some(self.serve_deployment_upload(req, &target))
     }
 
     fn override_framework_error(
@@ -136,4 +385,49 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// The body of an upload-plane refusal that found no upload: one sentence carrying
+/// nothing from the request, so a caller cannot probe for deployments it was not handed
+/// a destination for.
+const UPLOAD_NOT_FOUND_MESSAGE: &str = "The requested upload destination does not exist";
+
+/// The body of an upload-plane refusal of a write whose reservation's window has closed.
+const UPLOAD_EXPIRED_MESSAGE: &str = "Request has expired";
+
+/// The body of an upload-plane refusal of a body larger than this emulator reads from
+/// one deployment (`crate::ops::start_deployment::MAX_ARCHIVE_BYTES`).
+const UPLOAD_TOO_LARGE_MESSAGE: &str = "The upload is larger than this endpoint accepts";
+
+/// The body of an upload-plane refusal of a request whose body this process cannot read
+/// as bytes, and so cannot store.
+const UPLOAD_UNREADABLE_MESSAGE: &str = "The upload's body could not be read";
+
+/// The body of a hosting-edge answer for a path the branch's deployment did not publish.
+const SITE_NOT_FOUND_MESSAGE: &str = "The requested file was not found";
+
+/// The body of a hosting-edge refusal of a method other than the read of a file.
+const SITE_METHOD_MESSAGE: &str = "This site is read by GET or HEAD";
+
+/// The body of a hosting-edge answer when this service's store is unreachable.
+const SITE_STORE_MESSAGE: &str = "the Amplify hosting store is unavailable";
+
+/// One answer of a plane this service serves outside the model — the deployment-upload
+/// destinations and the hosting edge: the status, the code in `x-amzn-errortype`, and a
+/// JSON body carrying the reason.
+///
+/// Those planes are plain HTTPS rather than modelled operations, so they answer in this
+/// one small envelope instead of the service's restJson1 one. The message is built from
+/// constants, never from the request: a visitor of a site is told that the file is not
+/// there, not what else the branch holds.
+fn plane_error(status: u16, code: &str, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({ "message": message, "code": code }).to_string();
+    let mut resp = RtResponse::new(
+        StatusCode::try_from(status).expect("the status is a constant of this module"),
+        SdkBody::from(body),
+    );
+    resp.headers_mut().insert("content-type", "application/json");
+    resp.headers_mut()
+        .insert("x-amzn-errortype", code.to_string());
+    resp
 }

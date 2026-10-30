@@ -69,8 +69,12 @@ fn past_the_settle_span() -> Duration {
 }
 
 /// An app with one branch, and the branch's ARN (which every `jobArn` extends).
+///
+/// The app is CONNECTED TO A REPOSITORY, because every case here starts a job: a build
+/// of the app's repository is what `StartJob` runs, so an app with no repository
+/// provider refuses it (see `start_job_repository_precondition.rs`).
 async fn app_with_branch(emulator: &Emulator, name: &str, branch: &str) -> (String, String) {
-    let app_id = emulator.app_id_of_new_app(name).await;
+    let app_id = emulator.app_id_of_new_repository_app(name).await;
     let created = emulator
         .create_branch(&app_id, &json!({ "branchName": branch }))
         .await;
@@ -318,7 +322,7 @@ async fn start_job_records_the_job_and_get_job_answers_the_record() {
 #[tokio::test]
 async fn job_ids_are_counted_per_branch_and_the_branch_reports_its_jobs() {
     let emulator = Emulator::new();
-    let app_id = emulator.app_id_of_new_app("counting-app").await;
+    let app_id = emulator.app_id_of_new_repository_app("counting-app").await;
 
     // Two branches of the SAME app: each counts its own jobs from 1, and starting a
     // job on one may not disturb the other.

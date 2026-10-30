@@ -221,6 +221,19 @@ impl Deployments {
             .await
     }
 
+    /// One request FOLLOWING an upload destination `CreateDeployment` handed back,
+    /// exactly as a client follows it: the method and URL the service published, and NO
+    /// credential of any kind. Answers the HTTP status.
+    async fn upload(&self, method: &str, url: &str, body: &[u8]) -> u16 {
+        let request = http::Request::builder()
+            .method(method)
+            .uri(url)
+            .header("content-type", "application/zip")
+            .body(bytes::Bytes::copy_from_slice(body))
+            .expect("an upload destination is a well-formed URL");
+        self.emulator.dispatch(request).await.status().as_u16()
+    }
+
     /// The asset paths one job published, as this service persists them — the content the
     /// deployment put on the branch, which no modelled read reports.
     fn deployed_assets(&self, app_id: &str, branch: &str, job_id: &str) -> BTreeSet<String> {
@@ -749,11 +762,14 @@ async fn a_reserved_deployment_is_started_from_its_uploads() {
                 )],
             };
             for (url, body) in destinations {
-                let (bucket, key) = split_destination(&url);
-                // The destination's bucket is the deployment bucket of this region; it is
-                // created here because nothing has uploaded to it yet.
-                let _ = deployments.s3("PUT", &format!("/{bucket}"), &[]).await;
-                deployments.put_object(&bucket, &key, &body).await;
+                // Followed exactly as a client follows it: the destination the
+                // reservation published accepts the upload itself.
+                let status = deployments.upload("PUT", &url, &body).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the destination {url:?} must accept the upload, \
+                     got {status}"
+                );
             }
         }
 
@@ -805,23 +821,6 @@ async fn a_reserved_deployment_is_started_from_its_uploads() {
             "case {case:?}: expected the deployment to publish {expected:?}, got {published:?}"
         );
     }
-}
-
-/// The bucket and key one upload destination addresses: `CreateDeployment` mints it as a
-/// virtual-hosted Amazon S3 URL, and this suite uploads path-style through the one
-/// regional front door the emulator serves.
-fn split_destination(url: &str) -> (String, String) {
-    let rest = url
-        .strip_prefix("https://")
-        .unwrap_or_else(|| panic!("an upload destination is an https URL, got {url:?}"));
-    let (host, key) = rest
-        .split_once('/')
-        .unwrap_or_else(|| panic!("an upload destination names a key, got {url:?}"));
-    let bucket = host
-        .split_once(".s3.")
-        .unwrap_or_else(|| panic!("an upload destination names a bucket, got {url:?}"))
-        .0;
-    (bucket.to_string(), key.to_string())
 }
 
 /// Rule 5: a request that names nothing to deploy, or an entity that does not exist, is

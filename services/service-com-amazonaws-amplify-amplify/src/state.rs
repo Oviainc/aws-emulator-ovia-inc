@@ -115,6 +115,31 @@ pub struct AmplifyBranch {
     /// of that sequence without starting anything, and a job exists only once a
     /// start call creates it.
     pub started_jobs: u64,
+    /// The files this branch's hosting edge serves now, keyed by the path each is
+    /// served at under the site root — what the branch's LATEST deployment to have
+    /// succeeded published, and empty for a branch nothing has deployed to yet.
+    ///
+    /// Held on the BRANCH, not on the job that deployed it, because this is the live
+    /// site: one branch serves one set of files whatever its job history holds, and a
+    /// later successful deployment REPLACES it (see [`Self::stage_site`]).
+    pub site: BTreeMap<String, Vec<u8>>,
+    /// The deployment that has been started and whose job the clock has not settled
+    /// yet, with the files it publishes when it succeeds.
+    ///
+    /// A deployment's content goes live when its JOB reaches its terminal status, not
+    /// when the call that started it answers, so the files wait here until the clock
+    /// has settled that job — which [`Self::settle`] materialises.
+    pub staged_site: Option<StagedSite>,
+}
+
+/// The files one started deployment publishes, and the job whose settling publishes
+/// them.
+#[derive(Debug, Clone)]
+pub struct StagedSite {
+    /// The `jobId` of the deployment that will publish these files.
+    pub job_id: String,
+    /// The files it publishes, keyed by the path each is served at.
+    pub files: BTreeMap<String, Vec<u8>>,
 }
 
 impl AmplifyBranch {
@@ -126,6 +151,56 @@ impl AmplifyBranch {
             jobs: BTreeMap::new(),
             next_job_seq: 0,
             started_jobs: 0,
+            site: BTreeMap::new(),
+            staged_site: None,
+        }
+    }
+
+    /// Record the files the deployment running under `job_id` publishes WHEN that job
+    /// succeeds.
+    ///
+    /// Only one deployment of a branch can be waiting to go live: a deployment started
+    /// while another is still settling replaces it, exactly as it replaces it as the
+    /// branch's active job.
+    pub fn stage_site(&mut self, job_id: &str, files: BTreeMap<String, Vec<u8>>) {
+        self.staged_site = Some(StagedSite {
+            job_id: job_id.to_string(),
+            files,
+        });
+    }
+
+    /// Materialise everything the clock has ALREADY made due on this branch: every
+    /// job's own status change, and the site a started deployment publishes once its
+    /// job has settled.
+    ///
+    /// Both are owed at an instant that passes whether or not anybody calls, so any
+    /// operation that reports on this branch applies them before answering. Before that
+    /// instant this is a no-op, so a caller that reads straight after a start call still
+    /// observes the non-terminal job AND the site as it was.
+    ///
+    /// A staged deployment whose job FAILED publishes nothing: a deployment that could
+    /// not be carried out does not take the live site down with it.
+    pub fn settle(&mut self) {
+        for job in self.jobs.values_mut() {
+            job.settle();
+        }
+        let Some(staged) = self.staged_site.as_ref() else {
+            return;
+        };
+        // A job the branch no longer holds — retired out of its bounded history, or
+        // deleted — settles nothing: there is no status left to read, so the staged
+        // files are dropped rather than published on no evidence.
+        let Some(job) = self.jobs.get(&staged.job_id) else {
+            self.staged_site = None;
+            return;
+        };
+        if job.settles_at.is_some() {
+            return;
+        }
+        let succeeded = job.job.summary.status == JOB_STATUS_SUCCEED;
+        let staged = self.staged_site.take();
+        if let (true, Some(staged)) = (succeeded, staged) {
+            self.site = staged.files;
         }
     }
 
@@ -191,6 +266,30 @@ impl AmplifyBranch {
         let now = now_millis();
         self.deployments
             .retain(|_, pending| now < pending.expires_at);
+    }
+
+    /// How many bytes of DEPLOYMENT CONTENT this branch retains: what has been uploaded
+    /// to its live reservations, plus the files of the site it serves and of the
+    /// deployment waiting to replace it.
+    ///
+    /// All of it is caller content held in this process, which is why the store counts
+    /// it (see [`MAX_STORED_DEPLOYMENT_BYTES`]). `token` is the one upload NOT counted —
+    /// the slot a write is about to replace — and is the empty string for a caller that
+    /// is replacing none.
+    pub fn retained_bytes_apart_from_upload(&self, token: &str) -> usize {
+        let reserved = self
+            .deployments
+            .values()
+            .map(|pending| pending.uploaded_bytes_apart_from(token));
+        let published = self.site.values().map(Vec::len);
+        let staged = self
+            .staged_site
+            .iter()
+            .flat_map(|staged| staged.files.values().map(Vec::len));
+        reserved
+            .chain(published)
+            .chain(staged)
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Retire old jobs until this branch can hold one more, and report whether it can.
@@ -267,9 +366,9 @@ pub struct PendingDeployment {
     /// The files the reservation named, keyed by file name: empty when the caller
     /// reserved a single upload of the whole zipped deployment.
     pub files: BTreeMap<String, DeploymentFile>,
-    /// Where the zipped deployment is uploaded, or the empty string when the
-    /// reservation named its files individually and so has no single zip upload.
-    pub zip_upload_url: String,
+    /// The single upload of the zipped deployment, or `None` when the reservation
+    /// named its files individually and so has no zip upload.
+    pub zip: Option<DeploymentUpload>,
     /// Epoch milliseconds at which this reservation was created.
     pub created_at: i64,
     /// Epoch milliseconds past which this reservation can no longer be started:
@@ -277,16 +376,163 @@ pub struct PendingDeployment {
     pub expires_at: i64,
 }
 
+impl PendingDeployment {
+    /// The value `CreateDeployment` reports as `zipUploadUrl`: the destination of the
+    /// zipped deployment, or the empty string for a reservation that has none.
+    ///
+    /// `zipUploadUrl` is returned "when the fileMap argument is not provided in the
+    /// request", and the member is @required with a `length` minimum of 0
+    /// (`smithy_query(query="shape",shape="UploadUrl")`), so the empty value is how
+    /// "not returned" is expressed on the wire.
+    pub fn zip_upload_url(&self) -> String {
+        self.zip
+            .as_ref()
+            .map(|zip| zip.url.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `token` authorises one of this reservation's uploads.
+    pub fn holds_upload(&self, token: &str) -> bool {
+        self.zip.as_ref().is_some_and(|zip| zip.token == token)
+            || self
+                .files
+                .values()
+                .any(|file| file.upload.token == token)
+    }
+
+    /// The upload `token` authorises, to WRITE: the zipped deployment's, or the one
+    /// minted for a file this reservation named.
+    pub fn upload_mut(&mut self, token: &str) -> Option<&mut DeploymentUpload> {
+        if self.zip.as_ref().is_some_and(|zip| zip.token == token) {
+            return self.zip.as_mut();
+        }
+        self.files
+            .values_mut()
+            .map(|file| &mut file.upload)
+            .find(|upload| upload.token == token)
+    }
+
+    /// How many bytes this reservation already holds, NOT counting the upload `token`
+    /// names — which is what a write to that one upload would replace.
+    ///
+    /// A reservation's content is caller content held in this process, and how many
+    /// files a reservation names is the caller's own choice, so what a reservation may
+    /// hold is bounded as a WHOLE rather than only per upload.
+    pub fn uploaded_bytes_apart_from(&self, token: &str) -> usize {
+        let zip = self
+            .zip
+            .iter()
+            .filter(|zip| zip.token != token)
+            .filter_map(|zip| zip.content.as_ref().map(Vec::len));
+        let files = self
+            .files
+            .values()
+            .filter(|file| file.upload.token != token)
+            .filter_map(|file| file.upload.content.as_ref().map(Vec::len));
+        zip.chain(files).fold(0usize, usize::saturating_add)
+    }
+
+    /// Whether the clock has already closed this reservation's window — the 8 hours
+    /// [`DEPLOYMENT_WINDOW_MILLIS`] carries — at `now`.
+    pub fn has_expired(&self, now: i64) -> bool {
+        now >= self.expires_at
+    }
+}
+
 /// One file of a [`PendingDeployment`]: the content hash its caller declared for it,
-/// and the upload destination minted for that one file.
+/// and the upload minted for that one file.
 #[derive(Debug, Clone)]
 pub struct DeploymentFile {
     /// The hash of the file's content, as the reservation's caller declared it
     /// (`FileMap` is modelled file name -> `MD5Hash`,
     /// `smithy_query(query="shape",shape="FileMap")`).
     pub content_md5: String,
-    /// Where this one file's content is uploaded.
-    pub upload_url: String,
+    /// Where this one file's content is uploaded, and the content that arrived there.
+    pub upload: DeploymentUpload,
+}
+
+/// ONE upload of a reserved deployment: the destination the reservation handed its
+/// caller, the token that authorises writing to it, and the bytes that were written.
+///
+/// The content lives HERE because the destination is served by this emulator (see
+/// [`deployment_upload_path`]): what a deployment deploys is what was actually
+/// uploaded to the destinations its reservation handed out, so the bytes have to
+/// outlive the request that wrote them and be readable by the later call that starts
+/// the deployment.
+#[derive(Debug, Clone)]
+pub struct DeploymentUpload {
+    /// The opaque token that authorises this one upload ([`ComAmazonawsAmplifyAmplifyState::mint_upload_token`]).
+    pub token: String,
+    /// The URL the reservation handed its caller for this upload.
+    pub url: String,
+    /// The bytes uploaded to it, or `None` while nothing has been uploaded.
+    pub content: Option<Vec<u8>>,
+}
+
+/// What a request to a deployment-upload URL names: the app it was reserved under, the
+/// reservation's `jobId`, and the token authorising that one upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentUploadTarget {
+    pub app_id: String,
+    pub job_id: String,
+    pub token: String,
+}
+
+/// The path the deployment-upload plane serves ONE upload of a reservation under.
+///
+/// It sits under the app the deployment was reserved on — the same `/apps` space the
+/// modelled routes use — and names no modelled operation: a deployment is reserved at
+/// `POST /apps/{appId}/branches/{branchName}/deployments` and started at
+/// `/apps/{appId}/branches/{branchName}/deployments/start`
+/// (`smithy_query(query="operation",operation="CreateDeployment,StartDeployment")`),
+/// neither of which this path shape can collide with. That is what lets the service
+/// serve it from its routing-error seam.
+///
+/// The BRANCH is not part of the path: a branch name is free text
+/// (`BranchName` `pattern ^(?s).+$`), which would have to be escaped into a path
+/// segment, and the `jobId` and the token already locate the one reservation this
+/// upload belongs to.
+pub fn deployment_upload_path(app_id: &str, job_id: &str, token: &str) -> String {
+    format!("/apps/{app_id}/deployments/{job_id}/uploads/{token}")
+}
+
+/// The upload a request path names, or `None` when the path is not one this service
+/// publishes.
+pub fn parse_deployment_upload_path(path: &str) -> Option<DeploymentUploadTarget> {
+    let rest = path.strip_prefix("/apps/")?;
+    let mut segments = rest.split('/');
+    let (Some(app_id), Some("deployments"), Some(job_id), Some("uploads"), Some(token), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    if app_id.is_empty() || job_id.is_empty() || token.is_empty() {
+        return None;
+    }
+    Some(DeploymentUploadTarget {
+        app_id: app_id.to_string(),
+        job_id: job_id.to_string(),
+        token: token.to_string(),
+    })
+}
+
+/// The URL one upload of a reserved deployment is written to: the endpoint the caller
+/// reached, plus that upload's own path.
+///
+/// NO SigV4 signature is attached — this emulator does not sign URLs, and a fabricated
+/// signature would claim a computation nothing performed. The token in the path is the
+/// receipt that authorises the write: it is minted per upload, unguessable, and stops
+/// being usable when the reservation's window closes.
+pub fn deployment_upload_url(host: &str, app_id: &str, job_id: &str, token: &str) -> String {
+    format!(
+        "https://{host}{}",
+        deployment_upload_path(app_id, job_id, token)
+    )
 }
 
 /// How long a reserved deployment may wait to be started.
@@ -307,6 +553,31 @@ pub const DEPLOYMENT_WINDOW_MILLIS: i64 = 8 * 60 * 60 * 1_000;
 /// [`MAX_JOBS_PER_BRANCH`], because every reservation that IS started becomes one job
 /// of that branch's equally bounded history.
 pub const MAX_PENDING_DEPLOYMENTS_PER_BRANCH: usize = MAX_JOBS_PER_BRANCH;
+
+/// How many bytes of DEPLOYMENT CONTENT this service's store retains AT ONCE, across
+/// every reservation's uploads and every branch's published and staged site.
+///
+/// CHOSEN, not a published quota: the content is caller content kept in this process,
+/// and the per-deployment clamps
+/// ([`crate::ops::start_deployment::MAX_ARCHIVE_BYTES`]) bound ONE item while the number
+/// of reservations, branches and apps a caller may create bounds nothing — so without
+/// this ceiling the total the process holds would grow with the number of items. It is
+/// twice that per-deployment bound: enough for one deployment's content being uploaded
+/// beside one published site of the same size, which is the most a single branch needs
+/// to go from one site to the next, and it is the order the sibling in-memory payload
+/// stores in this workspace use.
+///
+/// Reaching it refuses the WRITE that would pass it — the upload plane's 413, and a
+/// deployment that fails rather than retaining its files — so nothing already published
+/// is dropped out from under a visitor. Content is released when a reservation is
+/// started (its uploads are spent), when a later deployment replaces a branch's site,
+/// and when the branch or the app holding it is deleted.
+pub const MAX_STORED_DEPLOYMENT_BYTES: usize = 2 * crate::ops::start_deployment::MAX_ARCHIVE_BYTES;
+
+/// What the upload plane and a starting deployment are refused with when the write
+/// would take this store past [`MAX_STORED_DEPLOYMENT_BYTES`].
+pub const STORED_DEPLOYMENT_BYTES_EXCEEDED: &str =
+    "The deployment content this endpoint holds is at its limit";
 
 /// One job as this service persists it: the modelled [`Job`] record, the instant at
 /// which the clock owes that job its next status change, and what that change is.
@@ -402,6 +673,23 @@ impl BranchJob {
             context: None,
         }];
     }
+
+    /// Stop this job: it leaves the status it is in for [`JOB_STATUS_CANCELLING`] now,
+    /// and the clock settles it to [`JOB_STATUS_CANCELLED`].
+    ///
+    /// Stopping is ASYNCHRONOUS exactly as starting is — "stops a job that is in
+    /// progress" names work that is already running — so the status a caller is answered
+    /// is the non-terminal one and the terminal status is owed
+    /// [`JOB_SETTLE_MILLIS`] later. The step the job is cancelled IN is the one its
+    /// recorded conclusion names, because that is the phase the job was stopped in; only
+    /// the status and the reason are the cancellation's.
+    pub fn cancel(&mut self) {
+        self.job.summary.status = JOB_STATUS_CANCELLING.to_string();
+        self.job.summary.end_time = None;
+        self.job.steps = Vec::new();
+        self.conclusion = JobConclusion::cancelled(&self.conclusion.step_name);
+        self.settles_at = Some(now_millis().saturating_add(JOB_SETTLE_MILLIS));
+    }
 }
 
 /// How one job ends: the terminal `JobStatus` it reaches, the execution step that
@@ -452,6 +740,16 @@ impl JobConclusion {
             status_reason: Some(reason.into()),
         }
     }
+
+    /// A job a `StopJob` request stopped: it ends [`JOB_STATUS_CANCELLED`] in the step
+    /// it was stopped in, carrying [`JOB_CANCELLED_REASON`].
+    pub fn cancelled(step_name: &str) -> Self {
+        Self {
+            status: JOB_STATUS_CANCELLED.to_string(),
+            step_name: step_name.to_string(),
+            status_reason: Some(JOB_CANCELLED_REASON.to_string()),
+        }
+    }
 }
 
 /// How long after `StartJob` the clock settles a job out of its non-terminal status.
@@ -476,6 +774,46 @@ pub const JOB_STATUS_FAILED: &str = "FAILED";
 /// The terminal status a job settles to when its work WAS done — the status Amplify
 /// spells `SUCCEED` (`smithy_query(query="shape",shape="JobStatus")`), not `SUCCEEDED`.
 pub const JOB_STATUS_SUCCEED: &str = "SUCCEED";
+
+/// The status a job carries from `StopJob` until the clock settles the cancellation.
+///
+/// `JobStatus` models both halves of stopping a job — `CANCELLING` and `CANCELLED`
+/// (`smithy_query(query="shape",shape="JobStatus")`) — so a stop that has been accepted
+/// and not finished yet has its own status, which is the one `StopJob` answers.
+pub const JOB_STATUS_CANCELLING: &str = "CANCELLING";
+
+/// The terminal status a stopped job settles to.
+pub const JOB_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// The statuses a job has reached the END of its life in: no further status is owed and
+/// there is no progress left to stop.
+///
+/// `JobStatus` is modelled `CREATED | PENDING | PROVISIONING | RUNNING | FAILED |
+/// SUCCEED | CANCELLING | CANCELLED` (`smithy_query(query="shape",shape="JobStatus")`);
+/// of those, a job that has FAILED, SUCCEEDed or been CANCELLED is over, while
+/// `CANCELLING` is a stop still in flight.
+pub fn is_terminal_job_status(status: &str) -> bool {
+    matches!(
+        status,
+        JOB_STATUS_FAILED | JOB_STATUS_SUCCEED | JOB_STATUS_CANCELLED
+    )
+}
+
+/// Why a stopped job ends in [`JOB_STATUS_CANCELLED`], carried on the one modelled
+/// member that can hold a reason (`Step$statusReason`).
+pub const JOB_CANCELLED_REASON: &str = "The job was stopped by a StopJob request.";
+
+/// The `message` a `StopJob` `BadRequestException` carries for a job that has already
+/// reached a terminal status.
+///
+/// The operation "stops a job that is in progress"
+/// (`smithy_query(query="doc",shape="StopJob")`), and this job has no progress left, so
+/// the sentence states that precondition and names the job the request addressed —
+/// built FROM THE REQUEST, in the one-sentence form every other refusal in this crate
+/// is built in ([`not_found_message`]).
+pub fn job_not_in_progress_message(job_id: &str) -> String {
+    format!("Job {job_id} is not in progress.")
+}
 
 /// The name of the execution step a settled job carries its failure reason on.
 ///
@@ -911,6 +1249,96 @@ impl ComAmazonawsAmplifyAmplifyState {
         }
     }
 
+    /// Whether this store holds the reservation one deployment-upload URL names.
+    ///
+    /// The token in the path is the receipt: it was minted by this store, is
+    /// unguessable, and stops being usable when the reservation's window closes. That
+    /// is what makes the service's claim on such a request unambiguous — a URL this
+    /// emulator never handed out is claimed by nobody.
+    pub fn holds_deployment_upload(&self, target: &DeploymentUploadTarget) -> bool {
+        self.reservation_of_upload(target).is_some()
+    }
+
+    /// The reservation a deployment-upload URL names, to READ.
+    pub fn reservation_of_upload(
+        &self,
+        target: &DeploymentUploadTarget,
+    ) -> Option<&PendingDeployment> {
+        self.apps
+            .get(&target.app_id)?
+            .branches
+            .values()
+            .filter_map(|branch| branch.deployments.get(&target.job_id))
+            .find(|pending| pending.holds_upload(&target.token))
+    }
+
+    /// The reservation a deployment-upload URL names, to WRITE.
+    ///
+    /// A `jobId` is minted per BRANCH, so the branches of the app the path names are
+    /// walked for the one holding a reservation under that id AND the token — both of
+    /// which the reservation itself minted, so at most one reservation matches.
+    pub fn reservation_of_upload_mut(
+        &mut self,
+        target: &DeploymentUploadTarget,
+    ) -> Option<&mut PendingDeployment> {
+        self.apps
+            .get_mut(&target.app_id)?
+            .branches
+            .values_mut()
+            .filter_map(|branch| branch.deployments.get_mut(&target.job_id))
+            .find(|pending| pending.holds_upload(&target.token))
+    }
+
+    /// How many bytes of DEPLOYMENT CONTENT this whole store retains — every live
+    /// reservation's uploads and every branch's published and staged site — NOT counting
+    /// the one upload `token` names, which is the slot a write is about to replace (the
+    /// empty string counts everything).
+    ///
+    /// This is what [`MAX_STORED_DEPLOYMENT_BYTES`] bounds: the per-deployment clamps
+    /// cap one item, and this caps the TOTAL the process holds, so no number of
+    /// reservations, branches or apps can grow it without limit.
+    pub fn retained_deployment_bytes_apart_from_upload(&self, token: &str) -> usize {
+        self.apps
+            .values()
+            .flat_map(|app| app.branches.values())
+            .map(|branch| branch.retained_bytes_apart_from_upload(token))
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// Whether some branch of some app is HOSTED at `host` — the question
+    /// `Service::can_handle` asks of a request addressed to a branch's default domain.
+    pub fn hosts_a_branch(&self, host: &str) -> bool {
+        let host = hosted_site_host(host);
+        self.apps.values().any(|app| {
+            let domain = app.app.default_domain.to_ascii_lowercase();
+            app.branches
+                .values()
+                .any(|branch| hosted_branch_host(&branch.branch.display_name, &domain) == host)
+        })
+    }
+
+    /// The branch whose hosting edge answers at `host`, to serve from.
+    ///
+    /// A branch's site is served at `<displayName>.<app defaultDomain>`:
+    /// `Branch$displayName` "is used as the default domain prefix"
+    /// (`smithy_query(query="doc",shape="Branch",member="displayName")`) and
+    /// `App$defaultDomain` is "the default domain for the Amplify app"
+    /// (`smithy_query(query="doc",shape="App",member="defaultDomain")`). The match is
+    /// case-insensitive and ignores any port, because a host is.
+    ///
+    /// `&mut` because serving a request REPORTS on the branch, and reporting
+    /// materialises what the clock already owes it ([`AmplifyBranch::settle`]) — never
+    /// anything else.
+    pub fn hosted_branch_mut(&mut self, host: &str) -> Option<&mut AmplifyBranch> {
+        let host = hosted_site_host(host);
+        self.apps.values_mut().find_map(|app| {
+            let domain = app.app.default_domain.to_ascii_lowercase();
+            app.branches.values_mut().find(|branch| {
+                hosted_branch_host(&branch.branch.display_name, &domain) == host
+            })
+        })
+    }
+
     /// The app an ARN addressed for tagging, or the `message` its 404 carries.
     fn app_for_tagging(&self, app_id: &str) -> Result<&AmplifyApp, String> {
         self.apps
@@ -1078,6 +1506,83 @@ fn base36_digits(mut value: u64) -> String {
 /// SigV4 credential scope to read it from. It is the region the emulator's own shared
 /// AWS config names, so an unsigned call and a default-configured client agree.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The host one branch's site is served at, built from the branch's display name and
+/// the (already lowercased) default domain of its app.
+fn hosted_branch_host(display_name: &str, default_domain: &str) -> String {
+    format!("{}.{default_domain}", display_name.to_ascii_lowercase())
+}
+
+/// The host a request addressed, as a name to compare a branch's default domain
+/// against: no userinfo, no port, no trailing root dot, lowercased — the four ways the
+/// same host is written.
+fn hosted_site_host(host: &str) -> String {
+    ::service_common::data_plane_addressing::host_only(host)
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+/// The document a hosted branch serves for a request that names a directory rather than
+/// a file — the root of the site, or a path ending in the separator.
+///
+/// It is the same document a deployment has to carry at its root to be servable, which
+/// `StartDeployment` owns ([`crate::ops::start_deployment::ROOT_DOCUMENT`]).
+pub fn site_root_document() -> &'static str {
+    crate::ops::start_deployment::ROOT_DOCUMENT
+}
+
+/// The path a hosted-site request asks for, as a key of a branch's published files: the
+/// request path without its leading separator, with the root document appended when it
+/// names a directory.
+///
+/// `None` for a path that would leave the site — a `..` segment — which names no file
+/// the deployment published.
+pub fn hosted_site_key(path: &str) -> Option<String> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    if path.split('/').any(|segment| segment == ".." || segment == ".") {
+        return None;
+    }
+    if path.is_empty() || path.ends_with('/') {
+        return Some(format!("{path}{}", site_root_document()));
+    }
+    Some(path.to_string())
+}
+
+/// The media type a hosted file is served with, from the extension of the path it is
+/// served at.
+///
+/// A hosting edge answers the type of the FILE, which is what a browser needs to render
+/// a page rather than download it. The reading is the workspace's one
+/// (`::service_common::web_media_type`), so this plane and the next one to serve deployed
+/// files cannot answer one extension differently.
+pub fn hosted_file_media_type(path: &str) -> &'static str {
+    ::service_common::web_media_type::media_type_of_path(path)
+}
+
+/// This service's own endpoint prefix (`smithy_query(query="service_info")`:
+/// endpointPrefix `amplify`), which its published endpoint host is built from.
+pub const ENDPOINT_PREFIX: &str = "amplify";
+
+/// The endpoint host this request reached the emulator on, so a URL this service hands
+/// out resolves back to where the caller is already talking rather than naming a host
+/// nothing serves.
+///
+/// The reading is the workspace's one
+/// (`::service_common::data_plane_addressing::reached_endpoint_host`): the host the
+/// request addressed — its `Host` header, or the authority of an absolute-form URI for a
+/// request that carries its endpoint there — when it is shaped like a host, and this
+/// service's published endpoint for the region it was signed for otherwise.
+pub fn request_endpoint_host(parts: &::http::request::Parts, region: &str) -> String {
+    ::service_common::data_plane_addressing::reached_endpoint_host(
+        &parts.uri.to_string(),
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+        ENDPOINT_PREFIX,
+        region,
+    )
+}
 
 /// The region this request was signed for, defaulting to [`DEFAULT_REGION`].
 ///

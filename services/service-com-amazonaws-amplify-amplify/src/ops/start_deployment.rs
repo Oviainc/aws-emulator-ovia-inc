@@ -88,6 +88,8 @@
 //! * an Amazon S3 source is read in AMPLIFY'S OWN name, so the bucket's own policy has to
 //!   grant the Amplify service principal that read — a bucket whose policy grants it
 //!   nothing is refused with the modelled `UnauthorizedException`, before any job exists;
+//! * the uploads of a reservation are read out of this service's own state, where the
+//!   plane serving their destinations wrote them (`crate::service`);
 //! * a source the read could not resolve — a prefix the policy lets nobody list, an
 //!   archive object that is not there, a source outside this emulator — starts a job that
 //!   the clock settles to `FAILED`, carrying the reason on its one execution step;
@@ -97,7 +99,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -208,8 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The source, read now: an unauthorized source is refused here, and a source
         // that could not be read decides how the job this call starts ends.
-        let deployment = read_source(ctx, &region, &app_arn, &source).await?;
-
+        let mut deployment = read_source(ctx, &region, &app_arn, &source).await?;
         // What the job reports about where its files came from: the URL the request
         // named, and the kind of source it named it as — which for a request that named
         // no kind is the modelled default. A deployment of a reservation's uploads has
@@ -228,6 +229,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // What this store already holds of other deployments' content, which bounds what
+        // THIS one may publish into it: the reservation this call spends is not counted,
+        // because starting it hands its uploads over to the deployment rather than
+        // adding to them. A deployment whose files would take the store past the ceiling
+        // publishes nothing and says so on its job, rather than retaining them.
+        let stored = store
+            .retained_deployment_bytes_apart_from_upload("")
+            .saturating_sub(match &source {
+                Source::Reserved(pending) => pending.uploaded_bytes_apart_from(""),
+                _ => 0,
+            });
+        if deployment.publishes()
+            && stored.saturating_add(deployment.stored_bytes())
+                > crate::state::MAX_STORED_DEPLOYMENT_BYTES
+        {
+            deployment = Deployment::failed(format!(
+                "{} ({}).",
+                crate::state::STORED_DEPLOYMENT_BYTES_EXCEEDED,
+                source.label()
+            ));
+        }
         let app = store
             .apps
             .get_mut(&input.app_id)
@@ -290,6 +312,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             job_id,
         };
 
+        let deployed_assets = deployment.assets();
+        let publishes = deployment.publishes();
         branch.jobs.insert(
             summary.job_id.clone(),
             crate::state::BranchJob::settling(
@@ -298,9 +322,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     steps: Vec::new(),
                 },
                 deployment.conclusion,
-                deployment.assets,
+                deployed_assets,
             ),
         );
+        // The files go LIVE when the deployment's job reaches its terminal status, not
+        // when this call answers, so they are staged on the branch and published by the
+        // settling the clock owes that job (see `crate::state::AmplifyBranch::settle`).
+        // A deployment that ends FAILED publishes nothing and leaves the site as it was.
+        if publishes {
+            branch.stage_site(&summary.job_id, deployment.files);
+        }
 
         // The branch's own view of its jobs: the deployment just started is the active
         // one, and `totalNumberOfJobs` counts the jobs this branch has STARTED.
@@ -434,10 +465,11 @@ fn s3_location(source_url: &str) -> Option<(String, String)> {
     (!bucket.is_empty()).then(|| (bucket.to_string(), path.to_string()))
 }
 
-/// What reading a source produced: the asset paths the deployment publishes, and the
-/// conclusion the clock settles its job to.
+/// What reading a source produced: the files the deployment publishes, keyed by the path
+/// each is served at under the site root, and the conclusion the clock settles its job
+/// to.
 struct Deployment {
-    assets: BTreeSet<String>,
+    files: BTreeMap<String, Vec<u8>>,
     conclusion: crate::state::JobConclusion,
 }
 
@@ -450,18 +482,18 @@ impl Deployment {
     /// a source holding no file at all deploys nothing. Either way the job ends FAILED
     /// with the reason on its step, rather than reporting a deployment that cannot be
     /// visited as having succeeded.
-    fn published(label: &str, assets: BTreeSet<String>) -> Self {
-        if assets.is_empty() {
+    fn published(label: &str, files: BTreeMap<String, Vec<u8>>) -> Self {
+        if files.is_empty() {
             return Self::failed(format!("The deployment source {label} holds no file to deploy."));
         }
-        if !assets.contains(ROOT_DOCUMENT) {
+        if !files.contains_key(ROOT_DOCUMENT) {
             return Self::failed(format!(
                 "The deployment source {label} carries no {ROOT_DOCUMENT} at its root, so \
                  the branch has no document to serve."
             ));
         }
         Self {
-            assets,
+            files,
             conclusion: crate::state::JobConclusion::deployed(),
         }
     }
@@ -469,9 +501,27 @@ impl Deployment {
     /// A deployment that published nothing, for the reason given.
     fn failed(reason: impl Into<String>) -> Self {
         Self {
-            assets: BTreeSet::new(),
+            files: BTreeMap::new(),
             conclusion: crate::state::JobConclusion::not_deployed(reason),
         }
+    }
+
+    /// The paths this deployment published, which is what its job reports.
+    fn assets(&self) -> BTreeSet<String> {
+        self.files.keys().cloned().collect()
+    }
+
+    /// Whether this deployment's job settles to the status that PUBLISHES its files.
+    fn publishes(&self) -> bool {
+        self.conclusion.status == crate::state::JOB_STATUS_SUCCEED
+    }
+
+    /// How many bytes of content publishing this deployment would have the store retain.
+    fn stored_bytes(&self) -> usize {
+        self.files
+            .values()
+            .map(Vec::len)
+            .fold(0usize, usize::saturating_add)
     }
 }
 
@@ -502,7 +552,7 @@ async fn read_source(
             "The deployment source {label} is outside this emulator, which opens no \
              outbound connection, so the archive was never downloaded."
         ))),
-        Source::Reserved(pending) => Ok(reserved_deployment(ctx, region, pending, &label).await),
+        Source::Reserved(pending) => Ok(reserved_deployment(pending, &label)),
         Source::Prefix { bucket, prefix } => {
             let policy = bucket_policy(ctx, region, bucket).await;
             // Amplify reads the objects of the source in its OWN name, so the read has
@@ -635,6 +685,12 @@ async fn source_object(
 /// deployed at the same paths as the files of `s3://b/` would be — which is what makes
 /// the prefix the root of the deployed site. A key that ends in the separator is the
 /// folder placeholder a console creates, not a file, and is deployed as nothing.
+///
+/// Each object's CONTENT is read too, because that content is what the branch's hosting
+/// edge then serves. The read is bounded in the same two ways the rest of this operation
+/// is: at most [`MAX_DEPLOYMENT_ASSETS`] keys, and at most [`MAX_ARCHIVE_BYTES`] of
+/// content in total, past which the deployment fails rather than taking the host's
+/// memory.
 async fn prefix_deployment(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -643,7 +699,7 @@ async fn prefix_deployment(
     label: &str,
 ) -> Deployment {
     let client = s3_client(ctx, region);
-    let mut assets = BTreeSet::new();
+    let mut keys: Vec<(String, String)> = Vec::new();
     let mut examined = 0usize;
     let mut pages = 0usize;
     let mut continuation: Option<String> = None;
@@ -689,7 +745,10 @@ async fn prefix_deployment(
                      {MAX_DEPLOYMENT_ASSETS} files this emulator deploys."
                 ));
             }
-            let Some(path) = object.key().and_then(|key| key.strip_prefix(prefix)) else {
+            let Some(key) = object.key() else {
+                continue;
+            };
+            let Some(path) = key.strip_prefix(prefix) else {
                 continue;
             };
             // A key that ends in the separator is the folder placeholder a console
@@ -697,14 +756,85 @@ async fn prefix_deployment(
             if path.is_empty() || path.ends_with('/') {
                 continue;
             }
-            assets.insert(path.to_string());
+            keys.push((path.to_string(), key.to_string()));
         }
         continuation = page.next_continuation_token().map(str::to_string);
         if continuation.is_none() {
             break;
         }
     }
-    Deployment::published(label, assets)
+
+    let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut total = 0usize;
+    for (path, key) in keys {
+        let content = match source_content(
+            ctx,
+            region,
+            bucket,
+            &key,
+            MAX_ARCHIVE_BYTES.saturating_sub(total),
+        )
+        .await
+        {
+            Ok(content) => content,
+            Err(why) => {
+                return Deployment::failed(format!(
+                    "The deployment source {label} could not be read from Amazon S3: {why}."
+                ))
+            }
+        };
+        total = total.saturating_add(content.len());
+        files.insert(path, content);
+    }
+    Deployment::published(label, files)
+}
+
+/// The bytes of ONE object of a deployment source, read through the same in-process
+/// client the rest of this operation reads S3 with, and bounded by `remaining`.
+///
+/// The content is caller content, so the bound is applied as the body ARRIVES rather
+/// than only where the answer declares a length: an object that would take the
+/// deployment past what this emulator reads is an error before the byte that would pass
+/// it is kept.
+async fn source_content(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    key: &str,
+    remaining: usize,
+) -> Result<Vec<u8>, String> {
+    let answer = s3_client(ctx, region)
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|failure| {
+            ::tracing::warn!(
+                bucket,
+                key,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                "the deployment source's object could not be read"
+            );
+            format!("the object {key} could not be read")
+        })?;
+    let mut body = answer.body;
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        match body.try_next().await {
+            Ok(Some(chunk)) => {
+                if bytes.len().saturating_add(chunk.len()) > remaining {
+                    return Err(format!(
+                        "its files are larger than the {MAX_ARCHIVE_BYTES} bytes this \
+                         emulator reads from one deployment"
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(bytes),
+            Err(failure) => return Err(failure.to_string()),
+        }
+    }
 }
 
 /// The `.zip` object `bucket`/`key`, as a deployment of the files it carries.
@@ -764,8 +894,8 @@ async fn archive_deployment(
             }
         }
     }
-    match archive_assets(&bytes) {
-        Ok(assets) => Deployment::published(label, assets),
+    match archive_files(&bytes) {
+        Ok(files) => Deployment::published(label, files),
         Err(why) => Deployment::failed(format!(
             "The deployment source {label} is not an archive this emulator can deploy: \
              {why}."
@@ -776,20 +906,16 @@ async fn archive_deployment(
 /// The deployment a reservation's uploads make up.
 ///
 /// A reservation handed its caller one destination per file it named, or one for the
-/// zipped deployment, so what it deploys is what is actually AT those destinations now:
-/// a reservation whose uploads never happened deploys nothing, and its job says so.
+/// zipped deployment, and the plane serving those destinations
+/// (`crate::state::deployment_upload_path`) wrote what arrived onto the reservation. So
+/// what this deploys is what is actually AT those destinations now: a reservation whose
+/// uploads never happened deploys nothing, and its job says so.
 ///
-/// How many files the reservation named is the CALLER'S choice, so the walk over them is
-/// bounded exactly as the walk over a prefix's objects is: at most
-/// [`MAX_DEPLOYMENT_ASSETS`] destinations are looked up, and a reservation naming more
-/// than a deployment may hold deploys nothing rather than fanning one call out into
-/// unboundedly many.
-async fn reserved_deployment(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-    pending: &crate::state::PendingDeployment,
-    label: &str,
-) -> Deployment {
+/// How many files the reservation named is the CALLER'S choice, so the set of files is
+/// bounded exactly as the walk over a prefix's objects is: a reservation naming more
+/// than [`MAX_DEPLOYMENT_ASSETS`] files — more than a deployment may hold — deploys
+/// nothing rather than publishing unboundedly many paths.
+fn reserved_deployment(pending: &crate::state::PendingDeployment, label: &str) -> Deployment {
     if !pending.files.is_empty() {
         if pending.files.len() > MAX_DEPLOYMENT_ASSETS {
             return Deployment::failed(format!(
@@ -798,55 +924,55 @@ async fn reserved_deployment(
                 pending.files.len()
             ));
         }
-        let client = s3_client(ctx, region);
-        let mut assets = BTreeSet::new();
-        for (file_name, file) in &pending.files {
-            let Some((bucket, key)) = upload_destination(&file.upload_url) else {
-                continue;
-            };
-            if client
-                .head_object()
-                .bucket(bucket)
-                .key(key)
-                .send()
-                .await
-                .is_ok()
-            {
-                assets.insert(file_name.clone());
-            }
-        }
-        return Deployment::published(label, assets);
+        // A reservation that named its files deploys one file per destination that was
+        // uploaded to, at the path the reservation named it by, carrying the bytes that
+        // were uploaded there; a file nobody uploaded is not deployed.
+        let files: BTreeMap<String, Vec<u8>> = pending
+            .files
+            .iter()
+            .filter_map(|(file_name, file)| {
+                file.upload
+                    .content
+                    .as_ref()
+                    .map(|content| (file_name.clone(), content.clone()))
+            })
+            .collect();
+        return Deployment::published(label, files);
     }
-    let Some((bucket, key)) = upload_destination(&pending.zip_upload_url) else {
+    let Some(archive) = pending
+        .zip
+        .as_ref()
+        .and_then(|zip| zip.content.as_deref())
+    else {
         return Deployment::failed(format!(
             "The deployment source {label} has no upload to deploy."
         ));
     };
-    archive_deployment(ctx, region, &bucket, &key, label).await
+    // The zipped deployment deploys the files the archive carries, read the same way an
+    // archive named by a source URL is.
+    match archive_files(archive) {
+        Ok(files) => Deployment::published(label, files),
+        Err(why) => Deployment::failed(format!(
+            "The deployment source {label} is not an archive this emulator can deploy: \
+             {why}."
+        )),
+    }
 }
 
-/// The bucket and key one upload destination of a reserved deployment addresses.
-///
-/// `CreateDeployment` mints every destination as a virtual-hosted Amazon S3 URL
-/// (`https://<bucket>.s3.<region>.amazonaws.com/<key>`), so the content a caller
-/// uploaded to it is the object `<key>` of `<bucket>`. A destination in any other form
-/// addresses no object of this emulator's object storage, and is answered as none.
-fn upload_destination(upload_url: &str) -> Option<(String, String)> {
-    let rest = upload_url.strip_prefix("https://")?;
-    let (host, key) = rest.split_once('/')?;
-    let bucket = host.split_once(".s3.")?.0;
-    (!bucket.is_empty() && !key.is_empty()).then(|| (bucket.to_string(), key.to_string()))
-}
-
-/// Every file entry of a zip archive, by the path it deploys at.
+/// Every file entry of a zip archive, by the path it deploys at, with its content.
 ///
 /// Reading the archive format is the `zip` crate's job, not this emulator's; what this
-/// function owns is the BOUND, because the archive is caller content: no more entry
-/// names than a deployment may hold are collected, and no entry's CONTENT is read at
-/// all, so a compressed stream cannot expand into this process. A directory entry names
-/// no file, and an entry whose path would leave the deployment's root is refused rather
-/// than deployed somewhere the archive did not name.
-fn archive_assets(bytes: &[u8]) -> Result<BTreeSet<String>, String> {
+/// function owns is the BOUNDS, because the archive is caller content: no more entries
+/// than a deployment may hold ([`MAX_DEPLOYMENT_ASSETS`]), and no more content in total
+/// than this emulator reads from one archive ([`MAX_ARCHIVE_BYTES`]) — so a compressed
+/// stream cannot expand into this process. A directory entry names no file, and an entry
+/// whose path would leave the deployment's root is refused rather than deployed
+/// somewhere the archive did not name.
+///
+/// The CONTENT is read because it is what the branch's hosting edge then serves: a
+/// deployment that published only paths would answer a request for one of them with
+/// nothing.
+fn archive_files(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let mut archive =
         ::zip::ZipArchive::new(::std::io::Cursor::new(bytes)).map_err(|err| err.to_string())?;
     if archive.len() > MAX_DEPLOYMENT_ASSETS {
@@ -856,9 +982,10 @@ fn archive_assets(bytes: &[u8]) -> Result<BTreeSet<String>, String> {
             archive.len()
         ));
     }
-    let mut assets = BTreeSet::new();
+    let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut total = 0usize;
     for index in 0..archive.len() {
-        let entry = archive.by_index(index).map_err(|err| err.to_string())?;
+        let mut entry = archive.by_index(index).map_err(|err| err.to_string())?;
         // zip reports an entry's name as a `Result`, because a name that is not valid
         // UTF-8 cannot be a deployed path at all: such an entry is refused rather than
         // deployed under a lossily decoded name.
@@ -872,9 +999,25 @@ fn archive_assets(bytes: &[u8]) -> Result<BTreeSet<String>, String> {
         if name.starts_with('/') || name.split('/').any(|segment| segment == "..") {
             return Err(format!("the entry {name} names a path outside the deployment"));
         }
-        assets.insert(name);
+        // The bound is applied to what is DECOMPRESSED, one byte past the budget at
+        // most: `take` is what stops a stream that claims to be small and is not.
+        let budget = MAX_ARCHIVE_BYTES.saturating_sub(total);
+        let mut content: Vec<u8> = Vec::new();
+        ::std::io::Read::read_to_end(
+            &mut ::std::io::Read::take(&mut entry, u64::try_from(budget).unwrap_or(u64::MAX) + 1),
+            &mut content,
+        )
+        .map_err(|err| format!("the entry {name} could not be read: {err}"))?;
+        if content.len() > budget {
+            return Err(format!(
+                "its entries decompress to more than the {MAX_ARCHIVE_BYTES} bytes this \
+                 emulator reads from one archive"
+            ));
+        }
+        total = total.saturating_add(content.len());
+        files.insert(name, content);
     }
-    Ok(assets)
+    Ok(files)
 }
 
 /// What the source bucket's own policy is, as S3 answered.

@@ -155,6 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx.parts());
+        // The endpoint the caller reached, which is where the upload destinations this
+        // call hands back have to resolve: they are served by this emulator (see
+        // `crate::state::deployment_upload_path`), so they name the endpoint the caller
+        // is already talking to rather than a host nothing here serves.
+        let endpoint_host = crate::state::request_endpoint_host(ctx.parts(), &region);
         let created_at = crate::state::now_millis();
 
         // `fileMap` is "an optional file map that contains the file name as the key
@@ -204,27 +209,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     file_name,
                     crate::state::DeploymentFile {
                         content_md5,
-                        upload_url: upload_url(&region, &input.app_id, &job_id, &token),
+                        upload: upload(&endpoint_host, &input.app_id, &job_id, token),
                     },
                 )
             })
             .collect();
-        let zip_upload_url = if files.is_empty() {
+        let zip = if files.is_empty() {
             let token = store.mint_upload_token();
-            upload_url(&region, &input.app_id, &job_id, &token)
+            Some(upload(&endpoint_host, &input.app_id, &job_id, token))
         } else {
             // `zipUploadUrl` is returned "when the fileMap argument is not provided in
             // the request", and this request provided one, so there is no single
-            // upload of a zipped deployment to point at. The member is @required with
-            // a `length` minimum of 0 (`smithy_query(query="shape",shape="UploadUrl")`),
-            // so the empty value is how "not returned" is expressed on the wire.
-            String::new()
+            // upload of a zipped deployment to point at; the empty value the wire
+            // carries for it is `PendingDeployment::zip_upload_url`'s.
+            None
         };
 
         let pending = crate::state::PendingDeployment {
             job_id,
             files,
-            zip_upload_url,
+            zip,
             created_at,
             // The window this deployment has to be started in; see
             // `crate::state::DEPLOYMENT_WINDOW_MILLIS`.
@@ -232,7 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Persisted on the branch, because the call that STARTS this deployment is a
-        // later one that knows only the job id handed back here.
+        // later one that knows only the job id handed back here — and because the
+        // plane serving these destinations writes what is uploaded into this record.
         branch_of(&mut store, &input.app_id, &input.branch_name)?
             .deployments
             .insert(pending.job_id.clone(), pending.clone());
@@ -240,16 +245,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateDeploymentOutput {
             // The id of the job this deployment runs under once it is started, which
             // is what `StartDeployment` is called with.
-            job_id: Some(pending.job_id),
+            job_id: Some(pending.job_id.clone()),
             // "When the fileMap argument is provided in the request, fileUploadUrls
             // will contain a map of file names to upload URLs" — the same file names
             // the request named, each with the destination minted for it.
             file_upload_urls: pending
                 .files
                 .iter()
-                .map(|(file_name, file)| (file_name.clone(), file.upload_url.clone()))
+                .map(|(file_name, file)| (file_name.clone(), file.upload.url.clone()))
                 .collect(),
-            zip_upload_url: pending.zip_upload_url,
+            zip_upload_url: pending.zip_upload_url(),
         })
     }
 }
@@ -289,19 +294,33 @@ fn branch_of<'store>(
 
 /// Where ONE upload of a reserved deployment goes.
 ///
-/// A deployment's content is uploaded to the Amplify deployment bucket of the
-/// request's region, under the reservation's own prefix (`{appId}/{jobId}`) and the
-/// `token` minted for that one upload — so an app id and a job id, which the caller
-/// already knows, are not by themselves enough to write to a deployment.
+/// A deployment's content is uploaded to a destination THIS EMULATOR SERVES — the
+/// endpoint the reserving caller reached, under the reservation's own path
+/// (`crate::state::deployment_upload_path`) — because a URL this operation hands back
+/// is a promise that it can be written to: "the caller uploads the zipped site to that
+/// URL and then calls StartDeployment", and what that later call deploys is what is
+/// actually at these destinations. The `crate::service` upload plane serves them.
 ///
-/// The file name is NOT part of the URL: which upload a token stands for is recorded
-/// on the reservation (`crate::state::PendingDeployment::files`), which keeps every
-/// URL returned inside `UploadUrl`'s modelled `length 0..1000`
+/// Each destination carries the `token` minted for that one upload, so an app id and a
+/// job id — which the caller already knows — are not by themselves enough to write to
+/// a deployment, and no two uploads share a URL.
+///
+/// The file name is NOT part of the URL: which upload a token stands for is recorded on
+/// the reservation (`crate::state::PendingDeployment::files`), which keeps every URL
+/// returned inside `UploadUrl`'s modelled `length 0..1000`
 /// (`smithy_query(query="shape",shape="UploadUrl")`) whatever a request named its
 /// files — a `FileName` is itself modelled up to 255 characters.
-fn upload_url(region: &str, app_id: &str, job_id: &str, token: &str) -> String {
-    format!(
-        "https://aws-amplify-{region}-deployment.s3.{region}.amazonaws.com\
-         /{app_id}/{job_id}/{token}"
-    )
+fn upload(
+    endpoint_host: &str,
+    app_id: &str,
+    job_id: &str,
+    token: String,
+) -> crate::state::DeploymentUpload {
+    crate::state::DeploymentUpload {
+        url: crate::state::deployment_upload_url(endpoint_host, app_id, job_id, &token),
+        token,
+        // Nothing has been uploaded yet: a reservation whose uploads never happen
+        // deploys nothing, and the job its start call runs says so.
+        content: None,
+    }
 }

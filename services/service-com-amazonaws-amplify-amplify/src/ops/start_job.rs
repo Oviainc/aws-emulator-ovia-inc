@@ -167,20 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|job_id| !job_id.is_empty())
             .map(str::to_string);
 
-        // `StartJobRequest$jobId` is "the unique ID for an existing job. This is
-        // required if the value of jobType is RETRY" — a RETRY re-runs a job that
-        // already exists, so a RETRY without an id names nothing to re-run and the
-        // request is refused with the modelled 400 rather than starting a new job.
         let retry = input.job_type == RETRY_JOB_TYPE;
-        if retry && requested_job_id.is_none() {
-            return Err(StartJobErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "jobId is required when jobType is {RETRY_JOB_TYPE}."
-                )),
-            })
-            .into());
-        }
-
         let started = crate::state::now();
         let mut store = state.lock();
 
@@ -195,6 +182,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         })?;
+
+        // A job this operation starts is a build of the app's connected repository —
+        // `jobType` RELEASE "starts a new job with the latest change from the specified
+        // branch", a value "available only for apps that are connected to a repository"
+        // (`smithy_query(query="doc",shape="StartJobRequest",member="jobType")`) — so an
+        // app with no repository provider has no job to start for ANY job type, and the
+        // operation is not supported on it. That precondition is the APP'S, so it is
+        // judged as soon as the app is resolved and BEFORE the request's own parameter
+        // rules (the RETRY `jobId` requirement below): a caller on such an app is told
+        // to deploy manually instead, not that supplying a `jobId` would make the call
+        // work.
+        if app.app.repository.is_empty() {
+            return Err(StartJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(REPOSITORY_NOT_CONNECTED.to_string()),
+            })
+            .into());
+        }
+
         let branch = app.branches.get_mut(&input.branch_name).ok_or_else(|| {
             StartJobErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::not_found_message(
@@ -203,6 +208,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         })?;
+
+        // `StartJobRequest$jobId` is "the unique ID for an existing job. This is
+        // required if the value of jobType is RETRY" — a RETRY re-runs a job that
+        // already exists, so a RETRY without an id names nothing to re-run and the
+        // request is refused with the modelled 400 rather than starting a new job.
+        if retry && requested_job_id.is_none() {
+            return Err(StartJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "jobId is required when jobType is {RETRY_JOB_TYPE}."
+                )),
+            })
+            .into());
+        }
 
         // A RETRY runs the job the request named, so that job must exist on this
         // branch; every other job type starts a NEW job and the branch mints its id.
@@ -295,6 +313,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// What `StartJob` refuses an app with no repository provider with, as recorded
+/// behaviour words this modelled 400 ("A request contains unexpected data"): entirely
+/// fixed text, carrying no value from the request or from state, and naming the two
+/// operations that DO deploy such an app.
+pub const REPOSITORY_NOT_CONNECTED: &str =
+    "Operation not supported for app that was not connected to a repository provider. \
+     Please use CreateDeployment and StartDeployment operations instead.";
 
 /// The `jobType` whose job is an existing one, re-run.
 ///

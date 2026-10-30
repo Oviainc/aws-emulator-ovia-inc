@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +103,19 @@ impl From<StopJobErrorModeled> for StopJobError {
     }
 }
 
+/// The refusal an app id, a branch name or a job id that names nothing takes.
+///
+/// A job is stopped THROUGH its branch and its app
+/// (`DELETE /apps/{appId}/branches/{branchName}/jobs/{jobId}/stop`), so the modelled 404
+/// ("An entity was not found during an operation") names the entity that is absent and
+/// the identifier the request used for it — the wording every other 404 in this crate is
+/// built with ([`crate::state::not_found_message`]).
+fn absent(entity: &str, identifier: &str) -> StopJobErrorModeled {
+    StopJobErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::not_found_message(entity, identifier)),
+    })
+}
+
 /// The `StopJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -146,20 +150,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopJobErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // A job is addressed through its branch and its app, so neither an unknown app
+        // nor a branch this app does not carry resolves to a job: the 404 names the
+        // entity that is actually absent.
+        let app = store
+            .apps
+            .get_mut(&input.app_id)
+            .ok_or_else(|| absent(crate::state::APP_ENTITY, &input.app_id))?;
+
+        let branch = app
+            .branches
+            .get_mut(&input.branch_name)
+            .ok_or_else(|| absent(crate::state::BRANCH_ENTITY, &input.branch_name))?;
+        let job = branch
+            .jobs
+            .get_mut(&input.job_id)
+            .ok_or_else(|| absent(crate::state::JOB_ENTITY, &input.job_id))?;
+
+        // The status change the clock has already made due is materialised BEFORE this
+        // call judges the job: it was owed whether or not anybody called, so a job the
+        // clock finished is a finished job here too, not one still in progress that this
+        // call could stop.
+        job.settle();
+
+        // "Stops a job that is in progress": a job that has already reached a terminal
+        // status has no progress left to stop, so the request is refused with the
+        // modelled 400 and the job is left exactly as it ended.
+        if crate::state::is_terminal_job_status(&job.job.summary.status) {
+            return Err(StopJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::job_not_in_progress_message(&input.job_id)),
+            })
+            .into());
+        }
+
+        // Stopping is ASYNCHRONOUS, like starting: the call answers with the
+        // non-terminal status Amplify spells `CANCELLING` and the clock settles the job
+        // to `CANCELLED` (see `crate::state::BranchJob::cancel`), so a caller that reads
+        // the job straight after this call still observes the cancellation in flight.
+        job.cancel();
+        Ok(StopJobOutput {
+            job_summary: job.job.summary.clone(),
+        })
     }
 }
