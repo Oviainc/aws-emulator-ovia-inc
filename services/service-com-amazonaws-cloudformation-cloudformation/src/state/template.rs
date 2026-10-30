@@ -3019,6 +3019,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     EVENTS_RULE,
     FIS_EXPERIMENT_TEMPLATE,
     GUARDDUTY_DETECTOR,
+    GUARDDUTY_IP_SET,
     IAM_ACCESS_KEY,
     "AWS::IAM::Role",
     KMS_KEY,
@@ -4092,6 +4093,20 @@ fn return_values(
             attributes.insert("Id".to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the IPSet's id"; Fn::GetAtt: Id. GuardDuty ASSIGNS that id —
+        // `CreateIPSet` takes the list's name, format and location and answers with the
+        // `ipSetId` it minted — so a declaration reports an identifier of GuardDuty's own
+        // shape (32 lowercase hexadecimal characters, as a detector id is) rather than
+        // CloudFormation's `<stack>-<logical id>-<unique id>` name, which no GuardDuty call
+        // would accept as an `IpSetId`. This is also the type `super::provisioning` creates
+        // in GuardDuty itself, which reports the id IT minted back over the `Id` attribute
+        // — and THAT id, not this one, is what the stack reports for a list GuardDuty
+        // created.
+        GUARDDUTY_IP_SET => {
+            let id = derived_digits(IP_SET_ID_SALT, name, DETECTOR_ID_HEX_DIGITS, Alphabet::Lower);
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
         // "Ref returns the hosted zone ID"; Fn::GetAtt: Id, NameServers. Route 53 ASSIGNS
         // that id — `CreateHostedZone` takes no identifier, and the zone's `Name` is only
         // the DNS name it answers for — so a declaration reports an identifier of Route 53's
@@ -4389,7 +4404,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAYV2_API => &["ApiEndpoint"],
         APIGATEWAYV2_API_MAPPING => &["ApiMappingId"],
         APIGATEWAYV2_DOMAIN_NAME => &["DomainNameArn", "RegionalDomainName"],
-        GUARDDUTY_DETECTOR => &["Id"],
+        GUARDDUTY_DETECTOR | GUARDDUTY_IP_SET => &["Id"],
         ROUTE53_HEALTH_CHECK => &["HealthCheckId"],
         ROUTE53_HOSTED_ZONE => &["Id"],
         KMS_KEY => &["Arn", "KeyId"],
@@ -4499,6 +4514,11 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == GRAFANA_WORKSPACE
         || resource_type == EMR_CLUSTER
         || resource_type == GUARDDUTY_DETECTOR
+        // A GuardDuty trusted IP list is the same case: `CreateIPSet` takes no identifier
+        // for the list — the `Name` a declaration states is only the user-friendly name of
+        // the IPSet — and answers the `IpSetId` GuardDuty minted, which is what that
+        // type's `Ref` returns and what every GuardDuty call on the list takes.
+        || resource_type == GUARDDUTY_IP_SET
         || resource_type == KMS_KEY
         || resource_type == AOSS_COLLECTION
         || resource_type == ACM_ACME_ENDPOINT
@@ -4993,6 +5013,14 @@ pub const GRAFANA_WORKSPACE: &str = "AWS::Grafana::Workspace";
 /// service answered with.
 pub const GUARDDUTY_DETECTOR: &str = "AWS::GuardDuty::Detector";
 
+/// An Amazon GuardDuty trusted IP list's resource type (the same
+/// `cloudFormationName: GuardDuty`). This is a type `super::provisioning` creates in
+/// GuardDuty itself, and `Ref` returns the IPSet's id — `CreateIPSet` takes no identifier
+/// and MINTS one, which is the `IpSetId` `GetIPSet`, `UpdateIPSet` and `DeleteIPSet`
+/// address the list by — so the id a stack reports for the resource is the one that
+/// service answered with. That is what [`identity_is_service_assigned`] names it for.
+pub const GUARDDUTY_IP_SET: &str = "AWS::GuardDuty::IPSet";
+
 /// A KMS key's resource type (the KMS model: `cloudFormationName: KMS`). This is a type
 /// `super::provisioning` creates in KMS itself, and "Ref returns the key ID" — `CreateKey`
 /// takes no identifier and MINTS the key id — so the id a stack reports for the resource,
@@ -5194,6 +5222,12 @@ const DETECTOR_ID_HEX_DIGITS: usize = 32;
 /// The salt the stand-in detector id is derived under (see [`derived_digits`]), so it
 /// cannot collide with another identifier derived for the same resource.
 const DETECTOR_ID_SALT: &str = "guardduty/detector-id";
+
+/// The salt the stand-in IPSet id is derived under (see [`derived_digits`]), so the
+/// identifier computed for a trusted IP list cannot collide with the one computed for a
+/// detector of the same name. The WIDTH is [`DETECTOR_ID_HEX_DIGITS`]: GuardDuty mints an
+/// `IpSetId` with the same `mint_id` it mints a detector id with.
+const IP_SET_ID_SALT: &str = "guardduty/ip-set-id";
 
 /// The prefix of an experiment-template id, as FIS mints one (`EXT` + a base-36 suffix;
 /// FIS's own `TEMPLATE_ID_PREFIX`).

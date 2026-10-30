@@ -140,6 +140,12 @@
 //!   is GuardDuty's OWN to mint — `CreateDetector` takes no identifier and answers with
 //!   `detectorId` — so, as for the FIS, AWS WAF Classic and Amazon EMR types above, what
 //!   the stack reports for the resource is the id that create answered with.
+//! * `AWS::GuardDuty::IPSet`'s are `CreateIPSet`'s own members spelled the same way, with
+//!   the detector the list hangs off addressing the call rather than travelling in its
+//!   body, and the list's NAME taken from the naming rules so a declaration that names none
+//!   still creates a list. An IPSet's id is GuardDuty's OWN to mint — `CreateIPSet` takes no
+//!   identifier and answers with `ipSetId` — so what the stack reports for the resource is
+//!   the id that create answered with, which is what `GetIPSet` resolves.
 //! * `AWS::EC2::VPC`'s and `AWS::EC2::Subnet`'s are `CreateVpc`'s and `CreateSubnet`'s own
 //!   members under the same names ([`EC2_VPC_CREATE_MEMBERS`],
 //!   [`EC2_SUBNET_CREATE_MEMBERS`]), walked against those catalogues by the same
@@ -449,7 +455,8 @@ use super::template::{
     ECR_PUBLIC_REPOSITORY, ECS_CLUSTER,
     EMR_CLUSTER, EVENTS_RULE, FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE,
     ELASTIC_BEANSTALK_APPLICATION, ELASTIC_BEANSTALK_APPLICATION_VERSION,
-    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, IAM_ACCESS_KEY,
+    ELASTIC_BEANSTALK_ENVIRONMENT, GRAFANA_WORKSPACE, GUARDDUTY_DETECTOR, GUARDDUTY_IP_SET,
+    IAM_ACCESS_KEY,
     KINESIS_STREAM,
     KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
@@ -609,6 +616,10 @@ pub(super) enum Provisioner {
     GlueJob,
     GrafanaWorkspace,
     GuardDutyDetector,
+    /// `AWS::GuardDuty::IPSet`: a trusted IP list of one of those detectors, which
+    /// `CreateIPSet` creates in the detector its declaration names and `DeleteIPSet`
+    /// deletes. GuardDuty mints the `IpSetId` that type's `Ref` returns.
+    GuardDutyIpSet,
     KmsKey,
     KmsAlias,
     MskCluster,
@@ -723,6 +734,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         GLUE_JOB => Some(Provisioner::GlueJob),
         GRAFANA_WORKSPACE => Some(Provisioner::GrafanaWorkspace),
         GUARDDUTY_DETECTOR => Some(Provisioner::GuardDutyDetector),
+        GUARDDUTY_IP_SET => Some(Provisioner::GuardDutyIpSet),
         KMS_KEY => Some(Provisioner::KmsKey),
         KMS_ALIAS => Some(Provisioner::KmsAlias),
         MSK_CLUSTER => Some(Provisioner::MskCluster),
@@ -922,6 +934,9 @@ impl Provisioner {
             }
             Self::GuardDutyDetector => {
                 create_detector(ctx, region, resource, propagated).await
+            }
+            Self::GuardDutyIpSet => {
+                create_guardduty_ip_set(ctx, region, resource, propagated).await
             }
             Self::KmsKey => create_kms_key(ctx, region, resource, propagated).await,
             // `AWS::KMS::Alias` publishes `AliasName` and `TargetKeyId` and no `Tags`: an
@@ -1650,6 +1665,10 @@ impl Provisioner {
                 delete_workspace(ctx, region, physical_resource_id).await
             }
             Self::GuardDutyDetector => delete_detector(ctx, region, physical_resource_id).await,
+            // A trusted IP list is addressed by the PAIR that identifies it — the detector
+            // its declaration names and the id GuardDuty minted — so the delete takes the
+            // whole record rather than the id.
+            Self::GuardDutyIpSet => delete_guardduty_ip_set(ctx, region, resource).await,
             // A KMS key is not deleted at once: its deletion is SCHEDULED, for the waiting
             // period the declaration asks for.
             Self::KmsKey => {
@@ -1948,6 +1967,8 @@ impl Provisioner {
                 describe_workspace(ctx, region, physical_resource_id).await
             }
             Self::GuardDutyDetector => describe_detector(ctx, region, physical_resource_id).await,
+            // Read back by the same pair the delete addresses the list by.
+            Self::GuardDutyIpSet => describe_guardduty_ip_set(ctx, region, resource).await,
             Self::KmsKey => describe_kms_key(ctx, region, physical_resource_id).await,
             Self::KmsAlias => describe_kms_alias(ctx, region, physical_resource_id).await,
             // One `DescribeClusterV2` reads a cluster of either kind back.
@@ -10191,6 +10212,202 @@ async fn describe_detector(
 /// internal failure, which says nothing about whether the detector is there.
 fn guardduty_rejected(refusal: &Refusal) -> bool {
     refusal.code == GUARDDUTY_INVALID_INPUT || refusal.code == GUARDDUTY_BAD_REQUEST
+}
+
+// ---------------------------------------------------------------------------
+// Amazon GuardDuty: AWS::GuardDuty::IPSet
+// ---------------------------------------------------------------------------
+
+/// The collection a detector's trusted IP lists hang off, and the segment one list's own URI
+/// starts from: `POST /detector/{DetectorId}/ipset` creates one,
+/// `GET /detector/{DetectorId}/ipset/{IpSetId}` reads it and
+/// `DELETE /detector/{DetectorId}/ipset/{IpSetId}` deletes it
+/// (`smithy_query(operation="CreateIPSet,GetIPSet,DeleteIPSet")`).
+const GUARDDUTY_IP_SET_SEGMENT: &str = "ipset";
+
+/// The `AWS::GuardDuty::IPSet` properties that do NOT travel in `CreateIPSet`'s body.
+///
+/// `DetectorId` is the call's `@httpLabel` — it ADDRESSES the create rather than configuring
+/// the list — `Name` is the resource's physical name, which CloudFormation decides (the
+/// declared one or the one it generates, [`declared_name`]), and `Tags` is the `[{Key,
+/// Value}]` list the type publishes where the create takes a MAP ([`tags_as_map`]). Every
+/// other property of the type IS a member of that create spelled with an initial capital —
+/// `Activate`, `Format`, `Location` and `ExpectedBucketOwner` against `activate`, `format`,
+/// `location` and `expectedBucketOwner`, each one a `jsonName` of
+/// `smithy_query(operation="CreateIPSet")` — so the rest of the evaluated document is
+/// carried through [`lower_camel_members`], the same re-casing the detector arm above needs
+/// and safe for the same reason: no property of this type carries a MAP of caller data.
+const GUARDDUTY_IP_SET_LIFTED_PROPERTIES: &[&str] = &["DetectorId", "Name", "Tags"];
+
+/// Create the trusted IP list an `AWS::GuardDuty::IPSet` declares, and report the `IpSetId`
+/// GuardDuty ASSIGNED it.
+///
+/// A list is addressed by the PAIR `(DetectorId, IpSetId)`: the detector half is the
+/// resource's own declared property — a declaration carrying none describes no list that
+/// could be created, so it is refused here rather than sent as a request GuardDuty would
+/// have to reject — and the id half is GuardDuty's to mint, `CreateIPSet` taking no
+/// identifier and answering with `ipSetId`. That answer is what this reports back as the
+/// resource's physical id, which is what `Ref` resolves to and what a client then passes as
+/// `IpSetId`; it is also the type's one published `Fn::GetAtt` attribute (`Id`), so that is
+/// re-reported off the identity GuardDuty assigned rather than the one the naming rules
+/// computed.
+///
+/// VALUES are untouched: the format, the location and the activation flag are what the
+/// template declared, and GuardDuty's own validation is what judges them — its refusal
+/// leaves the stack `CREATE_FAILED` rather than a list configured differently from the
+/// template. A property the declaration does not carry is absent from the request, including
+/// the `Activate` the create models `@required`: which lists GuardDuty uses is the template's
+/// statement to make, so a declaration that makes none is that service's refusal to word
+/// rather than an activation this arm chose.
+async fn create_guardduty_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let detector_id = guardduty_ip_set_detector(resource)?;
+    let mut request = Map::new();
+    if let Some(properties) = resource.properties.as_object() {
+        for (property, value) in properties {
+            if GUARDDUTY_IP_SET_LIFTED_PROPERTIES.contains(&property.as_str()) {
+                continue;
+            }
+            request.insert(lower_initial(property), lower_camel_members(value, 0)?);
+        }
+    }
+    request.insert("name".to_string(), Value::String(declared_name(resource)));
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), Value::Object(tags));
+    }
+    let reported = call_rest_json(
+        ctx,
+        GUARDDUTY_SIGNING_NAME,
+        region,
+        "POST",
+        &guardduty_ip_set_collection_uri(&detector_id),
+        Some(&Value::Object(request)),
+    )
+    .await?;
+    let Some(ip_set_id) = reported.get("ipSetId").and_then(Value::as_str) else {
+        // The create answered 2xx without the id its output models. Nothing addresses a
+        // list without one, so this is reported as a failure rather than recorded as a
+        // resource with a physical id nothing minted.
+        return Err(Refusal {
+            code: UNIDENTIFIED_FAILURE.to_string(),
+            message: "CreateIPSet answered no ipSetId".to_string(),
+        });
+    };
+    let mut attributes = BTreeMap::new();
+    attributes.insert("Id".to_string(), ip_set_id.to_string());
+    Ok(Created {
+        physical_resource_id: Some(ip_set_id.to_string()),
+        attributes,
+    })
+}
+
+/// Delete the trusted IP list a stack created, addressed by the pair that identifies it: the
+/// detector its declaration names and the id GuardDuty minted, which is this resource's
+/// physical id.
+///
+/// A list GuardDuty no longer resolves that pair to is already in the state the delete asks
+/// for. GuardDuty answers every client rejection under one class, so the code alone does not
+/// say WHICH rejection it was: a refusal is confirmed by reading the list back, exactly as
+/// [`delete_detector`] confirms one, and only a read that refuses it too is treated as
+/// already deleted.
+async fn delete_guardduty_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let uri = guardduty_ip_set_uri(
+        &guardduty_ip_set_detector(resource)?,
+        &resource.physical_resource_id,
+    );
+    let refusal =
+        match call_rest_json(ctx, GUARDDUTY_SIGNING_NAME, region, "DELETE", &uri, None).await {
+            Ok(_) => return Ok(()),
+            Err(refusal) => refusal,
+        };
+    if !guardduty_rejected(&refusal) {
+        return Err(refusal);
+    }
+    match call_rest_json(ctx, GUARDDUTY_SIGNING_NAME, region, "GET", &uri, None).await {
+        // The list is still there, so the delete really was refused.
+        Ok(_) => Err(refusal),
+        // GuardDuty does not resolve the pair: the list is already in the state the delete
+        // asks for. Judged on the client-rejection class, so a transport or internal
+        // failure of the confirming read is reported rather than mistaken for a deletion.
+        Err(confirmation) if guardduty_rejected(&confirmation) => Ok(()),
+        Err(confirmation) => Err(confirmation),
+    }
+}
+
+/// The list's configuration as GuardDuty reports it, for drift detection. A pair GuardDuty
+/// no longer resolves was deleted, which for a READ is the one reading its client-rejection
+/// class has (the case [`describe_detector`] is in).
+///
+/// Only the properties `GetIPSet` reports in the SAME shape the type declares them in are
+/// reported, because a property the actual document does not carry is not evidence of
+/// anything (`super::drift::differs`): `Name`, `Format`, `Location` and
+/// `ExpectedBucketOwner`, each one the member of that read spelled with an initial capital.
+/// `Activate` is a FLAG where the read reports an `IpSetStatus` whose seven values also
+/// carry the transitional and error states, and `Tags` is a map where the property is a list
+/// of pairs; comparing either would need a mapping this module would have to invent, so
+/// neither is reported and neither is ever read as drift.
+async fn describe_guardduty_ip_set(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let uri = guardduty_ip_set_uri(
+        &guardduty_ip_set_detector(resource)?,
+        &resource.physical_resource_id,
+    );
+    let reported =
+        match call_rest_json(ctx, GUARDDUTY_SIGNING_NAME, region, "GET", &uri, None).await {
+            Ok(reported) => reported,
+            Err(refusal) if guardduty_rejected(&refusal) => return Ok(None),
+            Err(refusal) => return Err(refusal),
+        };
+    Ok(Some(reported_as_properties(
+        &reported,
+        &[
+            ("Name", "name"),
+            ("Format", "format"),
+            ("Location", "location"),
+            ("ExpectedBucketOwner", "expectedBucketOwner"),
+        ],
+    )))
+}
+
+/// The detector a trusted IP list's declaration names — the other half of the list's
+/// identity, and the `@httpLabel` of every GuardDuty call on one.
+///
+/// A declaration carrying no `DetectorId` is refused here, naming that property, rather than
+/// sent as a request the owning service would reject.
+fn guardduty_ip_set_detector(resource: &StoredResource) -> Result<String, Refusal> {
+    property(resource, "DetectorId").ok_or_else(|| Refusal {
+        code: MISSING_PROPERTY_CODE.to_string(),
+        message: format!("{} declares no DetectorId", resource.resource_type),
+    })
+}
+
+/// The collection URI a detector's trusted IP lists are created in.
+fn guardduty_ip_set_collection_uri(detector_id: &str) -> String {
+    format!(
+        "{GUARDDUTY_DETECTOR_URI}/{}/{GUARDDUTY_IP_SET_SEGMENT}",
+        percent_encoded(detector_id)
+    )
+}
+
+/// The URI of ONE trusted IP list, which its read and its delete are both bound to.
+fn guardduty_ip_set_uri(detector_id: &str, ip_set_id: &str) -> String {
+    format!(
+        "{}/{}",
+        guardduty_ip_set_collection_uri(detector_id),
+        percent_encoded(ip_set_id)
+    )
 }
 
 // ---------------------------------------------------------------------------

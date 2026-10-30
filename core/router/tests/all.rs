@@ -19,6 +19,11 @@
 // else appends to.
 #[path = "all/cloudformation_refuses_s3vectors_vector_buckets.rs"]
 mod cloudformation_refuses_s3vectors_vector_buckets;
+// Declared in this same head region, for the reason the entry above records: the appended
+// tail and the sorted `c…` span (where every cloudformation suite lands) are both regions
+// concurrently landing suites add their line to.
+#[path = "all/cloudformation_provisions_guardduty_ip_set.rs"]
+mod cloudformation_provisions_guardduty_ip_set;
 // Declared here, at the head, for the reason the entry below records: the appended tail and
 // the sorted `k…` span are both regions concurrently landing suites add their line to.
 #[path = "all/kinesisvideo_signing_name_routing.rs"]
