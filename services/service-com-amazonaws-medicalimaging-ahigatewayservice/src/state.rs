@@ -2203,13 +2203,27 @@ pub fn parse_resource_arn(arn: &str) -> Option<ResourceArn> {
 }
 
 /// `[0-9a-z]{32}`: the id form [`ARN_PATTERN`] gives both `datastore/` and
-/// `/imageset/`, and the form [`ComAmazonawsMedicalimagingAhigatewayserviceState::mint_id`]
-/// produces.
+/// `/imageset/` — what a request may NAME a resource by, which is wider than the form
+/// this service mints one in ([`is_minted_id`]).
 fn is_resource_id(value: &str) -> bool {
     value.len() == 32
         && value
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// `[0-9a-f]{32}`: the form of every identifier this service MINTS, which
+/// [`ComAmazonawsMedicalimagingAhigatewayserviceState::mint_id`] writes as 32 lowercase
+/// HEX characters — narrower than the `[0-9a-z]{32}` a request is allowed to name a
+/// resource by ([`is_resource_id`]).
+///
+/// What a payload this service itself wrote is checked against: text outside this form is
+/// something no call of this service ever produced, whatever a request may legally carry.
+fn is_minted_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 /// A modelled timestamp for `instant`, kept to full nanosecond precision rather than
@@ -2335,6 +2349,35 @@ pub fn encode_page_token(marker: &str, instant: SystemTime, resource_id: &str) -
     ::hex::encode(format!("{marker}{secs}.{nanos}:{id}").as_bytes())
 }
 
+/// Read one NUMBER a continuation payload carries, spelled exactly as this service spells
+/// one: ASCII digits only, so a signed, space-padded or empty text that `str::parse` would
+/// otherwise accept is not honoured as part of a position.
+///
+/// Shared by every codec below, because a payload half this service did not write is not a
+/// position in any of their collections.
+fn page_token_number(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// How many nanoseconds one second holds — the bound the sub-second half of an instant
+/// stays under, since it is a remainder of a second ([`page_sort_key`] takes it from
+/// [`::std::time::Duration::subsec_nanos`]).
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// Read the INSTANT half of a continuation payload — seconds and nanoseconds, spelled
+/// exactly as [`encode_page_token`] writes them ([`page_token_number`] each, the
+/// sub-second half inside the second it is a remainder of) — or `None` when it is not a
+/// text this service would have written.
+pub fn parse_page_token_instant(instant: &str) -> Option<(u64, u32)> {
+    let (secs, nanos) = instant.split_once('.')?;
+    let secs = page_token_number(secs)?;
+    let nanos = u32::try_from(page_token_number(nanos)?).ok()?;
+    (u64::from(nanos) < NANOS_PER_SECOND).then_some((secs, nanos))
+}
+
 /// Decode a token [`encode_page_token`] produced for the collection `marker` names, or
 /// `None` when it was not one — a string that is not hex, does not decode to UTF-8,
 /// carries another collection's marker (or none), or holds a payload this service would
@@ -2343,13 +2386,21 @@ pub fn decode_page_token(marker: &str, token: &str) -> Option<PageCursor> {
     let bytes = ::hex::decode(token).ok()?;
     let decoded = String::from_utf8(bytes).ok()?;
     let payload = decoded.strip_prefix(marker)?;
-    // Every identifier a listing pages over is `[0-9a-z]+`, so neither `:` nor `.` can
-    // appear in it and splitting on the first of each is unambiguous.
+    // Every identifier a listing pages over is one this service minted, so neither `:`
+    // nor `.` can appear in it and splitting on the first of each is unambiguous.
     let (instant, resource_id) = payload.split_once(':')?;
-    let (secs, nanos) = instant.split_once('.')?;
+    // Both halves have to be spelled as this service spells them: the tie-breaker an
+    // identifier it MINTS (what the sibling codec below checks too), the instant a pair of
+    // plain numbers. A cursor carrying anything else is no position this service ever
+    // handed out, and honouring it would resume the walk at a key no record holds — above
+    // the record the real token named, which the walk would then never serve.
+    if !is_minted_id(resource_id) {
+        return None;
+    }
+    let (instant_secs, instant_nanos) = parse_page_token_instant(instant)?;
     Some(PageCursor {
-        instant_secs: secs.parse().ok()?,
-        instant_nanos: nanos.parse().ok()?,
+        instant_secs,
+        instant_nanos,
         resource_id: resource_id.to_string(),
     })
 }
@@ -2377,14 +2428,11 @@ pub fn decode_ordinal_page_token(marker: &str, token: &str) -> Option<u32> {
     let bytes = ::hex::decode(token).ok()?;
     let decoded = String::from_utf8(bytes).ok()?;
     let payload = decoded.strip_prefix(marker)?;
-    // Spelled exactly as this service spells an ordinal: ASCII digits only, so a signed
-    // or space-padded payload `str::parse` would otherwise accept is not honoured as a
-    // position. Every ordinal this service mints is numbered from one, so zero is not one
-    // either.
-    if payload.is_empty() || !payload.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let ordinal: u32 = payload.parse().ok()?;
+    // Spelled exactly as this service spells an ordinal ([`page_token_number`]): ASCII
+    // digits only, so a signed or space-padded payload `str::parse` would otherwise accept
+    // is not honoured as a position. Every ordinal this service mints is numbered from
+    // one, so zero is not one either.
+    let ordinal = u32::try_from(page_token_number(payload)?).ok()?;
     (ordinal > 0).then_some(ordinal)
 }
 
@@ -2408,16 +2456,20 @@ pub fn encode_keyed_page_token(marker: &str, key: &str, resource_id: &str) -> St
 /// Decode a token [`encode_keyed_page_token`] produced for the collection and order
 /// `marker` names, as the key's own text and the identifier that broke its tie, or `None`
 /// when it was not one — a string that is not hex, does not decode to UTF-8, carries
-/// another collection's or another order's marker (or none), or holds no identifier.
+/// another collection's or another order's marker (or none), or holds no identifier this
+/// service would have minted.
 ///
-/// Split at the LAST `:`, because every identifier this service pages over is `[0-9a-z]+`
+/// Split at the LAST `:`, because every identifier this service pages over is minted hex
 /// and so cannot contain one, while a key's text may.
 pub fn decode_keyed_page_token(marker: &str, token: &str) -> Option<(String, String)> {
     let bytes = ::hex::decode(token).ok()?;
     let decoded = String::from_utf8(bytes).ok()?;
     let payload = decoded.strip_prefix(marker)?;
     let (key, resource_id) = payload.rsplit_once(':')?;
-    if !is_resource_id(resource_id) {
+    // The tie-breaker has to be an identifier this service MINTS, exactly as the
+    // instant-keyed codec above checks: a token is a position this service named, and no
+    // id it ever named falls outside that form.
+    if !is_minted_id(resource_id) {
         return None;
     }
     Some((key.to_string(), resource_id.to_string()))

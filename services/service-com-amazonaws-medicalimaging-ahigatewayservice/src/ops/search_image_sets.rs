@@ -535,9 +535,12 @@ impl SortKey {
     /// or `None` when the text is not one this service would have written for that field.
     fn parse(field: SortField, text: &str) -> Option<Self> {
         match field {
+            // An instant is read back through the service's own reader
+            // (`crate::state::parse_page_token_instant`), so a pair of numbers spelled any
+            // other way than this service writes it is not honoured as a position.
             SortField::UpdatedAt | SortField::CreatedAt => {
-                let (secs, nanos) = text.split_once('.')?;
-                Some(Self::Instant(secs.parse().ok()?, nanos.parse().ok()?))
+                let (secs, nanos) = crate::state::parse_page_token_instant(text)?;
+                Some(Self::Instant(i64::try_from(secs).ok()?, nanos))
             }
             SortField::StudyDateAndTime => Some(Self::Text(text.to_string())),
         }

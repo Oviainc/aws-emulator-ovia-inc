@@ -73,6 +73,8 @@ mod metadata_document_shape;
 mod metadata_document_structure;
 #[path = "all/metadata_merge_depth.rs"]
 mod metadata_merge_depth;
+#[path = "all/page_token_payload_forgery.rs"]
+mod page_token_payload_forgery;
 #[path = "all/regional_isolation.rs"]
 mod regional_isolation;
 #[path = "all/resource_tagging.rs"]

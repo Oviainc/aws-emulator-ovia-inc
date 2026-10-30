@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_medicalimaging_ahigatewayservice::state::DATASTORE_DELETION_DELAY;
 
 use crate::datastore_lifecycle::{Emulator, SETTLE_MULTIPLE};
+use crate::page_token_payload_forgery::{split_issued_token, token_carrying};
 
 /// The `KmsKeyArn` `@pattern` with its anchors stripped — the expression this service
 /// advertises. Source:
@@ -508,8 +509,9 @@ async fn two_violations_are_stated_in_the_plural_envelope() {
 /// token it DID issue is still honoured.
 ///
 /// Rows span the token axis: not hex at all, odd-length hex, hex that decodes to text
-/// without this service's marker, a real token truncated, a real token with a mutated
-/// payload, and a maximum-length token.
+/// without this service's marker, a real token truncated, a real token's marker over a
+/// payload this service would never have written (an unparseable instant, no instant
+/// separator, an identifier outside the form it mints), and a maximum-length token.
 #[tokio::test]
 async fn an_unissued_pagination_token_is_refused_with_the_services_fixed_text() {
     let emulator = Emulator::new();
@@ -532,12 +534,12 @@ async fn an_unissued_pagination_token_is_refused_with_the_services_fixed_text() 
         "case \"issued token\": expected a nextToken on a one-per-page listing, got {first_page:?}"
     );
 
-    let mutated = ::hex::encode(format!(
-        // The marker every token this service mints carries (`PAGE_TOKEN_MARKER` in
-        // `src/ops/list_datastores.rs`), over a payload it would never mint.
-        "ahi-datastores-v1:notanumber.0:{}",
-        "0".repeat(32)
-    ));
+    // The marker the token above really carries, read back OFF it
+    // (`crate::page_token_payload_forgery::split_issued_token`) rather than spelled again
+    // here: a marker names the collection — this listing, its region and its filter — so
+    // a literal copy of one leaves these rows refused at the marker check instead of at
+    // the payload branch each names.
+    let (marker, _, identifier) = split_issued_token("issued token", &issued);
 
     let rows: Vec<(&str, String)> = vec![
         ("not hex at all", "not-a-token".to_string()),
@@ -551,10 +553,17 @@ async fn an_unissued_pagination_token_is_refused_with_the_services_fixed_text() 
             "a real token cut down to its first bytes",
             issued[..10].to_string(),
         ),
-        ("the marker over an unparseable instant", mutated),
+        (
+            "the marker over an unparseable instant",
+            token_carrying(&marker, &format!("notanumber.0:{identifier}")),
+        ),
         (
             "the marker over a payload with no instant separator",
-            ::hex::encode(format!("ahi-datastores-v1:12345:{}", "0".repeat(32))),
+            token_carrying(&marker, &format!("12345:{identifier}")),
+        ),
+        (
+            "the marker over an identifier this service never minted",
+            token_carrying(&marker, &format!("12345.0:{}", "z".repeat(32))),
         ),
         ("a maximum-length token", "a".repeat(8192)),
     ];
