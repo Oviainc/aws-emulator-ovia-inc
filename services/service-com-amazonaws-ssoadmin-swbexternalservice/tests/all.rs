@@ -41,6 +41,8 @@ mod application_access_scope_limits;
 mod application_access_scopes;
 #[path = "all/application_assignment_configuration.rs"]
 mod application_assignment_configuration;
+#[path = "all/application_assignment_conflict.rs"]
+mod application_assignment_conflict;
 #[path = "all/application_assignment_delete.rs"]
 mod application_assignment_delete;
 #[path = "all/application_assignment_describe.rs"]
