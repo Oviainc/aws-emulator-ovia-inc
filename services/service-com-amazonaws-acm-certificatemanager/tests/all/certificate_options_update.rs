@@ -10,8 +10,8 @@
 //! that method while leaving the certificate's own status and each domain's validation
 //! status alone. It applies only to a certificate ACM has ISSUED: while the request is
 //! still being validated, or once it has failed, there is no issued certificate to
-//! reconfigure and the request does not satisfy the operation's constraints, so ACM
-//! answers `ValidationException`. `Export` is fixed at creation
+//! reconfigure and the certificate's processing state is what refuses the call, so ACM
+//! answers `InvalidStateException`. `Export` is fixed at creation
 //! ("You cannot update the value of `Export` after the the certificate is created",
 //! `CertificateOptions$Export` doc), so asking for a different value is refused with
 //! `ValidationException` while asking for the one in force is accepted.

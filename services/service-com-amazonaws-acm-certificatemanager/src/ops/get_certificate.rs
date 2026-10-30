@@ -203,14 +203,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "The certificate request is in process and the certificate in your account
-        // has not yet been issued" (`RequestInProgressException` doc) — the state this
-        // operation has nothing to hand back in, and the retry signal a client polling
-        // for the certificate loops on.
+        // ACM has no material to hand back for a certificate it has not issued, which
+        // is the condition `RequestInProgressException` reports ("the certificate
+        // request is in process and the certificate in your account has not yet been
+        // issued") — the retry signal a client polling for the certificate loops on.
+        // The sentence names the certificate the caller asked for and the account that
+        // holds it, so a client polling many certificates can attribute the refusal.
         let Some(body) = certificate.certificate_body.clone() else {
             return Err(GetCertificateErrorModeled::RequestInProgressException(
                 RequestInProgressException {
-                    message: Some(crate::state::REQUEST_IN_PROGRESS_MESSAGE.to_string()),
+                    message: Some(crate::state::certificate_not_yet_issued_message(
+                        &input.certificate_arn,
+                    )),
                 },
             )
             .into());

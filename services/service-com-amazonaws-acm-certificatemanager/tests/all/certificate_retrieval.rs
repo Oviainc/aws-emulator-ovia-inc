@@ -30,14 +30,14 @@ use crate::certificate_lifecycle::{
     router, router_with_engine, ACCOUNT, REGION,
 };
 
-/// The `RequestInProgressException` sentence the rule requires. The model documents the
-/// whole error class in one sentence — "The certificate request is in process and the
-/// certificate in your account has not yet been issued"
-/// (`smithy_query(query="doc", shape="com.amazonaws.acm#RequestInProgressException")`) —
-/// and that is what the refusal reports.
-const REQUEST_IN_PROGRESS_MESSAGE: &str =
-    "The certificate request is in process and the certificate in your account has not yet \
-     been issued.";
+/// The `RequestInProgressException` sentence the rule requires for a certificate ACM
+/// has not issued, as ACM's recorded behaviour words it: the certificate the request
+/// named and the account that holds it, inside fixed text and with no terminating
+/// period. Written out here rather than imported from the service, so the template is
+/// not asserted against itself.
+fn expected_not_yet_issued_message(arn: &str) -> String {
+    format!("Certificate {arn} in account {ACCOUNT} not yet issued")
+}
 
 /// One retrieval case: what it exercises, the certificate to generate, how many
 /// certificates the chain the import carries holds (`0` for an import with no chain),
@@ -368,8 +368,8 @@ async fn a_reimport_replaces_the_material_under_its_arn() {
 }
 
 /// RULE: a resource this service holds no certificate for is refused with HTTP 400
-/// `RequestInProgressException` and the documented sentence — never with an answer
-/// carrying no material.
+/// `RequestInProgressException`, under the sentence naming the certificate the request
+/// asked for and the account that holds it — never with an answer carrying no material.
 #[tokio::test]
 async fn a_certificate_with_no_material_reports_the_in_progress_refusal() {
     let (router, engine) = router_with_engine();
@@ -414,9 +414,10 @@ async fn a_certificate_with_no_material_reports_the_in_progress_refusal() {
             "case {case:?}: expected 400 RequestInProgressException, got {status} {response}"
         );
         let message = error_message(&response);
+        let expected = expected_not_yet_issued_message(arn);
         assert_eq!(
-            message, REQUEST_IN_PROGRESS_MESSAGE,
-            "case {case:?}: expected message {REQUEST_IN_PROGRESS_MESSAGE:?}, got {message:?}"
+            message, expected,
+            "case {case:?}: expected message {expected:?}, got {message:?}"
         );
     }
 }

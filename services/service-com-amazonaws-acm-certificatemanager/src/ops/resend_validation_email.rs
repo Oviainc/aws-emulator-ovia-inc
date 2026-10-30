@@ -288,13 +288,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Beyond here the request is well formed and the only question is whether this
-        // certificate still has validation mail to send for that domain.
+        // certificate still has validation mail to send for that domain. A domain ACM
+        // proves control of by another method has no approval mail at all, and the
+        // sentence says so by naming the certificate, the method the resend is for and
+        // the domain the request asked about — never the method in force, which
+        // `DescribeCertificate` reports.
         let validation = &certificate.domain_validations[index];
         if validation.validation_method != crate::state::VALIDATION_METHOD_EMAIL {
-            let method = validation.validation_method.clone();
             return Err(invalid_state(format!(
-                "The domain {} of certificate {} is validated by {method}, not by email.",
-                input.domain, input.certificate_arn
+                "Certificate {} is not using {} validation for domain {}",
+                input.certificate_arn,
+                crate::state::VALIDATION_METHOD_EMAIL,
+                input.domain
             )));
         }
         if validation.validation_status != crate::state::DOMAIN_STATUS_PENDING_VALIDATION {
@@ -307,13 +312,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // ACM sends the FIRST validation mail itself, a bounded span after it accepts
         // the request: while that dispatch is still owed the request is still being
-        // processed and there is no message to RE-send yet.
+        // processed and there is no message to RE-send yet. The sentence is ACM's own
+        // fixed text for that short-lived gate — it names nothing of the request, which
+        // is what tells it apart from the refusals above that name the certificate and
+        // the domain they were asked about.
         if certificate.pending_validation_email.is_some() {
-            return Err(invalid_state(format!(
-                "The request for certificate {} is still in progress: its initial domain \
-                 validation email has not been sent yet. Try again later.",
-                input.certificate_arn
-            )));
+            return Err(invalid_state(REQUEST_STILL_IN_PROGRESS_MESSAGE.to_string()));
         }
 
         // "If more than 72 hours have elapsed since your original request or since
@@ -366,3 +370,16 @@ fn invalid_state(message: String) -> ResendValidationEmailError {
     })
     .into()
 }
+
+/// The `InvalidStateException` message for a resend asked for before ACM has dispatched
+/// the certificate's first validation mail.
+///
+/// `InvalidStateException` carries one modelled member (`message: String`) and the model
+/// documents no text for it, so the sentence comes from ACM's recorded behaviour for
+/// this gate: ONE constant sentence saying the request is still being processed and to
+/// try again, naming nothing of the request and terminated by no period. The gate is
+/// short-lived — the identical call succeeds once the dispatch the clock owed has
+/// happened — and this sentence is the only thing that tells it apart from the refusals
+/// that will never succeed, so it is fixed text rather than a rendering of the request.
+const REQUEST_STILL_IN_PROGRESS_MESSAGE: &str =
+    "The certificate request is still in progress. Try again later";

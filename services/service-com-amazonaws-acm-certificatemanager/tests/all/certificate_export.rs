@@ -34,12 +34,13 @@ fn expected_not_export_enabled_message(arn: &str) -> String {
     format!("Certificate ARN: {arn} is not an export enabled certificate")
 }
 
-/// The `RequestInProgressException` sentence, the error class's own documented sentence
-/// ("The certificate request is in process and the certificate in your account has not
-/// yet been issued").
-const EXPECTED_REQUEST_IN_PROGRESS_MESSAGE: &str =
-    "The certificate request is in process and the certificate in your account has not yet \
-     been issued.";
+/// The `RequestInProgressException` sentence ACM answers when it holds no issued
+/// material for the certificate the request named: the ARN from the request and the
+/// account that ARN names, inside fixed text and with no terminating period — the same
+/// sentence `GetCertificate` reports for the same gap.
+fn expected_not_yet_issued_message(arn: &str) -> String {
+    format!("Certificate {arn} in account {ACCOUNT} not yet issued")
+}
 
 /// The `ResourceNotFoundException` sentence ACM answers when the ARN resolves but names
 /// no ISSUED certificate, as recorded against the real service.
@@ -211,7 +212,7 @@ async fn export_classifies_the_certificate_the_request_names() {
             &issued_enabled,
             b"Sim2RealPass123".to_vec(),
             "RequestInProgressException",
-            EXPECTED_REQUEST_IN_PROGRESS_MESSAGE.to_string(),
+            expected_not_yet_issued_message(&issued_enabled),
         ),
         (
             "a certificate ARN no record answers to",

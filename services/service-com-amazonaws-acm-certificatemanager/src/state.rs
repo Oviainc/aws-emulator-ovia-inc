@@ -2514,11 +2514,29 @@ pub const NOT_ISSUED_MESSAGE: &str = "The selected certificate is not Issued and
 /// the model documents the whole error class in one sentence — "The certificate request
 /// is in process and the certificate in your account has not yet been issued"
 /// (`RequestInProgressException` doc) — so that sentence, terminated by a period, is
-/// what the refusal reports. Rendered here so every path that needs an existing
-/// certificate body reports the same sentence.
+/// what the refusal reports. Rendered here so every path that reports a request ACM is
+/// still working on, without naming a certificate it has no material for, reports the
+/// same sentence.
 pub const REQUEST_IN_PROGRESS_MESSAGE: &str =
     "The certificate request is in process and the certificate in your account has not yet \
      been issued.";
+
+/// The `RequestInProgressException` message for a request that asks for the material of
+/// a certificate ACM has not issued, built from the ARN the request asked for.
+///
+/// `RequestInProgressException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence comes from ACM's recorded behaviour
+/// for this condition: `Certificate `, the requested ARN, ` in account ` and the
+/// account that ARN names, then ` not yet issued`, with no terminating period. The
+/// account is read off the ARN the caller addressed — the field that says whose
+/// certificate it is, as [`certificate_domain_not_found_message`] reads it — so the
+/// sentence can never name an account the request did not address. Rendered here so
+/// every path that holds no issued material for a certificate ARN reports one template.
+pub fn certificate_not_yet_issued_message(certificate_arn: &str) -> String {
+    let account =
+        acm_arn_account(certificate_arn).unwrap_or_else(|| ::engine::emulator_account_id());
+    format!("Certificate {certificate_arn} in account {account} not yet issued")
+}
 
 /// The refusal sentence for a pagination token the service did not issue.
 ///
@@ -2667,6 +2685,19 @@ pub fn not_pending_validation_message(certificate_arn: &str) -> String {
 /// certificate nor its status.
 pub const IMPORTED_CERTIFICATE_OPTIONS_MESSAGE: &str =
     "The UpdateCertificateOptions command is not permitted for imported certificates.";
+
+/// The `ValidationException` message `UpdateCertificateOptions` answers for a request
+/// that asks for an `Export` value other than the one the certificate carries.
+///
+/// "You cannot update the value of Export after the the certificate is created"
+/// (`CertificateOptions$Export` doc), so the member is fixed at creation.
+/// `ValidationException` carries one modelled member (`message: String`) and the model
+/// documents no text for it, so the sentence comes from ACM's recorded behaviour for
+/// this refusal: ONE constant sentence naming the member that cannot be updated, and
+/// neither the certificate, nor the value in force, nor the one asked for, and
+/// terminated by no period.
+pub const EXPORT_OPTION_NOT_UPDATABLE_MESSAGE: &str =
+    "Export option for certificates cannot be updated";
 
 /// The `ValidationException` message `RenewCertificate` answers for a certificate ACM
 /// does not renew, built from the ARN the request asked for.

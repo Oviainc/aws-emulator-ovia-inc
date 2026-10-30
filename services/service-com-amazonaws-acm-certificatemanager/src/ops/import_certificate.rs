@@ -371,8 +371,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// `InvalidParameterException` ("an input parameter was invalid"), the refusal ACM
-/// answers for a request whose bodies break one of the guidelines this operation's own
-/// documentation lists for a third-party certificate.
+/// answers for a PARAMETER of the request that is invalid rather than for the material
+/// it carries: the `CertificateArn` a reimport may not address, the `Tags` a reimport
+/// may not carry, and certificate CONTENT that decodes but asserts nothing ACM can
+/// record a certificate under (an empty issuer field, no name at all). Material ACM
+/// cannot read or will not hold is [`validation_exception`] instead.
 fn invalid_parameter(message: impl Into<String>) -> ImportCertificateError {
     ImportCertificateErrorModeled::InvalidParameterException(InvalidParameterException {
         message: Some(message.into()),
@@ -504,13 +507,18 @@ impl ImportedCertificate {
 /// its own encoding and its own members' validity ([`certificate_chain`]) and nothing
 /// else. Nothing here verifies a signature: no key of the issuing authority is
 /// reachable from this service.
+///
+/// Every one of those is a defect of the MATERIAL the request carries rather than of a
+/// parameter naming what to operate on, so each is the modelled constraint failure for
+/// supplied input ([`validation_exception`]) under the sentence naming the defect; what
+/// stays an invalid PARAMETER is certificate content that decodes and is reported on,
+/// but asserts nothing ACM can store a certificate under.
 fn imported_certificate(
     input: &ImportCertificateInput,
     now: ::std::time::SystemTime,
 ) -> Result<ImportedCertificate, ImportCertificateError> {
-    let certificate = X509Certificate::from_pem(&input.certificate).map_err(|_| {
-        invalid_parameter("the Certificate must be one PEM-encoded X.509 certificate")
-    })?;
+    let certificate =
+        X509Certificate::from_pem(&input.certificate).map_err(|_| certificate_not_pem())?;
 
     let chain_pem = input
         .certificate_chain
@@ -526,11 +534,23 @@ fn imported_certificate(
         ));
     }
 
+    // "The current time must be between the Not Before and Not After certificate
+    // fields" (this operation's doc): a certificate outside its own validity window is
+    // material ACM will not hold, so the import is refused under the sentence that says
+    // WHICH end of the window excludes it — the same sentence form the chain's own
+    // members are held to ([`certificate_chain`]).
     let not_before = tbs.validity.not_before.to_system_time();
     let not_after = tbs.validity.not_after.to_system_time();
-    if now < not_before || now > not_after {
-        return Err(invalid_parameter(
-            "the current time must be between the certificate's Not Before and Not After fields",
+    if now > not_after {
+        return Err(validation_exception(
+            "The certificate is expired. You can Import a certificate only during its \
+             validity period.",
+        ));
+    }
+    if now < not_before {
+        return Err(validation_exception(
+            "The certificate is not valid yet. You can Import a certificate only during its \
+             validity period.",
         ));
     }
 
@@ -557,7 +577,7 @@ fn imported_certificate(
     check_private_key(&input.private_key, &public_key)?;
 
     Ok(ImportedCertificate {
-        body: pem_text(&input.certificate, "Certificate")?,
+        body: certificate_pem_text(&input.certificate)?,
         chain: chain_pem,
         domain_name,
         subject_alternative_names: names,
@@ -639,6 +659,15 @@ fn chain_not_pem() -> ImportCertificateError {
     validation_exception("The certificate chain is not PEM-encoded or is not valid.")
 }
 
+/// The refusal for a `Certificate` body that is not one PEM-encoded X.509 certificate —
+/// bytes that are not text, text framing no PEM message, a body whose base64 content
+/// cannot be decoded, or one whose content does not decode as a certificate. The
+/// counterpart of [`chain_not_pem`] for the member that carries the certificate being
+/// imported, under the same sentence form.
+fn certificate_not_pem() -> ImportCertificateError {
+    validation_exception("The certificate is not PEM-encoded or is not valid.")
+}
+
 /// The PEM type labels the encapsulation boundaries in `text` carry, in the order they
 /// appear — empty for text that frames no PEM message at all. Each boundary is read by
 /// the PEM reader the X.509 crate already brings (`x509_cert::der::pem`) rather than
@@ -652,10 +681,12 @@ fn pem_labels(text: &str) -> Vec<&str> {
 }
 
 /// `ValidationException` ("the supplied input failed to satisfy constraints of an
-/// Amazon Web Services service"), the refusal ACM answers for certificate material that
-/// is not what the member it arrived in can hold — a chain that is not a chain, a
-/// private key that is not this certificate's. Each such refusal is told apart from the
-/// others by its own sentence alone, so the message is fixed text.
+/// Amazon Web Services service"), the refusal ACM answers for defective certificate
+/// MATERIAL: a body it cannot read as the PEM the member it arrived in holds (the
+/// certificate, the chain, the private key), a certificate outside its own validity
+/// window, a key that is not this certificate's, a key type it has no `KeyAlgorithm`
+/// for. Each such refusal is told apart from the others by its own sentence alone, so
+/// the message is fixed text.
 fn validation_exception(message: &str) -> ImportCertificateError {
     ImportCertificateErrorModeled::ValidationException(ValidationException {
         message: Some(message.to_string()),
@@ -663,7 +694,7 @@ fn validation_exception(message: &str) -> ImportCertificateError {
     .into()
 }
 
-/// The PEM body `member` carried, as the text ACM stores it as.
+/// The `Certificate` body, as the text ACM stores it as.
 ///
 /// "The certificate, private key, and certificate chain must be PEM-encoded"
 /// (`ImportCertificate` doc), and PEM is a text encoding, so a blob that is not text at
@@ -675,9 +706,8 @@ fn validation_exception(message: &str) -> ImportCertificateError {
 /// back with the newlines alone, so a body that arrived with CRLF endings is stored
 /// without the carriage returns. Nothing else about the body is touched: the
 /// certificate the client brought is the certificate ACM serves.
-fn pem_text(body: &[u8], member: &str) -> Result<String, ImportCertificateError> {
-    let text = ::std::str::from_utf8(body)
-        .map_err(|_| invalid_parameter(format!("the {member} must be PEM-encoded text")))?;
+fn certificate_pem_text(body: &[u8]) -> Result<String, ImportCertificateError> {
+    let text = ::std::str::from_utf8(body).map_err(|_| certificate_not_pem())?;
     Ok(stored_pem(text))
 }
 
@@ -792,9 +822,12 @@ fn check_private_key(
     private_key: &[u8],
     public: &PublicKey,
 ) -> Result<(), ImportCertificateError> {
-    let malformed = || {
-        invalid_parameter("the PrivateKey must be an unencrypted PEM-encoded private key")
-    };
+    // A body this member cannot hold at all: not text, framing no PEM private key, or
+    // framing one whose content does not decode as a key — including the encrypted key
+    // the operation's guidelines exclude, which carries its own PEM label. The sentence
+    // form is the one each unreadable body is refused under.
+    let malformed =
+        || validation_exception("The private key is not PEM-encoded or is not valid.");
     // The key is well-formed but belongs to another key pair: material that is not what
     // this member can hold for this certificate, under the fixed sentence that names it.
     let mismatched = || validation_exception("Key provided does not match the certificate.");

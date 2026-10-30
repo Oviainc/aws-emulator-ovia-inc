@@ -75,6 +75,8 @@ mod certificate_list_filters;
 mod certificate_not_found_message;
 #[path = "all/certificate_options_update.rs"]
 mod certificate_options_update;
+#[path = "all/certificate_refusal_classes.rs"]
+mod certificate_refusal_classes;
 #[path = "all/certificate_retrieval.rs"]
 mod certificate_retrieval;
 #[path = "all/certificate_revocation.rs"]

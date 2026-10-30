@@ -616,8 +616,10 @@ async fn a_reimport_replaces_the_certificate_under_the_same_arn() {
 }
 
 /// RULE: each guideline this operation documents for a third-party certificate is a
-/// refusal of the request, under the modelled error for what was wrong with it — never
-/// a stored certificate and never a 501.
+/// refusal of the request, under the modelled error for what was wrong with it — the
+/// constraint failure for supplied input wherever the MATERIAL is what ACM cannot read
+/// or will not hold, and the invalid-parameter class for the request's own parameters —
+/// never a stored certificate and never a 501.
 #[tokio::test]
 async fn an_import_that_breaks_a_guideline_is_refused() {
     let router = router();
@@ -659,7 +661,7 @@ async fn an_import_that_breaks_a_guideline_is_refused() {
                 "Certificate": blob("this is not a certificate"),
                 "PrivateKey": blob(&valid.private_key),
             }),
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "the Certificate is a PEM block that is not a certificate",
@@ -667,22 +669,22 @@ async fn an_import_that_breaks_a_guideline_is_refused() {
                 "Certificate": blob("-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n"),
                 "PrivateKey": blob(&valid.private_key),
             }),
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "the certificate's validity window has closed",
             import_body(&expired),
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "the certificate's validity window has not opened",
             import_body(&not_yet),
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             // Material ACM has no `KeyAlgorithm` to report the certificate under is
-            // supplied input that fails the service's constraints, not an invalid
-            // input parameter.
+            // supplied input that fails the service's constraints, like every other
+            // defect of the material a request carries.
             "the certificate's key algorithm is not one ACM declares",
             import_body(&unsupported),
             "ValidationException",
@@ -693,7 +695,7 @@ async fn an_import_that_breaks_a_guideline_is_refused() {
                 "Certificate": blob(&valid.certificate),
                 "PrivateKey": blob("not a key"),
             }),
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             "the PrivateKey is encrypted",
@@ -701,7 +703,7 @@ async fn an_import_that_breaks_a_guideline_is_refused() {
                 "Certificate": blob(&valid.certificate),
                 "PrivateKey": blob(&encrypted),
             }),
-            "InvalidParameterException",
+            "ValidationException",
         ),
         (
             // `rcgen` writes the optional public key into the PKCS#8 EC key it

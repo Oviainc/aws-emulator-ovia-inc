@@ -18,8 +18,7 @@
 //!    RFC 6761), is the exception ACM refuses up front.
 //! 2. An operation that needs an ISSUED certificate and is handed one in any other
 //!    status reports a PROCESSING STATE, `InvalidStateException` (HTTP 400) — a refusal
-//!    the same request stops drawing once the certificate is issued — and never the
-//!    `ValidationException` that says the request itself can never be served.
+//!    the same request stops drawing once the certificate is issued.
 //! 3. A DNS validation's CNAME target is a name under the validation's OWN subdomain of
 //!    the ACM validation zone: `_<token>.<per-validation label>.acm-validations.<zone>.`
 //!    — a token label, then a label of its own, then the zone.

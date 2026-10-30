@@ -20,11 +20,12 @@
 //!   certificate to reconfigure. That is a fact about the certificate's PROCESSING
 //!   STATE rather than about the request, which is well formed and becomes servable the
 //!   moment the certificate is issued, so it is refused with `InvalidStateException`
-//!   ("processing has reached an invalid state") and not with the `ValidationException`
-//!   that tells a client its request can never be served;
+//!   ("processing has reached an invalid state") under the one sentence ACM reports for
+//!   that whole class ([`crate::state::NOT_ISSUED_MESSAGE`]);
 //! * `Export` "cannot [be updated] after the the certificate is created"
 //!   (`CertificateOptions$Export` doc), so a request naming a different value than the
-//!   certificate carries is refused with `ValidationException`.
+//!   certificate carries is refused with `ValidationException` — a fact of the request
+//!   rather than of the certificate's status, so it is decided before the status.
 //!
 //! ## Shape of an operation
 //!
@@ -247,6 +248,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "You cannot update the value of Export after the the certificate is created"
+        // (`CertificateOptions$Export` doc). That is a fact of the REQUEST — this
+        // member can never be changed, whatever the certificate's status — so it is
+        // decided before the status precondition below. Naming the value the
+        // certificate already carries asks for no change and is accepted, so a client
+        // that reads the options and writes them back unchanged is not refused.
+        let current_export = crate::state::export_option(certificate);
+        if let Some(requested) = input.options.export.as_deref() {
+            if requested != current_export {
+                return Err(UpdateCertificateOptionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::EXPORT_OPTION_NOT_UPDATABLE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
         // The options this operation updates are those of an ISSUED certificate: a
         // request ACM is still validating has not produced one yet, a request that
         // failed or timed out never will, and a revoked or expired one no longer has a
@@ -263,26 +284,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
-
-        // "You cannot update the value of Export after the the certificate is created"
-        // (`CertificateOptions$Export` doc). Naming the value the certificate already
-        // carries asks for no change and is accepted, so a client that reads the
-        // options and writes them back unchanged is not refused.
-        let current_export = crate::state::export_option(certificate);
-        if let Some(requested) = input.options.export.as_deref() {
-            if requested != current_export {
-                return Err(UpdateCertificateOptionsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "Options.Export cannot be updated after the certificate is created: \
-                             this certificate was created with Export {current_export}, and the \
-                             request asks for {requested}"
-                        )),
-                    },
-                )
-                .into());
-            }
         }
 
         // Each member the request names replaces the stored one; one it omits is not

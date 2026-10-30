@@ -269,10 +269,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // yet been issued". This service mints no key pair for a certificate it was
         // asked to issue, so that material is what it does not hold for the record
         // reaching here — the same gap `GetCertificate` reports with the same modelled
-        // error for the same record.
+        // error and the same sentence for the same record. No recording of this
+        // operation words that refusal, so the sentence is the one recorded for the gap
+        // itself rather than a second wording for one condition.
         Err(ExportCertificateErrorModeled::RequestInProgressException(
             RequestInProgressException {
-                message: Some(crate::state::REQUEST_IN_PROGRESS_MESSAGE.to_string()),
+                message: Some(crate::state::certificate_not_yet_issued_message(
+                    &input.certificate_arn,
+                )),
             },
         )
         .into())
