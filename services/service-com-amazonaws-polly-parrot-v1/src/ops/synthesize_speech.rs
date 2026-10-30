@@ -38,8 +38,9 @@
 //! * `RequestCharacters` is the billed character count — every character of plain
 //!   text, and for `ssml` the text content only, because "SSML tags are not counted
 //!   as billed characters";
-//! * `SampleRate` is checked against the values the model documents for the chosen
-//!   format, and defaults per format and engine the same way;
+//! * `SampleRate` is a string whose domain the model enumerates per format, so it is
+//!   accepted only when it is one of those spellings exactly, and defaults per format
+//!   and engine the same way;
 //! * the text limits (6000 total / 3000 billed characters) are enforced;
 //! * `json` output is a real speech-mark stream: the sentence and word marks are
 //!   computed from the text itself — their `start`/`end` offsets and `value` come
@@ -277,21 +278,40 @@ pub fn content_type_for(output_format: &str) -> Option<&'static str> {
     })
 }
 
-/// The `SampleRate` values valid for `output_format`.
+/// The `SampleRate` values valid for `output_format`, as the STRINGS the
+/// documentation enumerates.
 ///
 /// Verbatim from `SynthesizeSpeechInput$SampleRate`'s documentation: "The valid
-/// values for mp3 and ogg_vorbis are 8000, 16000, 22050, 24000, 44100 and 48000 …
-/// Valid values for pcm are 8000 and 16000 … Valid value for ogg_opus is 48000 …
-/// Valid value for mu-law and a-law is 8000." `json` carries speech marks rather than
-/// audio, so no sample rate applies to it.
-pub fn valid_sample_rates(output_format: &str) -> &'static [u32] {
+/// values for mp3 and ogg_vorbis are \"8000\", \"16000\", \"22050\", \"24000\",
+/// \"44100\" and \"48000\" … Valid values for pcm are \"8000\" and \"16000\" … Valid
+/// value for ogg_opus is \"48000\" … Valid value for mu-law and a-law is \"8000\"."
+/// `json` carries speech marks rather than audio, so no sample rate applies to it.
+///
+/// `SampleRate` is a string member whose domain the documentation gives as these
+/// quoted spellings, so the set is kept as strings: membership is a comparison of the
+/// caller's characters with them, not of a number parsed out of them.
+pub fn valid_sample_rates(output_format: &str) -> &'static [&'static str] {
     match output_format {
-        "mp3" | "ogg_vorbis" => &[8000, 16000, 22050, 24000, 44100, 48000],
-        "pcm" => &[8000, 16000],
-        "ogg_opus" => &[48000],
-        "mulaw" | "alaw" => &[8000],
+        "mp3" | "ogg_vorbis" => &["8000", "16000", "22050", "24000", "44100", "48000"],
+        "pcm" => &["8000", "16000"],
+        "ogg_opus" => &["48000"],
+        "mulaw" | "alaw" => &["8000"],
         _ => &[],
     }
+}
+
+/// The frequency in Hz that `requested` names for `output_format`, or `None` when that
+/// format's documented value set does not contain that exact spelling.
+///
+/// The caller's string has to BE one of the enumerated values — a spelling that merely
+/// denotes the same number (a leading sign, leading zeros, surrounding space) is not in
+/// the set and is therefore refused. The Hz figure is then read off the matched
+/// enumerated value, so it can only ever be one of the documented frequencies.
+pub fn resolve_sample_rate(output_format: &str, requested: &str) -> Option<u32> {
+    valid_sample_rates(output_format)
+        .iter()
+        .find(|valid| **valid == requested)
+        .and_then(|valid| valid.parse::<u32>().ok())
 }
 
 /// The sample rate used when the request names none.
@@ -1223,16 +1243,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let sample_rate: Option<u32> = if output_format == "json" {
             None
         } else {
-            let valid = valid_sample_rates(output_format);
             Some(match input.sample_rate.as_deref() {
-                Some(requested) => {
-                    let parsed = requested.parse::<u32>().ok().filter(|r| valid.contains(r));
-                    parsed.ok_or_else(|| {
+                Some(requested) => resolve_sample_rate(output_format, requested).ok_or_else(
+                    || {
                         SynthesizeSpeechErrorModeled::InvalidSampleRateException(
                             crate::service::errors::invalid_sample_rate(),
                         )
-                    })?
-                }
+                    },
+                )?,
                 None => default_sample_rate(output_format, engine),
             })
         };
@@ -1419,8 +1437,10 @@ mod tests {
 
     #[test]
     fn mp3_frames_carry_a_valid_header_for_every_documented_rate() {
-        for rate in valid_sample_rates("mp3") {
-            let bytes = audio::mp3_silence(*rate, 1_000).expect("mp3 supports this rate");
+        for spelling in valid_sample_rates("mp3") {
+            let rate = resolve_sample_rate("mp3", spelling)
+                .unwrap_or_else(|| panic!("rate {spelling:?} is one of mp3's documented values"));
+            let bytes = audio::mp3_silence(rate, 1_000).expect("mp3 supports this rate");
             assert!(
                 !bytes.is_empty(),
                 "rate {rate}: expected frames, got an empty stream"
