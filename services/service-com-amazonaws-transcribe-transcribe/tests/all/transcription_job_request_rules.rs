@@ -528,10 +528,15 @@ fn references() -> Vec<Reference> {
         Reference {
             case: "LanguageIdSettings[es-US].VocabularyFilterName",
             kind: "vocabulary filter",
+            // The per-language member documents the same co-requirement with
+            // `VocabularyFilterMethod` the top-level one does, and the map models no
+            // method of its own, so the row carries it in `Settings`: what is under
+            // test is the family lookup, not that rule.
             members: |name| {
                 json!({
                     "LanguageCode": Value::Null,
                     "IdentifyMultipleLanguages": true,
+                    "Settings": {"VocabularyFilterMethod": "mask"},
                     "LanguageIdSettings": {"es-US": {"VocabularyFilterName": name}}
                 })
             },

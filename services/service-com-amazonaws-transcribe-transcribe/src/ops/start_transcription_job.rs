@@ -444,6 +444,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The vocabulary-filter co-requirement is documented on the per-language
+        // `LanguageIdSettings$VocabularyFilterName` word for word as it is on the
+        // top-level member, and that map models no method of its own, so a filter named
+        // in any of its entries is satisfied by the same
+        // `Settings.VocabularyFilterMethod` and refused when nothing names one — see
+        // [`crate::state::language_id_filter_method_error`], which both operations
+        // accepting the map read it through.
+        if let Some(message) = crate::state::language_id_filter_method_error(
+            "LanguageIdSettings",
+            input.language_id_settings.as_ref(),
+            "Settings.VocabularyFilterMethod",
+            settings.is_some_and(|settings| settings.vocabulary_filter_method.is_some()),
+        ) {
+            return Err(bad_request(&message));
+        }
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 

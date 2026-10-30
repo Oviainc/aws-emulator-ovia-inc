@@ -112,9 +112,13 @@ fn reference_rows() -> Vec<Reference> {
         },
         Reference {
             case: "Settings.LanguageIdSettings[es-US].VocabularyFilterName",
+            // The per-language member documents the same co-requirement with
+            // `VocabularyFilterMethod` the top-level one does, so the row carries the
+            // method too: what is under test is the family lookup, not that rule.
             settings: |name| {
                 json!({
                     "LanguageOptions": ["en-US", "es-US"],
+                    "VocabularyFilterMethod": "tag",
                     "LanguageIdSettings": {"es-US": {"VocabularyFilterName": name}}
                 })
             },

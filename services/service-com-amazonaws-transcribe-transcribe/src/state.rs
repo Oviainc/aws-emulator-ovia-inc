@@ -1392,6 +1392,45 @@ pub fn extend_language_id_references<'a>(
     }
 }
 
+/// The refusal for a request whose per-language `LanguageIdSettings` names a custom
+/// vocabulary filter while the request names no method to apply it with, or `None` when
+/// no entry of the map names a filter or the method is in the request.
+///
+/// `LanguageIdSettings$VocabularyFilterName` carries the very sentence its top-level
+/// sibling does — "Note that if you include `VocabularyFilterName` in your request, you
+/// must also include `VocabularyFilterMethod`" (`smithy_query(query="shape",
+/// shape="LanguageIdSettings,Settings")`) — so a filter named in the map is the same
+/// one-way co-requirement [`missing_companion_error`] words for the top-level member,
+/// and is refused rather than stored. The map itself models no method member, so what
+/// satisfies the requirement is the settings shape's `VocabularyFilterMethod`, the one
+/// member of either start request that says how a filter is applied; the caller spells
+/// both paths, as `method_member` and `map_member` are given here. Single-homed beside
+/// [`extend_language_id_references`] for its reason: the operations that accept the map
+/// cannot end up checking different members of it. The entries are walked in
+/// language-code order rather than the map's own, so which entry a refusal names is the
+/// same on every run.
+pub fn language_id_filter_method_error(
+    map_member: &str,
+    per_language: Option<&std::collections::HashMap<String, LanguageIdSettings>>,
+    method_member: &str,
+    method_present: bool,
+) -> Option<String> {
+    let language = per_language?
+        .iter()
+        .filter(|(_, settings)| settings.vocabulary_filter_name.is_some())
+        .map(|(language, _)| language)
+        .min()?;
+    // Reaching here IS the member being present: the walk above answered `None` unless
+    // some entry named a filter, so the one side of the pair left to decide is the
+    // method.
+    missing_companion_error(
+        &format!("{map_member}[{language}].VocabularyFilterName"),
+        true,
+        method_member,
+        method_present,
+    )
+}
+
 /// The most tags one Amazon Transcribe resource may carry.
 ///
 /// A CHOSEN ceiling, not a modelled one: `TagList` is modelled

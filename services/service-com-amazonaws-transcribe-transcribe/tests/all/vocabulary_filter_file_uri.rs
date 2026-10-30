@@ -613,7 +613,9 @@ struct FilterConsumer {
     /// The member of the reader's answer the stored job sits under.
     job_member: &'static str,
     /// A start request for the job `job` applying the filter `filter`, qualified by the
-    /// vocabulary filter `method` where the member it uses documents one.
+    /// vocabulary filter `method` — which EVERY member that names a filter documents,
+    /// the per-language `LanguageIdSettings` entries included, so every row carries it
+    /// (in the settings shape, the only place either request models the method).
     request: fn(job: &str, filter: &str, method: &str) -> Value,
     /// The filter name the stored job reports.
     stored_reference: fn(&Value) -> Option<&str>,
@@ -653,7 +655,11 @@ fn filter_consumers() -> Vec<FilterConsumer> {
             get: "GetTranscriptionJob",
             name_member: "TranscriptionJobName",
             job_member: "TranscriptionJob",
-            request: |job, filter, _| {
+            // "Note that if you include VocabularyFilterName in your request, you must
+            // also include VocabularyFilterMethod" is documented on the per-language
+            // member too, and `LanguageIdSettings` models no method of its own, so the
+            // method comes from the settings shape.
+            request: |job, filter, method| {
                 json!({
                     "TranscriptionJobName": job,
                     "IdentifyLanguage": true,
@@ -666,7 +672,8 @@ fn filter_consumers() -> Vec<FilterConsumer> {
                     // member="LanguageIdSettings")`).
                     "LanguageOptions": ["en-US"],
                     "Media": {"MediaFileUri": "https://example.invalid/media/clip.mp4"},
-                    "LanguageIdSettings": {"en-US": {"VocabularyFilterName": filter}}
+                    "LanguageIdSettings": {"en-US": {"VocabularyFilterName": filter}},
+                    "Settings": {"VocabularyFilterMethod": method}
                 })
             },
             stored_reference: |job| {

@@ -59,6 +59,8 @@ mod job_output_objects;
 mod job_start_language_model_status;
 #[path = "all/job_start_vocabulary_state.rs"]
 mod job_start_vocabulary_state;
+#[path = "all/language_id_settings_filter_method.rs"]
+mod language_id_settings_filter_method;
 #[path = "all/language_model_delete_requires_the_model.rs"]
 mod language_model_delete_requires_the_model;
 #[path = "all/language_model_encryption_updates.rs"]
