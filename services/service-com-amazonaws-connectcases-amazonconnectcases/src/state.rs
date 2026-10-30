@@ -22,8 +22,9 @@
 //!
 //! The per-request work is bounded the same way, and does not rest on the
 //! boundary validator alone: [`MAX_CASE_FIELD_IDS`],
-//! [`MAX_BATCH_FIELD_IDS`], [`MAX_CUSTOM_RELATED_ITEM_FIELDS`] and
-//! [`MAX_EVENT_INCLUDED_FIELD_IDS`] are re-checked
+//! [`MAX_BATCH_FIELD_IDS`], [`MAX_CUSTOM_RELATED_ITEM_FIELDS`],
+//! [`MAX_EVENT_INCLUDED_FIELD_IDS`], [`MAX_SEARCH_CASE_FIELD_IDS`],
+//! [`MAX_SEARCH_SORTS`] and [`MAX_CASE_FILTER_CLAUSES`] are re-checked
 //! in the handler ([`list_too_long`]),
 //! the scans below are linear in the list length, and a refusal names at most
 //! [`MAX_IDS_NAMED_IN_A_REFUSAL`] ids. A list that carries the same id twice is
@@ -220,6 +221,45 @@ pub const MAX_REQUIRED_FIELDS: usize = 100;
 /// (`smithy_query(query="shape", shape="CaseEventIncludedData")`), re-checked in
 /// the handler for the same reason as [`MAX_CASE_FIELD_IDS`].
 pub const MAX_EVENT_INCLUDED_FIELD_IDS: usize = 400;
+
+/// Most field ids one `SearchCases` request may project: the model's
+/// `SearchCasesRequest$fields` cap of `0..25`, which is also the cap on the
+/// `SearchCasesResponseItem$fields` list each answer carries
+/// (`smithy_query(query="operation", operation="SearchCases")`). Re-checked in
+/// the handler for the same reason as [`MAX_CASE_FIELD_IDS`].
+pub const MAX_SEARCH_CASE_FIELD_IDS: usize = 25;
+
+/// Most sorts one `SearchCases` request may apply: the model's
+/// `SearchCasesRequest$sorts` cap of `0..2`
+/// (`smithy_query(query="operation", operation="SearchCases")`), re-checked in
+/// the handler for the same reason as [`MAX_CASE_FIELD_IDS`].
+pub const MAX_SEARCH_SORTS: usize = 2;
+
+/// Entries one `CaseFilter` list (`andAll` / `orAll`) may carry: the model's
+/// `CaseFilterList` cap of `..10`
+/// (`smithy_query(query="shape", shape="CaseFilterList")`).
+pub const MAX_CASE_FILTER_CLAUSES_PER_LIST: usize = 10;
+
+/// Most clauses ONE `CaseFilter` tree may hold in all. `CaseFilter` nests
+/// through `not`, `andAll` and `orAll` without a modelled bound, so a tree of
+/// `MAX_CASE_FILTER_CLAUSES_PER_LIST`-wide lists grows its clause count
+/// multiplicatively with its depth; the search evaluates every clause against
+/// every candidate case, so the total is bounded here as well, keeping the work
+/// one request can ask for linear in this constant.
+pub const MAX_CASE_FILTER_CLAUSES: usize = 100;
+
+/// Deepest `CaseFilter` nesting the search evaluates, bounding the recursion a
+/// single request can drive for the same reason as
+/// [`MAX_CASE_FILTER_CLAUSES`].
+pub const MAX_CASE_FILTER_DEPTH: usize = 10;
+
+/// Entries one `SearchCases` answer carries when the request names no
+/// `maxResults`: the model documents "When no value is provided, 25 is the
+/// default"
+/// (`smithy_query(query="doc", shape="SearchCasesRequest", member="maxResults")`),
+/// which is this listing's own default rather than the service-wide
+/// [`MAX_PAGE_SIZE`].
+pub const DEFAULT_SEARCH_CASES_PAGE_SIZE: i32 = 25;
 
 /// Most ids a refusal message names, so a refusal over a long list cannot be
 /// amplified into a long response.

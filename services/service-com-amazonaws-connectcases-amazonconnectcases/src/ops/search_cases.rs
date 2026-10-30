@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchCases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchCases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchCases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the domain's stored cases that satisfy the request's
+//! `filter`, `searchTerm` and `sorts`, as abridged case documents projecting the
+//! requested fields, read from [`crate::state`]. It is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,626 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchCases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchCasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SearchCasesErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        // @readonly: it resolves the domain, reports the cases that satisfy the
+        // search criteria, and writes nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchCases"))
+        // Every caller-chosen bound is re-checked BEFORE the store lock is
+        // taken, so no caller-sized work happens while every other request is
+        // blocked, and the scans below are bounded by this code rather than by
+        // the boundary validator alone.
+        let requested_fields = input.fields.unwrap_or_default();
+        if let Some(message) = crate::state::list_too_long(
+            "fields",
+            requested_fields.len(),
+            crate::state::MAX_SEARCH_CASE_FIELD_IDS,
+        ) {
+            return Err(
+                SearchCasesErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+        let sorts = input.sorts.unwrap_or_default();
+        if let Some(message) =
+            crate::state::list_too_long("sorts", sorts.len(), crate::state::MAX_SEARCH_SORTS)
+        {
+            return Err(
+                SearchCasesErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+        // `sortOrder` is an `Order`, so a value that is not one of its members
+        // orders nothing and is a bad request rather than an arbitrary order.
+        // Checked here as well as at the boundary, so the comparison below is
+        // only ever asked about directions this service knows.
+        if let Some(sort) = sorts
+            .iter()
+            .find(|sort| !ORDER_VALUES.contains(&sort.sort_order.as_str()))
+        {
+            return Err(SearchCasesErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "sorts carries sortOrder {}, which is not an Order; the accepted values \
+                     are {}",
+                    sort.sort_order,
+                    ORDER_VALUES.join(", ")
+                ),
+            })
+            .into());
+        }
+        if let Some(message) = input.filter.as_ref().and_then(filter_too_complex) {
+            return Err(
+                SearchCasesErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+        // The page size is settled here too, with the other bounds: the model
+        // documents this listing's own default (25) and ranges `maxResults` at
+        // `1..100`, so a size outside that range is refused rather than
+        // clamped, and the refusal is worded by the same helper every other
+        // listing in this service refuses a page size with.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::DEFAULT_SEARCH_CASES_PAGE_SIZE);
+        if !(1..=crate::state::MAX_PAGE_SIZE).contains(&page_size) {
+            return Err(SearchCasesErrorModeled::ValidationException(
+                crate::state::page_validation_exception(&crate::state::PageError::InvalidMaxResults(
+                    page_size,
+                )),
+            )
+            .into());
+        }
+
+        let store = state.lock();
+        let domain = store
+            .domain(&input.domain_id)
+            .map_err(SearchCasesErrorModeled::ResourceNotFoundException)?;
+
+        // The same reference rule the other case operations apply, in the same
+        // order they apply it (the addressed resource first, then the body): an
+        // id the domain defines no field for cannot be projected, filtered on
+        // or sorted by, because the union's `emptyValue` would make a typo in a
+        // field id indistinguishable from a field that exists and was never
+        // written. Each member is resolved separately, so a refusal names the
+        // one a client has to fix.
+        for (member, ids) in [
+            (
+                "fields",
+                requested_fields
+                    .iter()
+                    .map(|field| field.id.clone())
+                    .collect::<Vec<String>>(),
+            ),
+            (
+                "sorts",
+                sorts.iter().map(|sort| sort.field_id.clone()).collect(),
+            ),
+            (
+                "filter",
+                input
+                    .filter
+                    .as_ref()
+                    .map(filter_field_ids)
+                    .unwrap_or_default(),
+            ),
+        ] {
+            let unknown = domain.unknown_field_ids(ids.iter().map(String::as_str));
+            if !unknown.is_empty() {
+                return Err(SearchCasesErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "{member} names field ids that do not exist in domain {}: {}",
+                        input.domain_id,
+                        crate::state::name_ids(&unknown)
+                    ),
+                })
+                .into());
+            }
+        }
+
+        // A term is compared without regard to case, so it is lowered once
+        // rather than per candidate case.
+        let search_term = input.search_term.unwrap_or_default().to_lowercase();
+        let mut matching: Vec<&crate::state::Case> = domain
+            .cases
+            .values()
+            .filter(|case| {
+                input
+                    .filter
+                    .as_ref()
+                    .is_none_or(|filter| case_matches(case, filter))
+                    && (search_term.is_empty() || matches_search_term(case, &search_term))
+            })
+            .collect();
+        // `totalCount` is "The total number of cases that matched the search
+        // criteria", so it counts every match, not only the ones on this page.
+        let total_count = matching.len() as i64;
+        matching.sort_by(|left, right| compare_cases(left, right, &sorts));
+
+        // The page cursor is the POSITION of the first entry not on the page in
+        // THIS ordering. The other listings in this service key their cursor on
+        // the stored creation instant, which they can because they answer in
+        // creation order; here the request's own `sorts` decide the order, and
+        // no key built from one stored value is monotone along an arbitrary
+        // sort, let alone a descending one. The rank is zero-padded so
+        // lexicographic order over the key is the result order, and carries the
+        // case id so two entries never share a key.
+        let ranked: Vec<(String, &crate::state::Case)> = matching
+            .into_iter()
+            .enumerate()
+            .map(|(rank, case)| (rank_key(rank, &case.case_id), case))
+            .collect();
+
+        let page = crate::state::page(
+            &crate::state::page_scope(
+                "SearchCases",
+                &input.domain_id,
+                &criteria_scope(&search_term, input.filter.as_ref(), &sorts),
+            ),
+            ranked,
+            Some(page_size),
+            input.next_token.as_deref(),
+        )
+        .map_err(|error| {
+            SearchCasesErrorModeled::ValidationException(crate::state::page_validation_exception(
+                &error,
+            ))
+        })?;
+
+        Ok(SearchCasesOutput {
+            cases: page
+                .items
+                .iter()
+                .map(|case| response_item(case, &requested_fields))
+                .collect(),
+            next_token: page.next_token,
+            total_count,
+        })
     }
+}
+
+/// The descending `Order`, one of `ORDER_VALUES` (`Asc | Desc`). Ascending is
+/// the other one, and is how a comparison reads before it is reversed.
+const ORDER_DESCENDING: &str = "Desc";
+
+/// The key one result is placed at in the ordering the request asked for: its
+/// rank, zero-padded so lexicographic order over the key is the result order,
+/// and the case's own id to make the key unique.
+fn rank_key(rank: usize, case_id: &str) -> String {
+    format!("{rank:010}#{case_id}")
+}
+
+/// One abridged case document: the case's identity, the values of exactly the
+/// requested fields, and its tags.
+fn response_item(
+    case: &crate::state::Case,
+    requested: &[FieldIdentifier],
+) -> SearchCasesResponseItem {
+    SearchCasesResponseItem {
+        case_id: case.case_id.clone(),
+        template_id: case.template_id.clone(),
+        // Exactly the requested ids, in the order they were asked for, as
+        // `GetCase` reports them: a field the domain defines but the case holds
+        // no value for reads back as the union's `emptyValue`, and a request
+        // that names no `fields` projects none.
+        fields: requested
+            .iter()
+            .map(|requested| FieldValue {
+                id: requested.id.clone(),
+                value: case
+                    .field_values
+                    .get(&requested.id)
+                    .cloned()
+                    .unwrap_or(FieldValueUnion::emptyValue(EmptyFieldValue {})),
+            })
+            .collect(),
+        tags: crate::state::tags_output(&case.tags),
+    }
+}
+
+/// Order two cases by the request's `sorts`, then by creation order.
+///
+/// A sort's direction orders VALUES, and "no value" is not one: a case that
+/// holds no value for the sort field is placed after every case that holds one,
+/// whichever direction the sort names. Creation order breaks every remaining
+/// tie, so one request's answer never depends on the store's hash iteration
+/// order.
+fn compare_cases(
+    left: &crate::state::Case,
+    right: &crate::state::Case,
+    sorts: &[Sort],
+) -> ::std::cmp::Ordering {
+    use ::std::cmp::Ordering;
+
+    for sort in sorts {
+        let ordering = match (
+            present_value(left, &sort.field_id),
+            present_value(right, &sort.field_id),
+        ) {
+            (Some(left), Some(right)) => {
+                let ordering = total_ordering(left, right);
+                if sort.sort_order == ORDER_DESCENDING {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    (left.created_time, left.case_id.as_str()).cmp(&(right.created_time, right.case_id.as_str()))
+}
+
+/// The value the case holds for `field_id`, or `None` when it holds none. A
+/// stored `emptyValue` is "no value": it is the union's own empty member, and
+/// it is exactly what a field that was never written reads back as.
+fn present_value<'a>(
+    case: &'a crate::state::Case,
+    field_id: &str,
+) -> Option<&'a FieldValueUnion> {
+    case.field_values
+        .get(field_id)
+        .filter(|value| !matches!(value, FieldValueUnion::emptyValue(_)))
+}
+
+/// The order one of AWS's comparisons relates two field values by, or `None`
+/// when none of them does: values of two different union variants are values of
+/// two different types, and nothing orders them, so no ordered `FieldFilter`
+/// may admit such a pair and no `equalTo` may call it equal. A double that is
+/// ordered against nothing (a NaN) is likewise related to nothing, which is
+/// what `partial_cmp` answers for it. `Text`, `Url`, `SingleSelect` and
+/// `DateTime` values are all carried as `stringValue`, and lexicographic order
+/// over an RFC 3339 instant is chronological order.
+fn compared_ordering(
+    left: &FieldValueUnion,
+    right: &FieldValueUnion,
+) -> Option<::std::cmp::Ordering> {
+    match (left, right) {
+        (FieldValueUnion::stringValue(left), FieldValueUnion::stringValue(right))
+        | (FieldValueUnion::userArnValue(left), FieldValueUnion::userArnValue(right)) => {
+            Some(left.cmp(right))
+        }
+        (FieldValueUnion::booleanValue(left), FieldValueUnion::booleanValue(right)) => {
+            Some(left.cmp(right))
+        }
+        (FieldValueUnion::doubleValue(left), FieldValueUnion::doubleValue(right)) => {
+            left.partial_cmp(right)
+        }
+        (FieldValueUnion::emptyValue(_), FieldValueUnion::emptyValue(_)) => {
+            Some(::std::cmp::Ordering::Equal)
+        }
+        _ => None,
+    }
+}
+
+/// Order two field values TOTALLY, for the sort.
+///
+/// A sort needs a TOTAL order — `slice::sort_by` is entitled to panic on a
+/// comparator that is not one — and [`compared_ordering`] is deliberately
+/// partial, so reporting its `None` as a tie would make the relation
+/// intransitive. Here the variant decides first, by a fixed rank, and the
+/// payload only within one variant; every double is ordered, including a NaN,
+/// by `total_cmp`. A field's values all have the field's own declared
+/// `FieldType`, so two variants under one field id do not arise through the
+/// write paths — the rank is what makes the comparator's contract hold anyway,
+/// rather than a behaviour a request can ask for.
+fn total_ordering(left: &FieldValueUnion, right: &FieldValueUnion) -> ::std::cmp::Ordering {
+    use ::std::cmp::Ordering;
+
+    variant_rank(left)
+        .cmp(&variant_rank(right))
+        .then_with(|| match (left, right) {
+            (FieldValueUnion::stringValue(left), FieldValueUnion::stringValue(right))
+            | (FieldValueUnion::userArnValue(left), FieldValueUnion::userArnValue(right)) => {
+                left.cmp(right)
+            }
+            (FieldValueUnion::booleanValue(left), FieldValueUnion::booleanValue(right)) => {
+                left.cmp(right)
+            }
+            (FieldValueUnion::doubleValue(left), FieldValueUnion::doubleValue(right)) => {
+                left.total_cmp(right)
+            }
+            // Equal ranks mean one variant, and the only one left carries no
+            // payload to compare.
+            _ => Ordering::Equal,
+        })
+}
+
+/// The fixed rank of a value's union variant, in the order the model declares
+/// its members. Only [`total_ordering`] reads it, to order two values nothing
+/// else orders.
+fn variant_rank(value: &FieldValueUnion) -> u8 {
+    match value {
+        FieldValueUnion::stringValue(_) => 0,
+        FieldValueUnion::doubleValue(_) => 1,
+        FieldValueUnion::booleanValue(_) => 2,
+        FieldValueUnion::emptyValue(_) => 3,
+        FieldValueUnion::userArnValue(_) => 4,
+    }
+}
+
+/// The text a value carries, for the containment comparisons, or `None` when it
+/// carries none: only the string-valued members of the union hold text.
+fn text_of(value: &FieldValueUnion) -> Option<&str> {
+    match value {
+        FieldValueUnion::stringValue(text) | FieldValueUnion::userArnValue(text) => Some(text),
+        _ => None,
+    }
+}
+
+/// The `FieldValue` a `FieldFilter` compares against: every member of that
+/// union targets `FieldValue`
+/// (`smithy_query(query="shape", shape="FieldFilter")`), which carries both the
+/// field id the filter is about and the value to compare with.
+fn filter_operand(filter: &FieldFilter) -> &FieldValue {
+    match filter {
+        FieldFilter::equalTo(operand)
+        | FieldFilter::Contains(operand)
+        | FieldFilter::greaterThan(operand)
+        | FieldFilter::greaterThanOrEqualTo(operand)
+        | FieldFilter::lessThan(operand)
+        | FieldFilter::lessThanOrEqualTo(operand) => operand,
+    }
+}
+
+/// Does `case` satisfy `filter`?
+///
+/// `andAll` over no clauses narrows nothing and `orAll` over no clauses admits
+/// nothing, which is what the conjunction and the disjunction of an empty set of
+/// conditions are. The recursion is bounded by
+/// [`crate::state::MAX_CASE_FILTER_DEPTH`], which [`filter_too_complex`] has
+/// already enforced.
+fn case_matches(case: &crate::state::Case, filter: &CaseFilter) -> bool {
+    match filter {
+        CaseFilter::Field(field) => {
+            field_filter_matches(present_value(case, &filter_operand(field).id), field)
+        }
+        CaseFilter::Tag(TagFilter::equalTo(tag)) => tag_matches(case, tag),
+        CaseFilter::Not(inner) => !case_matches(case, inner),
+        CaseFilter::andAll(clauses) => clauses.iter().all(|clause| case_matches(case, clause)),
+        CaseFilter::orAll(clauses) => clauses.iter().any(|clause| case_matches(case, clause)),
+    }
+}
+
+/// Does the case hold a tag the filter describes? Each part the filter names has
+/// to match on ONE tag — a key and a value naming two different tags is not a
+/// match — and a part it leaves out constrains nothing, so a filter that names
+/// neither narrows to the cases that carry any tag at all.
+fn tag_matches(case: &crate::state::Case, tag: &TagValue) -> bool {
+    case.tags.iter().any(|(key, value)| {
+        tag.key.as_deref().is_none_or(|wanted| wanted == key)
+            && tag.value.as_deref().is_none_or(|wanted| wanted == value)
+    })
+}
+
+/// Does the case's value for the filtered field satisfy the comparison?
+///
+/// `stored` is what the case holds for that field, `None` when it holds nothing
+/// (see [`present_value`]).
+fn field_filter_matches(stored: Option<&FieldValueUnion>, filter: &FieldFilter) -> bool {
+    use ::std::cmp::Ordering;
+
+    match filter {
+        // Equality is equality of the value, variant included. Asking for the
+        // union's `emptyValue` asks for the cases that hold no value for the
+        // field, since that is how an unwritten field reads back.
+        FieldFilter::equalTo(operand) => match (stored, &operand.value) {
+            (stored, FieldValueUnion::emptyValue(_)) => stored.is_none(),
+            (None, _) => false,
+            (Some(stored), wanted) => compared_ordering(stored, wanted) == Some(Ordering::Equal),
+        },
+        // Containment is over text, compared without regard to case, and a value
+        // that carries no text contains nothing.
+        FieldFilter::Contains(operand) => {
+            match (stored.and_then(text_of), text_of(&operand.value)) {
+                (Some(stored), Some(wanted)) => {
+                    stored.to_lowercase().contains(&wanted.to_lowercase())
+                }
+                _ => false,
+            }
+        }
+        FieldFilter::greaterThan(operand) => {
+            ordered_as(stored, operand, &[Ordering::Greater])
+        }
+        FieldFilter::greaterThanOrEqualTo(operand) => {
+            ordered_as(stored, operand, &[Ordering::Greater, Ordering::Equal])
+        }
+        FieldFilter::lessThan(operand) => ordered_as(stored, operand, &[Ordering::Less]),
+        FieldFilter::lessThanOrEqualTo(operand) => {
+            ordered_as(stored, operand, &[Ordering::Less, Ordering::Equal])
+        }
+    }
+}
+
+/// Does the stored value stand in one of `accepted` orderings to the filter's
+/// value? A field with no value, and a value no order relates to the filter's,
+/// satisfies no ordered comparison.
+fn ordered_as(
+    stored: Option<&FieldValueUnion>,
+    operand: &FieldValue,
+    accepted: &[::std::cmp::Ordering],
+) -> bool {
+    stored
+        .and_then(|stored| compared_ordering(stored, &operand.value))
+        .is_some_and(|ordering| accepted.contains(&ordering))
+}
+
+/// Does a case match the quick search? `searchTerm` is "A word or phrase used to
+/// perform a quick search", so it narrows to the cases one of whose text-valued
+/// fields contains it, compared without regard to case as `contains` compares.
+/// `lowercased` is the term already lowered.
+fn matches_search_term(case: &crate::state::Case, lowercased: &str) -> bool {
+    case.field_values
+        .values()
+        .filter_map(text_of)
+        .any(|text| text.to_lowercase().contains(lowercased))
+}
+
+/// `Some(message)` when the filter asks for more work than one request may,
+/// else `None`.
+///
+/// `CaseFilter` nests through `not`, `andAll` and `orAll` with no modelled bound
+/// on its depth, and the search evaluates every clause against every candidate
+/// case, so both the depth and the total clause count are held to
+/// [`crate::state::MAX_CASE_FILTER_DEPTH`] and
+/// [`crate::state::MAX_CASE_FILTER_CLAUSES`]. The walk is iterative and stops at
+/// the first breach, so checking a filter is itself bounded by those constants.
+fn filter_too_complex(filter: &CaseFilter) -> Option<String> {
+    let mut pending: Vec<(&CaseFilter, usize)> = vec![(filter, 1)];
+    let mut clauses: usize = 0;
+    while let Some((clause, depth)) = pending.pop() {
+        clauses += 1;
+        if depth > crate::state::MAX_CASE_FILTER_DEPTH {
+            return Some(format!(
+                "filter nests deeper than {} levels; at most that many are evaluated in one \
+                 request",
+                crate::state::MAX_CASE_FILTER_DEPTH
+            ));
+        }
+        if clauses > crate::state::MAX_CASE_FILTER_CLAUSES {
+            return Some(format!(
+                "filter carries more than {} clauses; at most that many are evaluated in one \
+                 request",
+                crate::state::MAX_CASE_FILTER_CLAUSES
+            ));
+        }
+        match clause {
+            CaseFilter::Field(_) | CaseFilter::Tag(_) => {}
+            CaseFilter::Not(inner) => pending.push((inner, depth + 1)),
+            CaseFilter::andAll(list) | CaseFilter::orAll(list) => {
+                if let Some(message) = crate::state::list_too_long(
+                    "filter",
+                    list.len(),
+                    crate::state::MAX_CASE_FILTER_CLAUSES_PER_LIST,
+                ) {
+                    return Some(message);
+                }
+                pending.extend(list.iter().map(|clause| (clause, depth + 1)));
+            }
+        }
+    }
+    None
+}
+
+/// Every field id the filter compares on, so they can be resolved against the
+/// domain's schema before anything is matched. Iterative, and run only after
+/// [`filter_too_complex`] has bounded the tree.
+fn filter_field_ids(filter: &CaseFilter) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut pending: Vec<&CaseFilter> = vec![filter];
+    while let Some(clause) = pending.pop() {
+        match clause {
+            CaseFilter::Field(field) => ids.push(filter_operand(field).id.clone()),
+            CaseFilter::Tag(_) => {}
+            CaseFilter::Not(inner) => pending.push(inner),
+            CaseFilter::andAll(list) | CaseFilter::orAll(list) => pending.extend(list.iter()),
+        }
+    }
+    ids
+}
+
+/// What makes this search a DIFFERENT listing from another one over the same
+/// domain, for [`crate::state::page_scope`]: the criteria that decide which
+/// cases match and in what order they come. The projected `fields` are left out
+/// — they change what each entry reports, not which entries there are or where
+/// a page boundary falls — so a token stays usable while a caller varies them.
+fn criteria_scope(search_term: &str, filter: Option<&CaseFilter>, sorts: &[Sort]) -> Vec<String> {
+    vec![
+        format!("searchTerm={search_term}"),
+        format!(
+            "filter={}",
+            filter.map(filter_fingerprint).unwrap_or_default()
+        ),
+        format!(
+            "sorts={}",
+            sorts
+                .iter()
+                .map(|sort| format!("{}:{}", sort.field_id, sort.sort_order))
+                .collect::<Vec<String>>()
+                .join(",")
+        ),
+    ]
+}
+
+/// One filter rendered so that two requests carrying the same filter render the
+/// same text and two carrying different filters do not. The recursion is bounded
+/// by [`filter_too_complex`], as [`case_matches`]'s is.
+fn filter_fingerprint(filter: &CaseFilter) -> String {
+    fingerprint_within_depth(filter, 0)
+}
+
+/// [`filter_fingerprint`] with the nesting it has descended so far, so the
+/// recursion is bounded by this function rather than only by its caller having
+/// run [`filter_too_complex`] first. Reaching the bound is unreachable through
+/// the handler, which refuses a deeper filter before anything renders it.
+fn fingerprint_within_depth(filter: &CaseFilter, depth: usize) -> String {
+    if depth >= crate::state::MAX_CASE_FILTER_DEPTH {
+        return "deeper".to_string();
+    }
+    match filter {
+        CaseFilter::Field(field) => {
+            let operand = filter_operand(field);
+            format!(
+                "field({} {} {})",
+                operand.id,
+                comparison_name(field),
+                value_fingerprint(&operand.value)
+            )
+        }
+        CaseFilter::Tag(TagFilter::equalTo(tag)) => format!(
+            "tag({:?} {:?})",
+            tag.key.as_deref(),
+            tag.value.as_deref()
+        ),
+        CaseFilter::Not(inner) => {
+            format!("not({})", fingerprint_within_depth(inner, depth + 1))
+        }
+        CaseFilter::andAll(clauses) => format!("and({})", fingerprints(clauses, depth + 1)),
+        CaseFilter::orAll(clauses) => format!("or({})", fingerprints(clauses, depth + 1)),
+    }
+}
+
+/// The clauses of one filter list, rendered in the order they were given: two
+/// orders of the same clauses are two filters, because `orAll` and `andAll` are
+/// evaluated in order.
+fn fingerprints(clauses: &[CaseFilter], depth: usize) -> String {
+    clauses
+        .iter()
+        .map(|clause| fingerprint_within_depth(clause, depth))
+        .collect::<Vec<String>>()
+        .join(",")
+}
+
+/// Which comparison a `FieldFilter` names.
+fn comparison_name(filter: &FieldFilter) -> &'static str {
+    match filter {
+        FieldFilter::equalTo(_) => "equalTo",
+        FieldFilter::Contains(_) => "contains",
+        FieldFilter::greaterThan(_) => "greaterThan",
+        FieldFilter::greaterThanOrEqualTo(_) => "greaterThanOrEqualTo",
+        FieldFilter::lessThan(_) => "lessThan",
+        FieldFilter::lessThanOrEqualTo(_) => "lessThanOrEqualTo",
+    }
+}
+
+/// One field value rendered for [`filter_fingerprint`]: its union variant and
+/// the content it carries, so two values that differ in either render
+/// differently.
+fn value_fingerprint(value: &FieldValueUnion) -> String {
+    let content = match value {
+        FieldValueUnion::stringValue(text) | FieldValueUnion::userArnValue(text) => text.clone(),
+        FieldValueUnion::doubleValue(number) => number.to_string(),
+        FieldValueUnion::booleanValue(flag) => flag.to_string(),
+        FieldValueUnion::emptyValue(_) => String::new(),
+    };
+    format!("{}:{content}", crate::state::variant_name(value))
 }

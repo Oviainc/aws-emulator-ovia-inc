@@ -17,6 +17,8 @@ mod case_audit_history;
 mod case_event_configuration;
 #[path = "all/case_lifecycle.rs"]
 mod case_lifecycle;
+#[path = "all/case_search.rs"]
+mod case_search;
 #[path = "all/domain_listing.rs"]
 mod domain_listing;
 #[path = "all/field_listing.rs"]
