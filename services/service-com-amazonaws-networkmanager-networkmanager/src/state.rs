@@ -57,6 +57,7 @@
 //! echoes its input back without storing it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -432,6 +433,11 @@ pub const FIELD_CONNECT_ATTACHMENT_ID: &str = "connectAttachmentId";
 pub const FIELD_INSIDE_CIDR_BLOCKS: &str = "insideCidrBlocks";
 /// See [`FIELD_CONNECT_ATTACHMENT_ID`].
 pub const FIELD_SUBNET_ARN: &str = "subnetArn";
+/// See [`FIELD_CONNECT_ATTACHMENT_ID`]: the two ends of the tunnel a Connect peer's BGP
+/// session runs over — the appliance's address and the core network's own.
+pub const FIELD_PEER_ADDRESS: &str = "peerAddress";
+/// See [`FIELD_PEER_ADDRESS`].
+pub const FIELD_CORE_NETWORK_ADDRESS: &str = "coreNetworkAddress";
 /// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
 /// member, for the version id a put of a core network policy asserts the history ends at.
 pub const FIELD_LATEST_VERSION_ID: &str = "latestVersionId";
@@ -941,6 +947,81 @@ pub fn check_inside_cidr_blocks(
                 format!("inside CIDR block {block} is named more than once"),
             ));
         }
+    }
+    Ok(())
+}
+
+/// The two IP address families, spelled the way this service's documentation spells them
+/// ("must be the same IP address family (IPv4 or IPv6)", `smithy_query query="doc"
+/// shape="CreateConnectPeer"`). The model declares no enumeration of them, so these are the
+/// words a refusal names a family by.
+pub const IP_FAMILY_V4: &str = "IPv4";
+/// See [`IP_FAMILY_V4`].
+pub const IP_FAMILY_V6: &str = "IPv6";
+
+/// Which IP address family `address` is in, or `None` when the value is no IP address at
+/// all.
+///
+/// Every address member of this service targets `IPAddress`, whose modelled constraints are
+/// a length and the permissive `^[\s\S]*$` (`smithy_query shape=IPAddress`), so the
+/// pre-handler constraint walk cannot tell an address from any other string and what a
+/// value IS has to be read here. The reading is the textual form of an IPv4 or an IPv6
+/// address and nothing else: no port, no prefix length, no surrounding space.
+pub fn ip_address_family(address: &str) -> Option<&'static str> {
+    match address.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => Some(IP_FAMILY_V4),
+        Ok(IpAddr::V6(_)) => Some(IP_FAMILY_V6),
+        Err(_) => None,
+    }
+}
+
+/// Check the PAIR of tunnel addresses a Connect peer create carries: each has to be an IP
+/// address, and the two ends of one peering have to be in the same address family — "The
+/// peer address and transit gateway address must be the same IP address family (IPv4 or
+/// IPv6)" (`smithy_query query="doc" shape="CreateConnectPeer"`), the core network's end
+/// being the transit gateway address that sentence names (`ConnectPeerConfiguration`
+/// reports it as `CoreNetworkAddress`, "The IP address of a core network").
+///
+/// A BGP session runs between two addresses of ONE family, so a pair that straddles the two
+/// describes a peering that cannot exist and is refused before anything is stored. The value
+/// that is at fault is a MEMBER's, so the refusal is a field failure
+/// ([`REASON_FIELD_VALIDATION_FAILED`]) naming the member that carried it; a mismatch is
+/// blamed on the core network's end, since the appliance's end is the required member every
+/// peering has and the core network's end is the one that has to agree with it.
+///
+/// `core_network_address` is `None` for a request naming no core network address at all,
+/// which carries no second family and so can never straddle one.
+pub fn check_tunnel_addresses(
+    peer_member: &str,
+    peer_address: &str,
+    core_member: &str,
+    core_network_address: Option<&str>,
+) -> Result<(), ValidationException> {
+    let not_an_address = |member: &str, value: &str| {
+        field_rejection(
+            member,
+            REASON_FIELD_VALIDATION_FAILED,
+            format!("{value} is not an {IP_FAMILY_V4} or {IP_FAMILY_V6} address"),
+        )
+    };
+    let peer_family =
+        ip_address_family(peer_address).ok_or_else(|| not_an_address(peer_member, peer_address))?;
+    let Some(core_address) = core_network_address else {
+        return Ok(());
+    };
+    let core_family = ip_address_family(core_address)
+        .ok_or_else(|| not_an_address(core_member, core_address))?;
+    if core_family != peer_family {
+        return Err(field_rejection(
+            core_member,
+            REASON_FIELD_VALIDATION_FAILED,
+            format!(
+                "core network address {core_address} is {core_family} and peer address \
+                 {peer_address} is {peer_family}; the peer address and the core network \
+                 address must be the same IP address family ({IP_FAMILY_V4} or \
+                 {IP_FAMILY_V6})"
+            ),
+        ));
     }
     Ok(())
 }

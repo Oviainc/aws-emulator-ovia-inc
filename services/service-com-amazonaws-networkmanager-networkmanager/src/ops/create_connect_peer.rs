@@ -10,8 +10,11 @@
 //! core network and an appliance" (`smithy_query query="doc" shape="CreateConnectPeer"`),
 //! so `ConnectAttachmentId` has to name a stored attachment of the CONNECT kind, and the
 //! peer takes that attachment's core network, edge location and tunnel protocol rather
-//! than any of its own. A created peer waits in `CREATING` until the transition the clock
-//! owes falls due and is `AVAILABLE` after it.
+//! than any of its own. The two ends of the BGP session it peers over — the appliance's
+//! address and the core network's — are addresses of ONE IP address family, so a request
+//! whose pair straddles the two is refused and nothing is stored
+//! ([`crate::state::check_tunnel_addresses`]). A created peer waits in `CREATING` until the
+//! transition the clock owes falls due and is `AVAILABLE` after it.
 //!
 //! ## Reaching this service's state
 //!
@@ -250,6 +253,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(rejection) = crate::state::check_inside_cidr_blocks(
             crate::state::FIELD_INSIDE_CIDR_BLOCKS,
             &inside_cidr_blocks,
+        ) {
+            return Err(CreateConnectPeerErrorModeled::ValidationException(rejection).into());
+        }
+
+        // The two ends of the peering have to be addresses of ONE family, the rule this
+        // operation's own documentation states; the pair is judged before anything is
+        // minted, so a peering that cannot exist is never stored.
+        if let Err(rejection) = crate::state::check_tunnel_addresses(
+            crate::state::FIELD_PEER_ADDRESS,
+            &input.peer_address,
+            crate::state::FIELD_CORE_NETWORK_ADDRESS,
+            input.core_network_address.as_deref(),
         ) {
             return Err(CreateConnectPeerErrorModeled::ValidationException(rejection).into());
         }
