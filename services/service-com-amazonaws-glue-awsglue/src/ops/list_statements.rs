@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStatements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStatements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStatements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports the statements run on ONE session ([`crate::state::SessionEntry::statements`]),
+//! in the order that session actioned them — which is the order it minted their ids in,
+//! oldest first — one page at a time, each element the SAME projection the single-statement
+//! read serves. A session this Region never created is a miss rather than an empty listing.
+//!
+//! The one write this read makes is the state change the CLOCK had already made due, for the
+//! reason [`crate::ops::get_statement`] gives: a statement leaves the state its run put it
+//! in at an instant that run recorded, whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +81,34 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// How many statements one page of this listing carries.
+///
+/// CHOSEN, not documented: this operation models no page-size member at all — its only
+/// paging input is `NextToken` (`smithy_query operation=ListStatements`) — so the page size
+/// is the service's own, while the `NextToken` the model declares on both sides makes the
+/// listing a paged one. It is deliberately below [`crate::state::MAX_STATEMENTS_PER_SESSION`],
+/// the number of statements one session keeps, so a session holding more statements than one
+/// page is walked through the token rather than truncated.
+pub const PAGE_SIZE: usize = 25;
+
+/// How many digits a statement id is padded to in a continuation token, so the token orders
+/// as a string the way the id it names orders as a number. Ten digits hold any
+/// `IntegerValue` id a session can mint.
+const CURSOR_ID_DIGITS: usize = 10;
+
+/// One statement's place in this listing, as the continuation token renders it: its `Id`,
+/// zero-padded so the token compares as a string exactly as the id compares as a number.
+///
+/// Comparing a token against this key is what resumes a page — the same cursor convention
+/// this crate's other listings use (`crate::state::history_page_cursor`,
+/// `crate::ops::get_table_versions`) — so any string a request sends names a well-defined
+/// place in the order, and a page stays correct across statements recorded or dropped
+/// between two calls.
+fn page_cursor(statement: &crate::state::StatementEntry) -> String {
+    let id = statement.id;
+    format!("{id:0CURSOR_ID_DIGITS$}")
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +183,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStatements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStatementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStatements"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(ListStatementsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue session store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // "The origin of the request to list statements" names who is asking, not which
+        // statements are asked for, so it changes nothing about this read.
+        let _ = &input.request_origin;
+        // A session is served only through the endpoint that created it, so the Region and
+        // the session id together are the whole address this listing resolves.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(session) = store.session_mut(&region, &input.session_id) else {
+            return Err(ListStatementsErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    // The refusal names the id that resolved to nothing, which is the whole
+                    // address of a session.
+                    message: Some(crate::state::messages::session_not_found(
+                        &input.session_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The only write a read makes: the state changes the clock had already made due.
+        session.settle_due_statements(now);
+
+        // A session actions one statement at a time, in the order it took them, and the `Id`
+        // it mints for each counts up in that same order — so this listing's order is over
+        // that id and not over the order the store happens to hold the records in, which
+        // keeps it total and the same on every call.
+        let mut ordered: Vec<&crate::state::StatementEntry> = session.statements.iter().collect();
+        ordered.sort_by_cached_key(|statement| page_cursor(statement));
+
+        // The token is the cursor of the last statement of the previous page, so the page
+        // resumes at the first statement strictly after it — which stays correct across
+        // statements recorded or dropped between two calls. A token this service never
+        // issued is DELIBERATELY a position in that order rather than a refusal, exactly as
+        // the sibling listings of this crate resolve a cursor.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => {
+                ordered.partition_point(|statement| page_cursor(statement).as_str() <= cursor)
+            }
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose can
+        // never index outside the set.
+        let page: Vec<&crate::state::StatementEntry> =
+            ordered.iter().copied().skip(start).take(PAGE_SIZE).collect();
+        let end = start.saturating_add(page.len());
+
+        // "Returns the list of statements": element for element the SAME projection the
+        // single-statement read serves (`crate::ops::get_statement`), so a client that works
+        // from this listing is never less informed than one that re-reads each statement.
+        let statements: Vec<Statement> = page
+            .iter()
+            .map(|statement| statement.to_statement())
+            .collect();
+        // "A continuation token, if not all statements have yet been returned": it names the
+        // last entry of the page, taken from the page itself so there is no index arithmetic
+        // to underflow on an empty page, and is absent once the page reaches the end of the
+        // listing.
+        let next_token = if end < ordered.len() {
+            page.last().copied().map(page_cursor)
+        } else {
+            None
+        };
+
+        Ok(ListStatementsOutput {
+            statements: Some(statements),
+            next_token,
+        })
     }
 }

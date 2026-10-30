@@ -80,7 +80,7 @@ fn set_session_due(engine: &Arc<engine::InMemoryEngine>, id: &str, at: SystemTim
 
 /// Put the instant the clock owes every unsettled statement of the session `id` its
 /// terminal state at `at`.
-fn set_statement_due(engine: &Arc<engine::InMemoryEngine>, id: &str, at: SystemTime) {
+pub(crate) fn set_statement_due(engine: &Arc<engine::InMemoryEngine>, id: &str, at: SystemTime) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let entry = store
@@ -97,7 +97,7 @@ fn set_statement_due(engine: &Arc<engine::InMemoryEngine>, id: &str, at: SystemT
 /// its terminal state, so a suite can observe that state without sleeping for the span:
 /// the record is pulled back by the span its run recorded, which leaves the span between
 /// a statement starting and finishing the one the run recorded.
-fn reach_due_instant(engine: &Arc<engine::InMemoryEngine>, id: &str) {
+pub(crate) fn reach_due_instant(engine: &Arc<engine::InMemoryEngine>, id: &str) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     let entry = store
@@ -131,13 +131,13 @@ fn rewind_session(engine: &Arc<engine::InMemoryEngine>, id: &str, elapsed: Durat
 }
 
 /// A session in `READY`: created, with the status its provisioning owed already due.
-async fn ready_session(router: &MultiServiceRouter, engine: &Arc<engine::InMemoryEngine>, id: &str) {
+pub(crate) async fn ready_session(router: &MultiServiceRouter, engine: &Arc<engine::InMemoryEngine>, id: &str) {
     create_session(router, id, json!({})).await;
     set_session_due(engine, id, already_past());
 }
 
 /// Run `code` on the session `id` and return the `Id` the answer reports.
-async fn run(router: &MultiServiceRouter, id: &str, code: &str) -> i64 {
+pub(crate) async fn run(router: &MultiServiceRouter, id: &str, code: &str) -> i64 {
     let answer = ok(
         router,
         "RunStatement",
@@ -150,7 +150,7 @@ async fn run(router: &MultiServiceRouter, id: &str, code: &str) -> i64 {
 }
 
 /// The `Statement` the `GetStatement` answer for `(id, statement)` reports.
-async fn get(router: &MultiServiceRouter, id: &str, statement: i64) -> Value {
+pub(crate) async fn get(router: &MultiServiceRouter, id: &str, statement: i64) -> Value {
     let read = ok(
         router,
         "GetStatement",

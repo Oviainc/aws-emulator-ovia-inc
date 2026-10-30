@@ -213,6 +213,8 @@ mod security_configurations;
 mod sessions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/statement_listing.rs"]
+mod statement_listing;
 #[path = "all/statements.rs"]
 mod statements;
 #[path = "all/store_capacity.rs"]
