@@ -45,6 +45,8 @@ mod recommendations_for_resource;
 mod resource_arn_owning_account;
 #[path = "all/seeded_support_plan.rs"]
 mod seeded_support_plan;
+#[path = "all/shared_lifecycle_write.rs"]
+mod shared_lifecycle_write;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support_level_gate.rs"]

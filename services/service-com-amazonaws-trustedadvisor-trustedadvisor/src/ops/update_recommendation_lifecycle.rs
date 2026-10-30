@@ -8,6 +8,10 @@
 //! [`crate::state::RecommendationEntry`], stamps `lastUpdatedAt` from the clock,
 //! and sets `resolvedAt` when (and only when) the new stage is `resolved`. A
 //! following `GetRecommendation` / `ListRecommendations` reports the new values.
+//! That guard and that write are [`crate::state::lifecycle_update_conflict`] and
+//! [`crate::state::apply_lifecycle_update`], shared with the organization-level
+//! `UpdateOrganizationRecommendationLifecycle`, which applies the same rule to
+//! its own entry type.
 //!
 //! Refusals: an identifier naming a recommendation owned by ANOTHER account is
 //! answered for that resource first — 403 `AccessDeniedException`
@@ -94,10 +98,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-// The one `UpdateRecommendationLifecycleStage` value that resolves a
-// recommendation. It lives in `crate::state` because the organization-level
-// lifecycle update stamps `resolvedAt` on the same stage.
-use crate::state::LIFECYCLE_STAGE_RESOLVED;
+// The lifecycle write itself — the guard that decides whether an update
+// applies to the stored entry, and the write that replaces its five lifecycle
+// members — lives in `crate::state`, because the organization-level
+// `UpdateOrganizationRecommendationLifecycle` applies the SAME rule to its own
+// entry type: it models the same stage and reason-code enums and carries the
+// same "only supports prioritized recommendations" sentence.
+use crate::state::{apply_lifecycle_update, lifecycle_update_conflict};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -250,33 +257,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        if entry.r#type != crate::state::RECOMMENDATION_TYPE_PRIORITY {
-            return Err(UpdateRecommendationLifecycleErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "the lifecycle of the {} recommendation {} cannot be updated: this \
-                         operation only supports prioritized recommendations",
-                        entry.r#type, entry.arn
-                    ),
-                },
-            )
-            .into());
+        // Only a prioritized recommendation's lifecycle can be moved: the
+        // shared guard reports the 409 for an entry of any other type.
+        if let Some(conflict) = lifecycle_update_conflict(entry) {
+            return Err(
+                UpdateRecommendationLifecycleErrorModeled::ConflictException(conflict).into(),
+            );
         }
 
-        // `@idempotent` PUT semantics: the request REPLACES the lifecycle of the
-        // recommendation, so an omitted `updateReason`/`updateReasonCode` clears
-        // the stored one rather than leaving the previous update's wording
-        // attached to the new stage.
-        let updated_at = crate::state::now_millis();
-        entry.lifecycle_stage = Some(input.lifecycle_stage.clone());
-        entry.update_reason = input.update_reason.clone();
-        entry.update_reason_code = input.update_reason_code.clone();
-        entry.last_updated_at_millis = updated_at;
-        // `resolvedAt` is "When the Recommendation was resolved": set it on the
-        // update that resolves the recommendation, and clear it on one that moves
-        // the recommendation back out of `resolved`.
-        entry.resolved_at_millis = (input.lifecycle_stage == LIFECYCLE_STAGE_RESOLVED)
-            .then_some(updated_at);
+        // The lifecycle write, as both `Update…Lifecycle` operations make it:
+        // replace the stage and both reason members, stamp `lastUpdatedAt` from
+        // the clock and set `resolvedAt` exactly when the new stage resolves the
+        // recommendation.
+        apply_lifecycle_update(
+            entry,
+            &input.lifecycle_stage,
+            input.update_reason.as_deref(),
+            input.update_reason_code.as_deref(),
+        );
 
         Ok(UpdateRecommendationLifecycleOutput)
     }

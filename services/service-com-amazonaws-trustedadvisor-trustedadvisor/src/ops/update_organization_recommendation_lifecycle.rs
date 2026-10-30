@@ -8,7 +8,11 @@
 //! [`crate::state::OrganizationRecommendationEntry`], stamps `lastUpdatedAt`
 //! from the clock, and sets `resolvedAt` when (and only when) the new stage is
 //! `resolved`. A following `GetOrganizationRecommendation` reports the new
-//! values.
+//! values. That guard and that write are
+//! [`crate::state::lifecycle_update_conflict`] and
+//! [`crate::state::apply_lifecycle_update`], shared with the account-level
+//! `UpdateRecommendationLifecycle`, which applies the same rule to its own entry
+//! type.
 //!
 //! Refusals: a well-formed ARN naming nothing in the store is a
 //! `ResourceNotFoundException` (404); an organization recommendation whose
@@ -91,11 +95,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-// The lifecycle stage that resolves a recommendation, and the recommendation
-// type whose lifecycle this operation can move — both shared with the
-// account-level `UpdateRecommendationLifecycle`, which models the same enums
-// and carries the same "only supports prioritized recommendations" sentence.
-use crate::state::{LIFECYCLE_STAGE_RESOLVED, RECOMMENDATION_TYPE_PRIORITY};
+// The lifecycle write itself — the guard that decides whether an update
+// applies to the stored entry, and the write that replaces its five lifecycle
+// members — lives in `crate::state`, shared with the account-level
+// `UpdateRecommendationLifecycle`, which models the same enums and carries the
+// same "only supports prioritized recommendations" sentence, so the two levels
+// cannot disagree about the members an update writes.
+use crate::state::{apply_lifecycle_update, lifecycle_update_conflict};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -240,36 +246,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store holds an organization recommendation only for a prioritized
         // recommendation, so this guards that invariant at the one write path:
         // an entry of any other type could not have its lifecycle moved by this
-        // operation, which supports only prioritized recommendations.
-        if entry.r#type != RECOMMENDATION_TYPE_PRIORITY {
+        // operation, which supports only prioritized recommendations. The guard
+        // is the shared one, so it refuses on the same test and in the same
+        // words as the account-level update.
+        if let Some(conflict) = lifecycle_update_conflict(entry) {
             return Err(
-                UpdateOrganizationRecommendationLifecycleErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "the lifecycle of the {} organization recommendation {} cannot be \
-                             updated: this operation only supports prioritized recommendations",
-                            entry.r#type, entry.arn
-                        ),
-                    },
-                )
-                .into(),
+                UpdateOrganizationRecommendationLifecycleErrorModeled::ConflictException(conflict)
+                    .into(),
             );
         }
 
-        // `@idempotent` PUT semantics: the request REPLACES the lifecycle of
-        // the organization recommendation, so an omitted
-        // `updateReason`/`updateReasonCode` clears the stored one rather than
-        // leaving the previous update's wording attached to the new stage.
-        let updated_at = crate::state::now_millis();
-        entry.lifecycle_stage = Some(input.lifecycle_stage.clone());
-        entry.update_reason = input.update_reason.clone();
-        entry.update_reason_code = input.update_reason_code.clone();
-        entry.last_updated_at_millis = updated_at;
-        // `resolvedAt` is "When the Recommendation was resolved": set it on the
-        // update that resolves the recommendation, and clear it on one that
-        // moves the recommendation back out of `resolved`.
-        entry.resolved_at_millis =
-            (input.lifecycle_stage == LIFECYCLE_STAGE_RESOLVED).then_some(updated_at);
+        // The lifecycle write, as both `Update…Lifecycle` operations make it:
+        // replace the stage and both reason members, stamp `lastUpdatedAt` from
+        // the clock and set `resolvedAt` exactly when the new stage resolves the
+        // recommendation.
+        apply_lifecycle_update(
+            entry,
+            &input.lifecycle_stage,
+            input.update_reason.as_deref(),
+            input.update_reason_code.as_deref(),
+        );
 
         Ok(UpdateOrganizationRecommendationLifecycleOutput)
     }

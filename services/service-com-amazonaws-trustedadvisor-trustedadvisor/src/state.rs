@@ -64,6 +64,15 @@
 //! ([`foreign_resource_refusal`]): no support plan grants an account access to
 //! another account's resources.
 //!
+//! The one rule a lifecycle update applies to a stored recommendation lives
+//! here as well — [`apply_lifecycle_update`], with the guard
+//! [`lifecycle_update_conflict`] ahead of it — because the account-level
+//! [`RecommendationEntry`] and the organization-level
+//! [`OrganizationRecommendationEntry`] are different shapes carrying the SAME
+//! lifecycle members ([`LifecycleWritable`]): the write that replaces them is
+//! stated once rather than once per operation, so the two levels cannot drift
+//! apart on it.
+//!
 //! The same ownership test ([`is_foreign_resource`]) SCOPES the account-level
 //! views: [`recommendations`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendations)
 //! and [`recommendation_resources`](ComAmazonawsTrustedadvisorTrustedadvisorState::recommendation_resources)
@@ -75,7 +84,7 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    AccessDeniedException, RecommendationCostOptimizingAggregates,
+    AccessDeniedException, ConflictException, RecommendationCostOptimizingAggregates,
     RecommendationPillarSpecificAggregates, RecommendationResourcesAggregates,
 };
 
@@ -563,6 +572,147 @@ pub struct OrganizationRecommendationEntry {
     pub resolved_at_millis: Option<i64>,
     pub update_reason: Option<String>,
     pub update_reason_code: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// The lifecycle write
+// ---------------------------------------------------------------------------
+
+/// The members of one stored recommendation that a lifecycle update writes,
+/// borrowed from the entry they live on: the stage, the two reason members, the
+/// `lastUpdatedAt` stamp and the resolution instant.
+///
+/// Handed out by [`LifecycleWritable::lifecycle_members`] so
+/// [`apply_lifecycle_update`] writes them on EITHER kind of stored
+/// recommendation without naming either one.
+pub struct LifecycleMembers<'entry> {
+    pub lifecycle_stage: &'entry mut Option<String>,
+    pub update_reason: &'entry mut Option<String>,
+    pub update_reason_code: &'entry mut Option<String>,
+    pub last_updated_at_millis: &'entry mut i64,
+    pub resolved_at_millis: &'entry mut Option<i64>,
+}
+
+/// A stored recommendation whose lifecycle an `Update…Lifecycle` operation
+/// moves: the account-level [`RecommendationEntry`] and the organization-level
+/// [`OrganizationRecommendationEntry`].
+///
+/// The two operations model the same stage and reason-code enums and carry the
+/// same "only supports prioritized recommendations" sentence, so they apply ONE
+/// rule to two kinds of entry. This is the seam that lets that rule be stated
+/// once — by [`lifecycle_update_conflict`] and [`apply_lifecycle_update`] —
+/// instead of once per operation, where the account-level and the
+/// organization-level lifecycle could drift apart on the same members.
+pub trait LifecycleWritable {
+    /// What this service calls the resource whose lifecycle is being moved, for
+    /// the refusal [`lifecycle_update_conflict`] builds.
+    const RESOURCE_NOUN: &'static str;
+
+    /// This entry's `RecommendationType`: the classification that decides
+    /// whether a lifecycle update applies to it at all.
+    fn recommendation_type(&self) -> &str;
+
+    /// This entry's own ARN — what a refusal names the refused resource by.
+    fn arn(&self) -> &str;
+
+    /// The members a lifecycle update replaces, borrowed mutably.
+    fn lifecycle_members(&mut self) -> LifecycleMembers<'_>;
+}
+
+impl LifecycleWritable for RecommendationEntry {
+    const RESOURCE_NOUN: &'static str = "recommendation";
+
+    fn recommendation_type(&self) -> &str {
+        &self.r#type
+    }
+
+    fn arn(&self) -> &str {
+        &self.arn
+    }
+
+    fn lifecycle_members(&mut self) -> LifecycleMembers<'_> {
+        LifecycleMembers {
+            lifecycle_stage: &mut self.lifecycle_stage,
+            update_reason: &mut self.update_reason,
+            update_reason_code: &mut self.update_reason_code,
+            last_updated_at_millis: &mut self.last_updated_at_millis,
+            resolved_at_millis: &mut self.resolved_at_millis,
+        }
+    }
+}
+
+impl LifecycleWritable for OrganizationRecommendationEntry {
+    const RESOURCE_NOUN: &'static str = "organization recommendation";
+
+    fn recommendation_type(&self) -> &str {
+        &self.r#type
+    }
+
+    fn arn(&self) -> &str {
+        &self.arn
+    }
+
+    fn lifecycle_members(&mut self) -> LifecycleMembers<'_> {
+        LifecycleMembers {
+            lifecycle_stage: &mut self.lifecycle_stage,
+            update_reason: &mut self.update_reason,
+            update_reason_code: &mut self.update_reason_code,
+            last_updated_at_millis: &mut self.last_updated_at_millis,
+            resolved_at_millis: &mut self.resolved_at_millis,
+        }
+    }
+}
+
+/// The refusal a lifecycle update answers for an entry it does not apply to:
+/// `Some(..)` when the entry's type is not [`RECOMMENDATION_TYPE_PRIORITY`], so
+/// the request is a `ConflictException` (HTTP 409, "Exception that the request
+/// was denied due to conflictions in state") rather than a write — both
+/// lifecycle operations are documented as supporting only prioritized
+/// recommendations, which makes them inapplicable to an entry of any other
+/// type.
+///
+/// The message is built from the entry: it names the type that makes the
+/// operation inapplicable and the resource it was asked for.
+pub fn lifecycle_update_conflict<Entry: LifecycleWritable>(
+    entry: &Entry,
+) -> Option<ConflictException> {
+    (entry.recommendation_type() != RECOMMENDATION_TYPE_PRIORITY).then(|| ConflictException {
+        message: format!(
+            "the lifecycle of the {} {} {} cannot be updated: this operation only supports \
+             prioritized recommendations",
+            entry.recommendation_type(),
+            Entry::RESOURCE_NOUN,
+            entry.arn(),
+        ),
+    })
+}
+
+/// Apply a lifecycle update to `entry`: the write BOTH `Update…Lifecycle`
+/// operations make, stated once.
+///
+/// The operations are `@idempotent` PUTs, so a request REPLACES the lifecycle
+/// of the recommendation: the new stage and BOTH reason members are written as
+/// the request states them, which means an omitted `updateReason` /
+/// `updateReasonCode` clears the stored one rather than leaving the previous
+/// update's wording attached to the new stage. `lastUpdatedAt` is stamped from
+/// the clock, never from the request, and `resolvedAt` — "When the
+/// Recommendation was resolved" — is that same instant exactly when the new
+/// stage is [`LIFECYCLE_STAGE_RESOLVED`], so an update that moves the
+/// recommendation back out of `resolved` clears it.
+pub fn apply_lifecycle_update<Entry: LifecycleWritable>(
+    entry: &mut Entry,
+    lifecycle_stage: &str,
+    update_reason: Option<&str>,
+    update_reason_code: Option<&str>,
+) {
+    let updated_at = now_millis();
+    let members = entry.lifecycle_members();
+    *members.lifecycle_stage = Some(lifecycle_stage.to_string());
+    *members.update_reason = update_reason.map(str::to_string);
+    *members.update_reason_code = update_reason_code.map(str::to_string);
+    *members.last_updated_at_millis = updated_at;
+    *members.resolved_at_millis =
+        (lifecycle_stage == LIFECYCLE_STAGE_RESOLVED).then_some(updated_at);
 }
 
 /// One AWS resource a recommendation flagged.
