@@ -17,7 +17,15 @@ pub struct GetBrowserInput {
     pub browser_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#GetBrowserResponse")]
+/// `GetBrowserResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `lastUpdatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation", operation="GetBrowser")`),
+/// and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetBrowserOutput {
     pub browser_id: String,
@@ -36,6 +44,71 @@ pub struct GetBrowserOutput {
     pub created_at: ::aws_smithy_types::DateTime,
     pub last_updated_at: ::aws_smithy_types::DateTime,
 }
+
+agentcore_schema_and_codec!(
+    GetBrowserOutput,
+    GET_BROWSER_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#GetBrowserResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "GetBrowserResponse",
+    (M_BROWSER_ID, browser_id, "browserId", 0, req, string),
+    (M_BROWSER_ARN, browser_arn, "browserArn", 1, req, string),
+    (M_NAME, name, "name", 2, req, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (
+        M_EXECUTION_ROLE_ARN,
+        execution_role_arn,
+        "executionRoleArn",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_NETWORK_CONFIGURATION,
+        network_configuration,
+        "networkConfiguration",
+        5,
+        req,
+        struct_of(BrowserNetworkConfiguration)
+    ),
+    (M_RECORDING, recording, "recording", 6, opt, struct_of(RecordingConfig)),
+    (
+        M_BROWSER_SIGNING,
+        browser_signing,
+        "browserSigning",
+        7,
+        opt,
+        struct_of(BrowserSigningConfigOutput)
+    ),
+    (
+        M_ENTERPRISE_POLICIES,
+        enterprise_policies,
+        "enterprisePolicies",
+        8,
+        opt,
+        list_of_struct(BrowserEnterprisePolicy)
+    ),
+    (
+        M_CERTIFICATES,
+        certificates,
+        "certificates",
+        9,
+        opt,
+        list_of_struct(Certificate)
+    ),
+    (
+        M_FILESYSTEM_CONFIGURATIONS,
+        filesystem_configurations,
+        "filesystemConfigurations",
+        10,
+        opt,
+        list_of_union(ToolsFileSystemConfiguration)
+    ),
+    (M_STATUS, status, "status", 11, req, string),
+    (M_FAILURE_REASON, failure_reason, "failureReason", 12, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 13, req, date_time),
+    (M_LAST_UPDATED_AT, last_updated_at, "lastUpdatedAt", 14, req, date_time),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#BrowserSigningConfigOutput")]
 #[derive(Debug, Clone, Default)]

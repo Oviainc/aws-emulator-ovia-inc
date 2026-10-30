@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBrowser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBrowser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBrowser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +179,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBrowser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBrowserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBrowser"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBrowserErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the browser store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The model states this rule in prose on the member itself, so the
+        // framework's constraint walk cannot refuse it: the VPC configuration
+        // "is required when the network mode is set to VPC". The other mode needs
+        // no caller-supplied network of its own.
+        if input.network_configuration.network_mode == crate::state::BROWSER_NETWORK_MODE_VPC
+            && input.network_configuration.vpc_config.is_none()
+        {
+            return Err(CreateBrowserErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    crate::state::BROWSER_VPC_CONFIG_MEMBER,
+                    &format!(
+                        "is required when networkMode is {}",
+                        crate::state::BROWSER_NETWORK_MODE_VPC
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // A browser whose earlier deletion the clock has already made due is gone
+        // before this call looks at the names this account holds.
+        store.expire_deleted_browsers(now);
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // browser that token first produced, rather than minting a second one:
+        // "If this token matches a previous request, Amazon Bedrock AgentCore
+        // ignores the request but does not return an error."
+        if let Some(browser_id) =
+            store.replayed_browser_result(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_browser_result` answers only for a browser the store
+            // still holds, so this lookup cannot miss.
+            if let Some(record) = store.browsers.get(&browser_id) {
+                return Ok(record.create_output(now));
+            }
+        }
+
+        // "The name must be unique within your account", so a repeated name is a
+        // conflict, not a second browser that later reads cannot tell apart.
+        if let Some(existing) = store.browser_names.get(&input.name) {
+            return Err(CreateBrowserErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a browser named {} already exists (browserId {existing})",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if store.browsers.len() >= crate::state::MAX_BROWSERS {
+            return Err(CreateBrowserErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} browsers",
+                        crate::state::MAX_BROWSERS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let browser_id = store.mint_browser_id(&input.name, now);
+        let record = crate::state::BrowserRecord {
+            browser_arn: crate::state::browser_arn(&region, &browser_id),
+            browser_id: browser_id.clone(),
+            name: input.name,
+            description: input.description,
+            execution_role_arn: input.execution_role_arn,
+            network_configuration: input.network_configuration,
+            recording: input.recording,
+            browser_signing: input.browser_signing.map(|requested| {
+                BrowserSigningConfigOutput {
+                    enabled: requested.enabled,
+                }
+            }),
+            enterprise_policies: input.enterprise_policies,
+            certificates: input.certificates,
+            filesystem_configurations: input.filesystem_configurations,
+            tags: crate::state::sorted_map(input.tags),
+            created_at: now,
+            updated_at: now,
+            // A new browser is created, not ready: the transition to READY is
+            // owed by the clock, not by this call.
+            transient_status: crate::state::BROWSER_STATUS_CREATING.to_string(),
+            settled_status: crate::state::BROWSER_STATUS_READY.to_string(),
+            settles_at: now + crate::state::BROWSER_SETTLE_DELAY,
+            // Nobody has deleted this browser, so the clock owes no removal.
+            removal_due_at: None,
+        };
+        let output = record.create_output(now);
+
+        store
+            .browser_names
+            .insert(record.name.clone(), browser_id.clone());
+        store.remember_browser_client_token(Self::NAME, input.client_token, &browser_id);
+        store.browsers.insert(browser_id, record);
+
+        Ok(output)
     }
 }

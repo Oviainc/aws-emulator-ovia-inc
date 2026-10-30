@@ -18,11 +18,30 @@ pub struct DeleteBrowserInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#DeleteBrowserResponse")]
+/// `DeleteBrowserResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `lastUpdatedAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation", operation="DeleteBrowser")`),
+/// and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct DeleteBrowserOutput {
     pub browser_id: String,
     pub status: String,
     pub last_updated_at: ::aws_smithy_types::DateTime,
 }
+
+agentcore_schema_and_codec!(
+    DeleteBrowserOutput,
+    DELETE_BROWSER_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#DeleteBrowserResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "DeleteBrowserResponse",
+    (M_BROWSER_ID, browser_id, "browserId", 0, req, string),
+    (M_STATUS, status, "status", 1, req, string),
+    (M_LAST_UPDATED_AT, last_updated_at, "lastUpdatedAt", 2, req, date_time),
+);
 

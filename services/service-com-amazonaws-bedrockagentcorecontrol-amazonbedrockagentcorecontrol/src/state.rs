@@ -21,6 +21,10 @@
 //! * the registry (`/registries/`): one [`RegistryRecord`] per `registryId`,
 //!   holding the catalog's configuration and the status the clock owes it, so
 //!   `GetRegistry` and any later registry read answer from one store;
+//! * the browser (`/browsers/`): one [`BrowserRecord`] per `browserId`, holding
+//!   the configuration `CreateBrowser` persisted and the statuses the clock owes
+//!   it, so `GetBrowser` reports exactly that and `DeleteBrowser` reports what it
+//!   is removing;
 //! * the token vault ([`TokenVaults`]): the KMS configuration each vault of the
 //!   account is encrypted under, so `SetTokenVaultCMK` and `GetTokenVault`
 //!   answer from one store;
@@ -43,8 +47,11 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AgentRuntime, AgentRuntimeArtifact, AgentRuntimeVersionSummary, ApprovalConfiguration,
     AuthorizerConfiguration,
-    CapacityProviderConfiguration, CertificateConfiguration, Code, ComponentConfiguration,
-    CreateGatewayOutput,
+    BrowserEnterprisePolicy, BrowserNetworkConfiguration, BrowserSigningConfigOutput,
+    CapacityProviderConfiguration, Certificate, CertificateConfiguration, Code,
+    ComponentConfiguration,
+    CreateBrowserOutput, CreateGatewayOutput, DeleteBrowserOutput, GetBrowserOutput,
+    RecordingConfig, ToolsFileSystemConfiguration,
     CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
     FilesystemConfiguration, GatewayInterceptorConfiguration, GatewayPolicyEngineConfiguration,
     GatewayProtocolConfiguration, GatewaySummary, GetGatewayOutput, GetGatewayTargetOutput,
@@ -1435,6 +1442,169 @@ impl RegistryRecord {
     }
 }
 
+/// The modelled not-found error for a browser this account does not hold.
+///
+/// This control plane words a missing browser in terms of the id the request
+/// named: "Browser with ID <browserId> does not exist" — the sentence around the
+/// identifier is fixed, and the identifier itself is the caller's own value.
+/// Shared by the handlers rather than written per operation, so one browser
+/// cannot be reported missing in two different sentences by two operations.
+pub fn browser_not_found(browser_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Browser with ID {browser_id} does not exist")),
+    }
+}
+
+/// The ARN resource type a browser THIS SERVICE CREATED carries. `BrowserArn` is
+/// `…:browser(-custom)?/(aws\.browser\.v1|…)` (`smithy_query shape=BrowserArn`),
+/// whose `arnReference` names `AWS::BedrockAgentCore::BrowserCustom`: the
+/// `-custom` spelling is the customer-created browser, and the bare one the
+/// service-provided tool (`aws.browser.v1`), which no operation mints.
+pub const BROWSER_ARN_RESOURCE: &str = "browser-custom";
+
+/// `BrowserStatus` members this service drives. The enum's full value list is
+/// `CREATING | CREATE_FAILED | READY | DELETING | DELETE_FAILED | DELETED`
+/// (`shared_types::BROWSER_STATUS_VALUES`, from `smithy_query
+/// shape=BrowserStatus`).
+pub const BROWSER_STATUS_CREATING: &str = "CREATING";
+pub const BROWSER_STATUS_READY: &str = "READY";
+pub const BROWSER_STATUS_DELETING: &str = "DELETING";
+
+/// How long a freshly created browser stays `CREATING` before the clock owes it
+/// `READY`, and how long an accepted deletion leaves it `DELETING` before the
+/// record is gone.
+///
+/// AWS documents no duration for either transition, so the span is chosen: long
+/// enough that a caller acting straight after the call still observes the
+/// transient status, short enough to keep a client script quick.
+pub const BROWSER_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// How many browsers this emulator will hold.
+///
+/// `CreateBrowser` models `ServiceQuotaExceededException` (HTTP 402) for
+/// exceeding the real service's quota; this number is not a fidelity claim about
+/// that quota but the emulator's own ceiling, set generously so no realistic
+/// workflow meets it, so a caller looping on create cannot grow this process's
+/// memory without bound.
+pub const MAX_BROWSERS: usize = 1_000;
+
+/// The member path `CreateBrowser` refuses a VPC-mode network configuration for
+/// when it carries no VPC configuration, and why.
+///
+/// The model states the rule in prose on the member itself — "This configuration
+/// is required when the network mode is set to `VPC`" (`smithy_query
+/// shape=BrowserNetworkConfiguration`) — so the framework's constraint walk
+/// cannot refuse it.
+pub const BROWSER_VPC_CONFIG_MEMBER: &str = "networkConfiguration.vpcConfig";
+
+/// `BrowserNetworkMode` for a browser that connects to a caller-supplied VPC.
+/// The enum's full value list is `PUBLIC | VPC`
+/// (`shared_types::BROWSER_NETWORK_MODE_VALUES`, from `smithy_query
+/// shape=BrowserNetworkMode`).
+pub const BROWSER_NETWORK_MODE_VPC: &str = "VPC";
+
+/// One custom browser: everything `CreateBrowser` persisted for it, and the
+/// statuses the clock owes it.
+///
+/// Every read of the browser reports this record, so a create and a later read
+/// cannot disagree about its configuration or status.
+#[derive(Debug, Clone)]
+pub struct BrowserRecord {
+    pub browser_id: String,
+    pub browser_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub execution_role_arn: Option<String>,
+    pub network_configuration: BrowserNetworkConfiguration,
+    pub recording: Option<RecordingConfig>,
+    /// The signing configuration as a READ reports it: the request carries
+    /// `BrowserSigningConfigInput` and every response the `…Output` shape, and
+    /// the two declare the same one member, so the stored form is the reported
+    /// one.
+    pub browser_signing: Option<BrowserSigningConfigOutput>,
+    pub enterprise_policies: Option<Vec<BrowserEnterprisePolicy>>,
+    pub certificates: Option<Vec<Certificate>>,
+    pub filesystem_configurations: Option<Vec<ToolsFileSystemConfiguration>>,
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The status the browser reports until [`Self::settles_at`].
+    pub transient_status: String,
+    /// The status it reports from then on.
+    pub settled_status: String,
+    /// When the clock owes the move from one to the other. Stored, never slept
+    /// on: a read materialises the transition the clock already made due.
+    pub settles_at: SystemTime,
+    /// The instant an accepted deletion removes this record, once
+    /// `DeleteBrowser` has accepted one; `None` for a browser nobody has
+    /// deleted. Stored, never slept on, like
+    /// [`GatewayRecord::removal_due_at`](GatewayRecord#structfield.removal_due_at).
+    pub removal_due_at: Option<SystemTime>,
+}
+
+impl BrowserRecord {
+    /// The status at `now`: the transient one until the clock owes the
+    /// transition, the settled one from then on. No read performs it — it is due
+    /// at that instant whether or not anybody looks.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        if now < self.settles_at {
+            &self.transient_status
+        } else {
+            &self.settled_status
+        }
+    }
+
+    /// Whether a deletion has been accepted for this browser: it reports
+    /// `DELETING` and the clock owes its removal.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// What the create of this browser reports: the four members
+    /// `CreateBrowserResponse` declares, every one of them off the record just
+    /// written.
+    pub fn create_output(&self, now: SystemTime) -> CreateBrowserOutput {
+        CreateBrowserOutput {
+            browser_id: self.browser_id.clone(),
+            browser_arn: self.browser_arn.clone(),
+            created_at: timestamp(self.created_at),
+            status: self.status_at(now).to_string(),
+        }
+    }
+
+    /// What a read of this browser reports.
+    pub fn get_output(&self, now: SystemTime) -> GetBrowserOutput {
+        GetBrowserOutput {
+            browser_id: self.browser_id.clone(),
+            browser_arn: self.browser_arn.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            execution_role_arn: self.execution_role_arn.clone(),
+            network_configuration: self.network_configuration.clone(),
+            recording: self.recording.clone(),
+            browser_signing: self.browser_signing.clone(),
+            enterprise_policies: self.enterprise_policies.clone(),
+            certificates: self.certificates.clone(),
+            filesystem_configurations: self.filesystem_configurations.clone(),
+            status: self.status_at(now).to_string(),
+            // Reported only for a status that HAS a reason; a browser this
+            // emulator drives reaches READY, which has none.
+            failure_reason: None,
+            created_at: timestamp(self.created_at),
+            last_updated_at: timestamp(self.updated_at),
+        }
+    }
+
+    /// What the deletion of this browser reports.
+    pub fn delete_output(&self, now: SystemTime) -> DeleteBrowserOutput {
+        DeleteBrowserOutput {
+            browser_id: self.browser_id.clone(),
+            status: self.status_at(now).to_string(),
+            last_updated_at: timestamp(self.updated_at),
+        }
+    }
+}
+
 /// The resource noun [`resource_not_found`] names for a configuration bundle.
 pub const RESOURCE_CONFIGURATION_BUNDLE: &str = "configuration bundle";
 
@@ -1638,6 +1808,7 @@ impl ConfigurationBundleRecord {
 /// [`MAX_STRATEGIES_PER_MEMORY`] the strategies one memory holds,
 /// [`MAX_HARNESSES`] the harnesses (and with them their 1:1 name index),
 /// [`MAX_REGISTRIES`] the registries (and with them their 1:1 name index),
+/// [`MAX_BROWSERS`] the browsers (and with them their 1:1 name index),
 /// [`MAX_CONFIGURATION_BUNDLES`] the configuration bundles (and with them their
 /// 1:1 name index), [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`] the versions one
 /// bundle accumulates and
@@ -1742,6 +1913,23 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::registry_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     registry_idempotency_order: VecDeque<String>,
+    /// Every custom browser, keyed by `browserId` — the identifier every browser
+    /// route addresses it by. The key order is the deterministic list order a
+    /// browser listing pages over.
+    pub browsers: BTreeMap<String, BrowserRecord>,
+    /// `name` -> `browserId`, so a duplicate name at create time is a
+    /// `ConflictException` ("The name must be unique within your account").
+    /// One entry per stored browser.
+    pub browser_names: BTreeMap<String, String>,
+    /// `<operation>/<clientToken>` -> the browser that token first produced, so
+    /// a replayed `CreateBrowser` answers with its first result instead of
+    /// minting a second browser. Separate from the maps above because the record
+    /// is validated against a different store; the key carries the operation for
+    /// the same reason as there.
+    browser_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::browser_idempotency`] in the order they were first
+    /// recorded, so the oldest record is the one evicted at the ceiling.
+    browser_idempotency_order: VecDeque<String>,
     /// Every configuration bundle, keyed by `bundleId` — the identifier every
     /// configuration-bundle route addresses it by. The key order is the
     /// deterministic list order a bundle listing pages over.
@@ -2212,6 +2400,93 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         );
     }
 
+    /// Mint a `browserId` for `name` that no stored browser holds: the name +
+    /// `-` + 10 alphanumerics, per `BrowserId`'s pattern
+    /// `^(aws\.browser\.v1|[a-zA-Z][a-zA-Z0-9_]{0,47}-[a-zA-Z0-9]{10})$`.
+    ///
+    /// `SandboxName` is `^[a-zA-Z][a-zA-Z0-9_]{0,47}$`, which is exactly the
+    /// stem that pattern admits, so the name needs no reshaping. The other
+    /// alternative, `aws.browser.v1`, is the service-provided browser tool,
+    /// which no create mints.
+    pub fn mint_browser_id(&mut self, name: &str, at: SystemTime) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = format!("{name}-{}", suffix_for(name, self.mint_counter, at));
+            if !self.browsers.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// The browser a previous request to `operation` carrying this `clientToken`
+    /// produced, if the record is still held and the browser still exists.
+    pub fn replayed_browser_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<String> {
+        let browser_id = self
+            .browser_idempotency
+            .get(&token_key(operation, client_token?))?;
+        self.browsers
+            .contains_key(browser_id)
+            .then(|| browser_id.clone())
+    }
+
+    /// Record what a `clientToken` produced for `operation`, evicting the oldest
+    /// record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held. An evicted token is
+    /// indistinguishable from one whose idempotency window has passed: the next
+    /// request carrying it is served as a fresh one.
+    pub fn remember_browser_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        browser_id: &str,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        remember_token(
+            &mut self.browser_idempotency,
+            &mut self.browser_idempotency_order,
+            token_key(operation, &token),
+            browser_id.to_string(),
+        );
+    }
+
+    /// Drop the idempotency records naming a browser that no longer exists, for
+    /// the same reason [`Self::forget_client_tokens_for`] does.
+    fn forget_browser_client_tokens_for(&mut self, browser_id: &str) {
+        self.browser_idempotency.retain(|_, id| id != browser_id);
+        let live = &self.browser_idempotency;
+        self.browser_idempotency_order
+            .retain(|token| live.contains_key(token));
+    }
+
+    /// Remove every browser whose accepted deletion the clock has made due, and
+    /// the name index entry and idempotency records naming it.
+    ///
+    /// `DeleteBrowser` ACCEPTS the deletion (202) and reports the browser
+    /// `DELETING`; the record itself goes when the span it owes passes, so a
+    /// caller polling the browser sees `DELETING` and then the modelled 404. The
+    /// removal is owed by the CLOCK — it was due at this instant whether or not
+    /// anybody called — so every operation that reads the browser store
+    /// materialises it first, and nothing ever sleeps for it.
+    pub fn expire_deleted_browsers(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .browsers
+            .iter()
+            .filter(|(_, record)| record.removal_due_at.is_some_and(|at| now >= at))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            if let Some(record) = self.browsers.remove(&id) {
+                self.browser_names.remove(&record.name);
+                self.forget_browser_client_tokens_for(&record.browser_id);
+            }
+        }
+    }
+
     /// Mint a `bundleId` for `bundle_name` that no stored bundle holds:
     /// `bundle_name` + `-` + 10 alphanumerics, per `ConfigurationBundleId`'s
     /// pattern `^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`.
@@ -2513,6 +2788,16 @@ pub fn registry_arn(region: &str, registry_id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{RESOURCE_REGISTRY}/{registry_id}"),
+    )
+}
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:browser-custom/{browserId}` —
+/// the customer-created alternative of `BrowserArn`'s pattern.
+pub fn browser_arn(region: &str, browser_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{BROWSER_ARN_RESOURCE}/{browser_id}"),
     )
 }
 

@@ -33,7 +33,15 @@ pub struct BrowserSigningConfigInput {
     pub enabled: bool,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#CreateBrowserResponse")]
+/// `CreateBrowserResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation", operation="CreateBrowser")`),
+/// and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct CreateBrowserOutput {
     pub browser_id: String,
@@ -41,4 +49,16 @@ pub struct CreateBrowserOutput {
     pub created_at: ::aws_smithy_types::DateTime,
     pub status: String,
 }
+
+agentcore_schema_and_codec!(
+    CreateBrowserOutput,
+    CREATE_BROWSER_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#CreateBrowserResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "CreateBrowserResponse",
+    (M_BROWSER_ID, browser_id, "browserId", 0, req, string),
+    (M_BROWSER_ARN, browser_arn, "browserArn", 1, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 2, req, date_time),
+    (M_STATUS, status, "status", 3, req, string),
+);
 
