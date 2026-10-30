@@ -44,7 +44,7 @@ use crate::connect_peer_tie_removal_refusals::assert_dependency_refusal;
 use crate::core_network_lifecycle::create_core_network;
 use crate::customer_gateway_association_lifecycle::{
     associate as associate_customer_gateway, disassociate as disassociate_customer_gateway,
-    get_associations as get_customer_gateway_associations, plain_cgw_arn,
+    get_associations as get_customer_gateway_associations, plain_cgw_arn, register_vpn_carrier,
 };
 use crate::device_lifecycle::create_device_ok;
 use crate::disassociate_connect_peer::disassociate as disassociate_connect_peer;
@@ -278,6 +278,10 @@ async fn tie(
     match kind {
         Kind::CustomerGateway => {
             let arn = plain_cgw_arn(CUSTOMER_GATEWAY_HEX);
+            // A customer gateway is associated only where the global network carries, in
+            // the gateway's Region, a transit gateway or core network edge its VPN
+            // attachment could be on.
+            register_vpn_carrier(emulator, &network.id, REGION).await;
             let (status, created) = associate_customer_gateway(
                 emulator,
                 &network.id,

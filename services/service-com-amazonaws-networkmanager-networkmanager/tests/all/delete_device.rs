@@ -22,6 +22,7 @@
 use serde_json::{json, Value};
 
 use crate::connection_lifecycle::without_state;
+use crate::customer_gateway_association_lifecycle::register_vpn_carrier;
 use crate::device_lifecycle::create_device_ok;
 use crate::global_network_lifecycle::{error_code, ids_of, Emulator, PAST_SETTLE};
 use crate::link_lifecycle::{create_link_ok, plain_link};
@@ -271,11 +272,20 @@ fn association_cases() -> Vec<AssociationCase> {
 /// Amazon VPC resource, so the form is EC2's, as `customer_gateway_association_lifecycle`
 /// builds it.
 fn cgw_arn(hex: &str) -> String {
-    format!("arn:aws:ec2:us-west-2:123456789012:customer-gateway/cgw-{hex}")
+    format!("arn:aws:ec2:{CUSTOMER_GATEWAY_REGION}:123456789012:customer-gateway/cgw-{hex}")
 }
 
+/// The Region the gateways above live in, which is therefore the Region their carrier is
+/// registered in ([`register_vpn_carrier`]).
+const CUSTOMER_GATEWAY_REGION: &str = "us-west-2";
+
 /// `AssociateCustomerGateway` tying `arn` to `device` of `network`, which must succeed.
+///
+/// A customer gateway is associated only where the global network carries, in the gateway's
+/// Region, a transit gateway or core network edge its VPN attachment could be on, so the
+/// carrier for the Region [`cgw_arn`] names is registered first.
 async fn associate_gateway_ok(emulator: &Emulator, network: &str, device: &str, arn: &str) {
+    register_vpn_carrier(emulator, network, CUSTOMER_GATEWAY_REGION).await;
     let (status, body) = emulator
         .post(
             &format!("/global-networks/{network}/customer-gateway-associations"),

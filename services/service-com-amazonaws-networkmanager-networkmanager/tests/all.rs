@@ -15,6 +15,8 @@
 mod arn_scoping;
 #[path = "all/associate_customer_gateway_scoping.rs"]
 mod associate_customer_gateway_scoping;
+#[path = "all/associate_customer_gateway_vpn_attachment_carrier.rs"]
+mod associate_customer_gateway_vpn_attachment_carrier;
 #[path = "all/associate_link_member_agreement.rs"]
 mod associate_link_member_agreement;
 #[path = "all/associate_link_refusals.rs"]

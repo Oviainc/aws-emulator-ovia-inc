@@ -49,8 +49,12 @@ fn cgw_arn(partition: &str, region: &str, account: &str, hex: &str) -> String {
 
 /// A customer gateway ARN in the shape most requests carry, distinguished by `hex`.
 pub(crate) fn plain_cgw_arn(hex: &str) -> String {
-    cgw_arn("aws", "us-west-2", "123456789012", hex)
+    cgw_arn("aws", PLAIN_REGION, "123456789012", hex)
 }
+
+/// The Region [`plain_cgw_arn`] names, which is therefore the Region a carrier of such a
+/// gateway has to be registered in or configure an edge at.
+pub(crate) const PLAIN_REGION: &str = "us-west-2";
 
 /// `AssociateCustomerGateway` on `network` with `body`.
 pub(crate) async fn associate(emulator: &Emulator, network: &str, body: Value) -> (u16, Value) {
@@ -148,7 +152,40 @@ async fn associate_link(emulator: &Emulator, network: &str, device: &str, link: 
     );
 }
 
-/// Create a site of `network`, a device at it and a link at it, and associate the pair.
+/// Register a transit gateway of `region` with `network`: the carrier a customer gateway of
+/// that Region reaches the global network through, which is what makes an associate of such
+/// a gateway acceptable at all ("You can only associate customer gateways that are connected
+/// to a VPN attachment on a transit gateway or core network registered in your global
+/// network", `smithy_query query="doc" shape="AssociateCustomerGateway"`).
+///
+/// A transit gateway is registered with at most one global network, so the gateway id is
+/// derived from the global network's own minted id: one call per (global network, Region)
+/// pair registers one gateway, and a repeat of the same call is the register's own
+/// idempotent answer. The account is the emulator's, the only one `RegisterTransitGateway`
+/// accepts.
+pub(crate) async fn register_vpn_carrier(emulator: &Emulator, network: &str, region: &str) {
+    let minted = network
+        .rsplit_once('-')
+        .map_or(network, |(_, suffix)| suffix);
+    let gateway = format!(
+        "arn:aws:ec2:{region}:{}:transit-gateway/tgw-{minted}",
+        engine::emulator_account_id()
+    );
+    let (status, body) = emulator
+        .post(
+            &format!("/global-networks/{network}/transit-gateway-registrations"),
+            json!({ "TransitGatewayArn": gateway }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "RegisterTransitGateway({gateway}): expected 200, got {status} with {body}"
+    );
+}
+
+/// Create a site of `network`, a device at it and a link at it, associate the pair, and
+/// register a transit gateway in the Region [`plain_cgw_arn`] names, so an associate of such
+/// a gateway satisfies both documented preconditions.
 pub(crate) async fn device_with_link(
     emulator: &Emulator,
     network: &str,
@@ -158,6 +195,7 @@ pub(crate) async fn device_with_link(
     let device = create_device_ok(emulator, network, json!({ "SiteId": site })).await;
     let link = create_link_ok(emulator, network, &site, &plain_link()).await;
     associate_link(emulator, network, &device, &link).await;
+    register_vpn_carrier(emulator, network, PLAIN_REGION).await;
     DeviceWithLink {
         site,
         device,
@@ -178,12 +216,19 @@ async fn customer_gateway_associations_round_trip_through_stored_state() {
     let emulator = Emulator::new();
     let network = emulator.create_global_network("customer gateways").await;
     let subject = device_with_link(&emulator, &network, "hq").await;
+    // A customer gateway is associated only where the global network carries, in the
+    // gateway's own Region, a transit gateway or core network edge its VPN attachment could
+    // be on, so every Region the rows span gets a registered carrier (`device_with_link`
+    // registered the one for [`PLAIN_REGION`]).
+    for region in ["cn-north-1", "us-gov-west-1"] {
+        register_vpn_carrier(&emulator, &network, region).await;
+    }
 
-    // The rows span what the rule generalises over: the ARN's partition, Region (including
-    // none at all, which the EC2 form admits), account and id width — the published bounds
-    // of that id are 8 and 17 hex digits — and both forms of the association, with a link
-    // and without. Several gateways on ONE device is itself a row of the class: the
-    // documented bound is one device per GATEWAY, not one gateway per device.
+    // The rows span what the rule generalises over: the ARN's partition, Region, account and
+    // id width — the published bounds of that id are 8 and 17 hex digits — and both forms of
+    // the association, with a link and without. Several gateways on ONE device is itself a
+    // row of the class: the documented bound is one device per GATEWAY, not one gateway per
+    // device.
     let rows = vec![
         Row {
             name: "device only",
@@ -206,13 +251,13 @@ async fn customer_gateway_associations_round_trip_through_stored_state() {
             with_link: false,
         },
         Row {
-            name: "another partition and Region",
+            name: "another partition, Region and account",
             arn: cgw_arn("aws-cn", "cn-north-1", "210987654321", "beefcafe1"),
             with_link: false,
         },
         Row {
-            name: "no Region segment",
-            arn: cgw_arn("aws-us-gov", "", "123456789012", "00000000"),
+            name: "another partition and Region, with a link",
+            arn: cgw_arn("aws-us-gov", "us-gov-west-1", "123456789012", "00000000"),
             with_link: true,
         },
     ];

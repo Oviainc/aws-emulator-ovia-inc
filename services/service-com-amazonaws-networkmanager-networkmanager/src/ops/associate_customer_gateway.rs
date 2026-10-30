@@ -170,6 +170,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The documented precondition below is about the REGION the gateway lives in, and
+        // only the gateway's own ARN names it — this operation carries no Region member — so
+        // an ARN that names none is a field failure on the member that carried it, judged
+        // here beside the form for the same reason: nothing stored bears on it. The two
+        // other handlers that have to read a foreign ARN's Region refuse one that carries
+        // none the same way (`AssociateTransitGatewayConnectPeer`,
+        // `CreateSiteToSiteVpnAttachment`).
+        let Some(gateway_region) =
+            crate::state::arn_region(&input.customer_gateway_arn).map(str::to_string)
+        else {
+            return Err(AssociateCustomerGatewayErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_CUSTOMER_GATEWAY_ARN,
+                    crate::state::REASON_FIELD_VALIDATION_FAILED,
+                    "must name the Region the customer gateway is in".to_string(),
+                ),
+            )
+            .into());
+        };
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             AssociateCustomerGatewayErrorModeled::InternalServerException(
                 InternalServerException {
@@ -243,6 +263,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // "You can only associate customer gateways that are connected to a VPN attachment
+        // on a transit gateway or core network registered in your global network." (same
+        // doc) — see `carries_vpn_attachment_in` for what this global network's
+        // registrations and core networks can establish about a gateway of that Region. The
+        // refusal is about the request against stored state rather than one input field, so
+        // it carries no `Fields` entry and the catch-all `Reason`, like the sibling associate
+        // standing on the parallel sentence of its own documentation.
+        if !store.carries_vpn_attachment_in(&input.global_network_id, &gateway_region) {
+            return Err(AssociateCustomerGatewayErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "global network {} has no transit gateway registered in {gateway_region} and no core network with an edge location there that customer gateway {} can be connected to a VPN attachment on",
+                        input.global_network_id, input.customer_gateway_arn
+                    ),
+                    reason: Some(crate::state::VALIDATION_REASON_OTHER.to_string()),
+                    fields: None,
+                },
+            )
+            .into());
         }
 
         // The association's identity is the global network / customer gateway pair, so a

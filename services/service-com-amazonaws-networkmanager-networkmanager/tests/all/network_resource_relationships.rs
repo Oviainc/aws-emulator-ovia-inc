@@ -27,6 +27,7 @@ use crate::attachment_lifecycle::{
 };
 use crate::connection_lifecycle::{create_connection_ok, id_of};
 use crate::core_network_lifecycle::create_core_network;
+use crate::customer_gateway_association_lifecycle::register_vpn_carrier;
 use crate::device_lifecycle::create_device_ok;
 use crate::global_network_lifecycle::{error_code, expected_arn, expected_scoped_arn, Emulator};
 use crate::link_association_lifecycle::associate_ok;
@@ -260,9 +261,13 @@ async fn graph(emulator: &Emulator) -> Graph {
 
     // A customer gateway of Amazon VPC, tied to the device AND to the link that device
     // reaches it over ("If you specify a link, it must be associated with the specified
-    // device", which the link association above is).
+    // device", which the link association above is). The tie also stands on a carrier in the
+    // gateway's own Region — a transit gateway or core network edge its VPN attachment could
+    // be on — and a registration is no network resource of this inventory, so registering one
+    // leaves every listing below as it was.
     let gateway =
         format!("arn:aws:ec2:{GATEWAY_REGION}:{FOREIGN_ACCOUNT}:customer-gateway/cgw-0123abcd");
+    register_vpn_carrier(emulator, &network, GATEWAY_REGION).await;
     let (status, body) = emulator
         .post(
             &format!("/global-networks/{network}/customer-gateway-associations"),

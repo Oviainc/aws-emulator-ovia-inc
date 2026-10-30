@@ -4596,6 +4596,46 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .count()
     }
 
+    /// Whether `global_network_id` carries, in `region`, something a VPN connection landing
+    /// there can be attached to: a registered transit gateway in that Region, or a core
+    /// network of this global network whose policy IN FORCE configures an edge there.
+    ///
+    /// "You can only associate customer gateways that are connected to a VPN attachment on a
+    /// transit gateway or core network registered in your global network." (`smithy_query
+    /// query="doc" shape="AssociateCustomerGateway"`). WHICH VPN connection a given customer
+    /// gateway is connected to is Amazon VPC's record, which this service holds no inventory
+    /// of, and the gateway's own ARN does not name it; what that ARN does fix is the Region
+    /// the gateway lives in, and a VPN connection is a Regional resource, so the transit
+    /// gateway it attaches to and the core network EDGE a site-to-site VPN attachment of it
+    /// sits at ([`PolicyTopology::has_edge_location`], which is also what
+    /// [`check_edge_location`] judges such an attachment against) are both in that same
+    /// Region. So the carriers that could reach the gateway are a registration of a gateway
+    /// in its Region and a core network edge configured there, and a global network holding
+    /// neither holds nothing the gateway can be connected to a VPN attachment on.
+    ///
+    /// The owning ACCOUNT is not compared, unlike [`Self::carries_transit_gateway_in`]: a
+    /// Connect peer is created ON the registered gateway and so belongs to the same account
+    /// as it, while a VPN connection belongs to the account that owns the customer gateway
+    /// and reaches a transit gateway or a core network edge the global network's own account
+    /// owns (`RegisterTransitGateway` holds every registration to that account), which is a
+    /// different account whenever the customer gateway is another account's.
+    pub fn carries_vpn_attachment_in(&self, global_network_id: &str, region: &str) -> bool {
+        let registered = self
+            .transit_gateway_registrations
+            .values()
+            .filter(|registration| registration.global_network_id == global_network_id)
+            .any(|registration| {
+                ec2_resource_region(&registration.transit_gateway_arn, TRANSIT_GATEWAY_TYPE)
+                    == Some(region)
+            });
+        registered
+            || self
+                .core_networks
+                .values()
+                .filter(|core_network| core_network.global_network_id == global_network_id)
+                .any(|core_network| core_network.topology().has_edge_location(region))
+    }
+
     /// How many managed prefix lists `core_network_id` is associated with, for the
     /// per-core-network quota.
     pub fn prefix_list_association_count_of(&self, core_network_id: &str) -> usize {
