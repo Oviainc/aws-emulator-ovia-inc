@@ -13,7 +13,8 @@
 //! `TagResource` and `ListTagsForResource`; `UntagResource` is driven through this same
 //! harness by `tests/all/untagging_authorization.rs`, which asserts the same rule over its
 //! own tables — including where the documents in force on the principal LIVE, through the
-//! `managed_policy` and `attach_role_policy` helpers below.
+//! `managed_policy`, `attach_role_policy` and `attach_user_policy` helpers below, which
+//! `tests/all/user_attached_policy_authorization.rs` drives over both kinds of principal.
 //!
 //! The decision is the real one: the principals below are made with IAM's and STS's OWN
 //! operations over the same engine — `CreateRole` + `PutRolePolicy` + `AssumeRole`,
@@ -312,6 +313,27 @@ impl Emulator {
         assert_eq!(
             status, 200,
             "attaching {policy_arn} to {role_name:?} must succeed, got {status} {body}"
+        );
+    }
+
+    /// Attach the managed policy `policy_arn` to the user `user_name`, so the policy's
+    /// document is in force on every request that user signs — the ordinary way AWS
+    /// permissions are granted to a user.
+    pub(crate) async fn attach_user_policy(&self, user_name: &str, policy_arn: &str) {
+        let (status, body) = self
+            .query(
+                "iam",
+                "2010-05-08",
+                "AttachUserPolicy",
+                &[
+                    ("UserName", user_name.to_string()),
+                    ("PolicyArn", policy_arn.to_string()),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "attaching {policy_arn} to {user_name:?} must succeed, got {status} {body}"
         );
     }
 }

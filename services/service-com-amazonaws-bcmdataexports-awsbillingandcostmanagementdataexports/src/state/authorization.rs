@@ -20,9 +20,9 @@
 //!    (IAM's own `access_keys` map, which its `GetUser` resolves a caller through), else
 //!    the account's own published credential;
 //! 2. **what it may do** — the identity-based policy documents the IAM store holds for
-//!    that principal (a role's inline policies and the default versions of the managed
-//!    policies attached to it, a user's inline policies), read out of the IAM service's
-//!    OWN store so this service sees exactly what IAM's handlers wrote;
+//!    that principal: its INLINE policies plus the default version of every MANAGED policy
+//!    attached to it, the same two sources for every kind of principal, read out of the IAM
+//!    service's OWN store so this service sees exactly what IAM's handlers wrote;
 //! 3. **the decision** — [`::service_common::iam_authorization`], the shared evaluation of
 //!    those documents against `(action, resource, principal)`, so this service and any
 //!    other handed the same documents decide alike.
@@ -210,41 +210,44 @@ pub fn caller<Eng: Send + Sync + 'static>(
             caller.principals = vec![user.arn.clone()];
         }
     }
-    if let Some(role_name) = assumed_role_name(&caller.arn) {
+    // The identity-based documents in force on a principal are its INLINE policies plus the
+    // default version of every MANAGED policy attached to it — the same two sources for
+    // every kind of principal, so the branches below only choose which of the IAM store's
+    // maps those two sources are read from (and a role session is additionally known by the
+    // role's own ARN, the spelling a policy may name it by).
+    let (inline, attached) = if let Some(role_name) = assumed_role_name(&caller.arn) {
         let role_key = iam_store::name_key(role_name);
         if let Some(held) = store.roles.get(&role_key) {
             caller.principals.push(held.arn.clone());
         }
-        caller
-            .documents
-            .extend(inline_documents(&store.role_inline_policies, &role_key));
-        for attached in store
-            .role_attached_policies
-            .get(&role_key)
-            .into_iter()
-            .flatten()
-        {
-            match store
-                .policy_by_arn(attached)
-                .and_then(default_version_document)
-            {
-                Some(document) => caller.documents.push(document),
-                // Only an AWS-MANAGED policy is a grant this emulator cannot read (see
-                // the module docs).
-                None if is_aws_managed_policy(attached) => {
-                    caller.unreadable_attachment = true;
-                }
-                None => {}
-            }
-        }
+        (
+            inline_documents(&store.role_inline_policies, &role_key),
+            store.role_attached_policies.get(&role_key),
+        )
     } else if let Some(user_name) = iam_user_name(&caller.arn) {
-        // A user's INLINE policies are what the IAM store holds for it; `AttachUserPolicy`
-        // is not implemented there, so there is no attached-policy map to read for a user
-        // (unlike a role's `role_attached_policies` above).
-        caller.documents.extend(inline_documents(
-            &store.user_inline_policies,
-            &iam_store::name_key(user_name),
-        ));
+        let user_key = iam_store::name_key(user_name);
+        (
+            inline_documents(&store.user_inline_policies, &user_key),
+            store.user_attached_policies.get(&user_key),
+        )
+    } else {
+        (Vec::new(), None)
+    };
+    caller.documents.extend(inline);
+    for attachment in attached.into_iter().flatten() {
+        match store
+            .policy_by_arn(attachment)
+            .and_then(default_version_document)
+        {
+            Some(document) => caller.documents.push(document),
+            // Only an AWS-MANAGED policy is a grant this emulator cannot read (see the
+            // module docs); an attachment naming a customer-managed policy the account does
+            // not hold grants nothing.
+            None if is_aws_managed_policy(attachment) => {
+                caller.unreadable_attachment = true;
+            }
+            None => {}
+        }
     }
     caller
 }

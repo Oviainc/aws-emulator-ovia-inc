@@ -97,6 +97,8 @@ mod unpublished_table_refusal_field;
 mod untagging_arn_validation;
 #[path = "all/untagging_authorization.rs"]
 mod untagging_authorization;
+#[path = "all/user_attached_policy_authorization.rs"]
+mod user_attached_policy_authorization;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
 #[path = "all/validation_messages.rs"]
