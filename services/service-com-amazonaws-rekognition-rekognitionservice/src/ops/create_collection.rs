@@ -90,6 +90,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -165,10 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateCollectionErrorModeled::InternalServerError(InternalServerError {
-                message: Some("the Rekognition collection store is unavailable".to_string()),
-                ..InternalServerError::default()
-            })
+            CreateCollectionErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
         })?;
         let mut state = state.lock();
 
@@ -178,13 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // indexed into the live collection.
         if state.collections.contains_key(&input.collection_id) {
             return Err(CreateCollectionErrorModeled::ResourceAlreadyExistsException(
-                ResourceAlreadyExistsException {
-                    message: Some(format!(
-                        "The collection id: {} already exists",
-                        input.collection_id
-                    )),
-                    ..ResourceAlreadyExistsException::default()
-                },
+                ResourceAlreadyExistsException::with_message(format!(
+                    "The collection id: {} already exists",
+                    input.collection_id
+                )),
             )
             .into());
         }
@@ -195,13 +195,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stores nothing.
         if state.collections.len() >= crate::state::MAX_COLLECTIONS {
             return Err(CreateCollectionErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "The maximum number of collections ({}) has been reached",
-                        crate::state::MAX_COLLECTIONS
-                    )),
-                    ..ServiceQuotaExceededException::default()
-                },
+                ServiceQuotaExceededException::with_message(format!(
+                    "The maximum number of collections ({}) has been reached",
+                    crate::state::MAX_COLLECTIONS
+                )),
             )
             .into());
         }

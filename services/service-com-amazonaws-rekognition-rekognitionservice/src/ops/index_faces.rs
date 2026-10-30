@@ -184,6 +184,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -263,10 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            IndexFacesErrorModeled::InternalServerError(InternalServerError {
-                message: Some("the Rekognition collection store is unavailable".to_string()),
-                ..InternalServerError::default()
-            })
+            IndexFacesErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
         })?;
         let mut state = state.lock();
 
@@ -277,13 +280,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collections
             .get_mut(&input.collection_id)
             .ok_or_else(|| {
-                IndexFacesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "The collection id: {} does not exist",
-                        input.collection_id
-                    )),
-                    ..ResourceNotFoundException::default()
-                })
+                IndexFacesErrorModeled::ResourceNotFoundException(
+                    crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+                )
             })?;
 
         // An `Image` carries its content either inline or as an S3 object, and the
@@ -293,20 +292,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let signature = crate::state::image_signature(&input.image).ok_or_else(|| {
             match input.image.s3_object.as_ref() {
                 Some(_) => IndexFacesErrorModeled::InvalidS3ObjectException(
-                    InvalidS3ObjectException {
-                        message: Some(
-                            crate::state::image_source::UNREADABLE_OBJECT_MESSAGE.to_string(),
-                        ),
-                        ..InvalidS3ObjectException::default()
-                    },
+                    InvalidS3ObjectException::with_message(
+                        crate::state::image_source::UNREADABLE_OBJECT_MESSAGE,
+                    ),
                 ),
                 None => IndexFacesErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            crate::state::image_source::MISSING_IMAGE_CONTENT_MESSAGE.to_string(),
-                        ),
-                        ..InvalidParameterException::default()
-                    },
+                    InvalidParameterException::with_message(
+                        crate::state::image_source::MISSING_IMAGE_CONTENT_MESSAGE,
+                    ),
                 ),
             }
         })?;
@@ -329,14 +322,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request stores nothing.
         if collection.faces.len() + indexed > crate::state::MAX_FACES_PER_COLLECTION {
             return Err(IndexFacesErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "The collection {} holds the maximum of {} faces",
-                        input.collection_id,
-                        crate::state::MAX_FACES_PER_COLLECTION
-                    )),
-                    ..ServiceQuotaExceededException::default()
-                },
+                ServiceQuotaExceededException::with_message(format!(
+                    "The collection {} holds the maximum of {} faces",
+                    input.collection_id,
+                    crate::state::MAX_FACES_PER_COLLECTION
+                )),
             )
             .into());
         }

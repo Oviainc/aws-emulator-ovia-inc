@@ -4,8 +4,9 @@
 //!
 //! Besides the state struct this module holds everything the face-collection
 //! handlers share — ARN construction, the request's region, the record-to-modelled
-//! shape conversions, the list cursor codec, the store's capacity bounds and the
-//! image-identity digest — so the nine operation files agree on one implementation of
+//! shape conversions, the list cursor codec, the store's capacity bounds, the
+//! image-identity digest and the construction of the modelled errors in
+//! [`modeled_error`] — so the nine operation files agree on one implementation of
 //! each instead of carrying copies that can drift apart.
 //!
 //! ## What this emulator does and does not compute
@@ -34,6 +35,7 @@
 
 pub mod face_detection;
 pub mod image_source;
+pub mod modeled_error;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};

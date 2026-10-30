@@ -67,7 +67,7 @@ const SWEEP_SEED: u64 = 0x5245_4b4f_474e_4954;
 const SWEEP_CASES: usize = 128;
 
 /// The emulator, with this one service mounted on a shared engine.
-fn harness() -> MultiServiceRouter {
+pub(crate) fn harness() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the router still routes by the
@@ -1218,15 +1218,28 @@ async fn search_faces_reports_the_faces_indexed_from_the_same_image() {
     );
 
     // A face id the collection does not hold names no face to search from — including
-    // one that is stored in a DIFFERENT collection.
-    for (case, collection, face_id) in [
+    // one that is stored in a DIFFERENT collection. The collection named exists in those
+    // two rows, so the id is a parameter the service rejects; a collection the service
+    // does not hold at all is the not-found refusal instead.
+    for (case, collection, face_id, expected) in [
         (
             "never indexed",
             "my-faces",
             "22222222-2222-4222-8222-222222222222",
+            "InvalidParameterException",
         ),
-        ("another collection's face", "my-faces", stranger.as_str()),
-        ("unknown collection", "no-such-collection", alice.as_str()),
+        (
+            "another collection's face",
+            "my-faces",
+            stranger.as_str(),
+            "InvalidParameterException",
+        ),
+        (
+            "unknown collection",
+            "no-such-collection",
+            alice.as_str(),
+            "ResourceNotFoundException",
+        ),
     ] {
         let reply = call(
             &router,
@@ -1236,7 +1249,7 @@ async fn search_faces_reports_the_faces_indexed_from_the_same_image() {
         .await;
         assert_eq!(
             (reply.status, reply.error_code().as_str()),
-            (400, "ResourceNotFoundException"),
+            (400, expected),
             "case {case:?}: got {:?}",
             reply.body
         );

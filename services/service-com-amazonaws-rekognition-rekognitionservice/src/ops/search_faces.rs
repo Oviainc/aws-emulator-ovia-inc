@@ -4,7 +4,8 @@
 //! Reports which other faces in a collection match one already stored in it.
 //!
 //! The searched face must itself be in the collection — the search is by `FaceId`, not
-//! by image — and it is never its own match.
+//! by image — and it is never its own match. A `FaceId` the collection does not hold is
+//! refused as a bad parameter, since the collection the request named does exist.
 //!
 //! No face recogniser runs in this process, so this operation computes no graded
 //! similarity and reports none. The one comparison it can make honestly is identity:
@@ -184,33 +185,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            SearchFacesErrorModeled::InternalServerError(InternalServerError {
-                message: Some("the Rekognition collection store is unavailable".to_string()),
-                ..InternalServerError::default()
-            })
+            SearchFacesErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
         })?;
         let state = state.lock();
 
         let collection = state.collections.get(&input.collection_id).ok_or_else(|| {
-            SearchFacesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "The collection id: {} does not exist",
-                    input.collection_id
-                )),
-                ..ResourceNotFoundException::default()
-            })
+            SearchFacesErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
         })?;
 
         // The search starts from a face the collection already holds: an id that was
-        // never indexed, or was deleted, names no face to compare against.
+        // never indexed, or was deleted, names no face to compare against. The
+        // collection itself exists, so what the request got wrong is the id it passed —
+        // a parameter refusal, not a missing resource.
         let searched = collection.face(&input.face_id).ok_or_else(|| {
-            SearchFacesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "The face id: {} does not exist in collection {}",
-                    input.face_id, input.collection_id
-                )),
-                ..ResourceNotFoundException::default()
-            })
+            SearchFacesErrorModeled::InvalidParameterException(
+                crate::state::modeled_error::face_id_not_in_collection(),
+            )
         })?;
 
         let threshold = input

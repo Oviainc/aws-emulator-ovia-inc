@@ -165,10 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListCollectionsErrorModeled::InternalServerError(InternalServerError {
-                message: Some("the Rekognition collection store is unavailable".to_string()),
-                ..InternalServerError::default()
-            })
+            ListCollectionsErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
         })?;
         let state = state.lock();
 
@@ -178,10 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::decode_cursor(crate::state::COLLECTIONS_CURSOR_SCOPE, token)
                     .ok_or_else(|| {
                         ListCollectionsErrorModeled::InvalidPaginationTokenException(
-                            InvalidPaginationTokenException {
-                                message: Some("Invalid pagination token".to_string()),
-                                ..InvalidPaginationTokenException::default()
-                            },
+                            crate::state::modeled_error::invalid_pagination_token(),
                         )
                     })?,
             ),

@@ -156,10 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            DeleteFacesErrorModeled::InternalServerError(InternalServerError {
-                message: Some("the Rekognition collection store is unavailable".to_string()),
-                ..InternalServerError::default()
-            })
+            DeleteFacesErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
         })?;
         let mut state = state.lock();
 
@@ -167,13 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collections
             .get_mut(&input.collection_id)
             .ok_or_else(|| {
-                DeleteFacesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!(
-                        "The collection id: {} does not exist",
-                        input.collection_id
-                    )),
-                    ..ResourceNotFoundException::default()
-                })
+                DeleteFacesErrorModeled::ResourceNotFoundException(
+                    crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+                )
             })?;
 
         let mut deleted = Vec::new();

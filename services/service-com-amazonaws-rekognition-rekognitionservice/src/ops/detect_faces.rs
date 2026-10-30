@@ -107,6 +107,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -205,40 +209,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn unreadable_error(reason: crate::state::image_source::UnreadableImage) -> DetectFacesError {
     use crate::state::image_source::UnreadableImage;
 
-    let message = Some(reason.message().to_string());
+    let message = reason.message().to_string();
     match reason {
         UnreadableImage::InvalidFormat(_) => DetectFacesErrorModeled::InvalidImageFormatException(
-            InvalidImageFormatException {
-                message,
-                ..InvalidImageFormatException::default()
-            },
+            InvalidImageFormatException::with_message(message),
         ),
-        UnreadableImage::TooLarge(_) => {
-            DetectFacesErrorModeled::ImageTooLargeException(ImageTooLargeException {
-                message,
-                ..ImageTooLargeException::default()
-            })
-        }
-        UnreadableImage::S3Unreadable(_) => {
-            DetectFacesErrorModeled::InvalidS3ObjectException(InvalidS3ObjectException {
-                message,
-                ..InvalidS3ObjectException::default()
-            })
-        }
-        UnreadableImage::InvalidParameter(_) => {
-            DetectFacesErrorModeled::InvalidParameterException(InvalidParameterException {
-                message,
-                ..InvalidParameterException::default()
-            })
-        }
+        UnreadableImage::TooLarge(_) => DetectFacesErrorModeled::ImageTooLargeException(
+            ImageTooLargeException::with_message(message),
+        ),
+        UnreadableImage::S3Unreadable(_) => DetectFacesErrorModeled::InvalidS3ObjectException(
+            InvalidS3ObjectException::with_message(message),
+        ),
+        UnreadableImage::InvalidParameter(_) => DetectFacesErrorModeled::InvalidParameterException(
+            InvalidParameterException::with_message(message),
+        ),
         // Nothing was established about the image itself, so this is the server fault it
         // is rather than anything about the request.
-        UnreadableImage::NotAnalysed(_) => {
-            DetectFacesErrorModeled::InternalServerError(InternalServerError {
-                message,
-                ..InternalServerError::default()
-            })
-        }
+        UnreadableImage::NotAnalysed(_) => DetectFacesErrorModeled::InternalServerError(
+            InternalServerError::with_message(message),
+        ),
     }
     .into()
 }

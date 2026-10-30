@@ -78,6 +78,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,10 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::InternalServerError(InternalServerError {
-                message: Some("the Rekognition collection store is unavailable".to_string()),
-                ..InternalServerError::default()
-            })
+            ListTagsForResourceErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
         })?;
         let state = state.lock();
 
@@ -166,13 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .find(|collection| collection.arn == input.resource_arn)
             .ok_or_else(|| {
                 ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "The resource {} does not exist",
-                            input.resource_arn
-                        )),
-                        ..ResourceNotFoundException::default()
-                    },
+                    ResourceNotFoundException::with_message(format!(
+                        "The resource {} does not exist",
+                        input.resource_arn
+                    )),
                 )
             })?;
 
