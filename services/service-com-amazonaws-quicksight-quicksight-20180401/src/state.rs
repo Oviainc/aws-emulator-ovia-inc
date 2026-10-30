@@ -16,8 +16,9 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     AccountInfo, ColumnGroup, ColumnLevelPermissionRule, CustomInstructions,
     DataPrepConfiguration, DataSet, DataSetSummary, DataSetUsageConfiguration, DataSource,
-    DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, InputColumn,
-    LogicalTable, OutputColumn, PerformanceConfiguration, PhysicalTable, ResourcePermission,
+    DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, IAMPolicyAssignment,
+    InputColumn, LogicalTable, OutputColumn, PerformanceConfiguration, PhysicalTable,
+    ResourcePermission,
     RowLevelPermissionDataSet, RowLevelPermissionTagConfiguration, SemanticModelConfiguration,
     SslProperties, Tag, Theme, ThemeConfiguration, ThemeVersion, TopicDetails,
     VpcConnectionProperties,
@@ -40,6 +41,13 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     pub topics: HashMap<(String, String), TopicRecord>,
     /// Themes by `(AwsAccountId, ThemeId)`.
     pub themes: HashMap<(String, String), ThemeRecord>,
+    /// IAM policy assignments by `(AwsAccountId, AssignmentName)`.
+    ///
+    /// The name alone identifies the assignment inside its account: the model states
+    /// that assignment names are unique per Amazon Web Services account, so the
+    /// namespace the assignment was created in is held on the record — it is the
+    /// address a later call must present, not part of the name's identity.
+    pub iam_policy_assignments: HashMap<(String, String), IamPolicyAssignmentRecord>,
     /// The sign-up details `CreateAccountSubscription` stored, by `AwsAccountId`.
     ///
     /// An account with no entry here is still a QuickSight account — see
@@ -150,6 +158,67 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
         self.data_sources
             .get(&(aws_account_id.to_string(), data_source_id.to_string()))
             .filter(|record| record.arn == arn)
+    }
+
+    /// The IAM policy assignment `aws_account_id` holds under `assignment_name`,
+    /// whichever namespace it was created in — what a create checks the account-wide
+    /// uniqueness of the name against.
+    pub fn iam_policy_assignment_named(
+        &self,
+        aws_account_id: &str,
+        assignment_name: &str,
+    ) -> Option<&IamPolicyAssignmentRecord> {
+        self.iam_policy_assignments
+            .get(&(aws_account_id.to_string(), assignment_name.to_string()))
+    }
+
+    /// The assignment a call addressing `(aws_account_id, namespace, assignment_name)`
+    /// reaches: the account's assignment of that name, and only while it is the
+    /// namespace that assignment was created in — another namespace holds no
+    /// assignment of that name to read, update or delete.
+    pub fn iam_policy_assignment(
+        &self,
+        aws_account_id: &str,
+        namespace: &str,
+        assignment_name: &str,
+    ) -> Option<&IamPolicyAssignmentRecord> {
+        self.iam_policy_assignment_named(aws_account_id, assignment_name)
+            .filter(|record| record.namespace == namespace)
+    }
+
+    /// [`Self::iam_policy_assignment`], for a call that updates what it addresses.
+    pub fn iam_policy_assignment_mut(
+        &mut self,
+        aws_account_id: &str,
+        namespace: &str,
+        assignment_name: &str,
+    ) -> Option<&mut IamPolicyAssignmentRecord> {
+        self.iam_policy_assignments
+            .get_mut(&(aws_account_id.to_string(), assignment_name.to_string()))
+            .filter(|record| record.namespace == namespace)
+    }
+
+    /// Removes the assignment a call addressing `(aws_account_id, namespace,
+    /// assignment_name)` reaches, answering `None` — and removing nothing — when that
+    /// namespace holds no assignment of that name.
+    pub fn remove_iam_policy_assignment(
+        &mut self,
+        aws_account_id: &str,
+        namespace: &str,
+        assignment_name: &str,
+    ) -> Option<IamPolicyAssignmentRecord> {
+        self.iam_policy_assignment(aws_account_id, namespace, assignment_name)?;
+        self.iam_policy_assignments
+            .remove(&(aws_account_id.to_string(), assignment_name.to_string()))
+    }
+
+    /// How many IAM policy assignments `aws_account_id` holds, across its namespaces —
+    /// what [`MAX_IAM_POLICY_ASSIGNMENTS_PER_ACCOUNT`] is checked against.
+    pub fn iam_policy_assignment_count(&self, aws_account_id: &str) -> usize {
+        self.iam_policy_assignments
+            .keys()
+            .filter(|(account, _)| account == aws_account_id)
+            .count()
     }
 }
 
@@ -626,6 +695,65 @@ impl ThemeVersionRecord {
             status: Some(self.status_at(now).to_string()),
         }
     }
+}
+
+/// A stored IAM policy assignment: the rule `CreateIAMPolicyAssignment` persisted,
+/// which is what every later read of that assignment reports.
+///
+/// The namespace is a field rather than part of the store key because the model makes
+/// the name unique per account: the namespace is the address a later call must present
+/// to reach this assignment.
+///
+/// The assignment carries no ARN and no timestamps: the modelled
+/// `IAMPolicyAssignment` structure declares neither, so nothing is stored that no
+/// read can report.
+#[derive(Debug, Clone)]
+pub struct IamPolicyAssignmentRecord {
+    pub aws_account_id: String,
+    pub namespace: String,
+    /// The server-minted id of the assignment, stable for its lifetime.
+    pub assignment_id: String,
+    pub assignment_name: String,
+    pub assignment_status: String,
+    pub policy_arn: Option<String>,
+    /// The users and groups the policy is assigned to, keyed the way the request
+    /// keyed them; `None` for an assignment created against no identity.
+    pub identities: Option<HashMap<String, Vec<String>>>,
+}
+
+impl IamPolicyAssignmentRecord {
+    /// The modelled `IAMPolicyAssignment` structure this record describes.
+    pub fn to_iam_policy_assignment(&self) -> IAMPolicyAssignment {
+        IAMPolicyAssignment {
+            aws_account_id: Some(self.aws_account_id.clone()),
+            assignment_id: Some(self.assignment_id.clone()),
+            assignment_name: Some(self.assignment_name.clone()),
+            policy_arn: self.policy_arn.clone(),
+            identities: self.identities.clone(),
+            assignment_status: Some(self.assignment_status.clone()),
+        }
+    }
+}
+
+/// The `ExceptionResourceType` an IAM policy assignment's refusals report (model enum
+/// `com.amazonaws.quicksight#ExceptionResourceType`).
+pub const EXCEPTION_RESOURCE_TYPE_IAM_POLICY_ASSIGNMENT: &str = "IAMPOLICY_ASSIGNMENT";
+
+/// How many IAM policy assignments one account may hold before a create is refused.
+/// Same standing as [`MAX_DATA_SOURCES_PER_ACCOUNT`]: a fidelity limit, not the
+/// process bound.
+pub const MAX_IAM_POLICY_ASSIGNMENTS_PER_ACCOUNT: usize = 1_000;
+
+/// The TOTAL number of IAM policy assignments this emulator holds, across every
+/// account and namespace — the process bound, for the same reason as
+/// [`MAX_DATA_SOURCES`]: every part of the key comes from the request.
+pub const MAX_IAM_POLICY_ASSIGNMENTS: usize = 10_000;
+
+/// The `AssignmentId` of a newly created IAM policy assignment. Server-minted: the
+/// request names only the assignment's name, and the id is the service's own handle
+/// on the rule.
+pub fn next_assignment_id() -> String {
+    uuid_shaped(next_minted_id())
 }
 
 /// The import mode whose data set QuickSight loads into SPICE, and so the one whose

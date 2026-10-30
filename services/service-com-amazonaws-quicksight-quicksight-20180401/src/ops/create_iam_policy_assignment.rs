@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIAMPolicyAssignment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIAMPolicyAssignment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIAMPolicyAssignment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an IAM policy assignment under `(AwsAccountId, AssignmentName)` — the name
+//! is unique per Amazon Web Services account, so a name the account already holds is
+//! refused in every namespace of that account rather than overwriting the rule that
+//! holds it. The namespace the create names is where the assignment lives, and so the
+//! address every later call must present. The submitted status, policy ARN and
+//! identities are persisted as given, so every later read of that assignment reports
+//! the rule this call was given.
 //!
 //! ## Shape of an operation
 //!
@@ -184,20 +183,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIAMPolicyAssignment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIAMPolicyAssignmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIAMPolicyAssignment"))
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateIAMPolicyAssignmentErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the QuickSight store is unavailable".to_string()),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        let key = (
+            input.aws_account_id.clone(),
+            input.assignment_name.clone(),
+        );
+        // An assignment name is unique per Amazon Web Services account, so a name the
+        // account already holds is a conflict — in the namespace that holds it and in
+        // every other namespace of the account, which is what keeps a create from
+        // overwriting a rule in another namespace.
+        if store
+            .iam_policy_assignment_named(&input.aws_account_id, &input.assignment_name)
+            .is_some()
+        {
+            return Err(
+                CreateIAMPolicyAssignmentErrorModeled::ResourceExistsException(
+                    ResourceExistsException {
+                        message: Some(format!(
+                            "An assignment named {} already exists.",
+                            input.assignment_name
+                        )),
+                        resource_type: Some(
+                            crate::state::EXCEPTION_RESOURCE_TYPE_IAM_POLICY_ASSIGNMENT.to_string(),
+                        ),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Both parts of the store key come from the request — the account id is an
+        // `@httpLabel` the caller chooses — so the total-records ceiling is what bounds
+        // this process and the per-account one is the fidelity limit on top of it. This
+        // operation models no `LimitExceededException`, so a capacity refusal takes the
+        // modelled retryable one.
+        if store.iam_policy_assignments.len() >= crate::state::MAX_IAM_POLICY_ASSIGNMENTS {
+            return Err(CreateIAMPolicyAssignmentErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "This QuickSight emulator holds the maximum of {} IAM policy assignments.",
+                        crate::state::MAX_IAM_POLICY_ASSIGNMENTS
+                    )),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+        if store.iam_policy_assignment_count(&input.aws_account_id)
+            >= crate::state::MAX_IAM_POLICY_ASSIGNMENTS_PER_ACCOUNT
+        {
+            return Err(CreateIAMPolicyAssignmentErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} IAM policy assignments.",
+                        crate::state::MAX_IAM_POLICY_ASSIGNMENTS_PER_ACCOUNT
+                    )),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::IamPolicyAssignmentRecord {
+            aws_account_id: input.aws_account_id,
+            namespace: input.namespace,
+            // The id is the service's own handle on the rule: the request names only
+            // the assignment's name, so the id is minted here and stays with it.
+            assignment_id: crate::state::next_assignment_id(),
+            assignment_name: input.assignment_name,
+            assignment_status: input.assignment_status,
+            policy_arn: input.policy_arn,
+            identities: input.identities,
+        };
+        // The response reports the record that was stored, so what a caller is told it
+        // created is what a later read of the store answers with.
+        let response = CreateIAMPolicyAssignmentOutput {
+            assignment_name: Some(record.assignment_name.clone()),
+            assignment_id: Some(record.assignment_id.clone()),
+            assignment_status: Some(record.assignment_status.clone()),
+            policy_arn: record.policy_arn.clone(),
+            identities: record.identities.clone(),
+            request_id: Some(request_id),
+            status: 200,
+        };
+        store.iam_policy_assignments.insert(key, record);
+
+        Ok(response)
     }
 }

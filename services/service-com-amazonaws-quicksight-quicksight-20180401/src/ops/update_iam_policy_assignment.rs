@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIAMPolicyAssignment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIAMPolicyAssignment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIAMPolicyAssignment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the IAM policy assignment the account holds under `AssignmentName`, as
+//! addressed through the namespace it was created in, applying only the optional
+//! members the request carries — an absent one leaves the stored value as it was, and
+//! a submitted `Identities` map replaces the stored one whole rather than merging into
+//! it. Refuses with the modelled `ResourceNotFoundException` when the addressed
+//! namespace holds no assignment of that name.
 //!
 //! ## Shape of an operation
 //!
@@ -181,20 +179,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIAMPolicyAssignment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIAMPolicyAssignmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIAMPolicyAssignment"))
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateIAMPolicyAssignmentErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the QuickSight store is unavailable".to_string()),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        let Some(record) = store.iam_policy_assignment_mut(
+            &input.aws_account_id,
+            &input.namespace,
+            &input.assignment_name,
+        ) else {
+            return Err(
+                UpdateIAMPolicyAssignmentErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Cannot find an assignment named {}.",
+                            input.assignment_name
+                        )),
+                        resource_type: Some(
+                            crate::state::EXCEPTION_RESOURCE_TYPE_IAM_POLICY_ASSIGNMENT.to_string(),
+                        ),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Only the optional members the request carries are applied: an absent one is
+        // "leave it as it is", not "clear it". A submitted `Identities` map replaces the
+        // stored one whole, so the assignment holds exactly the identities this call
+        // named.
+        if let Some(assignment_status) = input.assignment_status {
+            record.assignment_status = assignment_status;
+        }
+        if let Some(policy_arn) = input.policy_arn {
+            record.policy_arn = Some(policy_arn);
+        }
+        if let Some(identities) = input.identities {
+            record.identities = Some(identities);
+        }
+
+        Ok(UpdateIAMPolicyAssignmentOutput {
+            assignment_name: Some(record.assignment_name.clone()),
+            assignment_id: Some(record.assignment_id.clone()),
+            policy_arn: record.policy_arn.clone(),
+            identities: record.identities.clone(),
+            assignment_status: Some(record.assignment_status.clone()),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

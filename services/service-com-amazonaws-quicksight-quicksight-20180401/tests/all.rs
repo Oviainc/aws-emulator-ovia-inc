@@ -15,6 +15,8 @@
 mod account_subscription;
 #[path = "all/data_source_data_set_lifecycle.rs"]
 mod data_source_data_set_lifecycle;
+#[path = "all/iam_policy_assignment_lifecycle.rs"]
+mod iam_policy_assignment_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/theme_lifecycle.rs"]
