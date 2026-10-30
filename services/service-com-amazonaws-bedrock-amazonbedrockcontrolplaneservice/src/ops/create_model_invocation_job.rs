@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModelInvocationJob
-//! Submits a batch inference job: the job is minted `Submitted` — "this job has been
+//! Submits a batch inference job: the submission hands Amazon Bedrock the `roleArn` it is
+//! to carry out and manage the inference under, so the request is decided by the
+//! `iam:PassRole` step for that role BEFORE anything it names is resolved
+//! ([`crate::state::job_pass_role_denial`], the one decision every job-creating operation
+//! of this service makes): a role the caller may not pass is the modelled
+//! `AccessDeniedException`, and such a refusal writes no job at all.
+//!
+//! Where that decision admits the pass, the job is minted `Submitted` — "this job has been
 //! submitted to a queue for validation" — and the submission arms the whole clock the job
 //! runs on (`state::ModelInvocationJobClock`), so it is owed `Validating`, then
 //! `Scheduled`, then `InProgress`, and only then its terminal status — one stage per call
@@ -202,6 +209,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+
+        // The `iam:PassRole` step for `roleArn`, ahead of the store and ahead of every
+        // resource this request names: the role is the one Amazon Bedrock takes on to carry
+        // out and manage the batch inference, so whether this caller may pass it is settled
+        // before `modelId` is resolved — a denied pass is an authorization refusal rather
+        // than a report about a model — and it leaves no job behind. The decision is the
+        // one every job-creating operation of this service makes
+        // (`crate::state::job_pass_role_denial`), grounded in what this account's IAM
+        // answers about the role.
+        if let Some(denial) =
+            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn).await
+        {
+            return Err(CreateModelInvocationJobErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(denial),
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateModelInvocationJobErrorModeled::InternalServerException(
                 InternalServerException {
@@ -212,7 +240,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
         // The invocation endpoint the job runs against: one of the modelled enum's values,

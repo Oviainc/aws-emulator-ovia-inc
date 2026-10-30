@@ -4,7 +4,14 @@
 //!
 //! ## What this handler does
 //!
-//! Mints one evaluation job in the store and answers its `jobArn`. The job is accepted and
+//! Hands Amazon Bedrock the `roleArn` it is to run the evaluation under, so the request is
+//! decided by the `iam:PassRole` step for that role BEFORE anything it names is read
+//! ([`crate::state::job_pass_role_denial`], the one decision every job-creating operation
+//! of this service makes): a role the caller may not pass is the modelled
+//! `AccessDeniedException`, and such a refusal writes no job at all.
+//!
+//! Where that decision admits the pass, this mints one evaluation job in the store and
+//! answers its `jobArn`. The job is accepted and
 //! runs asynchronously, so it is stored `InProgress`, which is the only status this
 //! operation mints: the clock owes that non-terminal status its move to `Completed` after
 //! [`crate::state::EVALUATION_JOB_COMPLETE_AFTER`], materialised by the next call that
@@ -184,6 +191,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        let region = crate::state::request_region(ctx.parts());
+
+        // The `iam:PassRole` step for `roleArn`, ahead of the store and ahead of every
+        // resource this request names: the role is the one Amazon Bedrock takes on to run
+        // the evaluation and write its output, so whether this caller may pass it is
+        // settled before the configuration is read — a denied pass is an authorization
+        // refusal rather than a report about the request's contents — and it leaves no job
+        // behind. The decision is the one every job-creating operation of this service
+        // makes (`crate::state::job_pass_role_denial`), grounded in what this account's IAM
+        // answers about the role.
+        if let Some(denial) =
+            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn).await
+        {
+            return Err(CreateEvaluationJobErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(denial),
+                },
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateEvaluationJobErrorModeled::InternalServerException(
                 InternalServerException {
@@ -192,7 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
         // `TooManyTagsException` is not among this operation's modelled errors, so the

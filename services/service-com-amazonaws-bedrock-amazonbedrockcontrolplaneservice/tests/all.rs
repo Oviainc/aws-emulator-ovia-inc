@@ -37,6 +37,8 @@ mod automated_reasoning_policy_updates;
 mod automated_reasoning_policy_versions;
 #[path = "all/batch_delete_evaluation_jobs.rs"]
 mod batch_delete_evaluation_jobs;
+#[path = "all/control_plane_authorization.rs"]
+mod control_plane_authorization;
 #[path = "all/custom_model_authorization.rs"]
 mod custom_model_authorization;
 #[path = "all/custom_model_deployments.rs"]

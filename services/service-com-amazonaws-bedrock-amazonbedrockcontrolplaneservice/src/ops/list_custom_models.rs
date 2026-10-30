@@ -243,21 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM decides authorization ahead of this service reading anything, so a caller
-        // its policies do not allow is told it is not authorized rather than handed a page
-        // of this account's models ([`crate::service::authorization`]). A listing names no
-        // single resource, so the action is judged against the collection it reaches.
-        crate::service::authorization::authorize(
-            &*self.engine,
-            ctx,
-            Self::NAME,
-            &crate::service::authorization::collection_arn(
-                ctx,
-                crate::service::authorization::CUSTOM_MODEL_RESOURCE_TYPE,
-            ),
-        )
-        .map_err(ListCustomModelsErrorModeled::AccessDeniedException)?;
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListCustomModelsErrorModeled::InternalServerException(
                 InternalServerException {

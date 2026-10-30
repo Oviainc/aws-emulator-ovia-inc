@@ -4,7 +4,7 @@
 //!
 //! Hands Amazon Bedrock a role and asks it to customize a base model, so the request is
 //! decided by the `iam:PassRole` step for `roleArn` BEFORE anything it names is resolved
-//! ([`crate::state::customization_pass_role_denial`] asks whether the value names a role of
+//! ([`crate::state::job_pass_role_denial`] asks whether the value names a role of
 //! the CALLER'S OWN account that this account's IAM holds and whose trust policy grants
 //! Amazon Bedrock the assume THIS pass would make): a role the caller may not pass is the
 //! modelled `AccessDeniedException`, and such a refusal writes nothing at all.
@@ -214,10 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // customization, so whether this caller may pass it is settled before
         // `baseModelIdentifier` is resolved — a denied pass is an authorization refusal
         // rather than a report about a model — and it leaves no job and no custom model
-        // behind. See `crate::state::customization_pass_role_denial` for the decision,
+        // behind. See `crate::state::job_pass_role_denial` for the decision,
         // which is grounded in what this account's IAM answers about the role.
         if let Some(denial) =
-            crate::state::customization_pass_role_denial(ctx, &region, &input.role_arn).await
+            crate::state::job_pass_role_denial(ctx, &region, &input.role_arn).await
         {
             return Err(
                 CreateModelCustomizationJobErrorModeled::AccessDeniedException(

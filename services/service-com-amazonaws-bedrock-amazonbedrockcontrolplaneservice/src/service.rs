@@ -55,11 +55,12 @@
 //! of resources two of them cover ([`crate::state::SELF_VALIDATED_RESOURCE_TYPES`]) live
 //! in [`crate::state`]; this file is where the two layers that produce them sit:
 //!
-//! * [`ArnChecked`], the wrapper every modelled operation is served behind
+//! * [`Gated`], the wrapper every modelled operation is served behind
 //!   (`override_operation`), refuses an ARN of this service's own namespace that names
 //!   ANOTHER region before the modelled walk runs. It is the layer that can: the walk's
 //!   refusal reaches `override_refusal` with the violations ALONE — no request — so the
-//!   region the request addresses is not knowable there.
+//!   region the request addresses is not knowable there. That same wrapper is where IAM's
+//!   authorization decision is taken for every operation ([`authorization`]).
 //! * `override_refusal` words what is left, from the violation's own member expression and
 //!   value ([`refused_arn`]): an ARN of this service's namespace that is in-region but is
 //!   not a well-formed ARN of the resource type it names, and a value that is no ARN at
@@ -70,6 +71,21 @@
 //! framework's wording: such a caller named a resource rather than spelling an ARN, so
 //! there is no ARN for this service to read. So does an ARN of a resource type this
 //! service does not validate itself, which is what the corpus records for them.
+//!
+//! # The authorization layer every handler runs under
+//!
+//! AWS decides whether the CALLER may perform the action at the IAM layer, in front of the
+//! service: a principal whose identity-based policies do not grant `bedrock:<Operation>` —
+//! or that an explicit `Deny` covers — is refused the modelled `AccessDeniedException`
+//! (403) and the call performs nothing. That is a property of the request's identity and
+//! the action it names rather than of what any one handler does, so it is decided ONCE,
+//! here in [`Gated`], for every operation of this service ([`authorization`] holds the
+//! decision, the one operation whose model declares no such refusal, and the refusal's
+//! wording). The resource half is [`RequestArns::named_resource`] beside
+//! [`authorization::judged_resource`]: the ARN the request names of the family its URI
+//! space addresses, else that family's collection, so a policy scoped to one resource or
+//! to one family is evaluated against what the caller addressed and never against an ARN
+//! of another family the request happens to carry.
 
 pub mod authorization;
 pub mod validation;
@@ -99,7 +115,7 @@ use smithy_server_runtime::{
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// The input members whose ARN names a resource in ANOTHER region BY DESIGN, so
-/// [`ArnChecked`]'s region check does not apply to them, keyed by the operation that
+/// [`Gated`]'s region check does not apply to them, keyed by the operation that
 /// declares the member and the member's own path.
 ///
 /// Both members today carry the SOURCE model of a copy. `CreateModelCopyJob` "Copies a
@@ -125,11 +141,12 @@ const CROSS_REGION_ARN_INPUTS: &[(&str, &str)] = &[
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// One [`ArnChecked`] per modelled operation, keyed by the routing key the model
+    /// One [`Gated`] per modelled operation, keyed by the routing key the model
     /// names that operation by ([`Operation::NAME`], the same key the generated routing
-    /// table uses). Built once here, never per request; each entry is zero-sized, so
-    /// this is a table of names rather than a second set of operations.
-    arn_checked: HashMap<&'static str, Box<dyn ErasedOperation>>,
+    /// table uses). Built once here, never per request; each entry carries the operation's
+    /// TYPE and a handle on the one shared engine, so this is a table of names rather than
+    /// a second set of operations.
+    gated: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -138,8 +155,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
+            gated: gated_table::<Eng>(&engine),
             entry: crate::ServiceDefinition::new(engine),
-            arn_checked: arn_checked_table::<Eng>(),
         }
     }
 }
@@ -184,16 +201,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Serve every modelled operation through its [`ArnChecked`] wrapper, so an ARN
-        // of this service's own namespace naming another region is refused with this
-        // service's own sentence BEFORE the modelled constraint walk words a refusal of
-        // its own. The wrapper delegates every other request to the generated operation
-        // in the routing table, which stays the only thing that serves it.
+        // Serve every modelled operation through its [`Gated`] wrapper, so the two
+        // decisions AWS takes in front of a handler are taken there: an ARN of this
+        // service's own namespace naming another region is refused with this service's own
+        // sentence BEFORE the modelled constraint walk words a refusal of its own, and the
+        // caller's authorization for the action is decided before the operation reads or
+        // writes anything. The wrapper delegates every other request to the generated
+        // operation in the routing table, which stays the only thing that serves it.
         //
         // Keyed on the routing key the model names each operation by, so a request that
         // names no modelled operation resolves exactly as it did before.
         let key = self.entry.protocol().routing_key(req).ok()?;
-        self.arn_checked.get(key).map(|wrapper| &**wrapper)
+        self.gated.get(key).map(|wrapper| &**wrapper)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -203,7 +222,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // client that branches on the message shape takes the wrong branch when a
         // constraint envelope arrives where the service's own sentence belongs.
         //
-        // The region half of that check is answered one layer earlier, by [`ArnChecked`]
+        // The region half of that check is answered one layer earlier, by [`Gated`]
         // (it needs the request). What reaches here is an ARN this service accepts the
         // REGION of and whose resource is not a well-formed one of the type the ARN
         // itself names, so the sentence is the format one.
@@ -336,27 +355,30 @@ fn refused_policy_entry_quota(violation: &Violation) -> Option<String> {
     crate::state::guardrail_policy_entry_quota_message(&violation.path).map(str::to_string)
 }
 
-/// One modelled operation, served behind this service's own ARN check.
+/// One modelled operation, served behind the two decisions AWS takes in front of a
+/// handler: this service's own ARN check, and IAM's authorization of the action.
 ///
-/// Zero-sized: the wrapper holds no engine and no operation. It carries the operation
-/// TYPE, which is all it needs — the input shape to read the request into and the input
-/// `Schema` to read each member's declared form off — and delegates every request it does
-/// not refuse to the one operation instance the generated routing table built from the
-/// shared engine. There is therefore no second instance of any operation and no second
-/// store.
-struct ArnChecked<Op> {
+/// It carries the operation TYPE — the input shape to read the request into and the input
+/// `Schema` to read each member's declared form off — and a handle on the ONE shared
+/// engine, which is what the authorization decision reads the caller's identity and its
+/// policies through ([`authorization`]). Every request it does not refuse is delegated to
+/// the one operation instance the generated routing table built from that same engine, so
+/// there is no second instance of any operation and no second store.
+struct Gated<Op, Eng> {
     operation: PhantomData<fn() -> Op>,
+    engine: Arc<Eng>,
 }
 
-impl<Op> ArnChecked<Op> {
-    const fn new() -> Self {
+impl<Op, Eng> Gated<Op, Eng> {
+    fn new(engine: Arc<Eng>) -> Self {
         Self {
             operation: PhantomData,
+            engine,
         }
     }
 }
 
-impl<Op: Operation> ErasedOperation for ArnChecked<Op> {
+impl<Op: Operation, Eng: Send + Sync + 'static> ErasedOperation for Gated<Op, Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -366,12 +388,27 @@ impl<Op: Operation> ErasedOperation for ArnChecked<Op> {
         Box::pin(async move {
             let region = crate::state::request_region(ctx.parts());
             // The protocol is read, used and dropped inside this one statement, and the
-            // operation to delegate to is resolved into a value in the next one:
+            // operation to delegate to is resolved into a value further down:
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding one across the
-            // await below would make this future non-`Send`.
-            let refused = cross_region_arn::<Op>(svc.definition().protocol(), req, &region);
-            if let Some((path, value)) = refused {
+            // await below would make this future non-`Send`. Both ARNs the two gates read
+            // off the request come from ONE deserialization of its input.
+            let read = request_arns::<Op>(svc.definition().protocol(), req, &region);
+            if let Some((path, value)) = read.cross_region {
                 return rejection::<Op>(svc, path, value);
+            }
+            // IAM's decision, taken before the operation reads or writes anything: the
+            // action is this operation's own name under this service's prefix, and the
+            // resource is the one the REQUEST addresses. A refused request never reaches
+            // the delegate, so it mints nothing, moves no status and reports nothing.
+            let denial = if authorization::layer_judges(Op::NAME) {
+                let resource =
+                    authorization::judged_resource(ctx, read.named_resource, req.uri());
+                authorization::authorize(&*self.engine, ctx, Op::NAME, &resource).err()
+            } else {
+                None
+            };
+            if let Some(denial) = denial {
+                return authorization::refusal_response(svc.definition().protocol(), &denial);
             }
             let delegate = svc.definition().routing_table().get(Op::NAME);
             match delegate {
@@ -392,52 +429,112 @@ impl<Op: Operation> ErasedOperation for ArnChecked<Op> {
     }
 }
 
-/// The first ARN-bearing member of `req` whose value is an ARN of a resource this service
-/// validates itself ([`crate::state::SELF_VALIDATED_RESOURCE_TYPES`]) naming a region
-/// other than `region`, as its member path and the ARN it carried.
+/// What the two gates in front of a handler read off the request's own input, in ONE
+/// deserialization of it.
+#[derive(Debug, Default)]
+struct RequestArns {
+    /// The first ARN-bearing member whose value is an ARN of a resource this service
+    /// validates itself ([`crate::state::SELF_VALIDATED_RESOURCE_TYPES`]) naming a region
+    /// other than the one the request addresses, as its member path and the ARN it
+    /// carried.
+    ///
+    /// Only a member the MODEL declares an ARN-admitting `@pattern` for is read here, so a
+    /// description or a tag value that happens to contain an ARN is not one of these.
+    cross_region: Option<(String, String)>,
+    /// The ARN of one of this service's own resources the request CARRIES at a member the
+    /// model declares as an ARN member ([`carries_an_arn`]): an identifier member spells it
+    /// (`GetCustomModel$modelIdentifier` as a `custom-model` ARN,
+    /// `DeleteResourcePolicy$resourceArn` in the URI, `ListTagsForResource$resourceARN` in
+    /// the body). Whether it is the resource the action is judged against is
+    /// [`authorization::judged_resource`]'s question, because several operations carry an
+    /// ARN of ANOTHER family beside their target — a job create names the model it runs —
+    /// and only an ARN of the family the request's URI space addresses is the resource it
+    /// addressed.
+    ///
+    /// Read from the VALUE rather than from the member's declared form, because a member the
+    /// model lets carry a bare name beside an ARN addresses the resource itself when a
+    /// caller spells the ARN.
+    named_resource: Option<String>,
+}
+
+/// Read both ARNs off the operation's own input.
 ///
-/// Read off the operation's own input: the request is deserialized against `Op`'s input
-/// schema (so a member is placed by the model, not by where it happens to sit in the
-/// wire form) and every string the built input carries is collected by
-/// [`service_common::validation::submitted_leaves`], the one walk in the tree that spells
-/// a member path the way the framework's constraint walk does.
+/// The request is deserialized against `Op`'s input schema (so a member is placed by the
+/// model, not by where it happens to sit in the wire form) and every string the built input
+/// carries is collected by [`service_common::validation::submitted_leaves`], the one walk in
+/// the tree that spells a member path the way the framework's constraint walk does. Only
+/// TOP-LEVEL members, because a member schema carries its target's members nowhere, so a
+/// nested member's declared form is not reachable from the input schema; no ARN-bearing
+/// member of the operations these rules are recorded for is nested. Nothing is read out of
+/// the STORE, which is what keeps both decisions independent of whether the resource exists.
 ///
-/// Only a member the MODEL declares an ARN-admitting `@pattern` for is read, so a
-/// description or a tag value that happens to contain an ARN is not one of these; and
-/// only a TOP-LEVEL member, because a member schema carries its target's members
-/// nowhere, so a nested member's declared form is not reachable from the input schema. No
-/// ARN-bearing member of the operations this rule is recorded for is nested.
-///
-/// `None` when the request carries no such ARN — including a body no codec can read,
-/// which is a failure the framework's own walk words.
+/// Neither ARN is reported for a body no codec can read, which is a failure the framework's
+/// own walk words.
 ///
 /// KNOWN BOUND: the leaf walk stops at the budget its module states
 /// (`MAX_RECORDED_LEAVES` = 256 leaves, `MAX_RECORDED_BYTES` = 64 KiB), so a request
 /// whose earlier strings exhaust it — a 200-entry tag list ahead of the ARN member, say —
-/// can leave a later top-level ARN uninspected. The miss is FAIL-SAFE in one direction
-/// only: such a request falls back to the framework's constraint envelope (the divergence
-/// this check removes) rather than being refused for an ARN it carries, so no request is
-/// refused wrongly, but a very large one may still be worded wrongly. Closing it needs
-/// the shared walk to offer an unbounded form (or the framework to hand a built input to
-/// an operation), which is a change to shared code this issue does not own.
-fn cross_region_arn<Op: Operation>(
+/// can leave a later top-level ARN uninspected. The miss is FAIL-SAFE in both readings:
+/// such a request falls back to the framework's constraint envelope (the divergence the
+/// region check removes) rather than being refused for an ARN it carries, and it is
+/// authorized against the collection of the family it addressed rather than against an ARN
+/// this layer did not see — never against a resource the caller did not name. Closing it
+/// needs the shared walk to offer an unbounded form (or the framework to hand a built input
+/// to an operation), which is a change to shared code this issue does not own.
+fn request_arns<Op: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &aws_smithy_runtime_api::http::Request,
     region: &str,
-) -> Option<(String, String)> {
+) -> RequestArns {
     let Ok(mut deserializer) = protocol.deserialize_input(req, Op::INPUT_SCHEMA) else {
-        return None;
+        return RequestArns::default();
     };
     let read = <Op::Input as DeserializableStruct>::deserialize(&mut *deserializer);
     drop(deserializer);
-    let input = read.ok()?;
-    service_common::validation::submitted_leaves(&input, Op::INPUT_SCHEMA)
-        .into_iter()
-        .find(|(member_path, value)| {
-            admits_an_arn(Op::INPUT_SCHEMA, member_path)
-                && !CROSS_REGION_ARN_INPUTS.contains(&(Op::NAME, member_path.as_str()))
-                && crate::state::arn_names_another_region(value, region)
-        })
+    let Ok(input) = read else {
+        return RequestArns::default();
+    };
+    let leaves = service_common::validation::submitted_leaves(&input, Op::INPUT_SCHEMA);
+    RequestArns {
+        cross_region: leaves
+            .iter()
+            .find(|(member_path, value)| {
+                admits_an_arn(Op::INPUT_SCHEMA, member_path)
+                    && !CROSS_REGION_ARN_INPUTS.contains(&(Op::NAME, member_path.as_str()))
+                    && crate::state::arn_names_another_region(value, region)
+            })
+            .cloned(),
+        named_resource: leaves
+            .iter()
+            .find(|(member_path, value)| {
+                carries_an_arn(Op::INPUT_SCHEMA, member_path)
+                    && authorization::names_a_resource_of_this_service(value)
+            })
+            .map(|(_, value)| value.clone()),
+    }
+}
+
+/// Whether `input_schema` declares the TOP-LEVEL member at `member_path` as one that
+/// carries an ARN.
+///
+/// The member decides this, not the value: a free-text member a caller happens to put an
+/// ARN into — a description, a tag value, a job name — does not address that resource, and
+/// a NESTED value is not a member of the input at all (a job's `inferenceConfig` names the
+/// model it runs, which is not what the action acts on). The MODEL answers it two ways, and
+/// either suffices: the member's `@pattern` admits an ARN ([`admits_an_arn`]), or the model
+/// NAMES the member as one — `DeleteResourcePolicy$resourceArn` carries the documented "The
+/// Amazon Resource Name (ARN) of the resource" under a shape that declares a `@length` and
+/// no `@pattern` at all
+/// (`smithy_query(query="operation",operation="DeleteResourcePolicy")`).
+fn carries_an_arn(input_schema: &Schema, member_path: &str) -> bool {
+    let declared_member = input_schema.members().iter().any(|member| {
+        member
+            .member_name()
+            .is_some_and(|name| path::member(name) == member_path)
+    });
+    declared_member
+        && (admits_an_arn(input_schema, member_path)
+            || member_path.to_ascii_lowercase().ends_with("arn"))
 }
 
 /// Whether `input_schema` declares the top-level member at `member_path` with a
@@ -611,24 +708,28 @@ fn rejection<Op: Operation>(
     )
 }
 
-/// The [`ArnChecked`] wrapper for EVERY operation this service serves.
+/// The [`Gated`] wrapper for EVERY operation this service serves.
 ///
-/// Carrying an ARN is a property of an operation's INPUT SHAPE, and this service's ARN
-/// check is the same for every member that carries one, so the wrapper goes in front of
-/// all of them — implemented or still scaffolded. A stub answers 501 for a request whose
-/// ARNs this service accepts and the ARN refusal for one it does not, which is the order
+/// Carrying an ARN is a property of an operation's INPUT SHAPE, and the authorization
+/// decision is a property of the request's identity and the action it names, so neither
+/// check belongs to a few operations: the wrapper goes in front of all of them —
+/// implemented or still scaffolded. A stub answers 501 for a request this service accepts
+/// the ARNs of and whose caller IAM permits, and the refusal otherwise, which is the order
 /// the real service evaluates them in; leaving an operation out would answer the
-/// framework's generic constraint envelope there, the very divergence this removes.
-fn arn_checked_table<Eng: Send + Sync + 'static>() -> HashMap<&'static str, Box<dyn ErasedOperation>>
-{
+/// framework's generic constraint envelope there, or serve an unauthorized caller, the very
+/// divergences this removes.
+fn gated_table<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
     let mut wrappers: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
     macro_rules! register {
         ($($module:ident :: $operation:ident),+ $(,)?) => {
             $(
                 wrappers.insert(
                     <crate::ops::$module::$operation<Eng> as Operation>::NAME,
-                    Box::new(ArnChecked::<crate::ops::$module::$operation<Eng>>::new())
-                        as Box<dyn ErasedOperation>,
+                    Box::new(Gated::<crate::ops::$module::$operation<Eng>, Eng>::new(
+                        Arc::clone(engine),
+                    )) as Box<dyn ErasedOperation>,
                 );
             )+
         };

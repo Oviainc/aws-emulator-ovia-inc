@@ -203,22 +203,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // IAM decides authorization ahead of this service looking at anything the request
-        // names, so the caller's own policies are evaluated before a member is read, a
-        // name is resolved or a model is minted — and a refusal leaves nothing behind.
-        // The action is judged against the custom models of this account and Region: the
-        // id the ARN of the model this would mint carries does not exist yet.
-        crate::service::authorization::authorize(
-            &*self.engine,
-            ctx,
-            Self::NAME,
-            &crate::service::authorization::collection_arn(
-                ctx,
-                crate::service::authorization::CUSTOM_MODEL_RESOURCE_TYPE,
-            ),
-        )
-        .map_err(CreateCustomModelErrorModeled::AccessDeniedException)?;
-
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCustomModelErrorModeled::InternalServerException(
                 InternalServerException {

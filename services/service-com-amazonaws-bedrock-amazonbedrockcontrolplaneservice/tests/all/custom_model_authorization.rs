@@ -28,6 +28,11 @@
 //! engine — the stores those services' own handlers write — so the documents under test
 //! are the ones `iam:PutRolePolicy` stores and the principal is the one
 //! `sts:GetCallerIdentity` answers for the key the request signed with.
+//!
+//! The harness below (the emulator, the signed call, the seeded session and the policy
+//! documents) is SHARED with `crate::control_plane_authorization`, which asserts the same
+//! rule over the rest of this service's operations: one harness, so two suites cannot drive
+//! two different dispatch paths for one rule.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -44,13 +49,13 @@ use crate::support::{error_code, label, Reply, ACCOUNT, REGION};
 /// The access key id of the account's own published credential, as every other suite in
 /// this crate signs with it: a key neither STS nor IAM holds a record for, which is the
 /// position AWS account root credentials are in.
-const ACCOUNT_KEY_ID: &str = "AKIDEXAMPLE";
+pub(crate) const ACCOUNT_KEY_ID: &str = "AKIDEXAMPLE";
 
 /// The access key id of the assumed-role session the policy rows sign with.
-const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
+pub(crate) const SESSION_KEY_ID: &str = "ASIAEXAMPLESESSION01";
 
 /// The role that session is assumed from, and the session's own name.
-const ROLE: &str = "bedrock-custom-model-caller";
+pub(crate) const ROLE: &str = "bedrock-custom-model-caller";
 const SESSION: &str = "custom-model-session";
 
 /// The name of the inline policy the role carries.
@@ -70,12 +75,12 @@ const SOURCE_URI: &str = "s3://example-custom-model-artifacts/model/";
 
 /// One emulator: this service beside IAM and STS over ONE shared engine, so the policies
 /// and the session the cases seed are the ones those services hold.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
-fn emulator() -> Emulator {
+pub(crate) fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(bedrock::EmulatedService::new(Arc::clone(&engine)));
@@ -95,7 +100,7 @@ fn emulator() -> Emulator {
 impl Emulator {
     /// One control-plane call signed with `access_key_id`, which is what names the
     /// principal the request speaks for.
-    async fn call_as(
+    pub(crate) async fn call_as(
         &self,
         access_key_id: &str,
         method: &str,
@@ -150,7 +155,7 @@ impl Emulator {
 }
 
 /// The principal ARN the seeded session speaks for — what a refusal must name.
-fn session_arn() -> String {
+pub(crate) fn session_arn() -> String {
     format!("arn:aws:sts::{ACCOUNT}:assumed-role/{ROLE}/{SESSION}")
 }
 
@@ -164,7 +169,7 @@ fn role_arn() -> String {
 /// `iam:CreateRole` and `sts:AssumeRole` record them: the identity is the `assumed-role`
 /// ARN `sts:GetCallerIdentity` reports, and the role is the IAM entity whose policies are
 /// in force on it.
-fn given_session(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn given_session(engine: &Arc<engine::InMemoryEngine>) {
     let now = SystemTime::now();
     let role_arn = role_arn();
     let iam_store = iam::service_state(&**engine).expect("the IAM store");
@@ -213,7 +218,7 @@ fn given_session(engine: &Arc<engine::InMemoryEngine>) {
 /// Attach `document` to the role as its inline policy, replacing whatever it carried —
 /// what `iam:PutRolePolicy` does. `None` takes every policy off it, as
 /// `iam:DeleteRolePolicy` does.
-fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Value>) {
+pub(crate) fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Value>) {
     let store = iam::service_state(&**engine).expect("the IAM store");
     let mut store = store.lock();
     match document {
@@ -236,8 +241,12 @@ fn given_role_policy(engine: &Arc<engine::InMemoryEngine>, document: Option<&Val
 }
 
 /// Which verdict a row expects, and — for a refusal — which of IAM's rules reached it.
+///
+/// Shared with `crate::control_plane_authorization`, which asserts the same rule over the
+/// rest of this service's operations: IAM's refusal clauses are one vocabulary, so the two
+/// suites read them from one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
+pub(crate) enum Verdict {
     /// IAM permits the request, so the operation answers its own way.
     Served,
     /// The default deny of a request no statement allows.
@@ -248,7 +257,7 @@ enum Verdict {
 
 impl Verdict {
     /// The clause IAM closes the refusal with.
-    fn reason(self, action: &str) -> String {
+    pub(crate) fn reason(self, action: &str) -> String {
         match self {
             Self::DefaultDeny => {
                 format!("because no identity-based policy allows the {action} action")
@@ -260,7 +269,7 @@ impl Verdict {
 }
 
 /// A policy allowing `actions` on every resource.
-fn allow(actions: Value) -> Value {
+pub(crate) fn allow(actions: Value) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": actions, "Resource": "*" }]
@@ -269,7 +278,7 @@ fn allow(actions: Value) -> Value {
 
 /// A policy allowing everything and denying `action` — the shape a least-privilege
 /// guardrail takes, and the one the refusal must attribute to an explicit deny.
-fn allow_all_but(action: &str) -> Value {
+pub(crate) fn allow_all_but(action: &str) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [

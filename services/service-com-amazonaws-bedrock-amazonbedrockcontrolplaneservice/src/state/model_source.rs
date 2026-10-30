@@ -31,7 +31,7 @@
 //! Refused only on what the object store ANSWERED: an emulator assembled with no Amazon S3
 //! to ask, or an answer this could not read, leaves the source admitted, because a refusal
 //! has to be grounded — the same rule the rest of this service's cross-service decisions
-//! follow ([`crate::state::customization_pass_role_denial`],
+//! follow ([`crate::state::job_pass_role_denial`],
 //! [`super::model_invocation_run`]).
 
 use crate::ops::types::ModelDataSource;

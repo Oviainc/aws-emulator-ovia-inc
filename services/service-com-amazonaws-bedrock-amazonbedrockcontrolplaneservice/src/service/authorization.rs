@@ -8,10 +8,17 @@
 //! that an explicit `Deny` covers — is told it is not authorized rather than told anything
 //! about the resource, and the call performs nothing: no resource is minted, no status
 //! moves, no quota is consumed. This service models that refusal as `AccessDeniedException`
-//! (`@httpError(403)`), which every operation of the custom-model resource declares
-//! (`smithy_query(query="operation",operation="CreateCustomModel,GetCustomModel,ListCustomModels")`);
+//! (`@httpError(403)`), which 107 of this service's 108 operations declare
+//! (`smithy_query(query="operation",operation="CreateGuardrail,DeleteResourcePolicy,CreateModelInvocationJob")`,
+//! and every other one but the single exception [`UNMODELLED_REFUSAL_OPERATIONS`] names);
 //! an operation whose model declares no 403 is NOT judged here, because answering a caller
 //! an error its operation does not model would be a different divergence.
+//!
+//! The decision is therefore taken for EVERY operation of this service rather than for the
+//! few whose handler asks for it: it is a property of the request's identity, the action it
+//! names and the resource it addresses rather than of what the handler goes on to do, so it
+//! is taken ONCE, in the layer every operation is served behind
+//! (`crate::service::EmulatedService::override_operation`), and nowhere else.
 //!
 //! Three pieces, each held in exactly one place:
 //!
@@ -63,15 +70,101 @@
 
 use std::time::SystemTime;
 
+use ::aws_smithy_runtime_api::http::{Response as RtResponse, StatusCode};
+use ::aws_smithy_types::body::SdkBody;
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
 use ::service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_store;
 use ::service_common::iam_authorization::{self as iam, Decision};
+use ::smithy_server_runtime::ServerHttpProtocol;
 
 use crate::ops::types::AccessDeniedException;
 
 /// The resource an action that is not resource-scoped is judged against, as IAM writes it
 /// for such a request.
 pub const ANY_RESOURCE: &str = "*";
+
+/// The wire name of the refusal this gate answers with, and the status the model gives it:
+/// `AccessDeniedException`, `@error("client")` at `@httpError(403)`
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`).
+pub const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The media type this restJson1 service renders an error in.
+const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// The ONE operation of this service whose model declares no `AccessDeniedException`:
+/// `GetUseCaseForModelAccess`, whose errors are `ResourceNotFoundException`,
+/// `ThrottlingException`, `ValidationException` and `InternalServerException`
+/// (`smithy_query(query="operation",operation="GetUseCaseForModelAccess")`).
+///
+/// A caller of it is left unjudged rather than answered an error its operation does not
+/// model: that would be a different divergence from the one this gate removes.
+pub const UNMODELLED_REFUSAL_OPERATIONS: &[&str] = &["GetUseCaseForModelAccess"];
+
+/// Whether the layer every operation is served behind judges `operation` itself.
+#[must_use]
+pub fn layer_judges(operation: &str) -> bool {
+    !UNMODELLED_REFUSAL_OPERATIONS.contains(&operation)
+}
+
+/// Whether `value` is an ARN of THIS service's own namespace — the resource a request
+/// carrying it addresses.
+///
+/// The parse is the crate's one ARN parse (`service_common::arn`), with the vendor field
+/// compared against [`crate::state::ARN_NAMESPACE`], so no two services disagree about
+/// which ARNs are theirs.
+#[must_use]
+pub fn names_a_resource_of_this_service(value: &str) -> bool {
+    ::service_common::arn::parse_of(value, crate::state::ARN_NAMESPACE).is_some()
+}
+
+/// The wire answer to a request this gate refused: the modelled `AccessDeniedException` at
+/// its modelled 403, serialized through the SAME protocol a handler-returned error of that
+/// shape goes through, so a refusal taken in the layer and one taken in a handler are
+/// indistinguishable on the wire.
+///
+/// The hand-built fallback carries the same three things a client branches on — the status,
+/// the shape in `x-amzn-errortype` and the `__type` body — for the one case the serializer
+/// can fail: a value it cannot render.
+///
+/// CROSS-REFERENCE: `service_common::event_stream::error_response` renders a modelled error
+/// the same way, for an operation that holds its error as a `dyn OperationError`. This gate
+/// holds the error shape itself rather than an operation's error channel (the layer stands
+/// in front of 107 of them), and its fallback keeps the refusal's own status and code where
+/// that one answers a 500 — so the two are not one renderer today. Hoisting a renderer that
+/// takes the shape, the schema, the code and the status is the change that would merge them,
+/// and it belongs to whichever change needs it in a second service.
+#[must_use]
+pub fn refusal_response(
+    protocol: &dyn ServerHttpProtocol,
+    denial: &AccessDeniedException,
+) -> RtResponse {
+    protocol
+        .serialize_error(
+            denial,
+            &crate::ops::types::SCHEMA_ACCESS_DENIED_EXCEPTION,
+            ACCESS_DENIED_EXCEPTION,
+            ACCESS_DENIED_STATUS,
+        )
+        .unwrap_or_else(|_| {
+            let body = ::serde_json::json!({
+                "__type": ACCESS_DENIED_EXCEPTION,
+                "message": denial.message.clone().unwrap_or_default(),
+            });
+            let mut response = RtResponse::new(
+                StatusCode::try_from(ACCESS_DENIED_STATUS)
+                    .expect("the status is a constant of this module"),
+                SdkBody::from(body.to_string()),
+            );
+            response
+                .headers_mut()
+                .insert("content-type", JSON_CONTENT_TYPE);
+            response
+                .headers_mut()
+                .insert("x-amzn-errortype", ACCESS_DENIED_EXCEPTION);
+            response
+        })
+}
 
 /// What a refusal names as the principal of a request whose session credential has already
 /// expired: that credential speaks for nobody, and the key it presented is not quoted back.
@@ -82,10 +175,6 @@ const EXPIRED_CREDENTIAL_PRINCIPAL: &str = "an expired session credential";
 /// service's `endpointPrefix` / `sigv4Name` (`smithy_query(query="service_info")`) — the
 /// same string [`crate::state::ARN_NAMESPACE`] spells into every ARN this service builds.
 pub const ACTION_PREFIX: &str = crate::state::ARN_NAMESPACE;
-
-/// The ARN resource type a custom model carries, as [`crate::state`] spells it — the
-/// resource every operation of the custom-model family is judged against.
-pub const CUSTOM_MODEL_RESOURCE_TYPE: &str = crate::state::CUSTOM_MODEL_RESOURCE_TYPE;
 
 /// Authorize this request, where `operation` is the operation's own name
 /// ([`smithy_server_runtime::Operation::NAME`]) and `resource` the ARN the request NAMES.
@@ -173,27 +262,217 @@ pub fn collection_arn(
     )
 }
 
-/// The ARN an operation that addresses ONE resource of `resource_type` by `identifier` is
-/// judged against.
+/// The ARN an operation is judged against, given the ARN of one of this service's own
+/// resources that the request carries (`named`, when it carries one) and the request `uri`
+/// it was addressed to.
 ///
-/// The identifier member of such an operation admits the resource's ARN or its bare NAME
-/// (`smithy_query(query="operation",operation="GetCustomModel")`). An ARN is the resource
-/// itself, so it is what the action is judged on; a bare name is not an ARN and the id the
-/// ARN carries is one this service minted, so a request naming a resource that way reaches
-/// the collection rather than an ARN this gate would have to resolve out of the store —
-/// which is what keeps the decision independent of whether the resource exists.
+/// IAM evaluates an action against the resource the request addresses, and a request
+/// addresses one in exactly three ways:
+///
+/// * it NAMES it, by spelling the ARN of a resource of the family its URI space addresses —
+///   `GetCustomModel$modelIdentifier` spelled as a `custom-model` ARN,
+///   `DeleteResourcePolicy$resourceArn`. The resource TYPE has to be that family's, because
+///   several operations carry an ARN of ANOTHER family beside their target —
+///   `CreateModelInvocationJob$modelId` admits a `foundation-model`, `custom-model` or
+///   `inference-profile` ARN, `ListModelCopyJobs$sourceModelArnEquals` a source model — and
+///   the model a job runs is not the resource the job-creating action acts on;
+/// * it names no ARN of that family — a create, a listing, a read addressed by a bare name
+///   — and so addresses the family's whole collection in this account and Region
+///   ([`collection_arn`]): the id a create would mint does not exist while the create is
+///   still being authorized, and the id behind a bare name is one this service minted, so
+///   neither is an ARN this gate could resolve without reading the store;
+/// * its URI space addresses no family of its own and the request carries the TARGET's ARN
+///   instead ([`ARN_ADDRESSED_SPACES`]) — the tagging and resource-policy operations, whose
+///   target may be a resource of any taggable family.
+///
+/// Anything else is judged against [`ANY_RESOURCE`], as IAM writes it for a request that
+/// addresses no one resource: an account-level setting, a configuration, and an ARN in a
+/// request whose space addresses neither that ARN's family nor the ARN the caller named.
 #[must_use]
-pub fn resource_arn(
+pub fn judged_resource(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
-    resource_type: &str,
-    identifier: &str,
+    named: Option<String>,
+    uri: &str,
 ) -> String {
-    if crate::state::names_arn_of(identifier, resource_type) {
-        identifier.to_string()
-    } else {
-        collection_arn(ctx, resource_type)
+    match addressed(uri) {
+        Addressed::Family(resource_types) => {
+            // The ARN the request spells, only where it is one of THIS family's; otherwise
+            // the family's collection, written with the type its own resources carry first.
+            if let Some(arn) = named {
+                if resource_types
+                    .iter()
+                    .any(|resource_type| crate::state::names_arn_of(&arn, resource_type))
+                {
+                    return arn;
+                }
+            }
+            match resource_types.first() {
+                Some(resource_type) => collection_arn(ctx, resource_type),
+                None => ANY_RESOURCE.to_string(),
+            }
+        }
+        Addressed::NamedByTheRequest => named.unwrap_or_else(|| ANY_RESOURCE.to_string()),
+        Addressed::NoResource => ANY_RESOURCE.to_string(),
     }
 }
+
+/// What the URI space a request was sent to addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Addressed {
+    /// A family of this service's OWN resources, named by these ARN resource types
+    /// ([`RESOURCE_FAMILIES`]).
+    Family(&'static [&'static str]),
+    /// The resource the REQUEST names, of whichever family it belongs to
+    /// ([`ARN_ADDRESSED_SPACES`]).
+    NamedByTheRequest,
+    /// No resource of this service: a space in [`RESOURCE_FREE_SPACES`], or a target this
+    /// model binds no operation to.
+    NoResource,
+}
+
+/// How `uri` addresses a resource, read off the FIRST path segment of the request target
+/// ([`first_path_segment`], which reads both the origin and the absolute form of one).
+fn addressed(uri: &str) -> Addressed {
+    let space = first_path_segment(uri);
+    if let Some((_, resource_types)) = RESOURCE_FAMILIES
+        .iter()
+        .find(|(known, _)| *known == space)
+    {
+        return Addressed::Family(resource_types);
+    }
+    if ARN_ADDRESSED_SPACES.contains(&space) {
+        return Addressed::NamedByTheRequest;
+    }
+    // Every remaining space this service SERVES holds no resource of its own
+    // ([`RESOURCE_FREE_SPACES`]); a target outside this model's own spaces reaches no
+    // operation at all, so the framework answers it as a routing failure. The invariant is
+    // about the MODEL rather than about any request, so no caller can reach this assertion,
+    // and `tests::every_uri_space_of_this_service_is_classified` holds it in every build.
+    debug_assert!(
+        RESOURCE_FREE_SPACES.contains(&space) || !crate::ROUTE_PATH_SEGMENTS.contains(&space),
+        "every URI space this service serves is classified"
+    );
+    Addressed::NoResource
+}
+
+/// The first path segment of a request target, in either of the two forms one arrives in.
+///
+/// Both readings are the shared crate's: the target is reduced to its PATH by the one
+/// reader of a whole request URI (`service_common::uri_path`, which strips the scheme, the
+/// authority, the query string and the fragment) and split by the one segment reader
+/// (`service_common::nth_path_segment`) — so the origin form a client sends
+/// (`/guardrails?maxResults=1`) and the absolute form the AWS SDK sends
+/// (`https://bedrock.<region>.amazonaws.com/guardrails`) read the same, and this crate grows
+/// no private copy of either.
+fn first_path_segment(uri: &str) -> &str {
+    ::service_common::nth_path_segment(::service_common::uri_path(uri), 0).unwrap_or_default()
+}
+
+/// The URI spaces whose operations address a resource of ANY family, named by the request
+/// itself: the tagging operations, whose `resourceARN` is "the Amazon Resource Name (ARN) of
+/// the resource" being tagged, and the resource-policy operations, whose `resourceArn` is
+/// the resource the policy is attached to
+/// (`smithy_query(query="operation",operation="TagResource,UntagResource,ListTagsForResource,PutResourcePolicy,GetResourcePolicy,DeleteResourcePolicy")`).
+///
+/// They map to no entry of [`RESOURCE_FAMILIES`] because the family is not a property of the
+/// space: it is whichever family the ARN in the request belongs to, which is exactly the
+/// resource IAM evaluates such an action against.
+const ARN_ADDRESSED_SPACES: &[&str] = &[
+    "listTagsForResource",
+    "resource-policy",
+    "tagResource",
+    "untagResource",
+];
+
+/// Every URI space of this service that addresses a family of its OWN resources, and the
+/// ARN resource types that family's members are named by — the FIRST being the one a
+/// resource this service mints in that space carries, so it is the type the family's
+/// collection is written with.
+///
+/// The spaces are the first segments of this model's `@http` URIs (`OPERATIONS.md`, the
+/// same list `crate::ROUTE_PATH_SEGMENTS` claims a request by, and
+/// [`tests::every_uri_space_of_this_service_is_classified`] holds this table to it), and
+/// every resource type is one [`crate::state`]'s ARN builder for that family spells — so
+/// the collection a request is judged against is written exactly as the ARNs of the
+/// resources it reaches are, and a policy scoped to this account's resources of that type
+/// covers it.
+///
+/// A space whose operations address no resource of this service is in
+/// [`RESOURCE_FREE_SPACES`]; one whose target is the ARN the REQUEST carries is in
+/// [`ARN_ADDRESSED_SPACES`].
+const RESOURCE_FAMILIES: &[(&str, &[&str])] = &[
+    (
+        "advanced-prompt-optimization-job",
+        &["advanced-prompt-optimization-job"],
+    ),
+    (
+        "advanced-prompt-optimization-jobs",
+        &["advanced-prompt-optimization-job"],
+    ),
+    (
+        "automated-reasoning-policies",
+        &["automated-reasoning-policy"],
+    ),
+    ("create-foundation-model-agreement", &[FOUNDATION_MODEL]),
+    ("custom-models", &[crate::state::CUSTOM_MODEL_RESOURCE_TYPE]),
+    ("delete-foundation-model-agreement", &[FOUNDATION_MODEL]),
+    ("evaluation-job", &["evaluation-job"]),
+    ("evaluation-jobs", &["evaluation-job"]),
+    ("foundation-model-availability", &[FOUNDATION_MODEL]),
+    ("foundation-models", &[FOUNDATION_MODEL]),
+    ("guardrails", &["guardrail"]),
+    ("imported-models", &["imported-model"]),
+    // This space holds BOTH profile kinds: a create mints the application profile
+    // (`crate::state::application_inference_profile_arn`), while the profiles AWS publishes
+    // are system-defined ones (`crate::state::system_defined_inference_profile_arn`), and a
+    // read or a delete may name either.
+    (
+        "inference-profiles",
+        &["application-inference-profile", "inference-profile"],
+    ),
+    ("list-foundation-model-agreement-offers", &[FOUNDATION_MODEL]),
+    (
+        "model-customization",
+        &[crate::state::CUSTOM_MODEL_DEPLOYMENT_RESOURCE_TYPE],
+    ),
+    ("model-copy-jobs", &["model-copy-job"]),
+    ("model-customization-jobs", &["model-customization-job"]),
+    ("model-import-jobs", &["model-import-job"]),
+    ("model-invocation-job", &["model-invocation-job"]),
+    ("model-invocation-jobs", &["model-invocation-job"]),
+    // Every prompt-router ARN this service mints spells `default-prompt-router/<id>`, as
+    // `PromptRouterArn` does (`crate::state::prompt_router_arn`); the taggable form of the
+    // same resource is `prompt-router/<id>`, which a caller may name it by.
+    (
+        "prompt-routers",
+        &["default-prompt-router", "prompt-router"],
+    ),
+    ("provisioned-model-throughput", &["provisioned-model"]),
+    ("provisioned-model-throughputs", &["provisioned-model"]),
+];
+
+/// The URI spaces whose operations address no resource of this service, so an action of
+/// theirs is judged against [`ANY_RESOURCE`], as IAM writes it for such a request: the
+/// account-level settings and configurations (`/data-retention`, `/logging/modelinvocations`,
+/// `/use-case-for-model-access`, `/enforcedGuardrailsConfiguration`), and
+/// `/marketplace-model`, whose endpoints are named by an Amazon SageMaker ARN rather than
+/// by one of this service's (`crate::state::marketplace_model_endpoint_arn`).
+///
+/// Stated rather than left to the fall-through, so a space this model adds later cannot
+/// become an unjudged default without a case saying so
+/// ([`tests::every_uri_space_of_this_service_is_classified`]).
+const RESOURCE_FREE_SPACES: &[&str] = &[
+    "data-retention",
+    "enforcedGuardrailsConfiguration",
+    "logging",
+    "marketplace-model",
+    "use-case-for-model-access",
+];
+
+/// The ARN resource type a foundation model is named by: AWS publishes it, so its ARN
+/// carries no account, and the collection a request about one is judged against is this
+/// Region's.
+const FOUNDATION_MODEL: &str = "foundation-model";
 
 /// The refusal IAM states an authorization failure with: who was refused, which action,
 /// on which resource, and which of IAM's rules refused it. Every value in it comes from
@@ -401,6 +680,198 @@ mod tests {
             &[document.to_string()],
             &iam::Request::new(action, resource, &[]),
         )
+    }
+
+    /// RULE: a request that names no ARN of the family it addressed is judged against that
+    /// family's collection, and against every resource only where the space holds no
+    /// resource of this service.
+    #[test]
+    fn a_uri_space_names_the_resource_family_an_action_is_judged_against() {
+        // (case, the request target, what that space addresses)
+        let rows: &[(&str, &str, Addressed)] = &[
+            ("a create", "/guardrails", Addressed::Family(&["guardrail"])),
+            (
+                "a listing with a query",
+                "/guardrails?maxResults=1",
+                Addressed::Family(&["guardrail"]),
+            ),
+            (
+                "a read addressed by a bare id",
+                "/guardrails/abcd1234",
+                Addressed::Family(&["guardrail"]),
+            ),
+            (
+                "an absolute request target",
+                "https://bedrock.us-west-2.amazonaws.com/model-invocation-job",
+                Addressed::Family(&["model-invocation-job"]),
+            ),
+            (
+                "the plural space of the same family",
+                "/model-invocation-jobs",
+                Addressed::Family(&["model-invocation-job"]),
+            ),
+            (
+                "the singular space of the evaluation jobs",
+                "/evaluation-job/abcd1234/stop",
+                Addressed::Family(&["evaluation-job"]),
+            ),
+            (
+                "a family whose space nests the resource",
+                "/model-customization/custom-model-deployments",
+                Addressed::Family(&[crate::state::CUSTOM_MODEL_DEPLOYMENT_RESOURCE_TYPE]),
+            ),
+            (
+                "a throughput space, whose resources are named provisioned models",
+                "/provisioned-model-throughput",
+                Addressed::Family(&["provisioned-model"]),
+            ),
+            (
+                "a space holding two kinds of the same resource",
+                "/inference-profiles",
+                Addressed::Family(&["application-inference-profile", "inference-profile"]),
+            ),
+            // The spaces whose target is the ARN the request carries, whatever family it
+            // belongs to.
+            (
+                "a tagging operation",
+                "/tagResource",
+                Addressed::NamedByTheRequest,
+            ),
+            (
+                "a resource-policy operation",
+                "/resource-policy/arn%3Aaws%3Abedrock%3Aus-west-2%3A000000000000%3Aguardrail%2Fabc",
+                Addressed::NamedByTheRequest,
+            ),
+            // And the spaces that address no resource of this service at all.
+            (
+                "an account-level setting",
+                "/data-retention",
+                Addressed::NoResource,
+            ),
+            (
+                "the logging configuration",
+                "/logging/modelinvocations",
+                Addressed::NoResource,
+            ),
+            (
+                "a target this model does not bind",
+                "/nothing-here",
+                Addressed::NoResource,
+            ),
+            ("the root", "/", Addressed::NoResource),
+        ];
+        for (case, target, expected) in rows {
+            let read = addressed(target);
+            assert_eq!(
+                read, *expected,
+                "case {case:?}: expected {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// RULE: every resource type this table maps a family to is one this service's OWN ARN
+    /// builder spells for a resource of that family, so the collection an action is judged
+    /// against is written exactly as the ARNs of the resources it reaches are — and a
+    /// policy scoped to this account's resources of that type covers it.
+    ///
+    /// Asserted by minting an ARN through the builder each family's resources are minted by
+    /// and reading its resource type back ([`crate::state::names_arn_of`]), so a family
+    /// mapped to the WRONG type fails here.
+    #[test]
+    fn every_mapped_family_is_named_by_the_type_its_own_arns_carry() {
+        let region = "us-west-2";
+        let id = "0123456789ab";
+        // One ARN per family, minted by `crate::state`'s own builder for it.
+        let minted: &[(&str, String)] = &[
+            (
+                "advanced-prompt-optimization-jobs",
+                crate::state::advanced_prompt_optimization_job_arn(region, id),
+            ),
+            (
+                "automated-reasoning-policies",
+                crate::state::automated_reasoning_policy_arn(region, id),
+            ),
+            (
+                "custom-models",
+                crate::state::custom_model_arn(region, "amazon.base-v1:0", id),
+            ),
+            (
+                "evaluation-jobs",
+                crate::state::evaluation_job_arn(region, id),
+            ),
+            ("guardrails", crate::state::guardrail_arn(region, id)),
+            (
+                "imported-models",
+                crate::state::imported_model_arn(region, id),
+            ),
+            (
+                "inference-profiles",
+                crate::state::application_inference_profile_arn(region, id),
+            ),
+            (
+                "inference-profiles",
+                crate::state::system_defined_inference_profile_arn(region, id),
+            ),
+            (
+                "model-customization",
+                crate::state::custom_model_deployment_arn(region, id),
+            ),
+            (
+                "model-copy-jobs",
+                crate::state::model_copy_job_arn(region, id),
+            ),
+            (
+                "model-customization-jobs",
+                crate::state::model_customization_job_arn(region, "amazon.base-v1:0", id),
+            ),
+            (
+                "model-import-jobs",
+                crate::state::model_import_job_arn(region, id),
+            ),
+            (
+                "model-invocation-job",
+                crate::state::model_invocation_job_arn(region, id),
+            ),
+            ("prompt-routers", crate::state::prompt_router_arn(region, id)),
+            (
+                "provisioned-model-throughput",
+                crate::state::provisioned_model_arn(region, id),
+            ),
+            (
+                "foundation-models",
+                crate::state::foundation_model_arn(region, "amazon.base-v1:0"),
+            ),
+        ];
+        for (space, arn) in minted {
+            let Addressed::Family(resource_types) = addressed(&format!("/{space}")) else {
+                panic!("case {space:?}: this space must address a resource family");
+            };
+            assert!(
+                resource_types
+                    .iter()
+                    .any(|resource_type| crate::state::names_arn_of(arn, resource_type)),
+                "case {space:?}: {arn:?} is of none of the mapped types {resource_types:?}"
+            );
+        }
+    }
+
+    /// RULE: every URI space this service serves is CLASSIFIED — it addresses a family of
+    /// this service's resources, or the resource the request names, or no resource at all —
+    /// so a space added by a later model refresh cannot silently fall through to the
+    /// resource that no scoped policy matches.
+    #[test]
+    fn every_uri_space_of_this_service_is_classified() {
+        for space in crate::ROUTE_PATH_SEGMENTS {
+            let reached = addressed(&format!("/{space}"));
+            let resource_free = RESOURCE_FREE_SPACES.contains(space);
+            assert_eq!(
+                reached == Addressed::NoResource,
+                resource_free,
+                "case {space:?}: a space reads as addressing no resource exactly when it is \
+                 one of the spaces stated to hold none, got {reached:?} against \
+                 {resource_free}"
+            );
+        }
     }
 
     /// RULE: the action this gate asks about is `bedrock:<OperationName>`, so a policy

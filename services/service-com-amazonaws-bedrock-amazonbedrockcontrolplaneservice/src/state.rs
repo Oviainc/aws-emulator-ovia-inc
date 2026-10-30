@@ -3260,14 +3260,19 @@ pub async fn pass_role_denial(
     .then(|| CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string())
 }
 
-/// Why Amazon Bedrock may not be passed the role a model customization job names, or
-/// `None` when it may be passed.
+/// Why Amazon Bedrock may not be passed the role a JOB-creating request names, or `None`
+/// when it may be passed.
 ///
-/// Starting a customization makes Amazon Bedrock TAKE ON the submitted role — to read the
-/// training data and to write the artifacts the job produces — so `roleArn` names a role the
-/// service assumes rather than a string the request stores, and the `iam:PassRole` step that
+/// Starting a job makes Amazon Bedrock TAKE ON the submitted role — to read the job's
+/// inputs and to write the artifacts it produces — so `roleArn` names a role the service
+/// assumes rather than a string the request stores, and the `iam:PassRole` step that
 /// decides whether this caller may pass it stands in front of everything else the request
-/// needs: no resource it names is resolved until that decision is taken.
+/// needs: no resource it names is resolved until that decision is taken. The operations
+/// that make such a pass are the job creates whose `roleArn` is the role the job RUNS as —
+/// `CreateModelCustomizationJob`, `CreateModelInvocationJob` and `CreateEvaluationJob`
+/// (`smithy_query(query="operation",operation="CreateModelCustomizationJob,CreateModelInvocationJob,CreateEvaluationJob")`:
+/// each declares `roleArn` `@required` under `RoleArn` and `AccessDeniedException` at
+/// `@httpError(403)`) — and each takes this one decision rather than a copy of it.
 ///
 /// The decision is the one every service that is handed a role to act under makes
 /// ([`::service_common::iam_role::role_pass_is_unauthorized`]), asked for THIS pass:
@@ -3296,17 +3301,17 @@ pub async fn pass_role_denial(
 /// could not read, leaves the pass admitted, because a refusal has to be grounded.
 ///
 /// ONE sentence for every refusal this gate makes, [`CROSS_ACCOUNT_PASS_ROLE_DENIED`]: the
-/// corpus records this operation refusing a pass with that sentence and with nothing else,
+/// corpus records these operations refusing a pass with that sentence and with nothing else,
 /// and it records it for a role of the caller's OWN account — so the recorded wording is not
-/// reserved for the ARN naming another account, and no recording of this operation words a
+/// reserved for the ARN naming another account, and no recording of them words a
 /// refused pass any other way. Inventing a second sentence for the other paths of one
 /// decision would be a wording no recording supports; so the gate states the recorded one,
 /// which carries no part of the request to be wrong about.
 ///
-/// A denial is the modelled `AccessDeniedException` (`@httpError(403)`) carrying
-/// [`CROSS_ACCOUNT_PASS_ROLE_DENIED`], with no job and no custom model written, which is
+/// A denied pass is the modelled `AccessDeniedException` (`@httpError(403)`) carrying
+/// [`CROSS_ACCOUNT_PASS_ROLE_DENIED`], with no job and nothing else written, which is
 /// what every recording of such a create shows.
-pub async fn customization_pass_role_denial(
+pub async fn job_pass_role_denial(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     role_arn: &str,

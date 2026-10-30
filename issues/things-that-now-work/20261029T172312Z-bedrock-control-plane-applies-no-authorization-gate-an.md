@@ -66,3 +66,22 @@ Boot the emulator from this checkout and replay the three checks in trace_ids (s
 1. iam:CreateRole (trusted by <account>:root) + iam:PutRolePolicy {Deny *:*}; sts:AssumeRole; with those credentials call bedrock:CreateGuardrail. Expect 403 AccessDeniedException; observe 202/success (repeatedly, for at least 60s). Then DeleteResourcePolicy on a guardrail as the restricted principal (expect 403) and as the owning caller (expect 200).
 2. Create a role trusted by <account>:root and by bedrock.amazonaws.com, inline {Allow bedrock:ListFoundationModels, Deny bedrock:CreateModelInvocationJob}; assume it; confirm ListFoundationModels works; then CreateModelInvocationJob with modelId='meta.llama3-1-8b-instruct-v1:0'. Expect AccessDeniedException and ListModelInvocationJobs(nameContains=<jobName>) empty; observe 200 with a jobArn.
 3. Create a scratch bucket and a same-account role trusted for bedrock.amazonaws.com; CreateEvaluationJob as above. Expect 403 AccessDeniedException containing 'cross-account pass role'; observe 202 with a jobArn.
+
+## Resolution
+
+Causes 1 and 2 are fixed, and their checks replay clean: the identity-based decision is taken for
+every operation of this service in the layer each one is served behind
+(`src/service/authorization.rs`, reached from `src/service.rs`), and
+`CreateModelInvocationJob` / `CreateEvaluationJob` take the `iam:PassRole` decision over `roleArn`
+through the one helper `state::job_pass_role_denial` that `CreateModelCustomizationJob` uses.
+
+Cause 3's gate is implemented — `CreateEvaluationJob` makes exactly the decision this report asks
+for — but its check, `bedrock.stop-evaluation-job-terminal-state-rejected`, still diverges and is
+DECLINED as recorded: the role the recording passes is a role of the caller's own account that IAM
+holds and whose trust policy grants `bedrock.amazonaws.com` the assume this pass makes, so the
+decision grants it. Refusing it anyway would need a verdict hardwired to deny every pass of this
+operation, which the resolved issues
+`20261027T152401Z-bedrock-createmodelcustomizationjob-denies-every-rolearn-with-403-cross-account.md`
+and `20261027T212357Z-bedrock-createmodelcustomizationjob-is-now-accepted-for-every-well-formed.md`
+forbid, and no recording or document states a rule that separates that role from one AWS accepts.
+A later recording that does state such a rule is what would reopen it.
