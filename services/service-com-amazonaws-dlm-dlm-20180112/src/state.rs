@@ -1222,6 +1222,98 @@ default_policy_only_body!(
     crate::ops::types::UpdateLifecyclePolicyInput,
 );
 
+/// The `[Default policies only]` parameters ONE request states, beside the KIND
+/// of policy it describes — the input to [`DefaultPolicyOnlyRequest::violation`].
+///
+/// Both halves of [`DefaultPolicyOnlyParameters`] are read HERE, beside the
+/// member list itself, so the two refusals composed from them consult the same
+/// halves, in the same order, under the same prefix, on every operation that
+/// takes those parameters.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultPolicyOnlyRequest<'details> {
+    /// Whether the policy this request creates or updates IS a default policy:
+    /// the kind of policy those parameters belong to.
+    pub default_policy: bool,
+    /// Which of them the request BODY states, read through
+    /// [`DefaultPolicyOnlyBody`].
+    pub body: DefaultPolicyOnlyParameters,
+    /// Whether the request body states the policy's RESOURCE TYPE.
+    ///
+    /// [`DEFAULT_POLICY_MEMBER`] is the only body member that states it, so only
+    /// a create can carry one; an update may not change the resource type
+    /// ([`resource_type_cannot_be_updated`]) and its body declares no member for
+    /// it, so an update states none.
+    pub body_resource_type: bool,
+    /// The configuration structure this request carries, whose
+    /// `[Default policies only]` members are the alternative to the body ones.
+    pub details: Option<&'details PolicyDetails>,
+}
+
+impl DefaultPolicyOnlyRequest<'_> {
+    /// Why Amazon Data Lifecycle Manager refuses this request's `[Default
+    /// policies only]` parameters, or `None` when it states a set the
+    /// documentation admits.
+    ///
+    /// Two documented rules, decided by the kind of policy the request
+    /// describes, so at most one of them can refuse a request:
+    ///
+    /// * a policy that is NOT a default policy may carry none of those members,
+    ///   so a request stating one anywhere — in the request body or inside the
+    ///   configuration structure — is refused naming every place it stated one
+    ///   ([`default_policy_only_parameters_refused`]);
+    /// * a DEFAULT policy's request states them "either in the request body, or
+    ///   in the PolicyDetails request structure, but not both", so a request
+    ///   carrying the structure AND body members is refused naming those body
+    ///   members ([`configuration_stated_twice`]).
+    pub fn violation(&self) -> Option<InvalidRequestException> {
+        if !self.default_policy {
+            let refused = self.stated_names();
+            return (!refused.is_empty())
+                .then(|| default_policy_only_parameters_refused(&refused));
+        }
+        // A request carrying no configuration structure states the configuration
+        // in one place, so there is nothing for the second rule to refuse.
+        let duplicated = match self.details {
+            Some(_) => self.duplicated_body_names(),
+            None => Vec::new(),
+        };
+        (!duplicated.is_empty()).then(|| configuration_stated_twice(&duplicated))
+    }
+
+    /// Everywhere this request states a `[Default policies only]` parameter: the
+    /// body half first, then the structure half, each structure-stated member
+    /// qualified by [`POLICY_DETAILS_PREFIX`] so a refusal tells the caller
+    /// WHERE it stated the parameter.
+    fn stated_names(&self) -> Vec<String> {
+        let mut stated = self.body.stated_names("");
+        stated.extend(self.in_details().stated_names(POLICY_DETAILS_PREFIX));
+        stated
+    }
+
+    /// The body parameters a request carrying the configuration structure states
+    /// a second time, named by the BODY member the caller used — the alternative
+    /// to the structure.
+    ///
+    /// The resource type is one of those parameters, stated in the body as
+    /// [`DEFAULT_POLICY_MEMBER`] and in the structure as
+    /// [`RESOURCE_TYPE_MEMBER`]; that body member also MAKES a request a
+    /// default-policy request, so it is a second statement of the resource type
+    /// only when the structure states one too. It leads the list, the position
+    /// [`DefaultPolicyOnlyParameters::stated_names`] gives it.
+    fn duplicated_body_names(&self) -> Vec<String> {
+        let mut duplicated = self.body.stated_names("");
+        if self.body_resource_type && self.in_details().resource_type {
+            duplicated.insert(0, DEFAULT_POLICY_MEMBER.to_string());
+        }
+        duplicated
+    }
+
+    /// The structure half of the parameter set.
+    fn in_details(&self) -> DefaultPolicyOnlyParameters {
+        DefaultPolicyOnlyParameters::in_policy_details(self.details)
+    }
+}
+
 /// The `InvalidRequestException` for a DEFAULT policy request that states its
 /// configuration in the request body AND as a `PolicyDetails` structure.
 ///

@@ -197,52 +197,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let is_default = input.default_policy.is_some()
             || policy_language_is_simplified(input.policy_details.as_ref());
 
-        // The one cross-member rule `CreateLifecyclePolicy` documents and the
-        // model cannot express: "If you create a default policy, you can specify
-        // the request parameters either in the request body, or in the
-        // PolicyDetails request structure, but not both."
-        let stated_in_body = input.default_policy_only_body_parameters();
-        if is_default && input.policy_details.is_some() {
-            let mut duplicated = stated_in_body.stated_names("");
-            // The resource type is one of those parameters: `DefaultPolicy` and
-            // `PolicyDetails$ResourceType` carry the same documentation, so a
-            // request naming both states it in both places. The refusal names it
-            // by the BODY member the caller used, the alternative to the
-            // structure.
-            if input.default_policy.is_some()
-                && crate::state::DefaultPolicyOnlyParameters::in_policy_details(
-                    input.policy_details.as_ref(),
-                )
-                .resource_type
-            {
-                duplicated.insert(0, crate::state::DEFAULT_POLICY_MEMBER.to_string());
-            }
-            if !duplicated.is_empty() {
-                return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
-                    crate::state::configuration_stated_twice(&duplicated),
-                )
-                .into());
-            }
-        }
-
-        // The members above are each documented `[Default policies only]`, so a
-        // request that is not creating a default policy may not state one — in
-        // the request body or inside `PolicyDetails`. Refused before anything is
-        // stored, so no policy is left holding a configuration no read reports.
-        if !is_default {
-            let mut refused = stated_in_body.stated_names("");
-            refused.extend(
-                crate::state::DefaultPolicyOnlyParameters::in_policy_details(
-                    input.policy_details.as_ref(),
-                )
-                .stated_names(crate::state::POLICY_DETAILS_PREFIX),
+        // The two cross-member rules the `[Default policies only]` parameters
+        // follow, composed where the member list they read lives: the one
+        // `CreateLifecyclePolicy` documents and the model cannot express — "If
+        // you create a default policy, you can specify the request parameters
+        // either in the request body, or in the PolicyDetails request structure,
+        // but not both" — and, for a request that is not creating a default
+        // policy, that it may state none of those members anywhere. Refused
+        // before anything is stored, so no policy is left holding a
+        // configuration no read reports.
+        if let Some(refusal) = (crate::state::DefaultPolicyOnlyRequest {
+            default_policy: is_default,
+            body: input.default_policy_only_body_parameters(),
+            // The request body states the resource type as `DefaultPolicy`.
+            body_resource_type: input.default_policy.is_some(),
+            details: input.policy_details.as_ref(),
+        })
+        .violation()
+        {
+            return Err(
+                CreateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
             );
-            if !refused.is_empty() {
-                return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
-                    crate::state::default_policy_only_parameters_refused(&refused),
-                )
-                .into());
-            }
         }
 
         // The documented numeric domain of a default policy's cadence, which the

@@ -225,47 +225,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // Every one of the update's configuration members below is documented
-        // `[Default policies only]`, so the policy addressed must BE a default
-        // policy for the request to state one — in the request body or inside
-        // `PolicyDetails`. The check runs after the lookup (the policy has to
-        // exist before its kind can be read) and before the first write, so a
-        // refused update leaves the stored policy exactly as it was.
-        if !policy.default_policy {
-            let mut refused = input.default_policy_only_body_parameters().stated_names("");
-            refused.extend(
-                crate::state::DefaultPolicyOnlyParameters::in_policy_details(
-                    input.policy_details.as_ref(),
-                )
-                .stated_names(crate::state::POLICY_DETAILS_PREFIX),
+        // The two cross-member rules the `[Default policies only]` parameters
+        // follow, composed where the member list they read lives: every one of
+        // the update's configuration members below is documented `[Default
+        // policies only]`, so the policy addressed must BE a default policy for
+        // the request to state one — in the request body or inside
+        // `PolicyDetails` — and a default policy's request states them "either
+        // in the request body, or in the PolicyDetails request structure, but
+        // not both", the rule `CreateLifecyclePolicy` documents for the
+        // parameters this operation declares too. The check runs after the
+        // lookup (the policy has to exist before its kind can be read) and
+        // before the first write, so a refused update leaves the stored policy
+        // exactly as it was and no record holds two copies of its configuration.
+        if let Some(refusal) = (crate::state::DefaultPolicyOnlyRequest {
+            default_policy: policy.default_policy,
+            body: input.default_policy_only_body_parameters(),
+            details: input.policy_details.as_ref(),
+            // An update's request body declares no resource-type member: it may
+            // not change the resource type at all.
+            ..Default::default()
+        })
+        .violation()
+        {
+            return Err(
+                UpdateLifecyclePolicyErrorModeled::InvalidRequestException(refusal).into(),
             );
-            if !refused.is_empty() {
-                return Err(
-                    UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
-                        crate::state::default_policy_only_parameters_refused(&refused),
-                    )
-                    .into(),
-                );
-            }
-        }
-
-        // The one cross-member rule a default policy's configuration follows
-        // wherever it is stated, which `CreateLifecyclePolicy` documents for the
-        // parameters this operation declares too: "you can specify the request
-        // parameters either in the request body, or in the PolicyDetails request
-        // structure, but not both". Refused before the first write, so a request
-        // stating the configuration twice leaves no record holding two copies of
-        // it.
-        if policy.default_policy && input.policy_details.is_some() {
-            let duplicated = input.default_policy_only_body_parameters().stated_names("");
-            if !duplicated.is_empty() {
-                return Err(
-                    UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
-                        crate::state::configuration_stated_twice(&duplicated),
-                    )
-                    .into(),
-                );
-            }
         }
 
         // The members of the policy's IDENTITY a replacement configuration may
