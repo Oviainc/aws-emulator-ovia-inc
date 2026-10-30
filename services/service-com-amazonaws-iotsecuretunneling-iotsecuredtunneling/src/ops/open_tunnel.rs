@@ -162,7 +162,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("OpenTunnel"))?;
 
-        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
 
         // An absent `timeoutConfig`, or an absent member within it, takes the
@@ -184,11 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .transpose()
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
-        let mut store = state.lock();
         // A tunnel whose lifetime has run out is CLOSED as of the instant the
         // transition came due, whether or not anybody called, so its slot is
-        // already free before this open is counted against the quota.
-        store.materialize_expired_tunnels(now);
+        // already free before this open is counted against the quota. The instant
+        // this call reasons with — the one its own expiry is computed from below —
+        // comes from inside the critical section, so it is the instant at which
+        // this call holds the store and not an earlier one it sampled while
+        // waiting for the lock.
+        let (mut store, now) = crate::state::lock_and_settle(&state);
 
         // The quota is on the tunnels this account holds OPEN in this Region
         // (`MAX_CONCURRENT_TUNNELS`), which is what the modelled

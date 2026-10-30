@@ -137,14 +137,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A resource's tags are read through the endpoint of its own Region: an
         // ARN of another Region names nothing this endpoint holds.
-        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
-        let mut store = state.lock();
         // Settle the transition the clock already made due before reporting: a
-        // tunnel whose lifetime has run out was closed at `now` by the clock
-        // whether or not anybody called, so this read leaves the record in the
-        // same state every other entry point of this service would.
-        store.materialize_expired_tunnels(now);
+        // tunnel whose lifetime has run out was closed by the clock whether or
+        // not anybody called, so this read leaves the record in the same state
+        // every other entry point of this service would. The instant comes from
+        // inside the critical section, so a lifetime that ran out while this
+        // request waited for the lock has run out by the time it reads.
+        let (store, _) = crate::state::lock_and_settle(&state);
         if store
             .tunnel_id_for_arn(&region, &input.resource_arn)
             .is_none()

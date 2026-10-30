@@ -655,6 +655,35 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
     }
 }
 
+/// Take the store lock, read the clock INSIDE the critical section and settle
+/// the close the clock already owes, handing back the guard and that instant.
+///
+/// Every operation of this service reasons about the store with ONE instant, and
+/// that instant is the one at which it actually holds the store. Acquiring this
+/// shared lock blocks for an unbounded time — every operation takes the same one,
+/// and the listing operations hold it while they project records — so an instant
+/// sampled before the acquisition is not the instant at which the store is
+/// observed: a lifetime that ran out while the caller waited for the lock would
+/// still look live to it, [`ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState::materialize_expired_tunnels`]
+/// would be handed an instant earlier than that expiry and would settle nothing,
+/// and a stamp written from it could move `lastUpdatedAt` backwards past the
+/// update of a call that held the lock first.
+///
+/// So the clock is read here, once the guard is held, and the sweep runs on that
+/// instant — the single place this service samples it for the store, which is
+/// what keeps the eight handlers agreeing on it.
+pub fn lock_and_settle(
+    state: &::engine::ServiceState<ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState>,
+) -> (
+    ::std::sync::MutexGuard<'_, ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState>,
+    SystemTime,
+) {
+    let mut store = state.lock();
+    let now = SystemTime::now();
+    store.materialize_expired_tunnels(now);
+    (store, now)
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

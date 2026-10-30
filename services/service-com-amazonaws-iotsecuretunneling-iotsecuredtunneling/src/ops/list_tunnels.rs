@@ -178,10 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clamp(1, crate::state::MAX_LIST_PAGE_SIZE);
         let page_size = usize::try_from(page_size).unwrap_or(1);
 
-        let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // Settle the transition the clock already made due before reporting.
-        store.materialize_expired_tunnels(now);
+        // Settle the transition the clock already made due before reporting, on
+        // the instant at which this call holds the store: a lifetime that ran out
+        // while this request waited for the lock has run out by the time it lists.
+        let (store, _) = crate::state::lock_and_settle(&state);
 
         // "Tunnels are listed by creation time in descending order, newer tunnels
         // will be listed before older tunnels." Creation order is the stored

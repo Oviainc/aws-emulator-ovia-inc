@@ -206,12 +206,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .transpose()
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
-        let now = ::std::time::SystemTime::now();
         // Tokens are rotated through the endpoint of the tunnel's own Region and
         // no other: a tunnel of another Region is not a resource this one holds.
         let region = crate::state::request_region(ctx);
-        let mut store = state.lock();
-        store.materialize_expired_tunnels(now);
+        // The instant this call reasons with is the instant at which it holds the
+        // store, so a tunnel whose lifetime ran out while this request waited for
+        // the lock is already closed by the clock here — and is refused below
+        // instead of being handed fresh tokens.
+        let (mut store, now) = crate::state::lock_and_settle(&state);
 
         let Some(tunnel) = store.tunnel_mut(&region, &input.tunnel_id) else {
             return Err(RotateTunnelAccessTokenErrorModeled::ResourceNotFoundException(

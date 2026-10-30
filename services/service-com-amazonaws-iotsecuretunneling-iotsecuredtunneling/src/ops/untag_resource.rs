@@ -135,13 +135,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A resource is untagged through the endpoint of its own Region: an ARN of
         // another Region names nothing this endpoint holds.
-        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx);
-        let mut store = state.lock();
         // A tunnel whose lifetime has already run out is closed by the clock
         // before this call writes its own stamp, so the stamp this call leaves
-        // is never overtaken by a close that was owed earlier.
-        store.materialize_expired_tunnels(now);
+        // is never overtaken by a close that was owed earlier. The instant comes
+        // from inside the critical section, so it is the instant at which this
+        // call holds the store.
+        let (mut store, now) = crate::state::lock_and_settle(&state);
         let Some(tunnel_id) = store.tunnel_id_for_arn(&region, &input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

@@ -140,14 +140,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("DescribeTunnel"))?;
 
-        let now = ::std::time::SystemTime::now();
         // A tunnel belongs to the Region of the endpoint it was opened against, so
         // only that endpoint reports it: a tunnel of another Region is not a
         // resource this one holds.
         let region = crate::state::request_region(ctx);
-        let mut store = state.lock();
-        // Settle the transition the clock already made due before reporting.
-        store.materialize_expired_tunnels(now);
+        // Settle the transition the clock already made due before reporting, on
+        // the instant at which this call holds the store: a lifetime that ran out
+        // while this request waited for the lock has run out by the time it reads.
+        let (store, _) = crate::state::lock_and_settle(&state);
 
         let Some(stored) = store.tunnel(&region, &input.tunnel_id).cloned() else {
             return Err(DescribeTunnelErrorModeled::ResourceNotFoundException(
