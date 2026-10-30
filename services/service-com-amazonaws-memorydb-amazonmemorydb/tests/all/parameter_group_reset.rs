@@ -22,6 +22,8 @@
 //!   batch carrying one bad name leaves the whole group as it was;
 //! * a group that does not exist, and one the service itself owns, are refused with the
 //!   modelled faults;
+//! * every refusal states the rule it broke in the service's own sentence for that
+//!   rule, the same sentence for every input that breaks it;
 //! * a reset is idempotent (resetting the same names twice leaves the same listing) and
 //!   is recorded as a `parameter-group` event the way every other change to a group is.
 
@@ -387,7 +389,9 @@ async fn a_refused_reset_leaves_the_group_exactly_as_it_was() {
         ),
         (
             // The groups MemoryDB itself provides hold their family's engine defaults
-            // and are not the caller's to change.
+            // and are not the caller's to change — and the dotted name they carry is
+            // not a well-formed identifier either, which is the rule this one breaks
+            // first (the wording suite below pins which sentence says so).
             "a default parameter group",
             json!({ "ParameterGroupName": "default.memorydb-redis7", "AllParameters": true }),
             "InvalidParameterValueException",
@@ -428,6 +432,319 @@ async fn a_refused_reset_leaves_the_group_exactly_as_it_was() {
             field(parameter, "Source", &case),
             "system",
             "case {case:?}: a default group carries nothing but engine defaults"
+        );
+    }
+}
+
+/// The `message` of a refusal body.
+fn message(body: &Value, case: &str) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a message in {body}"))
+        .to_string()
+}
+
+/// The sentence a reset answers a request naming BOTH selectors with: the flag is named
+/// by the public name the service words this refusal with, and nothing is interpolated.
+const BOTH_SELECTORS: &str = "May not specify both ResetAllParameters and a list of \
+                              parameters to reset.";
+
+/// The sentence a reset answers a request naming NEITHER selector with — the other half
+/// of the same exclusivity rule, equally fixed.
+const NO_SELECTOR: &str = "Must specify either ResetAllParameters or a list of \
+                           parameters to reset.";
+
+/// The sentence a reset answers a `ParameterGroupName` that is not a well-formed
+/// MemoryDB identifier with: the request MEMBER at fault, then the rule for identifiers
+/// (`crate::parameter_groups` pins the same sentence for the create).
+const NOT_AN_IDENTIFIER: &str = "The parameter ParameterGroupName is not a valid \
+                                 identifier. Identifiers must begin with a letter; must \
+                                 contain only ASCII letters, digits, and hyphens; and \
+                                 must not end with a hyphen or contain two consecutive \
+                                 hyphens.";
+
+/// The sentence a reset answers a group this store holds none of with: fixed text, which
+/// reports back no name.
+const NOT_FOUND: &str = "Parameter Group not found.";
+
+/// A name one character past the service's 40-character identifier bound.
+const OVERLONG_NAME: &str = "pg-reset-name-that-is-one-character-too-l";
+
+/// A name list of `repeats` copies of `repeated` followed by `last`, for the rows about
+/// how LONG a list the service takes rather than what the names say.
+fn names_repeating(repeated: &str, repeats: usize, last: &str) -> Vec<String> {
+    let mut names: Vec<String> = vec![repeated.to_string(); repeats];
+    names.push(last.to_string());
+    names
+}
+
+/// One row of the refusal-wording table: the request, and the error class and the
+/// EXACT sentence the service answers it with.
+struct RefusalCase {
+    case: &'static str,
+    request: fn(&str) -> Value,
+    code: &'static str,
+    message: &'static str,
+}
+
+/// Every class of reset refusal, each over several inputs that break the SAME rule, with
+/// the one sentence the service states that rule in.
+///
+/// Each row's request is built from the name of a group that exists, carries overrides
+/// and is of family `memorydb_redis7` — except the rows that are about a name, which name
+/// their own.
+const REFUSAL_WORDING: &[RefusalCase] = &[
+    // The two selectors are mutually exclusive: whatever the list says, naming it beside
+    // the reset-everything flag is the one refusal.
+    RefusalCase {
+        case: "both selectors, one name",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "AllParameters": true,
+            "ParameterNames": ["timeout"],
+        }),
+        code: "InvalidParameterCombinationException",
+        message: BOTH_SELECTORS,
+    },
+    RefusalCase {
+        case: "both selectors, several names",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "AllParameters": true,
+            "ParameterNames": ["timeout", "maxmemory-policy", "activerehashing"],
+        }),
+        code: "InvalidParameterCombinationException",
+        message: BOTH_SELECTORS,
+    },
+    RefusalCase {
+        case: "both selectors, one name repeated",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "AllParameters": true,
+            "ParameterNames": ["timeout", "timeout"],
+        }),
+        code: "InvalidParameterCombinationException",
+        message: BOTH_SELECTORS,
+    },
+    // One of them is required: an absent list and an empty one name nothing, and the
+    // flag left at its modelled default (false) asks for nothing either.
+    RefusalCase {
+        case: "neither selector",
+        request: |group| json!({ "ParameterGroupName": group }),
+        code: "InvalidParameterCombinationException",
+        message: NO_SELECTOR,
+    },
+    RefusalCase {
+        case: "the flag spelled false, no list",
+        request: |group| json!({ "ParameterGroupName": group, "AllParameters": false }),
+        code: "InvalidParameterCombinationException",
+        message: NO_SELECTOR,
+    },
+    RefusalCase {
+        case: "the flag spelled false beside an empty list",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "AllParameters": false,
+            "ParameterNames": Vec::<String>::new(),
+        }),
+        code: "InvalidParameterCombinationException",
+        message: NO_SELECTOR,
+    },
+    RefusalCase {
+        case: "an empty list alone",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "ParameterNames": Vec::<String>::new(),
+        }),
+        code: "InvalidParameterCombinationException",
+        message: NO_SELECTOR,
+    },
+    // A name the group's FAMILY does not define: the refusal lists the names the request
+    // carried that the family has no parameter for, in request order.
+    RefusalCase {
+        case: "a name no family carries",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "ParameterNames": ["not-a-parameter"],
+        }),
+        code: "InvalidParameterValueException",
+        message: "The following parameters are not defined for the specified group: \
+                  not-a-parameter",
+    },
+    RefusalCase {
+        // The Redis 6 spelling of the collection-encoding parameters, which the Redis 7
+        // line replaced: a real MemoryDB parameter, defined for another family.
+        case: "a name of another engine line",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "ParameterNames": ["hash-max-ziplist-entries"],
+        }),
+        code: "InvalidParameterValueException",
+        message: "The following parameters are not defined for the specified group: \
+                  hash-max-ziplist-entries",
+    },
+    RefusalCase {
+        case: "two undefined names among defined ones",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "ParameterNames": ["timeout", "not-a-parameter", "hash-max-ziplist-entries"],
+        }),
+        code: "InvalidParameterValueException",
+        message: "The following parameters are not defined for the specified group: \
+                  not-a-parameter,hash-max-ziplist-entries",
+    },
+    RefusalCase {
+        case: "one undefined name repeated",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "ParameterNames": ["not-a-parameter", "not-a-parameter"],
+        }),
+        code: "InvalidParameterValueException",
+        message: "The following parameters are not defined for the specified group: \
+                  not-a-parameter",
+    },
+    // The per-request parameter limit: a list AT the bound is examined (and refused here
+    // on the name the family does not define), one past it is refused as too long.
+    RefusalCase {
+        case: "a list at the per-request bound",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "ParameterNames": names_repeating("timeout", 19, "not-a-parameter"),
+        }),
+        code: "InvalidParameterValueException",
+        message: "The following parameters are not defined for the specified group: \
+                  not-a-parameter",
+    },
+    RefusalCase {
+        case: "a list one past the per-request bound",
+        request: |group| json!({
+            "ParameterGroupName": group,
+            "ParameterNames": names_repeating("timeout", 20, "not-a-parameter"),
+        }),
+        code: "InvalidParameterCombinationException",
+        message: "Cannot reset more than 20 parameters in a single request",
+    },
+    // A name that is not a well-formed identifier names no group at all, so it is
+    // refused on the rule it broke — before the named group is resolved, and before
+    // whose group it would be is read.
+    RefusalCase {
+        case: "a dotted name, which is what the service's own default groups are called",
+        request: |_| json!({
+            "ParameterGroupName": "default.memorydb-redis7",
+            "AllParameters": true,
+        }),
+        code: "InvalidParameterValueException",
+        message: NOT_AN_IDENTIFIER,
+    },
+    RefusalCase {
+        case: "a name beginning with a digit",
+        request: |_| json!({ "ParameterGroupName": "9pg-reset", "AllParameters": true }),
+        code: "InvalidParameterValueException",
+        message: NOT_AN_IDENTIFIER,
+    },
+    RefusalCase {
+        case: "a name ending with a hyphen",
+        request: |_| json!({ "ParameterGroupName": "pg-reset-", "AllParameters": true }),
+        code: "InvalidParameterValueException",
+        message: NOT_AN_IDENTIFIER,
+    },
+    RefusalCase {
+        case: "a name with two consecutive hyphens",
+        request: |_| json!({ "ParameterGroupName": "pg--reset", "AllParameters": true }),
+        code: "InvalidParameterValueException",
+        message: NOT_AN_IDENTIFIER,
+    },
+    RefusalCase {
+        case: "a name carrying a character outside the identifier set",
+        request: |_| json!({ "ParameterGroupName": "pg_reset", "AllParameters": true }),
+        code: "InvalidParameterValueException",
+        message: NOT_AN_IDENTIFIER,
+    },
+    RefusalCase {
+        // ONE character past the bound, so the length rule is what it breaks rather than
+        // the spelling rule — the 40-character name below is refused as absent instead.
+        case: "a name one character too long",
+        request: |_| json!({ "ParameterGroupName": OVERLONG_NAME, "AllParameters": true }),
+        code: "InvalidParameterValueException",
+        message: "Parameter group name length must be less than 40.",
+    },
+    // A well-formed name this store holds no group for, whatever the request asks of it.
+    RefusalCase {
+        case: "a group that does not exist",
+        request: |_| json!({ "ParameterGroupName": "pg-reset-absent", "AllParameters": true }),
+        code: "ParameterGroupNotFoundFault",
+        message: NOT_FOUND,
+    },
+    RefusalCase {
+        case: "a group that does not exist, with names",
+        request: |_| json!({
+            "ParameterGroupName": "pg-reset-absent",
+            "ParameterNames": ["timeout"],
+        }),
+        code: "ParameterGroupNotFoundFault",
+        message: NOT_FOUND,
+    },
+    RefusalCase {
+        // The longest name the service admits: still absent, so still the not-found
+        // sentence rather than a length refusal.
+        case: "an absent group named at the length bound",
+        request: |_| json!({
+            "ParameterGroupName": "pg-reset-name-that-is-exactly-forty-char",
+            "AllParameters": true,
+        }),
+        code: "ParameterGroupNotFoundFault",
+        message: NOT_FOUND,
+    },
+];
+
+/// Every reset the service refuses states the rule it broke in the service's own
+/// sentence for that rule — the same sentence for every input that breaks it, with
+/// nothing interpolated but the names the request itself carried.
+#[tokio::test]
+async fn a_refused_reset_states_the_rule_it_broke() {
+    const FAMILY: &str = "memorydb_redis7";
+    let router = router();
+    let group = "pg-reset-wording";
+    create_group(&router, group, FAMILY).await;
+    let (status, body) = update(&router, group, &[("timeout", "300")]).await;
+    assert_eq!(
+        status, 200,
+        "case {group:?}: expected the update to answer 200, got {status} with {body}"
+    );
+    let before = parameters(&router, group).await;
+    assert_eq!(
+        OVERLONG_NAME.chars().count(),
+        41,
+        "case {:?}: the overlong row must sit one character past the bound, it is {}",
+        "a name one character too long",
+        OVERLONG_NAME.chars().count()
+    );
+
+    for row in REFUSAL_WORDING {
+        let case = row.case;
+        let request = (row.request)(group);
+        let (status, body) = call(&router, "ResetParameterGroup", &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, row.code,
+            "case {case:?}: expected {}, got {code} with {body}",
+            row.code
+        );
+        let answered = message(&body, case);
+        assert_eq!(
+            answered, row.message,
+            "case {case:?}: expected the message {:?}, got {answered:?}",
+            row.message
+        );
+        let after = parameters(&router, group).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused reset must leave the group exactly as it was"
         );
     }
 }

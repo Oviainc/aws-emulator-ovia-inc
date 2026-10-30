@@ -893,12 +893,22 @@ pub fn immutable_parameter_group_rejection(name: &str, mutation: Mutation) -> Op
 /// The message a `ParameterGroupNotFoundFault` carries for the group `name` the request
 /// named.
 ///
-/// Every operation that resolves a parameter group by name answers the absent one
-/// through this, so one request's name is reported back in one template whichever
-/// operation it was sent to.
+/// The operations that resolve a parameter group by name and report the name back answer
+/// the absent one through this, so one request's name is reported back in one template
+/// whichever of them it was sent to. Where the service words ONE operation's absent
+/// group differently — the reset's [`PARAMETER_GROUP_NOT_FOUND_FIXED_MESSAGE`], which
+/// names no group — that operation states its own sentence instead, the same way
+/// [`NO_SUCH_CLUSTER_MESSAGE`] does for a cluster.
 pub fn parameter_group_not_found_message(name: &str) -> String {
     format!("ParameterGroup not found: {name}")
 }
+
+/// What `ResetParameterGroup` answers a `ParameterGroupName` this store holds no group
+/// for with.
+///
+/// Fixed text: the condition is stated and the name the request carried is NOT reported
+/// back, unlike [`parameter_group_not_found_message`].
+pub const PARAMETER_GROUP_NOT_FOUND_FIXED_MESSAGE: &str = "Parameter Group not found.";
 
 /// The message the `*NotFoundFault` of `kind` carries for the `name` a request named
 /// the resource by DIRECTLY — in a name member, rather than inside an ARN.
@@ -1532,6 +1542,25 @@ const MAXMEMORY_POLICIES: &[&str] = &[
 /// `UpdateParameterGroup$ParameterNameValues` — "A maximum of 20 parameters may be
 /// updated per request."
 pub const MAX_PARAMETERS_PER_UPDATE: usize = 20;
+
+/// The most parameters one `ResetParameterGroup` call may name.
+///
+/// A parameter-group write takes at most the service's per-request parameter limit
+/// whichever write it is, so a reset that names parameters one at a time is bounded by
+/// the same count as the update that set them ([`MAX_PARAMETERS_PER_UPDATE`]) — which is
+/// also what keeps ONE request from sizing the catalog lookups the reset asks for, since
+/// the model constrains the list's length not at all. Resetting more than that in one
+/// call is what `AllParameters` is for.
+pub const MAX_PARAMETERS_PER_RESET: usize = MAX_PARAMETERS_PER_UPDATE;
+
+/// What `ResetParameterGroup` answers a `ParameterNames` list longer than
+/// [`MAX_PARAMETERS_PER_RESET`] with, worded as the sibling update words its own
+/// over-long list.
+pub fn reset_parameter_count_rejection(count: usize) -> Option<String> {
+    (count > MAX_PARAMETERS_PER_RESET).then(|| {
+        format!("Cannot reset more than {MAX_PARAMETERS_PER_RESET} parameters in a single request")
+    })
+}
 
 /// `Cluster$Status`: "The status of the cluster. For example, Available, Updating,
 /// Creating." MemoryDB renders them lower-case on the wire.
@@ -2901,6 +2930,38 @@ pub const SUBNET_GROUP_NOT_FOUND_MESSAGE: &str = "Subnet Group not found.";
 /// What `DeleteCluster` answers a `ClusterName` this store does not hold with: the
 /// service's own sentence for the condition, which quotes no value of the request.
 pub const NO_SUCH_CLUSTER_MESSAGE: &str = "Specified cluster does not exist";
+
+/// What `ResetParameterGroup` answers a request that asks for the whole group to be
+/// reset AND lists individual parameters to reset with.
+///
+/// Fixed text, end to end: the two selectors are mutually exclusive, so the sentence
+/// states that rule and interpolates nothing — no group name, no parameter name, no
+/// count. The flag is named by the public name the service words this refusal with
+/// (`ResetAllParameters`), not by the `AllParameters` wire member it is carried in.
+pub const RESET_SELECTORS_EXCLUSIVE_MESSAGE: &str =
+    "May not specify both ResetAllParameters and a list of parameters to reset.";
+
+/// What `ResetParameterGroup` answers a request that asks neither for the whole group to
+/// be reset NOR for any individual parameter with.
+///
+/// The other half of the same exclusivity rule, worded the same way: fixed text that
+/// states the rule, interpolates nothing, and names the flag by the public name
+/// `ResetAllParameters` rather than the `AllParameters` wire member.
+pub const RESET_SELECTOR_REQUIRED_MESSAGE: &str =
+    "Must specify either ResetAllParameters or a list of parameters to reset.";
+
+/// What `ResetParameterGroup` answers names the group's family does not define with.
+///
+/// The fixed part states the condition; the variable part is the list of names the
+/// request itself carried, in request order, comma-separated — so a caller that sent
+/// several unusable names learns all of them from one call. The list a reset may carry
+/// is bounded ([`MAX_PARAMETERS_PER_RESET`]), so the sentence this builds is too.
+pub fn undefined_parameters_message(names: &[&str]) -> String {
+    format!(
+        "The following parameters are not defined for the specified group: {}",
+        names.join(",")
+    )
+}
 
 /// What the service answers an `UpdateUser` naming no field to change with. Fixed text:
 /// the request carried no value to quote back, so the rule is stated.

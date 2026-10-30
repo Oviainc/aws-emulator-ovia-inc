@@ -5,10 +5,11 @@
 //! in [`crate::state`] — ALL of them when `AllParameters` is true, otherwise exactly the
 //! parameters `ParameterNames` names — so each reset parameter reports its family's
 //! engine default again (and `system` as its source) on a later `DescribeParameters`.
-//! The two selectors are exclusive and one of them is required, every name is checked
-//! against the group's FAMILY before anything is removed, and a refused reset writes
-//! NOTHING. An applied reset is recorded as a `parameter-group` event, which
-//! `DescribeEvents` reports.
+//! The group's name is checked for spelling first, the two selectors are exclusive and
+//! one of them is required, every name is checked against the group's FAMILY before
+//! anything is removed, and a refused reset writes NOTHING — each refusal stating the
+//! rule it broke in the service's own sentence for that rule. An applied reset is
+//! recorded as a `parameter-group` event, which `DescribeEvents` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +162,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
+        // The name is checked for SPELLING first, the way the sibling
+        // `CreateParameterGroup` checks its own: a name that is not a well-formed
+        // MemoryDB identifier names no group at all, so the request is refused on the
+        // rule it broke before the group is resolved and before anything is read of what
+        // the request asks of it.
+        if let Some(message) = crate::state::resource_name_rejection(
+            crate::state::ResourceKind::ParameterGroup,
+            &input.parameter_group_name,
+        ) {
+            return Err(
+                ResetParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         // The two selectors are EXCLUSIVE and one of them is required: "If AllParameters
         // is true, do not use ParameterNames. If AllParameters is false, you must
         // specify the name of at least one parameter to reset." An absent list and an
@@ -174,9 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ResetParameterGroupErrorModeled::InvalidParameterCombinationException(
                         InvalidParameterCombinationException {
                             message: Some(
-                                "ParameterNames must not be specified when AllParameters \
-                                 is true."
-                                    .to_string(),
+                                crate::state::RESET_SELECTORS_EXCLUSIVE_MESSAGE.to_string(),
                             ),
                         },
                     )
@@ -188,10 +205,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ResetParameterGroupErrorModeled::InvalidParameterCombinationException(
                     InvalidParameterCombinationException {
                         message: Some(
-                            "ParameterNames must supply the name of at least one parameter \
-                             to reset when AllParameters is false."
-                                .to_string(),
+                            crate::state::RESET_SELECTOR_REQUIRED_MESSAGE.to_string(),
                         ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A parameter-group write takes at most the service's per-request parameter
+        // limit, the same one the sibling `UpdateParameterGroup` enforces on its own
+        // list: the model bounds `ParameterNameList` not at all, so this is what keeps
+        // ONE request from deciding how many catalog lookups the reset below does and how
+        // many names a refusal reports back. Checked before the store is locked, so no
+        // caller-sized work happens while the shared store is held.
+        if let Some(message) = crate::state::reset_parameter_count_rejection(names.len()) {
+            return Err(
+                ResetParameterGroupErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(message),
                     },
                 )
                 .into(),
@@ -217,9 +248,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let not_found = || {
             ResetParameterGroupErrorModeled::ParameterGroupNotFoundFault(
                 ParameterGroupNotFoundFault {
-                    message: Some(crate::state::parameter_group_not_found_message(
-                        &parameter_group_name,
-                    )),
+                    message: Some(
+                        crate::state::PARAMETER_GROUP_NOT_FOUND_FIXED_MESSAGE.to_string(),
+                    ),
                 },
             )
         };
@@ -252,25 +283,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // values for one parameter say two different things.
         let mut reset: std::collections::BTreeSet<&'static str> =
             std::collections::BTreeSet::new();
+        // The refusal names EVERY name the family does not define, each ONCE and in the
+        // order the request listed them, so the caller learns all of them from a single
+        // call rather than one per retry. The set is what the order is taken from, so a
+        // repeated name costs a lookup in it rather than a walk of the list so far.
+        let mut undefined: Vec<&str> = Vec::new();
+        let mut seen_undefined: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
         for name in &names {
-            // A name already resolved needs no second lookup, which also bounds the
-            // catalog lookups this request can ask for by the family's parameter count:
-            // the first name the family does not carry refuses the whole request, so a
-            // long list can only repeat names that are already in the set.
-            if reset.contains(name.as_str()) {
+            // A name already resolved needs no second lookup, which bounds the catalog
+            // lookups this request can ask for by the number of DISTINCT names it
+            // carries: a name repeated in a long list is already in one of the two sets.
+            if reset.contains(name.as_str()) || seen_undefined.contains(name.as_str()) {
                 continue;
             }
-            let Some(parameter) = crate::state::family_parameter(&family, name) else {
-                return Err(
-                    ResetParameterGroupErrorModeled::InvalidParameterValueException(
-                        InvalidParameterValueException {
-                            message: Some(format!("Could not find parameter with name: {name}")),
-                        },
-                    )
-                    .into(),
-                );
-            };
-            reset.insert(parameter.name);
+            match crate::state::family_parameter(&family, name) {
+                Some(parameter) => {
+                    reset.insert(parameter.name);
+                }
+                None => {
+                    seen_undefined.insert(name.as_str());
+                    undefined.push(name.as_str());
+                }
+            }
+        }
+        if !undefined.is_empty() {
+            return Err(
+                ResetParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::undefined_parameters_message(&undefined)),
+                    },
+                )
+                .into(),
+            );
         }
 
         let Some(group) = state.parameter_groups.get_mut(&parameter_group_name) else {
