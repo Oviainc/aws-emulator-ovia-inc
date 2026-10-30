@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/batch_get_job.rs"]
 mod batch_get_job;
+#[path = "all/budget.rs"]
+mod budget;
 #[path = "all/farm_queue_job.rs"]
 mod farm_queue_job;
 #[path = "all/state_roundtrip.rs"]

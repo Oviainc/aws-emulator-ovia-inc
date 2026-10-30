@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBudgets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBudgets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBudgets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +148,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBudgets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBudgetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBudgets"))
+        // A read: nothing here writes.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListBudgetsErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        let Some(farm) = store.farm(&input.farm_id) else {
+            return Err(ListBudgetsErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        };
+
+        // Oldest first, with the id breaking a tie, so paging over the list is stable.
+        let mut ordered: Vec<(::std::time::SystemTime, String)> = farm
+            .budgets
+            .values()
+            // `status` asks for one status only; a farm's other budgets are not on the
+            // page at all, so paging over a filtered list stays stable too.
+            .filter(|budget| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| budget.status == status)
+            })
+            .map(|budget| (budget.created_at, budget.budget_id.clone()))
+            .collect();
+        ordered.sort();
+        let ids: Vec<String> = ordered.into_iter().map(|(_, budget_id)| budget_id).collect();
+
+        let (page, next_token) =
+            crate::state::page_keys(&ids, input.next_token.as_deref(), input.max_results).map_err(
+                |message| {
+                    ListBudgetsError::from(ListBudgetsErrorModeled::ValidationException(
+                        crate::state::field_validation_failed("nextToken", &message),
+                    ))
+                },
+            )?;
+
+        let budgets = page
+            .iter()
+            .filter_map(|budget_id| farm.budgets.get(budget_id))
+            .map(|budget| BudgetSummary {
+                budget_id: budget.budget_id.clone(),
+                usage_tracking_resource: budget.usage_tracking_resource.clone(),
+                status: budget.status.clone(),
+                display_name: budget.display_name.clone(),
+                approximate_dollar_limit: budget.approximate_dollar_limit,
+                usages: ConsumedUsages {
+                    approximate_dollar_usage: budget.approximate_dollar_usage,
+                },
+                created_by: budget.created_by.clone(),
+                created_at: crate::state::timestamp(budget.created_at),
+                updated_by: budget.updated_by.clone(),
+                updated_at: budget.updated_at.map(crate::state::timestamp),
+                description: budget.description.clone(),
+            })
+            .collect();
+
+        Ok(ListBudgetsOutput {
+            budgets,
+            next_token,
+        })
     }
 }

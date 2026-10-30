@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBudget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBudget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBudget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBudget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBudgetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The budget-action lists' element counts and the `float` bounds of this body are
+        // refused HERE rather than at the boundary (`skip_validation` in
+        // `types/update_budget_types.rs`), for the reason `create_budget.rs` states: this
+        // service words those findings itself, and a `float` bound has to be compared at
+        // `float` precision. Nothing is written until every finding is clear.
+        let mut findings = Vec::new();
+        if let Some(limit) = input.approximate_dollar_limit {
+            crate::state::check_approximate_dollar_limit(
+                "approximateDollarLimit",
+                limit,
+                &mut findings,
+            );
+        }
+        if let Some(actions) = input.actions_to_add.as_deref() {
+            let thresholds: Vec<f32> = actions
+                .iter()
+                .map(|action| action.threshold_percentage)
+                .collect();
+            crate::state::check_budget_actions("actionsToAdd", &thresholds, &mut findings);
+        }
+        if let Some(actions) = input.actions_to_remove.as_deref() {
+            let thresholds: Vec<f32> = actions
+                .iter()
+                .map(|action| action.threshold_percentage)
+                .collect();
+            crate::state::check_budget_actions("actionsToRemove", &thresholds, &mut findings);
+        }
+        if !findings.is_empty() {
+            return Err(UpdateBudgetErrorModeled::ValidationException(
+                crate::state::budget_body_invalid(&findings),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateBudgetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        if store.farm(&input.farm_id).is_none() {
+            return Err(UpdateBudgetErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        let updated_by = crate::state::caller_principal(ctx);
+        let Some(budget) = store.budget_mut(&input.farm_id, &input.budget_id) else {
+            return Err(UpdateBudgetErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_BUDGET, &input.budget_id),
+            )
+            .into());
+        };
+
+        // `ACTIVE -> INACTIVE` is one-way: a budget that has left ACTIVE cannot be put
+        // back, and the refused call changes nothing at all — not the status, and not any
+        // other member the same request asked to update.
+        if let Some(status) = input.status.as_deref() {
+            if budget.reactivation_refused(status) {
+                return Err(UpdateBudgetErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(
+                        "status",
+                        crate::state::REACTIVATION_REFUSED,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // The action list this request would leave the budget holding, worked out BEFORE
+        // anything is written: the model bounds the stored list as well as the request's
+        // (`crate::state::MAX_STORED_BUDGET_ACTIONS`), so an update that would pass that
+        // bound is refused with the budget — and every other member it asked to change —
+        // left exactly as it was. Both loops are bounded: the stored list is at most that
+        // maximum, and each request list at most `MAX_BUDGET_ACTIONS`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBudget"))
+        // Removals are applied before additions, so one request can replace an action
+        // with another at the same threshold. An action is named by the pair the model
+        // gives `BudgetActionToRemove` — its type and its threshold — and only the first
+        // action matching that pair goes, so removing one of two identical actions leaves
+        // the other.
+        let mut next_actions = budget.actions.clone();
+        for removed in input.actions_to_remove.into_iter().flatten() {
+            if let Some(position) = next_actions.iter().position(|action| {
+                action.r#type == removed.r#type
+                    && action.threshold_percentage == removed.threshold_percentage
+            }) {
+                next_actions.remove(position);
+            }
+        }
+        for added in input.actions_to_add.into_iter().flatten() {
+            next_actions.push(ResponseBudgetAction {
+                r#type: added.r#type,
+                threshold_percentage: added.threshold_percentage,
+                description: added.description,
+            });
+        }
+        if next_actions.len() > crate::state::MAX_STORED_BUDGET_ACTIONS {
+            // The same finding, in the same words, as a request list that is itself too
+            // long: to a caller "too many budget actions" is one refusal class, whether
+            // the request's list or the list it would leave behind crossed the bound.
+            let findings = vec![crate::state::BudgetFinding::array_too_long(
+                "actionsToAdd".to_string(),
+                crate::state::MAX_STORED_BUDGET_ACTIONS,
+                next_actions.len(),
+            )];
+            return Err(UpdateBudgetErrorModeled::ValidationException(
+                crate::state::budget_body_invalid(&findings),
+            )
+            .into());
+        }
+
+        if let Some(display_name) = input.display_name {
+            budget.display_name = display_name;
+        }
+        if let Some(description) = input.description {
+            budget.description = Some(description);
+        }
+        if let Some(limit) = input.approximate_dollar_limit {
+            budget.approximate_dollar_limit = limit;
+        }
+        if let Some(schedule) = input.schedule {
+            budget.schedule = schedule;
+        }
+        if let Some(status) = input.status {
+            budget.status = status;
+        }
+        budget.actions = next_actions;
+        budget.updated_at = Some(::std::time::SystemTime::now());
+        budget.updated_by = Some(updated_by);
+
+        Ok(UpdateBudgetOutput {})
     }
 }

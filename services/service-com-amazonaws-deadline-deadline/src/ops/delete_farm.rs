@@ -149,8 +149,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        // The queues and jobs held under the farm go with it: the model reaches them only
-        // through the farm's path, so leaving them would leave resources nothing can name.
+        // The queues, jobs and budgets held under the farm go with it: the model reaches
+        // them only through the farm's path, so leaving them would leave resources nothing
+        // can name.
         let Some(removed_farm) = store.farms.remove(&input.farm_id) else {
             return Err(DeleteFarmErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
@@ -164,6 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store's budget for the same reason.
         let mut removed = vec![removed_farm.farm_id.clone()];
         let mut released_template_bytes = 0;
+        for budget in removed_farm.budgets.values() {
+            removed.push(budget.budget_id.clone());
+        }
         for queue in removed_farm.queues.values() {
             removed.push(queue.queue_id.clone());
             for job in queue.jobs.values() {

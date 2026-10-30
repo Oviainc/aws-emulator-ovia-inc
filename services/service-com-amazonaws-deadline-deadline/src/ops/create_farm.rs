@@ -211,6 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: None,
             updated_by: None,
             queues: ::std::collections::HashMap::new(),
+            budgets: ::std::collections::HashMap::new(),
         };
         store.farms.insert(farm_id.clone(), farm);
         if let Some(key) = token {

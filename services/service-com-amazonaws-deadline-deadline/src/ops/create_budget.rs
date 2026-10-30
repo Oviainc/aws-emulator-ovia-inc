@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBudget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBudget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBudget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +158,129 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBudget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBudgetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBudget"))
+        // The budget-action list's element count and the two `float` bounds of this body
+        // are refused HERE rather than at the boundary (`skip_validation` in
+        // `types/create_budget_types.rs`), because this service states those findings in
+        // its own validator's words and compares a `float` bound at `float` precision.
+        // Nothing is stored until every finding is clear, so a refused body leaves no
+        // budget behind.
+        let mut findings = Vec::new();
+        crate::state::check_approximate_dollar_limit(
+            "approximateDollarLimit",
+            input.approximate_dollar_limit,
+            &mut findings,
+        );
+        let thresholds: Vec<f32> = input
+            .actions
+            .iter()
+            .map(|action| action.threshold_percentage)
+            .collect();
+        crate::state::check_budget_actions("actions", &thresholds, &mut findings);
+        if !findings.is_empty() {
+            return Err(CreateBudgetErrorModeled::ValidationException(
+                crate::state::budget_body_invalid(&findings),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateBudgetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A budget lives under its farm, so an unknown farm is a 404 and nothing is made.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(CreateBudgetErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+
+        // The budget tracks the usage of one queue of that farm; a queue the farm does
+        // not hold is not reachable through this path, so there is nothing to track.
+        let UsageTrackingResource::queueId(tracked_queue) = &input.usage_tracking_resource;
+        if store.queue(&input.farm_id, tracked_queue).is_none() {
+            return Err(CreateBudgetErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_QUEUE, tracked_queue),
+            )
+            .into());
+        }
+
+        // `clientToken` is `@idempotencyToken`: a retry of the same create must answer
+        // with the resource the first call made, not make a second one.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, &input.farm_id, token));
+        if let Some(key) = token.as_deref() {
+            if let Some(budget_id) = store.remembered_resource(key).map(str::to_string) {
+                if store.budget(&input.farm_id, &budget_id).is_some() {
+                    return Ok(CreateBudgetOutput { budget_id });
+                }
+            }
+        }
+
+        // A farm holds at most this many budgets: each one is a caller-driven insert that
+        // only a DeleteBudget (or deleting the farm) releases.
+        if store
+            .farm(&input.farm_id)
+            .is_some_and(|farm| farm.budgets.len() >= crate::state::MAX_BUDGETS_PER_FARM)
+        {
+            return Err(CreateBudgetErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::RESOURCE_TYPE_BUDGET,
+                    "You exceeded the number of budgets this emulator stores for one farm. \
+                     Delete a budget and try again.",
+                ),
+            )
+            .into());
+        }
+
+        let budget_id = store.mint_id("budget");
+        let budget = crate::state::Budget {
+            budget_id: budget_id.clone(),
+            farm_id: input.farm_id.clone(),
+            display_name: input.display_name,
+            description: Some(input.description),
+            // A budget is evaluated from the moment it exists, so it is created in its
+            // terminal ACTIVE status: nothing is owed by the clock.
+            status: crate::state::BUDGET_STATUS_ACTIVE.to_string(),
+            usage_tracking_resource: input.usage_tracking_resource,
+            approximate_dollar_limit: input.approximate_dollar_limit,
+            actions: input
+                .actions
+                .into_iter()
+                .map(|action| ResponseBudgetAction {
+                    r#type: action.r#type,
+                    threshold_percentage: action.threshold_percentage,
+                    description: action.description,
+                })
+                .collect(),
+            schedule: input.schedule,
+            // Nothing in this emulator meters rendering usage, so a new budget has
+            // consumed nothing.
+            approximate_dollar_usage: 0.0,
+            created_at: ::std::time::SystemTime::now(),
+            created_by: crate::state::caller_principal(ctx),
+            updated_at: None,
+            updated_by: None,
+            queue_stopped_at: None,
+        };
+
+        let Some(farm) = store.farms.get_mut(&input.farm_id) else {
+            return Err(CreateBudgetErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        };
+        farm.budgets.insert(budget_id.clone(), budget);
+        if let Some(key) = token {
+            store.remember_resource(key, &budget_id);
+        }
+
+        Ok(CreateBudgetOutput { budget_id })
     }
 }

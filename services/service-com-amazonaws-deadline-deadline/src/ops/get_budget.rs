@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBudget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBudget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBudget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +159,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBudget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBudgetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBudget"))
+        // A read: nothing here writes.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetBudgetErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        if store.farm(&input.farm_id).is_none() {
+            return Err(GetBudgetErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+        // A budget of another farm is not reachable through this farm's path.
+        let Some(budget) = store.budget(&input.farm_id, &input.budget_id) else {
+            return Err(GetBudgetErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_BUDGET, &input.budget_id),
+            )
+            .into());
+        };
+
+        Ok(GetBudgetOutput {
+            budget_id: budget.budget_id.clone(),
+            usage_tracking_resource: budget.usage_tracking_resource.clone(),
+            status: budget.status.clone(),
+            display_name: budget.display_name.clone(),
+            approximate_dollar_limit: budget.approximate_dollar_limit,
+            usages: ConsumedUsages {
+                approximate_dollar_usage: budget.approximate_dollar_usage,
+            },
+            created_by: budget.created_by.clone(),
+            created_at: crate::state::timestamp(budget.created_at),
+            updated_by: budget.updated_by.clone(),
+            updated_at: budget.updated_at.map(crate::state::timestamp),
+            description: budget.description.clone(),
+            actions: budget.actions.clone(),
+            schedule: budget.schedule.clone(),
+            queue_stopped_at: budget.queue_stopped_at.map(crate::state::timestamp),
+        })
     }
 }

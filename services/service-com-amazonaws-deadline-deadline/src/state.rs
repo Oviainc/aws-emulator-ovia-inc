@@ -4,8 +4,10 @@
 //!
 //! The resource hierarchy this service persists is `farm -> queue -> job`, exactly as
 //! the model's paths nest it (`/2023-10-12/farms/{farmId}/queues/{queueId}/jobs/{jobId}`),
-//! so a queue is reachable only through its farm and a job only through its queue. Every
-//! handler reads and writes through [`service_state`]; nothing here is per-request.
+//! so a queue is reachable only through its farm and a job only through its queue. A
+//! farm's budgets hang off it the same way
+//! (`/2023-10-12/farms/{farmId}/budgets/{budgetId}`). Every handler reads and writes
+//! through [`service_state`]; nothing here is per-request.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -38,12 +40,27 @@ pub const JOB_LIFECYCLE_CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 /// compared on read.
 pub const JOB_CREATE_COMPLETE_AFTER: Duration = Duration::from_millis(500);
 
+/// `BudgetStatus` a freshly created budget carries.
+///
+/// From `smithy_query(query="shape", shape="BudgetStatus")`: `ACTIVE`, `INACTIVE`. A
+/// budget is evaluated from the moment it exists, so a create answers with a budget that
+/// is already in this TERMINAL status — nothing is owed by the clock.
+pub const BUDGET_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `BudgetStatus` a budget reaches when it stops being evaluated.
+///
+/// Terminal in the other direction too: once a budget is here it stays here, so
+/// [`Budget::reactivation_refused`] refuses a move back to [`BUDGET_STATUS_ACTIVE`].
+pub const BUDGET_STATUS_INACTIVE: &str = "INACTIVE";
+
 /// `resourceType` this service reports for a farm in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_FARM: &str = "farm";
 /// `resourceType` this service reports for a queue in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_QUEUE: &str = "queue";
 /// `resourceType` this service reports for a job in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_JOB: &str = "job";
+/// `resourceType` this service reports for a budget in `ResourceNotFoundException`.
+pub const RESOURCE_TYPE_BUDGET: &str = "budget";
 
 /// How many client tokens the store remembers at once.
 ///
@@ -68,6 +85,9 @@ pub const MAX_QUEUES_PER_FARM: usize = 500;
 
 /// How many jobs one queue holds at once. See [`MAX_FARMS`].
 pub const MAX_JOBS_PER_QUEUE: usize = 1000;
+
+/// How many budgets one farm holds at once. See [`MAX_FARMS`].
+pub const MAX_BUDGETS_PER_FARM: usize = 500;
 
 /// How many bytes of job templates this emulator stores at once.
 ///
@@ -100,6 +120,46 @@ pub struct Farm {
     pub updated_at: Option<SystemTime>,
     pub updated_by: Option<String>,
     pub queues: HashMap<String, Queue>,
+    /// Every budget of this farm, keyed by `budgetId`. A budget is reached only through
+    /// its farm's path (`/2023-10-12/farms/{farmId}/budgets/{budgetId}`), so it hangs off
+    /// the farm exactly as a queue does.
+    pub budgets: HashMap<String, Budget>,
+}
+
+/// A persisted budget, as `CreateBudget` stored it under its farm.
+#[derive(Debug, Clone)]
+pub struct Budget {
+    pub budget_id: String,
+    pub farm_id: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub usage_tracking_resource: crate::ops::types::UsageTrackingResource,
+    pub approximate_dollar_limit: f32,
+    pub actions: Vec<crate::ops::types::ResponseBudgetAction>,
+    pub schedule: crate::ops::types::BudgetSchedule,
+    /// What the budget has spent so far. Nothing in this emulator meters rendering usage,
+    /// so a budget that has never had usage reported against it has consumed nothing.
+    pub approximate_dollar_usage: f32,
+    pub created_at: SystemTime,
+    pub created_by: String,
+    pub updated_at: Option<SystemTime>,
+    pub updated_by: Option<String>,
+    /// When this budget last stopped its queue's scheduling; `None` until a budget action
+    /// has fired, which nothing in this emulator does yet.
+    pub queue_stopped_at: Option<SystemTime>,
+}
+
+impl Budget {
+    /// Whether moving this budget to `status` is the one-way `ACTIVE -> INACTIVE`
+    /// transition's reverse, which the service refuses.
+    ///
+    /// A budget leaves `ACTIVE` once and never returns: `INACTIVE` covers an expired,
+    /// cancelled or deleted budget (`smithy_query(query="shape", shape="BudgetSummary")`
+    /// documents the status that way), none of which can be undone by an update.
+    pub fn reactivation_refused(&self, status: &str) -> bool {
+        self.status == BUDGET_STATUS_INACTIVE && status == BUDGET_STATUS_ACTIVE
+    }
 }
 
 /// A persisted queue, as `CreateQueue` stored it under its farm.
@@ -299,6 +359,17 @@ impl ComAmazonawsDeadlineDeadlineState {
         self.farms.get_mut(farm_id)?.queues.get_mut(queue_id)
     }
 
+    /// The budget `budget_id` names UNDER `farm_id`: a budget of another farm is not
+    /// found here, because the model reaches a budget only through its own farm's path.
+    pub fn budget(&self, farm_id: &str, budget_id: &str) -> Option<&Budget> {
+        self.farms.get(farm_id)?.budgets.get(budget_id)
+    }
+
+    /// Mutable form of [`budget`](Self::budget).
+    pub fn budget_mut(&mut self, farm_id: &str, budget_id: &str) -> Option<&mut Budget> {
+        self.farms.get_mut(farm_id)?.budgets.get_mut(budget_id)
+    }
+
     /// The job `job_id` names under `farm_id`/`queue_id`, with any clock-owed lifecycle
     /// transition already materialised.
     pub fn settled_job(&mut self, farm_id: &str, queue_id: &str, job_id: &str) -> Option<&Job> {
@@ -408,6 +479,197 @@ pub fn cannot_parse(member: &str, message: &str) -> crate::ops::types::Validatio
             name: member.to_string(),
             message: message.to_string(),
         }]),
+        context: None,
+    }
+}
+
+/// The refusal this service answers when an update asks a budget to go back to
+/// [`BUDGET_STATUS_ACTIVE`].
+///
+/// Entirely fixed text: the budget's id, name and current status are interpolated
+/// nowhere in it.
+pub const REACTIVATION_REFUSED: &str = "Reactivating of INACTIVE budget is not allowed";
+
+/// Modeled `@length` maximum of a budget-action list.
+///
+/// `BudgetActionsToAdd` and `BudgetActionsToRemove` both carry `length {min 0, max 10}`
+/// (`smithy_query(query="operation", operation="CreateBudget,UpdateBudget")`). There is
+/// no too-short finding to make for either: the modeled minimum is 0, and no list holds
+/// fewer entries than that.
+pub const MAX_BUDGET_ACTIONS: usize = 10;
+
+/// Modeled `@length` maximum of the action list a budget HOLDS.
+///
+/// `ResponseBudgetActionList` — the target of `GetBudget.actions` — carries
+/// `length {min 0, max 10}` (`smithy_query(query="operation", operation="GetBudget")`),
+/// so the model bounds the STORED list as well as each request's list. That is what keeps
+/// repeated updates from growing one budget's actions without limit, and the response that
+/// reports them from growing with it: an update that would leave the budget holding more
+/// than this is refused and applies nothing. Numerically the same figure as
+/// [`MAX_BUDGET_ACTIONS`], from a different shape, so each keeps its own citation.
+pub const MAX_STORED_BUDGET_ACTIONS: usize = 10;
+
+/// Modeled `@range` minimum of `ConsumedUsageLimit`, the target of
+/// `approximateDollarLimit`: `range {min 0.01}`, with no maximum.
+pub const MIN_APPROXIMATE_DOLLAR_LIMIT: f32 = 0.01;
+
+/// Modeled `@range` minimum of `ThresholdPercentage`, the target of a budget action's
+/// `thresholdPercentage`: `range {min 0, max 100}`.
+pub const MIN_THRESHOLD_PERCENTAGE: f32 = 0.0;
+
+/// Modeled `@range` maximum of `ThresholdPercentage`. See [`MIN_THRESHOLD_PERCENTAGE`].
+pub const MAX_THRESHOLD_PERCENTAGE: f32 = 100.0;
+
+/// The clause the budget-body validator appends to every finding list it reports.
+///
+/// A budget request body declares `float` members — `approximateDollarLimit` and each
+/// budget action's `thresholdPercentage` (`smithy_query(query="operation",
+/// operation="CreateBudget")` reports `"type": "float"` on both) — and the validator that
+/// checks those bodies does not implement the `float` format attribute, so it states that
+/// alongside whatever else it found. Fixed text: nothing of the request reaches it.
+const FLOAT_FORMAT_UNSUPPORTED: &str = "format attribute \"float\" not supported";
+
+/// Ceiling on the findings one refused body reports.
+///
+/// Every finding interpolates both the violated bound and the value sent, and the number
+/// of findings grows with the number of budget actions the request carries — which the
+/// element-count bound no longer caps before the handler sees it. Capping the COUNT is
+/// what keeps a refusal from amplifying an oversized body into a much larger message; a
+/// caller cannot act on more clauses than this anyway.
+const MAX_BUDGET_FINDINGS: usize = 100;
+
+/// One finding of the validator the budget plane checks its request bodies with: the
+/// member at fault, and the sentence the validator states about it.
+///
+/// Held as data rather than as a finished message because one refused body reports EVERY
+/// member it found at fault — as one bracketed list in the message, and member by member
+/// in the exception's `fieldList`.
+#[derive(Debug, Clone)]
+pub struct BudgetFinding {
+    member: String,
+    detail: String,
+}
+
+impl BudgetFinding {
+    /// A list member holding more entries than its `@length` maximum allows.
+    pub fn array_too_long(member: String, max: usize, found: usize) -> Self {
+        Self {
+            detail: format!(
+                "array is too long: must have at most {max} elements but \
+                 instance has {found} elements"
+            ),
+            member,
+        }
+    }
+
+    /// A numeric member below its `@range` minimum.
+    pub fn below_minimum(member: String, min: f32, found: f32) -> Self {
+        Self {
+            detail: format!(
+                "numeric instance is lower than the required minimum \
+                 (minimum: {min}, found: {found})"
+            ),
+            member,
+        }
+    }
+
+    /// A numeric member above its `@range` maximum.
+    pub fn above_maximum(member: String, max: f32, found: f32) -> Self {
+        Self {
+            detail: format!(
+                "numeric instance is greater than the required maximum \
+                 (maximum: {max}, found: {found})"
+            ),
+            member,
+        }
+    }
+}
+
+/// The dotted path of one budget action's member, spelled the way this framework's
+/// boundary validator spells a path that steps through a list element
+/// (`actions.1.member.thresholdPercentage`). `index` is 0-based; the path is 1-based.
+pub fn action_member_path(list_member: &str, index: usize, member: &str) -> String {
+    use ::aws_smithy_schema_server::constraints::path;
+    path::join(&[
+        list_member.to_string(),
+        path::element(index + 1),
+        path::member(member),
+    ])
+}
+
+/// Every finding a budget-action list carried under `member` contributes: its own
+/// element-count bound, and each action's `thresholdPercentage` range.
+///
+/// `thresholds` is the list's actions in request order, as the `thresholdPercentage`
+/// each one sets.
+pub fn check_budget_actions(member: &str, thresholds: &[f32], findings: &mut Vec<BudgetFinding>) {
+    if thresholds.len() > MAX_BUDGET_ACTIONS {
+        findings.push(BudgetFinding::array_too_long(
+            member.to_string(),
+            MAX_BUDGET_ACTIONS,
+            thresholds.len(),
+        ));
+    }
+    for (index, threshold) in thresholds.iter().copied().enumerate() {
+        if findings.len() >= MAX_BUDGET_FINDINGS {
+            return;
+        }
+        let path = action_member_path(member, index, "thresholdPercentage");
+        if threshold < MIN_THRESHOLD_PERCENTAGE {
+            findings.push(BudgetFinding::below_minimum(
+                path,
+                MIN_THRESHOLD_PERCENTAGE,
+                threshold,
+            ));
+        } else if threshold > MAX_THRESHOLD_PERCENTAGE {
+            findings.push(BudgetFinding::above_maximum(
+                path,
+                MAX_THRESHOLD_PERCENTAGE,
+                threshold,
+            ));
+        }
+    }
+}
+
+/// The finding `approximateDollarLimit` contributes, if any.
+///
+/// Compared at the precision the member carries on the wire (`float`), so the modeled
+/// minimum itself is accepted: widening a `float` to a wider type first puts the value
+/// just below the bound and refuses a request that satisfies it.
+pub fn check_approximate_dollar_limit(
+    member: &str,
+    value: f32,
+    findings: &mut Vec<BudgetFinding>,
+) {
+    if value < MIN_APPROXIMATE_DOLLAR_LIMIT {
+        findings.push(BudgetFinding::below_minimum(
+            member.to_string(),
+            MIN_APPROXIMATE_DOLLAR_LIMIT,
+            value,
+        ));
+    }
+}
+
+/// The modeled 400 a budget request body is refused with once the validator has found
+/// anything at fault: every finding as one bracketed list followed by the fixed clause
+/// the validator always appends, and every member at fault named in `fieldList`.
+///
+/// Answer it INSTEAD of storing anything: a refused body leaves no budget behind.
+pub fn budget_body_invalid(findings: &[BudgetFinding]) -> crate::ops::types::ValidationException {
+    let mut stated: Vec<&str> = findings.iter().map(|f| f.detail.as_str()).collect();
+    stated.push(FLOAT_FORMAT_UNSUPPORTED);
+    crate::ops::types::ValidationException {
+        message: format!("[{}]", stated.join(", ")),
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(
+            findings
+                .iter()
+                .map(|f| crate::ops::types::ValidationExceptionField {
+                    name: f.member.clone(),
+                    message: f.detail.clone(),
+                })
+                .collect(),
+        ),
         context: None,
     }
 }
