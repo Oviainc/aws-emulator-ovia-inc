@@ -388,10 +388,14 @@ async fn created_members_are_read_back_by_list_members_and_get_members() {
                 member.get("AdministratorId").and_then(Value::as_str),
                 "case {case:?}: expected MasterId to equal AdministratorId, got {member:?}"
             );
+            // The membership's type is not reported while Detective is still verifying
+            // the account: it appears on the reads that follow, once the verification
+            // has settled.
             assert_eq!(
-                member.get("InvitationType").and_then(Value::as_str),
-                Some("INVITATION"),
-                "case {case:?}: expected InvitationType INVITATION, got {member:?}"
+                member.get("InvitationType"),
+                None,
+                "case {case:?}: expected no InvitationType while verification is in \
+                 progress, got {member:?}"
             );
             // "CreateMembers verifies the accounts and then invites the verified
             // accounts": the membership is created mid-verification.
@@ -416,6 +420,10 @@ async fn created_members_are_read_back_by_list_members_and_get_members() {
         expected.extend(batch.iter().cloned());
     }
 
+    // Every membership the graph holds: the accounts invited above, and the
+    // administrator's own ENABLED membership, which the graph has held since it was
+    // created.
+    expected.push(ACCOUNT.to_string());
     expected.sort();
     let listed = all_member_ids(&router, &graph_arn, None).await;
     assert_eq!(
@@ -471,6 +479,8 @@ async fn list_members_pages_through_every_member_in_account_id_order() {
     );
 
     let mut expected = accounts.clone();
+    // The administrator's own membership is listed beside the invited accounts.
+    expected.push(ACCOUNT.to_string());
     expected.sort();
     for max_results in [None, Some(1), Some(4), Some(9), Some(10), Some(MAX_PAGE_SIZE as i32)] {
         let served = all_member_ids(&router, &graph_arn, max_results).await;
@@ -603,9 +613,10 @@ async fn an_account_that_cannot_be_processed_is_reported_rather_than_stored() {
         "administrator-account: expected it reported unprocessed, got {created:?}"
     );
 
-    // The store agrees: exactly the two real memberships exist.
+    // The store agrees: exactly the two real memberships exist, beside the
+    // administrator's own.
     let listed = all_member_ids(&router, &graph_arn, None).await;
-    let mut expected = vec![member.clone(), fresh.clone()];
+    let mut expected = vec![member.clone(), fresh.clone(), ACCOUNT.to_string()];
     expected.sort();
     assert_eq!(
         listed, expected,
@@ -824,10 +835,12 @@ async fn deleting_a_graph_removes_it_and_its_members_from_the_store() {
     }
 
     // The graph that was not deleted is untouched, and holds no member from the one
-    // that was.
+    // that was: only its own administrator's membership.
     let survivors = all_member_ids(&router, &kept, None).await;
-    assert!(
-        survivors.is_empty(),
-        "expected the surviving graph to hold no members, got {survivors:?}"
+    assert_eq!(
+        survivors,
+        vec![ACCOUNT.to_string()],
+        "expected the surviving graph to hold only its administrator's own membership, \
+         got {survivors:?}"
     );
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInvestigationState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInvestigationState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInvestigationState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: archives or re-activates one investigation of a behavior graph by
+//! storing the requested `State` on the investigation record `GetInvestigation` reads.
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +130,16 @@ impl From<UpdateInvestigationStateErrorModeled> for UpdateInvestigationStateErro
     }
 }
 
+/// What this operation answers when the investigation it was asked to update cannot be
+/// resolved: the modelled 404 with this one fixed sentence.
+///
+/// Recorded behaviour: the sentence names the two inputs that together identify the
+/// investigation and interpolates neither of them, and it is this operation's own text —
+/// `GetInvestigation` words the same condition differently, so neither can be sourced
+/// from the other.
+const INVESTIGATION_NOT_FOUND_MESSAGE: &str =
+    "Unable to find Investigation based on the Graph Arn or Investigation ID provided";
+
 /// The `UpdateInvestigationState` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -172,18 +176,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInvestigationState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInvestigationStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInvestigationState"))
+        let _ = ctx;
+        // `GraphArn`'s pattern, `InvestigationId`'s 21-character `^[0-9]+$` and
+        // `State`'s membership of the `State` value set are modelled constraints the
+        // centralized walk has already refused anything outside of, so what reaches here
+        // is a well-formed state for a well-formed id: the only question left is whether
+        // this graph holds that investigation.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateInvestigationStateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the behavior graph store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let now = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
+            UpdateInvestigationStateErrorModeled::ResourceNotFoundException(
+                crate::state::investigation_graph_not_found(),
+            )
+        })?;
+        // The run of each investigation was due to finish at an instant the clock may
+        // already have passed, so it is materialised before this call changes anything:
+        // archiving an investigation never rewinds the status its own run reached. See
+        // `crate::state::Investigation::settle`.
+        graph.settle_investigations(now);
+
+        let investigation = graph
+            .investigations
+            .get_mut(&input.investigation_id)
+            .ok_or_else(|| {
+                UpdateInvestigationStateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(INVESTIGATION_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+            })?;
+
+        // "Updates the state of an investigation": the requested state IS the
+        // investigation's state from here on — "an archived investigation indicates you
+        // have completed reviewing the investigation" — so it is stored on the record
+        // every later read of this investigation projects its `State` from. The state a
+        // request asks for is the one it already has when they agree, which is a
+        // no-change update rather than a refusal: the member is the state to BE in, not
+        // a transition.
+        investigation.state = input.state.clone();
+
+        Ok(UpdateInvestigationStateOutput)
     }
 }

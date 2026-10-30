@@ -3,24 +3,21 @@
 //! What `BatchGetGraphMemberDatasources` reports for a batch of accounts.
 //!
 //! The rule under test: for each DISTINCT account a request names, the behavior graph
-//! either ingests data for it — its administrator account, which `CreateGraph` "creates a
-//! new behavior graph for and sets as the administrator account", or an account with a
-//! membership in it — and then the call reports that account's data source package
-//! information, which is the graph's own package history: per modelled
-//! `DatasourcePackage` the graph holds a record for, one ISO8601 `date-time` per ingest
-//! state that package has entered (`LastIngestStateChangeDates` is modelled as a map
-//! keyed by `DatasourcePackageIngestState`) — or the graph ingests nothing for it, and
-//! then the account is reported in `UnprocessedAccounts` with the reason, never
-//! fabricated as a contributing account. Reporting writes nothing: a second call answers
-//! identically.
+//! either holds a membership for it — an account invited into it, or its administrator
+//! account, whose own membership `CreateGraph` creates with the graph — and then the call
+//! reports that MEMBERSHIP's data source package information: per modelled
+//! `DatasourcePackage` whose ingest has been started for the membership, the ISO8601
+//! `date-time` it was started at (`DatasourcePackageIngestHistory` is "details on when a
+//! data source package was added to a behavior graph", so it records additions and no
+//! other state change) — or the graph holds no membership for it, and then the account is
+//! reported in `UnprocessedAccounts` with the reason, never fabricated as a contributing
+//! account. Reporting writes nothing: a second call answers identically.
 //!
 //! Every case drives the real wire path: the production `MultiServiceRouter`, restJson1
 //! serialization, the modelled-constraint walk and the handlers.
 
 use std::collections::BTreeMap;
 
-use aws_smithy_types::date_time::Format;
-use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_detective_amazondetective::state::{
     GRAPH_NOT_FOUND_MESSAGE, NOT_INGESTED_FOR_REASON,
@@ -31,6 +28,11 @@ use crate::support::{
     account, account_id, assert_iso8601, call, create_graph_ok, emulator, error_code,
     error_message, ACCOUNT, REGION,
 };
+
+/// Every value the modelled `DatasourcePackage` enum accepts, from
+/// `smithy_query(query="shape",shape="DatasourcePackage")`, in the order a package name
+/// sorts \u2014 which is the order a history map is walked in.
+const PACKAGES: [&str; 3] = ["ASFF_SECURITYHUB_FINDING", "DETECTIVE_CORE", "EKS_AUDIT"];
 
 /// One `BatchGetGraphMemberDatasources` call that must succeed.
 async fn datasources_of(
@@ -70,24 +72,6 @@ fn reported_ids(answer: &Value, member: &str, case: &str) -> Vec<String> {
                 .to_string()
         })
         .collect()
-}
-
-/// A rendered ISO8601 `date-time` as epoch milliseconds, so two instants compare as
-/// INSTANTS.
-///
-/// They must not be compared as strings: the rendered form trims trailing zeros from
-/// its fractional seconds, so an earlier instant can sort after a later one
-/// (`…:56.28Z` > `…:56.284Z`, because `Z` > `4`) — which made the chronology
-/// assertion below fail whenever the earlier of two instants landed on a whole
-/// multiple of ten milliseconds. The sibling `datasource_package_ingest` suite parses
-/// for the same reason.
-fn epoch_millis(case: &str, rendered: &str) -> i64 {
-    let parsed = DateTime::from_str(rendered, Format::DateTime).unwrap_or_else(|error| {
-        panic!("case {case:?}: {rendered:?} is not a date-time timestamp: {error}")
-    });
-    parsed.to_millis().unwrap_or_else(|error| {
-        panic!("case {case:?}: {rendered:?} does not convert to millis: {error}")
-    })
 }
 
 /// One account's `DatasourcePackageIngestHistory` as `{package: {state: timestamp}}`,
@@ -178,8 +162,8 @@ fn batch_cases(members: &[String], strangers: &[String]) -> Vec<BatchCase> {
             expected_unprocessed: vec![strangers[0].clone(), strangers[1].clone()],
         },
         BatchCase {
-            // The account that created the graph administers it, and the graph ingests
-            // its data too, so it is reported even though it holds no MEMBERSHIP.
+            // The account that created the graph administers it, and holds its own
+            // membership in it, so it is reported like any other member.
             name: "the-administrator-account".to_string(),
             account_ids: vec![ACCOUNT.to_string()],
             expected_members: vec![ACCOUNT.to_string()],
@@ -299,31 +283,66 @@ async fn a_batch_reports_the_graphs_packages_for_the_accounts_it_ingests_for() {
                 Some(graph_arn.as_str()),
                 "case {name:?}: expected the graph asked about, got {reported:?}"
             );
-            // A freshly created graph ingests exactly the mandatory package, started.
+            // The administrator's own membership started every package the graph was
+            // created ingesting; an invited membership has started the mandatory
+            // package alone, so that is the only addition its history records.
+            let expected: Vec<String> = if member == ACCOUNT {
+                PACKAGES.iter().map(|p| (*p).to_string()).collect()
+            } else {
+                vec!["DETECTIVE_CORE".to_string()]
+            };
             assert_eq!(
                 ingest_history(&answer, member, name)
                     .keys()
                     .cloned()
                     .collect::<Vec<String>>(),
-                vec!["DETECTIVE_CORE".to_string()],
-                "case {name:?}: expected the graph's one package, got {reported:?}"
+                expected,
+                "case {name:?}: expected the packages started for this membership, got {reported:?}"
             );
         }
     }
 }
 
-/// One row of the package table: the set `UpdateDatasourcePackages` is asked for, the
-/// history the read must then report (package, in key order, with the ingest states it
-/// has entered), and the state `EKS_AUDIT` is left in by that update.
+/// One row of the package table: the set `UpdateDatasourcePackages` is asked for, and
+/// the state that update leaves `EKS_AUDIT` in ON THE GRAPH — which is what makes the
+/// row's assertion about the membership's history non-vacuous.
 struct PackageCase {
     name: &'static str,
     requested: Vec<&'static str>,
-    expected: Vec<(&'static str, Vec<&'static str>)>,
     eks_state: &'static str,
 }
 
+/// The ingest state `ListDatasourcePackages` reports for `package` on `graph_arn`.
+async fn graph_state_of(
+    router: &MultiServiceRouter,
+    graph_arn: &str,
+    package: &str,
+    case: &str,
+) -> String {
+    let (status, listed) = call(
+        router,
+        "/graph/datasources/list",
+        &json!({ "GraphArn": graph_arn }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: ListDatasourcePackages expected 200, got {status} {listed:?}"
+    );
+    listed
+        .get("DatasourcePackages")
+        .and_then(Value::as_object)
+        .and_then(|packages| packages.get(package))
+        .and_then(|detail| detail.get("DatasourcePackageIngestState"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: no ingest state for {package} on the graph: {listed:?}")
+        })
+        .to_string()
+}
+
 #[tokio::test]
-async fn the_reported_history_follows_the_graphs_package_changes_and_a_read_changes_nothing() {
+async fn a_memberships_history_records_what_was_started_for_it_and_a_read_changes_nothing() {
     let router = emulator();
     let graph_arn = create_graph_ok(&router, REGION, &json!({})).await;
     let member = account_id(7);
@@ -339,7 +358,8 @@ async fn the_reported_history_follows_the_graphs_package_changes_and_a_read_chan
     );
     let named = std::slice::from_ref(&member);
 
-    // A new graph ingests the mandatory package and nothing else.
+    // An invited membership has started the mandatory package alone, so that is the one
+    // addition its history records.
     let first = ingest_history(
         &datasources_of(&router, &graph_arn, named, "created").await,
         &member,
@@ -355,59 +375,65 @@ async fn the_reported_history_follows_the_graphs_package_changes_and_a_read_chan
         vec!["DETECTIVE_CORE".to_string()],
         "created: expected only the mandatory package, got {first:?}"
     );
+    // The administrator's own membership started every package the graph was created
+    // ingesting, so its history records one addition per modelled package.
+    let administrator = vec![ACCOUNT.to_string()];
+    let admin_first = ingest_history(
+        &datasources_of(&router, &graph_arn, &administrator, "created-administrator").await,
+        ACCOUNT,
+        "created-administrator",
+    );
+    assert_eq!(
+        admin_first.keys().cloned().collect::<Vec<String>>(),
+        PACKAGES
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect::<Vec<String>>(),
+        "created-administrator: expected every package the graph was created ingesting, \
+         got {admin_first:?}"
+    );
+    for (package, states) in admin_first.iter().chain(first.iter()) {
+        assert_eq!(
+            states.keys().cloned().collect::<Vec<String>>(),
+            vec!["STARTED".to_string()],
+            "created: {package}'s history records the addition and nothing else, got {states:?}"
+        );
+    }
 
-    // The rows walk the package set: every state change a package goes through adds its
-    // own date, and a package the graph never ingested has no entry at all.
+    // The rows walk the GRAPH's package set. A membership's history is the record of
+    // what was started FOR THAT MEMBERSHIP, so changing which packages the graph
+    // ingests moves the graph's own ingest state (asserted per row, so no row is
+    // vacuous) and adds nothing to either membership's history.
     //
     // `DatasourcePackage` value set:
     // `smithy_query(query="shape",shape="DatasourcePackage")` — DETECTIVE_CORE,
     // EKS_AUDIT, ASFF_SECURITYHUB_FINDING.
-    // The last column is the state `EKS_AUDIT` is in after the row's update: its date
-    // must be the LATEST in that package's history, and every other state's date must be
-    // the one the row before reported.
     let updates = vec![
         PackageCase {
-            name: "started-eks",
-            requested: vec!["DETECTIVE_CORE", "EKS_AUDIT"],
-            expected: vec![
-                ("DETECTIVE_CORE", vec!["STARTED"]),
-                ("EKS_AUDIT", vec!["STARTED"]),
-            ],
-            eks_state: "STARTED",
-        },
-        PackageCase {
-            name: "stopped-eks",
+            name: "stopped-the-optional-packages",
             requested: vec!["DETECTIVE_CORE"],
-            expected: vec![
-                ("DETECTIVE_CORE", vec!["STARTED"]),
-                ("EKS_AUDIT", vec!["STARTED", "STOPPED"]),
-            ],
             eks_state: "STOPPED",
         },
         PackageCase {
-            // The same package started AGAIN: the restart moves its `STARTED` date and
-            // leaves the `STOPPED` date it already carried where it was.
-            name: "restarted-eks-beside-every-other-package",
+            name: "started-eks-again",
+            requested: vec!["DETECTIVE_CORE", "EKS_AUDIT"],
+            eks_state: "STARTED",
+        },
+        PackageCase {
+            name: "every-modelled-package",
             requested: vec!["DETECTIVE_CORE", "EKS_AUDIT", "ASFF_SECURITYHUB_FINDING"],
-            expected: vec![
-                ("ASFF_SECURITYHUB_FINDING", vec!["STARTED"]),
-                ("DETECTIVE_CORE", vec!["STARTED"]),
-                ("EKS_AUDIT", vec!["STARTED", "STOPPED"]),
-            ],
             eks_state: "STARTED",
         },
     ];
 
-    let mut previous_eks: Option<BTreeMap<String, String>> = None;
     for PackageCase {
         name: case,
         requested: packages,
-        expected,
         eks_state,
     } in updates
     {
-        // Distinct instants, so a second state of one package is visibly later than the
-        // first rather than sharing its millisecond.
+        // Distinct instants, so a date the rule says must not move would be visibly
+        // different if it did.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let (status, updated) = call(
             &router,
@@ -419,30 +445,22 @@ async fn the_reported_history_follows_the_graphs_package_changes_and_a_read_chan
             status, 200,
             "case {case:?}: UpdateDatasourcePackages expected 200, got {status} {updated:?}"
         );
+        assert_eq!(
+            graph_state_of(&router, &graph_arn, "EKS_AUDIT", case).await,
+            eks_state,
+            "case {case:?}: expected the update to leave EKS_AUDIT {eks_state} on the graph"
+        );
 
         let history = ingest_history(
             &datasources_of(&router, &graph_arn, named, case).await,
             &member,
             case,
         );
-        let shape: Vec<(String, Vec<String>)> = history
-            .iter()
-            .map(|(package, states)| (package.clone(), states.keys().cloned().collect()))
-            .collect();
-        let want: Vec<(String, Vec<String>)> = expected
-            .iter()
-            .map(|(package, states)| {
-                (
-                    package.to_string(),
-                    states.iter().map(|s| s.to_string()).collect(),
-                )
-            })
-            .collect();
         assert_eq!(
-            shape, want,
-            "case {case:?}: expected one date per state each package entered, got {history:?}"
+            history, first,
+            "case {case:?}: the graph's package change must not touch the membership's \
+             addition history, got {history:?}"
         );
-        // The instant a package entered a state it is still in never moves.
         assert_eq!(
             history
                 .get("DETECTIVE_CORE")
@@ -450,36 +468,16 @@ async fn the_reported_history_follows_the_graphs_package_changes_and_a_read_chan
             Some(&core_started),
             "case {case:?}: expected the mandatory package's start instant to be stable, got {history:?}"
         );
-        let eks = history
-            .get("EKS_AUDIT")
-            .unwrap_or_else(|| panic!("case {case:?}: expected an EKS_AUDIT record"))
-            .clone();
-        let entered = eks
-            .get(eks_state)
-            .unwrap_or_else(|| panic!("case {case:?}: expected EKS_AUDIT {eks_state}, got {eks:?}"))
-            .clone();
-        for (state, when) in &eks {
-            if state == eks_state {
-                continue;
-            }
-            // Compared as INSTANTS (see `epoch_millis`): the state the package is in
-            // now is the one it entered last.
-            let when_millis = epoch_millis(case, when);
-            let entered_millis = epoch_millis(case, &entered);
-            assert!(
-                when_millis < entered_millis,
-                "case {case:?}: expected {state} ({when_millis} ms) earlier than \
-                 {eks_state} ({entered_millis} ms), got {eks:?}"
-            );
-            // A state the package did not re-enter keeps the date it already carried.
-            if let Some(earlier) = previous_eks.as_ref().and_then(|prev| prev.get(state)) {
-                assert_eq!(
-                    when, earlier,
-                    "case {case:?}: expected a stable EKS_AUDIT {state} instant, got {eks:?}"
-                );
-            }
-        }
-        previous_eks = Some(eks);
+        let admin_history = ingest_history(
+            &datasources_of(&router, &graph_arn, &administrator, case).await,
+            ACCOUNT,
+            case,
+        );
+        assert_eq!(
+            admin_history, admin_first,
+            "case {case:?}: the administrator's addition history must be stable too, \
+             got {admin_history:?}"
+        );
     }
 
     // A read does not change what a later caller sees.

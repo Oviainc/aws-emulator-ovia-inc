@@ -214,8 +214,13 @@ pub const INVESTIGATION_ID_LEN: usize = 21;
 /// `STATUS_VALUES`.
 pub const INVESTIGATION_STATUS_RUNNING: &str = "RUNNING";
 
-/// `Status$SUCCESSFUL`: the investigation finished. One of `STATUS_VALUES`.
+/// `Status$SUCCESSFUL`: the investigation finished. One of `STATUS_VALUES`. Nothing
+/// reaches it while no graph ingests account activity for a run to assemble a report
+/// from — see [`Investigation::settle`].
 pub const INVESTIGATION_STATUS_SUCCESSFUL: &str = "SUCCESSFUL";
+
+/// `Status$FAILED`: the investigation's run did not complete. One of `STATUS_VALUES`.
+pub const INVESTIGATION_STATUS_FAILED: &str = "FAILED";
 
 /// `State$ACTIVE`: the investigation has not been archived. One of `STATE_VALUES`.
 pub const INVESTIGATION_STATE_ACTIVE: &str = "ACTIVE";
@@ -270,22 +275,74 @@ pub const DATASOURCE_PACKAGE_STATE_STARTED: &str = "STARTED";
 /// `DATASOURCE_PACKAGE_INGEST_STATE_VALUES`.
 pub const DATASOURCE_PACKAGE_STATE_STOPPED: &str = "STOPPED";
 
+/// The data source package ingest records a behavior graph holds from the moment it is
+/// created: one per modelled `DatasourcePackage`
+/// (`smithy_query(query="shape",shape="DatasourcePackage")`), each
+/// [`DATASOURCE_PACKAGE_STATE_STARTED`] as of `now_millis`.
+///
+/// Recorded behaviour: a graph nobody has run `UpdateDatasourcePackages` on reports an
+/// ingest record for EVERY package the service models, each one started, so the optional
+/// packages are ingesting from creation rather than absent from the report. The records
+/// are only ever transitioned afterwards — `UpdateDatasourcePackages` moves a package's
+/// state and appends to its state-change history, and never removes a key — so a client
+/// can always tell a stopped package from one it has to ask about.
+pub fn initial_datasource_packages(now_millis: i64) -> BTreeMap<String, DatasourcePackageIngest> {
+    crate::ops::types::DATASOURCE_PACKAGE_VALUES
+        .iter()
+        .map(|package| {
+            (
+                (*package).to_string(),
+                DatasourcePackageIngest::entering(DATASOURCE_PACKAGE_STATE_STARTED, now_millis),
+            )
+        })
+        .collect()
+}
+
 /// One stored member account of a behavior graph: everything `MemberDetail`
 /// reports for it, plus the instant the verification `CreateMembers` started is
 /// due.
 #[derive(Debug, Clone)]
 pub struct Member {
     pub account_id: String,
-    pub email_address: String,
+    /// "The Amazon Web Services account root user email address for the member
+    /// account", as the request that invited the account gave it. A membership nobody
+    /// was invited into — the administrator's own — was never given one, so it has
+    /// none to report.
+    pub email_address: Option<String>,
     pub graph_arn: String,
     /// The account that administers the graph this membership belongs to.
     pub administrator_id: String,
     /// One of `MEMBER_STATUS_VALUES`.
     pub status: String,
-    /// One of `INVITATION_TYPE_VALUES`.
-    pub invitation_type: String,
-    pub invited_time_millis: i64,
-    pub updated_time_millis: i64,
+    /// How this membership came about, as one of `INVITATION_TYPE_VALUES` — "the type
+    /// of behavior graph membership", which is `INVITATION` for "an account that was
+    /// invited to a behavior graph" and `ORGANIZATION` for an organization account.
+    /// The administrator's own membership came about from neither, so it has no type to
+    /// report; see [`Member::reported_invitation_type`] for WHEN a type that is stored
+    /// is reported.
+    pub invitation_type: Option<String>,
+    /// "For invited accounts, the date and time that Detective sent the invitation to
+    /// the account", and for a membership no invitation created the instant that
+    /// membership came into being — for the administrator's own, the instant its graph
+    /// was created.
+    pub invited_time_millis: Option<i64>,
+    /// "The date and time that the member account was last updated", which starts out
+    /// as the instant the membership came into being.
+    pub updated_time_millis: Option<i64>,
+    /// When ingest for each data source package was last STARTED for this membership,
+    /// keyed by package, in epoch milliseconds.
+    ///
+    /// Ingest is enabled per ACCOUNT as well as per graph: a package the graph ingests
+    /// is only ingested for a membership once ingest for it has been started for that
+    /// account, which is what `StartMonitoringMember` ("sends a request to enable data
+    /// ingest for a member account") does. The mandatory package is started for every
+    /// membership when the membership is created — it is the one package a graph may
+    /// never switch off — and the administrator's own membership starts every package
+    /// the graph was created ingesting, since the graph exists to ingest its
+    /// administrator's data. This is the map `DatasourcePackageIngestHistory` reports,
+    /// "details on when a data source package was added to a behavior graph", and half
+    /// of what [`Graph::member_detail`] projects `DatasourcePackageIngestStates` from.
+    pub package_started_millis: BTreeMap<String, i64>,
     /// One of `MEMBER_DISABLED_REASON_VALUES`, only while the membership is
     /// `ACCEPTED_BUT_DISABLED`.
     pub disabled_reason: Option<String>,
@@ -312,37 +369,76 @@ impl Member {
     pub fn settle(&mut self, now_millis: i64) {
         if let Some(due) = self.verification_due_millis {
             if due <= now_millis {
-                self.status = if member_pair_verifies(&self.account_id, &self.email_address) {
+                self.status = if member_pair_verifies(
+                    &self.account_id,
+                    self.email_address.as_deref().unwrap_or_default(),
+                ) {
                     MEMBER_STATUS_INVITED.to_string()
                 } else {
                     MEMBER_STATUS_VERIFICATION_FAILED.to_string()
                 };
-                self.updated_time_millis = due;
+                self.updated_time_millis = Some(due);
                 self.verification_due_millis = None;
             }
         }
     }
 
-    /// This membership as the wire shape reports it.
+    /// Whether this is the membership a behavior graph holds for the account that
+    /// ADMINISTERS it, rather than one of the member accounts.
+    ///
+    /// The administration surface tells the two apart: `DeleteMembers` documents that
+    /// "an administrator account cannot use DeleteMembers to remove their own account
+    /// from the behavior graph", and the operations an invited member account's
+    /// membership is the subject of — rejecting the invitation that created it, enabling
+    /// its data ingest — have no such membership to act on, because no invitation
+    /// created this one. The reads report it like any other membership.
+    pub fn is_administrators_own(&self) -> bool {
+        self.account_id == self.administrator_id
+    }
+
+    /// The `InvitationType` this membership reports, which is none while Detective is
+    /// still deciding the membership.
+    ///
+    /// Recorded behaviour: the type of a membership appears only once the verification
+    /// `CreateMembers` starts has settled — the response that creates the membership,
+    /// whose `Status` is still `VERIFICATION_IN_PROGRESS`, carries no type, and the
+    /// reads that follow it do. A membership that came about from neither an invitation
+    /// nor an organization reports none at any point (see [`Member::invitation_type`]).
+    pub fn reported_invitation_type(&self) -> Option<String> {
+        if self.status == MEMBER_STATUS_VERIFICATION_IN_PROGRESS {
+            return None;
+        }
+        self.invitation_type.clone()
+    }
+
+    /// This membership as the wire shape reports it, carrying
+    /// `datasource_package_ingest_states` as its `DatasourcePackageIngestStates` —
+    /// "the state of a data source package for the behavior graph", which the graph
+    /// this membership belongs to projects for it ([`Graph::member_detail`], the one
+    /// caller of this).
     ///
     /// `MasterId` carries the same value as `AdministratorId`: the model deprecates
     /// it in favour of `AdministratorId` ("This property is deprecated. Use
     /// AdministratorId instead.") but still binds it, so a client reading the older
-    /// member sees the administrator too. The volume and data-source-package members
-    /// are left absent: nothing in this slice measures ingest, so reporting a number
-    /// for them would be a fabrication.
-    pub fn detail(&self) -> MemberDetail {
+    /// member sees the administrator too. The volume members are left absent: nothing
+    /// in this slice measures ingest volume, so reporting a number for them would be a
+    /// fabrication.
+    pub fn detail(
+        &self,
+        datasource_package_ingest_states: ::std::collections::HashMap<String, String>,
+    ) -> MemberDetail {
         MemberDetail {
             account_id: Some(self.account_id.clone()),
-            email_address: Some(self.email_address.clone()),
+            email_address: self.email_address.clone(),
             graph_arn: Some(self.graph_arn.clone()),
             master_id: Some(self.administrator_id.clone()),
             administrator_id: Some(self.administrator_id.clone()),
             status: Some(self.status.clone()),
             disabled_reason: self.disabled_reason.clone(),
-            invited_time: Some(millis_to_date_time(self.invited_time_millis)),
-            updated_time: Some(millis_to_date_time(self.updated_time_millis)),
-            invitation_type: Some(self.invitation_type.clone()),
+            invited_time: self.invited_time_millis.map(millis_to_date_time),
+            updated_time: self.updated_time_millis.map(millis_to_date_time),
+            invitation_type: self.reported_invitation_type(),
+            datasource_package_ingest_states: Some(datasource_package_ingest_states),
             ..Default::default()
         }
     }
@@ -445,10 +541,18 @@ impl Investigation {
     /// The same single write [`Member::settle`] makes, for the same reason: the move
     /// was owed at `completion_due_millis` whether or not anybody called, so the record
     /// a later caller sees is identical to this one.
+    ///
+    /// The status it moves to is the OUTCOME of the run, which `Status` reports ("the
+    /// status based on the completion status of the investigation"). An investigation is
+    /// a report assembled from the activity the behavior graph INGESTED for the entity
+    /// over the scope window; this emulator ingests no account activity into any graph,
+    /// so a run has nothing to assemble a report from and does not complete — the status
+    /// its completion yields is [`INVESTIGATION_STATUS_FAILED`], never a success claimed
+    /// for a report nothing produced.
     pub fn settle(&mut self, now_millis: i64) {
         if let Some(due) = self.completion_due_millis {
             if due <= now_millis {
-                self.status = INVESTIGATION_STATUS_SUCCESSFUL.to_string();
+                self.status = INVESTIGATION_STATUS_FAILED.to_string();
                 self.completion_due_millis = None;
             }
         }
@@ -471,12 +575,85 @@ pub struct Graph {
     /// Keyed by investigation id, so `ListInvestigations` will walk a stable order.
     pub investigations: BTreeMap<String, Investigation>,
     /// Keyed by data source package, so `ListDatasourcePackages` will walk a stable
-    /// order. `CreateGraph` seeds it with the mandatory package; everything else is
-    /// what `UpdateDatasourcePackages` stored.
+    /// order. [`initial_datasource_packages`] seeds it with every modelled package;
+    /// `UpdateDatasourcePackages` transitions those records and adds no key.
     pub datasource_packages: BTreeMap<String, DatasourcePackageIngest>,
 }
 
 impl Graph {
+    /// A behavior graph `administrator_id` has just created, holding what every graph
+    /// holds from the moment it exists: an ingest record per modelled data source
+    /// package ([`initial_datasource_packages`]) and the ENABLED self-membership of the
+    /// account that administers it ([`Graph::administrator_membership`]).
+    pub fn created_by(
+        arn: String,
+        administrator_id: String,
+        created_time_millis: i64,
+        tags: BTreeMap<String, String>,
+    ) -> Self {
+        let datasource_packages = initial_datasource_packages(created_time_millis);
+        let members = [(
+            administrator_id.clone(),
+            Self::administrator_membership(
+                &arn,
+                &administrator_id,
+                &datasource_packages,
+                created_time_millis,
+            ),
+        )]
+        .into_iter()
+        .collect();
+        Self {
+            arn,
+            created_time_millis,
+            administrator_id,
+            tags,
+            members,
+            investigations: BTreeMap::new(),
+            datasource_packages,
+        }
+    }
+
+    /// The membership a behavior graph holds for the account that administers it.
+    ///
+    /// Recorded behaviour: the administrator account is a member of its own behavior
+    /// graph — `ListMembers` reports it beside the accounts that were invited — and that
+    /// membership is `ENABLED` ("the member account currently contributes data to the
+    /// behavior graph"), which is the status of the account whose data the graph is
+    /// built from. Nobody invited it and no organization enrolled it, so it carries
+    /// neither a root-user email address nor an invitation type, and its two instants
+    /// are the one instant the membership came into being: the graph's own creation.
+    /// `DeleteMembers` cannot remove it ("an administrator account cannot use
+    /// DeleteMembers to remove their own account from the behavior graph"), so a graph
+    /// can never be left without it.
+    pub fn administrator_membership(
+        graph_arn: &str,
+        administrator_id: &str,
+        datasource_packages: &BTreeMap<String, DatasourcePackageIngest>,
+        created_time_millis: i64,
+    ) -> Member {
+        Member {
+            account_id: administrator_id.to_string(),
+            email_address: None,
+            graph_arn: graph_arn.to_string(),
+            administrator_id: administrator_id.to_string(),
+            status: MEMBER_STATUS_ENABLED.to_string(),
+            invitation_type: None,
+            invited_time_millis: Some(created_time_millis),
+            updated_time_millis: Some(created_time_millis),
+            disabled_reason: None,
+            verification_due_millis: None,
+            // The graph is created to ingest its administrator's data, so ingest of
+            // every package the graph was created ingesting is started for this
+            // membership at that same instant.
+            package_started_millis: datasource_packages
+                .iter()
+                .filter(|(_, ingest)| ingest.state == DATASOURCE_PACKAGE_STATE_STARTED)
+                .map(|(package, _)| (package.clone(), created_time_millis))
+                .collect(),
+        }
+    }
+
     /// This graph as `ListGraphs`' `Graph` shape reports it.
     pub fn detail(&self) -> GraphDetail {
         GraphDetail {
@@ -485,31 +662,72 @@ impl Graph {
         }
     }
 
-    /// Whether this graph ingests data for `account_id`.
+    /// The `DatasourcePackageIngestStates` one membership of this graph reports: one
+    /// entry per package the graph holds a record for, carrying the state ingest of that
+    /// package is in FOR THAT MEMBERSHIP.
     ///
-    /// Two kinds of account contribute to a behavior graph: the ADMINISTRATOR account,
-    /// which `CreateGraph` "creates a new behavior graph for ... and sets as the
-    /// administrator account" and whose own data the graph ingests from the moment it
-    /// exists, and every account with a MEMBERSHIP in it. An account that is neither is
-    /// one the graph holds no data source package information for at all.
-    pub fn ingests_for(&self, account_id: &str) -> bool {
-        self.administrator_id == account_id || self.members.contains_key(account_id)
+    /// Ingest of a package runs for an account when the graph is ingesting the package
+    /// and ingest of it has been started for that account ([`Member::package_started_millis`]);
+    /// anything else is `STOPPED`. No package is ever left out, so a client can tell a
+    /// package whose ingest is stopped for a member from one the graph does not know.
+    pub fn member_ingest_states(&self, member: &Member) -> ::std::collections::HashMap<String, String> {
+        self.datasource_packages
+            .iter()
+            .map(|(package, ingest)| {
+                let started = ingest.state == DATASOURCE_PACKAGE_STATE_STARTED
+                    && member.package_started_millis.contains_key(package);
+                let state = if started {
+                    DATASOURCE_PACKAGE_STATE_STARTED
+                } else {
+                    DATASOURCE_PACKAGE_STATE_STOPPED
+                };
+                (package.clone(), state.to_string())
+            })
+            .collect()
     }
 
-    /// One account of this graph as `MembershipDatasources` reports it.
+    /// One membership of this graph as `MemberDetail` reports it: the stored record
+    /// plus its per-package ingest states. The ONE projection of a member, so
+    /// `CreateMembers`, `GetMembers` and `ListMembers` cannot report a member
+    /// differently.
+    pub fn member_detail(&self, member: &Member) -> MemberDetail {
+        member.detail(self.member_ingest_states(member))
+    }
+
+    /// One membership of this graph as `MembershipDatasources` reports it.
     ///
-    /// Ingest is recorded per GRAPH — `UpdateDatasourcePackages` names the graph, not an
-    /// account, and "starts a data source package for the Detective behavior graph" — so
-    /// every account contributing to the graph contributes under the graph's packages,
-    /// and the history reported for one account is the graph's own package history.
-    pub fn membership_datasources(&self, account_id: &str) -> MembershipDatasources {
+    /// Every account whose data a behavior graph ingests holds a membership in it: the
+    /// accounts invited into the graph, and the ADMINISTRATOR account, which
+    /// `CreateGraph` "creates a new behavior graph for ... and sets as the administrator
+    /// account" and whose own membership the graph holds from the moment it exists. An
+    /// account with no membership is one the graph holds no data source package
+    /// information for at all, so there is nothing to project for it.
+    ///
+    /// What it reports is an ADDITION history: `DatasourcePackageIngestHistory` is
+    /// "details on when a data source package was added to a behavior graph", so each
+    /// package the membership ingests carries the instant ingest of it was started for
+    /// that membership and no other state's instant.
+    pub fn membership_datasources(&self, member: &Member) -> MembershipDatasources {
         MembershipDatasources {
-            account_id: Some(account_id.to_string()),
+            account_id: Some(member.account_id.clone()),
             graph_arn: Some(self.arn.clone()),
             datasource_package_ingest_history: Some(
-                self.datasource_packages
+                member
+                    .package_started_millis
                     .iter()
-                    .map(|(package, ingest)| (package.clone(), ingest.state_change_dates()))
+                    .map(|(package, millis)| {
+                        (
+                            package.clone(),
+                            [(
+                                DATASOURCE_PACKAGE_STATE_STARTED.to_string(),
+                                TimestampForCollection {
+                                    timestamp: Some(millis_to_date_time(*millis)),
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                        )
+                    })
                     .collect(),
             ),
         }

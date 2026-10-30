@@ -19,10 +19,14 @@ mod behavior_graph_lifecycle;
 mod datasource_package_ingest;
 #[path = "all/datasource_package_reporting.rs"]
 mod datasource_package_reporting;
+#[path = "all/investigation_state_transitions.rs"]
+mod investigation_state_transitions;
 #[path = "all/list_tags_for_resource.rs"]
 mod list_tags_for_resource;
 #[path = "all/member_datasource_ingest_history.rs"]
 mod member_datasource_ingest_history;
+#[path = "all/member_ingest_states_and_administrator_membership.rs"]
+mod member_ingest_states_and_administrator_membership;
 #[path = "all/member_removal.rs"]
 mod member_removal;
 #[path = "all/member_verification_outcome.rs"]

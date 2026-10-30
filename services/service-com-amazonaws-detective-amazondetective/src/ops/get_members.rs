@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             match graph.members.get(account_id) {
-                Some(member) => member_details.push(member.detail()),
+                Some(member) => member_details.push(graph.member_detail(member)),
                 // No membership is stored for this account in this graph, so there is
                 // nothing to report about it: it goes in `UnprocessedAccounts` with
                 // the reason, rather than being invented as a member. The reason is the

@@ -244,6 +244,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let administrator_id = graph.administrator_id.clone();
         let graph_arn = graph.arn.clone();
+        // The package every membership of the graph ingests from the moment it is
+        // created: the graph may never switch it off, so ingest of it is started for a
+        // member account with the membership itself. Ingest of the OPTIONAL packages is
+        // started for an account only when the administrator enables ingest for that
+        // account (`StartMonitoringMember`), so a membership starts out not ingesting
+        // them whatever the graph is ingesting.
+        let mandatory_started: ::std::collections::BTreeMap<String, i64> = graph
+            .datasource_packages
+            .keys()
+            .filter(|package| package.as_str() == crate::state::MANDATORY_DATASOURCE_PACKAGE)
+            .map(|package| (package.clone(), now))
+            .collect();
         let mut members = Vec::with_capacity(input.accounts.len());
         let mut unprocessed_accounts = Vec::new();
         let mut seen = ::std::collections::BTreeSet::new();
@@ -290,17 +302,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // about the stored membership.
             let member = crate::state::Member {
                 account_id: account.account_id.clone(),
-                email_address: account.email_address.clone(),
+                email_address: Some(account.email_address.clone()),
                 graph_arn: graph_arn.clone(),
                 administrator_id: administrator_id.clone(),
                 status: crate::state::MEMBER_STATUS_VERIFICATION_IN_PROGRESS.to_string(),
-                invitation_type: crate::state::INVITATION_TYPE_INVITATION.to_string(),
-                invited_time_millis: now,
-                updated_time_millis: now,
+                // "For an account that was invited to a behavior graph, the type is
+                // INVITATION." The type is only REPORTED once the verification settles
+                // — see `crate::state::Member::reported_invitation_type`.
+                invitation_type: Some(crate::state::INVITATION_TYPE_INVITATION.to_string()),
+                invited_time_millis: Some(now),
+                updated_time_millis: Some(now),
                 disabled_reason: None,
                 verification_due_millis: Some(now + crate::state::MEMBER_VERIFICATION_MILLIS),
+                package_started_millis: mandatory_started.clone(),
             };
-            members.push(member.detail());
+            members.push(graph.member_detail(&member));
             graph.members.insert(account.account_id.clone(), member);
         }
 

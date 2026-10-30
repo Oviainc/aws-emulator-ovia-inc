@@ -292,10 +292,14 @@ async fn a_removal_batch_drops_the_memberships_it_names_and_reports_the_rest_unp
     invite(&router, &graph_arn, &members).await;
 
     let mut survivors: BTreeSet<String> = members.iter().cloned().collect();
+    // The graph also holds the administrator's own membership, which no removal can
+    // take away: it is listed before any member is removed and after every one is.
+    survivors.insert(ACCOUNT.to_string());
     assert_eq!(
         listed_members(&router, &graph_arn).await,
         survivors,
-        "before any removal: expected every invited account to be a member"
+        "before any removal: expected every invited account and the administrator's own \
+         membership to be listed"
     );
 
     for case in removal_cases() {
@@ -419,7 +423,9 @@ async fn a_batch_outside_the_modelled_account_id_bounds_is_refused() {
     // Nothing was removed by any refused request.
     assert_eq!(
         listed_members(&router, &graph_arn).await,
-        [account_id(0)].into_iter().collect::<BTreeSet<String>>(),
+        [account_id(0), ACCOUNT.to_string()]
+            .into_iter()
+            .collect::<BTreeSet<String>>(),
         "a refused removal must leave every membership in place"
     );
 }

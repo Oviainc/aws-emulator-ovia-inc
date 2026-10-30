@@ -9,7 +9,7 @@
 //! suite asserts the three rules that are independent of any package's state:
 //!
 //! 1. A report is scoped to the behavior graph the request names: it carries that
-//!    graph's records and no other graph's, however the two graphs differ.
+//!    graph's ingest states and no other graph's, however the two graphs differ.
 //! 2. The report is not paginated: one call carries every package the graph holds and
 //!    no `NextToken`, whatever the graph holds, and a request that names `MaxResults` is
 //!    refused instead of being served a part of the map.
@@ -17,10 +17,11 @@
 //!    `ValidationException` (400) and one fixed sentence, for a token anywhere within
 //!    the modelled `PaginationToken` length of 1..1024 — the refusal never echoes it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_detective_amazondetective::state::{
+    DATASOURCE_PACKAGE_STATE_STARTED, DATASOURCE_PACKAGE_STATE_STOPPED,
     MANDATORY_DATASOURCE_PACKAGE, MAX_PAGE_SIZE,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -43,15 +44,15 @@ const UPDATE_URI: &str = "/graph/datasources/update";
 /// sentence, which is what keeps it from echoing the caller's token back.
 const NOT_A_TOKEN_MESSAGE: &str = "NextToken is not a pagination token issued by ListDatasourcePackages";
 
-/// One `ListDatasourcePackages` page, which must succeed; answers its
-/// `DatasourcePackages` keys and its `NextToken`.
+/// One `ListDatasourcePackages` page, which must succeed; answers the ingest state it
+/// reports per package, and its `NextToken`.
 async fn page_of(
     router: &MultiServiceRouter,
     case: &str,
     graph_arn: &str,
     max_results: Option<i32>,
     next_token: Option<&str>,
-) -> (BTreeSet<String>, Option<String>) {
+) -> (BTreeMap<String, String>, Option<String>) {
     let mut body = Map::new();
     body.insert("GraphArn".to_string(), json!(graph_arn));
     if let Some(max_results) = max_results {
@@ -65,20 +66,28 @@ async fn page_of(
         status, 200,
         "case {case:?}: expected 200, got {status} {listed:?}"
     );
-    let keys = listed
+    let states = listed
         .get("DatasourcePackages")
         .and_then(Value::as_object)
         .unwrap_or_else(|| {
             panic!("case {case:?}: response carried no DatasourcePackages map, got {listed:?}")
         })
-        .keys()
-        .cloned()
+        .iter()
+        .map(|(package, detail)| {
+            let state = detail
+                .get("DatasourcePackageIngestState")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: {package} carried no ingest state: {detail:?}")
+                });
+            (package.clone(), state.to_string())
+        })
         .collect();
     let token = listed
         .get("NextToken")
         .and_then(Value::as_str)
         .map(str::to_string);
-    (keys, token)
+    (states, token)
 }
 
 /// `UpdateDatasourcePackages` naming `packages` on `graph_arn`, signed for `region`,
@@ -110,7 +119,7 @@ async fn a_report_carries_the_named_graphs_records_and_no_other_graphs() {
     // Two graphs in one emulator, each ingesting a different set. They are in different
     // Regions because an account administers one behavior graph per Region — a second
     // `CreateGraph` in the one Region answers the same graph rather than minting another.
-    // The rows differ along which packages their graph holds, so neither report could
+    // The rows differ along which packages their graph ingests, so neither report could
     // pass by accident if the handler ignored the ARN it was given.
     let rows = [
         ("eks-graph", REGION, vec![MANDATORY_DATASOURCE_PACKAGE, "EKS_AUDIT"]),
@@ -133,21 +142,33 @@ async fn a_report_carries_the_named_graphs_records_and_no_other_graphs() {
             token, None,
             "case {case:?}: a report that fits on one page carries no NextToken"
         );
-        let expected: BTreeSet<String> = packages.iter().map(|p| (*p).to_string()).collect();
+        // Every modelled package is reported; the row's own set is what is STARTED.
+        let expected: BTreeMap<String, String> = PACKAGES_IN_ORDER
+            .iter()
+            .map(|package| {
+                let state = if packages.contains(package) {
+                    DATASOURCE_PACKAGE_STATE_STARTED
+                } else {
+                    DATASOURCE_PACKAGE_STATE_STOPPED
+                };
+                ((*package).to_string(), state.to_string())
+            })
+            .collect();
         assert_eq!(
             reported, expected,
-            "case {case:?}: expected exactly this graph's records, got {reported:?}"
+            "case {case:?}: expected exactly this graph's ingest states, got {reported:?}"
         );
-        // And the other graph's record is not in it: the two sets differ by exactly the
-        // optional package each one started.
+        // And the other graph's own package is not started here: the two graphs differ
+        // by exactly the optional package each one started.
         for (other_case, _, other_packages) in &graphs {
             if other_case == case {
                 continue;
             }
             for package in other_packages.iter().filter(|p| !packages.contains(p)) {
-                assert!(
-                    !reported.contains(*package),
-                    "case {case:?}: {package:?} belongs to {other_case:?}, got {reported:?}"
+                assert_eq!(
+                    reported.get(*package).map(String::as_str),
+                    Some(DATASOURCE_PACKAGE_STATE_STOPPED),
+                    "case {case:?}: {package} belongs to {other_case:?}, got {reported:?}"
                 );
             }
         }
@@ -158,9 +179,11 @@ async fn a_report_carries_the_named_graphs_records_and_no_other_graphs() {
 async fn one_report_carries_every_held_package_whatever_the_graph_holds() {
     let router = emulator();
 
-    // The rows differ along HOW MANY packages the graph holds and WHICH: the one package
-    // a fresh graph starts with, one optional package beside it, and every modelled value
-    // at once. Each row is one emulator, so each gets its own graph.
+    // The rows differ along HOW MANY packages the graph is ingesting and WHICH: the one
+    // package a graph may never switch off, one optional package beside it, and every
+    // modelled value at once. Each row is one emulator, so each gets its own graph. A
+    // graph holds a record for every modelled package whatever it is ingesting, so the
+    // report carries all of them in one response in every row.
     let rows: [(&str, Vec<&str>); 3] = [
         ("only-the-mandatory-package", vec![MANDATORY_DATASOURCE_PACKAGE]),
         (
@@ -179,11 +202,25 @@ async fn one_report_carries_every_held_package_whatever_the_graph_holds() {
             token, None,
             "case {case:?}: an unpaginated report issues no NextToken"
         );
-        let expected: BTreeSet<String> = packages.iter().map(|p| (*p).to_string()).collect();
+        let keys: BTreeSet<String> = reported.keys().cloned().collect();
+        let expected: BTreeSet<String> =
+            PACKAGES_IN_ORDER.iter().map(|p| (*p).to_string()).collect();
         assert_eq!(
-            reported, expected,
-            "case {case:?}: expected every held package in one response, got {reported:?}"
+            keys, expected,
+            "case {case:?}: expected every modelled package in one response, got {reported:?}"
         );
+        for package in PACKAGES_IN_ORDER {
+            let state = if packages.contains(&package) {
+                DATASOURCE_PACKAGE_STATE_STARTED
+            } else {
+                DATASOURCE_PACKAGE_STATE_STOPPED
+            };
+            assert_eq!(
+                reported.get(package).map(String::as_str),
+                Some(state),
+                "case {case:?}: expected {package} {state}, got {reported:?}"
+            );
+        }
     }
 
     // And a request that asks for a page of them is refused rather than served part of
@@ -276,7 +313,7 @@ async fn a_next_token_this_report_did_not_issue_is_refused_without_being_echoed(
         "the report must issue no NextToken, got {token:?}"
     );
     assert_eq!(
-        first,
+        first.keys().cloned().collect::<BTreeSet<String>>(),
         PACKAGES_IN_ORDER
             .iter()
             .map(|p| (*p).to_string())

@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_token = Some(crate::state::encode_page_token(account_id));
                 break;
             }
-            member_details.push(member.detail());
+            member_details.push(graph.member_detail(member));
         }
 
         Ok(ListMembersOutput {

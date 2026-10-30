@@ -9,8 +9,9 @@
 //!
 //! 1. An accepted `UpdateDatasourcePackages` leaves the behavior graph ingesting
 //!    exactly the packages the request names: every named package `STARTED`, and every
-//!    package the graph already held that the request does not name `STOPPED` — whatever
-//!    set is named, in whatever order, however often a value is repeated.
+//!    other package the graph holds `STOPPED` — whatever set is named, in whatever
+//!    order, however often a value is repeated. No key is ever removed, so a package
+//!    that is not ingesting is reported stopped rather than dropped.
 //! 2. `ListDatasourcePackages` reports, for every package the graph holds, that stored
 //!    ingest state and — under `LastIngestStateChange`, keyed by ingest state — the
 //!    instant the package entered each state it has been in. A package an update leaves
@@ -184,20 +185,29 @@ async fn an_accepted_update_starts_exactly_the_packages_it_names_and_stops_the_r
     // the rule generalises over. Each row gets its own emulator, and so its own graph:
     // an account administers one behavior graph per Region, so a row's expectation is
     // about its own request and nothing a row before it did; the sequence across
-    // updates is the next test. A fresh graph ingests only the mandatory package, so
-    // every state the row does not name is the stored STARTED/STOPPED the rule derives.
+    // updates is the next test. A graph holds a record for every modelled package from
+    // creation, so every row expects all three keys: the ones it names started, the
+    // rest stopped.
     let started = DATASOURCE_PACKAGE_STATE_STARTED;
     let stopped = DATASOURCE_PACKAGE_STATE_STOPPED;
     let cases = vec![
         UpdateCase {
             case: "mandatory-only",
             requested: vec![MANDATORY_DATASOURCE_PACKAGE],
-            expected: vec![("DETECTIVE_CORE", started)],
+            expected: vec![
+                ("ASFF_SECURITYHUB_FINDING", stopped),
+                ("DETECTIVE_CORE", started),
+                ("EKS_AUDIT", stopped),
+            ],
         },
         UpdateCase {
             case: "mandatory-plus-eks",
             requested: vec!["DETECTIVE_CORE", "EKS_AUDIT"],
-            expected: vec![("DETECTIVE_CORE", started), ("EKS_AUDIT", started)],
+            expected: vec![
+                ("ASFF_SECURITYHUB_FINDING", stopped),
+                ("DETECTIVE_CORE", started),
+                ("EKS_AUDIT", started),
+            ],
         },
         UpdateCase {
             // The one package the issue's recording never cited.
@@ -206,6 +216,7 @@ async fn an_accepted_update_starts_exactly_the_packages_it_names_and_stops_the_r
             expected: vec![
                 ("ASFF_SECURITYHUB_FINDING", started),
                 ("DETECTIVE_CORE", started),
+                ("EKS_AUDIT", stopped),
             ],
         },
         UpdateCase {
@@ -222,13 +233,21 @@ async fn an_accepted_update_starts_exactly_the_packages_it_names_and_stops_the_r
             // other way round.
             case: "reversed-order",
             requested: vec!["EKS_AUDIT", "DETECTIVE_CORE"],
-            expected: vec![("DETECTIVE_CORE", started), ("EKS_AUDIT", started)],
+            expected: vec![
+                ("ASFF_SECURITYHUB_FINDING", stopped),
+                ("DETECTIVE_CORE", started),
+                ("EKS_AUDIT", started),
+            ],
         },
         UpdateCase {
             // A set, so a repeated value asks for nothing more than the value does.
             case: "repeated-value",
             requested: vec!["DETECTIVE_CORE", "EKS_AUDIT", "EKS_AUDIT"],
-            expected: vec![("DETECTIVE_CORE", started), ("EKS_AUDIT", started)],
+            expected: vec![
+                ("ASFF_SECURITYHUB_FINDING", stopped),
+                ("DETECTIVE_CORE", started),
+                ("EKS_AUDIT", started),
+            ],
         },
     ];
 
@@ -264,22 +283,23 @@ async fn an_accepted_update_starts_exactly_the_packages_it_names_and_stops_the_r
             again, reported,
             "case {case:?}: a second report differed from the first"
         );
-        // And the stopped control: a package the row did not name is either absent or
-        // stopped, never started.
+        // And the stopped control: a package the row did not name is reported stopped,
+        // never started and never dropped.
         for package in PACKAGES {
             if requested.contains(&package) {
                 continue;
             }
-            if let Some(detail) = reported.get(package) {
-                let state = detail
-                    .get("DatasourcePackageIngestState")
-                    .and_then(Value::as_str);
-                assert_eq!(
-                    state,
-                    Some(stopped),
-                    "case {case:?}: {package} was not named, so it must not be started"
-                );
-            }
+            let detail = reported.get(package).unwrap_or_else(|| {
+                panic!("case {case:?}: {package} was not named, so it must still be reported")
+            });
+            let state = detail
+                .get("DatasourcePackageIngestState")
+                .and_then(Value::as_str);
+            assert_eq!(
+                state,
+                Some(stopped),
+                "case {case:?}: {package} was not named, so it must not be started"
+            );
         }
     }
 }
@@ -289,66 +309,44 @@ async fn last_ingest_state_change_records_when_each_state_was_entered_and_nothin
     let router = emulator();
     let graph_arn = create_graph_ok(&router, REGION, &json!({})).await;
 
-    // A new graph ingests the mandatory package, and the instant it entered STARTED is
-    // the only one it has been in.
+    // A new graph holds a record for every modelled package, each one STARTED, and the
+    // instant it entered STARTED is the only one it has been in.
     let case = "created";
     let created = all_packages(&router, case, &graph_arn).await;
     assert_eq!(
         reported_states(&created),
-        vec![(
-            MANDATORY_DATASOURCE_PACKAGE.to_string(),
-            DATASOURCE_PACKAGE_STATE_STARTED.to_string()
-        )],
-        "case {case:?}: a new graph ingests only the mandatory package, got {created:?}"
+        PACKAGES
+            .iter()
+            .map(|package| (
+                (*package).to_string(),
+                DATASOURCE_PACKAGE_STATE_STARTED.to_string()
+            ))
+            .collect::<Vec<(String, String)>>(),
+        "case {case:?}: a new graph ingests every modelled package, got {created:?}"
     );
-    let core_started = require_state_change_millis(
-        case,
-        detail_of(case, &created, MANDATORY_DATASOURCE_PACKAGE),
-        DATASOURCE_PACKAGE_STATE_STARTED,
-    );
-    assert_eq!(
-        state_change_millis(
-            case,
-            detail_of(case, &created, MANDATORY_DATASOURCE_PACKAGE),
-            DATASOURCE_PACKAGE_STATE_STOPPED
-        ),
-        None,
-        "case {case:?}: a package that was never stopped reports no STOPPED instant"
-    );
-
-    // Starting the two optional packages records when each entered STARTED, and leaves
-    // the mandatory package's own instant alone: its state did not change.
-    tokio::time::sleep(TICK).await;
-    let case = "started-all";
-    update_ok(&router, case, &graph_arn, &PACKAGES).await;
-    let started_all = all_packages(&router, case, &graph_arn).await;
-    let mut optional_started: BTreeMap<&str, i64> = BTreeMap::new();
+    let mut started_at: BTreeMap<&str, i64> = BTreeMap::new();
     for package in PACKAGES {
-        let detail = detail_of(case, &started_all, package);
-        let entered =
-            require_state_change_millis(case, detail, DATASOURCE_PACKAGE_STATE_STARTED);
-        if package == MANDATORY_DATASOURCE_PACKAGE {
-            assert_eq!(
-                entered, core_started,
-                "case {case:?}: {package} was already started, so its instant must not move"
-            );
-        } else {
-            assert!(
-                entered > core_started,
-                "case {case:?}: {package} started after the graph was created, \
-                 got {entered} against {core_started}"
-            );
-            optional_started.insert(package, entered);
-        }
+        let detail = detail_of(case, &created, package);
+        started_at.insert(
+            package,
+            require_state_change_millis(case, detail, DATASOURCE_PACKAGE_STATE_STARTED),
+        );
+        assert_eq!(
+            state_change_millis(case, detail, DATASOURCE_PACKAGE_STATE_STOPPED),
+            None,
+            "case {case:?}: {package} was never stopped, so it reports no STOPPED instant"
+        );
     }
+    let core_started = started_at[MANDATORY_DATASOURCE_PACKAGE];
 
-    // An update that confirms the same set changes no state, so no instant moves.
+    // An update that confirms the set already ingested changes no state, so no instant
+    // moves.
     tokio::time::sleep(TICK).await;
     let case = "confirmed-same-set";
     update_ok(&router, case, &graph_arn, &PACKAGES).await;
     let confirmed = all_packages(&router, case, &graph_arn).await;
     assert_eq!(
-        confirmed, started_all,
+        confirmed, created,
         "case {case:?}: confirming the set already ingested changed the report"
     );
 
@@ -364,7 +362,10 @@ async fn last_ingest_state_change_records_when_each_state_was_entered_and_nothin
     )
     .await;
     let narrowed = all_packages(&router, case, &graph_arn).await;
-    for (package, entered) in &optional_started {
+    for (package, entered) in started_at
+        .iter()
+        .filter(|(package, _)| **package != MANDATORY_DATASOURCE_PACKAGE)
+    {
         let detail = detail_of(case, &narrowed, package);
         assert_eq!(
             detail
@@ -385,6 +386,16 @@ async fn last_ingest_state_change_records_when_each_state_was_entered_and_nothin
             "case {case:?}: {package} stopped after it started, got {stopped_at} against {entered}"
         );
     }
+    // The package the graph may never switch off kept its state, and so its instant.
+    assert_eq!(
+        require_state_change_millis(
+            case,
+            detail_of(case, &narrowed, MANDATORY_DATASOURCE_PACKAGE),
+            DATASOURCE_PACKAGE_STATE_STARTED
+        ),
+        core_started,
+        "case {case:?}: the mandatory package was named again, so its instant must not move"
+    );
 
     // Starting a stopped package again moves only its STARTED instant forward.
     tokio::time::sleep(TICK).await;

@@ -194,17 +194,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::Member::settle`.
         graph.settle_members(now);
 
+        // Which packages the graph is ingesting, read before the membership is taken
+        // mutably: enabling ingest for a member account starts ingest of the packages
+        // the GRAPH ingests, and of nothing it does not.
+        let graph_packages: Vec<String> = graph
+            .datasource_packages
+            .iter()
+            .filter(|(_, ingest)| {
+                ingest.state == crate::state::DATASOURCE_PACKAGE_STATE_STARTED
+            })
+            .map(|(package, _)| package.clone())
+            .collect();
+
         // "Sends a request to enable data ingest for a member account": what this
         // operation resolves is a membership the account ACCEPTED — the only kind whose
         // ingest there is to enable. An account the graph holds no record for at all has
         // no such membership; a record that never got past invitation or verification is
         // the same modelled 404, told apart by naming the one fact that makes it one.
         // Neither refusal echoes the account id or the ARN.
-        let member = graph.members.get_mut(&input.account_id).ok_or_else(|| {
-            StartMonitoringMemberErrorModeled::ResourceNotFoundException(
-                crate::state::no_such_membership(),
-            )
-        })?;
+        let member = graph
+            .members
+            .get_mut(&input.account_id)
+            // "for a MEMBER account": the membership a graph holds for its own
+            // administrator is not one of them, so there is no member account's ingest
+            // to enable — the same "no such membership" as an account the graph holds no
+            // record for. See `crate::state::Member::is_administrators_own`.
+            .filter(|member| !member.is_administrators_own())
+            .ok_or_else(|| {
+                StartMonitoringMemberErrorModeled::ResourceNotFoundException(
+                    crate::state::no_such_membership(),
+                )
+            })?;
         if !crate::state::is_accepted_membership(&member.status) {
             return Err(StartMonitoringMemberErrorModeled::ResourceNotFoundException(
                 crate::state::invitation_not_accepted(),
@@ -230,10 +250,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Ingest is on: the membership is `ENABLED` and the reason it was disabled no
-        // longer holds.
+        // longer holds, and ingest of every package the graph ingests is now started for
+        // this membership — which is what the member's `DatasourcePackageIngestStates`
+        // then reports and what its ingest history records the instant of. A package
+        // ingest was already running for keeps the instant it started.
         member.status = crate::state::MEMBER_STATUS_ENABLED.to_string();
         member.disabled_reason = None;
-        member.updated_time_millis = now;
+        member.updated_time_millis = Some(now);
+        for package in graph_packages {
+            member.package_started_millis.entry(package).or_insert(now);
+        }
 
         Ok(StartMonitoringMemberOutput)
     }

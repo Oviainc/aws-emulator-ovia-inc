@@ -180,17 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !seen.insert(account_id.clone()) {
                 continue;
             }
-            if graph.ingests_for(account_id) {
-                member_datasources.push(graph.membership_datasources(account_id));
-            } else {
-                // The graph ingests nothing for this account, so there is no data source
-                // package information of it to report: it goes in
+            match graph.members.get(account_id) {
+                Some(member) => member_datasources.push(graph.membership_datasources(member)),
+                // The graph holds no membership for this account, so there is no data
+                // source package information of it to report: it goes in
                 // `UnprocessedAccounts` with the reason, rather than being invented as a
                 // contributing account.
-                unprocessed_accounts.push(crate::state::unprocessed(
+                None => unprocessed_accounts.push(crate::state::unprocessed(
                     account_id,
                     crate::state::NOT_INGESTED_FOR_REASON.to_string(),
-                ));
+                )),
             }
         }
 

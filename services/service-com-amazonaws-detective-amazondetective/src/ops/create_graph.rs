@@ -239,32 +239,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let arn = store.fresh_graph_arn(&region);
-        store.insert_graph(crate::state::Graph {
-            arn: arn.clone(),
-            created_time_millis,
+        store.insert_graph(crate::state::Graph::created_by(
+            arn.clone(),
             // "sets that account as the administrator account": the graph records who
             // administers it, which is what every `MemberDetail` of this graph later
-            // reports as its `AdministratorId`.
+            // reports as its `AdministratorId` — and the account whose own ENABLED
+            // membership of the graph is created with it.
             administrator_id,
+            created_time_millis,
             // Stored on the graph now: `TagResource` and `ListTagsForResource` key off
             // this same graph ARN.
             tags,
-            members: ::std::collections::BTreeMap::new(),
-            investigations: ::std::collections::BTreeMap::new(),
-            // A new behavior graph ingests the mandatory package and nothing else:
-            // `UpdateDatasourcePackages` refuses a request that omits
-            // `DETECTIVE_CORE`, naming it as the package a graph must have, so a graph
-            // starts with exactly that one started and the rest off.
-            datasource_packages: [(
-                crate::state::MANDATORY_DATASOURCE_PACKAGE.to_string(),
-                crate::state::DatasourcePackageIngest::entering(
-                    crate::state::DATASOURCE_PACKAGE_STATE_STARTED,
-                    created_time_millis,
-                ),
-            )]
-            .into_iter()
-            .collect(),
-        });
+        ));
 
         Ok(CreateGraphOutput {
             graph_arn: Some(arn),

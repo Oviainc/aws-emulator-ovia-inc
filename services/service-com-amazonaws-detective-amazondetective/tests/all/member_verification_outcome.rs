@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_detective_amazondetective::state::MEMBER_VERIFICATION_MILLIS;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::support::{account_id, assert_iso8601, call, create_graph_ok, emulator, REGION};
+use crate::support::{account_id, assert_iso8601, call, create_graph_ok, emulator, ACCOUNT, REGION};
 
 /// One `Accounts` entry: an account id and the email address given for it.
 fn entry(account_id: &str, email: &str) -> Value {
@@ -223,7 +223,7 @@ async fn every_invited_account_leaves_verification_for_verification_failed_indep
     }
 
     // None of the batch was dropped: `ListMembers` reports every invited account, each
-    // in the same settled status.
+    // in the same settled status, beside the administrator's own ENABLED membership.
     let (status, listed) = call(
         &router,
         "/graph/members/list",
@@ -241,24 +241,34 @@ async fn every_invited_account_leaves_verification_for_verification_failed_indep
     let mut reported: Vec<String> = details
         .iter()
         .map(|detail| {
-            assert_eq!(
-                detail.get("Status").and_then(Value::as_str),
-                Some("VERIFICATION_FAILED"),
-                "ListMembers: expected the terminal verification status, got {detail:?}"
-            );
-            detail
+            let account_id = detail
                 .get("AccountId")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_string()
+                .to_string();
+            // The administrator's own membership was never invited, so it is ENABLED
+            // rather than settled out of a verification.
+            let expected_status = if account_id == ACCOUNT {
+                "ENABLED"
+            } else {
+                "VERIFICATION_FAILED"
+            };
+            assert_eq!(
+                detail.get("Status").and_then(Value::as_str),
+                Some(expected_status),
+                "ListMembers: expected {expected_status} for {account_id}, got {detail:?}"
+            );
+            account_id
         })
         .collect();
     reported.sort();
     let mut expected = invited.clone();
+    expected.push(ACCOUNT.to_string());
     expected.sort();
     assert_eq!(
         reported, expected,
-        "ListMembers: expected every invited account once, got {reported:?}"
+        "ListMembers: expected every invited account once beside the administrator's own \
+         membership, got {reported:?}"
     );
 }
 

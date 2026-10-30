@@ -455,13 +455,16 @@ async fn an_investigation_finishes_once_the_clock_makes_its_run_due() {
     for attempt in 0..2 {
         let (status, got) = call(&router, "/investigations/getInvestigation", &read).await;
         assert_eq!(status, 200, "read {attempt}: got {status} {got:?}");
+        // Nothing was ingested for the entity over the scope window, so the run had
+        // nothing to assemble a report from and did not complete: the status its
+        // completion yields is FAILED.
         assert_eq!(
             got.get("Status").and_then(Value::as_str),
-            Some("SUCCESSFUL"),
-            "read {attempt}: expected SUCCESSFUL once the run was due, got {got:?}"
+            Some("FAILED"),
+            "read {attempt}: expected FAILED once the run was due, got {got:?}"
         );
-        // Nothing was ingested, so the investigation discovered no indicator of
-        // compromise and the severity that computes to is the lowest modelled one.
+        // And by the same fact the investigation discovered no indicator of compromise,
+        // so the severity that computes to is the lowest modelled one.
         assert_eq!(
             got.get("Severity").and_then(Value::as_str),
             Some("INFORMATIONAL"),
@@ -658,8 +661,9 @@ async fn create_members_reports_an_account_id_pattern_failure_with_detectives_ow
         .collect();
     assert_eq!(
         stored,
-        vec![valid.as_str()],
-        "expected only the account the accepted request named, got {stored:?}"
+        vec![ACCOUNT, valid.as_str()],
+        "expected only the account the accepted request named, beside the administrator's \
+         own membership, got {stored:?}"
     );
 }
 
@@ -755,7 +759,10 @@ async fn update_datasource_packages_validates_the_requested_package_set() {
     assert_eq!(
         stored_package_states(&engine, &graph_arn),
         vec![
-            ("ASFF_SECURITYHUB_FINDING".to_string(), None),
+            (
+                "ASFF_SECURITYHUB_FINDING".to_string(),
+                Some(DATASOURCE_PACKAGE_STATE_STOPPED.to_string())
+            ),
             (
                 "DETECTIVE_CORE".to_string(),
                 Some(DATASOURCE_PACKAGE_STATE_STARTED.to_string())
@@ -765,7 +772,7 @@ async fn update_datasource_packages_validates_the_requested_package_set() {
                 Some(DATASOURCE_PACKAGE_STATE_STARTED.to_string())
             ),
         ],
-        "expected both named packages started"
+        "expected both named packages started and the one left out stopped"
     );
 
     let (status, answered) = call(
@@ -778,7 +785,10 @@ async fn update_datasource_packages_validates_the_requested_package_set() {
     assert_eq!(
         stored_package_states(&engine, &graph_arn),
         vec![
-            ("ASFF_SECURITYHUB_FINDING".to_string(), None),
+            (
+                "ASFF_SECURITYHUB_FINDING".to_string(),
+                Some(DATASOURCE_PACKAGE_STATE_STOPPED.to_string())
+            ),
             (
                 "DETECTIVE_CORE".to_string(),
                 Some(DATASOURCE_PACKAGE_STATE_STARTED.to_string())
@@ -1121,7 +1131,8 @@ async fn reject_invitation_reports_an_invitation_the_caller_does_not_hold() {
         .map(Vec::len)
         .unwrap_or_default();
     assert_eq!(
-        stored, 1,
-        "expected the graph's one membership to survive, got {listed:?}"
+        stored, 2,
+        "expected the graph's invited membership and the administrator's own to survive, \
+         got {listed:?}"
     );
 }

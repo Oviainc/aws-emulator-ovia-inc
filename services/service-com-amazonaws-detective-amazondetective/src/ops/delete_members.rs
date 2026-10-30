@@ -196,9 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // "An administrator account cannot use DeleteMembers to remove their own
             // account from the behavior graph. To disable a behavior graph, the
-            // administrator account uses the DeleteGraph API method." The administrator
-            // is not a membership either, so without this the account would be reported
-            // with the generic reason; naming the rule is what tells the caller to use
+            // administrator account uses the DeleteGraph API method." The graph DOES hold
+            // a membership for its administrator, so this check is what keeps the removal
+            // below from dropping it, and naming the rule is what tells the caller to use
             // `DeleteGraph`. It is a per-account outcome of a batch, so it is reported in
             // `UnprocessedAccounts` rather than failing the whole call.
             if *account_id == administrator_id {

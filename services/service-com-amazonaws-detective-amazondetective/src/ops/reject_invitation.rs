@@ -200,6 +200,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let status = graph
             .members
             .get(&caller)
+            // The membership a graph holds for its own administrator was not created by
+            // an invitation, so this operation has nothing to reject on it: it is the
+            // same "no such membership" as a graph holding no record for the caller at
+            // all. See `crate::state::Member::is_administrators_own`.
+            .filter(|member| !member.is_administrators_own())
             .map(|member| member.status.clone())
             .ok_or_else(|| {
                 RejectInvitationErrorModeled::ResourceNotFoundException(
