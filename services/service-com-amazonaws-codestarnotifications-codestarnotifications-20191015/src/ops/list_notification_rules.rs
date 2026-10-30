@@ -81,18 +81,6 @@ impl From<ListNotificationRulesErrorModeled> for ListNotificationRulesError {
     }
 }
 
-/// The page size used when a request carries no `MaxResults`: the modelled maximum
-/// (`MaxResults`: `@range(min: 1, max: 100)`), so an unpaginated client sees as much as
-/// one page can hold and a `NextToken` for the rest.
-const DEFAULT_PAGE_SIZE: usize = 100;
-
-/// The most `Filters` entries one request may carry. `Filters` has no modelled length,
-/// and the filter count is the one request-chosen factor the per-rule matching work
-/// multiplies by, so this service caps it: the cap is CHOSEN, well above any real query
-/// (there are only four filter names to OR values over) and far below a figure that
-/// would let one request occupy the store lock.
-const MAX_FILTERS: usize = 32;
-
 /// Does `rule` satisfy one filter? The filter names are
 /// `ListNotificationRulesFilterName`'s own values.
 fn rule_satisfies(rule: &crate::state::NotificationRule, name: &str, value: &str) -> bool {
@@ -149,45 +137,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = st::request_region(ctx.parts());
         let filters = input.filters.clone().unwrap_or_default();
-        // `Filters` carries no modelled length, so this service bounds it itself: the
-        // filter count is the one request-chosen factor the matching work below
-        // multiplies by, and no real query needs more than a handful. CHOSEN.
-        if filters.len() > MAX_FILTERS {
-            return Err(ListNotificationRulesErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "Filters carries at most {MAX_FILTERS} entries, got {}",
-                        filters.len()
-                    )),
-                },
-            )
-            .into());
-        }
-        for filter in &filters {
-            if !LIST_NOTIFICATION_RULES_FILTER_NAME_VALUES.contains(&filter.name.as_str()) {
-                return Err(ListNotificationRulesErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "Filters name must be one of {LIST_NOTIFICATION_RULES_FILTER_NAME_VALUES:?}, got {:?}",
-                            filter.name
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
-
-        // Collapse the request's filters ONCE, before the store lock is taken: a name
-        // maps to the values given for it (OR within a name), and the names are ANDed
-        // (`Filters`' own documentation). Matching a rule is then one pass over at most
-        // `MAX_FILTERS` values instead of a re-scan of the request per rule per name.
-        let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
-        for filter in &filters {
-            match grouped.iter_mut().find(|(name, _)| *name == filter.name) {
-                Some((_, values)) => values.push(filter.value.as_str()),
-                None => grouped.push((filter.name.as_str(), vec![filter.value.as_str()])),
-            }
-        }
+        // Check and collapse the request's filters ONCE, before the store lock is taken:
+        // the bound on how many a request may carry, the filter names this operation's
+        // own enum lists, and the OR-within-a-name / AND-across-names grouping
+        // (`Filters`' own documentation) are the same for every listing this service
+        // serves, so they live in `crate::state`.
+        let pairs: Vec<(&str, &str)> = filters
+            .iter()
+            .map(|filter| (filter.name.as_str(), filter.value.as_str()))
+            .collect();
+        let grouped = st::grouped_filters(&pairs, LIST_NOTIFICATION_RULES_FILTER_NAME_VALUES)
+            .map_err(|reason| {
+                ListNotificationRulesErrorModeled::ValidationException(ValidationException {
+                    message: Some(reason),
+                })
+            })?;
 
         let start = match input.next_token.as_deref() {
             None => 0,
@@ -196,19 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListNotificationRulesErrorModeled::InvalidNextTokenException(
                         InvalidNextTokenException {
-                            message: Some(
-                                "The value for the enumeration token used in the request to return the next batch of the results is not valid"
-                                    .to_string(),
-                            ),
+                            message: Some(st::INVALID_NEXT_TOKEN.to_string()),
                         },
                     )
                     .into());
                 }
             },
         };
-        let page_size = input.max_results.map_or(DEFAULT_PAGE_SIZE, |max| {
-            usize::try_from(max).unwrap_or(DEFAULT_PAGE_SIZE).max(1)
-        });
+        let page_size = st::page_size(input.max_results);
 
         let Some(state) = st::service_state(&*self.engine) else {
             // This service's store is the shared `InMemoryEngine`. Mounted on any other

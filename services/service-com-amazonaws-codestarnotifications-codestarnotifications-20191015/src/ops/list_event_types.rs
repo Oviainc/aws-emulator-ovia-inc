@@ -92,14 +92,9 @@ fn invalid(message: impl Into<String>) -> ListEventTypesError {
 }
 
 /// The page size used when a request carries no `MaxResults`: `MaxResults`' own
-/// documentation for this operation — "The default number is 50."
+/// documentation for this operation — "The default number is 50." This operation
+/// publishes its own default, so it does not take the service-wide one.
 const DEFAULT_PAGE_SIZE: usize = 50;
-/// The most `Filters` entries one request may carry. `Filters` has no modelled length,
-/// and the filter count is the one request-chosen factor the per-entry matching work
-/// multiplies by, so this service caps it: the cap is CHOSEN, well above any real query
-/// (there are only two filter names to OR values over) and far below a figure that would
-/// let one request occupy the handler.
-const MAX_FILTERS: usize = 32;
 
 /// Does one catalogued event type satisfy one filter?
 ///
@@ -165,34 +160,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = &self.engine;
 
         let filters = input.filters.clone().unwrap_or_default();
-        // `Filters` carries no modelled length, so this service bounds it itself. CHOSEN.
-        if filters.len() > MAX_FILTERS {
-            return Err(invalid(format!(
-                "Filters carries at most {MAX_FILTERS} entries, got {}",
-                filters.len()
-            )));
-        }
-        for filter in &filters {
-            if let Some(reason) = st::enum_violation(
-                "Filters name",
-                &filter.name,
-                LIST_EVENT_TYPES_FILTER_NAME_VALUES,
-            ) {
-                return Err(invalid(reason));
-            }
-        }
-
-        // Collapse the request's filters ONCE: a name maps to the values given for it
-        // (OR within a name), and the names are ANDed. Matching an entry is then one
-        // pass over at most `MAX_FILTERS` values instead of a re-scan of the request per
-        // catalog entry per name.
-        let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
-        for filter in &filters {
-            match grouped.iter_mut().find(|(name, _)| *name == filter.name) {
-                Some((_, values)) => values.push(filter.value.as_str()),
-                None => grouped.push((filter.name.as_str(), vec![filter.value.as_str()])),
-            }
-        }
+        // Check and collapse the request's filters ONCE: the bound on how many a request
+        // may carry, the filter names this operation's own enum lists, and the
+        // OR-within-a-name / AND-across-names grouping are the same for every listing
+        // this service serves, so they live in `crate::state`.
+        let pairs: Vec<(&str, &str)> = filters
+            .iter()
+            .map(|filter| (filter.name.as_str(), filter.value.as_str()))
+            .collect();
+        let grouped = st::grouped_filters(&pairs, LIST_EVENT_TYPES_FILTER_NAME_VALUES)
+            .map_err(invalid)?;
 
         let start = match input.next_token.as_deref() {
             None => 0,
@@ -201,10 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListEventTypesErrorModeled::InvalidNextTokenException(
                         InvalidNextTokenException {
-                            message: Some(
-                                "The value for the enumeration token used in the request to return the next batch of the results is not valid"
-                                    .to_string(),
-                            ),
+                            message: Some(st::INVALID_NEXT_TOKEN.to_string()),
                         },
                     )
                     .into());

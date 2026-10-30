@@ -78,6 +78,10 @@ pub struct TargetRegistryEntry {
     /// [`TARGET_STATUS_ACTIVE`] from the moment it exists — see that constant.
     pub status: String,
     pub subscribed_rules: HashSet<String>,
+    /// Position in the account-wide registration order; the key a target listing orders
+    /// and pages over, taken the first time the address is seen and kept for as long as
+    /// the entry lives.
+    pub sequence: u64,
 }
 
 /// What a `ClientRequestToken` already bought: the resource it produced and a
@@ -138,6 +142,13 @@ impl ComAmazonawsCodestarnotificationsCodestarnotifications20191015State {
     /// Subscribe `rule_arn` to `target`, creating the account-wide registry entry the
     /// first time this address is seen.
     pub fn register_target(&mut self, rule_arn: &str, target: &RuleTarget) {
+        // An address the registry already holds keeps the position it entered the
+        // registration order at, so a second rule subscribing to it does not move it in
+        // a listing; a new address takes the next position.
+        let sequence = match self.targets.get(&target.target_address) {
+            Some(existing) => existing.sequence,
+            None => self.take_sequence(),
+        };
         let entry = self
             .targets
             .entry(target.target_address.clone())
@@ -145,6 +156,7 @@ impl ComAmazonawsCodestarnotificationsCodestarnotifications20191015State {
                 target_type: target.target_type.clone(),
                 status: TARGET_STATUS_ACTIVE.to_string(),
                 subscribed_rules: HashSet::new(),
+                sequence,
             });
         entry.target_type = target.target_type.clone();
         entry.subscribed_rules.insert(rule_arn.to_string());
@@ -268,6 +280,29 @@ impl ComAmazonawsCodestarnotificationsCodestarnotifications20191015State {
             .filter(|rule| rule.region == region)
             .collect();
         ordered.sort_by_key(|rule| rule.sequence);
+        ordered
+    }
+
+    /// Every target a rule of THIS REGION subscribes to, with its address, in the stable
+    /// registration order page tokens resume in.
+    ///
+    /// A target listing is served by a regional endpoint, like every other listing this
+    /// service answers, so an address only a rule of another region subscribes to is not
+    /// among them.
+    pub fn targets_in_region_order(&self, region: &str) -> Vec<(&str, &TargetRegistryEntry)> {
+        let mut ordered: Vec<(&str, &TargetRegistryEntry)> = self
+            .targets
+            .iter()
+            .filter(|(_, entry)| {
+                entry.subscribed_rules.iter().any(|arn| {
+                    self.rules
+                        .get(arn)
+                        .is_some_and(|rule| rule.region == region)
+                })
+            })
+            .map(|(address, entry)| (address.as_str(), entry))
+            .collect();
+        ordered.sort_by_key(|(_, entry)| entry.sequence);
         ordered
     }
 }
@@ -436,6 +471,65 @@ pub fn decode_page_token(token: &str) -> Option<u64> {
     let decoded = hex::decode(token).ok()?;
     let text = String::from_utf8(decoded).ok()?;
     text.strip_prefix("v1:")?.parse::<u64>().ok()
+}
+
+/// What a listing states when a `NextToken` does not decode: the sentence
+/// `InvalidNextTokenException` itself documents ("The value for the enumeration token
+/// used in the request to return the next batch of the results is not valid"). ONE text
+/// for the class, so every paginated operation of this service refuses an unknown token
+/// the same way.
+pub const INVALID_NEXT_TOKEN: &str = "The value for the enumeration token used in the \
+                                      request to return the next batch of the results is \
+                                      not valid";
+
+/// The page size a listing uses when the request carries no `MaxResults`: the modelled
+/// maximum (`MaxResults`: `@range(min: 1, max: 100)`), so an unpaginated client sees as
+/// much as one page can hold and a `NextToken` for the rest.
+pub const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// The most `Filters` entries one listing request may carry. `Filters` carries no
+/// modelled length, and the filter count is the one request-chosen factor the per-item
+/// matching work multiplies by, so this service caps it: the cap is CHOSEN, well above
+/// any real query (each filter name has only a handful of values to OR over) and far
+/// below a figure that would let one request occupy the store lock.
+pub const MAX_FILTERS: usize = 32;
+
+/// How many items one page of a listing holds, for the `MaxResults` a request carried.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    max_results.map_or(DEFAULT_PAGE_SIZE, |max| {
+        usize::try_from(max).unwrap_or(DEFAULT_PAGE_SIZE).max(1)
+    })
+}
+
+/// Collapse a listing's `Filters` into one entry per filter NAME, holding the values
+/// given for it: a name's values are ORed and the names are ANDed, as `Filters`
+/// documents, so a later match is one pass over the collapsed list rather than a re-scan
+/// of the request per item per name.
+///
+/// `allowed_names` is the operation's own filter-name enum (`*_FILTER_NAME_VALUES`).
+/// `Err` carries the reason a request is refused — too many entries, or a name the enum
+/// does not list — which each handler words in its own modelled `ValidationException`.
+pub fn grouped_filters<'a>(
+    filters: &[(&'a str, &'a str)],
+    allowed_names: &[&str],
+) -> Result<Vec<(&'a str, Vec<&'a str>)>, String> {
+    if filters.len() > MAX_FILTERS {
+        return Err(format!(
+            "Filters carries at most {MAX_FILTERS} entries, got {}",
+            filters.len()
+        ));
+    }
+    let mut grouped: Vec<(&'a str, Vec<&'a str>)> = Vec::new();
+    for (name, value) in filters {
+        if let Some(reason) = enum_violation("Filters name", name, allowed_names) {
+            return Err(reason);
+        }
+        match grouped.iter_mut().find(|(grouped, _)| grouped == name) {
+            Some((_, values)) => values.push(value),
+            None => grouped.push((name, vec![value])),
+        }
+    }
+    Ok(grouped)
 }
 
 /// Now, as a modelled timestamp.
