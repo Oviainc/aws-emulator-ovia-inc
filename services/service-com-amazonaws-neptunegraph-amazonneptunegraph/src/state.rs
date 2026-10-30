@@ -11,7 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AccessDeniedException, ConflictException, ExportFilter, ImportOptions,
-    ResourceNotFoundException, ValidationException, VectorSearchConfiguration,
+    ResourceNotFoundException, ServiceQuotaExceededException, ValidationException,
+    VectorSearchConfiguration,
 };
 
 /// The ARN namespace (and SigV4 signing name) of this service, from the model's
@@ -2960,7 +2961,8 @@ fn store_ceiling_clause(records: &str, ceiling: usize) -> String {
 /// Which modelled error reports a reached ceiling follows from the operation's own error
 /// set: an operation that models `ServiceQuotaExceededException` (402) reports it there
 /// (`CreateGraph`, `CreateGraphSnapshot`, `RestoreGraphFromSnapshot`,
-/// `CreateGraphUsingImportTask`, `CreatePrivateGraphEndpoint`), and an operation that
+/// `CreateGraphUsingImportTask`, `CreatePrivateGraphEndpoint`), through
+/// [`store_ceiling_quota_exceeded`], and an operation that
 /// models none reports it as the conflict it is — the request cannot be carried out
 /// against what the store already holds — through the `ConflictException` (409) it does
 /// model. A full store is never a `ValidationException`: every member of such a request
@@ -2978,6 +2980,38 @@ pub fn store_ceiling_conflict(records: &str, ceiling: usize) -> ConflictExceptio
         // that is simply full is not a concurrent modification of anything, so the
         // member is left absent.
         reason: None,
+    }
+}
+
+/// The modelled `ServiceQuotaExceededException` for a growth call that met a FULL store,
+/// raised by every operation that mints a record and DOES model a quota error — the 402
+/// half of the rule [`store_ceiling_conflict`] states for the operations that model none.
+///
+/// `records` names what the ceiling counts and `ceiling` is the bound the caller's guard
+/// read, so the clause always reports the bound that was actually met; `resource_type`
+/// names the kind of record that did not fit, which the modelled member asks for ("The
+/// type of the resource that exceeded quota. Ex: Graph, Snapshot" —
+/// `smithy_query(query="shape",shape="ServiceQuotaExceededException")`).
+///
+/// Worded by [`store_ceiling_clause`], so the ceiling reads the same whichever store was
+/// full and whichever operation met it.
+pub fn store_ceiling_quota_exceeded(
+    records: &str,
+    ceiling: usize,
+    resource_type: &str,
+) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: store_ceiling_clause(records, ceiling),
+        // The store as a whole is what has no room left; no stored record is the one
+        // that exceeded anything, and the record that did not fit was never minted, so
+        // there is no identifier to name.
+        resource_id: None,
+        resource_type: Some(resource_type.to_string()),
+        // The service whose ceiling was met is this one.
+        service_code: Some(ARN_NAMESPACE.to_string()),
+        // These ceilings are this emulator's own resource guards rather than quotas AWS
+        // publishes (see [`MAX_GRAPHS`]), so there is no Service Quotas code to name.
+        quota_code: None,
     }
 }
 

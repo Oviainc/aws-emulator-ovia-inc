@@ -261,20 +261,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store is shared and grows by one graph per call, so it has a ceiling
         // (`crate::state::MAX_GRAPHS`). Reaching it is the condition the model's
-        // `ServiceQuotaExceededException` (402) describes.
+        // `ServiceQuotaExceededException` (402) describes, worded by the one builder
+        // every full-store refusal in this crate reaches
+        // (`crate::state::store_ceiling_quota_exceeded`), so this refusal cannot be told
+        // apart from the one another operation answers for the same full store.
         if store.graphs.len() >= crate::state::MAX_GRAPHS {
             return Err(CreateGraphErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "this emulator holds at most {} graphs; delete a graph before \
-                         creating another",
-                        crate::state::MAX_GRAPHS
-                    ),
-                    resource_id: None,
-                    resource_type: Some("Graph".to_string()),
-                    service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
-                    quota_code: None,
-                },
+                crate::state::store_ceiling_quota_exceeded(
+                    "graphs",
+                    crate::state::MAX_GRAPHS,
+                    "Graph",
+                ),
             )
             .into());
         }

@@ -345,36 +345,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This call grows BOTH stores by one record, and each has a ceiling
         // (`crate::state::MAX_GRAPHS`, `crate::state::MAX_IMPORT_TASKS`). Reaching
         // either is the condition the model's `ServiceQuotaExceededException` (402)
-        // describes, so neither record is minted unless both have room.
-        for (reached, resource_type, message) in [
+        // describes, so neither record is minted unless both have room. Each refusal is
+        // worded by the one builder every full-store refusal in this crate reaches
+        // (`crate::state::store_ceiling_quota_exceeded`), so the graph store reads here
+        // exactly as it does from `CreateGraph`, and the import-task store exactly as it
+        // does from `StartImportTask`.
+        for (reached, records, ceiling, resource_type) in [
             (
                 store.graphs.len() >= crate::state::MAX_GRAPHS,
+                "graphs",
+                crate::state::MAX_GRAPHS,
                 "Graph",
-                format!(
-                    "this emulator holds at most {} graphs; delete a graph before \
-                     creating another",
-                    crate::state::MAX_GRAPHS
-                ),
             ),
             (
                 store.import_tasks.len() >= crate::state::MAX_IMPORT_TASKS,
+                "import tasks",
+                crate::state::MAX_IMPORT_TASKS,
                 "ImportTask",
-                format!(
-                    "this emulator holds at most {} import tasks",
-                    crate::state::MAX_IMPORT_TASKS
-                ),
             ),
         ] {
             if reached {
                 return Err(
                     CreateGraphUsingImportTaskErrorModeled::ServiceQuotaExceededException(
-                        ServiceQuotaExceededException {
-                            message,
-                            resource_id: None,
-                            resource_type: Some(resource_type.to_string()),
-                            service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
-                            quota_code: None,
-                        },
+                        crate::state::store_ceiling_quota_exceeded(
+                            records,
+                            ceiling,
+                            resource_type,
+                        ),
                     )
                     .into(),
                 );

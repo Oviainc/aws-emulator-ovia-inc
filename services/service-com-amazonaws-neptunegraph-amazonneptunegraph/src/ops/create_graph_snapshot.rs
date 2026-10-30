@@ -263,21 +263,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store is shared and grows by one snapshot per call, so it has a ceiling
         // (`crate::state::MAX_SNAPSHOTS`). Reaching it is the condition the model's
-        // `ServiceQuotaExceededException` (402) describes.
+        // `ServiceQuotaExceededException` (402) describes, worded by the one builder
+        // every full-store refusal in this crate reaches
+        // (`crate::state::store_ceiling_quota_exceeded`).
         if store.snapshots.len() >= crate::state::MAX_SNAPSHOTS {
             return Err(
                 CreateGraphSnapshotErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: format!(
-                            "this emulator holds at most {} graph snapshots; delete a \
-                             snapshot before creating another",
-                            crate::state::MAX_SNAPSHOTS
-                        ),
-                        resource_id: None,
-                        resource_type: Some("GraphSnapshot".to_string()),
-                        service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
-                        quota_code: None,
-                    },
+                    crate::state::store_ceiling_quota_exceeded(
+                        "graph snapshots",
+                        crate::state::MAX_SNAPSHOTS,
+                        "GraphSnapshot",
+                    ),
                 )
                 .into(),
             );

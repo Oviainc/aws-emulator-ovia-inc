@@ -99,6 +99,8 @@ mod resource_tagging;
 mod snapshot_of_a_graph_at_rest;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/store_ceiling_quota_refusals.rs"]
+mod store_ceiling_quota_refusals;
 #[path = "all/task_namespace_refusals.rs"]
 mod task_namespace_refusals;
 #[path = "all/unissued_page_token_refusal.rs"]

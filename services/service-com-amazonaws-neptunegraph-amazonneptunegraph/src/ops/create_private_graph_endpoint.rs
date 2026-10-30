@@ -230,21 +230,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The store is shared and grows by one endpoint per call, so it has a ceiling
         // (`crate::state::MAX_PRIVATE_GRAPH_ENDPOINTS`). Reaching it is the condition
-        // the model's `ServiceQuotaExceededException` (402) describes.
+        // the model's `ServiceQuotaExceededException` (402) describes, worded by the one
+        // builder every full-store refusal in this crate reaches
+        // (`crate::state::store_ceiling_quota_exceeded`).
         if store.private_endpoint_count() >= crate::state::MAX_PRIVATE_GRAPH_ENDPOINTS {
             return Err(
                 CreatePrivateGraphEndpointErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: format!(
-                            "this emulator holds at most {} private graph endpoints; delete \
-                             an endpoint before creating another",
-                            crate::state::MAX_PRIVATE_GRAPH_ENDPOINTS
-                        ),
-                        resource_id: None,
-                        resource_type: Some("PrivateGraphEndpoint".to_string()),
-                        service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
-                        quota_code: None,
-                    },
+                    crate::state::store_ceiling_quota_exceeded(
+                        "private graph endpoints",
+                        crate::state::MAX_PRIVATE_GRAPH_ENDPOINTS,
+                        "PrivateGraphEndpoint",
+                    ),
                 )
                 .into(),
             );
