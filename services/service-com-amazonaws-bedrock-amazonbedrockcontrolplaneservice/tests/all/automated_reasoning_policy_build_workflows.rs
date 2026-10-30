@@ -57,7 +57,9 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
 
-use crate::support::{date_time_seconds, emulator, label, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{
+    date_time_seconds, emulator, label, seed_build_workflow, Emulator, Reply, ACCOUNT, REGION,
+};
 
 /// Every `AutomatedReasoningPolicyBuildWorkflowType` the model admits
 /// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyBuildWorkflowType")`).
@@ -1237,47 +1239,6 @@ async fn walk_pages(
     panic!("case {case}: the listing kept issuing pagination tokens past 64 pages");
 }
 
-/// Store the build workflow an admitted `StartAutomatedReasoningPolicyBuildWorkflow` would
-/// have written `created_ago` ago, and hand back its `buildWorkflowId`.
-///
-/// The record is built out of the state helpers the start itself uses
-/// ([`bedrock::state::mint_build_workflow_id`] and the status constants), so a seeded
-/// workflow is the workflow a start would have left — and seeding is what lets a row fix
-/// the instant a workflow was started, and so the order a listing must walk, without
-/// sleeping between starts. `tweak` is where a row differs from that baseline.
-fn seed_workflow(
-    emu: &Emulator,
-    policy_arn: &str,
-    workflow_type: &str,
-    created_ago: Duration,
-    tweak: impl FnOnce(&mut bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord),
-) -> String {
-    let state = bedrock::state::service_state(&*emu.engine)
-        .expect("the shared engine carries this service's store");
-    let now = SystemTime::now();
-    let created_at = now - created_ago;
-    let mut store = state.lock();
-    let id = store.mint_build_workflow_id(now);
-    let mut record = bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord {
-        policy_arn: policy_arn.to_string(),
-        id: id.clone(),
-        workflow_type: workflow_type.to_string(),
-        status: bedrock::state::BUILD_WORKFLOW_STATUS_SCHEDULED,
-        completed_due_at: Some(created_at + bedrock::state::BUILD_WORKFLOW_COMPLETE_AFTER),
-        cancelled_due_at: None,
-        document_name: None,
-        document_content_type: None,
-        document_description: None,
-        created_at,
-        updated_at: created_at,
-    };
-    tweak(&mut record);
-    store
-        .automated_reasoning_policy_build_workflows
-        .insert((policy_arn.to_string(), id.clone()), record);
-    id
-}
-
 /// Seed `count` workflows of one policy, oldest first, and hand back their ids in the
 /// order they were started — which is the order the listing must report them in.
 ///
@@ -1287,7 +1248,7 @@ fn seed_workflow(
 fn seed_history(emu: &Emulator, policy_arn: &str, count: usize) -> Vec<String> {
     (0..count)
         .map(|index| {
-            seed_workflow(
+            seed_build_workflow(
                 emu,
                 policy_arn,
                 WORKFLOW_TYPES[index % WORKFLOW_TYPES.len()],
@@ -1599,7 +1560,7 @@ async fn a_listing_reports_the_status_the_clock_owes_and_changes_nothing() {
     let emu = emulator();
     for (index, (case, expected, tweak)) in rows.into_iter().enumerate() {
         let policy_arn = policy(&emu, &format!("settled policy {index}")).await;
-        let id = seed_workflow(
+        let id = seed_build_workflow(
             &emu,
             &policy_arn,
             WORKFLOW_TYPES[index % WORKFLOW_TYPES.len()],

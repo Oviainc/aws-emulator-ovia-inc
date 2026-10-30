@@ -189,8 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through only while it names the write the test currently holds, so a delete
         // issued against a test somebody has written since is refused instead of dropping
         // that write with the test.
-        let held = crate::state::date_time(stored.updated_at);
-        if epoch_millis(&input.last_updated_at) != epoch_millis(&held) {
+        if !crate::state::names_write_at(&input.last_updated_at, stored.updated_at) {
             return Err(conflict(
                 crate::state::automated_reasoning_policy_test_case_conflict_message(
                     DELETING,
@@ -225,18 +224,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DeleteAutomatedReasoningPolicyTestCaseOutput {})
     }
 }
-
-/// The instant a wire timestamp names, in whole milliseconds since the epoch.
-///
-/// The token is compared at this resolution, and not finer, because it is a value the
-/// caller echoes back from a read of the same test: a `date-time` instant travels through
-/// clients that carry milliseconds, so holding the echoed value to the nanosecond the store
-/// minted would refuse a caller naming the very write it just read. A millisecond still
-/// distinguishes two writes, which is what the token is for.
-fn epoch_millis(at: &::aws_smithy_types::DateTime) -> i128 {
-    i128::from(at.secs()) * 1_000 + i128::from(at.subsec_nanos() / 1_000_000)
-}
-
 
 /// The modelled 404 this operation answers for a `policyArn` this account holds no policy
 /// under — the test is stored UNDER a policy, so there is nothing there to delete from.

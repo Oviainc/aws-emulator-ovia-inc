@@ -2589,6 +2589,27 @@ pub fn build_workflow_not_found_message() -> &'static str {
     "Build WorkflowExecution not found"
 }
 
+/// What a write to a build workflow whose `lastUpdatedAt` concurrency token is not the one
+/// the stored workflow holds answers as its `ConflictException` message, for the write named
+/// by `action` ("deleting").
+///
+/// Worded as this service words that error class for a child resource of an Automated
+/// Reasoning policy ([`automated_reasoning_policy_test_case_conflict_message`]): the
+/// conflict, the write it conflicts with, the resource as its own refusals name it, and then
+/// the id and the policy ARN the REQUEST carried — so the wording is fixed and no instant
+/// appears in it, neither the one the workflow holds nor the one the request submitted.
+#[must_use]
+pub fn automated_reasoning_policy_build_workflow_conflict_message(
+    action: &str,
+    build_workflow_id: &str,
+    policy_arn: &str,
+) -> String {
+    format!(
+        "Conflict with {action} Build WorkflowExecution with buildWorkflowId: \
+         {build_workflow_id} and policyArn: {policy_arn}"
+    )
+}
+
 /// One stored Automated Reasoning policy build workflow: the identity
 /// `StartAutomatedReasoningPolicyBuildWorkflow` minted, the document that request named,
 /// and the status `GetAutomatedReasoningPolicyBuildWorkflow` reports.
@@ -6233,6 +6254,28 @@ pub fn caller_principal(parts: &http::request::Parts) -> String {
 /// A `SystemTime` as the wire timestamp type the response shapes carry.
 pub fn date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
+}
+
+/// Whether the `lastUpdatedAt` concurrency token a request carried names the write the
+/// addressed resource holds at `held`.
+///
+/// Stated once here because every resource of this service that is written under such a
+/// token is held against it the same way, so two renderings of the comparison could drift
+/// and one operation would then accept a token another refuses.
+///
+/// The comparison is at MILLISECOND resolution, and not finer: the token is a value the
+/// caller echoes back from a read of the same resource, and a `date-time` instant travels
+/// through clients that carry milliseconds, so holding the echoed value to the nanosecond
+/// the store minted would refuse a caller naming the very write it just read. A millisecond
+/// still distinguishes two writes, which is what the token is for.
+#[must_use]
+pub fn names_write_at(token: &::aws_smithy_types::DateTime, held: SystemTime) -> bool {
+    epoch_millis(token) == epoch_millis(&date_time(held))
+}
+
+/// The instant a wire timestamp names, in whole milliseconds since the epoch.
+fn epoch_millis(at: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000 + i128::from(at.subsec_nanos() / 1_000_000)
 }
 
 // =============================================================================

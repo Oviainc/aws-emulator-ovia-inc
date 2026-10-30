@@ -43,13 +43,12 @@
 //! * the test workflow already in progress, and the form that was never submitted: both
 //!   wholly fixed sentences, asserted to carry no part of the request or of the store.
 
-use aws_smithy_types::{date_time::Format, DateTime};
 use serde_json::{json, Value};
 
 use crate::automated_reasoning_policy_test_cases::{
     create_policy, create_test_case, get_test_case, CHECK_RESULTS,
 };
-use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{at_millis, emulator, epoch_millis, label, Emulator, Reply, ACCOUNT, REGION};
 
 // ---------------------------------------------------------------------------------------
 // The sentences under test, written out here rather than read off the crate so this suite
@@ -204,21 +203,6 @@ async fn stored_updated_at(emu: &Emulator, policy_arn: &str, test_case_id: &str)
             )
         })
         .to_string()
-}
-
-/// An RFC 3339 `date-time` as whole milliseconds since the epoch.
-fn epoch_millis(case: &str, text: &str) -> i64 {
-    let parsed = DateTime::from_str(text, Format::DateTime).unwrap_or_else(|error| {
-        panic!("case {case:?}: {text:?} does not parse as an RFC 3339 date-time: {error}")
-    });
-    parsed.secs() * 1_000 + i64::from(parsed.subsec_nanos() / 1_000_000)
-}
-
-/// `millis` since the epoch as the `date-time` text a client sends.
-fn at_millis(case: &str, millis: i64) -> String {
-    DateTime::from_millis(millis)
-        .fmt(Format::DateTime)
-        .unwrap_or_else(|error| panic!("case {case:?}: {millis} does not render: {error}"))
 }
 
 #[tokio::test]

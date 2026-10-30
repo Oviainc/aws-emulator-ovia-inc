@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let id = stored.id.clone();
-        let held = crate::state::date_time(stored.updated_at);
+        let held = stored.updated_at;
         let applied_token = stored.update_client_request_token.clone();
 
         // `clientRequestToken` "ensure[s] that the operation completes no more than one
@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record that EXISTS: the update goes through only while it names the write the
         // test currently holds, so an update issued against a test somebody has written
         // since is refused instead of overwriting that write.
-        if epoch_millis(&input.last_updated_at) != epoch_millis(&held) {
+        if !crate::state::names_write_at(&input.last_updated_at, held) {
             return Err(conflict(
                 crate::state::automated_reasoning_policy_test_case_conflict_message(
                     UPDATING,
@@ -252,18 +252,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// The instant a wire timestamp names, in whole milliseconds since the epoch.
-///
-/// The token is compared at this resolution, and not finer, for the reason the delete of a
-/// test compares it at: it is a value the caller echoes back from a read of the same test,
-/// and a `date-time` instant travels through clients that carry milliseconds, so holding
-/// the echoed value to the nanosecond the store minted would refuse a caller naming the
-/// very write it just read. A millisecond still distinguishes two writes.
-fn epoch_millis(at: &::aws_smithy_types::DateTime) -> i128 {
-    i128::from(at.secs()) * 1_000 + i128::from(at.subsec_nanos() / 1_000_000)
-}
-
 
 /// The modelled 404 this operation answers for a pair this account holds no test under —
 /// the test is addressed by the PAIR, so either half missing is "the resource was not

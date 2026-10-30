@@ -34,13 +34,12 @@
 //! prevent conflicting modifications"). The requests go through `crate::support` — the ONE
 //! harness every suite in this crate drives the emulator with.
 
-use aws_smithy_types::{date_time::Format, DateTime};
 use serde_json::{json, Value};
 
 use crate::automated_reasoning_policy_test_cases::{
     create_policy, create_test_case, get_test_case, list_test_cases, CHECK_RESULTS,
 };
-use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
+use crate::support::{at_millis, emulator, epoch_millis, label, Emulator, Reply, ACCOUNT, REGION};
 
 /// The status `DeleteAutomatedReasoningPolicyTestCase` answers a delete it accepted with
 /// (`@http(code: 202)`).
@@ -103,21 +102,6 @@ async fn stored_updated_at(emu: &Emulator, policy_arn: &str, test_case_id: &str)
             )
         })
         .to_string()
-}
-
-/// An RFC 3339 `date-time` as whole milliseconds since the epoch.
-fn epoch_millis(case: &str, text: &str) -> i64 {
-    let parsed = DateTime::from_str(text, Format::DateTime).unwrap_or_else(|error| {
-        panic!("case {case:?}: {text:?} does not parse as an RFC 3339 date-time: {error}")
-    });
-    parsed.secs() * 1_000 + i64::from(parsed.subsec_nanos() / 1_000_000)
-}
-
-/// `millis` since the epoch as the RFC 3339 `date-time` text a client sends.
-fn at_millis(case: &str, millis: i64) -> String {
-    DateTime::from_millis(millis)
-        .fmt(Format::DateTime)
-        .unwrap_or_else(|error| panic!("case {case:?}: {millis} does not render: {error}"))
 }
 
 /// Assert `reply` is the answer the delete gives a request it accepted: the modelled status

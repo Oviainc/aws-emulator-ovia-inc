@@ -8,6 +8,7 @@
 //! `MultiServiceRouter` the emulator boots.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice as bedrock;
@@ -74,6 +75,30 @@ pub fn date_time_seconds(case: &str, text: &str) -> f64 {
     parsed.as_secs_f64()
 }
 
+/// An RFC 3339 `date-time` as whole milliseconds since the epoch.
+///
+/// Beside [`date_time_seconds`] because every suite whose rule is about a `lastUpdatedAt`
+/// concurrency token reads a reported instant and sends one back at THIS resolution — the
+/// finest a client that carries milliseconds can echo — and one rendering of the pair is
+/// what keeps those suites reading and writing the same wire form.
+pub fn epoch_millis(case: &str, text: &str) -> i64 {
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        text,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| {
+        panic!("case {case:?}: {text:?} does not parse as an RFC 3339 date-time: {error}")
+    });
+    parsed.secs() * 1_000 + i64::from(parsed.subsec_nanos() / 1_000_000)
+}
+
+/// `millis` since the epoch as the `date-time` text a client sends.
+pub fn at_millis(case: &str, millis: i64) -> String {
+    ::aws_smithy_types::DateTime::from_millis(millis)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| panic!("case {case:?}: {millis} does not render: {error}"))
+}
+
 /// The test's own wall clock in epoch seconds, beside [`date_time_seconds`] so a suite that
 /// bounds a response's instant against the clock reads it the same way every other suite
 /// does: a stamp the emulator reports for a write must fall between the clock before the
@@ -110,6 +135,52 @@ pub fn foundation_model_arn(region: &str, model_id: &str) -> String {
 pub fn error_code(raw: &str) -> &str {
     let without_url = raw.split(':').next().unwrap_or(raw);
     without_url.rsplit('#').next().unwrap_or(without_url)
+}
+
+/// Store the build workflow an admitted `StartAutomatedReasoningPolicyBuildWorkflow` would
+/// have written `created_ago` ago, and hand back its `buildWorkflowId`.
+///
+/// The record is built out of the state helpers the start itself uses
+/// ([`bedrock::state::mint_build_workflow_id`] and the status constants), so a seeded
+/// workflow is the workflow a start would have left — and seeding is what lets a row fix the
+/// instant a workflow was started, and so the order a listing must walk, or the status a
+/// request must find it in, without sleeping for either. `tweak` is where a row differs from
+/// that baseline.
+///
+/// Here rather than in one suite because two of them seed this record, and ONE rendering of
+/// it is what keeps them from drifting apart when
+/// [`bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord`] gains a field.
+pub fn seed_build_workflow(
+    emu: &Emulator,
+    policy_arn: &str,
+    workflow_type: &str,
+    created_ago: Duration,
+    tweak: impl FnOnce(&mut bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord),
+) -> String {
+    let state = bedrock::state::service_state(&*emu.engine)
+        .expect("the shared engine carries this service's store");
+    let now = SystemTime::now();
+    let created_at = now - created_ago;
+    let mut store = state.lock();
+    let id = store.mint_build_workflow_id(now);
+    let mut record = bedrock::state::AutomatedReasoningPolicyBuildWorkflowRecord {
+        policy_arn: policy_arn.to_string(),
+        id: id.clone(),
+        workflow_type: workflow_type.to_string(),
+        status: bedrock::state::BUILD_WORKFLOW_STATUS_SCHEDULED,
+        completed_due_at: Some(created_at + bedrock::state::BUILD_WORKFLOW_COMPLETE_AFTER),
+        cancelled_due_at: None,
+        document_name: None,
+        document_content_type: None,
+        document_description: None,
+        created_at,
+        updated_at: created_at,
+    };
+    tweak(&mut record);
+    store
+        .automated_reasoning_policy_build_workflows
+        .insert((policy_arn.to_string(), id.clone()), record);
+    id
 }
 
 /// The emulator under test: one shared engine, one registered service, dispatched
