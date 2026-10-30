@@ -840,26 +840,141 @@ pub fn mint_access_token() -> String {
     hex::encode(minted_bytes())
 }
 
-/// The `nextToken` that resumes a `ListTunnels` page after the tunnel whose
-/// creation sequence is `seq`.
-pub fn encode_next_token(seq: u64) -> String {
-    format!("{NEXT_TOKEN_PREFIX}{seq:016x}")
+/// The listing a `ListTunnels` page token names a position in.
+///
+/// A creation sequence is a position in ONE listing and in no other, because
+/// what a listing reports is decided by the Region whose endpoint serves it —
+/// the only Region whose tunnels that endpoint holds at all — and by the
+/// `thingName` it is filtered by. Both go into every token the listing mints
+/// ([`encode_next_token`]) and are checked when a token comes back
+/// ([`decode_next_token`]), so a cursor replayed against a different listing is
+/// recognised as naming no position in it instead of being applied to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunnelListing<'a> {
+    /// The Region of the endpoint serving the listing, as [`request_region`]
+    /// reads it from the request.
+    pub region: &'a str,
+    /// The `thingName` the listing is filtered by, or `None` when it reports
+    /// every tunnel of the Region.
+    pub thing_name: Option<&'a str>,
 }
 
-/// The creation sequence a `nextToken` resumes after, or `None` when the token
-/// was not minted by [`encode_next_token`].
-///
-/// Parsing the suffix is not enough to decide that: `u64::from_str_radix` also
-/// accepts any other digit count and either letter case, neither of which
-/// [`encode_next_token`] can emit. So the parsed sequence is re-encoded and the
-/// result compared with what arrived: only a token identical to its own
-/// canonical rendering names a position in a listing, and every other string —
-/// truncated, re-cased, over-padded or hand-written — is foreign.
-pub fn decode_next_token(token: &str) -> Option<u64> {
-    let digits = token.strip_prefix(NEXT_TOKEN_PREFIX)?;
-    let seq = u64::from_str_radix(digits, 16).ok()?;
-    (encode_next_token(seq) == token).then_some(seq)
+impl TunnelListing<'_> {
+    /// The 64 bits that identify this listing, carried by every token it mints.
+    ///
+    /// The leading 64 bits of SHA-256 over the listing's scope: a token stays
+    /// short and opaque, while two different listings do not share a
+    /// fingerprint in any store this emulator can hold. The Region is
+    /// terminated by a NUL byte, which neither a Region label nor a `ThingName`
+    /// (modelled `^[a-zA-Z0-9:_-]+$`) can contain, so no two distinct scopes
+    /// hash the same bytes; the marker byte after it distinguishes "filtered by
+    /// this name" from "not filtered at all".
+    fn fingerprint(&self) -> u64 {
+        use sha2::{Digest, Sha256};
+
+        let mut digest = Sha256::new();
+        digest.update(self.region.as_bytes());
+        digest.update([0]);
+        match self.thing_name {
+            Some(thing_name) => {
+                digest.update([1]);
+                digest.update(thing_name.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+        let digest = digest.finalize();
+        // SHA-256's output is 32 bytes, so these 8 always exist.
+        let mut leading = [0u8; 8];
+        leading.copy_from_slice(&digest[..8]);
+        u64::from_be_bytes(leading)
+    }
 }
+
+/// The hex digits one field of a page token is rendered in. A `u64` written in
+/// full, so the rendering is fixed-width and is its own canonical form.
+const NEXT_TOKEN_FIELD_DIGITS: usize = 16;
+
+/// The ONE rendering of a page token: the prefix, then the creation sequence the
+/// previous page stopped at, then the fingerprint of the listing that minted it,
+/// each zero-padded to [`NEXT_TOKEN_FIELD_DIGITS`] lowercase hex digits. The
+/// whole token stays inside `NextToken`'s modelled pattern
+/// `^[a-zA-Z0-9_=-]{1,4096}$`.
+fn render_next_token(seq: u64, fingerprint: u64) -> String {
+    format!(
+        "{NEXT_TOKEN_PREFIX}{seq:0width$x}{fingerprint:0width$x}",
+        width = NEXT_TOKEN_FIELD_DIGITS
+    )
+}
+
+/// The `nextToken` that resumes `listing` after the tunnel whose creation
+/// sequence is `seq`.
+pub fn encode_next_token(listing: TunnelListing<'_>, seq: u64) -> String {
+    render_next_token(seq, listing.fingerprint())
+}
+
+/// What a `nextToken` names when it is read against the listing being served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagePosition {
+    /// The creation sequence the previous page of THIS listing stopped at: the
+    /// listing resumes strictly after it.
+    ResumeAfter(u64),
+    /// A token of a different listing — another Region's endpoint, or another
+    /// `thingName` filter. It names a position in that listing, and none here.
+    OtherListing,
+    /// Not a token this service can have minted.
+    Unissued,
+}
+
+/// Read `token` as a position in `listing`.
+///
+/// Parsing the fields is not enough to accept one: `u64::from_str_radix` also
+/// accepts a digit count, a sign and a letter case that [`render_next_token`]
+/// never emits, so the parsed fields are re-rendered and the result compared
+/// with what arrived — only a token identical to its own canonical rendering
+/// was minted here, and every other string (truncated, re-cased, over-padded or
+/// hand-written) is [`PagePosition::Unissued`]. A token that IS canonical still
+/// names a position only in the listing whose fingerprint it carries.
+pub fn decode_next_token(token: &str, listing: TunnelListing<'_>) -> PagePosition {
+    let Some(digits) = token.strip_prefix(NEXT_TOKEN_PREFIX) else {
+        return PagePosition::Unissued;
+    };
+    if digits.len() != 2 * NEXT_TOKEN_FIELD_DIGITS {
+        return PagePosition::Unissued;
+    }
+    let (Some(sequence_digits), Some(fingerprint_digits)) = (
+        digits.get(..NEXT_TOKEN_FIELD_DIGITS),
+        digits.get(NEXT_TOKEN_FIELD_DIGITS..),
+    ) else {
+        return PagePosition::Unissued;
+    };
+    let (Ok(seq), Ok(fingerprint)) = (
+        u64::from_str_radix(sequence_digits, 16),
+        u64::from_str_radix(fingerprint_digits, 16),
+    ) else {
+        return PagePosition::Unissued;
+    };
+    if render_next_token(seq, fingerprint) != token {
+        return PagePosition::Unissued;
+    }
+    if fingerprint == listing.fingerprint() {
+        PagePosition::ResumeAfter(seq)
+    } else {
+        PagePosition::OtherListing
+    }
+}
+
+/// The refusal for a `nextToken` that was minted by a DIFFERENT listing than
+/// the one being served.
+///
+/// Such a token names a position in that other listing — another Region's
+/// endpoint, or another `thingName` filter — and so names none here, exactly as
+/// a string this service never minted does. The text names the two members a
+/// caller has to keep stable while paging, so the request can be fixed from it
+/// alone.
+pub const NEXT_TOKEN_OTHER_LISTING_MESSAGE: &str =
+    "nextToken was issued by a different listing: a page token resumes only the listing that \
+     issued it, which is the Region the request was served in together with the thingName that \
+     request filtered by";
 
 /// `max_lifetime_timeout_minutes` as a duration, for computing a tunnel's
 /// expiry.

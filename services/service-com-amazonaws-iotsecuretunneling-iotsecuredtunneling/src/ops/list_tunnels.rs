@@ -138,14 +138,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("ListTunnels"))?;
 
-        // A page token this service did not mint cannot name a position in the
-        // listing. The operation models no error for it, so refuse it as invalid
-        // input rather than silently restarting the listing.
+        // The listing reports the tunnels of the account IN the Region being
+        // called, which is the only Region whose tunnels this endpoint holds,
+        // narrowed by the `thingName` the request filters by. That pair IS the
+        // listing a page token names a position in.
+        let region = crate::state::request_region(ctx);
+        let listing = crate::state::TunnelListing {
+            region: &region,
+            thing_name: input.thing_name.as_deref(),
+        };
+
+        // A page token names a position in ONE listing. A token this service did
+        // not mint names none at all, and a token another listing minted names
+        // one only there — applying it here would silently restart the listing
+        // or empty its page. The operation models no error for either, so both
+        // are refused as invalid input.
         let resume_after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::decode_next_token(token) {
-                Some(seq) => Some(seq),
-                None => {
+            Some(token) => match crate::state::decode_next_token(token, listing) {
+                crate::state::PagePosition::ResumeAfter(seq) => Some(seq),
+                crate::state::PagePosition::OtherListing => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::NEXT_TOKEN_OTHER_LISTING_MESSAGE,
+                    ))
+                }
+                crate::state::PagePosition::Unissued => {
                     return Err(crate::scaffolded::Scaffolded::validation(
                         "nextToken is not a token this service issued",
                     ))
@@ -162,9 +179,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(page_size).unwrap_or(1);
 
         let now = ::std::time::SystemTime::now();
-        // The listing reports the tunnels of the account IN the Region being
-        // called, which is the only Region whose tunnels this endpoint holds.
-        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         // Settle the transition the clock already made due before reporting.
         store.materialize_expired_tunnels(now);
@@ -177,8 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the page's own records are projected: a list call costs no deep copy of
         // the store, however many tunnels it holds.
         let mut ordered: Vec<(u64, String)> = store
-            .tunnels_in_region(&region)
-            .filter(|tunnel| match input.thing_name.as_deref() {
+            .tunnels_in_region(listing.region)
+            // The listing's own filter, read off the same scope the page token
+            // carries, so a resumed page reports exactly what its first page did.
+            .filter(|tunnel| match listing.thing_name {
                 None => true,
                 Some(thing_name) => tunnel
                     .destination_config
@@ -200,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = if has_more {
             ordered
                 .last()
-                .map(|(creation_seq, _)| crate::state::encode_next_token(*creation_seq))
+                .map(|(creation_seq, _)| crate::state::encode_next_token(listing, *creation_seq))
         } else {
             None
         };

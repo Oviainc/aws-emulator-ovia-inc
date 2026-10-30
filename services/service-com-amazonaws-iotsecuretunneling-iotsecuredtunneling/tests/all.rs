@@ -23,6 +23,8 @@ mod destination_service_limit;
 mod limit_refusals;
 #[path = "all/list_tunnels_next_token_form.rs"]
 mod list_tunnels_next_token_form;
+#[path = "all/list_tunnels_page_token_scope.rs"]
+mod list_tunnels_page_token_scope;
 #[path = "all/member_update_stamp.rs"]
 mod member_update_stamp;
 #[path = "all/owed_close_settled_by_every_entry_point.rs"]

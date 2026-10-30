@@ -11,6 +11,10 @@
 //! it was handed, each derived from a token this service really minted over the
 //! wire, so the assertions are about the class of forged tokens rather than the
 //! one string an issue happened to name.
+//!
+//! Which listing a canonical token belongs to is the subject of
+//! `list_tunnels_page_token_scope.rs`; this suite is about the FORM of the
+//! string alone, every row of it signed for one Region and unfiltered.
 
 use std::sync::Arc;
 
@@ -119,8 +123,9 @@ async fn page_after(router: &MultiServiceRouter, token: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every token this service mints is `tnl-` followed by exactly 16 lowercase hex
-/// digits, and it resumes the listing exactly where its page stopped.
+/// Every token this service mints is `tnl-` followed by exactly 32 lowercase hex
+/// digits — the position the page stopped at and the fingerprint of the listing
+/// that minted it — and it resumes that listing exactly where its page stopped.
 #[tokio::test]
 async fn a_minted_next_token_is_canonical_and_resumes_the_listing() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -142,8 +147,8 @@ async fn a_minted_next_token_is_canonical_and_resumes_the_listing() {
         });
         assert_eq!(
             digits.len(),
-            16,
-            "page size {page_size}: minted token {token:?} must carry 16 digits, got {}",
+            32,
+            "page size {page_size}: minted token {token:?} must carry 32 digits, got {}",
             digits.len()
         );
         assert!(
