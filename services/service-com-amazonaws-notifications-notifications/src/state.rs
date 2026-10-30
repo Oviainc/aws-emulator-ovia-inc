@@ -584,41 +584,94 @@ impl OrganizationAccessRecord {
 /// claim about AWS's.
 pub const MANAGED_DEFAULT_CHANNEL_IDENTIFIER: &str = "ACCOUNT_PRIMARY";
 
-/// The managed notification configurations this store publishes, as
-/// `(category, subCategory, description)`.
+/// One entry of the catalog [`MANAGED_NOTIFICATION_CATALOG`] publishes.
+///
+/// `name` and `description` are the entry's OWN published text and NOT a
+/// function of the arn: the display name is prose a console renders (so it
+/// carries spacing and capitalisation the arn's segments cannot), and the
+/// description states which events of that sub-category the configuration
+/// covers. Deriving either from the arn's `category`/`sub-category` tokens
+/// would publish an arn token where the service publishes display text, so both
+/// are carried per entry.
+#[derive(Debug, Clone, Copy)]
+struct PublishedManagedNotification {
+    /// The arn's `category/` segment — the service whose events this managed
+    /// configuration delivers.
+    category: &'static str,
+    /// The arn's `sub-category/` segment — that service's own event-type
+    /// category.
+    sub_category: &'static str,
+    /// `name`, the published display name.
+    name: &'static str,
+    /// `description`, the published prose description of the covered events.
+    description: &'static str,
+}
+
+/// The managed notification configurations this store publishes.
 ///
 /// A managed notification configuration is published BY the service: the model
 /// declares no create or delete for one, only `GetManagedNotificationConfiguration`
 /// and `ListManagedNotificationConfigurations` (plus the operations that
 /// associate channels with one), so the catalog is store state from boot rather
-/// than something a request inserts. The model does not enumerate the catalog
-/// either, so these entries are the EMULATOR's published set; their SHAPE is
-/// modelled — `ManagedNotificationConfigurationOsArn` is
-/// `managed-notification-configuration/category/<category>/sub-category/<subCategory>`
-/// with each segment `[a-zA-Z0-9\-]{3,64}` — and the sub-categories are the
-/// event-type categories of the service whose events AWS publishes managed
-/// notifications for.
-const MANAGED_NOTIFICATION_CATALOG: &[(&str, &str, &str)] = &[
-    (
-        "AWS-Health",
-        "Issue",
-        "Managed notifications for AWS Health issues that affect resources in this account.",
-    ),
-    (
-        "AWS-Health",
-        "AccountNotification",
-        "Managed notifications for AWS Health account notifications about this account.",
-    ),
-    (
-        "AWS-Health",
-        "ScheduledChange",
-        "Managed notifications for AWS Health scheduled changes to resources in this account.",
-    ),
-    (
-        "AWS-Health",
-        "Investigation",
-        "Managed notifications for AWS Health investigations into resources in this account.",
-    ),
+/// than something a request inserts.
+///
+/// The model does not enumerate the catalog, so the published SET is the
+/// service's own behaviour rather than something the model states; its SHAPE is
+/// modelled — `ManagedNotificationConfigurationOsArn` (see
+/// `smithy_query(query="shape",shape="ManagedNotificationConfigurationOsArn")`)
+/// is `managed-notification-configuration/category/<category>/sub-category/<subCategory>`
+/// with each segment `[a-zA-Z0-9\-]{3,64}`, and `ManagedNotificationConfigurationDescription`
+/// bounds a description at 256 characters.
+///
+/// The set below spans the services AWS publishes managed notifications for,
+/// each with one entry per event-type category of that service: `AWS-Health`
+/// (whose sub-categories are AWS Health's own event type categories) and
+/// `AWS-Partner-Central` (whose sub-categories are the AWS Marketplace seller
+/// notification categories). A category is published for every account, since
+/// nothing a caller does creates or removes one.
+const MANAGED_NOTIFICATION_CATALOG: &[PublishedManagedNotification] = &[
+    PublishedManagedNotification {
+        category: "AWS-Health",
+        sub_category: "Issue",
+        name: "Issues",
+        description: "AWS Health events reporting an issue that affects resources, services or regions you use, including the resources involved and the action to take.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-Health",
+        sub_category: "AccountNotification",
+        name: "Account notifications",
+        description: "AWS Health events reporting account and service notifications for this account, including announcements, deprecations and changes that need your attention.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-Health",
+        sub_category: "ScheduledChange",
+        name: "Scheduled changes",
+        description: "AWS Health events reporting a change scheduled against resources you use, including planned lifecycle events, maintenance windows and certificate rotations.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-Health",
+        sub_category: "Investigation",
+        name: "Investigations",
+        description: "AWS Health events reporting an open investigation into possible impact on resources you use, published while the impact is still being confirmed.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-Partner-Central",
+        sub_category: "PCProductListings",
+        name: "Product listings",
+        description: "Marketplace events related to your published AMI, container, and SaaS product catalog, including listing change set status, vulnerability scan findings, open product tasks, and Vendor Insights security profile snapshots.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-Partner-Central",
+        sub_category: "PCOffersAndAgreements",
+        name: "Offers and Agreements",
+        description: "Marketplace events related to your offers and the agreements buyers hold with you, including offer creation and expiry, and agreement acceptance, renewal and cancellation.",
+    },
+    PublishedManagedNotification {
+        category: "AWS-Partner-Central",
+        sub_category: "PCPaymentsAndDisbursements",
+        name: "Payments and disbursements",
+        description: "Marketplace events related to the money you are owed and paid, including disbursement status, buyer payment and invoice events, and changes to your bank or tax settings.",
+    },
 ];
 
 /// One published `ManagedNotificationConfiguration`.
@@ -669,7 +722,13 @@ fn seeded_managed_configurations() -> BTreeMap<String, ManagedNotificationConfig
     MANAGED_NOTIFICATION_CATALOG
         .iter()
         .enumerate()
-        .map(|(index, (category, sub_category, description))| {
+        .map(|(index, published)| {
+            let PublishedManagedNotification {
+                category,
+                sub_category,
+                name,
+                description,
+            } = *published;
             // `notifications` arns carry no region (`notifications::<account>:`).
             let arn = ::engine::emulator_arn(
                 "notifications",
@@ -680,13 +739,13 @@ fn seeded_managed_configurations() -> BTreeMap<String, ManagedNotificationConfig
             );
             let record = ManagedNotificationConfigurationRecord {
                 arn: arn.clone(),
-                // `ManagedNotificationConfigurationName` is `[A-Za-z0-9\-]+`
-                // (len 1..64), which both arn segments already satisfy, so the
-                // name is derived from them rather than stored twice.
-                name: format!("{category}-{sub_category}"),
-                description: (*description).to_string(),
-                category: (*category).to_string(),
-                sub_category: (*sub_category).to_string(),
+                // The published display name, NOT a rendering of the arn's own
+                // segments: the two are independent, so a caller that renders
+                // `name` shows display text rather than an arn token.
+                name: name.to_string(),
+                description: description.to_string(),
+                category: category.to_string(),
+                sub_category: sub_category.to_string(),
                 sequence: index as u64 + 1,
                 // The seeded association draws its sequence from the same
                 // counter every other association in this store uses (see

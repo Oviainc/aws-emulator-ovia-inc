@@ -40,6 +40,41 @@ impl Emulator {
     /// Send one request and return its status and parsed JSON body (`Value::Null`
     /// for an empty body).
     pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
+        let (status, raw) = self.send_raw(method, uri, body).await;
+        let parsed = if raw.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&raw).unwrap_or_else(|error| {
+                panic!(
+                    "{method} {uri} answered a body that is not JSON ({error}): {}",
+                    String::from_utf8_lossy(&raw)
+                )
+            })
+        };
+        (status, parsed)
+    }
+
+    /// Send one request and return its status and the RAW response body, for a
+    /// suite that asserts an answer carries no body at all rather than an empty
+    /// JSON document.
+    pub(crate) async fn send_raw(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (u16, bytes::Bytes) {
+        let response = self.send_http(method, uri, body).await;
+        (response.status().as_u16(), response.body().clone())
+    }
+
+    /// Send one request and return the whole HTTP response, for a suite that
+    /// asserts on the response HEADERS as well as the status and body.
+    pub(crate) async fn send_http(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> http::Response<bytes::Bytes> {
         let payload = match &body {
             Some(value) => {
                 bytes::Bytes::from(serde_json::to_vec(value).expect("a serializable body"))
@@ -54,20 +89,7 @@ impl Emulator {
             .header("authorization", CREDENTIAL_SCOPE)
             .body(payload)
             .expect("a well-formed request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let raw = response.body().clone();
-        let parsed = if raw.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&raw).unwrap_or_else(|error| {
-                panic!(
-                    "{method} {uri} answered a body that is not JSON ({error}): {}",
-                    String::from_utf8_lossy(&raw)
-                )
-            })
-        };
-        (status, parsed)
+        self.router.dispatch(request).await
     }
 }
 
@@ -102,6 +124,17 @@ pub(crate) fn encode_path_label(value: &str) -> String {
         })
         .collect()
 }
+
+/// The success status of this service's tag mutations, `TagResource` and
+/// `UntagResource`: 204 No Content.
+///
+/// Both answer an output structure with no members (see
+/// `smithy_query(query="shape",shape="TagResourceResponse,UntagResourceResponse")`),
+/// so a successful mutation carries nothing for the caller to parse and the
+/// service says so with the status rather than with the 200 the model leaves
+/// defaulted. Every suite that drives a tag mutation asserts this one constant,
+/// so the two operations cannot drift apart.
+pub(crate) const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
 
 /// The error code of an error response, from the restJson1 `__type` member.
 pub(crate) fn error_code(response: &Value) -> String {

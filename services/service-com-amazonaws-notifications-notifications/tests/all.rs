@@ -21,6 +21,8 @@ mod event_rule_updates;
 mod event_rules;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/managed_notification_catalog.rs"]
+mod managed_notification_catalog;
 #[path = "all/managed_notification_configurations.rs"]
 mod managed_notification_configurations;
 #[path = "all/not_found_messages.rs"]
@@ -35,6 +37,8 @@ mod organization_access;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_mutation_status.rs"]
+mod tag_mutation_status;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/validation_message_rendering.rs"]

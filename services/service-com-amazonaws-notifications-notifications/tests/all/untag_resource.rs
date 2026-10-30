@@ -24,7 +24,7 @@ use serde_json::{json, Map, Value};
 
 // The HTTP harness this suite drives the service through, shared with every
 // other suite in this crate.
-use crate::harness::{encode_path_label, error_code, Emulator};
+use crate::harness::{encode_path_label, error_code, Emulator, TAG_MUTATION_SUCCESS_STATUS};
 
 // The untagging-specific helpers this suite adds to the shared harness. An
 // inherent `impl` on a type declared elsewhere in the same crate is what keeps
@@ -291,8 +291,8 @@ async fn untag_resource_removes_exactly_the_keys_it_names() {
 
         let (status, response) = emulator.remove_tags(&arn, &case.removed).await;
         assert_eq!(
-            status, 200,
-            "case {:?}: UntagResource must answer 200, got {status} {response:?}",
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {:?}: UntagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {status} {response:?}",
             case.case
         );
         assert!(
@@ -314,8 +314,8 @@ async fn untag_resource_removes_exactly_the_keys_it_names() {
         // succeeds and removes nothing further.
         let (status, response) = emulator.remove_tags(&arn, &case.removed).await;
         assert_eq!(
-            status, 200,
-            "case {:?}: repeating UntagResource must answer 200, got {status} {response:?}",
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {:?}: repeating UntagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {status} {response:?}",
             case.case
         );
         let again = emulator.tag_set(&arn, case.case).await;
@@ -373,8 +373,8 @@ async fn an_untag_reaches_only_the_arn_it_names() {
         let case = format!("untag resource {index}");
         let (status, response) = emulator.remove_tags(arn, &keys(&["shared"])).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: UntagResource must answer 200, got {status} {response:?}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: UntagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {status} {response:?}"
         );
 
         for (other_index, other) in arns.iter().enumerate() {
@@ -468,8 +468,8 @@ async fn a_removal_frees_room_under_the_modelled_tag_maximum() {
         .collect();
     let (status, response) = emulator.write_tags(&arn, &at_bound).await;
     assert_eq!(
-        status, 200,
-        "case at the bound ({MAX_TAGS} tags): expected 200, got {status} {response:?}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case at the bound ({MAX_TAGS} tags): expected {TAG_MUTATION_SUCCESS_STATUS}, got {status} {response:?}"
     );
 
     // At the bound a new key does not fit.
@@ -489,8 +489,8 @@ async fn a_removal_frees_room_under_the_modelled_tag_maximum() {
         .remove_tags(&arn, &keys(&["key-000", "key-001"]))
         .await;
     assert_eq!(
-        status, 200,
-        "case freeing room: UntagResource must answer 200, got {status} {response:?}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case freeing room: UntagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {status} {response:?}"
     );
     let freed = emulator.tag_set(&arn, "freeing room").await;
     assert_eq!(
@@ -504,7 +504,7 @@ async fn a_removal_frees_room_under_the_modelled_tag_maximum() {
         .write_tags(&arn, &pairs(&[("late", "x"), ("later", "y")]))
         .await;
     assert_eq!(
-        status, 200,
+        status, TAG_MUTATION_SUCCESS_STATUS,
         "case after freeing room: the write must now fit, got {status} {response:?}"
     );
     let reported = emulator.tag_set(&arn, "after freeing room").await;

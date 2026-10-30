@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 
 // The HTTP harness this suite drives the service through, shared with every
 // other suite in this crate.
-use crate::harness::{encode_path_label, error_code, Emulator};
+use crate::harness::{encode_path_label, error_code, Emulator, TAG_MUTATION_SUCCESS_STATUS};
 
 // The tagging-specific helpers this suite adds to the shared harness. An
 // inherent `impl` on a type declared elsewhere in the same crate is what keeps
@@ -267,8 +267,8 @@ async fn tag_resource_merges_the_supplied_map_into_the_stored_tag_set() {
         for (write_index, write) in case.writes.iter().enumerate() {
             let (status, response) = emulator.tag_resource(&arn, write).await;
             assert_eq!(
-                status, 200,
-                "case {:?} write {write_index}: TagResource must answer 200, got {status} {response:?}",
+                status, TAG_MUTATION_SUCCESS_STATUS,
+                "case {:?} write {write_index}: TagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {status} {response:?}",
                 case.case
             );
             assert!(
@@ -336,8 +336,8 @@ async fn a_tag_write_reaches_only_the_arn_it_names() {
         let write = pairs(&[("shared", "written"), ("only", "here")]);
         let (status, response) = emulator.tag_resource(arn, &write).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: TagResource must answer 200, got {status} {response:?}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: TagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, got {status} {response:?}"
         );
 
         for (other_index, other) in arns.iter().enumerate() {
@@ -446,8 +446,8 @@ async fn a_write_past_the_modelled_tag_maximum_is_refused_whole() {
         .collect();
     let (status, response) = emulator.tag_resource(&arn, &at_bound).await;
     assert_eq!(
-        status, 200,
-        "case at the bound ({MAX_TAGS} tags): expected 200, got {status} {response:?}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case at the bound ({MAX_TAGS} tags): expected {TAG_MUTATION_SUCCESS_STATUS}, got {status} {response:?}"
     );
     assert_eq!(
         emulator.reported_tags(&arn, "at the bound").await.len(),
@@ -481,8 +481,8 @@ async fn a_write_past_the_modelled_tag_maximum_is_refused_whole() {
     let overwrite = pairs(&[("key-000", "rewritten"), ("key-199", "rewritten")]);
     let (status, response) = emulator.tag_resource(&arn, &overwrite).await;
     assert_eq!(
-        status, 200,
-        "case overwrite at the bound: expected 200, got {status} {response:?}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case overwrite at the bound: expected {TAG_MUTATION_SUCCESS_STATUS}, got {status} {response:?}"
     );
     let reported = emulator.reported_tags(&arn, "overwrite at the bound").await;
     assert_eq!(

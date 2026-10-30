@@ -137,7 +137,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful tag removal answers 204 No Content, for the same reason
+    // `TagResource` does: `UntagResourceResponse` has no members, so there is
+    // nothing for a caller to parse, and the model leaves this operation's
+    // `@http` code defaulted, so the status is the service's behaviour rather
+    // than something the model states.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

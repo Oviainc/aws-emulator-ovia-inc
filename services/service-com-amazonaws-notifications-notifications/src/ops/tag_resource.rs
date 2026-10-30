@@ -137,7 +137,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful tag write answers 204 No Content: `TagResourceResponse` has
+    // no members, so there is nothing for a caller to parse, and the service
+    // reports that with the status that says so rather than the 200 the model
+    // leaves defaulted (the model sets no explicit `@http` code for this
+    // operation, so the status is the service's behaviour, not the model's).
+    // `UntagResource`, the other tag mutation, answers the same way.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
