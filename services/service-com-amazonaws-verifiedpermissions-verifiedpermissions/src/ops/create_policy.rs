@@ -235,21 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The SIZE BOUND on everything below: the cheap length check, before the
-        // state lock and before any Cedar parse or schema validation, so no
-        // caller-sized statement reaches the parser or the validator. Only a
-        // `static` definition carries caller-sized Cedar text — a
-        // `templateLinked` one carries a template reference and two entity
-        // identifiers, each already bounded by the model — so only it has a size
-        // to check. Only the length is checked here; the full parse stays after
-        // the store is resolved, so an unknown store is still a 404 and a client
-        // token still replays before the statement is parsed.
-        if let PolicyDefinition::Static(def) = &input.definition {
-            crate::state::cedar::check_statement_size(&def.statement).map_err(invalid)?;
-        }
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();
+        // The store the request names is resolved BEFORE any of the request's own
+        // payload is read, so a reference to a store that does not exist answers
+        // `ResourceNotFoundException` rather than a refusal about the payload.
+        // Resolving is a READ, so a request refused below still changes nothing.
         let store_id = state
             .resolve_store_id(&input.policy_store_id)
             .ok_or_else(not_found)?;
@@ -316,6 +307,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the error channel rather than an `expect`, because the key came from the
         // request and a handler must not be able to panic on caller input.
         let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
+
+        // The SIZE BOUND on everything below: the cheap length check, before any
+        // Cedar parse or schema validation, so no caller-sized statement reaches
+        // the parser or the validator. Only a `static` definition carries
+        // caller-sized Cedar text — a `templateLinked` one carries a template
+        // reference and two entity identifiers, each already bounded by the model
+        // — so only it has a size to check. It reads the request's PAYLOAD, so it
+        // runs here: after the store the request references is resolved, and
+        // after the `clientToken` replay, exactly where
+        // `CreatePolicyTemplate` parses its statement.
+        if let PolicyDefinition::Static(def) = &input.definition {
+            crate::state::cedar::check_statement_size(&def.statement).map_err(invalid)?;
+        }
 
         // What the store's validation settings say this policy is checked
         // against — `None` when the store validates nothing, and the refusal a

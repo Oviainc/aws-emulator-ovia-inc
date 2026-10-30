@@ -69,6 +69,8 @@ mod policy_templates;
 mod policy_update;
 #[path = "all/policy_validation.rs"]
 mod policy_validation;
+#[path = "all/policy_writer_reference_precedence.rs"]
+mod policy_writer_reference_precedence;
 #[path = "all/repeated_entity_identifiers.rs"]
 mod repeated_entity_identifiers;
 #[path = "all/resource_names.rs"]

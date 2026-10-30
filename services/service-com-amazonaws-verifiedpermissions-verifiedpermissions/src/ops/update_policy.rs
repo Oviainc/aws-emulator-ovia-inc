@@ -241,14 +241,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The SIZE BOUND first, before the state lock and before any Cedar parse
-        // or schema validation, so no caller-sized statement reaches the parser.
-        if let Some(UpdatePolicyDefinition::Static(def)) = &input.definition {
-            crate::state::cedar::check_statement_size(&def.statement).map_err(invalid)?;
-        }
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();
+        // The resources the request REFERENCES — the store and the policy in it —
+        // are resolved BEFORE any of the request's own payload is read, so a
+        // reference that names nothing answers `ResourceNotFoundException`
+        // whatever else the request got wrong. Resolving is a READ, so a request
+        // refused below still changes nothing.
         let store_id = state
             .resolve_store_id(&input.policy_store_id)
             .ok_or_else(store_not_found)?;
@@ -271,6 +270,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let replacement = match &input.definition {
             None => None,
             Some(UpdatePolicyDefinition::Static(def)) => {
+                // The SIZE BOUND on everything below: the cheap length check,
+                // before any Cedar parse or schema validation, so no
+                // caller-sized statement reaches the parser or the validator. It
+                // reads the request's PAYLOAD, so it runs here — after the store
+                // and the policy the request references have been resolved.
+                crate::state::cedar::check_statement_size(&def.statement).map_err(invalid)?;
+
                 // "You can directly update only static policies. To change a
                 // template-linked policy, you must update the template
                 // instead": a template-linked policy holds no content of its
