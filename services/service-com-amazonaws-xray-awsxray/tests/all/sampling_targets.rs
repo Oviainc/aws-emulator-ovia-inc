@@ -39,7 +39,7 @@ use service_com_amazonaws_xray_awsxray::ops::get_sampling_targets::UNKNOWN_RULE_
 use service_com_amazonaws_xray_awsxray::state::{
     DEFAULT_SAMPLING_RULE_FIXED_RATE, DEFAULT_SAMPLING_RULE_NAME,
     DEFAULT_SAMPLING_RULE_RESERVOIR_SIZE, MAX_SAMPLING_BOOST_SERVICES_PER_RULE,
-    SAMPLING_RULE_NOT_FOUND_MESSAGE, SAMPLING_TARGET_INTERVAL_SECONDS, SAMPLING_WINDOW_SECONDS,
+    SAMPLING_TARGET_INTERVAL_SECONDS, SAMPLING_WINDOW_SECONDS, UNKNOWN_SAMPLING_RULE_MESSAGE,
 };
 
 use crate::trace_ingest_and_groups::{Answer, Xray};
@@ -580,11 +580,11 @@ async fn statistics_for_a_rule_the_account_does_not_hold_are_unprocessed() {
             "case {label:?}: the unprocessed entry names the rule reported, got {entry:?}"
         );
         // The code and the sentence are the service's own: the status a request
-        // refused for naming that rule would carry, and the sentence every
-        // other operation states a missing sampling rule with.
+        // refused for naming that rule would carry, and the fixed sentence a
+        // declined statistics document carries.
         for (member, expected) in [
             ("ErrorCode", UNKNOWN_RULE_ERROR_CODE),
-            ("Message", SAMPLING_RULE_NOT_FOUND_MESSAGE),
+            ("Message", UNKNOWN_SAMPLING_RULE_MESSAGE),
         ] {
             let value = entry.get(member).and_then(Value::as_str);
             assert_eq!(

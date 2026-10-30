@@ -158,6 +158,14 @@ pub const ENCRYPTION_STATUS_ACTIVE: &str = "ACTIVE";
 /// old settings" — so a read taken straight after the put must still see it.
 pub const ENCRYPTION_SETTLE_AFTER: Duration = Duration::from_millis(500);
 
+/// What X-Ray answers a `PutEncryptionConfig` that selects KMS encryption
+/// without naming a key with.
+///
+/// FIXED text: the refusal states the condition that was broken — a key is
+/// needed for this type of encryption — and interpolates nothing from the
+/// request, so it is the same sentence whatever else the request carried.
+pub const ENCRYPTION_KEY_ID_REQUIRED_MESSAGE: &str = "Key ID is required for type KMS";
+
 /// The number of digits in an Amazon Web Services account id, which the account
 /// field of an ARN carries.
 const ACCOUNT_ID_DIGITS: usize = 12;
@@ -1274,6 +1282,30 @@ pub const SAMPLING_RULE_NOT_FOUND_MESSAGE: &str = "Sampling rule does not exist"
 /// same fixed shape of wording, from its recorded `CreateSamplingRule`
 /// refusals.
 pub const SAMPLING_RULE_EXISTS_MESSAGE: &str = "Sampling rule already exists";
+
+/// The `UnprocessedStatistics$Message` for a statistics document reported
+/// against a sampling rule the account does not hold.
+///
+/// A DIFFERENT sentence from [`SAMPLING_RULE_NOT_FOUND_MESSAGE`], and
+/// deliberately so: that one is the message of a whole-request refusal
+/// (`DeleteSamplingRule`, `UpdateSamplingRule`), while this is the per-document
+/// note inside a `GetSamplingTargets` 200 — a report the service declined to
+/// process rather than a call it refused. FIXED text: the entry names the rule
+/// in its own `RuleName` member, so nothing of the request reaches the sentence.
+pub const UNKNOWN_SAMPLING_RULE_MESSAGE: &str = "Unknown rule";
+
+/// What X-Ray answers when a `ResourceARN` handed to one of the tagging
+/// operations names no resource this account holds.
+///
+/// The template states the resource the caller asked about and that it was not
+/// found, with the ARN echoed VERBATIM — undecorated, so a client that parses
+/// the ARN back out of the message reads the bytes it sent. Single-homed here so
+/// `TagResource`, `UntagResource` and `ListTagsForResource` cannot drift into
+/// three sentences for one error class.
+#[must_use]
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("Resource {resource_arn} not found")
+}
 
 /// What identifies one group in the store: the region it lives in and its
 /// case-sensitive `GroupName`.

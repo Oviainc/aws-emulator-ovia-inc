@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = store.tags_for_resource_mut(&resource_arn) else {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("no X-Ray resource is named by ARN `{resource_arn}`")),
+                    message: Some(crate::state::resource_not_found_message(&resource_arn)),
                     resource_name: Some(resource_arn),
                 },
             )

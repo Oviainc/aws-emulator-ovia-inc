@@ -36,6 +36,22 @@
 //! deserializer only to learn WHICH read failed — the failing read names the
 //! modelled target type through the `Schema` it is handed — and leaves the error
 //! itself untouched.
+//!
+//! # The value a constraint refusal echoes
+//!
+//! The second class is answered here too, for one reason: an AWS constraint
+//! message QUOTES the value the caller submitted (`Value '<value>' at
+//! '<member path>' failed to satisfy constraint: …`), and the framework's walk
+//! has no rendering of a LIST or MAP member beyond its element count, so a
+//! clause about a collection reaches `Service::override_refusal` carrying
+//! `<n> items` rather than the value. That seam is handed the violations ALONE,
+//! never the request they came from, so the value cannot be recovered there.
+//! This layer already has the built input in its hand ([`probe`]), so the echo
+//! is restored here — through `service_common`'s own restoring walk — and the
+//! refusal is then worded by the SAME `service_common` entry point
+//! `override_refusal` delegates to, so the two cannot drift: only which value a
+//! clause quotes differs, and the code, the status, the envelope, the member
+//! paths and every requirement stay the framework's.
 
 use std::cell::RefCell;
 use std::marker::PhantomData;
@@ -43,10 +59,12 @@ use std::marker::PhantomData;
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::serde::{SerdeError, ShapeDeserializer};
 use aws_smithy_schema::{Schema, ShapeType};
+use aws_smithy_schema_server::constraints::{self, Violation};
+use aws_smithy_schema_server::ProtocolError;
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::{BigDecimal, BigInteger, Blob, DateTime, Document};
 use smithy_server_runtime::{
-    BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
+    BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
     ServerHttpProtocol, Service,
 };
 
@@ -62,6 +80,23 @@ pub const SERIALIZATION_EXCEPTION: &str = "SerializationException";
 /// The HTTP status a protocol-level refusal of the request carries: the caller
 /// sent something that cannot be read, so it is a client error.
 const SERIALIZATION_EXCEPTION_STATUS: u16 = 400;
+
+/// Why this layer refuses a request before any handler runs.
+///
+/// The two arms are the two error CLASSES the module header separates, and they
+/// are answered by two different operations: a value the codec could not read at
+/// all is the protocol's own failure ([`UnreadableBody`]), while a value that was
+/// read and then broke a rule the model declares is a constraint refusal
+/// ([`ConstraintRefusal`]).
+#[derive(Debug)]
+pub enum PreDispatchRefusal {
+    /// A value whose JSON type the modelled member it is bound to cannot be read
+    /// from, described by [`coercion_message`].
+    Unreadable(String),
+    /// Every value of the request the model's own constraints refuse, each with
+    /// its clause's value echo restored to the bytes the caller submitted.
+    Invalid(Vec<Violation>),
+}
 
 /// The media type every response of this restJson1 service carries.
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -115,11 +150,14 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for UnreadableBody<Eng> {
             // `Some`, so the refusal is found again. The fallback keeps the
             // error CLASS right even if it somehow is not — the request reached
             // here because its body could not be read.
-            let message = protocol
+            let message = match protocol
                 .routing_key(req)
                 .ok()
                 .and_then(|key| refusal_for::<Eng>(key, protocol, req))
-                .unwrap_or_else(|| "the request body can not be deserialized".to_string());
+            {
+                Some(PreDispatchRefusal::Unreadable(message)) => message,
+                _ => "the request body can not be deserialized".to_string(),
+            };
             serialization_exception(&message)
         })
     }
@@ -176,7 +214,7 @@ pub fn refusal_for<Eng: Send + Sync + 'static>(
     key: &str,
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<String> {
+) -> Option<PreDispatchRefusal> {
     probe_by_key!(
         key,
         protocol,
@@ -222,29 +260,107 @@ pub fn refusal_for<Eng: Send + Sync + 'static>(
     )
 }
 
-/// Run the framework's own deserializer for `O` over the request, and report the
-/// first value whose JSON type could not be read into the modelled type of the
-/// member it is bound to.
+/// Run the framework's own deserializer for `O` over the request, and report
+/// what refuses it: the first value whose JSON type could not be read into the
+/// modelled type of the member it is bound to, or — for a body that READ — every
+/// constraint the model declares that the values broke, with each clause's value
+/// echo restored to the bytes the caller submitted.
 ///
 /// `None` is "nothing for THIS layer to refuse", which covers three different
-/// outcomes deliberately: the body read cleanly; the body could not be reached
-/// at all (there is no value to describe, so the framework's own rendering
-/// stands); or the read failed for a reason that is NOT a coercion — an absent
-/// `@required` member, a timestamp whose text does not parse — which the
-/// framework answers in its own envelope, unchanged by this layer.
-fn probe<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Option<String> {
+/// outcomes deliberately: the body read cleanly and satisfies every modelled
+/// constraint; the body could not be reached at all (there is no value to
+/// describe, so the framework's own rendering stands); or the read failed for a
+/// reason that is NOT a coercion — an absent `@required` member, a timestamp
+/// whose text does not parse — which the framework answers in its own envelope,
+/// unchanged by this layer.
+///
+/// The constraint walk is the framework's own (`constraints::validate` over the
+/// built input, the same call the dispatch sequence makes), so this layer can
+/// never find a different set of violations from the walk that follows it; only
+/// the value each clause quotes is restored, by `service_common`'s own walk over
+/// the SAME built input.
+fn probe<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<PreDispatchRefusal> {
     let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
     let found: RefCell<Option<String>> = RefCell::new(None);
-    {
+    let read = {
         let mut probe = Probe {
             inner: &mut *deserializer,
             found: &found,
         };
-        if <O::Input as DeserializableStruct>::deserialize(&mut probe).is_ok() {
-            return None;
+        <O::Input as DeserializableStruct>::deserialize(&mut probe)
+    };
+    let Ok(input) = read else {
+        return found.into_inner().map(PreDispatchRefusal::Unreadable);
+    };
+    let violations = constraints::validate(&input, O::INPUT_SCHEMA);
+    if violations.is_empty() {
+        return None;
+    }
+    Some(PreDispatchRefusal::Invalid(
+        service_common::validation::with_submitted_values(violations, &input, O::INPUT_SCHEMA),
+    ))
+}
+
+/// The operation this service serves for a request whose values the model's own
+/// constraints refuse.
+///
+/// It words that refusal through the SAME `service_common` entry point
+/// [`crate::service::EmulatedService::override_refusal`] delegates to, over
+/// violations whose value echo has been restored to the caller's own bytes — so
+/// the only difference from the framework's own walk is which value a clause
+/// quotes. Holds no state, for the same reason [`UnreadableBody`] holds none:
+/// the refusal is re-derived from the request the router passes back in.
+pub struct ConstraintRefusal<Eng> {
+    engine: PhantomData<Eng>,
+}
+
+impl<Eng> ConstraintRefusal<Eng> {
+    /// The one refusal value a service holds.
+    pub const fn new() -> Self {
+        Self {
+            engine: PhantomData,
         }
     }
-    found.into_inner()
+}
+
+impl<Eng> Default for ConstraintRefusal<Eng> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for ConstraintRefusal<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        _ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The same decision `override_operation` made, re-derived from the
+            // same request: this operation is reached only when it answered
+            // `Some` with this arm, so the violations are found again. An empty
+            // set leaves the framework to render its own default, which is the
+            // fail-safe direction.
+            let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
+            let violations = match protocol
+                .routing_key(req)
+                .ok()
+                .and_then(|key| refusal_for::<Eng>(key, protocol, req))
+            {
+                Some(PreDispatchRefusal::Invalid(violations)) => violations,
+                _ => Vec::new(),
+            };
+            let chosen = service_common::aws_validation_refusal(&Refusal::Invalid(
+                violations.clone(),
+            ));
+            svc.definition()
+                .refusal_response(ProtocolError::Invalid(violations), chosen)
+        })
+    }
 }
 
 /// The framework's deserializer, watched.

@@ -388,14 +388,14 @@ struct ReportedRule {
 
 /// What a reported document naming a rule the account does not hold is answered
 /// with: the rule it named, the client-error code of the refusal a request for
-/// that rule would get, and the service's own wording for a sampling rule that
-/// does not exist — the same sentence `DeleteSamplingRule` and
-/// `UpdateSamplingRule` state it with.
+/// that rule would get, and the FIXED sentence a declined statistics document
+/// carries ([`crate::state::UNKNOWN_SAMPLING_RULE_MESSAGE`]) — which is the
+/// per-document note of a 200, not the message of a whole-request refusal.
 fn unknown_rule(rule_name: &str) -> UnprocessedStatistics {
     UnprocessedStatistics {
         rule_name: Some(rule_name.to_string()),
         error_code: Some(UNKNOWN_RULE_ERROR_CODE.to_string()),
-        message: Some(crate::state::SAMPLING_RULE_NOT_FOUND_MESSAGE.to_string()),
+        message: Some(crate::state::UNKNOWN_SAMPLING_RULE_MESSAGE.to_string()),
     }
 }
 
@@ -407,6 +407,7 @@ fn unknown_rule(rule_name: &str) -> UnprocessedStatistics {
 /// (`smithy_query(query="shape",shape="UnprocessedStatistics")`). It is set to
 /// the status a request refused for naming that rule would carry, so one entry
 /// of a batch that otherwise succeeded reports the same class of failure as a
-/// whole-request refusal would. The message beside it is not chosen: it is the
-/// service's own sentence for a sampling rule that does not exist.
+/// whole-request refusal would. The message beside it is the service's own fixed
+/// sentence for a statistics document naming an unknown rule
+/// ([`crate::state::UNKNOWN_SAMPLING_RULE_MESSAGE`]).
 pub const UNKNOWN_RULE_ERROR_CODE: &str = "400";

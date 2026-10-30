@@ -25,7 +25,9 @@
 //!   modelled input shape is answered by [`request_layer`]'s refusal, because
 //!   that failure is the deserialization layer's and not a handler's.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. Edited here: a value that violates a MODELLED
+//!   before any handler ran, for the refusals that do not reach
+//!   [`request_layer`]'s pre-dispatch answer (an absent `@required` member is
+//!   found while READING the body, so it arrives here). Edited here: a value that violates a MODELLED
 //!   constraint (a `@length`, a `@range`, an absent `@required` member, a value
 //!   outside an enum) is refused by the request layer, and AWS answers that
 //!   class with the protocol-level `ValidationException` envelope — HTTP 400,
@@ -73,6 +75,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// [`Service::override_operation`] hands back a borrow of one of its own
     /// operations.
     unreadable_body: request_layer::UnreadableBody<Eng>,
+    /// Answers a request the model's own constraints refuse, with each clause
+    /// echoing the value the CALLER submitted — including a collection-valued
+    /// member, which the framework's walk can only summarise as `<n> items`
+    /// (see [`request_layer`]). Held on the service for the same reason.
+    constraint_refusal: request_layer::ConstraintRefusal<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -83,6 +90,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             unreadable_body: request_layer::UnreadableBody::new(),
+            constraint_refusal: request_layer::ConstraintRefusal::new(),
         }
     }
 }
@@ -121,10 +129,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // dispatch that follows), and a REFUSED one a third time when the
         // refusal re-derives its message — an emulator pays that to answer the
         // right error class, and nothing but the refusal path pays the third.
+        //
+        // A request that READ and then broke a modelled constraint is the other
+        // class, and it is answered here too — by `ConstraintRefusal`, in the
+        // same `ValidationException` envelope the framework renders — because an
+        // AWS constraint clause QUOTES the value the caller submitted, and the
+        // `override_refusal` seam below is handed the violations alone, never
+        // the request they came from: a collection-valued member therefore
+        // reaches it as the walk's `<n> items` summary. This seam still has the
+        // built input, so the echo is restored where it can be.
         let protocol = self.entry.protocol();
         if let Ok(key) = protocol.routing_key(req) {
-            if request_layer::refusal_for::<Eng>(key, protocol, req).is_some() {
-                return Some(&self.unreadable_body);
+            match request_layer::refusal_for::<Eng>(key, protocol, req) {
+                Some(request_layer::PreDispatchRefusal::Unreadable(_)) => {
+                    return Some(&self.unreadable_body);
+                }
+                Some(request_layer::PreDispatchRefusal::Invalid(_)) => {
+                    return Some(&self.constraint_refusal);
+                }
+                None => {}
             }
         }
         None

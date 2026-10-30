@@ -171,6 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is left to refuse is the relationship between the two members — "Omit this
         // key if you set Type to NONE" (`PutEncryptionConfig$KeyId`) — and a `KeyId`
         // that is not one of the three KMS selector forms that member documents.
+        //
+        // The missing-key refusal states the service's own FIXED sentence for that
+        // condition ([`crate::state::ENCRYPTION_KEY_ID_REQUIRED_MESSAGE`]), which a
+        // caller recognising a re-promptable misconfiguration reads.
         let refuse = |message: String| -> PutEncryptionConfigError {
             PutEncryptionConfigErrorModeled::InvalidRequestException(InvalidRequestException {
                 message: Some(message),
@@ -181,9 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ENCRYPTION_TYPE_KMS => {
                 let Some(key_id) = input.key_id else {
                     return Err(refuse(
-                        "KeyId is required when Type is KMS: it selects the KMS key to \
-                         encrypt with"
-                            .to_string(),
+                        crate::state::ENCRYPTION_KEY_ID_REQUIRED_MESSAGE.to_string(),
                     ));
                 };
                 if !crate::state::is_kms_key_selector(&key_id) {
