@@ -165,6 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut guard = state.lock();
+        // Which contacts this update must not reach is a question about statuses the clock
+        // moves on its own: a contact is confirmed, carried through its pass and its
+        // release completed at instants its own timestamps recorded. Each move was owed at
+        // this instant whether or not anybody called, so materialising them first is what
+        // makes this update judge the statuses that hold now.
+        guard.settle_due_contacts();
 
         if !guard
             .mission_profiles
@@ -239,6 +245,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     UpdateMissionProfileErrorModeled::InvalidParameterException(refusal).into(),
                 );
             }
+        }
+
+        // "Updating a mission profile will not update the execution parameters for
+        // existing future contacts", so an update that REWIRES the profile's dataflows
+        // leaves the pass of every contact still to be flown against it on the wiring that
+        // contact was reserved with: that graph is kept on those contacts first, and the
+        // replacement below then moves the profile alone. Only an update that really moves
+        // the wiring keeps anything — one carrying the graph the profile already holds
+        // changes no execution parameter, and a contact whose pass is over or released has
+        // none left to protect (`state::freeze_contact_dataflow_edges`). Done after every
+        // gate above, so a REFUSED update writes nothing.
+        let rewires = input.dataflow_edges.as_deref().is_some_and(|edges| {
+            guard
+                .mission_profiles
+                .get(&input.mission_profile_id)
+                .is_some_and(|stored| stored.dataflow_edges != edges)
+        });
+        if rewires {
+            guard.freeze_contact_dataflow_edges(&input.mission_profile_id);
         }
 
         let stored = guard

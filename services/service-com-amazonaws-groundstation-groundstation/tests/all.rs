@@ -103,6 +103,8 @@ mod minute_usage;
 mod mission_profile_deletion;
 #[path = "all/mission_profile_endpoint_group_agreement.rs"]
 mod mission_profile_endpoint_group_agreement;
+#[path = "all/mission_profile_update_reach.rs"]
+mod mission_profile_update_reach;
 #[path = "all/non_empty_response_members.rs"]
 mod non_empty_response_members;
 #[path = "all/not_found_messages.rs"]

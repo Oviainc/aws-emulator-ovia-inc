@@ -356,6 +356,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // been spent yet: a cancel before the pass gives the whole window back.
             cancellation_settles_at: None,
             antenna_time_spent: false,
+            // The wiring of the pass is the profile's for as long as the profile holds the
+            // one this contact was reserved against: it is copied onto the contact only
+            // when an update of that profile moves away from it
+            // (`crate::state::ComAmazonawsGroundstationGroundstationState::freeze_contact_dataflow_edges`),
+            // so one edge is recorded once and a contact whose profile is gone says
+            // nothing about a wiring nothing knows any more.
+            reserved_dataflow_edges: None,
         };
 
         // A contact has an ARN even though no operation in this slice returns one: it is

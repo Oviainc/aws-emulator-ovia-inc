@@ -197,10 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The dataflows of the pass: one per dataflow edge of the mission profile the
-        // contact is reserved against, read through the one helper every reader of a
-        // contact's dataflows shares (`crate::state::contact_dataflow_list`).
-        let dataflow_list = guard.contact_dataflow_list(&contact.mission_profile_arn, &contact.region);
+        // The dataflows of the pass: one per dataflow edge of the graph this contact is
+        // flown through — the wiring it was reserved with, whether that still is its
+        // profile's or is now held on the contact — read through the one helper every
+        // reader of a contact's dataflows shares (`crate::state::contact_dataflow_list`).
+        let dataflow_list = guard.contact_dataflow_list(contact);
 
         Ok(DescribeContactOutput {
             contact_id: Some(contact.contact_id.clone()),

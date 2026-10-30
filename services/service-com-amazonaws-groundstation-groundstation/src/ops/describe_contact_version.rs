@@ -254,8 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             contact_status: Some(contact.contact_status.clone()),
             region: Some(contact.region.clone()),
             tags: contact.response_tags(),
-            dataflow_list: guard
-                .contact_dataflow_list(&contact.mission_profile_arn, &contact.region),
+            dataflow_list: guard.contact_dataflow_list(contact),
             // The version-scoped facts: what THIS version flies the contact with, and the
             // version record itself.
             satellite_arn: version.satellite_arn.clone(),

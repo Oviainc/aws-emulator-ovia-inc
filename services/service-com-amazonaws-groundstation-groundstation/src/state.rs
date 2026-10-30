@@ -1485,6 +1485,17 @@ pub struct Contact {
     /// A record of minutes SPENT, not of an antenna held: which antennas a ground station
     /// still has held is [`Contact::reserves_antenna`].
     pub antenna_time_spent: bool,
+    /// The dataflow wiring this contact's pass is flown through, once that wiring is no
+    /// longer the one its mission profile holds: the edges the profile carried at the
+    /// moment an update of it moved away from them
+    /// ([`ComAmazonawsGroundstationGroundstationState::freeze_contact_dataflow_edges`]).
+    ///
+    /// `None` while the profile still holds the wiring this contact was reserved against,
+    /// which is every contact until such an update lands — so there is ONE record of each
+    /// edge for as long as the profile and the contact agree about it, and a contact whose
+    /// profile was deleted without ever having been rewired under it still reports no
+    /// wiring at all rather than an empty one.
+    pub reserved_dataflow_edges: Option<Vec<Vec<String>>>,
 }
 
 /// The model's `VersionStatus` values, whose full set is `UPDATING`, `ACTIVE`,
@@ -4771,7 +4782,8 @@ impl ComAmazonawsGroundstationGroundstationState {
     ///
     /// A contact carries the ARN of the profile it was reserved against
     /// ([`Contact::mission_profile_arn`]) and reads the wiring of its pass back out of
-    /// that profile ([`Self::contact_dataflow_list`]), so a contact holds its profile for
+    /// that profile until an update of it moves away from that wiring
+    /// ([`Self::contact_dataflow_edges`]), so a contact holds its profile for
     /// as long as it is NOT terminal ([`Contact::is_non_terminal`]) — once its pass is
     /// over or its reservation released, nothing of it is still to be flown and it no
     /// longer depends on the profile. Sorted, so a refusal listing them reads the same on
@@ -4926,7 +4938,7 @@ impl ComAmazonawsGroundstationGroundstationState {
     ///
     /// Written against a graph rather than a stored profile, so the writes that take one
     /// ([`Self::dataflow_endpoint_group_fault`]) and the reads of one that was stored
-    /// ([`Self::wired_dataflow_endpoint_names`]) resolve it the same way.
+    /// ([`Self::contact_wired_dataflow_endpoint_names`]) resolve it the same way.
     pub fn dataflow_endpoint_names_wired_by<'a>(&'a self, edges: &[Vec<String>]) -> Vec<&'a str> {
         let mut names: Vec<&str> = Vec::new();
         let selected = edges
@@ -5073,31 +5085,89 @@ impl ComAmazonawsGroundstationGroundstationState {
         carrying.pop()
     }
 
-    /// The dataflows of a contact's pass, as a `DataflowList`: one entry per dataflow edge
-    /// of the mission profile `mission_profile_arn` names, each end reported by the config
-    /// that edge wired it to and placed in `contact_region` unless the config names a region
-    /// of its own ([`dataflow_detail`]).
+    /// The dataflow graph `contact`'s pass is flown through, or `None` when nothing of its
+    /// wiring is known any more.
     ///
-    /// Read from the profile rather than copied into the contact, so there is one record of
-    /// each edge; a contact whose profile has since been DELETED (a terminal contact no
-    /// longer holds its profile) reports NO dataflow list at all rather than an empty one,
-    /// since what it was wired to is then no longer known.
+    /// The wiring a contact is flown with is the one it was RESERVED with: the edges held
+    /// on the contact once an update of its profile moved away from them
+    /// ([`Contact::reserved_dataflow_edges`]), and otherwise the edges the profile it names
+    /// still holds — one record of each edge for as long as the two agree about it. A
+    /// contact that holds no wiring of its own and whose profile has since been DELETED (a
+    /// terminal contact no longer holds its profile) knows nothing of what it was wired to,
+    /// which is what `None` says.
+    ///
+    /// The ONE answer to "what is this contact wired to", so a read of its dataflows
+    /// ([`Self::contact_dataflow_list`]) and the question of what resources its pass still
+    /// depends on ([`Self::contact_wired_dataflow_endpoint_names`]) cannot disagree.
+    pub fn contact_dataflow_edges<'a>(
+        &'a self,
+        contact: &'a Contact,
+    ) -> Option<&'a [Vec<String>]> {
+        if let Some(edges) = contact.reserved_dataflow_edges.as_deref() {
+            return Some(edges);
+        }
+        Some(
+            self.mission_profile_by_arn(&contact.mission_profile_arn)?
+                .dataflow_edges
+                .as_slice(),
+        )
+    }
+
+    /// The dataflows of `contact`'s pass, as a `DataflowList`: one entry per dataflow edge
+    /// of the graph it is flown through ([`Self::contact_dataflow_edges`]), each end
+    /// reported by the config that edge wired it to and placed in the contact's own region
+    /// unless the config names a region of its own ([`dataflow_detail`]). `None` when that
+    /// graph is no longer known at all.
     ///
     /// Shared by every read that reports a contact's dataflows, so two readers of one
     /// stored wiring cannot describe it differently.
-    pub fn contact_dataflow_list(
-        &self,
-        mission_profile_arn: &str,
-        contact_region: &str,
-    ) -> Option<Vec<DataflowDetail>> {
-        let profile = self.mission_profile_by_arn(mission_profile_arn)?;
+    pub fn contact_dataflow_list(&self, contact: &Contact) -> Option<Vec<DataflowDetail>> {
+        let edges = self.contact_dataflow_edges(contact)?;
         Some(
-            profile
-                .dataflow_edges
+            edges
                 .iter()
-                .map(|edge| dataflow_detail(self, edge, contact_region))
+                .map(|edge| dataflow_detail(self, edge, &contact.region))
                 .collect(),
         )
+    }
+
+    /// Keep the dataflow wiring of every contact an update of the mission profile
+    /// `mission_profile_id` must not reach, to be called BEFORE that update replaces it.
+    ///
+    /// "Updating a mission profile will not update the execution parameters for existing
+    /// future contacts" (`smithy_query(query="doc", shape="UpdateMissionProfile")`), and
+    /// the dataflows of a pass are such a parameter: a contact that still holds its profile
+    /// ([`Contact::is_non_terminal`] — the same contacts that keep the profile from being
+    /// deleted, [`Self::contacts_using_mission_profile`]) therefore goes on being flown
+    /// through the graph it was reserved with. So the graph the profile holds NOW is copied
+    /// onto each of those contacts first, and the update then moves the profile alone.
+    ///
+    /// A contact that already holds a graph of its own keeps it: that one is older, so it
+    /// is the wiring that contact was reserved with, and a second update cannot rewire it
+    /// either. A contact ALREADY terminal when the update lands has no pass left to fly and
+    /// keeps nothing, so what it reports stays the profile's and a profile deleted out from
+    /// under it still leaves it reporting no wiring at all.
+    ///
+    /// A contact that goes terminal LATER keeps the graph it was flown with, which is the
+    /// record of that pass: becoming terminal gives nothing back, exactly as the pass
+    /// stages do not give back the antenna time a contact has spent
+    /// ([`Contact::antenna_time_spent`]). So two terminal contacts of one profile can
+    /// report different wirings — the one each was flown through — and only a contact
+    /// nothing ever rewired has no wiring of its own to report once its profile is gone.
+    pub fn freeze_contact_dataflow_edges(&mut self, mission_profile_id: &str) {
+        let Some(profile) = self.mission_profiles.get(mission_profile_id) else {
+            return;
+        };
+        let mission_profile_arn = profile.mission_profile_arn.clone();
+        let edges = profile.dataflow_edges.clone();
+        for contact in self.contacts.values_mut() {
+            if contact.mission_profile_arn == mission_profile_arn
+                && contact.is_non_terminal()
+                && contact.reserved_dataflow_edges.is_none()
+            {
+                contact.reserved_dataflow_edges = Some(edges.clone());
+            }
+        }
     }
 
     /// The tags of the resource `arn` names, when this service holds one.
@@ -5186,25 +5256,27 @@ impl ComAmazonawsGroundstationGroundstationState {
         }
     }
 
-    /// The names of the dataflow endpoints the pass of a contact reserved against the
-    /// mission profile `mission_profile_arn` names is wired to, in a stable order and
-    /// without repeats; empty when that profile wires its dataflows to no endpoint, and
-    /// when the ARN names no profile this account holds.
+    /// The names of the dataflow endpoints `contact`'s pass is wired to, in a stable order
+    /// and without repeats; empty when its dataflows are wired to no endpoint, and when
+    /// nothing of its wiring is known any more.
     ///
     /// A dataflow edge ends at the config its `ConfigArn` names, and a
     /// `dataflowEndpointConfig` selects an endpoint of this account by name
-    /// (`dataflowEndpointName`), so those names are what the pass is wired to. This is the
-    /// resolution a read of the contact already takes when it reports the endpoint behind
-    /// each edge end ([`dataflow_end`]), read from the profile rather than copied into the
-    /// contact, so the in-use question and the read cannot disagree about what a pass is
-    /// wired to. The graph is resolved by [`Self::dataflow_endpoint_names_wired_by`], the
-    /// one reader of a graph's endpoint selections, and the names are then sorted so a
-    /// refusal listing them reads the same on every call.
-    pub fn wired_dataflow_endpoint_names(&self, mission_profile_arn: &str) -> Vec<&str> {
-        let Some(profile) = self.mission_profile_by_arn(mission_profile_arn) else {
+    /// (`dataflowEndpointName`), so those names are what the pass is wired to. The graph is
+    /// the contact's own ([`Self::contact_dataflow_edges`]) — the same graph a read of the
+    /// contact reports the endpoint behind each edge end of ([`dataflow_end`]), so the
+    /// in-use question and the read cannot disagree about what a pass is wired to. Its
+    /// endpoint selections are resolved by [`Self::dataflow_endpoint_names_wired_by`], the
+    /// one reader of a graph's selections, and the names are then sorted so a refusal
+    /// listing them reads the same on every call.
+    pub fn contact_wired_dataflow_endpoint_names<'a>(
+        &'a self,
+        contact: &'a Contact,
+    ) -> Vec<&'a str> {
+        let Some(edges) = self.contact_dataflow_edges(contact) else {
             return Vec::new();
         };
-        let mut names = self.dataflow_endpoint_names_wired_by(&profile.dataflow_edges);
+        let mut names = self.dataflow_endpoint_names_wired_by(edges);
         names.sort_unstable();
         names.dedup();
         names
@@ -5214,8 +5286,8 @@ impl ComAmazonawsGroundstationGroundstationState {
     /// the dataflow endpoint group `dataflow_endpoint_group_id` holds, in a stable order;
     /// empty when nothing holds it, and when no group has that id.
     ///
-    /// A contact is wired to the endpoints its profile's dataflow edges select by name
-    /// ([`Self::wired_dataflow_endpoint_names`]), and an endpoint carries that name whichever
+    /// A contact is wired to the endpoints its own dataflow edges select by name
+    /// ([`Self::contact_wired_dataflow_endpoint_names`]), and an endpoint carries that name whichever
     /// member of its group describes it ([`endpoint_name`]), so a contact holds the group
     /// holding any endpoint its wiring names. It holds it for as long as it is NOT terminal
     /// ([`Contact::is_non_terminal`]) — once its pass is over or its reservation released,
@@ -5246,7 +5318,7 @@ impl ComAmazonawsGroundstationGroundstationState {
             .filter(|contact| {
                 contact.is_non_terminal()
                     && self
-                        .wired_dataflow_endpoint_names(&contact.mission_profile_arn)
+                        .contact_wired_dataflow_endpoint_names(contact)
                         .iter()
                         .any(|wired| held.contains(wired))
             })
