@@ -41,5 +41,7 @@ mod secret_version_history;
 mod secret_version_ids;
 #[path = "all/secret_version_stages.rs"]
 mod secret_version_stages;
+#[path = "all/secret_write_targets.rs"]
+mod secret_write_targets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
