@@ -174,40 +174,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model nothing reuses, including one of a type nothing may reuse, is in no
         // relationship and is answered with the empty page rather than refused.
         //
-        // A stable order is what makes `nextToken` resumable: the asset models
-        // holding the composite models oldest first, ties broken by id so two
-        // created in the same instant still order deterministically — the order
-        // `ListAssetModels` enumerates in — and within one holder the stored order
-        // of its composite models.
-        let mut holders: Vec<&crate::state::AssetModelRecord> =
-            store.asset_models.values().collect();
-        holders.sort_by(|left, right| {
-            left.creation_date
-                .cmp(&right.creation_date)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-
+        // That enumeration is `composite_models_reusing`, this crate's one
+        // definition of "which composite models reuse this asset model" — the same
+        // one `DeleteAssetModel` refuses a still-reused model by, so what is listed
+        // here and what blocks that delete cannot drift. Its order is what makes
+        // `nextToken` resumable: the asset models holding the composite models
+        // oldest first, ties broken by id so two created in the same instant still
+        // order deterministically — the order `ListAssetModels` enumerates in — and
+        // within one holder the stored order of its composite models.
         let mut summaries: Vec<CompositionRelationshipSummary> = Vec::new();
-        for holder in holders {
-            for composite in &holder.composite_models {
-                // A composite model's link — the component model it reuses — is
-                // keyed by its id, so one carrying no id holds no link and is in no
-                // relationship to report here.
-                let Some(composite_id) = composite.id.as_deref() else {
-                    continue;
-                };
-                if holder.composed_asset_model_id(composite_id) != Some(asset_model_id.as_str()) {
-                    continue;
-                }
-                // Every member is read from the stored composite model and from the
-                // asset model holding it, so a listed relationship reports the same
-                // composite model `DescribeAssetModelCompositeModel` reads back.
-                summaries.push(CompositionRelationshipSummary {
-                    asset_model_id: holder.id.clone(),
-                    asset_model_composite_model_id: composite_id.to_string(),
-                    asset_model_composite_model_type: composite.r#type.clone(),
-                });
-            }
+        for (holder_id, composite_id) in store.composite_models_reusing(&asset_model_id) {
+            // Every member is read from the stored composite model and from the
+            // asset model holding it, so a listed relationship reports the same
+            // composite model `DescribeAssetModelCompositeModel` reads back.
+            let Some(composite) = store
+                .asset_models
+                .get(&holder_id)
+                .and_then(|holder| holder.composite_model(&composite_id))
+            else {
+                continue;
+            };
+            summaries.push(CompositionRelationshipSummary {
+                asset_model_id: holder_id,
+                asset_model_composite_model_id: composite_id,
+                asset_model_composite_model_type: composite.r#type.clone(),
+            });
         }
 
         // This enumeration's resume point is a composite model's id — globally

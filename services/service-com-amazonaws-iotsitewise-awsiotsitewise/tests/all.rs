@@ -27,6 +27,13 @@ mod task_delete;
 #[path = "all/query_results.rs"]
 mod query_results;
 
+// `asset_model_delete_dependents` is declared HERE, beside the suite above, for
+// the reason the note above gives: the sorted list and the END of this file are
+// both stretches every concurrent iotsitewise change puts a declaration of its
+// own in. Fold it into the list once the churn settles.
+#[path = "all/asset_model_delete_dependents.rs"]
+mod asset_model_delete_dependents;
+
 // `composite_model_definition_views` is declared HERE, beside the suite above, for
 // the reason its note gives: the sorted list and the END of this file are both
 // where every concurrent iotsitewise change puts a declaration of its own. Fold it

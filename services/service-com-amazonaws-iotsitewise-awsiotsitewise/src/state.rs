@@ -6324,23 +6324,49 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         }
     }
 
-    /// The stored asset models holding a composite model whose component model is
-    /// `asset_model_id`: the composition relationships of that model, read from
-    /// the holder's side, which is the one place a composite model's reuse link
-    /// is recorded.
-    fn asset_models_reusing(&self, asset_model_id: &str) -> Vec<String> {
-        self.asset_models
-            .values()
-            .filter(|holder| {
-                holder.composite_models.iter().any(|composite| {
-                    composite
-                        .id
-                        .as_deref()
-                        .and_then(|composite_id| holder.composed_asset_model_id(composite_id))
-                        == Some(asset_model_id)
+    /// Every stored composite model that REUSES asset model `asset_model_id` as
+    /// its component model, as `(the asset model holding it, its
+    /// assetModelCompositeModelId)` pairs: the composition relationships of that
+    /// model, read from the holder's side, which is the one place a composite
+    /// model's reuse link is recorded.
+    ///
+    /// ONE definition of "which composite models reuse this asset model", so the
+    /// listing that reports those relationships, the propagation that follows
+    /// them and the delete that has to refuse while one stands all answer from
+    /// the same enumeration. A composite model carrying no id holds no link and
+    /// so is in no relationship.
+    ///
+    /// Ordered the way the relationships are reported: the holding asset models
+    /// oldest first, ties broken by id so two created in the same instant still
+    /// order deterministically, and within one holder the stored order of its
+    /// composite models.
+    pub fn composite_models_reusing(&self, asset_model_id: &str) -> Vec<(String, String)> {
+        let mut holders: Vec<&AssetModelRecord> = self.asset_models.values().collect();
+        holders.sort_by(|left, right| {
+            left.creation_date
+                .cmp(&right.creation_date)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        holders
+            .into_iter()
+            .flat_map(|holder| {
+                holder.composite_models.iter().filter_map(move |composite| {
+                    let composite_id = composite.id.as_deref()?;
+                    (holder.composed_asset_model_id(composite_id) == Some(asset_model_id))
+                        .then(|| (holder.id.clone(), composite_id.to_string()))
                 })
             })
-            .map(|holder| holder.id.clone())
+            .collect()
+    }
+
+    /// The stored asset models holding a composite model whose component model is
+    /// `asset_model_id`, each named once: the holders of its composition
+    /// relationships ([`Self::composite_models_reusing`]).
+    fn asset_models_reusing(&self, asset_model_id: &str) -> Vec<String> {
+        let mut named: HashSet<String> = HashSet::new();
+        self.composite_models_reusing(asset_model_id)
+            .into_iter()
+            .filter_map(|(holder, _)| named.insert(holder.clone()).then_some(holder))
             .collect()
     }
 

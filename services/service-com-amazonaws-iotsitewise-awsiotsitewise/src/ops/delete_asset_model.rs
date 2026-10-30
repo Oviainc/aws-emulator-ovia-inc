@@ -301,10 +301,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A model still in use cannot go away: neither while assets instantiate it,
-        // nor while another model's hierarchy names it as the child model. Either
-        // way this is a TERMINAL request error — the caller has to delete the
-        // dependent resource first, and no retry of this call can succeed — so it
-        // is `InvalidRequestException` (400) and not the retryable
+        // nor while another model's hierarchy names it as the child model, nor
+        // while another model's composite model reuses it as its component model.
+        // Every such reference is a dependency this store RECORDS, and each is a
+        // TERMINAL request error — the caller has to delete the dependent resource
+        // first, and no retry of this call can succeed — so it is
+        // `InvalidRequestException` (400) and not the retryable
         // `ConflictingOperationException` (409), which states a transient
         // conflict between two operations on one resource.
         let referencing_asset = store
@@ -335,6 +337,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: format!(
                         "Asset model {id} is referenced by a hierarchy of asset model \
                          {referrer} when delete was called"
+                    ),
+                }),
+            ));
+        }
+        // The third direction the store records: a component-model-based composite
+        // model of ANOTHER asset model names this model as the component model it
+        // reuses — the composition relationship
+        // [`crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState::composite_models_reusing`]
+        // enumerates and `ListCompositionRelationships` reports. Such a composite
+        // model stores no properties of its own and reads them through from this
+        // model on every read, so removing this model would empty it rather than
+        // leave it as it was. A composite model of the model being deleted is NOT
+        // a dependant: it goes away with the model it lives on, exactly as a
+        // hierarchy of the model itself does.
+        if let Some((referrer, composite_model_id)) = store
+            .composite_models_reusing(&id)
+            .into_iter()
+            .find(|(holder, _)| holder != &id)
+        {
+            return Err(DeleteAssetModelError::Modeled(
+                DeleteAssetModelErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: format!(
+                        "Asset model {id} is referenced by composite model \
+                         {composite_model_id} of asset model {referrer} when delete was called"
                     ),
                 }),
             ));
