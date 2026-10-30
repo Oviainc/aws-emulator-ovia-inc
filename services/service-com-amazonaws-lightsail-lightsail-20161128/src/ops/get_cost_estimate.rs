@@ -36,6 +36,14 @@
 //! that report those resources resolve them. Region-scoping them is a change to
 //! the store's keys, and so belongs to the store rather than to this operation.
 //!
+//! Resolving a name is not the same as being allowed to report what it resolved:
+//! a record of a kind Lightsail serves from the N. Virginia endpoint ALONE — a
+//! CDN distribution, a DNS zone — is reported through that Region only, so once
+//! the name has resolved to one of those kinds a request made elsewhere is
+//! refused with the modelled `InvalidInputException` carrying the documented
+//! restriction, exactly as that record's own reader refuses it
+//! (`crate::state::domain_region_refusal_for_resource_type`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -211,6 +219,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             billed_resources(store, &region, &input.resource_name)
         })
         .ok_or_else(unavailable)??;
+
+        // A record of a kind the documented restriction covers is REPORTED only
+        // through the Region its own API is served in, so an estimate of one is
+        // refused here exactly as that record's own create, read and delete
+        // refuse. This door admits every kind of record, so WHICH kind the name
+        // addresses is known only once it has been resolved above — and the
+        // question is put to the crate's one owner of that rule rather than
+        // re-derived here.
+        if let Some(message) = billed.iter().find_map(|resource| {
+            crate::state::domain_region_refusal_for_resource_type(
+                ctx.parts(),
+                resource.resource_type,
+            )
+        }) {
+            return Err(invalid(message));
+        }
 
         // "A cost estimate will not generate for a resource that has been deleted":
         // a name this account holds no resource under is the service's

@@ -103,6 +103,8 @@ mod container_service_public_endpoint;
 mod container_service_update;
 #[path = "all/cost_estimate.rs"]
 mod cost_estimate;
+#[path = "all/cost_estimate_region_restriction.rs"]
+mod cost_estimate_region_restriction;
 #[path = "all/disk_attach_outstanding_settle.rs"]
 mod disk_attach_outstanding_settle;
 #[path = "all/disk_attachment.rs"]
