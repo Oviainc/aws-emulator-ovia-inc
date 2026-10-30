@@ -15,7 +15,7 @@
 //! members one report happened to cite:
 //!
 //! 1. the envelope is `<N> validation error(s) detected: ` over one clause per failing
-//!    member, joined with `; ` ([`refusal_message`]) — the framework's own envelope,
+//!    member, joined with `; ` ([`refusal_sentence`]) — the framework's own envelope,
 //!    kept so the two refusal paths cannot disagree. `<N>` is the number of violations
 //!    COLLECTED, which for an absent `@required` member is one: the codec stops at the
 //!    first one it misses, so a request missing two is stated as missing one. That is the
@@ -43,6 +43,14 @@
 //! recorded map rendering to state and nothing here invents one. Meeting a map therefore
 //! declines every rendering of that request, and each clause keeps the value the
 //! framework stored.
+//!
+//! A condition the model's constraint traits CANNOT express is refused by the handler that
+//! owns it, so the framework's walk never collects it and it reaches no [`Violation`]. Such
+//! a refusal is still one of this service's input-validation refusals and is worded here
+//! too: the handler states its own subject, member path and requirement and builds the
+//! sentence through [`clause`], [`echoed_value`] and [`refusal_sentence`], which is why
+//! those three are the crate's and not this module's alone. Nothing about the CONDITION
+//! moves here — only the sentence.
 //!
 //! A `@sensitive` member reached INSIDE a collection declines the same way, so rule 3
 //! holds wherever a value is stated and not only where the violation was raised. Declining
@@ -201,18 +209,45 @@ pub(super) fn refusal_message(
     let mut clauses: Vec<String> = Vec::with_capacity(violations.len());
     for violation in violations {
         let requirement = requirement_of(&violation.kind)?;
-        let subject = subject(violation, collections);
-        clauses.push(format!(
-            "{subject} at '{}' failed to satisfy constraint: {requirement}",
-            violation.path
+        clauses.push(clause(
+            &subject(violation, collections),
+            &violation.path,
+            &requirement,
         ));
     }
-    match clauses.len() {
-        0 => None,
-        1 => Some(format!("1 validation error detected: {}", clauses[0])),
-        n => Some(format!(
-            "{n} validation errors detected: {}",
-            clauses.join("; ")
+    refusal_sentence(&clauses)
+}
+
+/// ONE clause of the sentence: what the member held, the dotted path it is at, and the
+/// requirement it failed.
+///
+/// The only place this service spells that skeleton, so a clause is worded identically
+/// whether the violation came from the framework's constraint walk or from a handler
+/// refusing a condition the model cannot express.
+pub(crate) fn clause(subject: &str, member_path: &str, requirement: &str) -> String {
+    format!("{subject} at '{member_path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The subject of a clause about a member that HELD a value: the value echoed between
+/// quotes. The other two subjects a clause can state — an absent member, and a member
+/// whose value is never echoed — are [`subject`]'s own.
+pub(crate) fn echoed_value(value: &str) -> String {
+    format!("Value '{value}'")
+}
+
+/// Rule 1's envelope over the clauses of ONE refusal: the clause count, then the clauses
+/// joined with `; `, in the singular for a single clause.
+///
+/// `None` for no clauses at all — there is nothing refused, so there is no sentence to
+/// state.
+pub(crate) fn refusal_sentence(clauses: &[String]) -> Option<String> {
+    match clauses {
+        [] => None,
+        [only] => Some(format!("1 validation error detected: {only}")),
+        many => Some(format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
         )),
     }
 }
@@ -280,10 +315,10 @@ fn subject(violation: &Violation, collections: &RenderedCollections) -> String {
     }
     if let Some(collection) = collections.get(&violation.path) {
         if collection.summary == stored {
-            return format!("Value '{}'", collection.value);
+            return echoed_value(&collection.value);
         }
     }
-    format!("Value '{stored}'")
+    echoed_value(stored)
 }
 
 /// A `@pattern` expression without the anchors a model may spell it with: the service

@@ -70,7 +70,11 @@
 //! the model accepts is delegated untouched to the generated operation, which stays the
 //! only thing that serves it: each handler, its state and its 501 are exactly as before.
 
-mod validation;
+// `pub(crate)` because this module owns the WORDS of every input-validation refusal of
+// this service, including the clause a handler builds for a condition the model's
+// constraint traits cannot express: the clause and envelope builders are reached from
+// `crate::ops`, while everything that reads a `Violation` stays `pub(super)` to this file.
+pub(crate) mod validation;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::SerdeError;

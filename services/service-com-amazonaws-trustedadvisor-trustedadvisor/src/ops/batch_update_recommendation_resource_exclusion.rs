@@ -104,6 +104,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The module that owns the WORDS of this service's input-validation refusals. This
+// handler raises one of its own (see `repeated_arn_refusal`) and builds its sentence
+// there rather than spelling the clause and the envelope a second time.
+use crate::service::validation;
+
 /// Every recommendation-resource ARN the entry list names more than once, in the
 /// order in which each one first repeats.
 ///
@@ -123,33 +128,38 @@ fn repeated_arns(exclusions: &[RecommendationResourceExclusion]) -> Vec<&str> {
     repeated
 }
 
-/// The `message` of the refusal a repeated ARN earns, in the sentence this service
-/// builds every input-validation refusal from (see `crate::service::validation`):
-/// the clause count, then one `<subject> at '<member path>' failed to satisfy
-/// constraint: <requirement>` clause per offending value, joined with `; `. The
-/// subject is the repeated ARN itself — the value the caller has to fix — and not
-/// the whole list, so the message stays bounded by the number of distinct
-/// repeated ARNs.
+/// The member path a repeated-ARN clause names: the list member whose elements the
+/// repeat is in, which is the member a caller has to change.
+const REPEATED_ARN_MEMBER_PATH: &str = "recommendationResourceExclusions";
+
+/// What that member had to satisfy, worded the way the framework words a requirement
+/// about a list member's own values.
+const REPEATED_ARN_REQUIREMENT: &str = "Member must have unique arn values";
+
+/// The `message` of the refusal a repeated ARN earns.
 ///
-/// `repeated` must be non-empty: there is no refusal to word otherwise.
-fn repeated_arn_refusal(repeated: &[&str]) -> String {
+/// Only the CONDITION is this handler's — the modelled constraint traits cannot express
+/// it, so the framework's walk never collects it. The SENTENCE is the service's and is
+/// built by the module that owns it ([`crate::service::validation`]): one clause per
+/// offending value, inside that module's envelope, so this refusal and the ones worded
+/// from the framework's violations cannot disagree.
+///
+/// The subject is the repeated ARN itself — the value the caller has to fix — and not
+/// the whole list, so the message stays bounded by the number of distinct repeated ARNs.
+///
+/// `None` when nothing repeats: there is no refusal to word.
+fn repeated_arn_refusal(repeated: &[&str]) -> Option<String> {
     let clauses: Vec<String> = repeated
         .iter()
         .map(|arn| {
-            format!(
-                "Value '{arn}' at 'recommendationResourceExclusions' failed to satisfy \
-                 constraint: Member must have unique arn values"
+            validation::clause(
+                &validation::echoed_value(arn),
+                REPEATED_ARN_MEMBER_PATH,
+                REPEATED_ARN_REQUIREMENT,
             )
         })
         .collect();
-    match clauses.as_slice() {
-        [only] => format!("1 validation error detected: {only}"),
-        many => format!(
-            "{} validation errors detected: {}",
-            many.len(),
-            many.join("; ")
-        ),
-    }
+    validation::refusal_sentence(&clauses)
 }
 
 /// One refused entry of the batch: the ARN it names, the modelled error shape a
@@ -276,12 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // states for one resource, so the WHOLE request is refused and nothing is
         // applied — including the entries that name no repeated ARN.
         let repeated = repeated_arns(&input.recommendation_resource_exclusions);
-        if !repeated.is_empty() {
+        if let Some(message) = repeated_arn_refusal(&repeated) {
             return Err(
                 BatchUpdateRecommendationResourceExclusionErrorModeled::ValidationException(
-                    ValidationException {
-                        message: repeated_arn_refusal(&repeated),
-                    },
+                    ValidationException { message },
                 )
                 .into(),
             );
