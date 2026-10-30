@@ -21,21 +21,24 @@ use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::EmulatedS
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every case signs for.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The `X-Amz-Target` prefix of this service, which is its Smithy service shape name.
 const TARGET_PREFIX: &str = "AmazonDMSv20160101";
 
 /// The account segment every ARN this emulator mints carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A router carrying exactly this service, over one shared engine.
-struct Emulator {
+///
+/// Shared with the other suites in this target, so every case drives the same wire
+/// path.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -45,7 +48,7 @@ impl Emulator {
 
     /// Call `operation` with `body`, signed for [`REGION`] so the service resolves the
     /// request's region the way it does in production (the SigV4 credential scope).
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -67,7 +70,7 @@ impl Emulator {
     }
 
     /// Call `operation`, asserting a 200 and returning the response body.
-    async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, response) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -119,7 +122,7 @@ fn error_code(response: &Value) -> String {
 }
 
 /// The string at `pointer` in `value`, or a marker naming its absence.
-fn text(value: &Value, pointer: &str) -> String {
+pub(crate) fn text(value: &Value, pointer: &str) -> String {
     value
         .pointer(pointer)
         .and_then(Value::as_str)

@@ -15,7 +15,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Endpoint, ReplicationInstance, ReplicationTask, Tag, VpcSecurityGroupMembership,
+    DmsTransferSettings, DocDbSettings, DynamoDbSettings, ElasticsearchSettings, Endpoint,
+    GcpMySQLSettings, IBMDb2Settings, KafkaSettings, KinesisSettings, MicrosoftSQLServerSettings,
+    MongoDbSettings, MySQLSettings, NeptuneSettings, OracleSettings, PostgreSQLSettings,
+    RedisSettings, RedshiftSettings, ReplicationInstance, ReplicationTask, S3Settings,
+    SybaseSettings, Tag, TimestreamSettings, VpcSecurityGroupMembership,
 };
 
 /// A replication instance `CreateReplicationInstance` has accepted but not finished
@@ -73,6 +77,99 @@ pub const DEFAULT_ENGINE_VERSION: &str = "3.5.4";
 /// The SSL mode an endpoint gets when the request names none: the `Endpoint$SslMode`
 /// doc says "The default value is none."
 pub const DEFAULT_SSL_MODE: &str = "none";
+
+/// How an engine settings structure reports authentication when the request named no
+/// method.
+///
+/// DMS reports `password` there — authentication by the endpoint's own user name and
+/// password — for an endpoint created without one, and `password` is the value each
+/// engine's authentication-method enum models for exactly that
+/// (`MySQLAuthenticationMethod`, `PostgreSQLAuthenticationMethod`,
+/// `OracleAuthenticationMethod` and `SqlServerAuthenticationMethod`); the other values
+/// each name an alternative the caller has to ask for (`iam`, `kerberos`).
+pub const DEFAULT_AUTHENTICATION_METHOD: &str = "password";
+
+/// Whether an endpoint a caller created is read-only. `Endpoint$IsReadOnly`: "When set
+/// to true, this endpoint is managed by DMS as part of a zero-ETL integration and
+/// cannot be modified or deleted directly" — which a caller-created endpoint is not.
+pub const DEFAULT_IS_READ_ONLY: bool = false;
+
+/// The expanded engine name each `EngineName` value carries, which is what
+/// `Endpoint$EngineDisplayName` reports: "The expanded name for the engine name. For
+/// example, if the EngineName parameter is \"aurora\", this value would be \"Amazon
+/// Aurora MySQL\"". The keys are the values `CreateEndpoint$EngineName` publishes.
+const ENGINE_DISPLAY_NAMES: &[(&str, &str)] = &[
+    ("aurora", "Amazon Aurora MySQL"),
+    ("aurora-serverless", "Amazon Aurora MySQL Serverless"),
+    ("aurora-postgresql", "Amazon Aurora PostgreSQL"),
+    ("aurora-postgresql-serverless", "Amazon Aurora PostgreSQL Serverless"),
+    ("azuredb", "Microsoft Azure SQL Database"),
+    ("azure-sql-managed-instance", "Microsoft Azure SQL Managed Instance"),
+    ("babelfish", "Babelfish"),
+    ("db2", "IBM Db2 LUW"),
+    ("db2-zos", "IBM Db2 for z/OS"),
+    ("dms-transfer", "DMS Transfer"),
+    ("docdb", "Amazon DocumentDB"),
+    ("documentdb", "Amazon DocumentDB"),
+    ("dynamodb", "Amazon DynamoDB"),
+    ("elasticsearch", "Amazon OpenSearch Service"),
+    ("gcp-mysql", "Google Cloud SQL for MySQL"),
+    ("kafka", "Apache Kafka"),
+    ("kinesis", "Amazon Kinesis Data Streams"),
+    ("mariadb", "MariaDB"),
+    ("mongodb", "MongoDB"),
+    ("mysql", "MySQL"),
+    ("neptune", "Amazon Neptune"),
+    ("opensearch", "Amazon OpenSearch Service"),
+    ("oracle", "Oracle"),
+    ("postgres", "PostgreSQL"),
+    ("redis", "Redis"),
+    ("redshift", "Amazon Redshift"),
+    ("redshift-serverless", "Amazon Redshift Serverless"),
+    ("s3", "Amazon S3"),
+    ("sqlserver", "Microsoft SQL Server"),
+    ("sybase", "SAP ASE"),
+    ("timestream", "Amazon Timestream"),
+];
+
+/// The expanded name for `engine_name`.
+///
+/// An engine name outside the published catalog is reported as given rather than
+/// guessed at: the member still carries the engine the endpoint runs. Refusing an
+/// engine name the catalog does not list belongs to the create path's own validation
+/// rule; once that lands, this fallback is unreachable for a stored endpoint.
+pub fn engine_display_name(engine_name: &str) -> String {
+    ENGINE_DISPLAY_NAMES
+        .iter()
+        .find(|(name, _)| *name == engine_name)
+        .map(|(_, display)| (*display).to_string())
+        .unwrap_or_else(|| engine_name.to_string())
+}
+
+/// The key an endpoint's connection parameters are encrypted with when the request
+/// named none: "If you don't specify a value for the KmsKeyId parameter, then DMS uses
+/// your default encryption key. KMS creates the default encryption key for your Amazon
+/// Web Services account. Your Amazon Web Services account has a different default
+/// encryption key for each Amazon Web Services Region" (`Endpoint$KmsKeyId`).
+///
+/// Derived from the region alone, so it is one key per region, stable for the life of
+/// every endpoint that reports it.
+pub fn default_kms_key_arn(region: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"dms-default-encryption-key");
+    hasher.update(region.as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let hex = hex::encode(&digest[..16]);
+    let key_id = format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    );
+    emulator_server::emulator_arn("kms", region, &format!("key/{key_id}"))
+}
 
 /// Whether a replication instance the request says nothing about is publicly
 /// accessible: the `PubliclyAccessible` doc says "The default value is true."
@@ -259,6 +356,123 @@ impl ReplicationInstanceRecord {
     }
 }
 
+/// The engine-specific settings structures an endpoint holds, as the request that
+/// created it supplied them.
+///
+/// One field per settings member `CreateEndpoint` models; `EngineName` selects the one
+/// an `Endpoint` reports. Build it through [`EngineSettings::sanitized`], which is what
+/// keeps a secret out of the store — and so out of every response.
+#[derive(Debug, Clone, Default)]
+pub struct EngineSettings {
+    /// Settings for an Amazon DynamoDB target.
+    pub dynamo_db: Option<DynamoDbSettings>,
+    /// Settings for an Amazon S3 target.
+    pub s3: Option<S3Settings>,
+    /// Settings for a DMS Transfer source.
+    pub dms_transfer: Option<DmsTransferSettings>,
+    /// Settings for a MongoDB source.
+    pub mongo_db: Option<MongoDbSettings>,
+    /// Settings for an Amazon Kinesis Data Streams target.
+    pub kinesis: Option<KinesisSettings>,
+    /// Settings for an Apache Kafka target.
+    pub kafka: Option<KafkaSettings>,
+    /// Settings for an OpenSearch target.
+    pub elasticsearch: Option<ElasticsearchSettings>,
+    /// Settings for an Amazon Neptune target.
+    pub neptune: Option<NeptuneSettings>,
+    /// Settings for an Amazon Redshift endpoint.
+    pub redshift: Option<RedshiftSettings>,
+    /// Settings for a PostgreSQL endpoint.
+    pub postgre_sql: Option<PostgreSQLSettings>,
+    /// Settings for a MySQL endpoint.
+    pub my_sql: Option<MySQLSettings>,
+    /// Settings for an Oracle endpoint.
+    pub oracle: Option<OracleSettings>,
+    /// Settings for a SAP ASE endpoint.
+    pub sybase: Option<SybaseSettings>,
+    /// Settings for a Microsoft SQL Server endpoint.
+    pub microsoft_sql_server: Option<MicrosoftSQLServerSettings>,
+    /// Settings for an IBM Db2 endpoint.
+    pub ibm_db2: Option<IBMDb2Settings>,
+    /// Settings for a DocumentDB endpoint.
+    pub doc_db: Option<DocDbSettings>,
+    /// Settings for a Redis target.
+    pub redis: Option<RedisSettings>,
+    /// Settings for a GCP MySQL source.
+    pub gcp_my_sql: Option<GcpMySQLSettings>,
+    /// Settings for an Amazon Timestream target.
+    pub timestream: Option<TimestreamSettings>,
+}
+
+/// Clear each named member of an optional settings structure.
+macro_rules! clear_members {
+    ($holder:expr, $($member:ident),+ $(,)?) => {
+        if let Some(settings) = $holder.as_mut() {
+            $(settings.$member = None;)+
+        }
+    };
+}
+
+impl EngineSettings {
+    /// These settings with every secret member dropped.
+    ///
+    /// A password a request carried is persisted nowhere, so no response can echo one
+    /// back and nothing in the store holds a credential for a real database.
+    pub fn sanitized(mut self) -> Self {
+        clear_members!(self.my_sql, password);
+        clear_members!(self.postgre_sql, password);
+        clear_members!(self.oracle, password, asm_password, security_db_encryption);
+        clear_members!(self.microsoft_sql_server, password);
+        clear_members!(self.sybase, password);
+        clear_members!(self.ibm_db2, password);
+        clear_members!(self.mongo_db, password);
+        clear_members!(self.doc_db, password);
+        clear_members!(self.redshift, password);
+        clear_members!(self.gcp_my_sql, password);
+        clear_members!(self.redis, auth_password);
+        clear_members!(self.kafka, sasl_password, ssl_client_key_password);
+        self
+    }
+}
+
+/// Fill the connection parameters an engine settings structure shares with the
+/// endpoint's own members.
+///
+/// What the settings structure itself carries wins, and the endpoint's top-level
+/// member fills what the structure left unset: an `Endpoint` reports the connection
+/// parameters the request supplied, wherever it supplied them.
+macro_rules! with_connection_parameters {
+    ($record:expr, $settings:expr) => {{
+        let record = $record;
+        let mut settings = $settings;
+        if settings.server_name.is_none() {
+            settings.server_name = record.server_name.clone();
+        }
+        if settings.port.is_none() {
+            settings.port = record.port;
+        }
+        if settings.database_name.is_none() {
+            settings.database_name = record.database_name.clone();
+        }
+        if settings.username.is_none() {
+            settings.username = record.username.clone();
+        }
+        settings
+    }};
+}
+
+/// Report [`DEFAULT_AUTHENTICATION_METHOD`] for a settings structure whose engine
+/// models an authentication method the request did not name.
+macro_rules! with_default_authentication_method {
+    ($settings:expr) => {{
+        let mut settings = $settings;
+        if settings.authentication_method.is_none() {
+            settings.authentication_method = Some(DEFAULT_AUTHENTICATION_METHOD.to_string());
+        }
+        settings
+    }};
+}
+
 /// One endpoint.
 #[derive(Debug, Clone)]
 pub struct EndpointRecord {
@@ -266,7 +480,8 @@ pub struct EndpointRecord {
     pub arn: String,
     /// The caller's identifier.
     pub identifier: String,
-    /// `source` or `target`, as `ReplicationEndpointTypeValue` models them.
+    /// `source` or `target`, as `ReplicationEndpointTypeValue` models them for a
+    /// request.
     pub endpoint_type: String,
     /// The database engine name the caller named.
     pub engine_name: String,
@@ -284,14 +499,20 @@ pub struct EndpointRecord {
     pub extra_connection_attributes: Option<String>,
     /// The SSL mode used to connect.
     pub ssl_mode: String,
-    /// The KMS key the caller named, if any.
-    pub kms_key_id: Option<String>,
+    /// The key the endpoint's connection parameters are encrypted with: the one the
+    /// caller named, or the region's default DMS key ([`default_kms_key_arn`]).
+    pub kms_key_id: String,
     /// The certificate used for the SSL connection, if the caller named one.
     pub certificate_arn: Option<String>,
     /// The role DMS assumes to reach the endpoint, if the caller named one.
     pub service_access_role_arn: Option<String>,
     /// The external table definition, if the caller named one.
     pub external_table_definition: Option<String>,
+    /// Whether DMS manages this endpoint as part of a zero-ETL integration, which
+    /// makes it read-only.
+    pub is_read_only: bool,
+    /// The engine-specific settings the endpoint carries.
+    pub settings: EngineSettings,
     /// The endpoint's tags.
     pub tags: Vec<Tag>,
     /// Creation order, so a describe scans endpoints oldest first.
@@ -299,26 +520,24 @@ pub struct EndpointRecord {
 }
 
 impl EndpointRecord {
-    /// This record as the modelled `Endpoint` shape.
-    ///
-    /// The engine-specific settings structures (`S3Settings`, `MongoDbSettings`, …)
-    /// are deliberately absent: this slice does not persist them, and several of them
-    /// carry a password, which a response must never echo.
+    /// This record as the modelled `Endpoint` shape — the ONE projection every
+    /// operation that answers with an endpoint goes through, so the create path and
+    /// the describe path report the same member set for the same endpoint.
     pub fn to_shape(&self) -> Endpoint {
-        Endpoint {
+        let mut endpoint = Endpoint {
             endpoint_identifier: Some(self.identifier.clone()),
-            endpoint_type: Some(self.endpoint_type.clone()),
+            // A response carries the endpoint type uppercased; the lowercase
+            // `source`/`target` of `ReplicationEndpointTypeValue` are the request form.
+            endpoint_type: Some(self.endpoint_type.to_ascii_uppercase()),
             engine_name: Some(self.engine_name.clone()),
-            // The expanded engine name is a catalog the model does not publish, so
-            // nothing here can compute it.
-            engine_display_name: None,
+            engine_display_name: Some(engine_display_name(&self.engine_name)),
             username: self.username.clone(),
             server_name: self.server_name.clone(),
             port: self.port,
             database_name: self.database_name.clone(),
             extra_connection_attributes: self.extra_connection_attributes.clone(),
             status: Some(self.status.clone()),
-            kms_key_id: self.kms_key_id.clone(),
+            kms_key_id: Some(self.kms_key_id.clone()),
             endpoint_arn: Some(self.arn.clone()),
             certificate_arn: self.certificate_arn.clone(),
             ssl_mode: Some(self.ssl_mode.clone()),
@@ -327,29 +546,105 @@ impl EndpointRecord {
             // A cross-account external id is minted by a cross-account create, which
             // this emulator does not model.
             external_id: None,
-            // Only an endpoint DMS itself manages for a zero-ETL integration is
-            // read-only, and nothing here creates one.
-            is_read_only: None,
-            dynamo_db_settings: None,
-            s3_settings: None,
-            dms_transfer_settings: None,
-            mongo_db_settings: None,
-            kinesis_settings: None,
-            kafka_settings: None,
-            elasticsearch_settings: None,
-            neptune_settings: None,
-            redshift_settings: None,
-            postgre_sql_settings: None,
-            my_sql_settings: None,
-            oracle_settings: None,
-            sybase_settings: None,
-            microsoft_sql_server_settings: None,
-            ibm_db2_settings: None,
-            doc_db_settings: None,
-            redis_settings: None,
-            gcp_my_sql_settings: None,
-            timestream_settings: None,
+            is_read_only: Some(self.is_read_only),
+            // A Lakehouse endpoint is one DMS creates itself for a zero-ETL
+            // integration, so nothing here holds its settings.
             lakehouse_settings: None,
+            ..Endpoint::default()
+        };
+        self.project_engine_settings(&mut endpoint);
+        endpoint
+    }
+
+    /// Report the single engine settings structure this endpoint's `EngineName`
+    /// selects, leaving every structure belonging to another engine absent.
+    ///
+    /// A structure whose members are all optional is reported for its engine even when
+    /// the request carried none of it, because the endpoint's own connection
+    /// parameters and the engine's documented defaults populate it. A structure the
+    /// model gives required members (`ElasticsearchSettings`, `NeptuneSettings`,
+    /// `RedisSettings`, `TimestreamSettings`, `DynamoDbSettings`) is reported only as
+    /// the request supplied it, since nothing here can invent a required value.
+    fn project_engine_settings(&self, endpoint: &mut Endpoint) {
+        let settings = &self.settings;
+        match self.engine_name.as_str() {
+            "mysql" | "mariadb" | "aurora" | "aurora-serverless" => {
+                endpoint.my_sql_settings = Some(with_default_authentication_method!(
+                    with_connection_parameters!(self, settings.my_sql.clone().unwrap_or_default())
+                ));
+            }
+            "postgres" | "aurora-postgresql" | "aurora-postgresql-serverless" | "babelfish" => {
+                endpoint.postgre_sql_settings = Some(with_default_authentication_method!(
+                    with_connection_parameters!(
+                        self,
+                        settings.postgre_sql.clone().unwrap_or_default()
+                    )
+                ));
+            }
+            "oracle" => {
+                endpoint.oracle_settings = Some(with_default_authentication_method!(
+                    with_connection_parameters!(self, settings.oracle.clone().unwrap_or_default())
+                ));
+            }
+            "sqlserver" | "azuredb" | "azure-sql-managed-instance" => {
+                endpoint.microsoft_sql_server_settings = Some(with_default_authentication_method!(
+                    with_connection_parameters!(
+                        self,
+                        settings.microsoft_sql_server.clone().unwrap_or_default()
+                    )
+                ));
+            }
+            "sybase" => {
+                endpoint.sybase_settings = Some(with_connection_parameters!(
+                    self,
+                    settings.sybase.clone().unwrap_or_default()
+                ));
+            }
+            "db2" | "db2-zos" => {
+                endpoint.ibm_db2_settings = Some(with_connection_parameters!(
+                    self,
+                    settings.ibm_db2.clone().unwrap_or_default()
+                ));
+            }
+            "mongodb" => {
+                endpoint.mongo_db_settings = Some(with_connection_parameters!(
+                    self,
+                    settings.mongo_db.clone().unwrap_or_default()
+                ));
+            }
+            "docdb" | "documentdb" => {
+                endpoint.doc_db_settings = Some(with_connection_parameters!(
+                    self,
+                    settings.doc_db.clone().unwrap_or_default()
+                ));
+            }
+            "redshift" | "redshift-serverless" => {
+                endpoint.redshift_settings = Some(with_connection_parameters!(
+                    self,
+                    settings.redshift.clone().unwrap_or_default()
+                ));
+            }
+            "gcp-mysql" => {
+                endpoint.gcp_my_sql_settings = Some(with_connection_parameters!(
+                    self,
+                    settings.gcp_my_sql.clone().unwrap_or_default()
+                ));
+            }
+            "s3" => endpoint.s3_settings = settings.s3.clone(),
+            "dms-transfer" => endpoint.dms_transfer_settings = settings.dms_transfer.clone(),
+            "kinesis" => endpoint.kinesis_settings = settings.kinesis.clone(),
+            "kafka" => endpoint.kafka_settings = settings.kafka.clone(),
+            "dynamodb" => endpoint.dynamo_db_settings = settings.dynamo_db.clone(),
+            "opensearch" | "elasticsearch" => {
+                endpoint.elasticsearch_settings = settings.elasticsearch.clone();
+            }
+            "neptune" => endpoint.neptune_settings = settings.neptune.clone(),
+            "redis" => endpoint.redis_settings = settings.redis.clone(),
+            "timestream" => endpoint.timestream_settings = settings.timestream.clone(),
+            // An engine name the model's catalog does not list selects no settings
+            // structure, so reporting none is what keeps a response from carrying one
+            // belonging to another engine.
+            _ => {}
         }
     }
 }

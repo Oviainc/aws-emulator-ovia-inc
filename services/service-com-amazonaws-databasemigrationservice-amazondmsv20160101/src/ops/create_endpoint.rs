@@ -5,9 +5,9 @@
 //! `DescribeEndpoints` and `CreateReplicationTask` read the same record. The notes
 //! below are the scaffold's, kept for the next reader.
 //!
-//! The request's `Password` and the engine-specific settings structures are NOT
-//! persisted: this slice stores the endpoint members every engine shares, and several
-//! of those structures carry a password a response must never echo.
+//! The request's `Password` is NOT persisted, and neither is any password inside an
+//! engine-specific settings structure: the settings structures are stored sanitized,
+//! so a response can report the connection parameters without ever echoing a secret.
 //!
 //! ## Shape of an operation
 //!
@@ -357,10 +357,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ssl_mode: input
                 .ssl_mode
                 .unwrap_or_else(|| crate::state::DEFAULT_SSL_MODE.to_string()),
-            kms_key_id: input.kms_key_id,
+            // "If you don't specify a value for the KmsKeyId parameter, then DMS uses
+            // your default encryption key" (`KmsKeyId` doc), which is per region.
+            kms_key_id: input
+                .kms_key_id
+                .unwrap_or_else(|| crate::state::default_kms_key_arn(&region)),
             certificate_arn: input.certificate_arn,
             service_access_role_arn: input.service_access_role_arn,
             external_table_definition: input.external_table_definition,
+            // An endpoint a caller created is its own, not one DMS manages for a
+            // zero-ETL integration, so it is not read-only.
+            is_read_only: crate::state::DEFAULT_IS_READ_ONLY,
+            // `sanitized` drops every password the request carried, so the store holds
+            // no secret and no response can echo one.
+            settings: crate::state::EngineSettings {
+                dynamo_db: input.dynamo_db_settings,
+                s3: input.s3_settings,
+                dms_transfer: input.dms_transfer_settings,
+                mongo_db: input.mongo_db_settings,
+                kinesis: input.kinesis_settings,
+                kafka: input.kafka_settings,
+                elasticsearch: input.elasticsearch_settings,
+                neptune: input.neptune_settings,
+                redshift: input.redshift_settings,
+                postgre_sql: input.postgre_sql_settings,
+                my_sql: input.my_sql_settings,
+                oracle: input.oracle_settings,
+                sybase: input.sybase_settings,
+                microsoft_sql_server: input.microsoft_sql_server_settings,
+                ibm_db2: input.ibm_db2_settings,
+                doc_db: input.doc_db_settings,
+                redis: input.redis_settings,
+                gcp_my_sql: input.gcp_my_sql_settings,
+                timestream: input.timestream_settings,
+            }
+            .sanitized(),
             tags: crate::state::tags_for(&arn, input.tags),
             sequence,
         };
