@@ -38,7 +38,7 @@ const AFTER_RUN_SETTLES: Duration = Duration::from_millis(900);
 
 /// One AppFlow service on one shared engine, with the engine handed back so a case can
 /// seed the store directly instead of driving a thousand requests to reach a bound.
-fn appflow_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn appflow_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);

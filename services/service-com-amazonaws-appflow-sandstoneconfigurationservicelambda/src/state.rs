@@ -10,13 +10,17 @@
 //! The modelled shapes (`TriggerConfig`, `SourceFlowConfig`, `Task`, …) are stored as
 //! they arrived rather than re-modelled, so `DescribeFlow` can return exactly what
 //! `CreateFlow` was given.
+//!
+//! Beside the account's own resources it also holds the CATALOG of connectors AppFlow
+//! vends — a property of the service rather than of the account, which is why it is a
+//! table here and not a map a request can write (see [`VENDED_CONNECTORS`]).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DestinationFlowConfig, ErrorInfo, ExecutionDetails, ExecutionResult, FlowDefinition,
-    MetadataCatalogConfig, SourceFlowConfig, Task, TriggerConfig,
+    ConnectorConfiguration, ConnectorMetadata, DestinationFlowConfig, ErrorInfo, ExecutionDetails,
+    ExecutionResult, FlowDefinition, MetadataCatalogConfig, SourceFlowConfig, Task, TriggerConfig,
 };
 
 /// The region an ARN carries when the request is not SigV4-signed (an anonymous
@@ -31,6 +35,10 @@ pub const TRIGGER_TYPE_ON_DEMAND: &str = "OnDemand";
 /// The `triggerType` of a flow AppFlow runs on a schedule
 /// (`smithy_query(query="shape", shape="TriggerType")`).
 pub const TRIGGER_TYPE_SCHEDULED: &str = "Scheduled";
+
+/// The `triggerType` of a flow an event in the source application runs
+/// (`smithy_query(query="shape", shape="TriggerType")`).
+pub const TRIGGER_TYPE_EVENT: &str = "Event";
 
 /// How long after `StartFlow` a run stops being `InProgress`.
 ///
@@ -651,9 +659,18 @@ pub const DEFAULT_PAGE_SIZE: usize = MAX_PAGE_SIZE;
 /// value arrives, and it clamps to the SAME constants the model's bounds are recorded
 /// in, so the two cannot drift apart.
 pub fn page_size(max_results: Option<i32>) -> usize {
+    page_size_or(max_results, DEFAULT_PAGE_SIZE)
+}
+
+/// The page size to serve for a `maxResults`, for a listing whose own documentation
+/// states a default page of its own.
+///
+/// Same clamp as [`page_size`] — the two cannot bound a page differently — but the
+/// caller names the page an absent `maxResults` means for THAT operation.
+pub fn page_size_or(max_results: Option<i32>, default: usize) -> usize {
     match max_results {
         Some(requested) => (requested.max(0) as usize).clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
-        None => DEFAULT_PAGE_SIZE,
+        None => default.clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
     }
 }
 
@@ -681,4 +698,468 @@ pub fn decode_cursor(kind: &str, token: &str) -> Option<String> {
     let decoded = String::from_utf8(decoded).ok()?;
     let (token_kind, start_at) = decoded.split_once('\u{1f}')?;
     (token_kind == kind).then(|| start_at.to_string())
+}
+
+/// The listing a `DescribeConnectors` cursor belongs to.
+pub const CONNECTOR_CURSOR: &str = "connectors";
+
+/// The page `DescribeConnectors` serves a caller that names no `maxResults`
+/// (`smithy_query(query="doc", shape="DescribeConnectorsRequest", member="maxResults")`:
+/// "The maximum number of items that should be returned in the result set. The default
+/// is 20.").
+pub const DEFAULT_CONNECTOR_PAGE_SIZE: usize = 20;
+
+/// The `connectorType` of a connector a caller registered themselves, rather than one
+/// AppFlow vends (`smithy_query(query="shape", shape="ConnectorType")`).
+pub const CONNECTOR_TYPE_CUSTOM: &str = "CustomConnector";
+
+/// Every scheduling frequency a scheduled flow can run at, in the order the model
+/// declares them (`smithy_query(query="shape", shape="ScheduleFrequencyType")`).
+pub const SCHEDULE_FREQUENCIES: [&str; 6] = [
+    "BYMINUTE", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "ONCE",
+];
+
+/// Every operator a flow task can apply to a field it reads from a source, in the order
+/// the model declares them (`smithy_query(query="shape", shape="Operators")`, the member
+/// of `SupportedOperatorList`).
+pub const OPERATORS: [&str; 21] = [
+    "PROJECTION",
+    "LESS_THAN",
+    "GREATER_THAN",
+    "CONTAINS",
+    "BETWEEN",
+    "LESS_THAN_OR_EQUAL_TO",
+    "GREATER_THAN_OR_EQUAL_TO",
+    "EQUAL_TO",
+    "NOT_EQUAL_TO",
+    "ADDITION",
+    "MULTIPLICATION",
+    "DIVISION",
+    "SUBTRACTION",
+    "MASK_ALL",
+    "MASK_FIRST_N",
+    "MASK_LAST_N",
+    "VALIDATE_NON_NULL",
+    "VALIDATE_NON_ZERO",
+    "VALIDATE_NON_NEGATIVE",
+    "VALIDATE_NUMERIC",
+    "NO_OP",
+];
+
+/// Structured records — one of the two data transfer types a connector can move
+/// (`smithy_query(query="doc", shape="ConnectorConfiguration",
+/// member="supportedDataTransferTypes")`).
+pub const DATA_TRANSFER_TYPE_RECORD: &str = "RECORD";
+
+/// Files or binary data — the other data transfer type
+/// (`smithy_query(query="doc", shape="ConnectorConfiguration",
+/// member="supportedDataTransferTypes")`).
+pub const DATA_TRANSFER_TYPE_FILE: &str = "FILE";
+
+/// Records only.
+const RECORDS: &[&str] = &[DATA_TRANSFER_TYPE_RECORD];
+
+/// Records and files.
+const RECORDS_AND_FILES: &[&str] = &[DATA_TRANSFER_TYPE_RECORD, DATA_TRANSFER_TYPE_FILE];
+
+/// Files only.
+const FILES: &[&str] = &[DATA_TRANSFER_TYPE_FILE];
+
+/// What a destination a flow can only add to accepts. `INSERT` is the operation a flow
+/// gets when it names none (`smithy_query(query="shape", shape="WriteOperationType")`:
+/// "When this value is not provided, this defaults to the INSERT operation").
+const INSERT_ONLY: &[&str] = &["INSERT"];
+
+/// What a destination that addresses an existing record accepts: every
+/// `WriteOperationType`, in the order the model declares them
+/// (`smithy_query(query="shape", shape="WriteOperationType")`).
+const EVERY_WRITE_OPERATION: &[&str] = &["INSERT", "UPSERT", "UPDATE", "DELETE"];
+
+/// Nothing: a connector that cannot be a flow's destination accepts no write operation.
+const NO_WRITE_OPERATION: &[&str] = &[];
+
+/// One connector Amazon AppFlow vends, and what a flow may do with it.
+///
+/// This is service-wide, not per-account: the capabilities of a vended connector are
+/// the same for every caller and no request changes them, which is why the catalog is a
+/// table rather than a map in
+/// [`ComAmazonawsAppflowSandstoneconfigurationservicelambdaState`]. The connectors a
+/// CALLER registers are per-account and live in
+/// [`ComAmazonawsAppflowSandstoneconfigurationservicelambdaState::registered_connectors`]
+/// instead.
+#[derive(Debug, Clone, Copy)]
+pub struct VendedConnector {
+    /// The `ConnectorType` this entry describes
+    /// (`smithy_query(query="shape", shape="ConnectorType")`).
+    pub connector_type: &'static str,
+    /// Whether a flow can read from it.
+    pub can_use_as_source: bool,
+    /// Whether a flow can write to it.
+    pub can_use_as_destination: bool,
+    /// Whether a change in the source application can run a flow, which is what makes
+    /// the `Event` trigger type available for it.
+    pub supports_event_trigger: bool,
+    /// Whether a connection to it can run over AWS PrivateLink.
+    pub is_private_link_enabled: bool,
+    /// The `SupportedDataTransferType`s it moves.
+    pub data_transfer_types: &'static [&'static str],
+    /// The `WriteOperationType`s it accepts as a destination; empty when it is not one.
+    pub write_operations: &'static [&'static str],
+}
+
+/// Every connector Amazon AppFlow vends.
+///
+/// The TYPES are the model's own `ConnectorType` enum, less `CustomConnector` (which
+/// names a caller-registered connector, not a vended one), and they are listed in the
+/// order the model declares them. The CAPABILITIES are what AppFlow documents for each
+/// one: which applications it supports as a flow's source and as a flow's destination,
+/// which of them run a flow from an event in the source application, which accept a
+/// connection over AWS PrivateLink, and whether the connector moves structured records
+/// or whole files. Everything else a `ConnectorConfiguration` reports is DERIVED from
+/// these (see [`VendedConnector::to_connector_configuration`]), so one entry cannot
+/// claim a capability another part of the same answer denies.
+pub const VENDED_CONNECTORS: [VendedConnector; 23] = [
+    VendedConnector {
+        connector_type: "Salesforce",
+        can_use_as_source: true,
+        can_use_as_destination: true,
+        // Salesforce change-data-capture events run a flow.
+        supports_event_trigger: true,
+        is_private_link_enabled: true,
+        data_transfer_types: RECORDS,
+        write_operations: EVERY_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Singular",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: NO_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Slack",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: NO_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Redshift",
+        can_use_as_source: false,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: INSERT_ONLY,
+    },
+    VendedConnector {
+        connector_type: "S3",
+        can_use_as_source: true,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        // A flow reads objects from a bucket and writes objects to one, and the objects
+        // carry the records it transfers.
+        data_transfer_types: RECORDS_AND_FILES,
+        write_operations: INSERT_ONLY,
+    },
+    VendedConnector {
+        connector_type: "Marketo",
+        can_use_as_source: true,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: INSERT_ONLY,
+    },
+    VendedConnector {
+        connector_type: "Googleanalytics",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: NO_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Zendesk",
+        can_use_as_source: true,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: INSERT_ONLY,
+    },
+    VendedConnector {
+        connector_type: "Servicenow",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: NO_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Datadog",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: NO_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Trendmicro",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: NO_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Snowflake",
+        can_use_as_source: false,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: INSERT_ONLY,
+    },
+    VendedConnector {
+        connector_type: "Dynatrace",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: NO_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Infornexus",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: NO_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Amplitude",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: NO_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Veeva",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        // Veeva Vault transfers documents as well as records.
+        data_transfer_types: RECORDS_AND_FILES,
+        write_operations: NO_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "EventBridge",
+        can_use_as_source: false,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: INSERT_ONLY,
+    },
+    VendedConnector {
+        connector_type: "LookoutMetrics",
+        can_use_as_source: false,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: INSERT_ONLY,
+    },
+    VendedConnector {
+        connector_type: "Upsolver",
+        can_use_as_source: false,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        // Upsolver reads what a flow lands in its bucket.
+        data_transfer_types: FILES,
+        write_operations: INSERT_ONLY,
+    },
+    VendedConnector {
+        connector_type: "Honeycode",
+        can_use_as_source: false,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: INSERT_ONLY,
+    },
+    VendedConnector {
+        connector_type: "CustomerProfiles",
+        can_use_as_source: false,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: INSERT_ONLY,
+    },
+    VendedConnector {
+        connector_type: "SAPOData",
+        can_use_as_source: true,
+        can_use_as_destination: true,
+        supports_event_trigger: false,
+        is_private_link_enabled: true,
+        // OData entity sets carry records; the connector also transfers documents.
+        data_transfer_types: RECORDS_AND_FILES,
+        write_operations: EVERY_WRITE_OPERATION,
+    },
+    VendedConnector {
+        connector_type: "Pardot",
+        can_use_as_source: true,
+        can_use_as_destination: false,
+        supports_event_trigger: false,
+        is_private_link_enabled: false,
+        data_transfer_types: RECORDS,
+        write_operations: NO_WRITE_OPERATION,
+    },
+];
+
+/// The connector AppFlow vends under `connector_type`, or `None` when no vended
+/// connector has that type (`CustomConnector`, which names a registered connector).
+pub fn vended_connector(connector_type: &str) -> Option<&'static VendedConnector> {
+    VENDED_CONNECTORS
+        .iter()
+        .find(|connector| connector.connector_type == connector_type)
+}
+
+/// Every connector type a flow can transfer data TO, in catalog order.
+///
+/// Derived from the catalog rather than repeated per entry, so a connector is listed as
+/// an available destination exactly when its own entry says it can be one.
+pub fn destination_connector_types() -> Vec<String> {
+    VENDED_CONNECTORS
+        .iter()
+        .filter(|connector| connector.can_use_as_destination)
+        .map(|connector| connector.connector_type.to_string())
+        .collect()
+}
+
+/// The `connectorMetadata` member that belongs to `connector_type`, naming which
+/// connector the configuration describes.
+///
+/// `ConnectorMetadata` carries one member per connector AppFlow vends metadata for
+/// (`smithy_query(query="shape", shape="ConnectorMetadata")`); a type it declares no
+/// member for gets `None`.
+fn connector_metadata(connector_type: &str) -> Option<ConnectorMetadata> {
+    use crate::ops::types::{
+        AmplitudeMetadata, CustomerProfilesMetadata, DatadogMetadata, DynatraceMetadata,
+        EventBridgeMetadata, GoogleAnalyticsMetadata, HoneycodeMetadata, InforNexusMetadata,
+        MarketoMetadata, PardotMetadata, RedshiftMetadata, S3Metadata, SAPODataMetadata,
+        SalesforceMetadata, ServiceNowMetadata, SingularMetadata, SlackMetadata, SnowflakeMetadata,
+        TrendmicroMetadata, UpsolverMetadata, VeevaMetadata, ZendeskMetadata,
+    };
+
+    let mut metadata = ConnectorMetadata::default();
+    match connector_type {
+        "Amplitude" => metadata.amplitude = Some(AmplitudeMetadata::default()),
+        "CustomerProfiles" => metadata.customer_profiles = Some(CustomerProfilesMetadata::default()),
+        "Datadog" => metadata.datadog = Some(DatadogMetadata::default()),
+        "Dynatrace" => metadata.dynatrace = Some(DynatraceMetadata::default()),
+        "EventBridge" => metadata.event_bridge = Some(EventBridgeMetadata::default()),
+        "Googleanalytics" => metadata.google_analytics = Some(GoogleAnalyticsMetadata::default()),
+        "Honeycode" => metadata.honeycode = Some(HoneycodeMetadata::default()),
+        "Infornexus" => metadata.infor_nexus = Some(InforNexusMetadata::default()),
+        "Marketo" => metadata.marketo = Some(MarketoMetadata::default()),
+        "Pardot" => metadata.pardot = Some(PardotMetadata::default()),
+        "Redshift" => metadata.redshift = Some(RedshiftMetadata::default()),
+        "S3" => metadata.s3 = Some(S3Metadata::default()),
+        "SAPOData" => metadata.sapo_data = Some(SAPODataMetadata::default()),
+        "Salesforce" => metadata.salesforce = Some(SalesforceMetadata::default()),
+        "Servicenow" => metadata.service_now = Some(ServiceNowMetadata::default()),
+        "Singular" => metadata.singular = Some(SingularMetadata::default()),
+        "Slack" => metadata.slack = Some(SlackMetadata::default()),
+        "Snowflake" => metadata.snowflake = Some(SnowflakeMetadata::default()),
+        "Trendmicro" => metadata.trendmicro = Some(TrendmicroMetadata::default()),
+        "Upsolver" => metadata.upsolver = Some(UpsolverMetadata::default()),
+        "Veeva" => metadata.veeva = Some(VeevaMetadata::default()),
+        "Zendesk" => metadata.zendesk = Some(ZendeskMetadata::default()),
+        // `LookoutMetrics` is the one vended connector `ConnectorMetadata` declares no
+        // member for, so there is nothing to report for it.
+        _ => return None,
+    }
+    Some(metadata)
+}
+
+impl VendedConnector {
+    /// The wire `ConnectorConfiguration` for this connector.
+    ///
+    /// Everything beyond the catalog's own members is DERIVED here, from what a flow can
+    /// do with the connector:
+    ///
+    /// * a connector a flow can read FROM is the one that decides how the flow runs, so
+    ///   it reports the destinations a flow may send its records to, the frequencies a
+    ///   schedule may use, the trigger types that can run the flow and the operators its
+    ///   tasks may apply; a connector that can only be written to reports none of those,
+    ///   because a flow is never driven by its destination;
+    /// * a connector a flow can write TO reports the write operations it accepts.
+    pub fn to_connector_configuration(&self) -> ConnectorConfiguration {
+        let as_strings = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| (*value).to_string()).collect()
+        };
+
+        // In the order the model declares `TriggerType`.
+        let mut supported_trigger_types: Vec<String> = Vec::new();
+        if self.can_use_as_source {
+            supported_trigger_types.push(TRIGGER_TYPE_SCHEDULED.to_string());
+            if self.supports_event_trigger {
+                supported_trigger_types.push(TRIGGER_TYPE_EVENT.to_string());
+            }
+            supported_trigger_types.push(TRIGGER_TYPE_ON_DEMAND.to_string());
+        }
+
+        ConnectorConfiguration {
+            can_use_as_source: self.can_use_as_source,
+            can_use_as_destination: self.can_use_as_destination,
+            supported_destination_connectors: Some(if self.can_use_as_source {
+                destination_connector_types()
+            } else {
+                Vec::new()
+            }),
+            supported_scheduling_frequencies: Some(if self.can_use_as_source {
+                as_strings(&SCHEDULE_FREQUENCIES)
+            } else {
+                Vec::new()
+            }),
+            is_private_link_enabled: self.is_private_link_enabled,
+            // A vended connector resolves its own endpoint from the connector profile,
+            // so the caller never supplies a PrivateLink endpoint URL for one.
+            is_private_link_endpoint_url_required: false,
+            supported_trigger_types: Some(supported_trigger_types),
+            connector_metadata: connector_metadata(self.connector_type),
+            connector_type: Some(self.connector_type.to_string()),
+            supported_operators: Some(if self.can_use_as_source {
+                as_strings(&OPERATORS)
+            } else {
+                Vec::new()
+            }),
+            supported_write_operations: Some(as_strings(self.write_operations)),
+            supported_data_transfer_types: Some(as_strings(self.data_transfer_types)),
+            // A vended connector is not registered by anyone, so it carries none of the
+            // registration members (`connectorLabel`, `connectorOwner`,
+            // `connectorVersion`, `connectorArn`, `registeredAt`, `registeredBy`,
+            // `connectorProvisioningType`, `connectorProvisioningConfig`): those belong
+            // to a connector a caller registered.
+            ..ConnectorConfiguration::default()
+        }
+    }
 }
