@@ -292,7 +292,7 @@ async fn an_absent_configuration_recorder_names_the_selector_the_request_used() 
             "service-linked delete by service principal",
             json!({ "ServicePrincipal": "observabilityadmin.amazonaws.com" }),
             format!(
-                "Configuration recorder (AccountId: {account}, ServicePrincipal: \
+                "Configuration recorder (AccountId: {account}, Service Principal: \
                  observabilityadmin.amazonaws.com) cannot be found"
             ),
         ),

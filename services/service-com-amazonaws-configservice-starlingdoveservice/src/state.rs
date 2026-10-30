@@ -237,8 +237,9 @@ pub fn supports_third_party_service_linked_recording(service_principal: &str) ->
 /// Admin service principals Config links a recorder for the account's own telemetry
 /// resources to. A WELL-FORMED principal outside it names no service Config links a
 /// recorder to, and is refused rather than stored
-/// ([`invalid_service_principal_message`]; `ValidationException`: "You have provided a
-/// service principal for service-linked configuration recorder that is not valid").
+/// ([`UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE`]; `ValidationException`: "You
+/// have provided a service principal for service-linked configuration recorder that is
+/// not valid").
 /// Extend this table as Config links further services.
 ///
 /// The services whose recorder records a THIRD-PARTY cloud service provider's resources
@@ -260,15 +261,17 @@ pub fn supports_service_linked_recording(service_principal: &str) -> bool {
 }
 
 /// How Config words `ValidationException` for a `ServicePrincipal` that names no
-/// service Config links a configuration recorder for a third-party cloud service
-/// provider to — whether the value is no service principal at all or names a service
-/// that owns no such recorder.
+/// service Config links a configuration recorder to — whether the value is no service
+/// principal at all or names a service that owns no such recorder.
 ///
 /// The model states the condition (`ValidationException`: "You have provided a service
 /// principal for service-linked configuration recorder that is not valid") and Config
-/// answers it with this FIXED sentence — the same shape as the wording it uses for a
-/// configuration recorder name it cannot find — so the text is request-independent: it
-/// quotes nothing the caller sent.
+/// answers it with this FIXED sentence — the service-principal variant of the wording it
+/// uses for a configuration recorder it cannot find
+/// ([`no_such_configuration_recorder_message`]) — so the text is request-independent: it
+/// quotes nothing the caller sent, and it names the DIMENSION the request selected the
+/// recorder by. Every operation that takes a `ServicePrincipal` refuses an unrecognised
+/// one this way.
 pub const UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE: &str =
     "The service principal of the configuration recorder you entered cannot be found. \
      Verify the configuration recorder service principal, and try again.";
@@ -4268,12 +4271,15 @@ fn capitalise(word: &str) -> String {
 }
 
 /// How Config words `ValidationException` for a request whose `ServicePrincipal`
-/// names no Amazon Web Services service (`ValidationException`: "You have provided a
-/// service principal for service-linked configuration recorder that is not valid").
+/// names no Amazon Web Services service at all (`ValidationException`: "You have
+/// provided a service principal for service-linked configuration recorder that is not
+/// valid").
 ///
 /// BUILT FROM THE REQUEST — it quotes the value the caller sent and names the member
-/// to fix — so every operation that takes a service principal refuses it the same
-/// way.
+/// to fix. This is the refusal of a value that names no service, which is a different
+/// thing from a value that names a service Config links no configuration recorder for:
+/// that one is the recorder Config cannot resolve from the service principal it was
+/// given, worded as [`UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE`].
 pub fn invalid_service_principal_message(service_principal: &str) -> String {
     format!(
         "The ServicePrincipal '{service_principal}' provided in the request is not a valid \
@@ -5792,13 +5798,13 @@ impl RecorderSelector {
         }
     }
 
-    /// How a refusal that QUOTES the value names the member it came from, which is the
-    /// model's own spelling of it.
+    /// How a refusal that states WHICH recorder of this account was looked for names the
+    /// member the selector came from.
     fn quoted_member(self) -> &'static str {
         match self {
             Self::Name => "RecorderName",
             Self::Arn => "RecorderArn",
-            Self::ServicePrincipal => "ServicePrincipal",
+            Self::ServicePrincipal => "Service Principal",
         }
     }
 }
@@ -5833,8 +5839,9 @@ pub fn no_such_configuration_recorder_message(selector: RecorderSelector) -> Str
 /// the selector the request carried, so its refusal states what it looked for and where
 /// — the account and the selector's own value — rather than telling the caller to verify
 /// a member, which is how [`no_such_configuration_recorder_message`] words a lookup that
-/// takes several selectors at once. Recorded behaviour on the ARN selector; the member
-/// is named as the model spells it, so each selector states the one the request carried.
+/// takes several selectors at once. Recorded behaviour on the ARN and the
+/// service-principal selectors; each selector names the member the request carried, in
+/// the words the refusal spells it with ([`RecorderSelector::quoted_member`]).
 pub fn service_linked_recorder_not_found_message(
     selector: RecorderSelector,
     value: &str,
@@ -6011,23 +6018,15 @@ pub fn retention_configurations_quota_message() -> String {
     )
 }
 
-/// How Config words `ResourceNotDiscoveredException` — "You have specified a resource
-/// that is either unknown or has not been discovered" — for an aggregate resource
+/// How Config words `ResourceNotDiscoveredException` for an aggregate resource
 /// identifier the named aggregator holds no current configuration item for.
 ///
-/// The message is BUILT FROM THE REQUEST: it quotes all four members that identify an
-/// aggregated resource, so a caller can tell which of them put the resource outside
-/// what the aggregator holds.
-pub fn resource_not_discovered_message(identifier: &AggregateResourceIdentifier) -> String {
-    format!(
-        "The resource '{}' of type '{}' in account '{}' and region '{}' is either \
-         unknown or has not been discovered.",
-        identifier.resource_id,
-        identifier.resource_type,
-        identifier.source_account_id,
-        identifier.source_region,
-    )
-}
+/// FIXED, and it carries NO part of the request: the identifier the read asked about is
+/// not echoed, so the refusal reads the same across every identifier a caller tries. It
+/// is the sentence the error shape itself is documented with ("You have specified a
+/// resource that is either unknown or has not been discovered").
+pub const RESOURCE_NOT_DISCOVERED_MESSAGE: &str =
+    "You have specified a resource that is either unknown or has not been discovered.";
 
 /// How Config words `NoSuchConfigurationAggregatorException` for a request that named
 /// an aggregator this account does not hold.

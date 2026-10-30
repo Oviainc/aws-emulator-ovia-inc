@@ -11,8 +11,9 @@
 //!   ([`crate::state::read_expression`], which parses it with `sqlparser`); an
 //!   expression that is not one — unparsable, more than one statement, or carrying what
 //!   the documented query form has no place for — is refused with the modelled
-//!   `InvalidExpressionException` ("The syntax of the query is incorrect"), never
-//!   answered with an empty result set;
+//!   `InvalidExpressionException` ("The syntax of the query is incorrect"), worded as the
+//!   SYNTAX ERROR it is: the line and column of the submitted expression where the
+//!   reading stopped, never an empty result set and never prose of the reader;
 //! * the query runs over the CURRENT configuration item of each recorded resource
 //!   ([`crate::state::resource_configuration_item_documents`]), so the properties it
 //!   selects and filters on are the members of `ConfigurationItem`;

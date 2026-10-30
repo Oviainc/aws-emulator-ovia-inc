@@ -13,7 +13,9 @@
 //! where this aggregator holds no current configuration item for the identifier, a
 //! single read has no item to answer with and refuses with the modelled
 //! `ResourceNotDiscoveredException` instead of the batch path's
-//! `UnprocessedResourceIdentifiers` entry.
+//! `UnprocessedResourceIdentifiers` entry. That refusal carries the one fixed sentence
+//! Config words it with ([`crate::state::RESOURCE_NOT_DISCOVERED_MESSAGE`]) and quotes
+//! nothing of the identifier the request named.
 //!
 //! Unlike the batch path, the item carries the resource's TAGS: dropping them is
 //! documented for `BatchGetAggregateResourceConfig` ("The API does not return tags and
@@ -212,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetAggregateResourceConfigErrorModeled::ResourceNotDiscoveredException(
                     ResourceNotDiscoveredException {
-                        message: Some(crate::state::resource_not_discovered_message(identifier)),
+                        message: Some(crate::state::RESOURCE_NOT_DISCOVERED_MESSAGE.to_string()),
                     },
                 )
                 .into(),

@@ -29,6 +29,11 @@
 //! ([`configuration_item_document`]), which is why nothing here carries a list of field
 //! names: a member of `ConfigurationItem` is selectable because the item has it.
 //!
+//! A command that cannot be read is refused as a SYNTAX ERROR at the position of the
+//! submitted expression where the reading stopped ([`stopped_reading_at`]): which parser
+//! read the text, and what it made of it, is an implementation detail of this emulator
+//! and no part of the service's contract, so none of it travels in the refusal.
+//!
 //! The work one expression can cause is bounded before the parser is entered:
 //! `Expression` is `@length(1, 4096)`, which the boundary validator enforces before any
 //! handler runs, and [`MAX_EXPRESSION_DEPTH`] and [`MAX_EXPRESSION_TOKENS`] bound the
@@ -44,6 +49,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
 use super::{ComAmazonawsConfigserviceStarlingdoveserviceState, ConfigurationAggregatorEntry};
 use crate::ops::types::{ConfigurationItem, FieldInfo, QueryInfo};
@@ -622,8 +628,12 @@ fn like_matches(candidate: &str, pattern: &str) -> bool {
 /// The one error code stands for every refusal of a Config query, so the message is what
 /// tells a caller which refusal it got, and the two kinds say different things:
 ///
-/// * a command this service cannot READ as a Config query carries the sentence that says
-///   so, with the detail of what about it cannot be read ([`Self::unreadable`]);
+/// * a command this service cannot READ as a Config query is a SYNTAX error, and the
+///   message reports WHERE in the submitted expression the reading stopped
+///   ([`syntax_error_message`]): that position is the actionable part of such a refusal,
+///   and it is the whole of it — which parser read the text, and what it made of it, is
+///   an implementation detail of this emulator and no part of the contract, so the
+///   readers below carry no prose of their own;
 /// * a command that IS read and breaks a RULE of the query language carries the sentence
 ///   that rule is worded with ([`Self::broken_rule`]) — the one that names the fields
 ///   which broke the GROUP BY coverage rule, and otherwise the single sentence a query
@@ -632,13 +642,10 @@ fn like_matches(candidate: &str, pattern: &str) -> bool {
 pub struct ExpressionRefusal(String);
 
 impl ExpressionRefusal {
-    /// The refusal of a command that cannot be read as a Config query at all: `detail`
-    /// says what about it cannot be read, under the one sentence that says it is not a
-    /// query.
-    fn unreadable(detail: &str) -> Self {
-        Self(format!(
-            "The expression is not a valid Config query: {detail}."
-        ))
+    /// The refusal of a command that could not be read as a Config query: a syntax error
+    /// at the position of the submitted expression where the reading stopped.
+    fn syntax(stopped_at: Position) -> Self {
+        Self(syntax_error_message(stopped_at))
     }
 
     /// The refusal of a command that is read and breaks a rule of the query language:
@@ -653,12 +660,82 @@ impl ExpressionRefusal {
     }
 }
 
-/// A detail of what cannot be READ is the common case, so `?` lifts one into the
-/// refusal it is worded under.
-impl From<String> for ExpressionRefusal {
-    fn from(detail: String) -> Self {
-        Self::unreadable(&detail)
+/// A command one reading could not READ as a Config query.
+///
+/// It carries nothing: such a command is refused as a syntax error AT a position of the
+/// submitted expression, and the position is computed by [`read_expression`] — the only
+/// reader holding the whole command — so a reader that finds the fault inside one clause
+/// of it has nothing to add.
+#[derive(Debug, Clone, Copy)]
+struct Unreadable;
+
+/// Why one reading did not produce a Config query: the command could not be READ as one,
+/// or it was read and breaks a RULE of the query language, which has its own sentence.
+#[derive(Debug, Clone)]
+enum Unread {
+    Unreadable,
+    BrokenRule(String),
+}
+
+/// A reading that only says the command is unreadable is the common case, so `?` lifts
+/// one into the refusal it is reported under.
+impl From<Unreadable> for Unread {
+    fn from(_: Unreadable) -> Self {
+        Self::Unreadable
     }
+}
+
+/// A position in a submitted `Expression`: a line and a column, both counted from one,
+/// as Config reports where it stopped reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Position {
+    line: u64,
+    column: u64,
+}
+
+impl Position {
+    /// The first position of any expression.
+    const START: Self = Self { line: 1, column: 1 };
+
+    /// The position after `character`, which this one is the position of.
+    fn after(self, character: char) -> Self {
+        if character == '\n' {
+            Self {
+                line: self.line + 1,
+                column: 1,
+            }
+        } else {
+            Self {
+                line: self.line,
+                column: self.column + 1,
+            }
+        }
+    }
+}
+
+/// The tokenizer reports a token's position as its own [`Location`], counted from one on
+/// both axes — the same way this one is.
+impl From<Location> for Position {
+    fn from(location: Location) -> Self {
+        Self {
+            line: location.line,
+            column: location.column,
+        }
+    }
+}
+
+/// How Config words a command it could not read as a Config query: a syntax error at the
+/// position the reading stopped at.
+///
+/// BUILT FROM THE REQUEST, and it is the actionable part of the refusal — a caller fixing
+/// a query needs to know WHERE in the expression it sent the reading stopped. That
+/// position is all the sentence carries: no prose of the reader, and no text of the
+/// expression itself.
+fn syntax_error_message(stopped_at: Position) -> String {
+    format!(
+        "syntax error at line {}, column {}",
+        stopped_at.line, stopped_at.column
+    )
 }
 
 /// How Config words the GROUP BY coverage rule of the query language.
@@ -740,84 +817,70 @@ fn declared_non_numeric(path: &[String]) -> bool {
 /// Read `expression` as a Config query, or answer why it is not one
 /// ([`ExpressionRefusal`]).
 pub fn read_expression(expression: &str) -> Result<SelectQuery, ExpressionRefusal> {
-    if nesting_depth(expression) > MAX_EXPRESSION_DEPTH {
-        return Err(format!(
-            "the expression nests more than {MAX_EXPRESSION_DEPTH} levels of brackets"
-        )
-        .into());
+    if let Some(stopped_at) = passes_a_bound(expression) {
+        return Err(ExpressionRefusal::syntax(stopped_at));
     }
-    if token_count(expression) > MAX_EXPRESSION_TOKENS {
-        return Err(format!(
-            "the expression carries more than {MAX_EXPRESSION_TOKENS} tokens"
-        )
-        .into());
+    match read_command(expression) {
+        Ok(query) => Ok(query),
+        Err(Unread::BrokenRule(message)) => Err(ExpressionRefusal::broken_rule(message)),
+        // A command that could not be read is a syntax error at the position the reading
+        // stopped at, which only a reader holding the WHOLE command can say.
+        Err(Unread::Unreadable) => Err(ExpressionRefusal::syntax(stopped_reading_at(expression))),
     }
+}
 
-    let statements = Parser::parse_sql(&GenericDialect {}, expression)
-        .map_err(|error| format!("the expression is not a SQL SELECT command: {error}"))?;
+/// Read `expression` as a Config query, or say why that reading did not produce one.
+///
+/// The bounds [`read_expression`] checks are NOT checked here: this is also how a PREFIX
+/// of a command is read ([`stopped_reading_at`]), and a prefix of an expression that
+/// passed them passes them too.
+fn read_command(expression: &str) -> Result<SelectQuery, Unread> {
+    let statements =
+        Parser::parse_sql(&GenericDialect {}, expression).map_err(|_| Unread::Unreadable)?;
+    // Exactly one SQL SELECT command, and nothing else.
     let [Statement::Query(query)] = statements.as_slice() else {
-        return Err(
-            "the expression must be exactly one SQL SELECT command and nothing else"
-                .to_string()
-                .into(),
-        );
+        return Err(Unread::Unreadable);
     };
     read_query(query)
 }
 
 /// Read one parsed SQL query as a Config query.
-fn read_query(query: &Query) -> Result<SelectQuery, ExpressionRefusal> {
+fn read_query(query: &Query) -> Result<SelectQuery, Unread> {
+    // A Config query carries no WITH clause, and is a single SELECT rather than a set
+    // operation or a parenthesised query.
     if query.with.is_some() {
-        return Err("a Config query carries no WITH clause".to_string().into());
+        return Err(Unread::Unreadable);
     }
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return Err(
-            "a Config query is a single SELECT, not a set operation or a parenthesised query"
-                .to_string()
-                .into(),
-        );
+        return Err(Unread::Unreadable);
     };
     let select: &Select = select.as_ref();
-    if !select.from.is_empty() {
-        return Err(
-            "a Config query selects from the resources Config has recorded, so it carries no \
-             FROM clause"
-                .to_string()
-                .into(),
-        );
-    }
-    if select.having.is_some() {
-        return Err("a Config query carries no HAVING clause".to_string().into());
-    }
-    if select.distinct.is_some() {
-        return Err("a Config query carries no DISTINCT clause".to_string().into());
+    // A Config query selects from the resources Config has recorded, so it carries no
+    // FROM clause — nor a HAVING or a DISTINCT one, which the documented form of a Config
+    // query has no place for either.
+    if !select.from.is_empty() || select.having.is_some() || select.distinct.is_some() {
+        return Err(Unread::Unreadable);
     }
 
     let mut fields: Vec<Field> = Vec::new();
     for item in &select.projection {
         fields.push(read_field(item)?);
     }
+    // A Config query selects at least one property.
     if fields.is_empty() {
-        return Err("a Config query selects at least one property"
-            .to_string()
-            .into());
+        return Err(Unread::Unreadable);
     }
 
     let group_by = match &select.group_by {
         GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => {
             let mut grouped: Vec<Vec<String>> = Vec::new();
             for expression in expressions {
-                grouped.push(property_of(expression).ok_or_else(|| {
-                    "a Config query groups by a property of the configuration item".to_string()
-                })?);
+                // A Config query groups by properties of the configuration item.
+                grouped.push(property_of(expression).ok_or(Unreadable)?);
             }
             grouped
         }
-        _ => {
-            return Err("a Config query groups by properties of the configuration item"
-                .to_string()
-                .into())
-        }
+        _ => return Err(Unread::Unreadable),
     };
 
     let condition = match &select.selection {
@@ -839,9 +902,7 @@ fn read_query(query: &Query) -> Result<SelectQuery, ExpressionRefusal> {
             .iter()
             .any(|field| matches!(field, Field::Everything))
         {
-            return Err(ExpressionRefusal::broken_rule(
-                QUERY_IS_INVALID_MESSAGE.to_string(),
-            ));
+            return Err(Unread::BrokenRule(QUERY_IS_INVALID_MESSAGE.to_string()));
         }
         // Every property this query selects has to be one it groups by, and the refusal
         // names ALL of those that are not, in the order they were selected: the rule is
@@ -857,9 +918,9 @@ fn read_query(query: &Query) -> Result<SelectQuery, ExpressionRefusal> {
             })
             .collect();
         if !ungrouped.is_empty() {
-            return Err(ExpressionRefusal::broken_rule(
-                ungrouped_selected_fields_message(&ungrouped),
-            ));
+            return Err(Unread::BrokenRule(ungrouped_selected_fields_message(
+                &ungrouped,
+            )));
         }
 
         // AVG and SUM compute over NUMBERS, so a field the configuration item schema
@@ -876,9 +937,7 @@ fn read_query(query: &Query) -> Result<SelectQuery, ExpressionRefusal> {
                 if matches!(function, Aggregate::Avg | Aggregate::Sum)
                     && declared_non_numeric(path)
                 {
-                    return Err(ExpressionRefusal::broken_rule(
-                        QUERY_IS_INVALID_MESSAGE.to_string(),
-                    ));
+                    return Err(Unread::BrokenRule(QUERY_IS_INVALID_MESSAGE.to_string()));
                 }
             }
         }
@@ -891,9 +950,7 @@ fn read_query(query: &Query) -> Result<SelectQuery, ExpressionRefusal> {
         for key in &order_by {
             let path = key.property.join(".");
             if !group_by.contains(&key.property) && !names.contains(&path) {
-                return Err(ExpressionRefusal::broken_rule(
-                    QUERY_IS_INVALID_MESSAGE.to_string(),
-                ));
+                return Err(Unread::BrokenRule(QUERY_IS_INVALID_MESSAGE.to_string()));
             }
         }
     }
@@ -908,27 +965,21 @@ fn read_query(query: &Query) -> Result<SelectQuery, ExpressionRefusal> {
 }
 
 /// Read one selected item as a field of a Config query.
-fn read_field(item: &SelectItem) -> Result<Field, ExpressionRefusal> {
+fn read_field(item: &SelectItem) -> Result<Field, Unread> {
     match item {
         SelectItem::Wildcard(_) => Ok(Field::Everything),
         SelectItem::UnnamedExpr(expression) => read_field_expression(expression),
-        SelectItem::ExprWithAlias { .. } => Err(
-            "a Config query selects properties of the configuration item, which carry no alias"
-                .to_string()
-                .into(),
-        ),
-        SelectItem::QualifiedWildcard(..) => Err(
-            "a Config query selects properties of one configuration item, so a qualified \
-             wildcard names nothing"
-                .to_string()
-                .into(),
-        ),
+        // A Config query selects properties of ONE configuration item: they carry no
+        // alias, and a qualified wildcard names nothing.
+        SelectItem::ExprWithAlias { .. } | SelectItem::QualifiedWildcard(..) => {
+            Err(Unread::Unreadable)
+        }
     }
 }
 
 /// Read one selected expression: a property of the configuration item, or an aggregate
 /// over the items the query matched.
-fn read_field_expression(expression: &Expr) -> Result<Field, ExpressionRefusal> {
+fn read_field_expression(expression: &Expr) -> Result<Field, Unread> {
     if let Expr::Function(function) = expression {
         let name = function
             .name
@@ -941,44 +992,39 @@ fn read_field_expression(expression: &Expr) -> Result<Field, ExpressionRefusal> 
             // The language has no such function, so what was selected is not a call at
             // all: it is a FIELD NAME, and a field is named by a path of member names,
             // which the brackets of the call are not part of.
-            return Err(ExpressionRefusal::broken_rule(invalid_field_name_message(
+            return Err(Unread::BrokenRule(invalid_field_name_message(
                 &expression.to_string(),
             )));
         };
+        // An aggregate of the language takes exactly one argument.
         let FunctionArguments::List(arguments) = &function.args else {
-            return Err(format!("{name} takes one argument").into());
+            return Err(Unread::Unreadable);
         };
         let [argument] = arguments.args.as_slice() else {
-            return Err(format!("{name} takes exactly one argument").into());
+            return Err(Unread::Unreadable);
         };
         let property = match argument {
             FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
             FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
-                Some(property_of(inner).ok_or_else(|| {
-                    format!("{name} takes a property of the configuration item")
-                })?)
+                Some(property_of(inner).ok_or(Unreadable)?)
             }
-            _ => {
-                return Err(format!(
-                    "{name} takes a property of the configuration item, or * for COUNT"
-                )
-                .into())
-            }
+            // An aggregate of a Config query takes a property of the configuration item,
+            // or `*` for COUNT.
+            _ => return Err(Unread::Unreadable),
         };
         if property.is_none() && aggregate != Aggregate::Count {
-            return Err(format!("{name} takes a property, not *").into());
+            return Err(Unread::Unreadable);
         }
         return Ok(Field::Aggregated {
             function: aggregate,
             property,
         });
     }
-    property_of(expression).map(Field::Property).ok_or_else(|| {
-        "a Config query selects properties of the configuration item, aggregates over them, \
-         or *"
-            .to_string()
-            .into()
-    })
+    // A Config query selects properties of the configuration item, aggregates over them,
+    // or `*`.
+    property_of(expression)
+        .map(Field::Property)
+        .ok_or(Unread::Unreadable)
 }
 
 /// The words the Config query language's own grammar is written with — the clause
@@ -1019,11 +1065,9 @@ fn property_of(expression: &Expr) -> Option<Vec<String>> {
 /// [`MAX_EXPRESSION_DEPTH`] is enforced here as well as on the bytes. It bounds the
 /// recursion of this reading, of the drop of the condition it builds, and of
 /// [`Condition::matches`], which descends the same tree once per configuration item.
-fn read_condition(expression: &Expr, depth: usize) -> Result<Condition, String> {
+fn read_condition(expression: &Expr, depth: usize) -> Result<Condition, Unreadable> {
     if depth > MAX_EXPRESSION_DEPTH {
-        return Err(format!(
-            "the condition nests more than {MAX_EXPRESSION_DEPTH} levels"
-        ));
+        return Err(Unreadable);
     }
     let depth = depth + 1;
     match expression {
@@ -1074,26 +1118,23 @@ fn read_condition(expression: &Expr, depth: usize) -> Result<Condition, String> 
                         value,
                     });
                 }
-                Err(
-                    "a condition of a Config query compares a property of the configuration item \
-                     against a value"
-                        .to_string(),
-                )
+                // A condition of a Config query compares a property of the configuration
+                // item against a value.
+                Err(Unreadable)
             }
-            other => Err(format!(
-                "'{other}' is not an operator a condition of a Config query uses"
-            )),
+            // Any other operator is not one a condition of a Config query uses.
+            _ => Err(Unreadable),
         },
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             expr,
         } => Ok(Condition::Not(Box::new(read_condition(expr, depth)?))),
         Expr::IsNull(inner) => Ok(Condition::IsNull {
-            property: property_of(inner).ok_or_else(condition_needs_property)?,
+            property: property_of(inner).ok_or(Unreadable)?,
             negated: false,
         }),
         Expr::IsNotNull(inner) => Ok(Condition::IsNull {
-            property: property_of(inner).ok_or_else(condition_needs_property)?,
+            property: property_of(inner).ok_or(Unreadable)?,
             negated: true,
         }),
         Expr::InList {
@@ -1101,12 +1142,11 @@ fn read_condition(expression: &Expr, depth: usize) -> Result<Condition, String> 
             list,
             negated,
         } => {
-            let property = property_of(expr).ok_or_else(condition_needs_property)?;
+            let property = property_of(expr).ok_or(Unreadable)?;
             let mut values = Vec::new();
             for item in list {
-                values.push(literal_of(item).ok_or_else(|| {
-                    "an IN list of a Config query carries values".to_string()
-                })?);
+                // An IN list of a Config query carries values.
+                values.push(literal_of(item).ok_or(Unreadable)?);
             }
             Ok(Condition::In {
                 property,
@@ -1120,11 +1160,10 @@ fn read_condition(expression: &Expr, depth: usize) -> Result<Condition, String> 
             low,
             high,
         } => Ok(Condition::Between {
-            property: property_of(expr).ok_or_else(condition_needs_property)?,
-            low: literal_of(low)
-                .ok_or_else(|| "a BETWEEN of a Config query carries values".to_string())?,
-            high: literal_of(high)
-                .ok_or_else(|| "a BETWEEN of a Config query carries values".to_string())?,
+            property: property_of(expr).ok_or(Unreadable)?,
+            // A BETWEEN of a Config query carries values.
+            low: literal_of(low).ok_or(Unreadable)?,
+            high: literal_of(high).ok_or(Unreadable)?,
             negated: *negated,
         }),
         Expr::Like {
@@ -1133,25 +1172,22 @@ fn read_condition(expression: &Expr, depth: usize) -> Result<Condition, String> 
             pattern,
             ..
         } => {
-            let property = property_of(expr).ok_or_else(condition_needs_property)?;
+            let property = property_of(expr).ok_or(Unreadable)?;
+            // A LIKE of a Config query carries a pattern.
             let pattern = literal_of(pattern)
                 .and_then(|value| value.as_str().map(str::to_string))
-                .ok_or_else(|| "a LIKE of a Config query carries a pattern".to_string())?;
+                .ok_or(Unreadable)?;
             Ok(Condition::Like {
                 property,
                 pattern,
                 negated: *negated,
             })
         }
-        other => Err(format!(
-            "'{other}' is not a condition of the Config query language"
-        )),
+        // Anything else is no condition of the Config query language. A condition that
+        // does not name a property of the configuration item is not one either, which is
+        // what every reading above refuses.
+        _ => Err(Unreadable),
     }
-}
-
-/// The one sentence a condition that does not name a property is refused with.
-fn condition_needs_property() -> String {
-    "a condition of a Config query names a property of the configuration item".to_string()
 }
 
 /// The value `expression` is, if it is one: a string, a number, a boolean or NULL.
@@ -1192,19 +1228,18 @@ fn literal_of_sql_value(value: &sqlparser::ast::ValueWithSpan) -> Option<Value> 
 }
 
 /// Read a query's `ORDER BY` clause as the keys it orders by.
-fn read_order_by(query: &Query) -> Result<Vec<OrderKey>, String> {
+fn read_order_by(query: &Query) -> Result<Vec<OrderKey>, Unreadable> {
     use sqlparser::ast::OrderByKind;
     let Some(order_by) = query.order_by.as_ref() else {
         return Ok(Vec::new());
     };
+    // A Config query orders by properties of the configuration item.
     let OrderByKind::Expressions(expressions) = &order_by.kind else {
-        return Err("a Config query orders by properties of the configuration item".to_string());
+        return Err(Unreadable);
     };
     let mut keys = Vec::new();
     for expression in expressions {
-        let property = property_of(&expression.expr).ok_or_else(|| {
-            "a Config query orders by properties of the configuration item".to_string()
-        })?;
+        let property = property_of(&expression.expr).ok_or(Unreadable)?;
         keys.push(OrderKey {
             property,
             // "ORDER BY property [DESC | ASC]": ascending unless the query says
@@ -1216,21 +1251,22 @@ fn read_order_by(query: &Query) -> Result<Vec<OrderKey>, String> {
 }
 
 /// Read a query's `LIMIT` clause as the number of rows it bounds the answer to.
-fn read_limit(query: &Query) -> Result<Option<usize>, String> {
+fn read_limit(query: &Query) -> Result<Option<usize>, Unreadable> {
     use sqlparser::ast::LimitClause;
     let Some(clause) = query.limit_clause.as_ref() else {
         return Ok(None);
     };
+    // A Config query carries a plain LIMIT: a number of rows, and no OFFSET or BY.
     let LimitClause::LimitOffset {
         limit,
         offset,
         limit_by,
     } = clause
     else {
-        return Err("a Config query carries a plain LIMIT".to_string());
+        return Err(Unreadable);
     };
     if offset.is_some() || !limit_by.is_empty() {
-        return Err("a Config query carries a plain LIMIT".to_string());
+        return Err(Unreadable);
     }
     let Some(limit) = limit else {
         return Ok(None);
@@ -1238,39 +1274,30 @@ fn read_limit(query: &Query) -> Result<Option<usize>, String> {
     let rows = literal_of(limit)
         .as_ref()
         .and_then(Value::as_u64)
-        .ok_or_else(|| "the LIMIT of a Config query is a number of rows".to_string())?;
+        .ok_or(Unreadable)?;
     Ok(Some(usize::try_from(rows).unwrap_or(usize::MAX)))
 }
 
-/// The depth of `expression`'s bracketing: the most brackets open at any one point.
+/// Where `expression` passes a bound this emulator puts on the work ONE expression may
+/// ask for, if it passes one.
 ///
-/// One pass over the characters, so the bound costs less than the parse it guards.
-/// Brackets inside a literal are counted too, which can only make this OVER-count: an
-/// expression refused here is refused for carrying that many brackets, never served
-/// when it nests deeper.
-fn nesting_depth(expression: &str) -> usize {
-    let mut depth: usize = 0;
-    let mut deepest: usize = 0;
-    for character in expression.chars() {
-        match character {
-            '(' | '[' => {
-                depth += 1;
-                deepest = deepest.max(depth);
-            }
-            ')' | ']' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    deepest
-}
-
-/// The number of tokens `expression` carries: each run of word characters, and each
-/// other non-whitespace character, counts once. It OVER-counts rather than
-/// under-counts, which is the safe direction for a bound on depth.
-fn token_count(expression: &str) -> usize {
+/// [`MAX_EXPRESSION_DEPTH`] and [`MAX_EXPRESSION_TOKENS`] are the emulator's own bounds,
+/// and this is one pass over the characters, so they cost less than the parse they guard
+/// and nothing is parsed to find where one was passed — which is what keeps a
+/// caller-controlled expression from turning into a deep recursion in the parser, or in
+/// the drop of the tree it builds. Brackets and tokens inside a literal are counted too,
+/// which can only make this OVER-count: an expression refused here is refused for
+/// carrying that much, never served when it carries more.
+fn passes_a_bound(expression: &str) -> Option<Position> {
+    let mut open: usize = 0;
     let mut tokens: usize = 0;
     let mut inside_word = false;
+    let mut at = Position::START;
     for character in expression.chars() {
+        let here = at;
+        at = at.after(character);
+        // Each run of word characters, and each other non-whitespace character, counts as
+        // one token.
         if character.is_alphanumeric() || matches!(character, '_' | '-' | ':' | '.') {
             if !inside_word {
                 tokens += 1;
@@ -1282,8 +1309,108 @@ fn token_count(expression: &str) -> usize {
                 tokens += 1;
             }
         }
+        if tokens > MAX_EXPRESSION_TOKENS {
+            return Some(here);
+        }
+        match character {
+            '(' | '[' => {
+                open += 1;
+                if open > MAX_EXPRESSION_DEPTH {
+                    return Some(here);
+                }
+            }
+            ')' | ']' => open = open.saturating_sub(1),
+            _ => {}
+        }
     }
-    tokens
+    None
+}
+
+/// The keyword a Config query opens with ("SELECT property [, ...] [ WHERE condition ]
+/// [ GROUP BY property ] [ ORDER BY property [ASC | DESC] [, ...] ]").
+const SELECT_KEYWORD: &str = "SELECT";
+
+/// The most PREFIXES of one command [`stopped_reading_at`] reads to find where the reading
+/// stopped.
+///
+/// Reading a prefix costs about what reading the whole command costs, so this is what keeps
+/// refusing one expression a small multiple of reading it rather than a multiple of its
+/// token count ([`MAX_EXPRESSION_TOKENS`] of them). The prefixes are read from the LONGEST
+/// down and a Config query of the documented form carries a few dozen tokens, so the
+/// reading of a command written in that form stops within this many; a command whose fault
+/// is further than that from its end is answered at the token its reading began with, which
+/// is where nothing of it was read.
+const MAX_PREFIX_READINGS: usize = 64;
+
+/// Where the reading of `expression` stopped: the position of the first token it could
+/// not read as part of a Config query.
+///
+/// Found by READING, never by searching the text: the longest PREFIX of the command this
+/// service can read as a Config query is the part it read, so the token that FOLLOWS that
+/// prefix is the one the reading stopped at. Prefixes are cut at the token boundaries of
+/// the submitted command — the tokenizer the parser itself uses supplies them, each with
+/// the line and column it starts at — so the position names a token the caller wrote and
+/// never a point inside one. The `SELECT` a Config query opens with is a beginning the
+/// reading got past, so a command whose first selected property is already unreadable
+/// stops there, while one that opens with anything else stops at its very first token.
+fn stopped_reading_at(expression: &str) -> Position {
+    let dialect = GenericDialect {};
+    let tokenized = Tokenizer::new(&dialect, expression).tokenize_with_location();
+    let tokens = match tokenized {
+        Ok(tokens) => tokens,
+        // The text does not split into tokens at all (an unterminated string literal,
+        // say): the tokenizer itself reports where it stopped.
+        Err(error) => return Position::from(error.location),
+    };
+    let significant: Vec<&TokenWithSpan> = tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_)))
+        .collect();
+    let starts: Vec<Position> = significant
+        .iter()
+        .map(|token| Position::from(token.span.start))
+        .collect();
+    let offsets = byte_offsets(expression);
+
+    // Where the reading began: past the keyword a Config query opens with, or at the very
+    // first token of a command that opens with anything else.
+    let began_at = usize::from(
+        significant
+            .first()
+            .is_some_and(|token| token.token.to_string().eq_ignore_ascii_case(SELECT_KEYWORD)),
+    );
+    for cut in (began_at + 1..starts.len()).rev().take(MAX_PREFIX_READINGS) {
+        let prefix = offsets
+            .get(&starts[cut])
+            .and_then(|offset| expression.get(..*offset));
+        if prefix.is_some_and(|prefix| read_command(prefix).is_ok()) {
+            return starts[cut];
+        }
+    }
+    match starts.get(began_at) {
+        Some(stopped_at) => *stopped_at,
+        // Nothing follows the beginning of the command, so the reading stopped where the
+        // text ran out — the greatest position of the expression, one past its last
+        // character.
+        None if began_at > 0 => offsets
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(Position::START),
+        None => starts.first().copied().unwrap_or(Position::START),
+    }
+}
+
+/// The byte offset in `expression` of every position a token of it can start at.
+fn byte_offsets(expression: &str) -> BTreeMap<Position, usize> {
+    let mut offsets = BTreeMap::new();
+    let mut at = Position::START;
+    for (offset, character) in expression.char_indices() {
+        offsets.insert(at, offset);
+        at = at.after(character);
+    }
+    offsets.insert(at, expression.len());
+    offsets
 }
 
 /// The configuration item `item` as the JSON document a Config query runs over.

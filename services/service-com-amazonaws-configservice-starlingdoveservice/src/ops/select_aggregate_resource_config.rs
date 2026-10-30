@@ -15,7 +15,8 @@
 //!   ([`crate::state::read_expression`], the same reading `SelectResourceConfig`
 //!   applies, which parses it with `sqlparser`); an expression that is not one is
 //!   refused with the modelled `InvalidExpressionException` ("The syntax of the query is
-//!   incorrect");
+//!   incorrect"), worded as the syntax error it is — the line and column of the submitted
+//!   expression where the reading stopped;
 //! * the query runs over the CURRENT configuration item of each resource the aggregator
 //!   takes in ([`crate::state::aggregated_configuration_item_documents`]), so the
 //!   properties it selects and filters on are the members of `ConfigurationItem`;

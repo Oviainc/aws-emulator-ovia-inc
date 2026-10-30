@@ -172,3 +172,5 @@ mod aggregate_discovered_resources;
 mod recorded_configuration_item_capture_time;
 #[path = "all/unrecorded_resource_keys.rs"]
 mod unrecorded_resource_keys;
+#[path = "all/config_refusal_identifier_and_position.rs"]
+mod config_refusal_identifier_and_position;

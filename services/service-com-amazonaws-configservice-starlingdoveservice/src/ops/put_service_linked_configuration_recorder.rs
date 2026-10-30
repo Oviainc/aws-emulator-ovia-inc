@@ -210,7 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of this account's own resources to names no recorder this operation can
         // create. Both are refused before anything is stored, with the refusal the
         // model states for the case (`ValidationException`: "You have provided a service
-        // principal for service-linked configuration recorder that is not valid") —
+        // principal for service-linked configuration recorder that is not valid"), worded
+        // for the DIMENSION the request selected the recorder by — the service principal —
         // exactly as `PutThirdPartyServiceLinkedConfigurationRecorder` refuses a service
         // outside its own set.
         let name = match crate::state::service_linked_recorder_name(&service_principal) {
@@ -221,9 +222,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     PutServiceLinkedConfigurationRecorderErrorModeled::ValidationException(
                         ValidationException {
-                            message: Some(crate::state::invalid_service_principal_message(
-                                &service_principal,
-                            )),
+                            message: Some(
+                                crate::state::UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE
+                                    .to_string(),
+                            ),
                         },
                     )
                     .into(),

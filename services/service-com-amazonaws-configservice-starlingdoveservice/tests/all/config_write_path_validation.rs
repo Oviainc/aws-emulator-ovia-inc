@@ -8,7 +8,8 @@
 //! 1. `PutResourceConfig` records a configuration item only for a resource type the
 //!    CloudFormation registry holds a registration for — "The custom resource type must
 //!    be registered with CloudFormation" — refusing one it holds none for 400
-//!    `ValidationException` and recording nothing;
+//!    `InsufficientPermissionsException`, the class that registry lookup answers with,
+//!    and recording nothing;
 //! 2. `PutStoredQuery` saves a query only when its `Expression` IS a Config query (the
 //!    SQL `SELECT` command a select operation runs), refusing anything else 400
 //!    `ValidationException` and creating no query;
@@ -218,7 +219,7 @@ async fn put_resource_config_refuses_a_resource_type_with_no_registration() {
         );
         assert_eq!(
             (status, code.as_str(), message.as_str()),
-            (400, "ValidationException", expected.as_str()),
+            (400, "InsufficientPermissionsException", expected.as_str()),
             "case {case:?}: expected the registration precondition for {resource_type:?}, got \
              {status} with {code} and {message:?}"
         );
@@ -333,9 +334,9 @@ async fn put_stored_query_refuses_an_expression_that_is_no_config_query() {
              {status} with {code} and {message:?}"
         );
         assert!(
-            message.starts_with("The expression is not a valid Config query:"),
-            "case {case:?}: the refusal must say why the expression is no query, got \
-             {message:?}"
+            message.starts_with("syntax error at line "),
+            "case {case:?}: the refusal must report where the reading of the expression \
+             stopped, got {message:?}"
         );
 
         // No query was created: the name is not one the account holds.

@@ -18,7 +18,7 @@
 //!    language names the RULE and the selected fields of THIS request that broke it,
 //!    while a query the engine READ and will not run for any other reason carries the
 //!    one fixed sentence for that, and a command that cannot be read as a query at all
-//!    keeps its own.
+//!    is a syntax error at a position of the submitted text instead.
 //!
 //! Every case drives the emulator the way a client does, through the same
 //! `MultiServiceRouter` the production router builds, reusing the `Emulator` harness
@@ -41,10 +41,11 @@ const NO_SUCH_AGGREGATOR_TEXT: &str = "The configuration aggregator does not exi
 /// here for the same reason as [`NO_SUCH_AGGREGATOR_TEXT`].
 const INVALID_NEXT_TOKEN_TEXT: &str = "The nextToken provided is invalid";
 
-/// The sentence that opens the refusal of a command this service cannot READ as a
-/// Config query — the OTHER leg of `InvalidExpressionException`, which the GROUP BY
-/// rule's own sentence must not collapse into.
-const UNREADABLE_QUERY_PREFIX: &str = "The expression is not a valid Config query:";
+/// How a command this service cannot READ as a Config query is refused — the OTHER leg
+/// of `InvalidExpressionException`, which the GROUP BY rule's own sentence must not
+/// collapse into: a syntax error at the position in the submitted expression where the
+/// reading stopped.
+const UNREADABLE_QUERY_PREFIX: &str = "syntax error at line ";
 
 /// A 12-digit account id, the form `AccountId` takes (`^\d{12}$`), for the members that
 /// identify an aggregated resource.
