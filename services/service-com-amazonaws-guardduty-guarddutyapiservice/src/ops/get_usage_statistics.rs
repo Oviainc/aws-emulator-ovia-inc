@@ -235,12 +235,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .collect();
 
+        // WHICH ordered list a page token is a position in. Each statistic aggregates
+        // over a key list of its own — accounts, features, data sources, resources —
+        // so the statistic type belongs to the identity beside the detector reported
+        // on and the criteria the records are selected by: everything the keys this
+        // report pages are derived from.
+        let listing = crate::state::Listing::of(Self::NAME)
+            .by(&region)
+            .by(&input.detector_id)
+            .by(&input.usage_statistic_type)
+            .by(&input.usage_criteria);
         let (usage_statistics, next_token) = aggregated(
             &input.usage_statistic_type,
             &usage,
             &unit,
             input.max_results,
             input.next_token.as_deref(),
+            &listing,
         )?;
 
         Ok(GetUsageStatisticsOutput {
@@ -740,17 +751,19 @@ fn ordered(totals: &BTreeMap<String, i64>, order: Order) -> Vec<String> {
 
 /// The page of ordered keys `maxResults` / `nextToken` asks for.
 ///
-/// The token is the one this service's other listings issue — an offset into the ordered
-/// keys — so a token from another listing, or one past the end, is refused rather than
-/// silently answered with the first page.
+/// The token is the one this service's listings issue — a position in the ordered keys
+/// of the listing that minted it — so a token from another listing, or one past the
+/// end, is refused rather than silently answered with a page of a list the caller never
+/// paged.
 fn page(
     totals: &BTreeMap<String, i64>,
     order: Order,
     max_results: Option<i32>,
     token: Option<&str>,
+    listing: &crate::state::Listing,
 ) -> Result<(Vec<String>, Option<String>), GetUsageStatisticsError> {
     let keys = ordered(totals, order);
-    crate::state::paginate(&keys, max_results, token, TOP_ROWS).map_err(|_| {
+    crate::state::paginate(listing, &keys, max_results, token, TOP_ROWS).map_err(|_| {
         bad_request(crate::state::invalid_parameter_message(
             crate::state::NEXT_TOKEN_MEMBER,
         ))
@@ -783,11 +796,12 @@ fn aggregated(
     unit: &str,
     max_results: Option<i32>,
     next_token: Option<&str>,
+    listing: &crate::state::Listing,
 ) -> Result<(UsageStatistics, Option<String>), GetUsageStatisticsError> {
     match statistic_type {
         SUM_BY_ACCOUNT => {
             let totals = totals_by(usage, |record| Some(record.account_id.clone()));
-            let (keys, token) = page(&totals, Order::ByKey, max_results, next_token)?;
+            let (keys, token) = page(&totals, Order::ByKey, max_results, next_token, listing)?;
             Ok((
                 UsageStatistics {
                     sum_by_account: Some(
@@ -807,7 +821,7 @@ fn aggregated(
             let totals = totals_by(usage, |record| {
                 data_source_for(record.feature).map(str::to_string)
             });
-            let (keys, token) = page(&totals, Order::ByKey, max_results, next_token)?;
+            let (keys, token) = page(&totals, Order::ByKey, max_results, next_token, listing)?;
             Ok((
                 UsageStatistics {
                     sum_by_data_source: Some(
@@ -825,7 +839,7 @@ fn aggregated(
         }
         SUM_BY_FEATURES => {
             let totals = totals_by(usage, |record| Some(record.feature.to_string()));
-            let (keys, token) = page(&totals, Order::ByKey, max_results, next_token)?;
+            let (keys, token) = page(&totals, Order::ByKey, max_results, next_token, listing)?;
             Ok((
                 UsageStatistics {
                     sum_by_feature: Some(
@@ -850,7 +864,7 @@ fn aggregated(
             } else {
                 Order::ByKey
             };
-            let (keys, token) = page(&totals, order, max_results, next_token)?;
+            let (keys, token) = page(&totals, order, max_results, next_token, listing)?;
             let rows: Vec<UsageResourceResult> = keys
                 .iter()
                 .map(|resource| UsageResourceResult {
@@ -882,7 +896,13 @@ fn aggregated(
             let totals = totals_by(reported.iter().copied(), |record| {
                 Some(record.feature.to_string())
             });
-            let (keys, token) = page(&totals, Order::MostExpensiveFirst, max_results, next_token)?;
+            let (keys, token) = page(
+                &totals,
+                Order::MostExpensiveFirst,
+                max_results,
+                next_token,
+                listing,
+            )?;
             let rows: Vec<UsageTopAccountsResult> = keys
                 .iter()
                 .map(|feature| {

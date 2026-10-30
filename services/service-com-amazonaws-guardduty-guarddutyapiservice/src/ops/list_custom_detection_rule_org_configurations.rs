@@ -198,7 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for a caller that already holds the ordered records — so no record is
         // looked up again by key and the token this issues is the token every other
         // paginated report on this service issues.
+        // The list a page token is a position in: this report over the Region it
+        // serves, narrowed by the status the request named — everything the selection
+        // above is made by.
+        let listing = crate::state::Listing::of(Self::NAME)
+            .by(&region)
+            .by(&input.status);
         let (window, next_token) = crate::state::paginate_window(
+            &listing,
             matched.len(),
             input.max_results,
             input.next_token.as_deref(),

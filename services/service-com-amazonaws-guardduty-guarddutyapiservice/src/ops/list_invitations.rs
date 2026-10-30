@@ -158,7 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // One page out of that total order, so the token this call hands back names
         // the same entry on the call that returns it.
+        // The list a page token is a position in: this report over the Region it
+        // serves, which is everything the inbox above is selected by.
+        let listing = crate::state::Listing::of(Self::NAME).by(&region);
         let (window, next_token) = crate::state::paginate_window(
+            &listing,
             invitations.len(),
             input.max_results,
             input.next_token.as_deref(),

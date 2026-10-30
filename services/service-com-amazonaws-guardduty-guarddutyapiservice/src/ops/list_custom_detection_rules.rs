@@ -184,7 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|rule| rule.rule_id.clone())
             .collect();
 
+        // The list a page token is a position in: this report over the Region it
+        // serves, narrowed by the filters the request named — which is everything the
+        // selection above is made by, so a caller walks the pages with the same
+        // `Filters` it opened them with.
+        let listing = crate::state::Listing::of(Self::NAME)
+            .by(&region)
+            .by(&filters);
         let (page, next_token) = crate::state::paginate(
+            &listing,
             &selected,
             input.max_results,
             input.next_token.as_deref(),

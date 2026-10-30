@@ -198,7 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `smithy_query(operation="DescribeOrganizationConfiguration")`), and the
         // stored records are in a total order, which is what makes a page token
         // mean the same thing on the next call.
+        // The list a page token is a position in: this report over this detector,
+        // which is everything the stored features are selected by.
+        let listing = crate::state::Listing::of(Self::NAME)
+            .by(&region)
+            .by(&input.detector_id);
         let (window, next_token) = crate::state::paginate_window(
+            &listing,
             configuration.features.len(),
             input.max_results,
             input.next_token.as_deref(),

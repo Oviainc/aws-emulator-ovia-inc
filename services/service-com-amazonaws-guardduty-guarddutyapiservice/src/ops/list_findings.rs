@@ -202,7 +202,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|rejection| refusal(&rejection, SORT_CRITERIA_MEMBER))?;
 
         let ids: Vec<String> = matched.iter().map(|f| f.id.clone()).collect();
+        // The list a page token is a position in: this report over this detector,
+        // narrowed by the criteria and ordered by the sort the request named —
+        // everything the ids above are selected and ordered by. `FindingCriteria`
+        // carries its criteria in a MAP, so they go in as entries in key order: the
+        // criteria a request names are a set, and two requests naming the same set
+        // page the same list.
+        let listing = crate::state::Listing::of(Self::NAME)
+            .by(&region)
+            .by(&input.detector_id)
+            .by_entries(
+                input
+                    .finding_criteria
+                    .as_ref()
+                    .and_then(|criteria| criteria.criterion.as_ref())
+                    .into_iter()
+                    .flatten(),
+            )
+            .by(&input.sort_criteria);
         let (page, next_token) = crate::state::paginate(
+            &listing,
             &ids,
             input.max_results,
             input.next_token.as_deref(),

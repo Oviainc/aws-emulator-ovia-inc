@@ -33,13 +33,13 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # the account's clusters and for the GuardDuty security agent add-on installed on
 # each, because both are EKS resources.
 aws-sdk-eks = { version = "1", default-features = false }
+# Digests the identity of the ordered list a page token is a position in, so the
+# token names its own listing; `hex` renders that digest into the token.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

@@ -204,7 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::sort_investigations(&mut ordered, input.sort_criteria.as_ref())
             .map_err(|attribute| unsupported_attribute(&attribute))?;
 
+        // The list a page token is a position in: this report over this detector, in
+        // the order the sort criteria asked for — everything the records above are
+        // selected and ordered by.
+        let listing = crate::state::Listing::of(Self::NAME)
+            .by(&region)
+            .by(&input.detector_id)
+            .by(&input.sort_criteria);
         let (window, next_token) = crate::state::paginate_window(
+            &listing,
             ordered.len(),
             input.max_results,
             input.next_token.as_deref(),

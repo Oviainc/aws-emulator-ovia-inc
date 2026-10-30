@@ -155,7 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // mean the same thing on the next call.
         let ids = state.detector_ids_in(&region);
 
+        // The list a page token is a position in: this report over the Region it
+        // serves, which is everything the ids above are selected by.
+        let listing = crate::state::Listing::of(Self::NAME).by(&region);
         let (page, next_token) = crate::state::paginate(
+            &listing,
             &ids,
             input.max_results,
             input.next_token.as_deref(),

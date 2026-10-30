@@ -174,7 +174,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // detector, which is regional, so this endpoint names only the IPSets the
         // Region it serves holds.
         let ids = detector.live_ip_set_ids();
+        // The list a page token is a position in: this report over this detector,
+        // which is everything the ids above are selected by.
+        let listing = crate::state::Listing::of(Self::NAME)
+            .by(&region)
+            .by(&input.detector_id);
         let (page, next_token) = crate::state::paginate(
+            &listing,
             &ids,
             input.max_results,
             input.next_token.as_deref(),

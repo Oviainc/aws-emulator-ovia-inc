@@ -193,7 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // selection ITSELF: `paginate_window` hands back that run of it, so the
         // answer keeps the `(RuleId, Mode)` order with no parallel id list to page
         // in its stead and no second lookup to resolve each entry back.
+        // The list a page token is a position in: this report over the Region it
+        // serves, narrowed by the rule id and the mode the request named — everything
+        // the selection above is made by.
+        let listing = crate::state::Listing::of(Self::NAME)
+            .by(&region)
+            .by(&input.rule_id)
+            .by(&input.mode);
         let (window, next_token) = crate::state::paginate_window(
+            &listing,
             selected.len(),
             input.max_results,
             input.next_token.as_deref(),

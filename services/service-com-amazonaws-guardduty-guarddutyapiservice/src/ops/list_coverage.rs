@@ -206,7 +206,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::coverage::retain_matching(&mut rows, &criteria);
         crate::state::coverage::sort_rows(&mut rows, sort_key.as_deref(), descending);
 
+        // The list a page token is a position in: this report over this detector,
+        // narrowed by the filter criteria and in the order the sort criteria asked
+        // for — everything the rows above are selected and ordered by.
+        let listing = crate::state::Listing::of(Self::NAME)
+            .by(&region)
+            .by(&input.detector_id)
+            .by(&input.filter_criteria)
+            .by(&input.sort_criteria);
         let (window, next_token) = crate::state::paginate_window(
+            &listing,
             rows.len(),
             input.max_results,
             input.next_token.as_deref(),

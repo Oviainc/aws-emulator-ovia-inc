@@ -190,7 +190,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds: that is what makes a page token mean the same thing on the call
         // that hands it back.
         let account_ids = detector.member_ids(only_associated);
+        // The list a page token is a position in: this report over this detector,
+        // narrowed the way the request asked — everything the ids above are selected
+        // by.
+        let listing = crate::state::Listing::of(Self::NAME)
+            .by(&region)
+            .by(&input.detector_id)
+            .by(only_associated);
         let (page, next_token) = crate::state::paginate(
+            &listing,
             &account_ids,
             input.max_results,
             input.next_token.as_deref(),
