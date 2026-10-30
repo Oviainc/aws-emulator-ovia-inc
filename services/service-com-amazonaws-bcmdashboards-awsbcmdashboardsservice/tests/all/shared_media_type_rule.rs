@@ -1,27 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The shared response-media-type rule, driven through this service's operations.
+//! The media type a REQUEST announces, and why it changes no response.
 //!
-//! The rule, the one function that applies it and the operation-seam wrapper that carries
-//! it to the framework's refusal tail live in `service_common::response_media_type`; this
-//! service states only the pair its responses are re-announced across
-//! (`src/service/response_media_type.rs`). This suite drives that one shared path through
-//! the wire, at each of the three seams the service applies it at — the wrapper
-//! `Service::override_operation` hands back, `Service::override_routing_error` and
-//! `Service::override_framework_error` — so the service and the shared crate cannot drift
-//! apart unnoticed.
+//! The media types themselves are the shared crate's two constants rather than strings
+//! spelled here: `service_common::response_media_type::AWS_JSON_1_0` is what this service's
+//! `aws.protocols#awsJson1_0` model implies — the value the framework stamps, and the one
+//! every response answered in front of the dispatcher announces — and `AWS_JSON_1_1` is
+//! the one the dashboard and scheduled-report dispatcher announces. The shared crate is
+//! also where the mechanism lives that this service re-announces with
+//! (`src/service/response_media_type.rs` states only which announcer answers for what).
 //!
-//! The expectations are the shared crate's own two constants rather than strings spelled
-//! here: `AWS_JSON_1_0` is the media type the model's `aws.protocols#awsJson1_0` trait
-//! implies and the framework's renderers stamp, and `AWS_JSON_1_1` is the one every
-//! recorded response of this service announces.
-//!
-//! The rows span two dimensions: the LAYER that produced the response (a handler success,
-//! a handler's modelled exception, the boundary refusal the framework renders inside the
-//! request walk, the routing failure rendered before any operation runs, and the transport
-//! failure rendered before the request is routed), across several operations; and the media
-//! type the REQUEST was sent under, which is not re-read — a call sent under either awsJson
-//! media type is understood and answered under the announced one.
+//! The rule under test: which announcer produced a response is what decides the media type
+//! it announces, and the media type the REQUEST carried is not re-read — the awsJson `1.0`
+//! and `1.1` codecs are the same JSON over the same `X-Amz-Target` routing key, so a call
+//! sent under either one, under a bare `application/json`, under a parameterised value, or
+//! under no `content-type` at all is understood and answered identically. The rows cross
+//! that request dimension with one call from each announcer: a dispatcher success, a
+//! refusal that reports the request as invalid, and a resource-tagging read.
+//! `tests/all/response_media_type.rs` owns the other dimension of the same rule: every
+//! layer that can produce a response.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -38,12 +35,12 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20250818/us-east-1/bcm-dashboards/aws4_request, \
      SignedHeaders=host;x-amz-date;x-amz-target, Signature=0000";
 
-/// One request, sent under `request_media_type`, answered with the WHOLE response so the
-/// header a client reads is visible. `target` is `None` for a request carrying no
-/// `X-Amz-Target` at all.
+/// One request, sent under `request_media_type` (or under none at all when it is `None`),
+/// answered with the WHOLE response so the header a client reads is visible. `target` is
+/// `None` for a request carrying no `X-Amz-Target` at all.
 async fn send(
     router: &MultiServiceRouter,
-    request_media_type: &str,
+    request_media_type: Option<&str>,
     target: Option<&str>,
     chunked: bool,
     body: &Value,
@@ -52,10 +49,12 @@ async fn send(
         .method("POST")
         .uri("/")
         .header("authorization", AUTHORIZATION)
-        .header("host", "bcm-dashboards.us-east-1.amazonaws.com")
-        .header("content-type", request_media_type);
+        .header("host", "bcm-dashboards.us-east-1.amazonaws.com");
     if let Some(target) = target {
         request = request.header("x-amz-target", format!("AWSBCMDashboardsService.{target}"));
+    }
+    if let Some(request_media_type) = request_media_type {
+        request = request.header("content-type", request_media_type);
     }
     if chunked {
         // Declares `aws-chunked` framing and carries none of it, which the router refuses
@@ -80,9 +79,9 @@ fn media_type(response: &http::Response<Bytes>) -> String {
         .to_string()
 }
 
-/// One call through the shared path, and the layer that answers it.
+/// One call, the announcer that answers it and the status it carries.
 struct Case {
-    /// What produced the response, and through which seam the shared rule reaches it.
+    /// What the call asks for, and which announcer answers.
     label: &'static str,
     /// The operation named in `X-Amz-Target`, or `None` for a request carrying none.
     target: Option<&'static str>,
@@ -90,101 +89,91 @@ struct Case {
     chunked: bool,
     body: Value,
     status: u16,
+    /// The media type this response announces, whatever the request announced.
+    media_type: &'static str,
 }
 
-/// Every layer that can answer a request for this service announces the media type the
-/// shared pair names, whichever awsJson media type the request was sent under.
+/// Whatever media type the request announced, every response announces the media type of
+/// the announcer that produced it — and the call is understood either way.
 #[tokio::test]
-async fn every_layer_announces_the_shared_pairs_media_type() {
-    // Both awsJson media types, because the REQUEST side is not re-read: the codec is the
-    // same `JsonCodec` over the same body either way.
-    for request_media_type in [AWS_JSON_1_0, AWS_JSON_1_1] {
+async fn the_requests_media_type_changes_no_response() {
+    // The media types a caller can put on the request: both awsJson versions, the bare
+    // JSON media type, a parameterised one, and none at all.
+    let request_media_types = [
+        Some(AWS_JSON_1_0),
+        Some(AWS_JSON_1_1),
+        Some("application/json"),
+        Some("application/x-amz-json-1.0; charset=utf-8"),
+        None,
+    ];
+
+    for request_media_type in request_media_types {
         let router = router();
         let created = ok_call(
             &router,
             "CreateDashboard",
-            &json!({"name": "Shared Rule Fixture", "widgets": []}),
+            &json!({"name": "Request Media Type Fixture", "widgets": []}),
         )
         .await;
         let arn = created["arn"].as_str().expect("an arn").to_string();
-        // A well-formed `DashboardArn` for a dashboard nothing is stored under: the
-        // created one with its resource id replaced, so the account id stays the engine's.
-        let (prefix, _) = arn.rsplit_once('/').expect("an arn naming a resource");
-        let unknown_arn = format!("{prefix}/no-such-dashboard");
 
         let cases = [
             Case {
-                label: "a handler success through the shared wrapper: a create",
-                target: Some("CreateDashboard"),
-                chunked: false,
-                body: json!({"name": "Shared Rule Second", "widgets": []}),
-                status: 200,
-            },
-            Case {
-                label: "a handler success through the shared wrapper: a single read",
+                label: "the dispatcher: a read of the stored dashboard",
                 target: Some("GetDashboard"),
                 chunked: false,
                 body: json!({"arn": arn.clone()}),
                 status: 200,
+                media_type: AWS_JSON_1_1,
             },
             Case {
-                label: "a handler success through the shared wrapper: a listing",
-                target: Some("ListDashboards"),
-                chunked: false,
-                body: json!({"maxResults": 1}),
-                status: 200,
-            },
-            Case {
-                label: "a handler's modelled exception: a dashboard nothing is stored under",
-                target: Some("GetDashboard"),
-                chunked: false,
-                body: json!({"arn": unknown_arn}),
-                status: 400,
-            },
-            Case {
-                label: "the refusal tail INSIDE the walk: an absent @required member",
+                label: "the validator: no @required member in the body",
                 target: Some("GetDashboard"),
                 chunked: false,
                 body: json!({}),
                 status: 400,
+                media_type: AWS_JSON_1_0,
             },
             Case {
-                label: "the refusal tail INSIDE the walk: a value outside a @pattern",
-                target: Some("UpdateDashboard"),
+                label: "the tagging family: a tag listing",
+                target: Some("ListTagsForResource"),
                 chunked: false,
-                body: json!({
-                    "arn": "arn:aws:bcm-dashboards::123456789012:dashboard/NOT-LOWERCASE"
-                }),
-                status: 400,
+                body: json!({"resourceArn": arn.clone()}),
+                status: 200,
+                media_type: AWS_JSON_1_0,
             },
             Case {
-                label: "the routing failure: an X-Amz-Target naming no modelled operation",
+                label: "before routing: an X-Amz-Target naming no modelled operation",
                 target: Some("NoSuchOperation"),
                 chunked: false,
                 body: json!({}),
                 status: 501,
+                media_type: AWS_JSON_1_0,
             },
             Case {
-                label: "the routing failure: no X-Amz-Target to read a routing key from",
+                label: "before routing: no X-Amz-Target to read a routing key from",
                 target: None,
                 chunked: false,
                 body: json!({}),
                 status: 400,
+                media_type: AWS_JSON_1_0,
             },
             Case {
-                label: "the transport failure: an aws-chunked body that is not framed",
+                label: "before routing: an aws-chunked body that is not framed",
                 target: Some("ListScheduledReports"),
                 chunked: true,
                 body: json!({}),
                 status: 400,
+                media_type: AWS_JSON_1_0,
             },
             // Last: it removes the fixture the rows above read.
             Case {
-                label: "a handler success through the shared wrapper: a delete",
+                label: "the dispatcher: a delete of the stored dashboard",
                 target: Some("DeleteDashboard"),
                 chunked: false,
                 body: json!({"arn": arn.clone()}),
                 status: 200,
+                media_type: AWS_JSON_1_1,
             },
         ];
 
@@ -201,21 +190,21 @@ async fn every_layer_announces_the_shared_pairs_media_type() {
             let actual = media_type(&response);
             assert_eq!(
                 actual_status, case.status,
-                "case {:?} sent under {request_media_type}: expected HTTP {}, got \
+                "case {:?} sent under {request_media_type:?}: expected HTTP {}, got \
                  {actual_status} ({actual})",
                 case.label, case.status
             );
             assert_eq!(
-                actual, AWS_JSON_1_1,
-                "case {:?} sent under {request_media_type}: expected content-type \
-                 {AWS_JSON_1_1}, got {actual:?}",
-                case.label
+                actual, case.media_type,
+                "case {:?} sent under {request_media_type:?}: expected content-type {}, \
+                 got {actual:?} (the request's media type is not re-read)",
+                case.label, case.media_type
             );
             let parsed: Result<Value, _> = serde_json::from_slice(response.body());
             assert!(
                 parsed.is_ok(),
-                "case {:?} sent under {request_media_type}: the body under {actual} must be \
-                 the JSON document that media type promises, got {:?}",
+                "case {:?} sent under {request_media_type:?}: the body under {actual} must \
+                 be the JSON document that media type promises, got {:?}",
                 case.label,
                 String::from_utf8_lossy(response.body())
             );

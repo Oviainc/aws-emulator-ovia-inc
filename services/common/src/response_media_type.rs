@@ -16,6 +16,15 @@
 //! wire differs from it re-announces that ONE value and leaves every other response header
 //! alone.
 //!
+//! A service's wire can show MORE than one announcer, and then which layer answered decides
+//! the value: a front door that announces its own media type on what its handlers produce,
+//! with another layer in front of it — a request validator, say — recorded under a
+//! different one. That is still this rule, applied per announcer: the service states which
+//! responses one announcer produced ([`AnnouncedResponses`], reading the response a client
+//! receives, because which internal seam rendered it is the emulator's business and not the
+//! service's wire) and the rest keep the media type their own producer stamped. Which
+//! announcer owns which responses is a fact of the recorded wire, never a guess.
+//!
 //! The REQUEST side is untouched: the media type a caller sends is not re-read, routing
 //! still follows the model's protocol, and the awsJson `1.0` and `1.1` codecs are the same
 //! `JsonCodec` over the same body, so only the announced value differs.
@@ -39,9 +48,10 @@
 //! refusal tail is rendered INSIDE the centralized walk, so reaching it means serving that
 //! walk and re-announcing what it answered. That plumbing is therefore stated here once, as
 //! [`ResponseMediaTypeOperation`] (the wrapper a service hands back from
-//! `Service::override_operation`) and [`routes`] (the condition under which it claims a
-//! request); the other two seams are handed the rendered response and need nothing but the
-//! call.
+//! `Service::override_operation`, re-announcing either every response of the walk or only
+//! the ones an [`AnnouncedResponses`] predicate accepts) and [`routes`] (the condition under
+//! which it claims a request); the other two seams are handed the rendered response and need
+//! nothing but the call.
 //!
 //! One response no author seam reaches: the authentication refusal, which the router renders
 //! through `definition().refusal_response(..)` before the service is asked anything
@@ -57,7 +67,9 @@
 //! `service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator`,
 //! `service-com-amazonaws-freetier-awsfreetierservice` and
 //! `service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice` — the same AWS billing
-//! front door, the same `1.1` framing over an `awsJson1_0` model — and by
+//! front door, the same `1.1` framing over an `awsJson1_0` model; the last of them is the
+//! two-announcer case, so it states which responses that front door produced rather than
+//! re-announcing all of them — and by
 //! `service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice`, whose model
 //! declares `restJson1` and whose recorded wire announces the awsJson `1.1` media type
 //! on every reply, so it states its own pair (`application/json` → `1.1`) and takes the
@@ -153,11 +165,18 @@ pub fn routes(definition: &dyn ErasedServiceDefinition, req: &RtRequest) -> bool
 /// Serves the modelled operation the service's routing table names for the request, exactly
 /// as that table would, then announces the response the way the service announces it.
 ///
-/// This wrapper exists for ONE response: the framework-level refusal tail, which renders a
-/// constraint the model declares in the model-derived envelope INSIDE the centralized walk
-/// (`run_operation_http`), where `Service::override_protocol` explicitly does not reach.
-/// Every other response of a routed request is already serialized by the codec that seam
-/// returns, so [`ResponseMediaType::announce`] finds nothing to change on it.
+/// What it is FOR depends on the other seams its service takes. A service that also serves
+/// a codec through `Service::override_protocol` is already announcing every response that
+/// codec serialized, and takes this wrapper for the one response that seam explicitly does
+/// not reach: the framework-level refusal tail, which renders a constraint the model
+/// declares in the model-derived envelope INSIDE the centralized walk
+/// (`run_operation_http`). A service that keeps the model's protocol takes it for the whole
+/// walk instead, and says with an [`AnnouncedResponses`] predicate which of that walk's
+/// responses its announcer produced.
+///
+/// Either way it reaches only a ROUTED request: what the router renders outside the walk —
+/// an unroutable request, a transport-level failure, the authentication refusal — never
+/// passes through here and keeps the media type its own renderer stamped.
 ///
 /// It holds no operation of its own: the one it delegates to is the one the service's
 /// routing table names for the request, resolved from the `svc` the framework passes into
@@ -168,13 +187,51 @@ pub fn routes(definition: &dyn ErasedServiceDefinition, req: &RtRequest) -> bool
 #[derive(Debug, Clone, Copy)]
 pub struct ResponseMediaTypeOperation {
     media_type: ResponseMediaType,
+    announced: Option<AnnouncedResponses>,
 }
 
+/// Which of a walk's responses one announcer produced, for a service whose wire shows more
+/// than one of them.
+///
+/// A service answering under a single media type re-announces every response and states no
+/// predicate. Where two layers answer under different media types, the predicate is how the
+/// service says which responses belong to the layer it is re-announcing for; the rest are
+/// handed back as their producer wrote them.
+pub type AnnouncedResponses = fn(&RtResponse) -> bool;
+
 impl ResponseMediaTypeOperation {
-    /// The wrapper that re-announces across `media_type`. A service builds one in its
-    /// constructor, because `Service::override_operation` hands back a borrow of it.
+    /// The wrapper that re-announces EVERY response of the walk across `media_type`. A
+    /// service builds one in its constructor, because `Service::override_operation` hands
+    /// back a borrow of it.
     pub const fn new(media_type: ResponseMediaType) -> Self {
-        Self { media_type }
+        Self {
+            media_type,
+            announced: None,
+        }
+    }
+
+    /// The same wrapper, re-announcing only the responses `announced` accepts — the ones
+    /// the announcer this pair belongs to produced. Every other response keeps the media
+    /// type its own producer stamped.
+    pub const fn announcing(
+        media_type: ResponseMediaType,
+        announced: AnnouncedResponses,
+    ) -> Self {
+        Self {
+            media_type,
+            announced: Some(announced),
+        }
+    }
+
+    /// `resp` as this wrapper announces it: re-announced across the pair when it is one of
+    /// the responses this announcer produced, and handed back exactly as its producer wrote
+    /// it otherwise. A wrapper built by [`Self::new`] announces every response.
+    pub fn announce(&self, resp: RtResponse) -> RtResponse {
+        if self.announced.is_none_or(|produced_here| produced_here(&resp)) {
+            self.media_type.announce(resp)
+        } else {
+            resp
+        }
     }
 }
 
@@ -199,7 +256,7 @@ impl ErasedOperation for ResponseMediaTypeOperation {
                 // framework answers an unroutable request rather than guessed at.
                 None => definition.routing_error_response(req),
             };
-            self.media_type.announce(resp)
+            self.announce(resp)
         })
     }
 
@@ -286,6 +343,59 @@ mod tests {
             assert_eq!(
                 actual, None,
                 "case {pair:?} on a response with no media type: expected none, got \
+                 {actual:?}"
+            );
+        }
+    }
+
+    /// A wrapper re-announces every response of the walk, or only the ones its predicate
+    /// says its announcer produced — and the predicate decides from the response, so two
+    /// responses of one walk can come out announced differently.
+    ///
+    /// The rows span the three forms a service states: no predicate (every response), a
+    /// predicate accepting a response (re-announced) and one refusing it (left as its
+    /// producer wrote it); `status_is_ok` is a stand-in for a real service's "which layer
+    /// produced this" question.
+    #[test]
+    fn a_predicate_decides_which_responses_are_reannounced() {
+        /// Accepts the responses of a successful call, refuses a refusal.
+        fn status_is_ok(resp: &RtResponse) -> bool {
+            resp.status().is_success()
+        }
+
+        let pair = ResponseMediaType::new(AWS_JSON_1_0, AWS_JSON_1_1);
+        let every = ResponseMediaTypeOperation::new(pair);
+        let only_successes = ResponseMediaTypeOperation::announcing(pair, status_is_ok);
+
+        let cases: [(&str, ResponseMediaTypeOperation, u16, &str); 4] = [
+            ("no predicate, on a success", every, 200, AWS_JSON_1_1),
+            ("no predicate, on a refusal", every, 400, AWS_JSON_1_1),
+            (
+                "a predicate that accepts it",
+                only_successes,
+                200,
+                AWS_JSON_1_1,
+            ),
+            (
+                "a predicate that refuses it",
+                only_successes,
+                400,
+                AWS_JSON_1_0,
+            ),
+        ];
+
+        for (case, wrapper, status, expected) in cases {
+            let mut resp = RtResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(status)
+                    .expect("a status code"),
+                SdkBody::from(&b"{}"[..]),
+            );
+            resp.headers_mut().insert(CONTENT_TYPE, AWS_JSON_1_0);
+            let actual = media_type(&wrapper.announce(resp));
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected),
+                "case {case:?} (HTTP {status}): expected content-type {expected}, got \
                  {actual:?}"
             );
         }

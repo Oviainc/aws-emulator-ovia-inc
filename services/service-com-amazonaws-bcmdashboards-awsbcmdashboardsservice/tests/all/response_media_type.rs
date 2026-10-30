@@ -1,26 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The media type every response of this service announces.
+//! The media type every response of this service announces — there are two announcers.
 //!
-//! Every recorded response of this service — a success and an error alike — carries
-//! `content-type: application/x-amz-json-1.1`, while the media type the model's
-//! `aws.protocols#awsJson1_0` trait implies, and which the framework's serializers and
-//! pre-dispatch error renderers stamp, is `application/x-amz-json-1.0`. A client (or a
-//! recording proxy) selects its JSON-protocol decoder from that header, so the one the
-//! service announces is part of its wire contract.
+//! The rule under test: a response of the DASHBOARD or SCHEDULED-REPORT dispatcher — its
+//! successes, and the errors its handlers raise about stored state — announces
+//! `application/x-amz-json-1.1`, while everything answered in FRONT of that dispatcher
+//! announces the `application/x-amz-json-1.0` the model's `aws.protocols#awsJson1_0` trait
+//! implies: a refusal that reports the request itself as invalid (the modelled
+//! `ValidationException`), every response of a resource-tagging operation, an unroutable
+//! request, a transport-level failure and the authentication refusal. A client (or a
+//! recording proxy) picks its JSON-protocol decoder from that header, so which value a
+//! response carries is part of the wire contract.
 //!
-//! The rule under test: EVERY response this service answers announces
-//! `application/x-amz-json-1.1`, whichever layer produced it, while the REQUEST side stays
-//! awsJson1_0 — the calls below are routed by `X-Amz-Target` and sent under
-//! `content-type: application/x-amz-json-1.0` (see [`super::dashboard_lifecycle::call`]),
-//! and every one of them is understood.
+//! The rows span both halves of the rule at once: the LAYER that produced the response (a
+//! handler success, a handler's modelled exception about stored state, the boundary
+//! validator's refusal, a validation refusal a handler raises because the boundary
+//! validator cannot express the constraint, the routing failure rendered before any
+//! operation runs — this service's only 501, now that every operation it models is
+//! implemented — the transport failure rendered before the request is routed, and the
+//! authentication refusal the router renders before this service is asked anything), and
+//! the OPERATION family it belongs to. Every row states the media type it expects, so a
+//! row moving from one announcer to the other fails here.
 //!
-//! The rows span the layers that can produce a response, because the rule is about all of
-//! them and not about one operation: a handler's success, a handler's modelled exception,
-//! a handler's own refusal, the boundary validator's refusal, the routing failure
-//! rendered before any operation runs (which is where this service's only 501 comes from,
-//! now that every operation it models is implemented), and the transport failure rendered
-//! before the request is even routed.
+//! The REQUEST side stays awsJson1_0: the calls below are sent under
+//! `content-type: application/x-amz-json-1.0` (see [`super::dashboard_lifecycle::call`])
+//! and every one of them is understood. `tests/all/shared_media_type_rule.rs` varies that
+//! header instead, and shows it changes no response.
 
 use std::sync::Arc;
 
@@ -32,11 +37,13 @@ use service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::EmulatedService
 
 use super::dashboard_lifecycle::{ok_call, router};
 
-/// The media type every response of this service announces, as the wire record shows.
-const RESPONSE_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
+/// The media type the dashboard and scheduled-report dispatcher announces on what it
+/// returns.
+const DISPATCHER_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
 
-/// The media type the model's `awsJson1_0` protocol trait implies. Requests are still sent
-/// under it; no response may announce it.
+/// The media type the model's `awsJson1_0` protocol trait implies, which the framework
+/// stamps and everything answered in front of the dispatcher announces. Requests are sent
+/// under it too.
 const PROTOCOL_MEDIA_TYPE: &str = "application/x-amz-json-1.0";
 
 /// The SigV4 authorization header the router resolves this service's route key from. The
@@ -58,7 +65,6 @@ async fn send(
         .uri("/")
         .header("authorization", AUTHORIZATION)
         .header("host", "bcm-dashboards.us-east-1.amazonaws.com")
-        // The REQUEST side is awsJson1_0 and stays that way.
         .header("content-type", PROTOCOL_MEDIA_TYPE)
         .header("x-amz-target", format!("AWSBCMDashboardsService.{target}"))
         .body(Bytes::from(
@@ -78,9 +84,14 @@ fn media_type(response: &http::Response<Bytes>) -> String {
         .to_string()
 }
 
-/// Assert the rule on one response: it announces the media type this service answers
-/// under, and the body under that media type is the JSON document the media type promises.
-fn assert_media_type(case: &str, response: &http::Response<Bytes>, expected_status: u16) {
+/// Assert one response: the status it carries, the media type it announces, and that the
+/// body under that media type is the JSON document the media type promises.
+fn assert_media_type(
+    case: &str,
+    response: &http::Response<Bytes>,
+    expected_status: u16,
+    expected_media_type: &str,
+) {
     let actual = media_type(response);
     let status = response.status().as_u16();
     assert_eq!(
@@ -88,8 +99,8 @@ fn assert_media_type(case: &str, response: &http::Response<Bytes>, expected_stat
         "case {case:?}: expected HTTP {expected_status}, got {status} ({actual})"
     );
     assert_eq!(
-        actual, RESPONSE_MEDIA_TYPE,
-        "case {case:?}: expected content-type {RESPONSE_MEDIA_TYPE}, got {actual:?}"
+        actual, expected_media_type,
+        "case {case:?}: expected content-type {expected_media_type}, got {actual:?}"
     );
     let parsed: Result<Value, _> = serde_json::from_slice(response.body());
     assert!(
@@ -100,21 +111,23 @@ fn assert_media_type(case: &str, response: &http::Response<Bytes>, expected_stat
     );
 }
 
-/// One call, and the status the layer that answers it renders.
+/// One call: what produced the response, and what that layer answers with.
 struct Case {
-    /// What produced the response.
+    /// What produced the response, and which announcer it belongs to.
     label: &'static str,
     /// The operation named in `X-Amz-Target`.
     operation: &'static str,
     body: Value,
     status: u16,
+    /// The media type this response announces.
+    media_type: &'static str,
 }
 
-/// Every response of a routed request announces the service's media type: a success, a
-/// modelled exception, a handler refusal and a boundary refusal all come from different
-/// layers and all carry the same header.
+/// Every response of a routed request announces the media type of the announcer that
+/// produced it: the dispatcher's own successes and state errors on one side, the validation
+/// refusals and the whole resource-tagging family on the other.
 #[tokio::test]
-async fn every_routed_response_announces_the_services_media_type() {
+async fn every_routed_response_announces_its_announcers_media_type() {
     let router = router();
     let created = ok_call(
         &router,
@@ -130,112 +143,198 @@ async fn every_routed_response_announces_the_services_media_type() {
 
     let cases = [
         Case {
-            label: "a handler success: the create that minted the fixture",
+            label: "the dispatcher, a handler success: a create",
             operation: "CreateDashboard",
             body: json!({"name": "Second Dashboard", "widgets": []}),
             status: 200,
+            media_type: DISPATCHER_MEDIA_TYPE,
         },
         Case {
-            label: "a handler success: a single-resource read",
+            label: "the dispatcher, a handler success: a single-resource read",
             operation: "GetDashboard",
             body: json!({"arn": arn}),
             status: 200,
+            media_type: DISPATCHER_MEDIA_TYPE,
         },
         Case {
-            label: "a handler success: a paged listing",
+            label: "the dispatcher, a handler success: a paged listing",
             operation: "ListDashboards",
             body: json!({"maxResults": 1}),
             status: 200,
+            media_type: DISPATCHER_MEDIA_TYPE,
         },
         Case {
-            label: "a handler success: an empty listing",
+            label: "the dispatcher, a handler success: an empty listing",
             operation: "ListScheduledReports",
             body: json!({}),
             status: 200,
+            media_type: DISPATCHER_MEDIA_TYPE,
         },
         Case {
-            label: "a handler success: a projected policy document",
+            label: "the dispatcher, a handler success: a projected policy document",
             operation: "GetResourcePolicy",
             body: json!({"resourceArn": arn}),
             status: 200,
+            media_type: DISPATCHER_MEDIA_TYPE,
         },
         Case {
-            label: "a handler success: a tag listing",
-            operation: "ListTagsForResource",
-            body: json!({"resourceArn": arn}),
-            status: 200,
-        },
-        Case {
-            label: "a handler success: an update",
+            label: "the dispatcher, a handler success: an update",
             operation: "UpdateDashboard",
             body: json!({"arn": arn, "name": "Renamed Dashboard"}),
             status: 200,
+            media_type: DISPATCHER_MEDIA_TYPE,
         },
         Case {
-            label: "a handler's not-found answer: ResourceNotFoundException",
+            label: "the dispatcher, an error about stored state: a dashboard nothing is \
+                    stored under",
             operation: "GetDashboard",
-            body: json!({"arn": unknown_arn}),
+            body: json!({"arn": unknown_arn.clone()}),
             status: 400,
+            media_type: DISPATCHER_MEDIA_TYPE,
         },
         Case {
-            label: "a handler refusal: a pagination token this service never minted",
-            operation: "ListDashboards",
-            body: json!({"nextToken": "not-a-token-this-service-minted"}),
-            status: 400,
-        },
-        Case {
-            label: "a boundary refusal: an arn outside the modelled pattern",
-            operation: "GetDashboard",
-            body: json!({"arn": "arn:aws:bcm-dashboards::123456789012:dashboard/NOT-LOWERCASE"}),
-            status: 400,
-        },
-        Case {
-            label: "a handler success: a tag merge",
-            operation: "TagResource",
-            body: json!({"resourceArn": arn, "resourceTags": [{"key": "team", "value": "finops"}]}),
-            status: 200,
-        },
-        Case {
-            // No row here answers 501: every operation this service models is
-            // implemented, so the scaffold channel is unreachable from a routed request.
-            // The 501 a client can still see — an `X-Amz-Target` naming no modelled
-            // operation — is rendered before routing and is covered by
-            // `a_response_rendered_before_routing_announces_the_services_media_type`.
-            label: "a handler's not-found answer on an update that writes nothing",
+            label: "the dispatcher, an error about stored state: an update that writes \
+                    nothing",
             operation: "UpdateScheduledReport",
             body: json!({
                 "arn": "arn:aws:bcm-dashboards::123456789012:scheduled-report/never-created",
                 "name": "Renamed Report"
             }),
             status: 400,
+            media_type: DISPATCHER_MEDIA_TYPE,
         },
-        // Last: it removes the fixture every row above reads.
         Case {
-            label: "a handler success: a delete",
+            label: "the validator, inside the walk: an absent @required member",
+            operation: "CreateDashboard",
+            body: json!({"widgets": []}),
+            status: 400,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the validator, inside the walk: a page size above the modelled range",
+            operation: "ListDashboards",
+            // `maxResults` is `@range` min 1 max 100, source:
+            // `smithy_query(query="operation", operation="ListDashboards")`.
+            body: json!({"maxResults": 101}),
+            status: 400,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the validator, inside the walk: a page size below the modelled range",
+            operation: "ListDashboards",
+            body: json!({"maxResults": 0}),
+            status: 400,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the validator, inside the walk: an arn outside the modelled pattern",
+            operation: "GetDashboard",
+            body: json!({"arn": "arn:aws:bcm-dashboards::123456789012:dashboard/NOT-LOWERCASE"}),
+            status: 400,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the validator, raised by a handler: a name the boundary's regular \
+                    expression engine cannot refuse",
+            operation: "CreateDashboard",
+            // `DashboardName` is `@pattern` "no two spaces in a row" — a negative
+            // lookahead the boundary validator cannot compile, so the handler refuses it
+            // with the same modelled ValidationException. Source:
+            // `smithy_query(query="operation", operation="CreateDashboard")`.
+            body: json!({"name": "Two  Spaces", "widgets": []}),
+            status: 400,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the validator, raised by a handler: a pagination token this service \
+                    never minted",
+            operation: "ListDashboards",
+            body: json!({"nextToken": "not-a-token-this-service-minted"}),
+            status: 400,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the tagging family: a tag listing",
+            operation: "ListTagsForResource",
+            body: json!({"resourceArn": arn}),
+            status: 200,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the tagging family: a tag listing for a resource nothing is stored \
+                    under",
+            operation: "ListTagsForResource",
+            body: json!({"resourceArn": unknown_arn.clone()}),
+            status: 400,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the tagging family: a tag merge",
+            operation: "TagResource",
+            body: json!({"resourceArn": arn, "resourceTags": [{"key": "team", "value": "finops"}]}),
+            status: 200,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the tagging family: a tag merge onto a resource nothing is stored under",
+            operation: "TagResource",
+            body: json!({
+                "resourceArn": unknown_arn.clone(),
+                "resourceTags": [{"key": "team", "value": "finops"}]
+            }),
+            status: 400,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the tagging family: a tag removal",
+            operation: "UntagResource",
+            body: json!({"resourceArn": arn, "resourceTagKeys": ["team"]}),
+            status: 200,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the tagging family: a tag removal naming no key the resource carries",
+            operation: "UntagResource",
+            body: json!({"resourceArn": arn, "resourceTagKeys": ["never-set"]}),
+            status: 200,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        Case {
+            label: "the tagging family: a tag listing whose arn is outside the modelled \
+                    pattern",
+            operation: "ListTagsForResource",
+            body: json!({"resourceArn": "arn:aws:bcm-dashboards::123456789012:dashboard/NOT-LOWERCASE"}),
+            status: 400,
+            media_type: PROTOCOL_MEDIA_TYPE,
+        },
+        // Last: it removes the fixture the rows above read.
+        Case {
+            label: "the dispatcher, a handler success: a delete",
             operation: "DeleteDashboard",
             body: json!({"arn": arn}),
             status: 200,
+            media_type: DISPATCHER_MEDIA_TYPE,
         },
     ];
 
     for case in &cases {
         let response = send(&router, case.operation, &case.body).await;
-        assert_media_type(case.label, &response, case.status);
+        assert_media_type(case.label, &response, case.status, case.media_type);
     }
 }
 
 /// A request that reaches this service but names no modelled operation is answered before
-/// any operation runs — and under the same media type. The framework's own rendering for
-/// the awsJson family is kept: an unknown operation is a 501 `NotImplemented`, an
-/// unreadable routing key a 400 `SerializationException`.
+/// any operation runs — so no dispatcher produced it, and it announces the protocol's media
+/// type. The framework's own rendering for the awsJson family is kept: an unknown operation
+/// is a 501 `NotImplemented`, an unreadable routing key a 400 `SerializationException`.
 #[tokio::test]
-async fn a_response_rendered_before_routing_announces_the_services_media_type() {
+async fn a_response_rendered_before_routing_announces_the_protocols_media_type() {
     let router = router();
 
     // An `X-Amz-Target` naming an operation this model does not declare.
     for operation in ["NoSuchOperation", "getdashboard", "GetDashboardExtra"] {
         let response = send(&router, operation, &json!({})).await;
-        assert_media_type(operation, &response, 501);
+        assert_media_type(operation, &response, 501, PROTOCOL_MEDIA_TYPE);
     }
 
     // No `X-Amz-Target` at all: the route key still resolves from the credential scope, so
@@ -249,14 +348,14 @@ async fn a_response_rendered_before_routing_announces_the_services_media_type() 
         .body(Bytes::from_static(b"{}"))
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
-    assert_media_type("no x-amz-target", &response, 400);
+    assert_media_type("no x-amz-target", &response, 400, PROTOCOL_MEDIA_TYPE);
 }
 
 /// A transport-level failure the router detects before the request is routed at all — a
-/// body that declares `aws-chunked` framing and is not framed — is answered under the same
-/// media type.
+/// body that declares `aws-chunked` framing and is not framed — reaches no dispatcher
+/// either, and announces the protocol's media type.
 #[tokio::test]
-async fn a_transport_failure_announces_the_services_media_type() {
+async fn a_transport_failure_announces_the_protocols_media_type() {
     let router = router();
     let request = http::Request::builder()
         .method("POST")
@@ -271,20 +370,20 @@ async fn a_transport_failure_announces_the_services_media_type() {
         .expect("a well-formed request");
 
     let response = router.dispatch(request).await;
-    assert_media_type("an aws-chunked body that is not framed", &response, 400);
+    assert_media_type(
+        "an aws-chunked body that is not framed",
+        &response,
+        400,
+        PROTOCOL_MEDIA_TYPE,
+    );
 }
 
-/// The ONE response of this service the framework alone announces: the authentication
-/// refusal.
-///
-/// The router renders it through `definition().refusal_response(..)` before this service is
-/// asked anything (`vendor/smithy-server-runtime/src/multi_service_router.rs`), and no
-/// author seam is consulted on that path — `Service::override_refusal` chooses the code and
-/// the message, never the envelope. So it still announces the media type the model's
-/// protocol trait implies. This test pins that gap rather than leaving it in prose: should
-/// the framework grow a seam for this path, it fails here and says to take it.
+/// The authentication refusal, which the router renders through
+/// `definition().refusal_response(..)` before this service is asked anything
+/// (`vendor/smithy-server-runtime/src/multi_service_router.rs`): no operation of this
+/// service ran, so it announces the protocol's media type.
 #[tokio::test]
-async fn the_authentication_refusal_is_announced_by_the_framework_alone() {
+async fn the_authentication_refusal_announces_the_protocols_media_type() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut authenticating = MultiServiceRouter::new();
     authenticating.set_request_authentication(true);
@@ -293,20 +392,10 @@ async fn the_authentication_refusal_is_announced_by_the_framework_alone() {
     // The signature in [`AUTHORIZATION`] is not one this emulator vended, so the request is
     // refused before the operation it names runs.
     let response = send(&authenticating, "GetDashboard", &json!({})).await;
-    let status = response.status().as_u16();
-    assert_eq!(
-        status,
+    assert_media_type(
+        "the authentication refusal",
+        &response,
         403,
-        "case {:?}: an unverifiable signature must be refused, got {status}",
-        "the authentication refusal"
-    );
-    let actual = media_type(&response);
-    assert_eq!(
-        actual, PROTOCOL_MEDIA_TYPE,
-        "case {:?}: this path is the framework's alone, so it still announces \
-         {PROTOCOL_MEDIA_TYPE}; got {actual:?}. If this now answers {RESPONSE_MEDIA_TYPE}, \
-         the framework gained a seam for it — take it in src/service.rs and move this \
-         case to the routed table above.",
-        "the authentication refusal"
+        PROTOCOL_MEDIA_TYPE,
     );
 }
