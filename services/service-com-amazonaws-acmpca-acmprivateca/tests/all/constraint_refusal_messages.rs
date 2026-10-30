@@ -12,8 +12,9 @@
 //! * the submitted VALUE never stated (only an absent member is named, as `Value null`);
 //! * a `@pattern` quoted as the expression the value must match, with no `^`/`$` anchors;
 //! * one member that failed two of its constraints stating the EXPRESSION before the SIZE;
-//! * a violation of an enumerated type's value set stating the member and the set alone,
-//!   under no count at all.
+//! * a violation of an enumerated type's value set stating the member and the admissible
+//!   set, under the same count prefix as every other constraint class (the ORDER the set
+//!   is listed in is `crate::enum_value_set_order`'s subject).
 //!
 //! The rows differ along what the rule generalises over: which constraint failed (length
 //! floor, length ceiling, range ceiling, pattern, enum value set, an absent required
@@ -291,9 +292,10 @@ async fn a_constraint_violation_is_refused_with_the_member_and_the_requirement()
     }
 }
 
-/// A value outside an enumerated type's value set: the member and the set, under no count.
+/// A value outside an enumerated type's value set: the member and the set, under the count
+/// of how many values failed.
 #[tokio::test]
-async fn an_enum_violation_states_the_value_set_and_no_count() {
+async fn an_enum_violation_states_the_value_set_under_the_count() {
     let emulator = Emulator::new();
 
     // The enum members each row names, and the member path of the one that failed. Both
@@ -339,16 +341,12 @@ async fn an_enum_violation_states_the_value_set_and_no_count() {
             .await;
         let message = error_message(&answer, case);
         let opening = format!(
-            "Value at '{path}' failed to satisfy constraint: Member must satisfy enum value \
-             set: ["
+            "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
+             Member must satisfy enum value set: ["
         );
         assert!(
             message.starts_with(&opening) && message.ends_with(']'),
             "case {case:?}: expected {opening:?} with the value set, got {message:?}"
-        );
-        assert!(
-            !message.contains("validation error"),
-            "case {case:?}: an enum violation carries no count, got {message:?}"
         );
         for member in members {
             assert!(

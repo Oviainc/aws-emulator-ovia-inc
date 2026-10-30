@@ -43,6 +43,7 @@
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The `com-amazonaws-acmpca-acmprivateca` emulated service: the generated [`ServiceDefinition`] plus
@@ -157,20 +158,15 @@ const CONSTRAINT_PREAMBLE: &str = " failed to satisfy constraint: ";
 /// bound, never the submitted value, so nothing a caller sent is reflected back in the
 /// diagnostic (a member whose value is sensitive is refused like any other).
 ///
-/// The count prefix states how many values failed — except for a violation of an
-/// enumerated type's value set, which states the member and the set alone: the set IS the
-/// enumeration of what the member may hold, so the clause is self-contained.
+/// The count prefix opens EVERY constraint refusal, whichever constraints the request
+/// failed and however deep in it they sit: it states how many values failed, so a caller
+/// reading the message learns that a second bad member is being reported even when it
+/// parses only the first clause.
 fn constraint_message(violations: &[Violation]) -> String {
     let stated = stated_order(violations);
     let clauses: Vec<String> = stated.iter().map(|violation| clause(violation)).collect();
     if clauses.is_empty() {
         return "invalid request".to_string();
-    }
-    let enumerated = stated
-        .iter()
-        .all(|violation| matches!(violation.kind, ViolationKind::EnumValue(_)));
-    if enumerated {
-        return clauses.join("; ");
     }
     let errors = if clauses.len() == 1 { "error" } else { "errors" };
     format!(
@@ -180,32 +176,90 @@ fn constraint_message(violations: &[Violation]) -> String {
     )
 }
 
+/// How wide the table an enumerated type's admissible values are held in is, and so the
+/// modulus a value's bucket is taken at.
+const VALUE_SET_BUCKETS: u32 = 32;
+
+/// The order an enumerated type's admissible set is STATED in: the order the set's own
+/// hash table is walked in, which is each value's bucket ascending and — where two values
+/// share a bucket — the reverse of the order the model declares them in, the
+/// later-declared value ahead of the earlier one.
+///
+/// The order belongs to the enumerated TYPE rather than to a member or an operation
+/// carrying it, and it is computed from the values themselves: one type is stated the same
+/// way under every member that targets it, at any depth of the request, and a type the
+/// model gains is stated without anything being added here.
+fn stated_value_set(allowed: &[String]) -> Vec<&str> {
+    // Declaration order reversed FIRST, so the stable sort below leaves two values of one
+    // bucket in that reverse order.
+    let mut stated: Vec<&str> = allowed.iter().rev().map(String::as_str).collect();
+    stated.sort_by_key(|value| value_bucket(value));
+    stated
+}
+
+/// Which bucket of the table `value` sits in: its 31-based string hash — the hash so far
+/// multiplied by 31 plus the next UTF-16 code unit, wrapping at 32 bits — reduced to the
+/// table's width.
+///
+/// Two other crates in this tree model a hash-table walk of their own
+/// (`services/service-com-amazonaws-schemas-schemas/src/ops/get_discovered_schema.rs`,
+/// `services/service-com-amazonaws-cloudformation-cloudformation/src/state/template_validation.rs`),
+/// each private to its own operation and each with the derivation ITS order needs: a hash
+/// spread by its own high half, into a table whose width grows with the number of entries.
+/// This service's walk is a different table — no spreading, a fixed width, and a bucket's
+/// values stated in the reverse of the order they went in — and that derivation is what
+/// reproduces the sets this service states, so it is taken here rather than borrowed from an
+/// order that is not this one. The hash itself is the same four-line fold in all three: too
+/// small to pull a crate in for, and not a digest, since it only decides a listing order
+/// over model-declared values and reads nothing a caller sent.
+fn value_bucket(value: &str) -> u32 {
+    value.encode_utf16().fold(0u32, |hash, unit| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(unit))
+    }) % VALUE_SET_BUCKETS
+}
+
 /// The order the clauses are stated in: the members in the order the validating walk
 /// found them, and — where ONE member failed more than one of its constraints — the
 /// EXPRESSION it must match before the size it must fit, because the expression is the
 /// shape of the value and the length is a bound on it.
+///
+/// Each violation's key is computed ONCE, in a single pass that remembers where each member
+/// was first reported, rather than inside the comparator: a comparator that rescanned the
+/// slice would compare paths once per pair it is asked about, where this compares each path
+/// once. The validating walk also hands over at most its own ceiling of violations
+/// (`vendor/smithy-schema-server/src/constraints.rs`), so neither the clause count nor the
+/// message's length is something one request chooses.
 fn stated_order(violations: &[Violation]) -> Vec<&Violation> {
-    let mut stated: Vec<&Violation> = violations.iter().collect();
+    let mut first_reported_at: HashMap<&str, usize> = HashMap::with_capacity(violations.len());
+    let mut keyed: Vec<((usize, bool), &Violation)> = violations
+        .iter()
+        .enumerate()
+        .map(|(position, violation)| {
+            let member = *first_reported_at
+                .entry(violation.path.as_str())
+                .or_insert(position);
+            (
+                (member, !matches!(violation.kind, ViolationKind::Pattern(_))),
+                violation,
+            )
+        })
+        .collect();
     // A stable sort, so two violations this key cannot separate stay in the order the
     // walk found them.
-    stated.sort_by_key(|violation| {
-        let member = violations
-            .iter()
-            .position(|other| other.path == violation.path)
-            .unwrap_or(usize::MAX);
-        (member, !matches!(violation.kind, ViolationKind::Pattern(_)))
-    });
-    stated
+    keyed.sort_by_key(|(key, _)| *key);
+    keyed.into_iter().map(|(_, violation)| violation).collect()
 }
 
 /// One failed value's clause: the member path and the requirement that value failed.
 ///
 /// The requirement is the framework's own sentence for the constraint, read back off the
-/// clause it writes, so a constraint cannot be worded one way here and another there. Two
-/// things about the clause are this service's: the submitted value is not stated, and a
+/// clause it writes, so a constraint cannot be worded one way here and another there.
+/// Three things about the clause are this service's: the submitted value is not stated; a
 /// `@pattern` is quoted as the EXPRESSION the value must match rather than as the model's
 /// anchored literal — the anchors make it a whole-value match, which "must satisfy regular
-/// expression pattern" already says.
+/// expression pattern" already says; and an enumerated type's admissible set is listed in
+/// the order this service states that type in ([`stated_value_set`]), not in the order the
+/// model happens to declare its values.
 fn clause(violation: &Violation) -> String {
     let stated = violation.message();
     let requirement = match stated.split_once(CONSTRAINT_PREAMBLE) {
@@ -220,6 +274,13 @@ fn clause(violation: &Violation) -> String {
             let unanchored = opened.strip_suffix('$').unwrap_or(opened);
             requirement.replace(pattern.as_str(), unanchored)
         }
+        // The set the framework listed in the model's declaration order, restated in the
+        // order this service lists that enumerated type's values in. Both renderings are
+        // built from the same values, so the two cannot drift.
+        ViolationKind::EnumValue(allowed) => requirement.replace(
+            &allowed.join(", "),
+            &stated_value_set(allowed).join(", "),
+        ),
         _ => requirement.to_string(),
     };
     // An absent member has no value to name, and the clause says so; a value that is

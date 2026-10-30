@@ -27,6 +27,8 @@ mod create_idempotency;
 mod crl_bucket_resolution;
 #[path = "all/delete_certificate_authority.rs"]
 mod delete_certificate_authority;
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
 #[path = "all/permissions.rs"]
 mod permissions;
 #[path = "all/policy_documents.rs"]
