@@ -188,6 +188,88 @@ pub fn invalid_alias_name(alias_name: &str) -> Option<types::ValidationException
     )]))
 }
 
+/// The key a `@paginated` list operation of this service resumes its walk at,
+/// decoded from the caller's `nextToken` — `None` when the caller named none, so
+/// the walk starts at the first key.
+///
+/// A cursor this service did not mint is a bad request, not an empty page:
+/// answering an empty page would hide the client's mistake. The refusal is handed
+/// back as an [`InvalidInput`] naming [`paths::NEXT_TOKEN`] rather than as a
+/// modelled error, because each list operation declares its own
+/// `ValidationException` variant and lifts this into it through
+/// [`validation_exception`]; what every one of them shares is WHICH member is
+/// named and WHY, so that lives here once.
+pub fn page_cursor(next_token: Option<&str>) -> Result<Option<String>, InvalidInput> {
+    match next_token {
+        None => Ok(None),
+        Some(token) => crate::state::decode_page_token(token)
+            .map(Some)
+            .ok_or_else(|| {
+                InvalidInput::new(
+                    paths::NEXT_TOKEN,
+                    "it is not a cursor this service issued",
+                )
+            }),
+    }
+}
+
+/// How many items one page of a `@paginated` list operation carries.
+///
+/// No `maxResults` does NOT mean "the whole store in one response": every list
+/// operation here is `@paginated`, so an absent page size takes that operation's
+/// own documented `default_page_size` (`crate::state::DEFAULT_PAGE_SIZE`, or
+/// `crate::state::ALIAS_DEFAULT_PAGE_SIZE` for the one operation whose model
+/// states a different figure) and the caller pages for the rest. An asked-for
+/// size is clamped to [`crate::state::MAX_PAGE_SIZE`], so one small request can
+/// never materialise an arbitrarily large response, and to at least one, so a
+/// page is structurally non-empty: a zero page size would hand back an empty page
+/// and a cursor that never advances, which is a client loop that never ends. The
+/// modelled `range min 1` on `maxResults` already refuses zero at the boundary;
+/// this does not depend on that.
+pub fn page_size(max_results: Option<i32>, default_page_size: usize) -> usize {
+    max_results.map_or(default_page_size, |asked| {
+        usize::try_from(asked)
+            .unwrap_or(default_page_size)
+            .clamp(1, crate::state::MAX_PAGE_SIZE)
+    })
+}
+
+/// One page of a `@paginated` list operation over a persisted `BTreeMap`, and the
+/// cursor for the page after it — the ONE place this service's pagination rule
+/// lives, so no two list operations can page differently.
+///
+/// `entries` is the map the operation enumerates, keyed by the resource id the
+/// cursor names; a `BTreeMap`, so the order is stable across calls and
+/// `resume_from` ([`page_cursor`]) resumes at the first key at or after it.
+/// `selects` is the operation's own filter over a persisted record, and `item` is
+/// how it reports one. The page holds at most [`page_size`] items; when a further
+/// selected entry remains, the returned cursor names the key the page stopped at,
+/// so the next call resumes with it as its first candidate.
+pub fn page<Entry, Item>(
+    entries: &std::collections::BTreeMap<String, Entry>,
+    resume_from: Option<&str>,
+    max_results: Option<i32>,
+    default_page_size: usize,
+    selects: impl Fn(&Entry) -> bool,
+    item: impl Fn(&Entry) -> Item,
+) -> (Vec<Item>, Option<String>) {
+    let size = page_size(max_results, default_page_size);
+    let mut items: Vec<Item> = Vec::new();
+    let mut next_token = None;
+    for (key, entry) in entries
+        .iter()
+        .filter(|(key, _)| resume_from.is_none_or(|from| key.as_str() >= from))
+        .filter(|(_, entry)| selects(entry))
+    {
+        if items.len() == size {
+            next_token = Some(crate::state::encode_page_token(key));
+            break;
+        }
+        items.push(item(entry));
+    }
+    (items, next_token)
+}
+
 /// The JSON-pointer path of every request member this service's own input checks
 /// can refuse — ONE home for the paths rule (b) names, so a member is spelled the
 /// same way wherever it is refused from. Each is the member's location in the

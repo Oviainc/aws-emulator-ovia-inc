@@ -51,6 +51,8 @@ mod identity_sources;
 mod is_authorized_with_token;
 #[path = "all/list_identity_sources.rs"]
 mod list_identity_sources;
+#[path = "all/list_pagination_rule.rs"]
+mod list_pagination_rule;
 #[path = "all/list_policy_store_aliases.rs"]
 mod list_policy_store_aliases;
 #[path = "all/list_policy_templates.rs"]

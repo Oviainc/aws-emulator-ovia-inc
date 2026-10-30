@@ -76,19 +76,17 @@ use super::types::*;
 // `ListPolicyStoreAliasesError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-verifiedpermissions.json");
 
-// The page size this operation uses when the caller names no `maxResults`, and
-// the largest page it will build, both from
+// The page size this operation uses when the caller names no `maxResults`, from
 // `ListPolicyStoreAliasesInput$maxResults`'s own documentation: "If you do not
 // specify this parameter, the operation defaults to 5 policy store aliases per
-// response. You can specify a maximum of 50 policy store aliases per response."
+// response."
 //
-// Both live in `crate::state` beside the figures the service's other list
+// It lives in `crate::state` beside the figures the service's other list
 // operations page by, so no two list operations of this service page by
-// constants that could drift: the maximum is the one `state::MAX_PAGE_SIZE`
-// every list operation here shares, and the default is
-// `state::ALIAS_DEFAULT_PAGE_SIZE`, which differs from theirs only because this
-// operation's model says 5 where theirs say 10.
-use crate::state::{ALIAS_DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
+// constants that could drift: it differs from theirs only because this
+// operation's model says 5 where theirs say 10, and the largest page any of them
+// builds is the one `state::MAX_PAGE_SIZE` the shared pagination rule applies.
+use crate::state::ALIAS_DEFAULT_PAGE_SIZE;
 
 // The operation's MODELED errors. `ValidationException` and
 // `InternalServerException` are service-level errors this operation's own
@@ -154,33 +152,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        // A cursor this service did not mint is a bad request, not an empty page:
-        // answering an empty page would hide the client's mistake.
-        let resume_from = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+        // The cursor is decoded — and a forged one refused — by the service's one
+        // pagination rule, which this operation only lifts into its own error enum.
+        let resume_from =
+            crate::ops::page_cursor(input.next_token.as_deref()).map_err(|invalid| {
                 ListPolicyStoreAliasesErrorModeled::ValidationException(
-                    crate::ops::validation_exception([crate::ops::InvalidInput::new(
-                        crate::ops::paths::NEXT_TOKEN,
-                        "it is not a cursor this service issued",
-                    )]),
+                    crate::ops::validation_exception([invalid]),
                 )
-            })?),
-        };
-
-        // The model's `range min 1` already refuses a zero or negative
-        // `maxResults` at the boundary and the modelled `@default: 5` is
-        // materialised for an absent one, so this only bounds what reaches here:
-        // to at most the documented maximum, so one small request can never
-        // materialise an arbitrarily large response — the operation documents
-        // that "the service might return fewer results than the maximum even
-        // when there are more results available" — and to at least one, so a
-        // page is structurally non-empty: a zero page size would hand back an
-        // empty page and a cursor that never advances, which is a client loop
-        // that never ends.
-        let page_size = usize::try_from(input.max_results)
-            .unwrap_or(ALIAS_DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE);
+            })?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListPolicyStoreAliasesErrorModeled::InternalServerException(InternalServerException {
@@ -190,29 +169,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         // `aliases` is a `BTreeMap` keyed by the full alias name, so the
-        // enumeration order is stable across calls and a cursor resumes at the
-        // first key at or after it.
-        let matching = state
-            .aliases
-            .iter()
-            .filter(|(alias_name, _)| {
-                resume_from
-                    .as_ref()
-                    .is_none_or(|from| alias_name.as_str() >= from.as_str())
-            })
-            .filter(|(_, alias)| matches_filter(alias, input.filter.as_ref()));
-
-        let mut policy_store_aliases: Vec<PolicyStoreAliasItem> = Vec::new();
-        let mut next_token = None;
-        for (alias_name, alias) in matching {
-            if policy_store_aliases.len() == page_size {
-                // The page stopped here, so the cursor names THIS key: the next
-                // call resumes with it as its first candidate.
-                next_token = Some(crate::state::encode_page_token(alias_name));
-                break;
-            }
-            policy_store_aliases.push(alias_item(alias));
-        }
+        // enumeration order is stable across calls, and the page — its size, its
+        // boundary and the cursor that resumes it — is built by the service's one
+        // pagination rule. The model's `range min 1` already refuses a zero or
+        // negative `maxResults` at the boundary and the modelled `@default: 5` is
+        // materialised for an absent one, so what reaches the rule here is always
+        // a value the caller named; the operation documents that "the service
+        // might return fewer results than the maximum even when there are more
+        // results available", which is what the rule's cap answers with.
+        let (policy_store_aliases, next_token) = crate::ops::page(
+            &state.aliases,
+            resume_from.as_deref(),
+            Some(input.max_results),
+            ALIAS_DEFAULT_PAGE_SIZE,
+            |alias| matches_filter(alias, input.filter.as_ref()),
+            alias_item,
+        );
 
         Ok(ListPolicyStoreAliasesOutput {
             next_token,

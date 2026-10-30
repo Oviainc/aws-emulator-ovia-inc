@@ -146,19 +146,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
-        // A cursor this service did not mint is a bad request, not an empty page:
-        // answering an empty page would hide the client's mistake.
-        let resume_from = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                ListPoliciesErrorModeled::ValidationException(crate::ops::validation_exception([
-                    crate::ops::InvalidInput::new(
-                        crate::ops::paths::NEXT_TOKEN,
-                        "it is not a cursor this service issued",
-                    ),
-                ]))
-            })?),
-        };
+        // The cursor is decoded — and a forged one refused — by the service's one
+        // pagination rule, which this operation only lifts into its own error enum.
+        let resume_from = crate::ops::page_cursor(input.next_token.as_deref()).map_err(|invalid| {
+            ListPoliciesErrorModeled::ValidationException(crate::ops::validation_exception([
+                invalid,
+            ]))
+        })?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListPoliciesErrorModeled::InternalServerException(InternalServerException {
@@ -172,44 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
 
         // `policies` is a `BTreeMap`, so the enumeration order is stable across
-        // calls and a cursor resumes at the first key at or after it.
-        let matching = store
-            .policies
-            .iter()
-            .filter(|(policy_id, _)| {
-                resume_from
-                    .as_ref()
-                    .is_none_or(|from| policy_id.as_str() >= from.as_str())
-            })
-            .filter(|(_, policy)| matches_filter(policy, input.filter.as_ref()));
-
-        // No `maxResults` does NOT mean "the whole store in one response": the
-        // operation is `@paginated`, so an absent page size takes this service's
-        // own default and the caller pages for the rest. An asked-for size is
-        // clamped to the maximum, so one small request can never materialise an
-        // arbitrarily large response, and to at least one, so a page is
-        // structurally non-empty: a zero page size would hand back an empty page
-        // and a cursor that never advances, which is a client loop that never
-        // ends. The model's `range min 1` already refuses zero at the boundary;
-        // this does not depend on that.
-        let page_size = input
-            .max_results
-            .map_or(crate::state::DEFAULT_PAGE_SIZE, |n| {
-                usize::try_from(n)
-                    .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
-                    .clamp(1, crate::state::MAX_PAGE_SIZE)
-            });
-        let mut policies: Vec<PolicyItem> = Vec::new();
-        let mut next_token = None;
-        for (policy_id, policy) in matching {
-            if policies.len() == page_size {
-                // The page stopped here, so the cursor names THIS key: the next
-                // call resumes with it as its first candidate.
-                next_token = Some(crate::state::encode_page_token(policy_id));
-                break;
-            }
-            policies.push(policy_item(policy));
-        }
+        // calls, and the page — its size, its boundary and the cursor that
+        // resumes it — is built by the service's one pagination rule.
+        let (policies, next_token) = crate::ops::page(
+            &store.policies,
+            resume_from.as_deref(),
+            input.max_results,
+            crate::state::DEFAULT_PAGE_SIZE,
+            |policy| matches_filter(policy, input.filter.as_ref()),
+            policy_item,
+        );
 
         Ok(ListPoliciesOutput {
             next_token,
