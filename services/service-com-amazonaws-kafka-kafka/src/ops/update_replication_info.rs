@@ -122,6 +122,19 @@ impl From<UpdateReplicationInfoErrorModeled> for UpdateReplicationInfoError {
     }
 }
 
+/// The refusal a request that does not name one end of the replication it
+/// addresses earns: HTTP 400 `BadRequestException` carrying that end's fixed
+/// sentence. The two members are at fault as a PAIR — either one of them would
+/// have named the cluster — so no single member is reported as the invalid
+/// parameter.
+fn unnamed_end_refusal(message: String) -> UpdateReplicationInfoError {
+    UpdateReplicationInfoErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: None,
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `UpdateReplicationInfo` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -183,6 +196,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Every rule this operation enforces on the REQUEST is enforced here,
+        // before anything the request names is resolved: an incomplete or
+        // self-contradictory request is not one this operation could carry out
+        // against any replicator, so what the path's ARN points at — or whether
+        // it points at anything — cannot change the answer.
+        //
+        // Each end of the replication the call addresses is named EXACTLY once,
+        // by its Amazon MSK cluster ARN or by its Apache Kafka cluster id, and
+        // both resolve to the ALIASES every reader of a replicator reports them
+        // under. The source end is settled first, so a request that names
+        // neither end is answered about the first one it failed to name.
+        let source = match crate::state::replication_end_alias(
+            crate::state::SOURCE_REPLICATION_END,
+            input.source_kafka_cluster_arn.as_deref(),
+            input.source_kafka_cluster_id.as_deref(),
+        ) {
+            Ok(alias) => alias,
+            Err(message) => return Err(unnamed_end_refusal(message)),
+        };
+        let target = match crate::state::replication_end_alias(
+            crate::state::TARGET_REPLICATION_END,
+            input.target_kafka_cluster_arn.as_deref(),
+            input.target_kafka_cluster_id.as_deref(),
+        ) {
+            Ok(alias) => alias,
+            Err(message) => return Err(unnamed_end_refusal(message)),
+        };
+
         // A flow selects the topics it replicates by regular expression, so a
         // pattern list this service could not match topics against describes no
         // selection at all — refused here rather than stored and silently
@@ -203,19 +244,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The ends of the replication this call addresses, as the ALIASES every
-        // reader of a replicator reports them under: a cluster is named by its
-        // Amazon MSK ARN or by its Apache Kafka cluster id, and both resolve to
-        // one alias through the service's single rule.
-        let addressed = crate::state::flow_cluster_alias(
-            input.source_kafka_cluster_arn.as_deref(),
-            input.source_kafka_cluster_id.as_deref(),
-        )
-        .zip(crate::state::flow_cluster_alias(
-            input.target_kafka_cluster_arn.as_deref(),
-            input.target_kafka_cluster_id.as_deref(),
-        ));
-
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
         // Resolved through the settling lookup, as the reader does: the version
@@ -228,7 +256,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UpdateReplicationInfoErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some(crate::state::REPLICATOR_ARN_MEMBER.to_string()),
                     // The refusal names the input member that resolved to nothing
-                    // and says nothing about this endpoint's own state.
+                    // and says nothing about this endpoint's own state — the same
+                    // form every replicator operation resolves an ARN with.
                     message: Some(crate::state::parameter_not_found_message(
                         crate::state::REPLICATOR_ARN_MEMBER,
                     )),
@@ -240,8 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // quotes: a request whose pair of cluster aliases addresses no configured
         // replication asks to change something the replicator does not have,
         // whatever version it quotes.
-        let addressed = addressed
-            .and_then(|(source, target)| replicator.replication_index_of(&source, &target));
+        let addressed = replicator.replication_index_of(&source, &target);
         let stored_version = replicator.current_version.clone();
 
         let Some(index) = addressed else {

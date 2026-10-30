@@ -152,6 +152,17 @@ impl From<CreateReplicatorErrorModeled> for CreateReplicatorError {
     }
 }
 
+/// The refusal a `ReplicationInfoList` entry that does not name one end of its
+/// replication earns: HTTP 400 `BadRequestException` carrying that end's fixed
+/// sentence, naming the entry it came in as the invalid parameter.
+fn unnamed_end_refusal(index: usize, message: String) -> CreateReplicatorError {
+    CreateReplicatorErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: Some(format!("ReplicationInfoList[{index}]")),
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `CreateReplicator` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -277,29 +288,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         for (index, info) in input.replication_info_list.iter().enumerate() {
-            let source = crate::state::flow_cluster_alias(
+            // Each end of a flow is named EXACTLY once, by its Amazon MSK cluster
+            // ARN or by its Apache Kafka cluster id, and resolves to the alias
+            // every reader of a replicator reports it under — the same rule, in
+            // the same words, as the update that later addresses the flow by that
+            // pair of aliases.
+            let source = match crate::state::replication_end_alias(
+                crate::state::SOURCE_REPLICATION_END,
                 info.source_kafka_cluster_arn.as_deref(),
                 info.source_kafka_cluster_id.as_deref(),
-            );
-            let target = crate::state::flow_cluster_alias(
+            ) {
+                Ok(alias) => alias,
+                // The two members are at fault as a pair — either one would have
+                // named the cluster — so the entry they came in is what the
+                // refusal names. The source end is settled first, so an entry
+                // that names neither end is answered about the source.
+                Err(message) => return Err(unnamed_end_refusal(index, message)),
+            };
+            let target = match crate::state::replication_end_alias(
+                crate::state::TARGET_REPLICATION_END,
                 info.target_kafka_cluster_arn.as_deref(),
                 info.target_kafka_cluster_id.as_deref(),
-            );
-            // A flow that names no source, or no target, describes no replication
-            // at all: the model leaves both the ARN and the id optional because
-            // either one identifies a cluster, not because a flow may omit an end.
-            let (Some(source), Some(target)) = (source, target) else {
-                return Err(CreateReplicatorErrorModeled::BadRequestException(
-                    BadRequestException {
-                        invalid_parameter: Some(format!("ReplicationInfoList[{index}]")),
-                        message: Some(
-                            "Each replication flow must name a source and a target Kafka \
-                             cluster, by ARN or by cluster id."
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into());
+            ) {
+                Ok(alias) => alias,
+                Err(message) => return Err(unnamed_end_refusal(index, message)),
             };
             // The two ends of a flow are told apart by their cluster aliases —
             // the alias is what prefixes a replicated topic's name — so a flow

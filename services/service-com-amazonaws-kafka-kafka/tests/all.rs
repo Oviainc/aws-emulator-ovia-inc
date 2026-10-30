@@ -75,6 +75,8 @@ mod node_listing;
 mod placement_subnet_resolution;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/replication_end_naming.rs"]
+mod replication_end_naming;
 #[path = "all/replication_info_update.rs"]
 mod replication_info_update;
 #[path = "all/replicator_lifecycle.rs"]

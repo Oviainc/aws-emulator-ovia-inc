@@ -679,11 +679,12 @@ async fn a_pair_that_addresses_no_replication_is_refused() {
         copy_acls: false,
     };
 
-    // Rows span every way a pair can address no configured replication: the
-    // configured pair REVERSED, a source the replicator does not span, a target it
-    // does not span, a cluster it spans that no replication runs between, an end
-    // named as an Apache Kafka cluster id where the configured one is an MSK ARN,
-    // only one end named, and neither end named.
+    // Rows span every way a pair of NAMED ends can address no configured
+    // replication: the configured pair REVERSED, a source the replicator does not
+    // span, a target it does not span, a cluster it spans that no replication runs
+    // between, and an end named as an Apache Kafka cluster id where the configured
+    // one is an MSK ARN. A request that leaves an end unnamed never reaches this
+    // rule — see `crate::replication_end_naming`.
     let rows: Vec<(&str, Value)> = vec![
         (
             "reversed",
@@ -719,15 +720,6 @@ async fn a_pair_that_addresses_no_replication_is_refused() {
                 "targetKafkaClusterId": "mismatch-target",
             }),
         ),
-        (
-            "source-only",
-            json!({ "sourceKafkaClusterArn": source_arn }),
-        ),
-        (
-            "target-only",
-            json!({ "targetKafkaClusterArn": target_arn }),
-        ),
-        ("no-ends", json!({})),
     ];
 
     for (case, pair) in &rows {

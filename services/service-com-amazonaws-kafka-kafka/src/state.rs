@@ -907,8 +907,10 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{201
 ///
 /// `member` is the member's name as the wire carries it (`replicatorArn`), so the
 /// text names what the CALLER sent rather than anything about the serving
-/// endpoint. Built here, from one place, so every operation that resolves a
-/// replicator by ARN answers one form instead of describing its own state.
+/// endpoint — which is the form the behavioural corpus records MSK's replicator
+/// APIs answering, where the cluster APIs answer the bare sentence. Built here,
+/// from one place, so every operation that resolves a replicator by ARN answers
+/// one form instead of describing its own state.
 pub fn parameter_not_found_message(member: &str) -> String {
     format!("Invalid parameter {member}: {RESOURCE_NOT_FOUND_MESSAGE}")
 }
@@ -4776,6 +4778,80 @@ pub fn flow_cluster_alias(arn: Option<&str>, id: Option<&str>) -> Option<String>
     }
     id.filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+/// One END of a replication, as a request names it: the pair of members that can
+/// carry the Kafka cluster at that end, spelled as the wire spells them, and the
+/// word the service's refusals call that end by.
+///
+/// Both members of each pair are optional on every shape that takes a replication
+/// (`ReplicationInfo`, and the `UpdateReplicationInfo` request itself) because
+/// EITHER one identifies the cluster — not because an end may be left unnamed or
+/// named twice. That rule is not something the model can state, so the service
+/// states it at runtime, and it states it from here so every operation that takes
+/// a replication's ends enforces it in the same words.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicationEnd {
+    /// Which end this is, as the refusal names it.
+    end: &'static str,
+    /// The member carrying the end's Amazon MSK cluster ARN.
+    arn_member: &'static str,
+    /// The member carrying the end's Apache Kafka cluster id.
+    id_member: &'static str,
+}
+
+/// The end a replication runs FROM.
+pub const SOURCE_REPLICATION_END: ReplicationEnd = ReplicationEnd {
+    end: "source",
+    arn_member: "sourceKafkaClusterArn",
+    id_member: "sourceKafkaClusterId",
+};
+
+/// The end a replication runs TO.
+pub const TARGET_REPLICATION_END: ReplicationEnd = ReplicationEnd {
+    end: "target",
+    arn_member: "targetKafkaClusterArn",
+    id_member: "targetKafkaClusterId",
+};
+
+impl ReplicationEnd {
+    /// What the service refuses a request that does not name this end exactly
+    /// once with: one fixed sentence per end, built from the two member names the
+    /// wire carries and the word for the end, with NO part of it taken from the
+    /// request.
+    pub fn unnamed_message(&self) -> String {
+        format!(
+            "Must specify either {} or {} for the {} cluster.",
+            self.arn_member, self.id_member, self.end
+        )
+    }
+}
+
+/// The alias of the cluster at `end`, from the pair of members a request can name
+/// it by — or the refusal for that end when the pair does not name it exactly
+/// once.
+///
+/// One of the two members, never both and never neither: a cluster given by both
+/// its ARN and its cluster id is named twice, and one given by neither is not
+/// named at all, so neither request describes an end this service can resolve.
+/// A member sent EMPTY names nothing, the same reading [`flow_cluster_alias`]
+/// gives it, so it counts as absent rather than as an end named by a value
+/// nothing resolves. The alias itself comes from that one rule, so an end named
+/// either way resolves to the alias every reader of a replicator reports it
+/// under.
+pub fn replication_end_alias(
+    end: ReplicationEnd,
+    arn: Option<&str>,
+    id: Option<&str>,
+) -> Result<String, String> {
+    let arn = arn.filter(|value| !value.is_empty());
+    let id = id.filter(|value| !value.is_empty());
+    match (arn, id) {
+        (Some(_), None) | (None, Some(_)) => {
+            flow_cluster_alias(arn, id).ok_or_else(|| end.unnamed_message())
+        }
+        _ => Err(end.unnamed_message()),
+    }
 }
 
 /// The alias Amazon MSK knows the cluster `arn` names a replicator by, or `None`
