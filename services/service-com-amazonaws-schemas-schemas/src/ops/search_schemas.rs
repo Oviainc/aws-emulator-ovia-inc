@@ -232,11 +232,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // differently-selected search: `Keywords` is a free-form string, so the
         // fingerprint is rendered by `crate::state::selection_fingerprint`, which no
         // value a caller can send renders ambiguously.
+        //
+        // What is fingerprinted is the selection as THIS handler resolved it, not the
+        // bytes the caller typed: `Keywords` decides nothing until `keywords_of` has
+        // normalised it and `matches_every_keyword` has folded the result, so the
+        // canonical form of the member is the keyword SET
+        // ([`canonical_keywords`]) — every spelling of one selection therefore walks one
+        // listing and shares its tokens, which is what
+        // `crate::state::selection_fingerprint` requires of a value that selects the
+        // same items.
         let selection = crate::state::selection_fingerprint(
             Self::NAME,
             &[
                 ("registryName", input.registry_name.as_str()),
-                ("keywords", input.keywords.as_str()),
+                ("keywords", canonical_keywords(&keywords).as_str()),
             ],
         );
 
@@ -313,6 +322,23 @@ fn keywords_of(raw: &str) -> Vec<String> {
         .filter(|keyword| !keyword.is_empty())
         .map(str::to_lowercase)
         .collect()
+}
+
+/// The canonical rendering of what a `Keywords` value SELECTS, as one value a
+/// selection fingerprint can carry.
+///
+/// Two searches select the same schemas exactly when their keyword SETS agree:
+/// [`keywords_of`] has already dropped the separators and folded the case, and
+/// [`matches_every_keyword`] folds the result with `all`, so neither the order the
+/// keywords arrived in nor a keyword repeated in the value changes which schemas match.
+/// Sorting and de-duplicating turns the list into that set, and joining with a comma is
+/// unambiguous because a keyword can hold no comma — commas are what `keywords_of` split
+/// on.
+fn canonical_keywords(keywords: &[String]) -> String {
+    let mut canonical: Vec<&str> = keywords.iter().map(String::as_str).collect();
+    canonical.sort_unstable();
+    canonical.dedup();
+    canonical.join(",")
 }
 
 /// Whether `keywords` match a schema.
@@ -421,6 +447,42 @@ mod tests {
             assert_eq!(
                 parsed, expected,
                 "case {raw:?}: expected {expected:?}, got {parsed:?}"
+            );
+        }
+    }
+
+    /// Two `Keywords` values select the same schemas exactly when their keyword SETS
+    /// agree, so that set — not the bytes the caller typed — is what the fingerprint a
+    /// `NextToken` carries is rendered from.
+    #[test]
+    fn the_canonical_keywords_are_the_selecting_set() {
+        // Spellings of one selection, and the one value they all render as.
+        for (spellings, canonical) in [
+            (vec!["orders", "ORDERS", "orders,", " orders ", "orders,orders"], "orders"),
+            (
+                vec!["order placed", "placed,order", "ORDER,PLACED", " placed  order "],
+                "order,placed",
+            ),
+            (vec!["", " ", ",", ",,  ,"], ""),
+        ] {
+            for spelling in spellings {
+                let rendered = canonical_keywords(&keywords_of(spelling));
+                assert_eq!(
+                    rendered, canonical,
+                    "case {spelling:?}: expected {canonical:?}, got {rendered:?}"
+                );
+            }
+        }
+        // And a selection that is NOT the same one renders differently.
+        for (left, right) in [("orders", "order"), ("order placed", "orders"), ("orders", "")] {
+            let (rendered_left, rendered_right) = (
+                canonical_keywords(&keywords_of(left)),
+                canonical_keywords(&keywords_of(right)),
+            );
+            assert_ne!(
+                rendered_left, rendered_right,
+                "case {left:?} vs {right:?}: different selections must render differently, \
+                 got {rendered_left:?}"
             );
         }
     }

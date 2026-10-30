@@ -95,6 +95,8 @@ mod schema_version_label_spellings;
 mod search_keyword_index;
 #[path = "all/search_schemas.rs"]
 mod search_schemas;
+#[path = "all/search_token_selection.rs"]
+mod search_token_selection;
 #[path = "all/service_owned_policy_writes.rs"]
 mod service_owned_policy_writes;
 #[path = "all/state_roundtrip.rs"]
