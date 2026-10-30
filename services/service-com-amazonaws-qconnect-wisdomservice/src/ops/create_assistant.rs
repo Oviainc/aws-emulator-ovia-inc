@@ -275,6 +275,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )),
             ai_agent_configuration,
             ai_agents,
+            // A fresh assistant holds no AI guardrail: one is created by
+            // `CreateAIGuardrail`, under the assistant the route names.
+            ai_guardrails: ::std::collections::HashMap::new(),
             orchestrator_configuration_list: Vec::new(),
             sessions: ::std::collections::HashMap::new(),
         };

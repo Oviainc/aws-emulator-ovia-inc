@@ -11,7 +11,10 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AIAgentConfigurationData, AssistantAssociationData, AssistantAssociationInputData,
+    AIAgentConfigurationData, AIGuardrailContentPolicyConfig,
+    AIGuardrailContextualGroundingPolicyConfig, AIGuardrailData,
+    AIGuardrailSensitiveInformationPolicyConfig, AIGuardrailTopicPolicyConfig,
+    AIGuardrailWordPolicyConfig, AssistantAssociationData, AssistantAssociationInputData,
     AssistantAssociationOutputData, AssistantAssociationSummary, AssistantCapabilityConfiguration,
     AssistantData,
     AssistantIntegrationConfiguration, AssistantSummary, ContentData, ContentSummary,
@@ -161,9 +164,17 @@ pub const AI_AGENT_ORIGIN_SYSTEM: &str = "SYSTEM";
 /// `PUBLISHED`).
 pub const AI_AGENT_VISIBILITY_PUBLISHED: &str = "PUBLISHED";
 
-/// The terminal `Status` of an AI agent in service
-/// (`smithy_query(query="shape",shape="Status")`).
-pub const AI_AGENT_STATUS_ACTIVE: &str = "ACTIVE";
+/// The terminal `Status` of an AI resource in service — an AI agent, and an AI guardrail
+/// too, since the model gives both the one `Status` shape
+/// (`smithy_query(query="shape",shape="Status")`, which also declares
+/// `CREATE_IN_PROGRESS`, `CREATE_FAILED`, `DELETE_IN_PROGRESS`, `DELETE_FAILED` and
+/// `DELETED`).
+///
+/// A create answers with the resource already in service, so no later status change is
+/// owed and every read reports the same value — the rule [`ASSISTANT_STATUS_ACTIVE`]
+/// states for the assistant that holds them, and a delete removes the record outright
+/// rather than moving it through a deleting status.
+pub const AI_RESOURCE_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// The version of a default `SYSTEM` AI agent the service provisions with an assistant,
 /// and so the version the assistant's binding to it names.
@@ -208,6 +219,58 @@ pub const DEFAULT_AI_AGENT_TYPES: [&str; 8] = [
     "NOTE_TAKING",
     "SELF_SERVICE",
 ];
+
+/// The fixed text for a request addressed to an AI guardrail its named assistant does
+/// not hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`] for why the sentence quotes nothing
+/// from the request.
+pub const MESSAGE_AI_GUARDRAIL_NOT_FOUND: &str = "AI Guardrail does not exist.";
+
+/// The most AI guardrails one assistant may hold at a time. A create beyond it is
+/// refused with the modelled `ServiceQuotaExceededException` (HTTP 402), which
+/// `CreateAIGuardrail` declares for exactly this, and which is also what keeps this
+/// store finite: a guardrail is released only by `DeleteAIGuardrail` or by the delete of
+/// its assistant.
+///
+/// CHOSEN: AWS quotas AI guardrails per assistant but does not publish the figure.
+pub const MAX_AI_GUARDRAILS_PER_ASSISTANT: usize = 100;
+
+/// The sentence a create past [`MAX_AI_GUARDRAILS_PER_ASSISTANT`] is refused with,
+/// stating the RULE — the ceiling and what to do about it — and carrying nothing from the
+/// request or from what the assistant already holds, the way
+/// [`message_quick_response_quota`] does for the other family with a per-parent ceiling.
+pub fn message_ai_guardrail_quota() -> String {
+    format!(
+        "The maximum number of AI Guardrails ({MAX_AI_GUARDRAILS_PER_ASSISTANT}) in this \
+         assistant has been reached. Delete an AI Guardrail before creating another."
+    )
+}
+
+/// The most policy entries one AI guardrail carries across the five policy
+/// configurations it is created with — denied topics, content filters, words and managed
+/// word lists, PII entities and regular expressions, and contextual-grounding filters.
+///
+/// The model bounds some of those lists and leaves others open
+/// (`smithy_query(query="shape",shape="AIGuardrailTopicPolicyConfig")` and its siblings
+/// put `length min 1` on `topicsConfig`, `wordsConfig`, `piiEntitiesConfig`,
+/// `regexesConfig` and the grounding `filtersConfig` with no maximum), so without this
+/// ceiling one caller could store an arbitrarily long policy in this process's heap — the
+/// same reason [`MAX_TAGS_PER_RESOURCE`] exists for the equally unbounded tag map.
+///
+/// It is a HEAP GUARD rather than a quota: it sits at twice the largest list AWS
+/// documents for a guardrail policy (ten thousand custom words), so a policy AWS would
+/// accept is never refused here, and the figure is this emulator's own.
+pub const MAX_AI_GUARDRAIL_POLICY_ENTRIES: usize = 20_000;
+
+/// The sentence a create whose policy configurations carry more than
+/// [`MAX_AI_GUARDRAIL_POLICY_ENTRIES`] entries between them is refused with. It states
+/// the RULE — the ceiling the resulting policy must stay within — and carries nothing
+/// from the request.
+pub fn message_too_many_policy_entries() -> String {
+    format!(
+        "The resultant AI Guardrail policy must not have more than \
+         {MAX_AI_GUARDRAIL_POLICY_ENTRIES} entries."
+    )
+}
 
 /// The most knowledge bases one account may hold at a time, with the same contract as
 /// [`MAX_ASSISTANTS`]: a create beyond it is refused with the modelled
@@ -661,6 +724,20 @@ pub fn ai_agent_arn(region: &str, assistant_id: &str, ai_agent_id: &str) -> Stri
     )
 }
 
+/// This service's ARN for an AI guardrail, which names its parent assistant too:
+/// `arn:aws:wisdom:<region>:<account>:ai-guardrail/<assistantId>/<aiGuardrailId>`.
+///
+/// The same nested two-id-segment form [`ai_agent_arn`] uses, for the same reason: an AI
+/// guardrail is reachable only through its assistant, and the guardrail's own id comes
+/// LAST so [`resolve_id`] reads it back out.
+pub fn ai_guardrail_arn(region: &str, assistant_id: &str, ai_guardrail_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("ai-guardrail/{assistant_id}/{ai_guardrail_id}"),
+    )
+}
+
 /// The ARN of the SNS topic an assistant streams chat messages through, which the
 /// service provisions with the assistant: an Amazon SNS topic ARN
 /// (`arn:aws:sns:<region>:<account>:<topic>`), named after the assistant it belongs to,
@@ -728,6 +805,24 @@ pub fn resolve_id(label: &str) -> &str {
         id
     } else {
         label
+    }
+}
+
+/// The id and the VERSION QUALIFIER a label of the model's
+/// `UuidOrArnOrEitherWithQualifier` shape carries
+/// (`smithy_query(query="shape",shape="UuidOrArnOrEitherWithQualifier")`: a uuid or an
+/// ARN, each optionally followed by `:<QUALIFIER>`).
+///
+/// The id is resolved exactly as [`resolve_id`] resolves a plain label, so an ARN this
+/// emulator could not have minted still names nothing. The qualifier is what the model
+/// says selects a VERSION of the resource rather than the resource itself — the
+/// `versionNumber` of a read "is returned if a version was specified via use of a
+/// qualifier" — so an operation that reads one has to tell the two apart.
+pub fn resolve_qualified_id(label: &str) -> (&str, Option<&str>) {
+    let id = resolve_id(label);
+    match id.split_once(':') {
+        Some((id, qualifier)) => (id, Some(qualifier)),
+        None => (id, None),
     }
 }
 
@@ -1016,6 +1111,106 @@ pub struct AiAgent {
     pub created_at: SystemTime,
 }
 
+/// One Amazon Q in Connect AI guardrail, as this emulator persists it.
+///
+/// An AI guardrail is created inside an assistant and is reachable only through it, as a
+/// session and an AI agent are, so the record lives on [`Assistant`] rather than in a
+/// store-wide map: an id of one assistant's guardrail does not resolve under another.
+/// Every member a create carried is kept here, so what the create answered is what every
+/// later read answers.
+#[derive(Debug, Clone)]
+pub struct AiGuardrail {
+    pub ai_guardrail_id: String,
+    pub ai_guardrail_arn: String,
+    pub assistant_id: String,
+    /// The ARN of the assistant this guardrail belongs to, read off that stored record
+    /// rather than rebuilt, so the guardrail reports its parent's own ARN.
+    pub assistant_arn: String,
+    pub name: String,
+    pub visibility_status: String,
+    pub blocked_input_messaging: String,
+    pub blocked_outputs_messaging: String,
+    pub description: Option<String>,
+    pub topic_policy_config: Option<AIGuardrailTopicPolicyConfig>,
+    pub content_policy_config: Option<AIGuardrailContentPolicyConfig>,
+    pub word_policy_config: Option<AIGuardrailWordPolicyConfig>,
+    pub sensitive_information_policy_config: Option<AIGuardrailSensitiveInformationPolicyConfig>,
+    pub contextual_grounding_policy_config: Option<AIGuardrailContextualGroundingPolicyConfig>,
+    pub tags: HashMap<String, String>,
+    /// The `Status` this guardrail reports. The create answers with the guardrail already
+    /// in service — see [`AI_RESOURCE_STATUS_ACTIVE`] — so it is stored once and reported
+    /// unchanged.
+    pub status: String,
+    /// When this record was last written: the create that minted it, until something
+    /// modifies it. It is what the reported `modifiedTime` renders.
+    pub modified_at: SystemTime,
+}
+
+impl AiGuardrail {
+    /// How many entries this guardrail's policy configurations carry between them, which
+    /// is what [`MAX_AI_GUARDRAIL_POLICY_ENTRIES`] bounds: every list of every policy,
+    /// counted once, since it is the whole stored policy the ceiling is about.
+    pub fn policy_entries(&self) -> usize {
+        let topics = self
+            .topic_policy_config
+            .as_ref()
+            .map_or(0, |policy| policy.topics_config.len());
+        let filters = self
+            .content_policy_config
+            .as_ref()
+            .map_or(0, |policy| policy.filters_config.len());
+        let words = self.word_policy_config.as_ref().map_or(0, |policy| {
+            policy.words_config.as_ref().map_or(0, Vec::len)
+                + policy.managed_word_lists_config.as_ref().map_or(0, Vec::len)
+        });
+        let sensitive = self
+            .sensitive_information_policy_config
+            .as_ref()
+            .map_or(0, |policy| {
+                policy.pii_entities_config.as_ref().map_or(0, Vec::len)
+                    + policy.regexes_config.as_ref().map_or(0, Vec::len)
+            });
+        let grounding = self
+            .contextual_grounding_policy_config
+            .as_ref()
+            .map_or(0, |policy| policy.filters_config.len());
+        topics
+            .saturating_add(filters)
+            .saturating_add(words)
+            .saturating_add(sensitive)
+            .saturating_add(grounding)
+    }
+
+    /// The `AIGuardrailData` every operation that reports this guardrail answers with,
+    /// rendered entirely out of the stored record.
+    pub fn to_ai_guardrail_data(&self) -> AIGuardrailData {
+        AIGuardrailData {
+            assistant_id: self.assistant_id.clone(),
+            assistant_arn: self.assistant_arn.clone(),
+            ai_guardrail_arn: self.ai_guardrail_arn.clone(),
+            ai_guardrail_id: self.ai_guardrail_id.clone(),
+            name: self.name.clone(),
+            visibility_status: self.visibility_status.clone(),
+            blocked_input_messaging: self.blocked_input_messaging.clone(),
+            blocked_outputs_messaging: self.blocked_outputs_messaging.clone(),
+            description: self.description.clone(),
+            // Each policy configuration is reported exactly as the create persisted it,
+            // and a guardrail configured with none reports none rather than an empty
+            // structure the caller never sent.
+            topic_policy_config: self.topic_policy_config.clone(),
+            content_policy_config: self.content_policy_config.clone(),
+            word_policy_config: self.word_policy_config.clone(),
+            sensitive_information_policy_config: self
+                .sensitive_information_policy_config
+                .clone(),
+            contextual_grounding_policy_config: self.contextual_grounding_policy_config.clone(),
+            tags: tags_out(&self.tags),
+            status: Some(self.status.clone()),
+            modified_time: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+        }
+    }
+}
+
 /// One Amazon Q in Connect assistant, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Assistant {
@@ -1044,6 +1239,11 @@ pub struct Assistant {
     /// ones the create provisions, and any a caller adds later. An AI agent is
     /// reachable only through its assistant, as a session is.
     pub ai_agents: HashMap<String, AiAgent>,
+    /// The AI guardrails this assistant holds, keyed by `aiGuardrailId`, at most
+    /// [`MAX_AI_GUARDRAILS_PER_ASSISTANT`] of them. A guardrail is reachable only through
+    /// its assistant, as an AI agent and a session are, so it goes when the assistant
+    /// goes.
+    pub ai_guardrails: HashMap<String, AiGuardrail>,
     /// This assistant's orchestrator configurations, with the same contract as
     /// [`Self::ai_agent_configuration`].
     pub orchestrator_configuration_list: Vec<OrchestratorConfigurationEntry>,
@@ -1123,6 +1323,39 @@ impl Assistant {
         (0..MINT_ATTEMPTS as u64)
             .map(|attempt| mint_candidate(seq, attempt))
             .find(|candidate| !self.sessions.contains_key(candidate))
+    }
+
+    /// An `aiGuardrailId` no guardrail of this assistant holds, with the same contract as
+    /// [`Self::mint_session_id`].
+    pub fn mint_ai_guardrail_id(&self, seq: u64) -> Option<String> {
+        (0..MINT_ATTEMPTS as u64)
+            .map(|attempt| mint_candidate(seq, attempt))
+            .find(|candidate| !self.ai_guardrails.contains_key(candidate))
+    }
+
+    /// The AI guardrail a `UuidOrArnOrEitherWithQualifier` label names, or `None` when
+    /// this assistant holds none under it.
+    ///
+    /// A label carrying a VERSION qualifier names a version of the guardrail rather than
+    /// the guardrail itself, and this emulator publishes none — `CreateAIGuardrailVersion`
+    /// is still a scaffold stub — so such a label names nothing here and the caller gets
+    /// the operation's not-found answer.
+    pub fn ai_guardrail(&self, label: &str) -> Option<&AiGuardrail> {
+        let (id, qualifier) = resolve_qualified_id(label);
+        match qualifier {
+            Some(_) => None,
+            None => self.ai_guardrails.get(id),
+        }
+    }
+
+    /// The id of the live AI guardrail of this assistant already using this name, if any.
+    /// A guardrail's name identifies it inside its assistant, so this is what a second
+    /// create under that name is refused by.
+    pub fn ai_guardrail_id_with_name(&self, name: &str) -> Option<&str> {
+        self.ai_guardrails
+            .values()
+            .find(|guardrail| guardrail.name == name)
+            .map(|guardrail| guardrail.ai_guardrail_id.as_str())
     }
 }
 
@@ -2102,7 +2335,7 @@ impl ComAmazonawsQconnectWisdomserviceState {
                     r#type: agent_type.to_string(),
                     origin: AI_AGENT_ORIGIN_SYSTEM.to_string(),
                     visibility_status: AI_AGENT_VISIBILITY_PUBLISHED.to_string(),
-                    status: AI_AGENT_STATUS_ACTIVE.to_string(),
+                    status: AI_RESOURCE_STATUS_ACTIVE.to_string(),
                     version_number: AI_AGENT_FIRST_VERSION,
                     created_at,
                 },
@@ -2147,10 +2380,10 @@ impl ComAmazonawsQconnectWisdomserviceState {
     /// `UntagResource` take an `Arn` rather than one family's path label
     /// (`smithy_query(query="operation",operation="ListTagsForResource")`), so the lookup
     /// covers EVERY family this store holds a tag map for — assistants, knowledge bases,
-    /// contents, sessions, assistant associations and quick responses — and reads the tags
-    /// off that one stored record. Nothing is copied into a second place: a tag a create
-    /// persisted on its resource is the tag reported here, and a resource a delete removed
-    /// holds none.
+    /// contents, sessions, AI guardrails, assistant associations and quick responses — and
+    /// reads the tags off that one stored record. Nothing is copied into a second place: a
+    /// tag a create persisted on its resource is the tag reported here, and a resource a
+    /// delete removed holds none.
     ///
     /// The ARN is matched against the one the record itself carries, not merely against
     /// the id [`resolve_id`] reads out of it, so an ARN that pairs a stored id with
@@ -2194,14 +2427,23 @@ impl ComAmazonawsQconnectWisdomserviceState {
         {
             return Some(&quick_response.tags);
         }
-        // A session is reachable only through its parent assistant, whose id a session
-        // ARN carries in the segment before the session's own ([`session_arn`]). A
+        // A resource nested inside an assistant — a session, an AI guardrail — is
+        // reachable only through its parent, whose id its ARN carries in the segment
+        // before the resource's own ([`session_arn`], [`ai_guardrail_arn`]). A
         // single-segment ARN's preceding field still holds the `arn:…:<label>` prefix,
         // which is no assistant id, so it simply misses.
         let parent = resource_arn.rsplit('/').nth(1)?;
-        self.assistants
-            .get(parent)
-            .and_then(|assistant| assistant.sessions.get(id))
+        let assistant = self.assistants.get(parent)?;
+        if let Some(guardrail) = assistant
+            .ai_guardrails
+            .get(id)
+            .filter(|guardrail| guardrail.ai_guardrail_arn == resource_arn)
+        {
+            return Some(&guardrail.tags);
+        }
+        assistant
+            .sessions
+            .get(id)
             .filter(|session| session.session_arn == resource_arn)
             .map(|session| &session.tags)
     }
@@ -2266,12 +2508,21 @@ impl ComAmazonawsQconnectWisdomserviceState {
                 .get_mut(&id)
                 .map(|quick_response| &mut quick_response.tags);
         }
-        // A session is reachable only through its parent assistant, whose id a session
-        // ARN carries in the segment before the session's own.
+        // A resource nested inside an assistant — a session, an AI guardrail — is
+        // reachable only through its parent, whose id its ARN carries in the segment
+        // before the resource's own.
         let parent = resource_arn.rsplit('/').nth(1)?.to_string();
-        self.assistants
-            .get_mut(&parent)
-            .and_then(|assistant| assistant.sessions.get_mut(&id))
+        let assistant = self.assistants.get_mut(&parent)?;
+        if let Some(guardrail) = assistant
+            .ai_guardrails
+            .get_mut(&id)
+            .filter(|guardrail| guardrail.ai_guardrail_arn == resource_arn)
+        {
+            return Some(&mut guardrail.tags);
+        }
+        assistant
+            .sessions
+            .get_mut(&id)
             .filter(|session| session.session_arn == resource_arn)
             .map(|session| &mut session.tags)
     }
@@ -2471,6 +2722,9 @@ impl ComAmazonawsQconnectWisdomserviceState {
             .filter(|(_, created)| {
                 created.resource_id == assistant.assistant_id
                     || assistant.sessions.contains_key(created.resource_id.as_str())
+                    || assistant
+                        .ai_guardrails
+                        .contains_key(created.resource_id.as_str())
                     || associations.contains(&created.resource_id)
             })
             .map(|(token, _)| token.clone())
@@ -2479,6 +2733,70 @@ impl ComAmazonawsQconnectWisdomserviceState {
             self.idempotency.remove(&token);
         }
         Some(assistant)
+    }
+
+    /// The AI guardrail a (`assistantId` label, `aiGuardrailId` label) pair names, or
+    /// `None` when this account holds no assistant under the first label or that
+    /// assistant holds no guardrail under the second — including a guardrail of ANOTHER
+    /// assistant, which this one does not hold.
+    pub fn ai_guardrail(
+        &self,
+        assistant_label: &str,
+        guardrail_label: &str,
+    ) -> Option<&AiGuardrail> {
+        self.assistant(assistant_label)?.ai_guardrail(guardrail_label)
+    }
+
+    /// Store an AI guardrail inside the assistant it names. `false` — nothing stored —
+    /// when this account holds no such assistant, or when that assistant already holds
+    /// [`MAX_AI_GUARDRAILS_PER_ASSISTANT`], so the bound holds however the caller reaches
+    /// this.
+    pub fn insert_ai_guardrail(&mut self, guardrail: AiGuardrail) -> bool {
+        let Some(assistant) = self.assistants.get_mut(&guardrail.assistant_id) else {
+            return false;
+        };
+        if assistant.ai_guardrails.len() >= MAX_AI_GUARDRAILS_PER_ASSISTANT {
+            return false;
+        }
+        assistant
+            .ai_guardrails
+            .insert(guardrail.ai_guardrail_id.clone(), guardrail);
+        true
+    }
+
+    /// Forget one AI guardrail, as `DeleteAIGuardrail` does, together with the
+    /// `clientToken` entry that created it: a token whose resource is gone must not
+    /// resurrect it on a replay. `None` — nothing removed — when the pair names no
+    /// guardrail this account holds, which is the caller's not-found.
+    ///
+    /// The name the record held is released by the same call, so a create may take it
+    /// again: the conflict a duplicate name is refused with is a conflict with a LIVE
+    /// guardrail.
+    pub fn remove_ai_guardrail(
+        &mut self,
+        assistant_label: &str,
+        guardrail_label: &str,
+    ) -> Option<AiGuardrail> {
+        let assistant_id = self.assistant(assistant_label)?.assistant_id.clone();
+        let guardrail_id = self
+            .ai_guardrail(&assistant_id, guardrail_label)?
+            .ai_guardrail_id
+            .clone();
+        let guardrail = self
+            .assistants
+            .get_mut(&assistant_id)?
+            .ai_guardrails
+            .remove(&guardrail_id)?;
+        let gone: Vec<String> = self
+            .idempotency
+            .iter()
+            .filter(|(_, created)| created.resource_id == guardrail_id)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in gone {
+            self.idempotency.remove(&token);
+        }
+        Some(guardrail)
     }
 
     /// The id of the live assistant already using this name, if any.
