@@ -39,7 +39,7 @@ fn at<'a>(body: &'a Value, path: &str) -> Option<&'a Value> {
 /// (`AutoScalingMode`) and `workerCapabilities` are both required, and that structure
 /// requires `vCpuCount`, `memoryMiB`, `osFamily` and `cpuArchitectureType`
 /// (`smithy_query(query="closure", operation="CreateFleet")`).
-fn customer_managed(os_family: &str, cpu: &str, extra: Value) -> Value {
+pub(crate) fn customer_managed(os_family: &str, cpu: &str, extra: Value) -> Value {
     let mut capabilities = json!({
         "vCpuCount": {"min": 1, "max": 4},
         "memoryMiB": {"min": 512, "max": 4096},
@@ -56,7 +56,7 @@ fn customer_managed(os_family: &str, cpu: &str, extra: Value) -> Value {
 
 /// A service managed Amazon EC2 fleet configuration: `instanceCapabilities` and
 /// `instanceMarketOptions` are both required.
-fn service_managed(os_family: &str, cpu: &str, market: &str, extra: Value) -> Value {
+pub(crate) fn service_managed(os_family: &str, cpu: &str, market: &str, extra: Value) -> Value {
     let mut capabilities = json!({
         "vCpuCount": {"min": 2},
         "memoryMiB": {"min": 1024},
@@ -85,19 +85,19 @@ fn capabilities_path(configuration: &Value) -> &'static str {
     }
 }
 
-fn create_fleet_path(farm_id: &str) -> String {
+pub(crate) fn create_fleet_path(farm_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/fleets")
 }
 
-fn get_fleet_path(farm_id: &str, fleet_id: &str) -> String {
+pub(crate) fn get_fleet_path(farm_id: &str, fleet_id: &str) -> String {
     format!("/2023-10-12/farms/{farm_id}/fleets/{fleet_id}")
 }
 
 /// An IAM role ARN satisfying the modeled `IamRoleArn` pattern.
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/DeadlineFleet";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/DeadlineFleet";
 
 /// Create a fleet under `farm_id` with `display_name` and return its id.
-async fn create_fleet(emulator: &Emulator, farm_id: &str, display_name: &str) -> String {
+pub(crate) async fn create_fleet(emulator: &Emulator, farm_id: &str, display_name: &str) -> String {
     let (status, body) = emulator
         .post(
             &create_fleet_path(farm_id),
@@ -118,7 +118,7 @@ async fn create_fleet(emulator: &Emulator, farm_id: &str, display_name: &str) ->
 
 /// The `fleetId`s one `ListFleets` page reports, in the order it reported them, plus the
 /// token the next page starts at.
-fn page_of(body: &Value) -> (Vec<String>, Option<String>) {
+pub(crate) fn page_of(body: &Value) -> (Vec<String>, Option<String>) {
     let ids = body
         .get("fleets")
         .and_then(Value::as_array)
