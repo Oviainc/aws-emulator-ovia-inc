@@ -19,7 +19,11 @@ pub struct ImportApiInput {
     pub fail_on_warnings: Option<bool>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#ImportApiResponse")]
+/// `CreatedDate` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `apigwv2_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="ImportApiResponse")`; `IpAddressType` and
+/// `ProtocolType` are enum shapes, which the generator writes as `ShapeType::String`.
 #[derive(Debug, Clone, Default)]
 pub struct ImportApiOutput {
     pub api_endpoint: Option<String>,
@@ -40,4 +44,75 @@ pub struct ImportApiOutput {
     pub version: Option<String>,
     pub warnings: Option<Vec<String>>,
 }
+
+apigwv2_schema_and_codec!(
+    ImportApiOutput,
+    IMPORT_API_OUTPUT_SCHEMA,
+    "ImportApiResponse",
+    (M_API_ENDPOINT, api_endpoint, "ApiEndpoint", "apiEndpoint", 0, opt, string),
+    (
+        M_API_GATEWAY_MANAGED,
+        api_gateway_managed,
+        "ApiGatewayManaged",
+        "apiGatewayManaged",
+        1,
+        opt,
+        boolean
+    ),
+    (M_API_ID, api_id, "ApiId", "apiId", 2, opt, string),
+    (
+        M_API_KEY_SELECTION_EXPRESSION,
+        api_key_selection_expression,
+        "ApiKeySelectionExpression",
+        "apiKeySelectionExpression",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_CORS_CONFIGURATION,
+        cors_configuration,
+        "CorsConfiguration",
+        "corsConfiguration",
+        4,
+        opt,
+        struct_of(Cors)
+    ),
+    (M_CREATED_DATE, created_date, "CreatedDate", "createdDate", 5, opt, date_time),
+    (M_DESCRIPTION, description, "Description", "description", 6, opt, string),
+    (
+        M_DISABLE_SCHEMA_VALIDATION,
+        disable_schema_validation,
+        "DisableSchemaValidation",
+        "disableSchemaValidation",
+        7,
+        opt,
+        boolean
+    ),
+    (
+        M_DISABLE_EXECUTE_API_ENDPOINT,
+        disable_execute_api_endpoint,
+        "DisableExecuteApiEndpoint",
+        "disableExecuteApiEndpoint",
+        8,
+        opt,
+        boolean
+    ),
+    (M_IMPORT_INFO, import_info, "ImportInfo", "importInfo", 9, opt, list_of_string),
+    (M_IP_ADDRESS_TYPE, ip_address_type, "IpAddressType", "ipAddressType", 10, opt, string),
+    (M_NAME, name, "Name", "name", 11, opt, string),
+    (M_PROTOCOL_TYPE, protocol_type, "ProtocolType", "protocolType", 12, opt, string),
+    (
+        M_ROUTE_SELECTION_EXPRESSION,
+        route_selection_expression,
+        "RouteSelectionExpression",
+        "routeSelectionExpression",
+        13,
+        opt,
+        string
+    ),
+    (M_TAGS, tags, "Tags", "tags", 14, opt, map_of_string),
+    (M_VERSION, version, "Version", "version", 15, opt, string),
+    (M_WARNINGS, warnings, "Warnings", "warnings", 16, opt, list_of_string),
+);
 

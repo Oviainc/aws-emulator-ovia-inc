@@ -18,7 +18,11 @@ pub struct GetDeploymentInput {
     pub deployment_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#GetDeploymentResponse")]
+/// `CreatedDate` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `apigwv2_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="GetDeploymentResponse")`; `DeploymentStatus` is an
+/// enum shape, which the generator writes as `ShapeType::String`.
 #[derive(Debug, Clone, Default)]
 pub struct GetDeploymentOutput {
     pub auto_deployed: Option<bool>,
@@ -28,4 +32,32 @@ pub struct GetDeploymentOutput {
     pub deployment_status_message: Option<String>,
     pub description: Option<String>,
 }
+
+apigwv2_schema_and_codec!(
+    GetDeploymentOutput,
+    GET_DEPLOYMENT_OUTPUT_SCHEMA,
+    "GetDeploymentResponse",
+    (M_AUTO_DEPLOYED, auto_deployed, "AutoDeployed", "autoDeployed", 0, opt, boolean),
+    (M_CREATED_DATE, created_date, "CreatedDate", "createdDate", 1, opt, date_time),
+    (M_DEPLOYMENT_ID, deployment_id, "DeploymentId", "deploymentId", 2, opt, string),
+    (
+        M_DEPLOYMENT_STATUS,
+        deployment_status,
+        "DeploymentStatus",
+        "deploymentStatus",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_DEPLOYMENT_STATUS_MESSAGE,
+        deployment_status_message,
+        "DeploymentStatusMessage",
+        "deploymentStatusMessage",
+        4,
+        opt,
+        string
+    ),
+    (M_DESCRIPTION, description, "Description", "description", 5, opt, string),
+);
 

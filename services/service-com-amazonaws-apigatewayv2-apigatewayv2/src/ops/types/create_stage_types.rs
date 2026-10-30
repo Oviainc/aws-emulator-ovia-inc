@@ -27,7 +27,11 @@ pub struct CreateStageInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.apigatewayv2#CreateStageResponse")]
+/// `CreatedDate` and `LastUpdatedDate` target `__timestampIso8601`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `apigwv2_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order, wire
+/// names and requiredness from
+/// `smithy_query(query="shape", shape="CreateStageResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct CreateStageOutput {
     pub access_log_settings: Option<AccessLogSettings>,
@@ -45,4 +49,88 @@ pub struct CreateStageOutput {
     pub stage_variables: Option<std::collections::HashMap<String, String>>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+apigwv2_schema_and_codec!(
+    CreateStageOutput,
+    CREATE_STAGE_OUTPUT_SCHEMA,
+    "CreateStageResponse",
+    (
+        M_ACCESS_LOG_SETTINGS,
+        access_log_settings,
+        "AccessLogSettings",
+        "accessLogSettings",
+        0,
+        opt,
+        struct_of(AccessLogSettings)
+    ),
+    (
+        M_API_GATEWAY_MANAGED,
+        api_gateway_managed,
+        "ApiGatewayManaged",
+        "apiGatewayManaged",
+        1,
+        opt,
+        boolean
+    ),
+    (M_AUTO_DEPLOY, auto_deploy, "AutoDeploy", "autoDeploy", 2, opt, boolean),
+    (
+        M_CLIENT_CERTIFICATE_ID,
+        client_certificate_id,
+        "ClientCertificateId",
+        "clientCertificateId",
+        3,
+        opt,
+        string
+    ),
+    (M_CREATED_DATE, created_date, "CreatedDate", "createdDate", 4, opt, date_time),
+    (
+        M_DEFAULT_ROUTE_SETTINGS,
+        default_route_settings,
+        "DefaultRouteSettings",
+        "defaultRouteSettings",
+        5,
+        opt,
+        struct_of(RouteSettings)
+    ),
+    (M_DEPLOYMENT_ID, deployment_id, "DeploymentId", "deploymentId", 6, opt, string),
+    (M_DESCRIPTION, description, "Description", "description", 7, opt, string),
+    (
+        M_LAST_DEPLOYMENT_STATUS_MESSAGE,
+        last_deployment_status_message,
+        "LastDeploymentStatusMessage",
+        "lastDeploymentStatusMessage",
+        8,
+        opt,
+        string
+    ),
+    (
+        M_LAST_UPDATED_DATE,
+        last_updated_date,
+        "LastUpdatedDate",
+        "lastUpdatedDate",
+        9,
+        opt,
+        date_time
+    ),
+    (
+        M_ROUTE_SETTINGS,
+        route_settings,
+        "RouteSettings",
+        "routeSettings",
+        10,
+        opt,
+        map_of_struct(RouteSettings)
+    ),
+    (M_STAGE_NAME, stage_name, "StageName", "stageName", 11, opt, string),
+    (
+        M_STAGE_VARIABLES,
+        stage_variables,
+        "StageVariables",
+        "stageVariables",
+        12,
+        opt,
+        map_of_string
+    ),
+    (M_TAGS, tags, "Tags", "tags", 13, opt, map_of_string),
+);
 

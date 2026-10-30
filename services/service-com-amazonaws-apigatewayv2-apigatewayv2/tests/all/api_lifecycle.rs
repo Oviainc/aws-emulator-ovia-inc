@@ -245,10 +245,10 @@ const CREATED_DATE_SLACK_SECONDS: f64 = 10.0;
 
 /// `CreatedDate` must be the instant the api was created.
 ///
-/// The ENCODING is the protocol's, not this service's: a restJson1 timestamp member
-/// is written in the protocol's default epoch-seconds form unless its schema carries
-/// `@timestampFormat`, which the vendored schema generator does not emit. So this
-/// accepts either form and asserts the INSTANT, which is what the handler decides.
+/// The ENCODING is part of the contract: every timestamp member of this service targets
+/// `__timestampIso8601` (`@timestampFormat("date-time")`), so the value is an RFC 3339
+/// string and never the protocol's default epoch-seconds number. [`instant`] is what
+/// pins that; this asserts the INSTANT, which is what the handler decides.
 pub(crate) fn assert_created_now(case: &str, body: &Value) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -264,12 +264,14 @@ pub(crate) fn assert_created_now(case: &str, body: &Value) {
 /// The instant a timestamp member reports, in epoch seconds — the one decoder every
 /// suite reads a timestamp through, so two of them cannot drift.
 ///
-/// Accepts both forms for the reason given on [`assert_created_now`], and panics when
-/// the member is absent or is neither: a response that must carry an instant and does
-/// not is a failure, not a zero.
+/// Requires the RFC 3339 / ISO-8601 date-time STRING the `date-time` format on every one
+/// of this service's timestamp targets makes part of the wire contract: a JSON number is
+/// the protocol default no generated client can deserialize into a `date-time`, so it
+/// fails here. Panics when the member is absent as well: a response that must carry an
+/// instant and does not is a failure, not a zero. `tests/all/iso8601_timestamp_members.rs`
+/// states the rule in full.
 pub(crate) fn instant(case: &str, body: &Value, member: &str) -> f64 {
     match body.get(member) {
-        Some(Value::Number(number)) => number.as_f64().unwrap_or_default(),
         Some(Value::String(rendered)) => ::aws_smithy_types::DateTime::from_str(
             rendered,
             ::aws_smithy_types::date_time::Format::DateTime,
@@ -278,7 +280,10 @@ pub(crate) fn instant(case: &str, body: &Value, member: &str) -> f64 {
             panic!("case {case:?}: {member} {rendered:?} is not ISO-8601: {error}")
         })
         .as_secs_f64(),
-        other => panic!("case {case:?}: the response must report a {member}, got {other:?}"),
+        other => panic!(
+            "case {case:?}: the response must report {member} as an RFC 3339 date-time string, \
+             got {other:?}"
+        ),
     }
 }
 

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The wire form of this service's developer-portal, product and VPC-link
-//! `@timestampFormat("date-time")` members.
+//! The wire form of this service's `@timestampFormat("date-time")` members.
 //!
 //! RULE: a structure member whose target carries `@timestampFormat("date-time")` travels
 //! on the restJson1 wire as an RFC 3339 / ISO-8601 date-time STRING — never as the epoch
@@ -13,15 +12,19 @@
 //! `"timestampFormat": "date-time"`), so the rule reaches every shape that reports one.
 //! This suite covers the portal, portal-product, product-page, product-REST-endpoint-page
 //! and VPC-link shapes — `lastModified`, `lastPublished`, `logoLastUploaded` and
-//! `createdDate`; the `api`, `stage`, `deployment` and domain-name shapes carry the same
-//! members and are owned by their own issues.
+//! `createdDate` — and the api, stage and deployment shapes, whose `createdDate` and
+//! `lastUpdatedDate` the control plane reports on every create, read, update and list
+//! path. `DomainNameConfiguration$CertificateUploadDate` is the one `date-time` member no
+//! response of this emulator carries: nothing is uploaded here, so the service leaves it
+//! unset (`state::DomainNameEndpoint::to_wire`), and the shape a request also carries
+//! keeps the generated schema that enforces its members' constraints.
 //!
 //! The rule is checked twice over, at both ends of the mechanism that carries it:
 //!
-//! * on the WIRE, over a table spanning the five resource families and every path that
-//!   reports an instant for them — create, read, update and list — including the round
-//!   trip back to the instant the create reported (so a well-formed string naming the
-//!   wrong moment fails too);
+//! * on the WIRE, over a table spanning the resource families and every path that
+//!   reports an instant for them — create, read, update, list and (for an api) import and
+//!   reimport — including the round trip back to the instant the create reported (so a
+//!   well-formed string naming the wrong moment fails too);
 //! * on the SCHEMA, because the member schema's `timestamp_format()` is the single thing
 //!   the JSON codec consults (`vendor/smithy-schema-server/src/json.rs::write_timestamp`),
 //!   read against the shipped Smithy model itself rather than against a copied list — so
@@ -40,13 +43,15 @@ use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use service_com_amazonaws_apigatewayv2_apigatewayv2::ops::types::{
-    CreatePortalOutput, CreatePortalProductOutput, CreateProductPageOutput,
-    CreateProductRestEndpointPageOutput, CreateVpcLinkOutput, GetPortalOutput,
+    Api, CreateApiOutput, CreateDeploymentOutput, CreatePortalOutput, CreatePortalProductOutput,
+    CreateProductPageOutput, CreateProductRestEndpointPageOutput, CreateStageOutput,
+    CreateVpcLinkOutput, Deployment, GetApiOutput, GetDeploymentOutput, GetPortalOutput,
     GetPortalProductOutput, GetProductPageOutput, GetProductRestEndpointPageOutput,
-    GetVpcLinkOutput, PortalProductSummary, PortalSummary, PortalTheme,
-    ProductPageSummaryNoBody, ProductRestEndpointPageSummaryNoBody, UpdatePortalOutput,
+    GetStageOutput, GetVpcLinkOutput, ImportApiOutput, PortalProductSummary, PortalSummary,
+    PortalTheme, ProductPageSummaryNoBody, ProductRestEndpointPageSummaryNoBody,
+    ReimportApiOutput, Stage, UpdateApiOutput, UpdateDeploymentOutput, UpdatePortalOutput,
     UpdatePortalProductOutput, UpdateProductPageOutput, UpdateProductRestEndpointPageOutput,
-    UpdateVpcLinkOutput, VpcLink,
+    UpdateStageOutput, UpdateVpcLinkOutput, VpcLink,
 };
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{to_timestamp, PORTAL_BUILD};
 use smithy_server_runtime::MultiServiceRouter;
@@ -404,15 +409,267 @@ async fn reported_documents(emulator: &MultiServiceRouter) -> Vec<Reported> {
     rows
 }
 
-/// RULE on the wire: every reported instant of the five families is an RFC 3339 date-time
-/// string naming the moment the service wrote.
+/// The OpenAPI definition the import and reimport rows carry: one path served by one
+/// HTTP-proxy integration.
+fn imported_definition(title: &str) -> String {
+    json!({
+        "openapi": "3.0.1",
+        "info": { "title": title, "version": "1" },
+        "paths": {
+            "/items": {
+                "get": {
+                    "x-amazon-apigateway-integration": {
+                        "type": "http_proxy",
+                        "httpMethod": "GET",
+                        "uri": "https://items.example.com/items"
+                    }
+                }
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Drive every path of the api, stage and deployment families that reports an instant, and
+/// answer what each one reported.
+///
+/// The rows vary what the rule generalises over: the resource family, the member
+/// (`createdDate`, `lastUpdatedDate`), the path that reports it (create, read, update,
+/// list, import, reimport), the api's protocol type, and whether the stage carries the
+/// map-of-structure `routeSettings` member that sits beside the timestamps in the same
+/// shape.
+async fn reported_control_plane_documents(emulator: &MultiServiceRouter) -> Vec<Reported> {
+    let mut rows: Vec<Reported> = Vec::new();
+
+    // ---- The api: `createdDate` on create, read, update and list, on both protocols,
+    // and on the two paths that mint an api from a definition document.
+    let (status, api) = call(
+        emulator,
+        "POST",
+        "/v2/apis",
+        Some(json!({ "name": "timestamped-api", "protocolType": "HTTP" })),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateApi must answer 201, got {status} {api}");
+    let api_id = as_str(&api, "apiId");
+    let api_uri = format!("/v2/apis/{api_id}");
+
+    let (_, fetched_api) = call(emulator, "GET", &api_uri, None).await;
+    let (status, updated_api) = call(
+        emulator,
+        "PATCH",
+        &api_uri,
+        Some(json!({ "description": "an update keeps the creation instant" })),
+    )
+    .await;
+    assert_eq!(status, 200, "UpdateApi must answer 200, got {status} {updated_api}");
+    let (_, listed_apis) = call(emulator, "GET", "/v2/apis", None).await;
+
+    let (status, socket_api) = call(
+        emulator,
+        "POST",
+        "/v2/apis",
+        Some(json!({
+            "name": "timestamped-socket-api",
+            "protocolType": "WEBSOCKET",
+            "routeSelectionExpression": "$request.body.action"
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "CreateApi must answer 201 for a WebSocket api, got {status} {socket_api}"
+    );
+
+    let (status, imported) = call(
+        emulator,
+        "PUT",
+        "/v2/apis",
+        Some(json!({ "body": imported_definition("timestamped-imported-api") })),
+    )
+    .await;
+    assert_eq!(status, 201, "ImportApi must answer 201, got {status} {imported}");
+    let imported_id = as_str(&imported, "apiId");
+    let (status, reimported) = call(
+        emulator,
+        "PUT",
+        &format!("/v2/apis/{imported_id}"),
+        Some(json!({ "body": imported_definition("timestamped-reimported-api") })),
+    )
+    .await;
+    assert_eq!(status, 201, "ReimportApi must answer 201, got {status} {reimported}");
+
+    for (case, document) in [
+        ("CreateApi", api.clone()),
+        ("CreateApi on a WebSocket api", socket_api),
+        ("GetApi", fetched_api.clone()),
+        ("UpdateApi", updated_api),
+        (
+            "GetApis item",
+            listed("GetApis item", &listed_apis, "apiId", &api_id),
+        ),
+        ("ImportApi", imported),
+        ("ReimportApi", reimported),
+    ] {
+        rows.push(Reported {
+            case: case.to_string(),
+            document,
+            members: vec!["createdDate"],
+        });
+    }
+
+    // ---- The stage: `createdDate` and `lastUpdatedDate` on create, read, update and
+    // list. The create carries `routeSettings`, the one map-of-structure member of the
+    // shape, so the entries beside the timestamps are exercised too.
+    let stages_uri = format!("{api_uri}/stages");
+    let (status, stage) = call(
+        emulator,
+        "POST",
+        &stages_uri,
+        Some(json!({
+            "stageName": "timestamped",
+            "autoDeploy": false,
+            "description": "the stage the instants are read from",
+            "routeSettings": {
+                "GET /widgets": { "throttlingBurstLimit": 100, "detailedMetricsEnabled": true }
+            },
+            "stageVariables": { "tier": "gold" }
+        })),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateStage must answer 201, got {status} {stage}");
+    let stage_uri = format!("{stages_uri}/timestamped");
+
+    let (_, fetched_stage) = call(emulator, "GET", &stage_uri, None).await;
+    let (status, updated_stage) = call(
+        emulator,
+        "PATCH",
+        &stage_uri,
+        Some(json!({ "description": "an update moves only the update instant" })),
+    )
+    .await;
+    assert_eq!(status, 200, "UpdateStage must answer 200, got {status} {updated_stage}");
+    let (_, listed_stages) = call(emulator, "GET", &stages_uri, None).await;
+
+    let stage_members = vec!["createdDate", "lastUpdatedDate"];
+    for (case, document) in [
+        ("CreateStage", stage.clone()),
+        ("GetStage", fetched_stage.clone()),
+        ("UpdateStage", updated_stage),
+        (
+            "GetStages item",
+            listed("GetStages item", &listed_stages, "stageName", "timestamped"),
+        ),
+    ] {
+        rows.push(Reported {
+            case: case.to_string(),
+            document,
+            members: stage_members.clone(),
+        });
+    }
+
+    // The members that travel beside the timestamps in the hand-written stage schema are
+    // the control: a boolean stays a JSON boolean and the route settings keep their
+    // entries, so the schema that carries the date-time format carries the rest unchanged.
+    for (case, document) in [("CreateStage", &stage), ("GetStage", &fetched_stage)] {
+        assert_eq!(
+            document.get("autoDeploy"),
+            Some(&json!(false)),
+            "case {case:?}: AutoDeploy must stay a JSON boolean, got {document}"
+        );
+        let settings = at_path(document, "routeSettings.GET /widgets")
+            .unwrap_or_else(|| panic!("case {case:?}: the stage must report its route settings, got {document}"));
+        assert_eq!(
+            settings.get("throttlingBurstLimit"),
+            Some(&json!(100)),
+            "case {case:?}: the route settings entry must report its burst limit, got {settings}"
+        );
+        assert_eq!(
+            settings.get("detailedMetricsEnabled"),
+            Some(&json!(true)),
+            "case {case:?}: the route settings entry must report its metrics flag, got {settings}"
+        );
+    }
+
+    // ---- The deployment: `createdDate` on create, read, update and list.
+    let deployments_uri = format!("{api_uri}/deployments");
+    let (status, deployment) = call(
+        emulator,
+        "POST",
+        &deployments_uri,
+        Some(json!({ "description": "the first release" })),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateDeployment must answer 201, got {status} {deployment}");
+    let deployment_id = as_str(&deployment, "deploymentId");
+    let deployment_uri = format!("{deployments_uri}/{deployment_id}");
+
+    let (_, fetched_deployment) = call(emulator, "GET", &deployment_uri, None).await;
+    let (_, listed_deployments) = call(emulator, "GET", &deployments_uri, None).await;
+
+    // `UpdateDeployment` is still a stub (501), so `UpdateDeploymentResponse` is covered by
+    // the schema test alone until that operation's own issue implements it.
+    for (case, document) in [
+        ("CreateDeployment", deployment.clone()),
+        ("GetDeployment", fetched_deployment.clone()),
+        (
+            "GetDeployments item",
+            listed(
+                "GetDeployments item",
+                &listed_deployments,
+                "deploymentId",
+                &deployment_id,
+            ),
+        ),
+    ] {
+        rows.push(Reported {
+            case: case.to_string(),
+            document,
+            members: vec!["createdDate"],
+        });
+    }
+
+    // The created instant each resource reports is the SAME on the create and on the read
+    // that follows it, for every member the create reported.
+    for (case, created, fetched, members) in [
+        ("api", &api, &fetched_api, &["createdDate"][..]),
+        (
+            "stage",
+            &stage,
+            &fetched_stage,
+            &["createdDate", "lastUpdatedDate"][..],
+        ),
+        (
+            "deployment",
+            &deployment,
+            &fetched_deployment,
+            &["createdDate"][..],
+        ),
+    ] {
+        for member in members {
+            let on_create = date_time_millis(case, created, member);
+            let on_read = date_time_millis(case, fetched, member);
+            assert_eq!(
+                on_create, on_read,
+                "case {case:?}: the read must report the instant the create did for {member}, \
+                 got {on_create} ms then {on_read} ms"
+            );
+        }
+    }
+
+    rows
+}
+
+/// RULE on the wire: every reported instant of every resource family is an RFC 3339
+/// date-time string naming the moment the service wrote.
 #[tokio::test]
 async fn every_date_time_member_is_an_rfc_3339_string_naming_the_stored_instant() {
     let emulator = emulator();
-    let rows = reported_documents(&emulator).await;
+    let mut rows = reported_documents(&emulator).await;
+    rows.extend(reported_control_plane_documents(&emulator).await);
 
     assert!(
-        rows.len() >= 18,
+        rows.len() >= 32,
         "the table must span every path that reports an instant, got {} rows",
         rows.len()
     );
@@ -509,6 +766,20 @@ fn shapes_under_test() -> Vec<(&'static str, &'static Schema)> {
         ("GetVpcLinkResponse", &GetVpcLinkOutput::SCHEMA),
         ("UpdateVpcLinkResponse", &UpdateVpcLinkOutput::SCHEMA),
         ("VpcLink", &VpcLink::SCHEMA),
+        ("CreateApiResponse", &CreateApiOutput::SCHEMA),
+        ("GetApiResponse", &GetApiOutput::SCHEMA),
+        ("UpdateApiResponse", &UpdateApiOutput::SCHEMA),
+        ("ImportApiResponse", &ImportApiOutput::SCHEMA),
+        ("ReimportApiResponse", &ReimportApiOutput::SCHEMA),
+        ("Api", &Api::SCHEMA),
+        ("CreateStageResponse", &CreateStageOutput::SCHEMA),
+        ("GetStageResponse", &GetStageOutput::SCHEMA),
+        ("UpdateStageResponse", &UpdateStageOutput::SCHEMA),
+        ("Stage", &Stage::SCHEMA),
+        ("CreateDeploymentResponse", &CreateDeploymentOutput::SCHEMA),
+        ("GetDeploymentResponse", &GetDeploymentOutput::SCHEMA),
+        ("UpdateDeploymentResponse", &UpdateDeploymentOutput::SCHEMA),
+        ("Deployment", &Deployment::SCHEMA),
     ]
 }
 
@@ -630,7 +901,7 @@ fn every_hand_written_schema_matches_the_model_member_for_member() {
     // Both kinds were actually exercised, so neither branch of the rule passed by being
     // unreachable.
     assert!(
-        date_time_members >= 24 && other_members >= 100,
+        date_time_members >= 42 && other_members >= 260,
         "the table must span both kinds of member, got {date_time_members} date-time and \
          {other_members} other members"
     );

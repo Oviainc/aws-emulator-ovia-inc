@@ -72,6 +72,9 @@ macro_rules! apigwv2_shape_type {
     (string) => {
         ::aws_smithy_schema::ShapeType::String
     };
+    (boolean) => {
+        ::aws_smithy_schema::ShapeType::Boolean
+    };
     (date_time) => {
         ::aws_smithy_schema::ShapeType::Timestamp
     };
@@ -79,6 +82,9 @@ macro_rules! apigwv2_shape_type {
         ::aws_smithy_schema::ShapeType::List
     };
     (map_of_string) => {
+        ::aws_smithy_schema::ShapeType::Map
+    };
+    (map_of_struct) => {
         ::aws_smithy_schema::ShapeType::Map
     };
     (struct_of) => {
@@ -92,7 +98,8 @@ macro_rules! apigwv2_shape_type {
 /// `$local` is the enclosing shape's local name, `$member` the member as the model spells
 /// it, `$json` its `@jsonName` wire key and `$idx` its position in the model's member
 /// list. `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
-/// string-encoded), `date_time`, `list_of_string`, `map_of_string` or `struct_of(T)`.
+/// string-encoded), `boolean`, `date_time`, `list_of_string`, `map_of_string`,
+/// `map_of_struct(T)` or `struct_of(T)`.
 macro_rules! apigwv2_member_schema {
     ($local:literal, $member:literal, $json:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -127,6 +134,7 @@ macro_rules! apigwv2_member_schema {
 /// Write one member, as the vendored codegen's `codegen::emit_write` does for that kind.
 macro_rules! apigwv2_write_member {
     ($s:ident, $m:expr, $v:expr, string) => { $s.write_string($m, $v.as_str())?; };
+    ($s:ident, $m:expr, $v:expr, boolean) => { $s.write_boolean($m, *$v)?; };
     ($s:ident, $m:expr, $v:expr, date_time) => { $s.write_timestamp($m, $v)?; };
     ($s:ident, $m:expr, $v:expr, list_of_string) => {
         $s.write_list($m, &|__sl| {
@@ -148,6 +156,17 @@ macro_rules! apigwv2_write_member {
             Ok(())
         })?;
     };
+    // A map of structures writes each entry the same way, the value through the struct's
+    // own serializer.
+    ($s:ident, $m:expr, $v:expr, map_of_struct($inner:ty)) => {
+        $s.write_map($m, &|__sm| {
+            for (__k, __mv) in $v.iter() {
+                __sm.write_string($m, __k.as_str())?;
+                __sm.write_struct($m, __mv)?;
+            }
+            Ok(())
+        })?;
+    };
     ($s:ident, $m:expr, $v:expr, struct_of($inner:ty)) => { $s.write_struct($m, $v)?; };
 }
 
@@ -159,6 +178,7 @@ macro_rules! apigwv2_write_member {
 /// body nesting deeper than its `MAX_DEPTH`.
 macro_rules! apigwv2_read_member {
     ($d:ident, $m:expr, string) => { $d.read_string($m)? };
+    ($d:ident, $m:expr, boolean) => { $d.read_boolean($m)? };
     ($d:ident, $m:expr, date_time) => { $d.read_timestamp($m)? };
     ($d:ident, $m:expr, list_of_string) => {{
         let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
@@ -175,6 +195,20 @@ macro_rules! apigwv2_read_member {
         > = ::std::collections::HashMap::new();
         $d.read_map($m, &mut |__k, __dm| {
             let __value = __dm.read_string($m)?;
+            __out.insert(__k, __value);
+            Ok(())
+        })?;
+        __out
+    }};
+    // A failing entry of a map of structures is named by its key, as the vendored
+    // codegen names it for a value that can report an absent `@required` member.
+    ($d:ident, $m:expr, map_of_struct($inner:ty)) => {{
+        let mut __out: ::std::collections::HashMap<::std::string::String, $inner> =
+            ::std::collections::HashMap::new();
+        $d.read_map($m, &mut |__k, __dm| {
+            let __value =
+                <$inner as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(__dm)
+                    .map_err(|__e| ::aws_smithy_schema_server::within_map_entry(__e, &__k))?;
             __out.insert(__k, __value);
             Ok(())
         })?;
