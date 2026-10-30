@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|alias| alias.alias_id.clone())
         else {
             return Err(UpdateAliasErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("The alias {} was not found.", input.alias_id)),
+                message: Some(crate::state::alias_not_found_message(&input.alias_id)),
             })
             .into());
         };

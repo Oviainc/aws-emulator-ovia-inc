@@ -974,6 +974,21 @@ impl GameSessionQueueRecord {
     }
 }
 
+/// What the service answers when no alias is stored under the `AliasIdOrArn` an operation
+/// was asked to act on — the message of the modelled `NotFoundException`, shared by every
+/// operation that names ONE alias, so the same missing alias reads the same way whichever
+/// of them was called.
+///
+/// The resource kind leads the sentence and the identifier the CALLER supplied is its one
+/// variable part, carried verbatim in parentheses: either of the two forms the member
+/// accepts selects the same alias, so the refusal states what was asked for rather than
+/// anything the service resolved it to. [`script_not_found_message`] answers a missing
+/// script in the same shape, closing with a full stop where this one does not: each of
+/// the two reproduces the sentence the service answers for that resource kind.
+pub fn alias_not_found_message(id_or_arn: &str) -> String {
+    format!("Alias ({id_or_arn}) not found")
+}
+
 /// An alias for a fleet, as `CreateAlias` persisted it.
 ///
 /// Every member of the modelled `Alias` is either a setting the request supplied or one

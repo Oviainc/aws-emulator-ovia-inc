@@ -238,8 +238,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(fleet_reference), _) => Some(fleet_reference.clone()),
             (None, Some(alias_reference)) => {
                 let Some(alias) = state.resolve_alias(alias_reference) else {
-                    return Err(not_found(format!(
-                        "The alias {alias_reference} was not found."
+                    return Err(not_found(crate::state::alias_not_found_message(
+                        alias_reference,
                     )));
                 };
                 match alias.routing() {

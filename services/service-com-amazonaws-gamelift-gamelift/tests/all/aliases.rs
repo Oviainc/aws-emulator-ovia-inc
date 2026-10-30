@@ -31,30 +31,30 @@ const MAX_NAME_LENGTH: usize = 1024;
 /// The ARN an alias with `alias_id` is assigned:
 /// `arn:aws:gamelift:<region>:<account>:alias/<alias id>` — "in a GameLift alias ARN, the
 /// resource ID matches the alias ID value" (`smithy_query shape=Alias` member `AliasArn`).
-fn alias_arn(alias_id: &str) -> String {
+pub(crate) fn alias_arn(alias_id: &str) -> String {
     gamelift_arn(&format!("alias/{alias_id}"))
 }
 
 /// A simple routing strategy pointing at `fleet_reference`: "SIMPLE - The alias resolves
 /// to one specific fleet."
-fn simple_routing(fleet_reference: &str) -> Value {
+pub(crate) fn simple_routing(fleet_reference: &str) -> Value {
     json!({"Type": "SIMPLE", "FleetId": fleet_reference})
 }
 
 /// A terminal routing strategy carrying `message`: "TERMINAL - The alias does not resolve
 /// to a fleet but instead can be used to display a message to the user."
-fn terminal_routing(message: &str) -> Value {
+pub(crate) fn terminal_routing(message: &str) -> Value {
     json!({"Type": "TERMINAL", "Message": message})
 }
 
 /// The alias `CreateAlias` reports for `request`, which must be the stored record.
-async fn create_alias(gamelift: &GameLift, request: Value) -> Value {
+pub(crate) async fn create_alias(gamelift: &GameLift, request: Value) -> Value {
     let created = gamelift.ok("CreateAlias", request).await;
     created["Alias"].clone()
 }
 
 /// The `AliasId` of a created alias.
-fn alias_id_of(alias: &Value) -> String {
+pub(crate) fn alias_id_of(alias: &Value) -> String {
     alias["AliasId"]
         .as_str()
         .expect("CreateAlias must report an AliasId")

@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // either not created yet or deleted"), not an empty success.
         let Some(alias) = state.resolve_alias(&input.alias_id) else {
             return Err(DescribeAliasErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("The alias {} was not found.", input.alias_id)),
+                message: Some(crate::state::alias_not_found_message(&input.alias_id)),
             })
             .into());
         };
