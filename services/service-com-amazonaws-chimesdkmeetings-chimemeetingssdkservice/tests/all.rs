@@ -25,3 +25,5 @@ mod not_found_message;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_meeting_transcription.rs"]
+mod stop_meeting_transcription;

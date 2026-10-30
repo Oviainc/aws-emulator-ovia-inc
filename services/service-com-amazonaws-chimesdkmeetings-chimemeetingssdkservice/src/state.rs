@@ -40,6 +40,7 @@ use crate::ops::types::{
     Attendee, AttendeeCapabilities, BadRequestException, LimitExceededException, MediaPlacement,
     Meeting, MeetingFeaturesConfiguration, NotFoundException, NotificationsConfiguration,
     ResourceNotFoundException, ServiceFailureException, TooManyTagsException,
+    TranscriptionConfiguration,
 };
 
 /// The `arnNamespace` this service's ARNs carry (`OPERATIONS.md`, `## Wire protocol`).
@@ -274,6 +275,14 @@ pub struct StoredMeeting {
     /// The `ClientRequestToken` that created this meeting, so deleting the meeting can
     /// drop its idempotency record too.
     pub client_request_token: String,
+    /// The transcription currently running in this meeting, as the call that started it
+    /// configured it, or `None` when none is running — which is what a meeting starts out
+    /// with and what stopping leaves behind.
+    ///
+    /// It is nested in the meeting rather than kept in a map beside the meetings so that
+    /// it cannot outlive the meeting it belongs to: deleting the meeting drops it, and no
+    /// second record can disagree about whether this meeting is being transcribed.
+    pub transcription: Option<TranscriptionConfiguration>,
 }
 
 /// Per-service state for com-amazonaws-chimesdkmeetings-chimemeetingssdkservice. A handler reaches it through [`service_state`].
@@ -374,6 +383,20 @@ impl ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState {
             }
         }
         Some(removed)
+    }
+
+    /// Stop whatever transcription is running in `meeting_id`, leaving the meeting, its
+    /// attendees and every other meeting exactly as they were.
+    ///
+    /// The configuration is DROPPED rather than kept beside a stopped flag: nothing
+    /// reports a stopped transcription, and a later start supplies its own configuration.
+    /// A meeting with nothing running, or an id this store holds no meeting under, is
+    /// left untouched — stopping states the outcome "no transcription is running in this
+    /// meeting", which already holds in both cases.
+    pub fn stop_transcription(&mut self, meeting_id: &str) {
+        if let Some(stored) = self.meetings.get_mut(meeting_id) {
+            stored.transcription = None;
+        }
     }
 
     /// Whether this id named a meeting this store has since deleted.

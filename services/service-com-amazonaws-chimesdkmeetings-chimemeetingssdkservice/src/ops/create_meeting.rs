@@ -265,6 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 notifications_configuration: input.notifications_configuration,
                 media_placement_network_type: input.media_placement_network_type,
                 client_request_token: input.client_request_token,
+                // A meeting is created with no transcription running; starting one is a
+                // call of its own.
+                transcription: None,
             },
         );
 
