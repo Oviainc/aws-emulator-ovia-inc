@@ -91,6 +91,8 @@ mod container_service_delete;
 mod container_service_deployment;
 #[path = "all/container_service_deployment_history.rs"]
 mod container_service_deployment_history;
+#[path = "all/container_service_health_check_success_codes.rs"]
+mod container_service_health_check_success_codes;
 #[path = "all/container_service_lifecycle.rs"]
 mod container_service_lifecycle;
 #[path = "all/container_service_log.rs"]

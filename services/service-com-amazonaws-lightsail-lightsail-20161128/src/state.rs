@@ -8771,6 +8771,14 @@ const HEALTH_CHECK_DEFAULT_SUCCESS_CODES: &str = "200-499";
 const HEALTH_CHECK_TIMEOUT_SECONDS_RANGE: (i32, i32) = (2, 60);
 /// "You can specify between 5 and 300 seconds" (`intervalSeconds`).
 const HEALTH_CHECK_INTERVAL_SECONDS_RANGE: (i32, i32) = (5, 300);
+/// "You can specify values between `200` and `499`" (`successCodes`).
+const HEALTH_CHECK_SUCCESS_CODES_RANGE: (i32, i32) = (200, 499);
+/// What separates the values of a success-code list: "You can specify multiple
+/// values (for example, `200,202`)" (`successCodes`).
+const SUCCESS_CODES_VALUE_SEPARATOR: char = ',';
+/// What separates the two bounds of a success-code range: "or a range of values
+/// (for example, `200-299`)" (`successCodes`).
+const SUCCESS_CODES_RANGE_SEPARATOR: char = '-';
 
 /// How many characters the per-service token of a container service's public
 /// address carries, from the example in the modelled `serviceName`
@@ -10008,8 +10016,10 @@ impl StoredContainerService {
 ///
 /// A deployment launches containers, so it must name at least one, and each must
 /// name the image it runs. A public endpoint must name one of those containers,
-/// on a port that container opens, and its health check is filled in with the
-/// documented defaults for whatever the request left out.
+/// on a port that container opens, its health check is filled in with the
+/// documented defaults for whatever the request left out, and every health-check
+/// member the request did fill in is checked against the value domain that
+/// member's own documentation states.
 pub fn deployment_from_request(
     version: i32,
     now_ms: i64,
@@ -10089,8 +10099,15 @@ pub fn deployment_from_request(
 }
 
 /// The health check `request` asks for, with every member it left out filled in
-/// from that member's documented default, or a refusal naming the member that is
-/// outside its documented range.
+/// from that member's documented default, or a refusal naming the member whose
+/// value falls outside the domain that member's own documentation states.
+///
+/// Every member that documents a domain is checked against it: the two second
+/// counts against their published ranges, and the success codes against the HTTP
+/// code domain and list form their member documents (see
+/// [`validate_success_codes`]). The thresholds and the path document a default
+/// each and no domain at all, so any value the model admits for them is one the
+/// service takes.
 fn health_check_from_request(
     request: Option<&ContainerServiceHealthCheckConfig>,
 ) -> Result<ContainerServiceHealthCheckConfig, String> {
@@ -10114,6 +10131,10 @@ fn health_check_from_request(
              {interval_min} and {interval_max}, got {interval_seconds}"
         ));
     }
+    let success_codes = request
+        .and_then(|config| config.success_codes.clone())
+        .unwrap_or_else(|| HEALTH_CHECK_DEFAULT_SUCCESS_CODES.to_string());
+    validate_success_codes(&success_codes)?;
     Ok(ContainerServiceHealthCheckConfig {
         healthy_threshold: Some(
             request
@@ -10132,12 +10153,64 @@ fn health_check_from_request(
                 .and_then(|config| config.path.clone())
                 .unwrap_or_else(|| HEALTH_CHECK_DEFAULT_PATH.to_string()),
         ),
-        success_codes: Some(
-            request
-                .and_then(|config| config.success_codes.clone())
-                .unwrap_or_else(|| HEALTH_CHECK_DEFAULT_SUCCESS_CODES.to_string()),
-        ),
+        success_codes: Some(success_codes),
     })
+}
+
+/// `codes` read as the documented value domain of a health check's
+/// `successCodes`, or a refusal naming what falls outside it.
+///
+/// The member documents the domain whole: the HTTP codes a container's response
+/// is checked against are "values between `200` and `499`", given as "multiple
+/// values (for example, `200,202`) or a range of values (for example,
+/// `200-299`)". So a value names at least one code; each value it lists is one
+/// code or a pair of codes running from the lower one to the higher one, written
+/// the way the documented examples write them (decimal digits and the two
+/// separators, nothing else); and every code named lies within the documented
+/// bounds.
+fn validate_success_codes(codes: &str) -> Result<(), String> {
+    let (min, max) = HEALTH_CHECK_SUCCESS_CODES_RANGE;
+    let malformed = || {
+        format!(
+            "deployment.publicEndpoint.healthCheck.successCodes must be HTTP codes between \
+             {min} and {max}, given as multiple values (for example, \
+             200{SUCCESS_CODES_VALUE_SEPARATOR}202) or a range of values (for example, \
+             200{SUCCESS_CODES_RANGE_SEPARATOR}299), got '{codes}'"
+        )
+    };
+    let code = |text: &str| -> Result<i32, String> {
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(malformed());
+        }
+        let value: i32 = text.parse().map_err(|_| malformed())?;
+        if !(min..=max).contains(&value) {
+            return Err(format!(
+                "deployment.publicEndpoint.healthCheck.successCodes must be HTTP codes between \
+                 {min} and {max}, got {value}"
+            ));
+        }
+        Ok(value)
+    };
+    for value in codes.split(SUCCESS_CODES_VALUE_SEPARATOR) {
+        // A value carrying the range separator is the documented range form, so
+        // both of its bounds are codes; anything else is one code on its own.
+        match value.split_once(SUCCESS_CODES_RANGE_SEPARATOR) {
+            None => {
+                code(value)?;
+            }
+            Some((low, high)) => {
+                let (low, high) = (code(low)?, code(high)?);
+                if low > high {
+                    return Err(format!(
+                        "deployment.publicEndpoint.healthCheck.successCodes range \
+                         '{low}{SUCCESS_CODES_RANGE_SEPARATOR}{high}' must run from the lower \
+                         HTTP code to the higher one"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The public domain names `requested` carries, or a refusal when it carries more
