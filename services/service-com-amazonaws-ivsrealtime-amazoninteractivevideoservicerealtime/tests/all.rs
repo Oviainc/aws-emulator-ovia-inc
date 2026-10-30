@@ -61,6 +61,8 @@ mod encoder_configurations;
 mod error_envelope;
 #[path = "all/float_members_wire_form.rs"]
 mod float_members_wire_form;
+#[path = "all/forced_ingest_configuration_delete_ends_replications.rs"]
+mod forced_ingest_configuration_delete_ends_replications;
 #[path = "all/foreign_page_token_wording.rs"]
 mod foreign_page_token_wording;
 #[path = "all/get_composition.rs"]

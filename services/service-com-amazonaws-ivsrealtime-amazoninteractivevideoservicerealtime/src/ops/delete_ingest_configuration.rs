@@ -2,6 +2,16 @@
 
 //! @op DeleteIngestConfiguration
 //!
+//! A forced delete takes every publisher of the configuration out of the stage it
+//! publishes in (`crate::state::leave_stage_session`, the one place a participant
+//! leaves), and a publisher is replicated into another stage only while it is connected:
+//! the departure puts every replication that publisher sources on the window the start
+//! asked to reconnect in (`StartParticipantReplicationRequest$reconnectWindowSeconds`),
+//! and the end the clock already owes is written down before this answers
+//! (`crate::state::materialize_due_replications`) — so with the documented default window
+//! the replication is stopped and its replica is out of the destination stage's session
+//! here, exactly as `DisconnectParticipant` and `StopParticipantReplication` leave them.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -205,6 +215,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &publisher.participant_id,
             );
         }
+
+        // A replication replicates a PUBLISHING participant, so each departure above put
+        // every replication that publisher sources on the reconnect deadline its own window
+        // earns it (`crate::state::leave_stage_session`), and what the clock already owes
+        // those replications is written down here
+        // (`crate::state::materialize_due_replications`): with the window the model
+        // documents as the default, the end is owed at the instant the publisher went —
+        // which is this call — so the replication is reported stopped and its replica is out
+        // of the destination stage's session by the time this answers, exactly as
+        // `DisconnectParticipant` leaves them, while a window the caller asked for leaves
+        // the end owed until it runs out.
+        crate::state::materialize_due_replications(&mut store, ::std::time::SystemTime::now());
 
         // The configuration "can no longer be used to broadcast": the record goes, and
         // with it the ingest key and the participant ids it carried, so a later read of
