@@ -322,7 +322,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// Build this service from the shared engine. The engine is threaded into the
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
+    ///
+    /// This is also where this service's store is installed
+    /// ([`crate::state::install_service_state`]): the emulator runs this constructor
+    /// once per service as it boots, so the inventory the store starts with — and
+    /// the instant stamped on each of its records — is fixed at the emulator's start
+    /// rather than by whichever request reaches the store first.
     pub fn new(engine: Arc<Eng>) -> Self {
+        crate::state::install_service_state(&*engine);
         Self {
             entry: crate::ServiceDefinition::new(engine),
             protocol: aws_smithy_schema_server::rpc::AwsJson11(),

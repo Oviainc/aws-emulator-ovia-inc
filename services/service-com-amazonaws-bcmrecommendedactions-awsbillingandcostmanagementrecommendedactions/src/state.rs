@@ -10,6 +10,13 @@
 //! recommendation generator) and is re-filled through the seeding seam below
 //! ([`RecommendedActionsStore::seed`]).
 //!
+//! That starting value is installed when the emulator BUILDS this service
+//! ([`install_service_state`], called from `EmulatedService::new`), not when a
+//! request first reaches the store: the engine builds a service's state on first
+//! access, so leaving it to the first access would make the inventory — and the
+//! instant stamped on each of its records — a function of when the first caller
+//! happened to read.
+//!
 //! Records are held in INSERTION ORDER: `ListRecommendedActions` is `@paginated`,
 //! and a stable order is what makes its `nextToken` resume exactly where the
 //! previous page stopped without duplicating or skipping a record.
@@ -226,6 +233,11 @@ fn computed(
 /// others. The inventory is fixed rather than derived from traffic: this emulator
 /// observes no billing usage to derive one from.
 fn computed_recommendations() -> Vec<StoredAction> {
+    // The instant the inventory was produced, which is the instant this store is
+    // built — the emulator's own start, because `install_service_state` builds it on
+    // the boot path. It is NOT a reader's clock: a record nobody changed keeps the
+    // timestamp it was computed with however long the emulator runs before it is
+    // first listed.
     let computed_at = iso8601(std::time::SystemTime::now());
     vec![
         computed(
@@ -263,9 +275,11 @@ pub struct RecommendedActionsStore {
 
 impl Default for RecommendedActionsStore {
     /// The inventory the service computed for this account — see
-    /// [`computed_recommendations`]. Part of the store's INITIAL value rather than
-    /// something a reader installs on first use, so `ListRecommendedActions` stays
-    /// a pure read: two callers see the same records whichever of them called first.
+    /// [`computed_recommendations`]. The store's INITIAL value, installed on the
+    /// emulator's boot path by [`install_service_state`] rather than by whichever
+    /// request reaches the store first, so `ListRecommendedActions` stays a pure
+    /// read: two callers see the same records whichever of them called first, and
+    /// neither one's clock decides what they report.
     fn default() -> Self {
         Self {
             actions: computed_recommendations(),
@@ -328,4 +342,27 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsBcmrecommendedactionsAwsbillingandcostmanagementrecommendedactionsState>)
+}
+
+/// Build this service's store NOW, so its initial value is fixed when the emulator
+/// is built rather than when a request first reads it.
+///
+/// The engine builds a service's state on first access, and this service binds one
+/// operation, a report. Left to first access, the initial value — including the
+/// instant [`computed_recommendations`] stamps on every record it produces — would
+/// be decided by whichever request got there first: an emulator listed an hour
+/// after it started would report its unchanged inventory as computed just now, and
+/// two emulators holding the identical inventory would report different instants.
+/// Called from `EmulatedService::new`, which the emulator runs once per service
+/// while it boots, before any request is served.
+///
+/// Idempotent and lock-free for later callers: the engine keeps the state it built
+/// first, so calling this again (or a reader that somehow got there first) observes
+/// that one store. A `None` answer — an engine this crate's store does not live in —
+/// leaves nothing to install, and the handler states it as a server error.
+pub fn install_service_state<Eng: Send + Sync + 'static>(engine: &Eng) {
+    // The handle itself is of no use here: resolving it is what builds the store,
+    // and the handlers reach it through `service_state` per request. So the handle
+    // is dropped deliberately, and a `None` needs no answer at this seam.
+    drop(service_state(engine));
 }

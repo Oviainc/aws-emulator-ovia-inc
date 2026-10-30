@@ -12,8 +12,9 @@
 //!   "returns a list of recommended actions"; it never writes, so two identical
 //!   calls answer identically and a later caller sees exactly what an earlier one
 //!   saw. The records come from the store, which already holds the inventory this
-//!   account has when the emulator starts
-//!   ([`crate::state::RecommendedActionsStore::default`]) and which a caller can
+//!   account has when the emulator starts — installed while the emulator boots
+//!   ([`crate::state::install_service_state`]), so no request of this operation,
+//!   not even the first, decides what any record reports — and which a caller can
 //!   re-fill through [`crate::state::RecommendedActionsStore::seed`] — the service
 //!   has no create operation because AWS itself computes the recommendations.
 //! * **Every account the caller can see.** `RecommendedAction$accountId` is "the
