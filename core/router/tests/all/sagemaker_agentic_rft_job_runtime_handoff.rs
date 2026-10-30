@@ -472,11 +472,16 @@ async fn a_client_samples_the_job_the_control_plane_minted_for_it() {
                 "case {case:?} turn {index}: expected an OpenAI-compatible \
                  {expected_object:?} object, got {completion}"
             );
+            // The envelope reports the JOB the call resolved to, as the shared directory
+            // identifies one (its `<category>/<name>` resource path), not the ARN string
+            // the request addressed that job through — so every turn of one rollout names
+            // one job.
+            let expected_model = format!("{category}/{name}");
             assert_eq!(
                 completion.get("model").and_then(Value::as_str),
-                Some(arn.as_str()),
-                "case {case:?} turn {index}: expected the turn to be served for the session \
-                 the request named ({arn}), got {completion}"
+                Some(expected_model.as_str()),
+                "case {case:?} turn {index}: expected the turn to be served for the job the \
+                 request resolved to ({expected_model}), got {completion}"
             );
             let prompt_tokens = completion
                 .pointer("/usage/prompt_tokens")
@@ -554,6 +559,10 @@ async fn the_minted_job_is_served_however_the_data_plane_addresses_it() {
         created.text()
     );
     let minted = created.str_field("JobArn");
+    // The ONE job every row below addresses, as the shared directory identifies one: the
+    // `<category>/<name>` resource path of its ARN, which is what the served envelope
+    // reports as the job that served the turn.
+    let expected_model = format!("{}/rollout-9", JOB_CATEGORIES[0]);
 
     // Rows differ along the partition, Region and account the sampling call addresses the
     // SAME created job through — including the empty Region the runtime's pattern admits
@@ -621,11 +630,14 @@ async fn the_minted_job_is_served_however_the_data_plane_addresses_it() {
                 served.text()
             );
             let completion = completion_of(&served, streamed);
+            // The job the call resolved to is the same job for every row, so the envelope
+            // reports the one job however the ARN addressed it: partition, Region and
+            // account are how an ARN is addressed, not which job it names.
             assert_eq!(
                 completion.get("model").and_then(Value::as_str),
-                Some(arn.as_str()),
+                Some(expected_model.as_str()),
                 "case {case:?} (streamed={streamed}): expected the turn to be served for the \
-                 session the request named, got {completion}"
+                 one job the create minted ({expected_model}), got {completion}"
             );
         }
     }

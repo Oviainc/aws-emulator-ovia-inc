@@ -25,7 +25,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // The shared harness: the wire-answer reduction and the job-directory setup every suite
 // of this crate drives (`tests/all/harness.rs`).
 use crate::harness::{
-    create_job_at_arn as create_job, job_arn, mounted_service, send, Reply,
+    create_job_at_arn as create_job, job_arn, mounted_service, send, served_completion, Reply,
     COMPLETE_ROLLOUT_PATH, JOB_ARN_HEADER, SAMPLE_PATH, SAMPLE_STREAM_PATH, TRAJECTORY_ID_HEADER,
     UPDATE_REWARD_PATH,
 };
@@ -298,12 +298,7 @@ async fn every_sampling_call_captures_a_turn_and_serves_what_it_recorded() {
                     text.starts_with("data: ") && text.ends_with("data: [DONE]\n\n"),
                     "case {case:?} turn {index}: expected server-sent-event framing, got {text:?}"
                 );
-                let first = text
-                    .strip_prefix("data: ")
-                    .and_then(|rest| rest.split("\n\n").next())
-                    .unwrap_or_default()
-                    .to_string();
-                let chunk: Value = serde_json::from_str(&first).unwrap_or(Value::Null);
+                let chunk: Value = served_completion(reply);
                 assert_eq!(
                     chunk["object"], "chat.completion.chunk",
                     "case {case:?} turn {index}: expected a chat.completion.chunk, got {:?}",

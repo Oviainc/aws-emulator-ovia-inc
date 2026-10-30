@@ -119,7 +119,12 @@ the only thing that makes a job addressable here, so its directory is the only p
 an ARN can be resolved. Which partition, Region and account an ARN was addressed
 through identifies no job, so a job the control plane created resolves however a
 caller addresses it, and a trajectory is keyed by the job that resolution identifies
-together with the request's `TrajectoryId` (`state::trajectory_key`).
+together with the request's `TrajectoryId` (`state::trajectory_key`). The same holds
+for what a served turn REPORTS: the per-job values of its completion envelope — the
+turn's `id` and the `model` that served it — are derived from the job that resolution
+identifies (`state::job_identity`) and never from the ARN string one call spelled it
+with, so every turn of one rollout, and every response body retained for it, names
+one job (`tests/all/served_turn_reports_the_job.rs`).
 
 A `JobArn` the member's own modelled constraints admit (`@length` 1..256 and the ARN
 `@pattern`, which allow any partition, region, account and job name) but that no

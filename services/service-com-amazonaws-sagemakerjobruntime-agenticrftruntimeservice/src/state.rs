@@ -245,12 +245,27 @@ pub type TrajectoryKey = (String, String);
 /// it ([`job_exists`]).
 #[must_use]
 pub fn trajectory_key(job_arn: &str, trajectory_id: &str) -> TrajectoryKey {
-    (
-        ::service_common::agentic_rft_jobs::job_identity_of_arn(job_arn)
-            .unwrap_or(job_arn)
-            .to_string(),
-        trajectory_id.to_string(),
-    )
+    (job_identity(job_arn).to_string(), trajectory_id.to_string())
+}
+
+/// WHICH JOB the `JobArn` of a call resolves to, as the shared directory identifies one:
+/// the `<category>/<name>` resource path of the ARN
+/// ([`::service_common::agentic_rft_jobs::job_identity_of_arn`]).
+///
+/// This crate's ONE reading of a request's `JobArn` as the job it addresses, so nothing
+/// this service keys, stores or REPORTS per job can be taken from the ARN string one call
+/// happened to spell that job with: the partition, the Region and the account an ARN was
+/// addressed through identify no job, so two calls of one rollout that differ only there
+/// address one job and must agree about it. Everything per-job derives from here —
+/// [`trajectory_key`] and [`Trajectory::new`] for where a turn is stored, [`completion_id`]
+/// and [`completion_envelope`] for what a served turn reports.
+///
+/// A value naming no job resource has no identity to key or report by and stands for
+/// itself; every operation refuses such a call before it reaches the store, because no job
+/// can resolve for it ([`job_exists`]).
+#[must_use]
+pub fn job_identity(job_arn: &str) -> &str {
+    ::service_common::agentic_rft_jobs::job_identity_of_arn(job_arn).unwrap_or(job_arn)
 }
 
 /// How this service reports a `(JobArn, TrajectoryId)` pair it holds no trajectory for.
@@ -873,6 +888,14 @@ pub fn emulated_turn_text(turn_number: usize, prompt_tokens: u64) -> String {
 /// this service's `Body` members are documented to carry: `id`, `object`,
 /// `created`, `model`, `choices[].message`, `choices[].finish_reason` and
 /// `usage`.
+///
+/// Both of the per-job values the envelope carries — the turn's `id` and the
+/// `model` that served it — are derived from the JOB the call resolves to
+/// ([`job_identity`]), never from the ARN string the request addressed that job
+/// through, so every retained turn of ONE trajectory reports one job, whichever
+/// partition, Region or account its own call spelled the ARN with. No language
+/// model runs here ([`emulated_turn_text`]), so the job the turn was routed to is
+/// what `model` reports.
 #[must_use]
 pub fn completion_envelope(
     job_arn: &str,
@@ -893,7 +916,7 @@ pub fn completion_envelope(
         "id": completion_id(job_arn, trajectory_id, index),
         "object": if streaming { "chat.completion.chunk" } else { "chat.completion" },
         "created": created_secs,
-        "model": job_arn,
+        "model": job_identity(job_arn),
         "choices": [{
             "index": 0,
             message_key: { "role": "assistant", "content": text },

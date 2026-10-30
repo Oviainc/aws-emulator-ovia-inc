@@ -7,9 +7,10 @@
 //!
 //! * how a wire answer is REDUCED to what a suite asserts on — the status, the bare
 //!   error code behind `x-amzn-errortype`, the `Message` member of a restJson1 error
-//!   document, and the raw body ([`Reply`]) — and how a request is DISPATCHED, including
-//!   the access key id it presents ([`send`], [`send_as`]), which is the one thing that
-//!   names the principal it speaks for;
+//!   document, the raw body ([`Reply`]) and the completion document an inference payload
+//!   carries in either framing ([`completion_document`], [`served_completion`]) — and how a
+//!   request is DISPATCHED, including the access key id it presents ([`send`], [`send_as`]),
+//!   which is the one thing that names the principal it speaks for;
 //! * how a job comes to EXIST for a test of this crate — this service's model binds no
 //!   operation that creates, lists or deletes a job, so the shared job directory the
 //!   SageMaker control plane writes is the only place an ARN can be resolved
@@ -200,6 +201,31 @@ pub async fn send_as(
         .body(bytes::Bytes::from(body))
         .expect("a well-formed test request");
     Reply::of(router.dispatch(request).await)
+}
+
+/// The completion document an inference payload carries, out of EITHER framing: a
+/// `Sample` payload IS the completion envelope, and a `SampleWithResponseStream` payload
+/// carries it in the first server-sent event of its stream. It reads the bytes alone, so a
+/// wire answer and a body RETAINED on a captured turn are reduced the same way.
+///
+/// [`Value::Null`] when the payload carries no completion at all — a refusal envelope, or
+/// anything else that is not one — so a suite asserts on what it read instead of on a
+/// parse that panicked.
+#[must_use]
+pub fn completion_document(body: &[u8]) -> Value {
+    let text = String::from_utf8_lossy(body);
+    let document = text
+        .strip_prefix("data: ")
+        .and_then(|rest| rest.split("\n\n").next())
+        .unwrap_or(text.as_ref());
+    serde_json::from_str(document).unwrap_or(Value::Null)
+}
+
+/// The completion document one sampling ANSWER served, in whichever framing its operation
+/// renders ([`completion_document`]).
+#[must_use]
+pub fn served_completion(reply: &Reply) -> Value {
+    completion_document(&reply.body)
 }
 
 /// A job ARN assembled from the parts the modelled

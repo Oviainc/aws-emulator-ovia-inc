@@ -34,8 +34,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // The shared harness: the wire-answer reduction and the job-directory setup every suite
 // of this crate drives (`tests/all/harness.rs`).
 use crate::harness::{
-    create_job_at_arn, job_arn, mounted_service, send, Reply, COMPLETE_ROLLOUT_PATH,
-    JOB_ARN_HEADER, SAMPLE_PATH, SAMPLE_STREAM_PATH, TRAJECTORY_ID_HEADER, UPDATE_REWARD_PATH,
+    create_job_at_arn, job_arn, mounted_service, send, served_completion, Reply,
+    COMPLETE_ROLLOUT_PATH, JOB_ARN_HEADER, SAMPLE_PATH, SAMPLE_STREAM_PATH, TRAJECTORY_ID_HEADER,
+    UPDATE_REWARD_PATH,
 };
 
 /// One `Sample` or `SampleWithResponseStream` call.
@@ -245,21 +246,9 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The `id` the served completion reports, out of either framing.
+/// The `id` the served completion reports, out of either framing (`harness::served_completion`).
 fn served_completion_id(reply: &Reply) -> String {
-    let document: Value = if reply.content_type.as_deref() == Some(state::EVENT_STREAM_CONTENT_TYPE)
-    {
-        let text = reply.text();
-        let first = text
-            .strip_prefix("data: ")
-            .and_then(|rest| rest.split("\n\n").next())
-            .unwrap_or_default()
-            .to_string();
-        serde_json::from_str(&first).unwrap_or(Value::Null)
-    } else {
-        reply.json()
-    };
-    document
+    served_completion(reply)
         .get("id")
         .and_then(Value::as_str)
         .unwrap_or_default()

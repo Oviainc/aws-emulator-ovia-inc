@@ -52,6 +52,9 @@ mod rollout_resolution_is_one_path;
 #[path = "all/sampling_path_is_shared.rs"]
 mod sampling_path_is_shared;
 
+#[path = "all/served_turn_reports_the_job.rs"]
+mod served_turn_reports_the_job;
+
 #[path = "all/shared_harness_is_one_path.rs"]
 mod shared_harness_is_one_path;
 
