@@ -15,12 +15,15 @@
 //! its request carries (replacing a submitted `Identities` map whole), the delete
 //! removes the record, and every read answers from that stored record. So the rows
 //! below vary what the rule generalises over — the status, the presence of a policy
-//! ARN, the shape of the identity map, the name's form, the namespace and the account —
-//! rather than re-running one recorded call.
+//! ARN, the shape of the identity map, the name's form, the namespace, the account and
+//! the number of callers racing to create — rather than re-running one recorded call.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
+
+use service_com_amazonaws_quicksight_quicksight_20180401::state as qs_state;
 
 use super::data_source_data_set_lifecycle::Harness;
 
@@ -831,4 +834,201 @@ async fn delete_removes_the_assignment_and_leaves_its_siblings() {
         "the re-created assignment is read through the namespace that created it, got \
          {status} with {body}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_creates_of_distinct_names_all_commit_and_read_back() {
+    // Creates are serialized by the store, so simultaneous creates of names nothing
+    // holds all commit: the number of callers racing is what this rule generalises
+    // over. Each row stands up its own emulator, so what it asserts about the store
+    // depends on that row's racers alone.
+    for (case, callers) in [
+        ("two-racers", 2usize),
+        ("six-racers", 6),
+        ("eleven-racers", 11),
+    ] {
+        let harness = Arc::new(Harness::new());
+        let mut racers = Vec::with_capacity(callers);
+        for index in 0..callers {
+            let handle = Arc::clone(&harness);
+            let name = format!("{case}-{index}");
+            racers.push(tokio::spawn(async move {
+                let (status, body) = create_assignment(
+                    &handle,
+                    ACCOUNT,
+                    DEFAULT_NAMESPACE,
+                    json!({
+                        "AssignmentName": name,
+                        "AssignmentStatus": "DRAFT",
+                        "PolicyArn": READ_ONLY_POLICY,
+                    }),
+                )
+                .await;
+                (name, status, body)
+            }));
+        }
+
+        let mut committed: Vec<(String, String)> = Vec::with_capacity(callers);
+        for racer in racers {
+            let (name, status, body) = racer.await.expect("a racing create panicked");
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the racer that named {name:?} expected 200, got {status} \
+                 with {body}"
+            );
+            let assignment_id = body["AssignmentId"]
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the racer that named {name:?} minted no AssignmentId: {body}")
+                })
+                .to_string();
+            committed.push((name, assignment_id));
+        }
+
+        let distinct: HashSet<&String> = committed.iter().map(|(_, id)| id).collect();
+        assert_eq!(
+            distinct.len(),
+            callers,
+            "case {case:?}: {callers} committed creates must hold {callers} distinct \
+             AssignmentIds, got {committed:?}"
+        );
+
+        // Every racer's assignment is readable, and reads back ITS record rather than
+        // another racer's.
+        for (name, assignment_id) in &committed {
+            let (status, body) =
+                describe_assignment(&harness, ACCOUNT, DEFAULT_NAMESPACE, name).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: {name:?} must read back, got {status} with {body}"
+            );
+            let assignment = &body["IAMPolicyAssignment"];
+            assert_eq!(
+                assignment["AssignmentId"],
+                json!(assignment_id),
+                "case {case:?}: {name:?} reads back another create's record: {body}"
+            );
+            assert_eq!(
+                assignment["AssignmentStatus"],
+                json!("DRAFT"),
+                "case {case:?}: {name:?} lost the submitted AssignmentStatus: {body}"
+            );
+            assert_eq!(
+                assignment["PolicyArn"],
+                json!(READ_ONLY_POLICY),
+                "case {case:?}: {name:?} lost the submitted PolicyArn: {body}"
+            );
+        }
+
+        // The account holds one record per committed create and nothing besides.
+        let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+        let held = state.lock().iam_policy_assignment_count(ACCOUNT);
+        assert_eq!(
+            held, callers,
+            "case {case:?}: the account must hold one record per committed create, it \
+             holds {held}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_creates_of_one_name_commit_exactly_one_assignment() {
+    // However many callers race for ONE name, the store is serialized: one of them
+    // commits and every other is refused the name, so the account holds exactly one
+    // assignment under it and the refused racers leave nothing behind. Each row stands
+    // up its own emulator, so the count it asserts is that row's alone.
+    for (case, callers, assignment_status) in [
+        ("two-racers", 2usize, "DRAFT"),
+        ("six-racers", 6, "ENABLED"),
+        ("eleven-racers", 11, "DISABLED"),
+    ] {
+        let harness = Arc::new(Harness::new());
+        let name = format!("contended-{case}");
+        let mut racers = Vec::with_capacity(callers);
+        for _ in 0..callers {
+            let handle = Arc::clone(&harness);
+            let name = name.clone();
+            racers.push(tokio::spawn(async move {
+                create_assignment(
+                    &handle,
+                    ACCOUNT,
+                    DEFAULT_NAMESPACE,
+                    json!({
+                        "AssignmentName": name,
+                        "AssignmentStatus": assignment_status,
+                        "PolicyArn": READ_ONLY_POLICY,
+                    }),
+                )
+                .await
+            }));
+        }
+
+        let mut winners: Vec<String> = Vec::new();
+        for racer in racers {
+            let (status, body) = racer.await.expect("a racing create panicked");
+            match status {
+                200 => winners.push(
+                    body["AssignmentId"]
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!("case {case:?}: the committing create minted no AssignmentId: {body}")
+                        })
+                        .to_string(),
+                ),
+                // The name was already claimed by the racer that reached the store
+                // first, so this one is refused the modelled conflict.
+                409 => assert_eq!(
+                    body["Message"],
+                    json!(format!("An assignment named {name} already exists.")),
+                    "case {case:?}: a refused racer must name the assignment: {body}"
+                ),
+                other => panic!(
+                    "case {case:?}: a racing create answered {other}, which is neither a \
+                     commit nor a modelled refusal: {body}"
+                ),
+            }
+        }
+        assert_eq!(
+            winners.len(),
+            1,
+            "case {case:?}: exactly one of {callers} racers for one name may commit, got \
+             {winners:?}"
+        );
+
+        // What the name holds is the committing racer's record, whole: the refused
+        // racers wrote nothing over it.
+        let (status, body) = describe_assignment(&harness, ACCOUNT, DEFAULT_NAMESPACE, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the committed assignment must read back, got {status} with {body}"
+        );
+        assert_eq!(
+            body["IAMPolicyAssignment"]["AssignmentId"],
+            json!(winners[0]),
+            "case {case:?}: the stored assignment must be the one that committed: {body}"
+        );
+        assert_eq!(
+            body["IAMPolicyAssignment"]["AssignmentStatus"],
+            json!(assignment_status),
+            "case {case:?}: the stored assignment lost the submitted AssignmentStatus: {body}"
+        );
+
+        let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+        let store = state.lock();
+        let record = store
+            .iam_policy_assignment(ACCOUNT, DEFAULT_NAMESPACE, &name)
+            .unwrap_or_else(|| panic!("case {case:?}: the committed assignment is not stored"));
+        assert_eq!(
+            record.assignment_id, winners[0],
+            "case {case:?}: the store holds a record no create reported"
+        );
+        // The refused racers left nothing behind: one commit, one record in the whole
+        // account.
+        let held = store.iam_policy_assignment_count(ACCOUNT);
+        assert_eq!(
+            held, 1,
+            "case {case:?}: {callers} racers for one name must leave the account holding \
+             one assignment, it holds {held}"
+        );
+    }
 }
