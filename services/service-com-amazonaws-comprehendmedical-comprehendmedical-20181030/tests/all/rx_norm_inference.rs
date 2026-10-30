@@ -326,12 +326,12 @@ async fn the_prescription_around_a_medication_is_reported_as_its_attributes() {
         (
             "Metformin 500 mg twice daily.",
             "Metformin",
-            vec![("STRENGTH", "500 mg"), ("FREQUENCY", "twice daily")],
+            vec![("DOSAGE", "500 mg"), ("FREQUENCY", "twice daily")],
         ),
         (
             "Metformin 500mg BID.",
             "Metformin",
-            vec![("STRENGTH", "500mg"), ("FREQUENCY", "BID")],
+            vec![("DOSAGE", "500mg"), ("FREQUENCY", "BID")],
         ),
         (
             "Take 1 tablet of Tylenol 500 mg by mouth every 8 hours for 10 days.",
@@ -382,7 +382,7 @@ async fn the_prescription_around_a_medication_is_reported_as_its_attributes() {
             "Prednisone 20 mg po daily x 5 days.",
             "Prednisone",
             vec![
-                ("STRENGTH", "20 mg"),
+                ("DOSAGE", "20 mg"),
                 ("ROUTE_OR_MODE", "po"),
                 ("FREQUENCY", "daily"),
                 ("DURATION", "x 5 days"),
@@ -430,11 +430,11 @@ async fn each_part_of_a_prescription_is_reported_on_the_medication_it_follows() 
     let expected: Vec<(&str, Vec<ExpectedAttribute>)> = vec![
         (
             "Metformin",
-            vec![("STRENGTH", "500 mg"), ("FREQUENCY", "BID")],
+            vec![("DOSAGE", "500 mg"), ("FREQUENCY", "BID")],
         ),
         (
             "lisinopril",
-            vec![("STRENGTH", "10 mg"), ("FREQUENCY", "daily")],
+            vec![("DOSAGE", "10 mg"), ("FREQUENCY", "daily")],
         ),
     ];
     for (mention, attributes) in expected {
@@ -483,10 +483,13 @@ async fn context_cues_license_the_traits_this_ontology_models() {
             vec!["NEGATION"],
         ),
         (
-            "History of amiodarone and warfarin.",
+            "History of warfarin therapy.",
             "warfarin",
             vec!["PAST_HISTORY"],
         ),
+        // A history cue reaches the mention it introduces, so one with other content
+        // written between it and the mention does not scope it.
+        ("History of amiodarone and warfarin.", "warfarin", vec![]),
         (
             "Previously on lisinopril.",
             "lisinopril",

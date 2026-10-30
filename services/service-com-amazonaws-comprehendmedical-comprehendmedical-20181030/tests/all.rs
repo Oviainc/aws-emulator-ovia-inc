@@ -27,3 +27,5 @@ mod rx_norm_inference;
 mod snomedct_inference;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/synchronous_inference_shape.rs"]
+mod synchronous_inference_shape;

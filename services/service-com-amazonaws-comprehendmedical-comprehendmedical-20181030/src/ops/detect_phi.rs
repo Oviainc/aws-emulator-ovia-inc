@@ -5,7 +5,8 @@
 //! IMPLEMENTED. The protected-health-information pass runs in-process over the
 //! submitted clinical text: every entity it reports is a stretch of THAT text, placed
 //! either by the written form an identifier class takes (an e-mail address, a telephone
-//! number, a date, a street address, a social-security number) or by the words standing
+//! number, a date, a street address, a social-security number), by the designator a named
+//! organization is written with (a hospital, a clinic, a school), or by the words standing
 //! around an otherwise ambiguous value (a bare number after an age or record-number cue,
 //! a capitalized word after a personal title). Nothing is matched out of a particular
 //! request, and no value is carried from one call to the next.
@@ -98,8 +99,8 @@ use super::types::*;
 use std::sync::OnceLock;
 
 use crate::ops::infer_icd10_cm::{
-    character_offset, character_starts, lexicon_matches, term_confidence, tokenize, Span, Token,
-    WEIGHT_CUE, WEIGHT_PATTERN,
+    character_offset, character_starts, lexicon_matches, span_confidence, term_confidence, tokenize,
+    Span, Token, FIRST_ID, WEIGHT_CUE, WEIGHT_PATTERN,
 };
 
 /// The version this emulator reports for the model behind the PHI pass.
@@ -167,15 +168,20 @@ enum Evidence {
 }
 
 impl Evidence {
-    /// The confidence a span of this evidence class carries, in (0, 1]. A closed written
-    /// form and a context cue are weighted as every other pass of this crate weights
-    /// them; a lexicon match is weighted by how many tokens its written form spans.
+    /// The confidence a span of this evidence class carries, in (0, 1].
+    ///
+    /// The class weight says how the span was established; the confidence this reports is
+    /// that weight carried by the span's OWN written form, so two spans established the
+    /// same way but written out to different extents are reported with different
+    /// confidences rather than one constant for the whole class. A lexicon match is
+    /// weighted by how many tokens its written form spans before that.
     fn score(self, matched: &str) -> f32 {
-        match self {
+        let base = match self {
             Self::Form => WEIGHT_PATTERN,
             Self::Context => WEIGHT_CUE,
             Self::Lexicon => term_confidence(matched.split_whitespace().count()),
-        }
+        };
+        span_confidence(base, matched)
     }
 }
 
@@ -676,6 +682,38 @@ const NOT_A_NAME: &[&str] = &[
     "room",
     "visit",
     "vitals",
+];
+
+/// The words a NAMED organization ends with: the health-care facilities a note names, and
+/// the institutions it names a person's employer or school by.
+///
+/// Source: the designator a facility's or an organization's proper name is written with.
+/// A run of capitalized words ending in one of these NAMES that organization — "Boston
+/// General Hospital" — where the designator standing alone is just the common noun
+/// ("hospital course"), which is why one capitalized word in front of it is required.
+const ORGANIZATION_DESIGNATORS: &[&str] = &[
+    "hospital",
+    "hospitals",
+    "clinic",
+    "clinics",
+    "center",
+    "centers",
+    "centre",
+    "infirmary",
+    "institute",
+    "dispensary",
+    "laboratory",
+    "laboratories",
+    "pharmacy",
+    "university",
+    "college",
+    "school",
+    "foundation",
+    "corporation",
+    "incorporated",
+    "inc",
+    "llc",
+    "ltd",
 ];
 
 /// The longest written form the occupation lexicon holds, in tokens, built once.
@@ -1499,6 +1537,39 @@ fn lexicon_name_spans(text: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Every organization a note names: a run of capitalized words whose last word is an
+/// organization designator, and which carries at least one capitalized word in front of
+/// that designator — the words that make the designator a proper name.
+///
+/// A named facility is a location identifier of the document, which is the identifier
+/// class the modelled `ADDRESS` sub-type reports, so one is reported wherever it is
+/// written rather than only where a street address stands.
+fn organization_spans(text: &str, tokens: &[Token]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for index in 0..tokens.len() {
+        if !ORGANIZATION_DESIGNATORS.contains(&tokens[index].lower.as_str())
+            || !is_capitalized(text, &tokens[index])
+        {
+            continue;
+        }
+        let mut start = index;
+        while start > 0 {
+            let previous = start - 1;
+            if !is_word(&tokens[previous])
+                || !is_capitalized(text, &tokens[previous])
+                || !matches!(between(text, tokens[previous].end, tokens[start].start), " " | "-")
+            {
+                break;
+            }
+            start = previous;
+        }
+        if start < index {
+            spans.push((tokens[start].start, tokens[index].end));
+        }
+    }
+    spans
+}
+
 /// Every occupation the clause states as the person's own.
 fn profession_spans(tokens: &[Token]) -> Vec<(usize, usize)> {
     let mut covered = vec![false; tokens.len()];
@@ -1553,7 +1624,8 @@ fn states_occupation(tokens: &[Token], span: &Span) -> bool {
 /// and the strongest evidence for it is what reports it.
 ///
 /// The `Id` member is "a monotonically increasing id unique within this response", so
-/// each entity takes the next one in writing order. A PHI entity reports no attribute
+/// each entity takes the next one of this document's sequence in writing order, counted
+/// from [`FIRST_ID`]. A PHI entity reports no attribute
 /// and no trait: the identifier classes carry no modifier of their own, which is what
 /// the operation's own documented output — the entity text, its category, where it
 /// begins and ends, and the confidence — says it reports.
@@ -1592,6 +1664,11 @@ fn detect_phi(text: &str) -> Vec<Entity> {
         ),
         (age_spans(text, &tokens), TYPE_AGE, Evidence::Context),
         (
+            organization_spans(text, &tokens),
+            TYPE_ADDRESS,
+            Evidence::Context,
+        ),
+        (
             titled_name_spans(text, &tokens),
             TYPE_NAME,
             Evidence::Context,
@@ -1624,7 +1701,11 @@ fn detect_phi(text: &str) -> Vec<Entity> {
         .into_iter()
         .enumerate()
         .map(|(index, mention)| Entity {
-            id: Some(i32::try_from(index).unwrap_or(i32::MAX)),
+            id: Some(
+                i32::try_from(index)
+                    .unwrap_or(i32::MAX)
+                    .saturating_add(FIRST_ID),
+            ),
             begin_offset: Some(character_offset(mention.start)),
             end_offset: Some(character_offset(mention.end)),
             score: Some(mention.score),

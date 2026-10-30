@@ -106,10 +106,10 @@ use std::sync::OnceLock;
 // The generic clinical-text pass, stated once for every ontology-linking operation of
 // this service. See the module docs of `infer_icd10_cm` for why it lives there.
 use crate::ops::infer_icd10_cm::{
-    character_offset, character_starts, cue_precedes, cue_trait_names, first_family_cues, is_count,
-    lexicon_matches, term_confidence, tokenize, Span, Token, CONCEPT_CANDIDATE_LIMIT,
-    CONCEPT_RANK_DECAY, RELATIONSHIP_DISTANCE_PENALTY, WEIGHT_CUE, WEIGHT_MODIFIER, WEIGHT_PATTERN,
-    WEIGHT_RELATIONSHIP,
+    character_offset, character_starts, cue_governs, cue_trait_names, first_family_cues, is_count,
+    lexicon_matches, span_confidence, term_confidence, tokenize, Span, Token,
+    CONCEPT_CANDIDATE_LIMIT, CONCEPT_RANK_DECAY, FIRST_ID, RELATIONSHIP_DISTANCE_PENALTY,
+    WEIGHT_CUE, WEIGHT_MODIFIER, WEIGHT_PATTERN, WEIGHT_RELATIONSHIP,
 };
 // Two more rules of that pass that the SNOMED CT operation states: the distance between
 // two spans, and the cue vocabulary behind the `PAST_HISTORY` trait that both ontologies'
@@ -594,16 +594,21 @@ fn is_sig_unit(word: &str) -> bool {
 /// modelled attribute type reports it.
 ///
 /// An amount measured per unit of TIME is how fast the medication is given, which is what
-/// `RATE` reports; any other measured amount is the medication's own strength. A count of
-/// the units a dose is counted in is neither — it is the amount taken at once, which
-/// [`dose`] reports — so this rule answers `None` for it unless a time unit makes it a
-/// rate ("20 units" against "1000 units/hr").
+/// `RATE` reports. An amount measured PER another unit is a concentration — how much
+/// active ingredient each unit of the preparation holds — which is what `STRENGTH`
+/// reports. A bare measured amount is the amount of medication the prescription orders,
+/// which is what `DOSAGE` reports; the third element of the answer marks it, because a
+/// prescription that ALSO states the amount taken at once ("1 tablet") is stating the
+/// strength of each of those units instead, which [`measured_patterns`] settles once it
+/// has read the whole clause. A count of the units a dose is counted in is none of the
+/// three — it is the amount taken at once, which [`dose`] reports — so this rule answers
+/// `None` for it unless a time unit makes it a rate ("20 units" against "1000 units/hr").
 fn measured_amount(
     text: &str,
     tokens: &[Token],
     covered: &[bool],
     index: usize,
-) -> Option<(Range<usize>, &'static str)> {
+) -> Option<(Range<usize>, &'static str, bool)> {
     let clause = tokens[index].clause;
     let (mut end, first_unit) = match split_number_unit(tokens[index].lower.as_str()) {
         // "500mg": the number and its unit written as one run.
@@ -621,6 +626,7 @@ fn measured_amount(
         }
     };
     let mut unit = first_unit;
+    let mut chained = false;
     loop {
         // "mg/mL": a single separator in the text joins two runs of one written unit.
         if open(tokens, covered, end, clause)
@@ -629,6 +635,7 @@ fn measured_amount(
         {
             unit = tokens[end].lower.as_str();
             end += 1;
+            chained = true;
             continue;
         }
         // "100 mL per hour": the same per-unit chain written out in words.
@@ -639,16 +646,21 @@ fn measured_amount(
         {
             unit = tokens[end + 1].lower.as_str();
             end += 2;
+            chained = true;
             continue;
         }
         break;
     }
     if SIG_TIME_UNITS.contains(&unit) {
-        return Some((index..end, ATTRIBUTE_RATE));
+        return Some((index..end, ATTRIBUTE_RATE, false));
     }
-    STRENGTH_UNITS
-        .contains(&first_unit)
-        .then_some((index..end, ATTRIBUTE_STRENGTH))
+    if !STRENGTH_UNITS.contains(&first_unit) {
+        return None;
+    }
+    if chained {
+        return Some((index..end, ATTRIBUTE_STRENGTH, false));
+    }
+    Some((index..end, ATTRIBUTE_DOSAGE, true))
 }
 
 /// How long the medication is taken, written at `index`: a count of a time unit, with or
@@ -718,14 +730,24 @@ fn dose(tokens: &[Token], covered: &[bool], index: usize) -> Option<Range<usize>
 ///
 /// The tokens of a match are marked covered, so the vocabulary pass never reads one of
 /// them again, and the rules are tried most-specific-first at each token: a count of a
-/// time unit is a duration rather than a strength, and the count of an interval belongs to
+/// time unit is a duration rather than an amount, and the count of an interval belongs to
 /// the interval rather than to a duration of its own.
+///
+/// A bare measured amount is settled only once the whole text has been read: it is the
+/// amount of medication ordered — the modelled `DOSAGE` — unless its own clause ALSO
+/// states the amount taken at once in dose units, in which case the measured amount is
+/// how much active ingredient each of those units holds, which is the modelled
+/// `STRENGTH`.
 fn measured_patterns(
     text: &str,
     tokens: &[Token],
     covered: &mut [bool],
 ) -> Vec<(Span, &'static str, f32)> {
-    let mut placed = Vec::new();
+    let mut placed: Vec<(Span, &'static str, f32)> = Vec::new();
+    // Where in `placed` each bare measured amount sits, and which clauses state the
+    // amount taken at once in dose units.
+    let mut bare_amounts: Vec<(usize, usize)> = Vec::new();
+    let mut counted_dose_clauses: Vec<usize> = Vec::new();
     let mut index = 0usize;
     while index < tokens.len() {
         if covered[index] {
@@ -733,12 +755,20 @@ fn measured_patterns(
             continue;
         }
         let found = duration(tokens, covered, index)
-            .map(|range| (range, ATTRIBUTE_DURATION))
-            .or_else(|| interval(tokens, covered, index).map(|range| (range, ATTRIBUTE_FREQUENCY)))
+            .map(|range| (range, ATTRIBUTE_DURATION, false))
+            .or_else(|| {
+                interval(tokens, covered, index).map(|range| (range, ATTRIBUTE_FREQUENCY, false))
+            })
             .or_else(|| measured_amount(text, tokens, covered, index))
-            .or_else(|| dose(tokens, covered, index).map(|range| (range, ATTRIBUTE_DOSAGE)));
+            .or_else(|| dose(tokens, covered, index).map(|range| (range, ATTRIBUTE_DOSAGE, false)));
         match found {
-            Some((range, attribute_type)) => {
+            Some((range, attribute_type, bare_amount)) => {
+                let clause = tokens[range.start].clause;
+                if bare_amount {
+                    bare_amounts.push((placed.len(), clause));
+                } else if attribute_type == ATTRIBUTE_DOSAGE {
+                    counted_dose_clauses.push(clause);
+                }
                 for taken in &mut covered[range.clone()] {
                     *taken = true;
                 }
@@ -746,6 +776,11 @@ fn measured_patterns(
                 placed.push((Span::of(tokens, range), attribute_type, WEIGHT_PATTERN));
             }
             None => index += 1,
+        }
+    }
+    for (position, clause) in bare_amounts {
+        if counted_dose_clauses.contains(&clause) {
+            placed[position].1 = ATTRIBUTE_STRENGTH;
         }
     }
     placed
@@ -792,23 +827,21 @@ fn nearest_mention(tokens: &[Token], entities: &[Entity], span: &Span) -> Option
     nearest(true).or_else(|| nearest(false))
 }
 
-/// The traits the words around `span` license, as the modelled RxNorm trait shape.
+/// The traits a medication MENTION carries, as the modelled RxNorm trait shape.
 ///
 /// The shared context cues answer with the trait names of the clinical-text pass as a
 /// whole, of which this ontology's `RxNormTraitName` enum holds only `NEGATION`: a
 /// medication a relative takes, or one named as a hypothetical, is not a trait this
 /// operation reports, so a name outside the enum is dropped rather than invented. A
-/// medication named as something the patient used to take carries `PAST_HISTORY`.
-fn span_traits(
+/// medication the text names as one the patient used to take carries `PAST_HISTORY`,
+/// which is read only where the history cue directly governs the mention it introduces.
+fn entity_traits(
     tokens: &[Token],
     span: &Span,
     family_cues: &HashMap<usize, usize>,
 ) -> Vec<RxNormTrait> {
-    let mut names: Vec<&'static str> = cue_trait_names(tokens, span, family_cues)
-        .into_iter()
-        .filter(|name| RX_NORM_TRAIT_NAME_VALUES.contains(name))
-        .collect();
-    if cue_precedes(tokens, span, PAST_HISTORY_CUES) {
+    let mut names: Vec<&'static str> = modelled_trait_names(tokens, span, family_cues);
+    if cue_governs(tokens, span, PAST_HISTORY_CUES) {
         names.push(TRAIT_PAST_HISTORY);
     }
     names
@@ -817,6 +850,37 @@ fn span_traits(
             name: Some(name.to_string()),
             score: Some(WEIGHT_CUE),
         })
+        .collect()
+}
+
+/// The traits one part of a prescription carries: "InferRxNorm recognizes the trait
+/// `NEGATION` for attributes, i.e. that the patient is not taking a specific dose or form
+/// of a medication", so a cue that places the MEDICATION in the patient's history is not
+/// a trait of the dose written inside the prescription.
+fn attribute_traits(
+    tokens: &[Token],
+    span: &Span,
+    family_cues: &HashMap<usize, usize>,
+) -> Vec<RxNormTrait> {
+    modelled_trait_names(tokens, span, family_cues)
+        .into_iter()
+        .map(|name| RxNormTrait {
+            name: Some(name.to_string()),
+            score: Some(WEIGHT_CUE),
+        })
+        .collect()
+}
+
+/// The names the shared context cues license at `span` that this ontology's trait enum
+/// holds.
+fn modelled_trait_names(
+    tokens: &[Token],
+    span: &Span,
+    family_cues: &HashMap<usize, usize>,
+) -> Vec<&'static str> {
+    cue_trait_names(tokens, span, family_cues)
+        .into_iter()
+        .filter(|name| RX_NORM_TRAIT_NAME_VALUES.contains(name))
         .collect()
 }
 
@@ -899,8 +963,9 @@ pub fn infer_rx_norm(text: &str) -> Vec<RxNormEntity> {
     let starts = character_starts(text);
 
     // `Id` is a monotonically increasing id unique within this response: every entity and
-    // every attribute takes the next one, in the order they are written.
-    let next_id = std::cell::Cell::new(0i32);
+    // every attribute takes the next one of ONE document-wide sequence, in the order they
+    // are written.
+    let next_id = std::cell::Cell::new(FIRST_ID);
     let mint_id = || {
         let id = next_id.get();
         next_id.set(id + 1);
@@ -908,9 +973,13 @@ pub fn infer_rx_norm(text: &str) -> Vec<RxNormEntity> {
     };
     let mut reported = Vec::with_capacity(entities.len());
     for entity in entities {
-        let score = term_confidence(entity.medication.term.split(' ').count());
+        let written = &text[entity.span.start..entity.span.end];
+        let score = span_confidence(
+            term_confidence(entity.medication.term.split(' ').count()),
+            written,
+        );
         let id = mint_id();
-        let traits = span_traits(&tokens, &entity.span, &family_cues);
+        let traits = entity_traits(&tokens, &entity.span, &family_cues);
         let mut attributes = entity.attributes;
         attributes.sort_by_key(|attribute| attribute.span.start);
         let attributes = attributes
@@ -920,21 +989,22 @@ pub fn infer_rx_norm(text: &str) -> Vec<RxNormEntity> {
                 let relationship_score = (WEIGHT_RELATIONSHIP
                     - RELATIONSHIP_DISTANCE_PENALTY * attribute.distance as f32)
                     .clamp(RELATIONSHIP_SCORE_FLOOR, WEIGHT_RELATIONSHIP);
+                let part = &text[attribute.span.start..attribute.span.end];
                 RxNormAttribute {
                     r#type: Some(attribute.attribute_type.to_string()),
-                    score: Some(attribute.score),
+                    score: Some(span_confidence(attribute.score, part)),
                     relationship_score: Some(relationship_score),
                     id: Some(attribute_id),
                     begin_offset: Some(character_offset(&starts, attribute.span.start)),
                     end_offset: Some(character_offset(&starts, attribute.span.end)),
-                    text: Some(text[attribute.span.start..attribute.span.end].to_string()),
-                    traits: Some(span_traits(&tokens, &attribute.span, &family_cues)),
+                    text: Some(part.to_string()),
+                    traits: Some(attribute_traits(&tokens, &attribute.span, &family_cues)),
                 }
             })
             .collect();
         reported.push(RxNormEntity {
             id: Some(id),
-            text: Some(text[entity.span.start..entity.span.end].to_string()),
+            text: Some(written.to_string()),
             category: Some(CATEGORY_MEDICATION.to_string()),
             r#type: Some(entity.medication.entity_type.to_string()),
             score: Some(score),

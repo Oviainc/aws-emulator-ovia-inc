@@ -108,10 +108,11 @@ use std::sync::OnceLock;
 // The generic clinical-text pass, stated once for every ontology-linking operation of
 // this service. See the module docs of `infer_icd10_cm` for why it lives there.
 use crate::ops::infer_icd10_cm::{
-    character_offset, character_starts, cue_precedes, cue_trait_names, first_family_cues, is_count,
-    lexicon_matches, term_confidence, tokenize, Span, Token, ACUITY_MODIFIERS,
-    ATTRIBUTE_WINDOW_TOKENS, CONCEPT_CANDIDATE_LIMIT, CONCEPT_RANK_DECAY, DIRECTION_MODIFIERS,
-    QUALITY_MODIFIERS, RELATIONSHIP_DISTANCE_PENALTY, WEIGHT_CUE, WEIGHT_MODIFIER, WEIGHT_PATTERN,
+    character_offset, character_starts, cue_governs, cue_trait_names, first_family_cues, is_count,
+    lexicon_matches, span_confidence, split_leading, subtype_qualifier_tokens, term_confidence,
+    tokenize, Span, Token, ACUITY_MODIFIERS, ATTRIBUTE_WINDOW_TOKENS, CONCEPT_CANDIDATE_LIMIT,
+    CONCEPT_RANK_DECAY, DIRECTION_MODIFIERS, FIRST_ID, QUALITY_MODIFIERS,
+    RELATIONSHIP_DISTANCE_PENALTY, WEIGHT_CUE, WEIGHT_MODIFIER, WEIGHT_PATTERN,
     WEIGHT_RELATIONSHIP,
 };
 
@@ -152,7 +153,14 @@ const ATTRIBUTE_SYSTEM_ORGAN_SITE: &str = "SYSTEM_ORGAN_SITE";
 const ATTRIBUTE_TEST_VALUE: &str = "TEST_VALUE";
 const ATTRIBUTE_TEST_UNIT: &str = "TEST_UNIT";
 
-/// One SNOMED CT concept: the concept id and the description the ontology gives it.
+/// One SNOMED CT concept: the concept id and the FULLY SPECIFIED NAME the ontology gives
+/// it.
+///
+/// A SNOMED CT concept's fully specified name is its term followed by the semantic tag of
+/// the hierarchy it belongs to, in parentheses — "Diabetes mellitus type 2 (disorder)" —
+/// and that whole string is the name a terminology release carries, so it is what the
+/// modelled `SNOMEDCTConcept$Description` reports: a description without the tag matches
+/// no row of the release.
 #[derive(Debug)]
 struct Concept {
     code: &'static str,
@@ -181,664 +189,632 @@ struct Term {
     concepts: &'static [Concept],
 }
 
-// The candidate lists. Source: the concept ids and descriptions of the SNOMED CT release
-// named by `DETAILS_*` above, which is what the modelled `SNOMEDCTConcept` reports. Each
-// list is ordered most-likely-first: the concept a bare mention names, then the nearby
-// concepts the same mention could be refined to. Lists are shared by the synonyms and
-// abbreviations that name one concept.
+// The candidate lists. Source: the concept ids and FULLY SPECIFIED NAMES of the SNOMED CT
+// release named by `DETAILS_*` above, which is what the modelled `SNOMEDCTConcept`
+// reports. Each list is ordered most-likely-first: the concept a bare mention names, then
+// the nearby concepts the same mention could be refined to. Lists are shared by the
+// synonyms and abbreviations that name one concept.
 
 const CONCEPTS_DIABETES: &[Concept] = &[
     Concept {
         code: "73211009",
-        description: "Diabetes mellitus",
+        description: "Diabetes mellitus (disorder)",
     },
     Concept {
         code: "44054006",
-        description: "Diabetes mellitus type 2",
+        description: "Diabetes mellitus type 2 (disorder)",
     },
     Concept {
         code: "46635009",
-        description: "Diabetes mellitus type 1",
+        description: "Diabetes mellitus type 1 (disorder)",
     },
 ];
 
 const CONCEPTS_DIABETES_TYPE_2: &[Concept] = &[
     Concept {
         code: "44054006",
-        description: "Diabetes mellitus type 2",
+        description: "Diabetes mellitus type 2 (disorder)",
     },
     Concept {
         code: "73211009",
-        description: "Diabetes mellitus",
+        description: "Diabetes mellitus (disorder)",
     },
 ];
 
 const CONCEPTS_DIABETES_TYPE_1: &[Concept] = &[
     Concept {
         code: "46635009",
-        description: "Diabetes mellitus type 1",
+        description: "Diabetes mellitus type 1 (disorder)",
     },
     Concept {
         code: "73211009",
-        description: "Diabetes mellitus",
+        description: "Diabetes mellitus (disorder)",
     },
 ];
 
 const CONCEPTS_KETOACIDOSIS: &[Concept] = &[Concept {
     code: "420422005",
-    description: "Ketoacidosis in diabetes mellitus",
+    description: "Ketoacidosis in diabetes mellitus (disorder)",
 }];
 
 const CONCEPTS_HYPERTENSION: &[Concept] = &[
     Concept {
         code: "38341003",
-        description: "Hypertensive disorder, systemic arterial",
+        description: "Hypertensive disorder, systemic arterial (disorder)",
     },
     Concept {
         code: "59621000",
-        description: "Essential hypertension",
+        description: "Essential hypertension (disorder)",
     },
 ];
 
 const CONCEPTS_HYPERLIPIDEMIA: &[Concept] = &[Concept {
     code: "55822004",
-    description: "Hyperlipidemia",
+    description: "Hyperlipidemia (disorder)",
 }];
 
 const CONCEPTS_MYOCARDIAL_INFARCTION: &[Concept] = &[
     Concept {
         code: "22298006",
-        description: "Myocardial infarction",
+        description: "Myocardial infarction (disorder)",
     },
     Concept {
         code: "57054005",
-        description: "Acute myocardial infarction",
+        description: "Acute myocardial infarction (disorder)",
     },
 ];
 
 const CONCEPTS_ATRIAL_FIBRILLATION: &[Concept] = &[Concept {
     code: "49436004",
-    description: "Atrial fibrillation",
+    description: "Atrial fibrillation (disorder)",
 }];
 
 const CONCEPTS_HEART_FAILURE: &[Concept] = &[
     Concept {
         code: "84114007",
-        description: "Heart failure",
+        description: "Heart failure (disorder)",
     },
     Concept {
         code: "42343007",
-        description: "Congestive heart failure",
+        description: "Congestive heart failure (disorder)",
     },
 ];
 
 const CONCEPTS_CONGESTIVE_HEART_FAILURE: &[Concept] = &[
     Concept {
         code: "42343007",
-        description: "Congestive heart failure",
+        description: "Congestive heart failure (disorder)",
     },
     Concept {
         code: "84114007",
-        description: "Heart failure",
+        description: "Heart failure (disorder)",
     },
 ];
 
 const CONCEPTS_CORONARY_ARTERY_DISEASE: &[Concept] = &[Concept {
     code: "53741008",
-    description: "Coronary arteriosclerosis",
+    description: "Coronary arteriosclerosis (disorder)",
 }];
 
 const CONCEPTS_STROKE: &[Concept] = &[Concept {
     code: "230690007",
-    description: "Cerebrovascular accident",
+    description: "Cerebrovascular accident (disorder)",
 }];
 
 const CONCEPTS_ASTHMA: &[Concept] = &[Concept {
     code: "195967001",
-    description: "Asthma",
+    description: "Asthma (disorder)",
 }];
 
 const CONCEPTS_COPD: &[Concept] = &[Concept {
     code: "13645005",
-    description: "Chronic obstructive lung disease",
+    description: "Chronic obstructive lung disease (disorder)",
 }];
 
 const CONCEPTS_PNEUMONIA: &[Concept] = &[Concept {
     code: "233604007",
-    description: "Pneumonia",
+    description: "Pneumonia (disorder)",
 }];
 
 const CONCEPTS_BRONCHITIS: &[Concept] = &[Concept {
     code: "32398004",
-    description: "Bronchitis",
+    description: "Bronchitis (disorder)",
 }];
 
 const CONCEPTS_INFLUENZA: &[Concept] = &[Concept {
     code: "6142004",
-    description: "Influenza",
+    description: "Influenza (disorder)",
 }];
 
 const CONCEPTS_COUGH: &[Concept] = &[Concept {
     code: "49727002",
-    description: "Cough",
+    description: "Cough (finding)",
 }];
 
 const CONCEPTS_DYSPNEA: &[Concept] = &[Concept {
     code: "267036007",
-    description: "Dyspnea",
+    description: "Dyspnea (finding)",
 }];
 
 const CONCEPTS_WHEEZING: &[Concept] = &[Concept {
     code: "56018004",
-    description: "Wheezing",
+    description: "Wheezing (finding)",
 }];
 
 const CONCEPTS_FEVER: &[Concept] = &[Concept {
     code: "386661006",
-    description: "Fever",
+    description: "Fever (finding)",
 }];
 
 const CONCEPTS_CHILLS: &[Concept] = &[Concept {
     code: "43724002",
-    description: "Chill",
+    description: "Chill (finding)",
 }];
 
 const CONCEPTS_FATIGUE: &[Concept] = &[Concept {
     code: "84229001",
-    description: "Fatigue",
+    description: "Fatigue (finding)",
 }];
 
 const CONCEPTS_HEADACHE: &[Concept] = &[Concept {
     code: "25064002",
-    description: "Headache",
+    description: "Headache (finding)",
 }];
 
 const CONCEPTS_MIGRAINE: &[Concept] = &[Concept {
     code: "37796009",
-    description: "Migraine",
+    description: "Migraine (disorder)",
 }];
 
 const CONCEPTS_NAUSEA: &[Concept] = &[Concept {
     code: "422587007",
-    description: "Nausea",
+    description: "Nausea (finding)",
 }];
 
 const CONCEPTS_VOMITING: &[Concept] = &[Concept {
     code: "422400008",
-    description: "Vomiting",
+    description: "Vomiting (disorder)",
 }];
 
 const CONCEPTS_DIARRHEA: &[Concept] = &[Concept {
     code: "62315008",
-    description: "Diarrhea",
+    description: "Diarrhea (finding)",
 }];
 
 const CONCEPTS_CONSTIPATION: &[Concept] = &[Concept {
     code: "14760008",
-    description: "Constipation",
+    description: "Constipation (finding)",
 }];
 
 const CONCEPTS_ABDOMINAL_PAIN: &[Concept] = &[Concept {
     code: "21522001",
-    description: "Abdominal pain",
+    description: "Abdominal pain (finding)",
 }];
 
 const CONCEPTS_CHEST_PAIN: &[Concept] = &[Concept {
     code: "29857009",
-    description: "Chest pain",
+    description: "Chest pain (finding)",
 }];
 
 const CONCEPTS_BACK_PAIN: &[Concept] = &[Concept {
     code: "161891005",
-    description: "Backache",
+    description: "Backache (finding)",
 }];
 
 const CONCEPTS_LOW_BACK_PAIN: &[Concept] = &[Concept {
     code: "279039007",
-    description: "Low back pain",
+    description: "Low back pain (finding)",
 }];
 
 const CONCEPTS_PAIN: &[Concept] = &[Concept {
     code: "22253000",
-    description: "Pain",
+    description: "Pain (finding)",
 }];
 
 const CONCEPTS_DIZZINESS: &[Concept] = &[Concept {
     code: "404640003",
-    description: "Dizziness",
+    description: "Dizziness (finding)",
 }];
 
 const CONCEPTS_SYNCOPE: &[Concept] = &[Concept {
     code: "271594007",
-    description: "Syncope",
+    description: "Syncope (disorder)",
 }];
 
 const CONCEPTS_RASH: &[Concept] = &[Concept {
     code: "271807003",
-    description: "Eruption of skin",
+    description: "Eruption of skin (disorder)",
 }];
 
 const CONCEPTS_WEIGHT_LOSS: &[Concept] = &[Concept {
     code: "89362005",
-    description: "Weight loss finding",
+    description: "Weight loss finding (finding)",
 }];
 
 const CONCEPTS_EDEMA: &[Concept] = &[Concept {
     code: "267038008",
-    description: "Edema",
+    description: "Edema (finding)",
 }];
 
 const CONCEPTS_SEIZURE: &[Concept] = &[Concept {
     code: "91175000",
-    description: "Seizure",
+    description: "Seizure (finding)",
 }];
 
 const CONCEPTS_SORE_THROAT: &[Concept] = &[
     Concept {
         code: "267102003",
-        description: "Sore throat symptom",
+        description: "Sore throat symptom (finding)",
     },
     Concept {
         code: "405737000",
-        description: "Pharyngitis",
+        description: "Pharyngitis (disorder)",
     },
 ];
 
 const CONCEPTS_URINARY_TRACT_INFECTION: &[Concept] = &[Concept {
     code: "68566005",
-    description: "Urinary tract infectious disease",
+    description: "Urinary tract infectious disease (disorder)",
 }];
 
 const CONCEPTS_ANEMIA: &[Concept] = &[Concept {
     code: "271737000",
-    description: "Anemia",
+    description: "Anemia (disorder)",
 }];
 
 const CONCEPTS_OBESITY: &[Concept] = &[Concept {
     code: "414916001",
-    description: "Obesity",
+    description: "Obesity (disorder)",
 }];
 
 const CONCEPTS_DEPRESSION: &[Concept] = &[Concept {
     code: "35489007",
-    description: "Depressive disorder",
+    description: "Depressive disorder (disorder)",
 }];
 
 const CONCEPTS_ANXIETY: &[Concept] = &[
     Concept {
         code: "48694002",
-        description: "Anxiety",
+        description: "Anxiety (finding)",
     },
     Concept {
         code: "197480006",
-        description: "Anxiety disorder",
+        description: "Anxiety disorder (disorder)",
     },
 ];
 
 const CONCEPTS_HYPOTHYROIDISM: &[Concept] = &[Concept {
     code: "40930008",
-    description: "Hypothyroidism",
+    description: "Hypothyroidism (disorder)",
 }];
 
 const CONCEPTS_REFLUX: &[Concept] = &[Concept {
     code: "235595009",
-    description: "Gastroesophageal reflux disease",
+    description: "Gastroesophageal reflux disease (disorder)",
 }];
 
 const CONCEPTS_CHRONIC_KIDNEY_DISEASE: &[Concept] = &[Concept {
     code: "709044004",
-    description: "Chronic kidney disease",
+    description: "Chronic kidney disease (disorder)",
 }];
 
 const CONCEPTS_OSTEOARTHRITIS: &[Concept] = &[Concept {
     code: "396275006",
-    description: "Osteoarthritis",
+    description: "Osteoarthritis (disorder)",
 }];
 
 const CONCEPTS_FRACTURE: &[Concept] = &[Concept {
     code: "125605004",
-    description: "Fracture of bone",
+    description: "Fracture of bone (disorder)",
 }];
 
 const CONCEPTS_THORAX: &[Concept] = &[Concept {
     code: "51185008",
-    description: "Thoracic structure",
+    description: "Thoracic structure (body structure)",
 }];
 
 const CONCEPTS_ABDOMEN: &[Concept] = &[Concept {
     code: "113345001",
-    description: "Abdominal structure",
+    description: "Abdominal structure (body structure)",
 }];
 
 const CONCEPTS_HEAD: &[Concept] = &[Concept {
     code: "69536005",
-    description: "Head structure",
+    description: "Head structure (body structure)",
 }];
 
 const CONCEPTS_NECK: &[Concept] = &[Concept {
     code: "45048000",
-    description: "Neck structure",
+    description: "Neck structure (body structure)",
 }];
 
 const CONCEPTS_BACK: &[Concept] = &[Concept {
     code: "77568009",
-    description: "Back structure",
+    description: "Back structure (body structure)",
 }];
 
 const CONCEPTS_LUNG: &[Concept] = &[Concept {
     code: "39607008",
-    description: "Lung structure",
+    description: "Lung structure (body structure)",
 }];
 
 const CONCEPTS_HEART: &[Concept] = &[Concept {
     code: "80891009",
-    description: "Heart structure",
+    description: "Heart structure (body structure)",
 }];
 
 const CONCEPTS_KIDNEY: &[Concept] = &[Concept {
     code: "64033007",
-    description: "Kidney structure",
+    description: "Kidney structure (body structure)",
 }];
 
 const CONCEPTS_LIVER: &[Concept] = &[Concept {
     code: "10200004",
-    description: "Liver structure",
+    description: "Liver structure (body structure)",
 }];
 
 const CONCEPTS_STOMACH: &[Concept] = &[Concept {
     code: "69695003",
-    description: "Stomach structure",
+    description: "Stomach structure (body structure)",
 }];
 
 const CONCEPTS_BLADDER: &[Concept] = &[Concept {
     code: "89837001",
-    description: "Urinary bladder structure",
+    description: "Urinary bladder structure (body structure)",
 }];
 
 const CONCEPTS_BRAIN: &[Concept] = &[Concept {
     code: "12738006",
-    description: "Brain structure",
+    description: "Brain structure (body structure)",
 }];
 
 const CONCEPTS_SKIN: &[Concept] = &[Concept {
     code: "39937001",
-    description: "Skin structure",
+    description: "Skin structure (body structure)",
 }];
 
 const CONCEPTS_THROAT: &[Concept] = &[Concept {
     code: "54066008",
-    description: "Pharyngeal structure",
+    description: "Pharyngeal structure (body structure)",
 }];
 
 const CONCEPTS_EYE: &[Concept] = &[Concept {
     code: "81745001",
-    description: "Structure of eye proper",
+    description: "Structure of eye proper (body structure)",
 }];
 
 const CONCEPTS_EAR: &[Concept] = &[Concept {
     code: "117590005",
-    description: "Ear structure",
+    description: "Ear structure (body structure)",
 }];
 
 const CONCEPTS_ARM: &[Concept] = &[Concept {
     code: "40983000",
-    description: "Structure of upper limb",
+    description: "Structure of upper limb (body structure)",
 }];
 
 const CONCEPTS_LEG: &[Concept] = &[Concept {
     code: "61685007",
-    description: "Structure of lower limb",
+    description: "Structure of lower limb (body structure)",
 }];
 
 const CONCEPTS_HAND: &[Concept] = &[Concept {
     code: "85562004",
-    description: "Hand structure",
+    description: "Hand structure (body structure)",
 }];
 
 const CONCEPTS_FOOT: &[Concept] = &[Concept {
     code: "56459004",
-    description: "Foot structure",
+    description: "Foot structure (body structure)",
 }];
 
 const CONCEPTS_KNEE: &[Concept] = &[Concept {
     code: "72696002",
-    description: "Knee region structure",
+    description: "Knee region structure (body structure)",
 }];
 
 const CONCEPTS_HIP: &[Concept] = &[Concept {
     code: "29836001",
-    description: "Hip region structure",
+    description: "Hip region structure (body structure)",
 }];
 
 const CONCEPTS_SHOULDER: &[Concept] = &[Concept {
     code: "16982005",
-    description: "Shoulder region structure",
+    description: "Shoulder region structure (body structure)",
 }];
 
 const CONCEPTS_BLOOD_PRESSURE: &[Concept] = &[Concept {
     code: "75367002",
-    description: "Blood pressure",
+    description: "Blood pressure (observable entity)",
 }];
 
 const CONCEPTS_HEART_RATE: &[Concept] = &[Concept {
     code: "364075005",
-    description: "Heart rate",
+    description: "Heart rate (observable entity)",
 }];
 
 const CONCEPTS_TEMPERATURE: &[Concept] = &[Concept {
     code: "56342008",
-    description: "Temperature taking",
+    description: "Temperature taking (procedure)",
 }];
 
 const CONCEPTS_HEMOGLOBIN_A1C: &[Concept] = &[Concept {
     code: "43396009",
-    description: "Hemoglobin A1c measurement",
+    description: "Hemoglobin A1c measurement (procedure)",
 }];
 
 const CONCEPTS_GLUCOSE: &[Concept] = &[Concept {
     code: "33747003",
-    description: "Glucose measurement",
+    description: "Glucose measurement (procedure)",
 }];
 
 const CONCEPTS_CREATININE: &[Concept] = &[Concept {
     code: "70901006",
-    description: "Creatinine measurement",
+    description: "Creatinine measurement (procedure)",
 }];
 
 const CONCEPTS_COMPLETE_BLOOD_COUNT: &[Concept] = &[Concept {
     code: "26604007",
-    description: "Complete blood count",
+    description: "Complete blood count (procedure)",
 }];
 
 const CONCEPTS_URINALYSIS: &[Concept] = &[Concept {
     code: "27171005",
-    description: "Urinalysis",
+    description: "Urinalysis (procedure)",
 }];
 
 const CONCEPTS_CHEST_XRAY: &[Concept] = &[Concept {
     code: "399208008",
-    description: "Plain chest X-ray",
+    description: "Plain chest X-ray (procedure)",
 }];
 
 const CONCEPTS_XRAY: &[Concept] = &[Concept {
     code: "168537006",
-    description: "Plain radiography",
+    description: "Plain radiography (procedure)",
 }];
 
 const CONCEPTS_COMPUTED_TOMOGRAPHY: &[Concept] = &[Concept {
     code: "77477000",
-    description: "Computerized axial tomography",
+    description: "Computerized axial tomography (procedure)",
 }];
 
 const CONCEPTS_MAGNETIC_RESONANCE_IMAGING: &[Concept] = &[Concept {
     code: "113091000",
-    description: "Magnetic resonance imaging",
+    description: "Magnetic resonance imaging (procedure)",
 }];
 
 const CONCEPTS_ELECTROCARDIOGRAM: &[Concept] = &[Concept {
     code: "29303009",
-    description: "Electrocardiographic procedure",
+    description: "Electrocardiographic procedure (procedure)",
 }];
 
 const CONCEPTS_ECHOCARDIOGRAM: &[Concept] = &[Concept {
     code: "40701008",
-    description: "Echocardiography",
+    description: "Echocardiography (procedure)",
 }];
 
 const CONCEPTS_ULTRASOUND: &[Concept] = &[Concept {
     code: "16310003",
-    description: "Diagnostic ultrasonography",
+    description: "Diagnostic ultrasonography (procedure)",
 }];
 
 const CONCEPTS_BIOPSY: &[Concept] = &[Concept {
     code: "86273004",
-    description: "Biopsy",
+    description: "Biopsy (procedure)",
 }];
 
 const CONCEPTS_COLONOSCOPY: &[Concept] = &[Concept {
     code: "73761001",
-    description: "Colonoscopy",
+    description: "Colonoscopy (procedure)",
 }];
 
 const CONCEPTS_APPENDECTOMY: &[Concept] = &[Concept {
     code: "80146002",
-    description: "Appendectomy",
+    description: "Appendectomy (procedure)",
 }];
 
 const CONCEPTS_CHOLECYSTECTOMY: &[Concept] = &[Concept {
     code: "38102005",
-    description: "Cholecystectomy",
+    description: "Cholecystectomy (procedure)",
 }];
 
 const CONCEPTS_CORONARY_BYPASS: &[Concept] = &[Concept {
     code: "232717009",
-    description: "Coronary artery bypass graft",
+    description: "Coronary artery bypass graft (procedure)",
 }];
 
 const CONCEPTS_CORONARY_INTERVENTION: &[Concept] = &[Concept {
     code: "415070008",
-    description: "Percutaneous coronary intervention",
+    description: "Percutaneous coronary intervention (procedure)",
 }];
 
 const CONCEPTS_INTUBATION: &[Concept] = &[Concept {
     code: "112798008",
-    description: "Insertion of endotracheal tube",
+    description: "Insertion of endotracheal tube (procedure)",
 }];
 
 const CONCEPTS_DIALYSIS: &[Concept] = &[Concept {
     code: "265764009",
-    description: "Renal dialysis",
+    description: "Renal dialysis (procedure)",
 }];
 
 const CONCEPTS_SURGERY: &[Concept] = &[Concept {
     code: "387713003",
-    description: "Surgical procedure",
+    description: "Surgical procedure (procedure)",
 }];
 
 const CONCEPTS_TRANSFUSION: &[Concept] = &[Concept {
     code: "116859006",
-    description: "Transfusion of blood product",
+    description: "Transfusion of blood product (procedure)",
 }];
 
 const CONCEPTS_CHEMOTHERAPY: &[Concept] = &[Concept {
     code: "367336001",
-    description: "Chemotherapy",
+    description: "Chemotherapy (procedure)",
 }];
 
 const CONCEPTS_RADIOTHERAPY: &[Concept] = &[Concept {
     code: "108290001",
-    description: "Radiation oncology AND/OR radiotherapy",
+    description: "Radiation oncology AND/OR radiotherapy (procedure)",
 }];
 
 const CONCEPTS_PHYSICAL_THERAPY: &[Concept] = &[Concept {
     code: "91251008",
-    description: "Physical therapy procedure",
+    description: "Physical therapy procedure (regime/therapy)",
 }];
 
 const CONCEPTS_VACCINATION: &[Concept] = &[Concept {
     code: "33879002",
-    description: "Administration of vaccine product",
+    description: "Administration of vaccine product (procedure)",
 }];
 
 const CONCEPTS_OXYGEN_THERAPY: &[Concept] = &[Concept {
     code: "57485005",
-    description: "Oxygen therapy",
+    description: "Oxygen therapy (procedure)",
 }];
 
-const CONCEPTS_INSULIN: &[Concept] = &[Concept {
-    code: "67866001",
-    description: "Insulin",
+// The qualifier-value concepts. Source: the qualifier-value hierarchy of the SNOMED CT
+// release named by `DETAILS_*` above, whose members are what a subtype qualifier of a
+// condition is linked to — they are concepts in their own right, which is why the
+// modelled `SNOMEDCTAttribute` carries a concept list of its own.
+
+const CONCEPTS_QUALIFIER_TYPE_1: &[Concept] = &[Concept {
+    code: "258194007",
+    description: "Type 1 (qualifier value)",
 }];
 
-const CONCEPTS_METFORMIN: &[Concept] = &[Concept {
-    code: "109081006",
-    description: "Metformin",
+const CONCEPTS_QUALIFIER_TYPE_2: &[Concept] = &[Concept {
+    code: "258195006",
+    description: "Type 2 (qualifier value)",
 }];
 
-const CONCEPTS_ASPIRIN: &[Concept] = &[Concept {
-    code: "387458008",
-    description: "Aspirin",
-}];
+/// The concepts each subtype qualifier this pass can split off is linked to, by the
+/// qualifier as the shared tokenizer normalizes it — lowercase tokens separated by single
+/// spaces, so the digit and the roman-numeral spellings of one subtype reach the same
+/// concept.
+///
+/// A qualifier this table does not name is still reported as the attribute it is, with no
+/// concept list rather than a concept the ontology does not hold.
+const QUALIFIER_CONCEPTS: &[(&str, &[Concept])] = &[
+    ("type 1", CONCEPTS_QUALIFIER_TYPE_1),
+    ("type i", CONCEPTS_QUALIFIER_TYPE_1),
+    ("type 2", CONCEPTS_QUALIFIER_TYPE_2),
+    ("type ii", CONCEPTS_QUALIFIER_TYPE_2),
+];
 
-const CONCEPTS_LISINOPRIL: &[Concept] = &[Concept {
-    code: "386873009",
-    description: "Lisinopril",
-}];
-
-const CONCEPTS_ATORVASTATIN: &[Concept] = &[Concept {
-    code: "373444002",
-    description: "Atorvastatin",
-}];
-
-const CONCEPTS_SALBUTAMOL: &[Concept] = &[Concept {
-    code: "372897005",
-    description: "Salbutamol",
-}];
-
-const CONCEPTS_PREDNISONE: &[Concept] = &[Concept {
-    code: "116602009",
-    description: "Prednisone",
-}];
-
-const CONCEPTS_AMOXICILLIN: &[Concept] = &[Concept {
-    code: "372687004",
-    description: "Amoxicillin",
-}];
-
-const CONCEPTS_IBUPROFEN: &[Concept] = &[Concept {
-    code: "387207008",
-    description: "Ibuprofen",
-}];
-
-const CONCEPTS_FUROSEMIDE: &[Concept] = &[Concept {
-    code: "387475002",
-    description: "Furosemide",
-}];
-
-const CONCEPTS_WARFARIN: &[Concept] = &[Concept {
-    code: "372756006",
-    description: "Warfarin",
-}];
-
-const CONCEPTS_METOPROLOL: &[Concept] = &[Concept {
-    code: "372826007",
-    description: "Metoprolol",
-}];
-
-const CONCEPTS_NITROGLYCERIN: &[Concept] = &[Concept {
-    code: "387404004",
-    description: "Glyceryl trinitrate",
-}];
-
-const CONCEPTS_OMEPRAZOLE: &[Concept] = &[Concept {
-    code: "387137007",
-    description: "Omeprazole",
-}];
-
-const CONCEPTS_ANTIBIOTIC: &[Concept] = &[Concept {
-    code: "255631004",
-    description: "Antibiotic",
-}];
+/// The concepts the qualifier written at `span` is linked to, or an empty list when this
+/// pass can name none.
+fn qualifier_concepts(tokens: &[Token], span: &Span) -> &'static [Concept] {
+    let phrase = tokens[span.tokens.clone()]
+        .iter()
+        .map(|token| token.lower.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    QUALIFIER_CONCEPTS
+        .iter()
+        .find(|(qualifier, _)| *qualifier == phrase.as_str())
+        .map_or(&[][..], |(_, concepts)| *concepts)
+}
 
 /// The lexicon: every written form this pass places, with the SNOMED CT concepts it is
 /// linked to.
@@ -848,6 +824,12 @@ const CONCEPTS_ANTIBIOTIC: &[Concept] = &[Concept {
 /// observes is a `SIGN` — which is what the modelled `SNOMEDCTTrait` reports for a bare
 /// mention. A body structure, a test, a treatment and a procedure assert nothing about
 /// the patient on their own, so they carry no base trait.
+///
+/// What this lexicon holds is bounded by the modelled `SNOMEDCTEntityCategory`: a medical
+/// condition, a body structure, and a test, treatment or procedure. A medication mention
+/// is in none of those categories — it is what `InferRxNorm` reports, against the
+/// vocabulary that models a medication's own attributes — so no written form of a
+/// medication is placed here.
 const TERMS: &[Term] = &[
     // Medical conditions.
     Term {
@@ -879,6 +861,20 @@ const TERMS: &[Term] = &[
         concepts: CONCEPTS_DIABETES_TYPE_2,
     },
     Term {
+        term: "type ii diabetes",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES_TYPE_2,
+    },
+    Term {
+        term: "type ii diabetes mellitus",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES_TYPE_2,
+    },
+    Term {
         term: "t2dm",
         category: CATEGORY_MEDICAL_CONDITION,
         entity_type: Some(TYPE_DX_NAME),
@@ -894,6 +890,20 @@ const TERMS: &[Term] = &[
     },
     Term {
         term: "type 1 diabetes mellitus",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES_TYPE_1,
+    },
+    Term {
+        term: "type i diabetes",
+        category: CATEGORY_MEDICAL_CONDITION,
+        entity_type: Some(TYPE_DX_NAME),
+        base_trait: Some(TRAIT_DIAGNOSIS),
+        concepts: CONCEPTS_DIABETES_TYPE_1,
+    },
+    Term {
+        term: "type i diabetes mellitus",
         category: CATEGORY_MEDICAL_CONDITION,
         entity_type: Some(TYPE_DX_NAME),
         base_trait: Some(TRAIT_DIAGNOSIS),
@@ -1884,125 +1894,6 @@ const TERMS: &[Term] = &[
         base_trait: None,
         concepts: CONCEPTS_OXYGEN_THERAPY,
     },
-    Term {
-        term: "insulin",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_INSULIN,
-    },
-    Term {
-        term: "metformin",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_METFORMIN,
-    },
-    Term {
-        term: "aspirin",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_ASPIRIN,
-    },
-    Term {
-        term: "lisinopril",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_LISINOPRIL,
-    },
-    Term {
-        term: "atorvastatin",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_ATORVASTATIN,
-    },
-    Term {
-        term: "albuterol",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_SALBUTAMOL,
-    },
-    Term {
-        term: "salbutamol",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_SALBUTAMOL,
-    },
-    Term {
-        term: "prednisone",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_PREDNISONE,
-    },
-    Term {
-        term: "amoxicillin",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_AMOXICILLIN,
-    },
-    Term {
-        term: "ibuprofen",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_IBUPROFEN,
-    },
-    Term {
-        term: "furosemide",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_FUROSEMIDE,
-    },
-    Term {
-        term: "warfarin",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_WARFARIN,
-    },
-    Term {
-        term: "metoprolol",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_METOPROLOL,
-    },
-    Term {
-        term: "nitroglycerin",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_NITROGLYCERIN,
-    },
-    Term {
-        term: "omeprazole",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_OMEPRAZOLE,
-    },
-    Term {
-        term: "antibiotic",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_ANTIBIOTIC,
-    },
-    Term {
-        term: "antibiotics",
-        category: CATEGORY_TEST_TREATMENT_PROCEDURE,
-        entity_type: Some(TYPE_TREATMENT_NAME),
-        base_trait: None,
-        concepts: CONCEPTS_ANTIBIOTIC,
-    },
 ];
 
 /// Words that place the mention after them in the patient's history rather than in the
@@ -2270,10 +2161,14 @@ fn modifier_attributes(
     attributes
 }
 
-/// The traits of the span at `span`: the one its lexicon entry licenses on its own, plus
-/// every trait the words around it license — the shared context cues, and the cues that
-/// place the mention in the patient's history or in the future.
-fn span_traits(
+/// The traits of the ENTITY at `span`: the one its lexicon entry licenses on its own,
+/// plus every trait the words around it license — the shared context cues, and the cues
+/// that place the mention in the patient's history or in the future.
+///
+/// A cue that places the mention in TIME is read only where it directly governs the
+/// mention it introduces ([`cue_governs`]): "history of" states when the mention was
+/// recorded, so it reaches the mention it introduces and not every mention of the clause.
+fn entity_traits(
     tokens: &[Token],
     span: &Span,
     family_cues: &HashMap<usize, usize>,
@@ -2287,19 +2182,12 @@ fn span_traits(
             score: Some(base_score),
         });
     }
-    traits.extend(
-        cue_trait_names(tokens, span, family_cues)
-            .into_iter()
-            .map(|name| SNOMEDCTTrait {
-                name: Some(name.to_string()),
-                score: Some(WEIGHT_CUE),
-            }),
-    );
+    traits.extend(attribute_traits(tokens, span, family_cues));
     for (cues, name) in [
         (PAST_HISTORY_CUES, TRAIT_PAST_HISTORY),
         (FUTURE_CUES, TRAIT_FUTURE),
     ] {
-        if cue_precedes(tokens, span, cues) {
+        if cue_governs(tokens, span, cues) {
             traits.push(SNOMEDCTTrait {
                 name: Some(name.to_string()),
                 score: Some(WEIGHT_CUE),
@@ -2307,6 +2195,26 @@ fn span_traits(
         }
     }
     traits
+}
+
+/// The traits of an ATTRIBUTE of an entity: the hedges the words around it license.
+///
+/// An attribute reports "contextual information for an attribute", which is what the
+/// shared hedging cues establish about the stretch of text itself. A cue that places
+/// something in time scopes the ENTITY the record is asserting something about rather
+/// than a modifier written inside it, so it is not read here.
+fn attribute_traits(
+    tokens: &[Token],
+    span: &Span,
+    family_cues: &HashMap<usize, usize>,
+) -> Vec<SNOMEDCTTrait> {
+    cue_trait_names(tokens, span, family_cues)
+        .into_iter()
+        .map(|name| SNOMEDCTTrait {
+            name: Some(name.to_string()),
+            score: Some(WEIGHT_CUE),
+        })
+        .collect()
 }
 
 /// The SNOMED CT concepts a lexicon entry is linked to, most likely first.
@@ -2341,9 +2249,14 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
     let family_cues = first_family_cues(&tokens);
     let lexicon = lexicon();
 
-    // Every lexicon mention, in document order. The matcher marks the tokens it placed,
-    // so a mention never overlaps another and no modifier pass below re-reads one.
-    let matches: Vec<(Span, &'static Term)> =
+    // Every lexicon mention, in document order, with the subtype qualifier its written
+    // form carries split off. The matcher marks the tokens it placed, so a mention never
+    // overlaps another and no modifier pass below re-reads one.
+    //
+    // A qualifier modifies the concept the rest of the written form names, so the entity
+    // spans that name and the qualifier is reported as the entity's own `QUALITY`
+    // attribute, linked to the qualifier-value concepts it names in its own right.
+    let matches: Vec<(Span, Option<Span>, &'static Term)> =
         lexicon_matches(&tokens, &mut covered, lexicon.max_tokens, |phrase| {
             lexicon.terms.contains_key(phrase)
         })
@@ -2354,6 +2267,13 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
                 .get(phrase.as_str())
                 .map(|term| (span, *term))
         })
+        .map(
+            |(span, term)| match split_leading(&tokens, &span, subtype_qualifier_tokens(term.term))
+            {
+                Some((name, qualifier)) => (name, Some(qualifier), term),
+                None => (span, None, term),
+            },
+        )
         .collect();
 
     // A mention of a condition, a test, a treatment or a procedure is an entity of its
@@ -2362,17 +2282,30 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
     // `SYSTEM_ORGAN_SITE` attribute reports — and an entity of its own otherwise.
     let mut entities: Vec<Entity> = matches
         .iter()
-        .filter(|(_, term)| term.category != CATEGORY_ANATOMY)
-        .map(|(span, term)| Entity {
+        .filter(|(_, _, term)| term.category != CATEGORY_ANATOMY)
+        .map(|(span, qualifier, term)| Entity {
             span: span.clone(),
             term,
-            attributes: Vec::new(),
+            attributes: qualifier
+                .iter()
+                .map(|qualifier| Attribute {
+                    span: qualifier.clone(),
+                    attribute_type: ATTRIBUTE_QUALITY,
+                    category: attribute_category(ATTRIBUTE_QUALITY, term.category),
+                    score: WEIGHT_MODIFIER,
+                    // The qualifier is written immediately in front of the name it
+                    // qualifies, so nothing stands between the two.
+                    distance: 0,
+                    concepts: qualifier_concepts(&tokens, qualifier),
+                })
+                .collect(),
         })
         .collect();
     let mut loose_anatomy: Vec<(Span, &'static Term)> = Vec::new();
     for (span, term) in matches
         .iter()
-        .filter(|(_, term)| term.category == CATEGORY_ANATOMY)
+        .filter(|(_, _, term)| term.category == CATEGORY_ANATOMY)
+        .map(|(span, _, term)| (span, term))
     {
         match nearest_entity(&tokens, &entities, span) {
             Some((owner, distance)) if distance <= ATTRIBUTE_WINDOW_TOKENS => {
@@ -2423,8 +2356,9 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
     let starts = character_starts(text);
 
     // `Id` is a monotonically increasing id unique within this response: every entity
-    // and every attribute takes the next one, in the order they are written.
-    let next_id = std::cell::Cell::new(0i32);
+    // and every attribute takes the next one of ONE document-wide sequence, in the order
+    // they are written.
+    let next_id = std::cell::Cell::new(FIRST_ID);
     let mint_id = || {
         let id = next_id.get();
         next_id.set(id + 1);
@@ -2432,9 +2366,13 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
     };
     let mut reported = Vec::with_capacity(entities.len());
     for entity in entities {
-        let score = term_confidence(entity.term.term.split(' ').count());
+        let written = &text[entity.span.start..entity.span.end];
+        let score = span_confidence(
+            term_confidence(entity.term.term.split(' ').count()),
+            written,
+        );
         let id = mint_id();
-        let traits = span_traits(
+        let traits = entity_traits(
             &tokens,
             &entity.span,
             &family_cues,
@@ -2450,34 +2388,30 @@ pub fn infer_snomedct(text: &str) -> Vec<SNOMEDCTEntity> {
                 let relationship_score = (WEIGHT_RELATIONSHIP
                     - RELATIONSHIP_DISTANCE_PENALTY * attribute.distance as f32)
                     .clamp(0.0, 1.0);
+                let part = &text[attribute.span.start..attribute.span.end];
+                let attribute_score = span_confidence(attribute.score, part);
                 SNOMEDCTAttribute {
                     category: Some(attribute.category.to_string()),
                     r#type: Some(attribute.attribute_type.to_string()),
-                    score: Some(attribute.score),
+                    score: Some(attribute_score),
                     relationship_score: Some(relationship_score),
                     relationship_type: Some(relationship_type(attribute.attribute_type).to_string()),
                     id: Some(attribute_id),
                     begin_offset: Some(character_offset(&starts, attribute.span.start)),
                     end_offset: Some(character_offset(&starts, attribute.span.end)),
-                    text: Some(text[attribute.span.start..attribute.span.end].to_string()),
-                    traits: Some(span_traits(
-                        &tokens,
-                        &attribute.span,
-                        &family_cues,
-                        None,
-                        attribute.score,
-                    )),
+                    text: Some(part.to_string()),
+                    traits: Some(attribute_traits(&tokens, &attribute.span, &family_cues)),
                     // Only an attribute a lexicon placed names a concept of its own.
                     snomedct_concepts: match attribute.concepts {
                         [] => None,
-                        entry => Some(concepts(entry, attribute.score)),
+                        entry => Some(concepts(entry, attribute_score)),
                     },
                 }
             })
             .collect();
         reported.push(SNOMEDCTEntity {
             id: Some(id),
-            text: Some(text[entity.span.start..entity.span.end].to_string()),
+            text: Some(written.to_string()),
             category: Some(entity.term.category.to_string()),
             r#type: entity.term.entity_type.map(ToString::to_string),
             score: Some(score),

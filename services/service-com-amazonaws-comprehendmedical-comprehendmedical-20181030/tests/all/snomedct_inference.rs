@@ -160,7 +160,7 @@ async fn a_mention_is_linked_to_its_snomedct_concepts() {
     let cases: Vec<CatalogRow> = vec![
         (
             "Patient has type 2 diabetes mellitus.",
-            "type 2 diabetes mellitus",
+            "diabetes mellitus",
             "MEDICAL_CONDITION",
             Some("DX_NAME"),
             "44054006",
@@ -255,11 +255,11 @@ async fn a_mention_is_linked_to_its_snomedct_concepts() {
             None,
         ),
         (
-            "Continue metformin.",
-            "metformin",
+            "Continue oxygen therapy.",
+            "oxygen therapy",
             "TEST_TREATMENT_PROCEDURE",
             Some("TREATMENT_NAME"),
-            "109081006",
+            "57485005",
             None,
         ),
         (
@@ -326,7 +326,7 @@ async fn concept_candidates_are_well_formed_ranked_and_bounded() {
         "Patient has diabetes, hypertension and asthma.",
         "Reports chest pain and shortness of breath.",
         "Assessment: congestive heart failure with chronic kidney disease.",
-        "Plan: aspirin, lisinopril and a chest X-ray.",
+        "Plan: a chest X-ray and physical therapy.",
         "A biopsy of the skin was performed.",
     ];
     for text in cases {
@@ -452,7 +452,7 @@ async fn context_cues_license_the_traits_they_scope() {
             "PAST_HISTORY",
         ),
         ("Prior appendectomy.", "appendectomy", "PAST_HISTORY"),
-        ("Will start insulin.", "insulin", "FUTURE"),
+        ("Will start dialysis.", "dialysis", "FUTURE"),
         ("Scheduled for a colonoscopy.", "colonoscopy", "FUTURE"),
     ];
     for (text, mention, expected) in cases {
@@ -695,7 +695,7 @@ async fn a_text_with_no_clinical_concept_reports_no_entity() {
 async fn mentions_are_ordered_and_every_id_is_unique_and_increasing() {
     let router = router();
     let text = "Patient with chronic asthma reports severe chest pain. \
-                History of type 2 diabetes mellitus treated with metformin, \
+                History of type 2 diabetes mellitus treated with dialysis, \
                 and an EKG was obtained.";
     let answer = infer(&router, text).await;
     let found = entities(&answer);

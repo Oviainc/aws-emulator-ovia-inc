@@ -155,7 +155,7 @@ async fn a_condition_mention_is_linked_to_its_icd10cm_concepts() {
     let cases: Vec<(&str, &str, &str, &str)> = vec![
         (
             "Patient has type 2 diabetes mellitus.",
-            "type 2 diabetes mellitus",
+            "diabetes mellitus",
             "E11.9",
             "DIAGNOSIS",
         ),
@@ -168,7 +168,7 @@ async fn a_condition_mention_is_linked_to_its_icd10cm_concepts() {
         ("History of T2DM.", "T2DM", "E11.9", "DIAGNOSIS"),
         (
             "Patient has type 1 diabetes.",
-            "type 1 diabetes",
+            "diabetes",
             "E10.9",
             "DIAGNOSIS",
         ),

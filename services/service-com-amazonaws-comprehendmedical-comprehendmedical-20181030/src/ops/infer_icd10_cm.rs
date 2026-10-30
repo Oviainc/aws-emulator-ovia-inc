@@ -191,6 +191,100 @@ pub(crate) const ATTRIBUTE_WINDOW_TOKENS: usize = 4;
 /// it is searched for without this window.
 pub(crate) const CUE_WINDOW_TOKENS: usize = 6;
 
+/// The first `Id` a response mints.
+///
+/// Every modelled `Id` member is "a monotonically increasing id unique within this
+/// response rather than a global unique identifier", and the service numbers the spans of
+/// one document from one, entities and their attributes sharing the single sequence — so
+/// a client that cross-references an attribute's `Id` against an entity's reads the same
+/// numbering the service produced.
+pub(crate) const FIRST_ID: i32 = 1;
+
+/// How high the confidence of any one detection of this crate's passes can be carried by
+/// the written form it placed: a rule-and-lexicon pass establishes a mention, never
+/// certainty about it.
+pub(crate) const CONFIDENCE_CEILING: f32 = 0.99;
+
+/// The share of the distance to [`CONFIDENCE_CEILING`] that each further written group of
+/// a placed span closes.
+pub(crate) const CONFIDENCE_GROUP_SHARE: f32 = 0.4;
+
+/// The classifier words a record writes a condition's SUBTYPE with, each followed by the
+/// numeral that picks the subtype out ("type 2 diabetes mellitus", "stage 3 chronic
+/// kidney disease").
+///
+/// Source: the modelled `QUALITY` attribute type, which reports a qualifier OF the
+/// condition an entity names rather than part of the condition's own name.
+pub(crate) const SUBTYPE_CLASSIFIERS: &[&str] = &["type", "stage", "grade", "class"];
+
+/// The numerals a subtype is written with: digits, or the roman numerals a record writes
+/// a disease type with.
+pub(crate) const SUBTYPE_NUMERALS: &[&str] = &["i", "ii", "iii", "iv", "v"];
+
+/// The words a cue is written with in front of the mention it introduces.
+pub(crate) const CUE_FUNCTION_WORDS: &[&str] = &["of", "for", "with", "on", "a", "an", "the"];
+
+/// The alphanumeric groups `matched` is written in — the parts of a written form, as the
+/// text itself separates them.
+pub(crate) fn written_groups(matched: &str) -> usize {
+    matched
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|group| !group.is_empty())
+        .count()
+}
+
+/// The confidence of ONE detection whose evidence class weighs `base` and whose placed
+/// text is `matched`.
+///
+/// A confidence reports what THIS detection established, so it is read off the text the
+/// detection placed rather than fixed per evidence class: every written group beyond the
+/// first is one more part of the class's written form that the text actually spells out,
+/// and each closes [`CONFIDENCE_GROUP_SHARE`] of what is left between the class weight
+/// and [`CONFIDENCE_CEILING`] — so a more fully written mention is reported with more
+/// confidence and no detection reports certainty.
+pub(crate) fn span_confidence(base: f32, matched: &str) -> f32 {
+    let base = base.clamp(0.0, CONFIDENCE_CEILING);
+    let groups = written_groups(matched);
+    let remaining = (1.0 - CONFIDENCE_GROUP_SHARE)
+        .powi(i32::try_from(groups.saturating_sub(1)).unwrap_or(i32::MAX));
+    (CONFIDENCE_CEILING - (CONFIDENCE_CEILING - base) * remaining).clamp(0.0, CONFIDENCE_CEILING)
+}
+
+/// How many LEADING tokens of the normalized written form `term` are a subtype qualifier
+/// of the condition the rest of it names, or 0 when it carries none.
+///
+/// A qualifier is a classifier word and its numeral, and it qualifies a condition NAME,
+/// so a written form that is NOTHING but a qualifier carries none: there would be no name
+/// left for the entity to span.
+pub(crate) fn subtype_qualifier_tokens(term: &str) -> usize {
+    let words: Vec<&str> = term.split(' ').collect();
+    if words.len() < 3 || !SUBTYPE_CLASSIFIERS.contains(&words[0]) {
+        return 0;
+    }
+    let numeral = words[1];
+    let numbered = !numeral.is_empty()
+        && (numeral.chars().all(|character| character.is_ascii_digit())
+            || SUBTYPE_NUMERALS.contains(&numeral));
+    if numbered {
+        2
+    } else {
+        0
+    }
+}
+
+/// `span` split after its first `leading` tokens: the stretch of text the REST of it
+/// covers, then the stretch those leading tokens cover. `None` when there is nothing to
+/// split off, or nothing left after it.
+pub(crate) fn split_leading(tokens: &[Token], span: &Span, leading: usize) -> Option<(Span, Span)> {
+    let boundary = span.tokens.start + leading;
+    (leading > 0 && boundary < span.tokens.end).then(|| {
+        (
+            Span::of(tokens, boundary..span.tokens.end),
+            Span::of(tokens, span.tokens.start..boundary),
+        )
+    })
+}
+
 /// One ICD-10-CM concept: the code and the long description the ontology gives it.
 #[derive(Debug)]
 struct Concept {
@@ -749,6 +843,11 @@ const CONDITIONS: &[Condition] = &[
         concepts: CONCEPTS_DIABETES_TYPE_2,
     },
     Condition {
+        term: "type ii diabetes mellitus",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_TYPE_2,
+    },
+    Condition {
         term: "t2dm",
         base_trait: TRAIT_DIAGNOSIS,
         concepts: CONCEPTS_DIABETES_TYPE_2,
@@ -760,6 +859,16 @@ const CONDITIONS: &[Condition] = &[
     },
     Condition {
         term: "type 1 diabetes mellitus",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_TYPE_1,
+    },
+    Condition {
+        term: "type i diabetes",
+        base_trait: TRAIT_DIAGNOSIS,
+        concepts: CONCEPTS_DIABETES_TYPE_1,
+    },
+    Condition {
+        term: "type i diabetes mellitus",
         base_trait: TRAIT_DIAGNOSIS,
         concepts: CONCEPTS_DIABETES_TYPE_1,
     },
@@ -1551,6 +1660,32 @@ pub(crate) fn cue_precedes(tokens: &[Token], span: &Span, cues: &[&str]) -> bool
         .any(|token| cues.contains(&token.lower.as_str()))
 }
 
+/// Whether one of `cues` DIRECTLY governs `span`: the cue stands in the span's own
+/// clause and nothing but the words a cue is written with stands between the two.
+///
+/// A cue that asserts something about the mention ITSELF — when it happened — reaches
+/// only the mention it introduces, so any other word written between the two ends its
+/// reach. A hedge over the whole clause reaches further, which is what [`cue_precedes`]
+/// answers for.
+pub(crate) fn cue_governs(tokens: &[Token], span: &Span, cues: &[&str]) -> bool {
+    let clause = tokens[span.tokens.start].clause;
+    let mut index = span.tokens.start;
+    while index > 0 {
+        index -= 1;
+        if tokens[index].clause != clause {
+            return false;
+        }
+        let word = tokens[index].lower.as_str();
+        if cues.contains(&word) {
+            return true;
+        }
+        if !CUE_FUNCTION_WORDS.contains(&word) {
+            return false;
+        }
+    }
+    false
+}
+
 /// The names of the traits the words around `span` license, beside the one its lexicon
 /// entry carries. Every name is a member of both ontologies' trait enums, so each
 /// operation maps them onto its own modelled trait shape.
@@ -1646,7 +1781,22 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
     let tokens = tokenize(text);
     let mut covered = vec![false; tokens.len()];
     let family_cues = first_family_cues(&tokens);
-    let mentions = condition_mentions(&tokens, &mut covered);
+
+    // Every condition mention, with the subtype qualifier its written form carries split
+    // off: a qualifier modifies the condition the rest of the form names, so the entity
+    // spans the condition NAME and the qualifier is reported as that entity's own
+    // `QUALITY` attribute. The concepts stay the ones the WHOLE written form names — the
+    // qualifier is what tells the subtype's codes from the unspecified ones.
+    let mentions: Vec<(Span, Option<Span>, &'static Condition)> =
+        condition_mentions(&tokens, &mut covered)
+            .into_iter()
+            .map(|(span, condition)| {
+                match split_leading(&tokens, &span, subtype_qualifier_tokens(condition.term)) {
+                    Some((name, qualifier)) => (name, Some(qualifier), condition),
+                    None => (span, None, condition),
+                }
+            })
+            .collect();
     let times = time_expressions(&tokens, &mut covered);
 
     // A time expression is reported only in a clause that also carries a condition
@@ -1656,10 +1806,21 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
     // same clause is its own `TIME_EXPRESSION` entity.
     let mut placed: Vec<Placed> = mentions
         .iter()
-        .map(|(span, condition)| Placed::Condition {
+        .map(|(span, qualifier, condition)| Placed::Condition {
             span: span.clone(),
             condition,
-            attributes: Vec::new(),
+            attributes: qualifier
+                .iter()
+                .map(|qualifier| Attribute {
+                    span: qualifier.clone(),
+                    attribute_type: ATTRIBUTE_QUALITY,
+                    category: TYPE_DX_NAME,
+                    relationship_type: relationship_type(ATTRIBUTE_QUALITY),
+                    // The qualifier is written immediately in front of the name it
+                    // qualifies, so nothing stands between the two.
+                    distance: 0,
+                })
+                .collect(),
         })
         .collect();
     let mut loose_times: Vec<Span> = Vec::new();
@@ -1667,8 +1828,8 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
         let clause = tokens[time.tokens.start].clause;
         let nearest = mentions
             .iter()
-            .filter(|(span, _)| tokens[span.tokens.start].clause == clause)
-            .map(|(span, _)| {
+            .filter(|(span, _, _)| tokens[span.tokens.start].clause == clause)
+            .map(|(span, _, _)| {
                 let distance = if span.tokens.end <= time.tokens.start {
                     time.tokens.start - span.tokens.end
                 } else {
@@ -1709,7 +1870,7 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
 
     // The modifiers come last, so a token a mention or a time expression already covers
     // is never read as a modifier too.
-    let mention_spans: Vec<Span> = mentions.into_iter().map(|(span, _)| span).collect();
+    let mention_spans: Vec<Span> = mentions.into_iter().map(|(span, _, _)| span).collect();
     for span in &mention_spans {
         let found = modifier_attributes(&tokens, span, &mut covered);
         if let Some(Placed::Condition { attributes, .. }) =
@@ -1730,8 +1891,9 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
     let character_offset = |byte: usize| character_offset(&character_starts, byte);
 
     // `Id` is "a monotonically increasing id unique within this response": every entity
-    // and every attribute takes the next one, in the order they are written.
-    let mut next_id = 0i32;
+    // and every attribute takes the next one of ONE document-wide sequence, in the order
+    // they are written, and the first one a response mints is 1.
+    let mut next_id = FIRST_ID;
     let mut entities = Vec::with_capacity(placed.len());
     for entry in placed {
         match entry {
@@ -1740,7 +1902,11 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
                 condition,
                 mut attributes,
             } => {
-                let score = term_confidence(condition.term.split(' ').count());
+                let written = &text[span.start..span.end];
+                let score = span_confidence(
+                    term_confidence(condition.term.split(' ').count()),
+                    written,
+                );
                 let id = next_id;
                 next_id += 1;
                 let mut traits = vec![ICD10CMTrait {
@@ -1757,19 +1923,21 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
                         let relationship_score = (WEIGHT_RELATIONSHIP
                             - RELATIONSHIP_DISTANCE_PENALTY * attribute.distance as f32)
                             .clamp(0.0, 1.0);
+                        let written = &text[attribute.span.start..attribute.span.end];
+                        let base = if attribute.attribute_type == ATTRIBUTE_TIME_TO_DX_NAME {
+                            WEIGHT_PATTERN
+                        } else {
+                            WEIGHT_MODIFIER
+                        };
                         ICD10CMAttribute {
                             r#type: Some(attribute.attribute_type.to_string()),
-                            score: Some(if attribute.attribute_type == ATTRIBUTE_TIME_TO_DX_NAME {
-                                WEIGHT_PATTERN
-                            } else {
-                                WEIGHT_MODIFIER
-                            }),
+                            score: Some(span_confidence(base, written)),
                             relationship_score: Some(relationship_score),
                             relationship_type: Some(attribute.relationship_type.to_string()),
                             id: Some(attribute_id),
                             begin_offset: Some(character_offset(attribute.span.start)),
                             end_offset: Some(character_offset(attribute.span.end)),
-                            text: Some(text[attribute.span.start..attribute.span.end].to_string()),
+                            text: Some(written.to_string()),
                             traits: Some(cue_traits(&tokens, &attribute.span, &family_cues)),
                             category: Some(attribute.category.to_string()),
                         }
@@ -1790,7 +1958,7 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
                     .collect();
                 entities.push(ICD10CMEntity {
                     id: Some(id),
-                    text: Some(text[span.start..span.end].to_string()),
+                    text: Some(written.to_string()),
                     category: Some(CATEGORY_MEDICAL_CONDITION.to_string()),
                     r#type: Some(TYPE_DX_NAME.to_string()),
                     score: Some(score),
@@ -1804,12 +1972,13 @@ pub fn infer_icd10_cm(text: &str) -> Vec<ICD10CMEntity> {
             Placed::Time { span } => {
                 let id = next_id;
                 next_id += 1;
+                let written = &text[span.start..span.end];
                 entities.push(ICD10CMEntity {
                     id: Some(id),
-                    text: Some(text[span.start..span.end].to_string()),
+                    text: Some(written.to_string()),
                     category: Some(CATEGORY_MEDICAL_CONDITION.to_string()),
                     r#type: Some(TYPE_TIME_EXPRESSION.to_string()),
-                    score: Some(WEIGHT_PATTERN),
+                    score: Some(span_confidence(WEIGHT_PATTERN, written)),
                     begin_offset: Some(character_offset(span.start)),
                     end_offset: Some(character_offset(span.end)),
                     attributes: Some(Vec::new()),
