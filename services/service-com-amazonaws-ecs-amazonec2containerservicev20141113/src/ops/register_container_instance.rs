@@ -428,13 +428,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instance.platform_devices = platform_devices;
             instance.tags = tags;
             instance.version += 1;
-            let view = instance.view(crate::state::ContainerInstanceFields::all());
             // A re-registration is the other way this cluster's capacity comes back —
             // the instance it names was not counted while it was deregistered — so the
             // tasks parked on it are placed from here too.
             guard.place_tasks_awaiting_capacity(&cluster_name, now);
             return Ok(RegisterContainerInstanceOutput {
-                container_instance: Some(view),
+                container_instance: guard
+                    .container_instance_view(&arn, crate::state::ContainerInstanceFields::all()),
             });
         }
 
@@ -481,7 +481,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             registered_at: crate::state::now(),
             version: 0,
         };
-        let view = record.view(crate::state::ContainerInstanceFields::all());
+        let arn = record.arn.clone();
         let registered_into = record.cluster_name.clone();
         guard.container_instances.insert(record.arn.clone(), record);
         // The capacity a task parked on an empty capacity provider was waiting for has
@@ -490,7 +490,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.place_tasks_awaiting_capacity(&registered_into, now);
 
         Ok(RegisterContainerInstanceOutput {
-            container_instance: Some(view),
+            container_instance: guard
+                .container_instance_view(&arn, crate::state::ContainerInstanceFields::all()),
         })
     }
 }

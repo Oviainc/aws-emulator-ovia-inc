@@ -261,6 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Specifying a containerInstance limits the results to tasks that belong to
         // that container instance." An id that names no REGISTERED instance names
         // nothing in the cluster, which the modelled error reports.
+        let mut host_instance_arn = None;
         if let Some(reference) = input.container_instance.as_deref() {
             let arn = crate::state::container_instance_arn_from_reference(
                 &region,
@@ -281,6 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            host_instance_arn = Some(arn);
         }
 
         let mut matching: Vec<String> = guard
@@ -314,9 +316,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A daemon cannot exist in this slice, so no task belongs to one and a
             // `daemonName` filter selects nothing.
             .filter(|_| input.daemon_name.is_none())
-            // Nothing in this emulator places a task on a container instance (a stored
-            // task records none), so a `containerInstance` filter selects nothing.
-            .filter(|_| input.container_instance.is_none())
+            // The tasks that belong to the named container instance: the ones a
+            // placement put ON it, which is the instance each task records.
+            .filter(|task| {
+                host_instance_arn
+                    .as_deref()
+                    .is_none_or(|arn| task.container_instance_arn.as_deref() == Some(arn))
+            })
             .map(|task| task.task_arn.clone())
             .collect();
         // Task ARNs end in a zero-padded, monotonically minted id, so sorting them puts

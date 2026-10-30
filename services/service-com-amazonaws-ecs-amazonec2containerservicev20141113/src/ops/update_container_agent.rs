@@ -296,9 +296,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UpdateContainerAgent` has no `include` member to narrow the response with, so
         // the instance it just changed is reported with its tags.
         Ok(UpdateContainerAgentOutput {
-            container_instance: Some(
-                instance.view(crate::state::ContainerInstanceFields::all()),
-            ),
+            container_instance: guard
+                .container_instance_view(&arn, crate::state::ContainerInstanceFields::all()),
         })
     }
 }

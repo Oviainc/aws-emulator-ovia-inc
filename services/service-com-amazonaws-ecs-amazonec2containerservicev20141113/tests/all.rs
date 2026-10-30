@@ -119,6 +119,8 @@ mod service_run_state;
 mod service_validation;
 #[path = "all/services_by_namespace.rs"]
 mod services_by_namespace;
+#[path = "all/start_task.rs"]
+mod start_task;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_set_reads.rs"]

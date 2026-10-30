@@ -212,8 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !seen.insert(arn.clone()) {
                 continue;
             }
-            match guard.resolve_container_instance(&region, &cluster_name, reference) {
-                Some(instance) => container_instances.push(instance.view(fields)),
+            let resolved = guard
+                .resolve_container_instance(&region, &cluster_name, reference)
+                .map(|instance| instance.arn.clone());
+            match resolved.and_then(|arn| guard.container_instance_view(&arn, fields)) {
+                Some(view) => container_instances.push(view),
                 // A `containerInstances` entry that resolves to no registered instance
                 // is reported under the identifier the request sent, NOT under the
                 // cluster-qualified ARN a registered instance of that id would carry.

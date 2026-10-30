@@ -334,12 +334,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "An error will be received if you specify the SERVICE option when running a
         // task."
-        if input.propagate_tags.as_deref() == Some("SERVICE") {
+        if input.propagate_tags.as_deref() == Some(crate::state::PROPAGATE_TAGS_SERVICE) {
             return Err(RunTaskErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(
-                        "propagateTags must not be SERVICE when running a task".to_string(),
-                    ),
+                    message: Some(crate::state::PROPAGATE_TAGS_SERVICE_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -553,15 +551,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Specifies whether to propagate the tags from the task definition to the
         // task. If no value is specified, the tags aren't propagated."
-        let mut tags = Vec::new();
-        if input.propagate_tags.as_deref() == Some("TASK_DEFINITION") {
-            tags.extend(definition.tags.iter().cloned());
-        }
-        for tag in input.tags.iter().flatten() {
-            if !tags.iter().any(|existing: &Tag| existing.key == tag.key) {
-                tags.push(tag.clone());
-            }
-        }
+        let tags = crate::state::standalone_task_tags(
+            input.propagate_tags.as_deref(),
+            &definition,
+            input.tags.as_deref().unwrap_or_default(),
+        );
 
         let created_at = crate::state::now();
         // Where the placement is routed through a capacity provider that still has to
@@ -605,6 +599,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 task_id,
                 cluster_name: cluster_name.clone(),
                 cluster_arn: cluster_arn.clone(),
+                // Which of a cluster's container instances would run this task is the
+                // scheduler's choice, under the placement constraints and strategy the
+                // run carries; nothing here evaluates them, so the task records no host
+                // instance. `StartTask` is the placement whose caller NAMES one.
+                container_instance_arn: None,
                 task_definition_arn: definition.arn.clone(),
                 family: definition.family.clone(),
                 last_status: initial_status.to_string(),

@@ -325,6 +325,10 @@ pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 /// specify up to 10 tasks for each call."
 pub const MAX_RUN_TASK_COUNT: i32 = 10;
 
+/// The most container instances one `StartTask` call may place a task on. The
+/// `StartTask$containerInstances` doc: "You can specify up to 10 container instances."
+pub const MAX_START_TASK_CONTAINER_INSTANCES: usize = 10;
+
 /// A list operation's page size when the caller gives no `maxResults`. The
 /// `ListTasks$maxResults` and `ListContainerInstances$maxResults` docs both say: "This
 /// value can be between 1 and 100. If this parameter isn't used, then
@@ -1533,6 +1537,39 @@ pub const PROPAGATE_TAGS_SERVICE: &str = "SERVICE";
 /// See [`PROPAGATE_TAGS_NONE`]: propagate the task DEFINITION's tags to the task.
 pub const PROPAGATE_TAGS_TASK_DEFINITION: &str = "TASK_DEFINITION";
 
+/// `InvalidParameterException$message` for a placement that asks for the SERVICE tag set
+/// on a task no service placed. `RunTask$propagateTags`: "An error will be received if
+/// you specify the SERVICE option when running a task" — a task a client places itself
+/// belongs to no service, so there is no service tag set to copy from, whichever
+/// operation places it.
+pub const PROPAGATE_TAGS_SERVICE_MESSAGE: &str =
+    "propagateTags must not be SERVICE when running a task";
+
+/// The tag set a task a CLIENT places carries: what `propagate_tags` copies from the
+/// revision it runs, plus the `requested` tags the call carried.
+///
+/// "Specifies whether to propagate the tags from the task definition to the task. If no
+/// value is specified, the tags aren't propagated" — so only `TASK_DEFINITION` copies
+/// anything, and a key that is already on the task is not written twice: "each tag key
+/// must be unique, and each tag key can have only one value". Shared by every operation
+/// that places a standalone task, so two placements cannot tag one differently.
+pub fn standalone_task_tags(
+    propagate_tags: Option<&str>,
+    definition: &TaskDefinitionRecord,
+    requested: &[Tag],
+) -> Vec<Tag> {
+    let mut tags = Vec::new();
+    if propagate_tags == Some(PROPAGATE_TAGS_TASK_DEFINITION) {
+        tags.extend(definition.tags.iter().cloned());
+    }
+    for tag in requested {
+        if !tags.iter().any(|existing: &Tag| existing.key == tag.key) {
+            tags.push(tag.clone());
+        }
+    }
+    tags
+}
+
 /// `availabilityZoneRebalancing` a CREATE takes when the request names none — the
 /// member's doc: "For create service requests, when no value is specified for
 /// AvailabilityZoneRebalancing, Amazon ECS defaults the value to ENABLED."
@@ -2242,19 +2279,21 @@ pub struct ContainerInstanceRecord {
 
 impl ContainerInstanceRecord {
     /// The `ContainerInstance` every container-instance operation reports, built from
-    /// what is stored.
+    /// what is stored and from `hosted`, the RUNNING/PENDING split of the tasks placed on
+    /// this instance — which is why the one projection every operation goes through is
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::container_instance_view`],
+    /// the reader that counts them.
     ///
     /// `remainingResources` is "the remaining CPU and memory that wasn't already
-    /// allocated to tasks": no task in this emulator is placed on a container instance
-    /// (a `TaskRecord` records no instance), so nothing is allocated out of the
-    /// registered set and the remainder equals it — for the same reason
-    /// `runningTasksCount` and `pendingTasksCount` are a true zero rather than an
-    /// invented number.
+    /// allocated to tasks": what a task allocates is the reservation its own containers
+    /// hold (`Container$cpu`, `$memory`, `$memoryReservation`), which every task reports
+    /// for itself, and no pass over the task map subtracts those from the instance, so
+    /// the remainder is the set the registration reported.
     ///
     /// `healthStatus` stays absent: nothing runs an agent health check here, so there is
     /// no check result to report. `agentUpdateStatus` is reported only once an update was
     /// requested ("If an update wasn't ever requested, this value is NULL").
-    pub fn view(&self, fields: ContainerInstanceFields) -> ContainerInstance {
+    fn view(&self, fields: ContainerInstanceFields, hosted: ServiceTally) -> ContainerInstance {
         ContainerInstance {
             container_instance_arn: Some(self.arn.clone()),
             ec2_instance_id: Some(self.ec2_instance_id.clone()),
@@ -2266,8 +2305,11 @@ impl ContainerInstanceRecord {
             status: Some(self.status.clone()),
             status_reason: self.status_reason.clone(),
             agent_connected: self.agent_connected,
-            running_tasks_count: 0,
-            pending_tasks_count: 0,
+            // "The number of tasks on the container instance that are in the RUNNING
+            // status" and the same for `PENDING`: read off the tasks placed on this
+            // instance, so a counter cannot drift from the task records that exist.
+            running_tasks_count: hosted.running,
+            pending_tasks_count: hosted.pending,
             agent_update_status: self.agent_update_status.clone(),
             attributes: Some(self.attributes.clone()),
             registered_at: Some(self.registered_at),
@@ -2288,6 +2330,14 @@ impl ContainerInstanceRecord {
     /// in both ACTIVE and DRAINING status."
     pub fn is_registered(&self) -> bool {
         self.status == CONTAINER_INSTANCE_ACTIVE || self.status == CONTAINER_INSTANCE_DRAINING
+    }
+
+    /// Whether a task may be placed on this instance now. "Only instances connected to an
+    /// agent can accept task placement requests", and a `DRAINING` instance is one Amazon
+    /// ECS is taking out of service ("prevents new tasks from being scheduled for
+    /// placement on the container instance"), so neither is capacity a placement can use.
+    pub fn accepts_task_placement(&self) -> bool {
+        self.status == CONTAINER_INSTANCE_ACTIVE && self.agent_connected
     }
 
     /// The agent version this instance reported when it registered, if it reported one at
@@ -2972,6 +3022,14 @@ pub struct TaskRecord {
     pub task_id: String,
     pub cluster_name: String,
     pub cluster_arn: String,
+    /// The container instance that HOSTS this task (`Task$containerInstanceArn`: "The ARN
+    /// of the container instances that host the task"), and `None` for a task no
+    /// placement put on one. A placement the CALLER directs at named container instances
+    /// (`StartTask$containerInstances`: "the container instances where you would like to
+    /// place your task") records the instance it named; a placement left to the scheduler
+    /// carries no instance, because nothing here chooses which of a cluster's instances
+    /// would run it.
+    pub container_instance_arn: Option<String>,
     pub task_definition_arn: String,
     pub family: String,
     pub last_status: String,
@@ -3043,6 +3101,7 @@ impl TaskRecord {
             // rather than one invented.
             attachments: Some(self.attachments.iter().map(AttachmentRecord::view).collect()),
             cluster_arn: Some(self.cluster_arn.clone()),
+            container_instance_arn: self.container_instance_arn.clone(),
             containers: Some(self.containers.iter().map(ContainerRecord::view).collect()),
             cpu: self.cpu.clone(),
             created_at: Some(self.created_at),
@@ -4302,7 +4361,9 @@ impl ExpressGatewayServiceRecord {
     }
 }
 
-/// What one pass over the task map counts for ONE service.
+/// What one pass over the task map counts for ONE owner of tasks — a service, one of its
+/// deployments or task sets, or a container instance: the RUNNING/PENDING split its own
+/// counters report.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ServiceTally {
     pub running: i32,
@@ -5352,12 +5413,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     // never burned on a hook nothing reached.
                     let hook_id = self.next_lifecycle_hook_id();
                     if let Some(record) = self.service_deployments.get_mut(&arn) {
-                        let timeout = u64::try_from(stop.timeout_minutes).unwrap_or(0);
                         record.lifecycle_hooks.push(LifecycleHookRecord {
                             hook_id,
                             stage: stop.stage,
                             status: LIFECYCLE_HOOK_AWAITING_ACTION.to_string(),
-                            expires_at: due + Duration::from_secs(timeout * 60),
+                            // "The number of minutes Amazon ECS waits for the lifecycle
+                            // hook to complete before taking the timeout action", counted
+                            // from the instant the rollout reached the stage.
+                            expires_at: minutes_from(due, stop.timeout_minutes),
                             timeout_action: stop.timeout_action,
                         });
                     }
@@ -5979,6 +6042,30 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         self.container_instances
             .get(&arn)
             .filter(|instance| instance.cluster_name == cluster_name)
+    }
+
+    /// The `ContainerInstance` a response reports for the instance stored under `arn`, and
+    /// `None` when this store holds none.
+    ///
+    /// The ONE projection of a container instance: the stored record plus the counters
+    /// read off the tasks placed on it ([`Self::container_instance_tally`]), so every
+    /// operation that reports an instance reports the same derived numbers.
+    pub fn container_instance_view(
+        &self,
+        arn: &str,
+        fields: ContainerInstanceFields,
+    ) -> Option<ContainerInstance> {
+        let instance = self.container_instances.get(arn)?;
+        Some(instance.view(fields, self.container_instance_tally(arn)))
+    }
+
+    /// What the task map counts for ONE container instance: the tasks placed on it that
+    /// are still wanted running, split by lifecycle status —
+    /// `ContainerInstance$runningTasksCount` is "the number of tasks on the container
+    /// instance that are in the RUNNING status" and `pendingTasksCount` the same for
+    /// `PENDING`.
+    pub fn container_instance_tally(&self, instance_arn: &str) -> ServiceTally {
+        self.tally_wanted(|task| task.container_instance_arn.as_deref() == Some(instance_arn))
     }
 
     /// The latest `ACTIVE` revision registered for `family`, if any.
@@ -7328,6 +7415,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             task_id,
             cluster_name: service.cluster_name.clone(),
             cluster_arn: service.cluster_arn.clone(),
+            // The scheduler places a service's task under its placement constraints and
+            // strategy, which nothing here evaluates, so no one of the cluster's container
+            // instances is the instance that hosts it.
+            container_instance_arn: None,
             task_definition_arn: definition.arn.clone(),
             family: definition.family.clone(),
             last_status: initial_task_status(awaiting_capacity).to_string(),
@@ -9997,6 +10088,29 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// Now, as the wire timestamp type every modelled timestamp member uses.
 pub fn now() -> DateTime {
     DateTime::from(SystemTime::now())
+}
+
+/// How many seconds one minute of a wait is, so a minutes-valued member is converted to a
+/// duration in one place.
+const SECONDS_PER_MINUTE: u64 = 60;
+
+/// The instant a wait of `minutes` from `from` falls due.
+///
+/// Every minutes-valued member of this API states the range it accepts
+/// (`DeploymentLifecycleHookTimeoutConfiguration$timeoutInMinutes` is `1..=20160`,
+/// `UpdateTaskProtection$expiresInMinutes` `1..=2880`) and a value outside it is refused
+/// before any of this runs, so the conversion always has an answer. It is done CHECKED all
+/// the same, so no instant this store keeps can be the product of overflowing arithmetic: a
+/// wait that is not a number of minutes, or that this clock cannot represent, is read as a
+/// wait that is already over rather than wrapping or panicking.
+///
+/// Spelled once for every such member, so two waits cannot be converted differently.
+pub fn minutes_from(from: SystemTime, minutes: i32) -> SystemTime {
+    u64::try_from(minutes)
+        .ok()
+        .and_then(|minutes| minutes.checked_mul(SECONDS_PER_MINUTE))
+        .and_then(|seconds| from.checked_add(Duration::from_secs(seconds)))
+        .unwrap_or(from)
 }
 
 /// A wire timestamp as a key that ORDERS and COMPARES: whole seconds and the nanoseconds

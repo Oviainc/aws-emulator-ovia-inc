@@ -249,11 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Specify true to mark a task for protection and false to unset protection":
         // protecting a task records when the protection expires, and unsetting it takes
         // the expiry off — the one place `protectionEnabled` is read from.
-        let expires_at = input.protection_enabled.then(|| {
-            now + ::std::time::Duration::from_secs(
-                u64::try_from(requested_minutes).unwrap_or_default() * 60,
-            )
-        });
+        let expires_at = input
+            .protection_enabled
+            .then(|| crate::state::minutes_from(now, requested_minutes));
 
         let mut protected_tasks = Vec::new();
         let mut failures = Vec::new();

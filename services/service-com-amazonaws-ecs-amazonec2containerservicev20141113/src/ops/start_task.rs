@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Places ONE task of a stored task-definition revision on EACH container instance the
+//! caller names — the placement a client directs itself, rather than leaving it to the
+//! scheduler as `RunTask` does. Every placed task is persisted with the instance that
+//! hosts it, so `DescribeTasks`, `ListTasks` (including its `containerInstance` filter),
+//! that instance's own task counts and the cluster counters all read the same records
+//! back. A task is answered in `PENDING`, the status AWS reports for a task that has been
+//! placed but has not started yet, and the move to `RUNNING` is owed by the clock (see
+//! `crate::state`). A named instance this store holds no placeable capacity for is
+//! reported in `failures` rather than refusing the whole call, so the instances that can
+//! take a task still get one.
 //!
 //! ## Shape of an operation
 //!
@@ -217,18 +218,284 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartTaskErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "The container instance IDs or full ARN entries for the container instances
+        // where you would like to place your task" — a call that names none names nowhere
+        // to place it, and the member's own bound caps how many one call may name ("You
+        // can specify up to 10 container instances"), which bounds the work this call
+        // does and the tasks it creates however long its list is.
+        if input.container_instances.is_empty() {
+            return Err(StartTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "containerInstances must name at least one container instance"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        if input.container_instances.len() > crate::state::MAX_START_TASK_CONTAINER_INSTANCES {
+            return Err(StartTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::at_most_items_message(
+                        "container instances",
+                        crate::state::MAX_START_TASK_CONTAINER_INSTANCES,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A task a client places belongs to no service, so there is no service tag set to
+        // copy to it.
+        if input.propagate_tags.as_deref() == Some(crate::state::PROPAGATE_TAGS_SERVICE) {
+            return Err(StartTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::PROPAGATE_TAGS_SERVICE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some((family, requested_revision)) =
+            crate::state::parse_task_definition_reference(&input.task_definition)
+        else {
+            return Err(StartTaskErrorModeled::ClientException(ClientException {
+                message: Some(crate::state::task_definition_reference_message(
+                    &input.task_definition,
+                )),
+            })
+            .into());
+        };
+
+        // A caller-supplied tag may not write into the namespace Amazon Web Services keeps
+        // for its own tags, whichever operation carries the `tags` list.
+        if let Some(message) =
+            crate::state::reserved_tag_prefix_violation(input.tags.as_deref().unwrap_or_default())
+        {
+            return Err(StartTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+            return Err(StartTaskErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::cluster_refusal_message(
+                        guard.clusters.get(&cluster_name),
+                    )),
+                },
+            )
+            .into());
+        };
+        let cluster_arn = cluster.arn.clone();
+
+        // "If a revision isn't specified, the latest ACTIVE revision is used", and a
+        // revision this call NAMES has to be one it may use: "You can't use an INACTIVE
+        // task definition to run new tasks."
+        let definition = match guard.usable_revision(&family, requested_revision) {
+            Ok(definition) => definition.clone(),
+            Err(refusal) => {
+                let message = Some(refusal.message().to_string());
+                return Err(match refusal {
+                    crate::state::TaskDefinitionRefusal::Inactive => {
+                        StartTaskErrorModeled::InvalidParameterException(
+                            InvalidParameterException { message },
+                        )
+                    }
+                    crate::state::TaskDefinitionRefusal::NotFound => {
+                        StartTaskErrorModeled::ClientException(ClientException { message })
+                    }
+                }
+                .into());
+            }
+        };
+
+        // Both rules below are keyed on the REGISTERED task definition this call places,
+        // which the model cannot express, so both are checked here — before any task is
+        // stored, since AWS places nothing when it refuses.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartTask"))
+        // An `awsvpc` task gets its own elastic network interface, so the placement has to
+        // say which subnets and security groups it takes.
+        if let Some(message) = crate::state::network_configuration_violation(
+            &definition.network_mode,
+            input.network_configuration.as_ref(),
+        ) {
+            return Err(StartTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // ECS Exec signs its session with the TASK's role, so a placement that enables it
+        // needs the revision to declare one.
+        if let Some(message) = crate::state::execute_command_violation(
+            input.enable_execute_command,
+            Some(&definition),
+            crate::state::EXECUTE_COMMAND_TASK_SUBJECT,
+        ) {
+            return Err(StartTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // One task per named instance, so the store's task bound is checked against the
+        // whole list before any of it is placed.
+        if guard.tasks.len() + input.container_instances.len() > crate::state::MAX_TASKS {
+            return Err(StartTaskErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "this emulator holds at most {} tasks; stop some before running more",
+                    crate::state::MAX_TASKS
+                )),
+            })
+            .into());
+        }
+
+        // "The default value is the family name of the task definition (for example,
+        // family:my-family-name)."
+        let group = input
+            .group
+            .clone()
+            .unwrap_or_else(|| format!("family:{}", definition.family));
+        let tags = crate::state::standalone_task_tags(
+            input.propagate_tags.as_deref(),
+            &definition,
+            input.tags.as_deref().unwrap_or_default(),
+        );
+        let created_at = crate::state::now();
+
+        let mut started = Vec::with_capacity(input.container_instances.len());
+        let mut failures = Vec::new();
+        // The same instance named twice names ONE instance, and one instance takes one
+        // task of this call, so a repeated entry places nothing further and is not
+        // reported twice.
+        let mut seen = ::std::collections::HashSet::new();
+        for reference in &input.container_instances {
+            let arn = crate::state::container_instance_arn_from_reference(
+                &region,
+                &cluster_name,
+                reference,
+            );
+            if !seen.insert(arn.clone()) {
+                continue;
+            }
+            // An entry that names no instance this cluster can place a task on — nothing
+            // stored, an instance of another cluster, or one that is no longer placeable
+            // capacity — is reported as the identifier the request sent, beside the tasks
+            // the instances that could take one got.
+            let host = guard
+                .resolve_container_instance(&region, &cluster_name, reference)
+                .filter(|instance| instance.accepts_task_placement())
+                .map(|instance| instance.arn.clone());
+            let Some(container_instance_arn) = host else {
+                failures.push(crate::state::unresolved_failure(
+                    &region,
+                    crate::state::CONTAINER_INSTANCE_RESOURCE_TYPE,
+                    reference,
+                ));
+                continue;
+            };
+
+            let task_id = guard.next_task_id();
+            let task_arn = crate::state::task_arn(&region, &cluster_name, &task_id);
+            let containers = guard.mint_containers(
+                &region,
+                &cluster_name,
+                &task_id,
+                &task_arn,
+                &definition,
+                crate::state::STATUS_PENDING,
+            );
+            // The elastic network interface an `awsvpc` task is allocated, out of the
+            // networking this placement launches it with.
+            let attachments = guard.mint_task_attachments(
+                &definition.network_mode,
+                input.network_configuration.as_ref(),
+            );
+
+            let record = crate::state::TaskRecord {
+                task_arn: task_arn.clone(),
+                task_id,
+                cluster_name: cluster_name.clone(),
+                cluster_arn: cluster_arn.clone(),
+                // The instance the CALLER named: this placement put the task on it, so
+                // the task records the instance that hosts it.
+                container_instance_arn: Some(container_instance_arn),
+                task_definition_arn: definition.arn.clone(),
+                family: definition.family.clone(),
+                // The capacity is already there — the call named it — so the task is
+                // placed, and only its start is still owed.
+                last_status: crate::state::STATUS_PENDING.to_string(),
+                desired_status: crate::state::STATUS_RUNNING.to_string(),
+                containers,
+                cpu: definition.cpu.clone(),
+                memory: definition.memory.clone(),
+                overrides: input.overrides.clone(),
+                // A container instance is the registered capacity of this launch type,
+                // and `StartTask` carries neither a launch type nor a capacity provider
+                // to say otherwise.
+                launch_type: Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string()),
+                capacity_provider_name: None,
+                // "A platform version is only specified for tasks hosted on Fargate",
+                // which a task on a container instance is not.
+                platform_version: None,
+                started_by: input.started_by.clone(),
+                group: group.clone(),
+                // Nothing but the service scheduler places a task for a service, so a
+                // task a client started stands alone.
+                service_name: None,
+                tags: tags.clone(),
+                enable_execute_command: input.enable_execute_command,
+                created_at,
+                started_at: None,
+                stopping_at: None,
+                stopped_at: None,
+                execution_stopped_at: None,
+                // Only the agent's own report carries the image-pull instants.
+                pull_started_at: None,
+                pull_stopped_at: None,
+                stopped_reason: None,
+                stop_code: None,
+                version: 1,
+                // The task is placed, so no placement is outstanding; its start falls due
+                // one transition span from here and the clock materialises it.
+                pending_due_at: None,
+                running_due_at: Some(now + crate::state::TRANSITION_SPAN),
+                stopped_due_at: None,
+                // Scale-in protection is `UpdateTaskProtection`'s to set; a task nobody
+                // has protected holds none.
+                protection_expires_at: None,
+                attachments,
+            };
+            // `StartTask` has no `include` member to narrow the response with, so the
+            // task it just created is reported with the tags it was created with.
+            started.push(record.view(true));
+            guard.tasks.insert(task_arn, record);
+        }
+
+        Ok(StartTaskOutput {
+            tasks: Some(started),
+            failures: Some(failures),
+        })
     }
 }

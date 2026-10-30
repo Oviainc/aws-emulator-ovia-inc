@@ -216,8 +216,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instance stops counting towards the cluster's registered capacity and "then
         // transitions to an INACTIVE status", which is the status
         // `ListContainerInstances` leaves out by default. `force` changes nothing here:
-        // it governs the tasks that were placed ON the instance, and no task in this
-        // emulator is placed on a container instance, so none can be orphaned.
+        // it governs the tasks that were placed ON the instance, which "remain running
+        // until you terminate the instance or the tasks stop through some other means,
+        // but they're orphaned" — so a task placed on it is left exactly as it stands.
         //
         // An instance that has already been deregistered is reported as it stands: it is
         // already out of the cluster's capacity, so there is no second transition to
@@ -234,9 +235,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(DeregisterContainerInstanceOutput {
-            container_instance: Some(
-                instance.view(crate::state::ContainerInstanceFields::all()),
-            ),
+            container_instance: guard
+                .container_instance_view(&arn, crate::state::ContainerInstanceFields::all()),
         })
     }
 }
