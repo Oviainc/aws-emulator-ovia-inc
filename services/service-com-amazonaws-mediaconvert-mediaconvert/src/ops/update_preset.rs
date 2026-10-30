@@ -162,6 +162,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `{Name}` arrives percent-decoded from the path, so a value made only of
+        // whitespace reaches here: it names no preset, so the modification is refused
+        // naming the member it arrived in rather than probed for a key nothing could hold
+        // — the same test `GetPreset` and `DeletePreset` take
+        // (`crate::state::carries_no_characters`).
+        if crate::state::carries_no_characters(&input.name) {
+            return Err(UpdatePresetErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::blank_member_message("Name")),
+            })
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         // `{Name}` addresses the preset; the stored key is the name exactly as

@@ -176,6 +176,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `{Name}` arrives percent-decoded from the path and ADDRESSES the template this
+        // request would change, so it is tested before the members it carries: a value
+        // made only of whitespace names no job template, and the modification is refused
+        // naming the member it arrived in rather than probed for a key nothing could hold
+        // — the same test `GetJobTemplate` and `DeleteJobTemplate` take, and the one this
+        // handler already applies to its `Queue` member below.
+        if crate::state::carries_no_characters(&input.name) {
+            return Err(UpdateJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::blank_member_message("Name")),
+                },
+            )
+            .into());
+        }
+
         // "The new queue for the job template, if you are changing it" — a queue the
         // caller named is a reference to a queue resource, by name or by ARN, exactly as
         // it is on create. A member the caller SENT is a value they meant, so an empty

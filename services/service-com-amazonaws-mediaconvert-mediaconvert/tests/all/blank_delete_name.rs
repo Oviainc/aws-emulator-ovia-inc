@@ -28,7 +28,7 @@
 use serde_json::json;
 
 use super::blank_resource_name::{
-    assert_blank_refusal, blanks, create_request, doors, listed_names, Door,
+    assert_blank_refusal, blanks, create_resource, doors, listed_names, read_resource, Door,
 };
 use super::job_lifecycle::{Emulator, Reply};
 use super::resource_tagging::encode_label;
@@ -44,29 +44,6 @@ const ABSENT_NAME: &str = "never-created";
 async fn delete_label(emulator: &Emulator, door: &Door, label: &str) -> Reply {
     emulator
         .send("DELETE", &format!("{}/{label}", door.collection), None)
-        .await
-}
-
-/// Create the resource `name` names at `door`, asserting the fixture landed.
-async fn create(emulator: &Emulator, door: &Door, name: &str) {
-    let created = emulator
-        .send("POST", door.collection, Some(create_request(door, name)))
-        .await;
-    assert_eq!(
-        created.status, 201,
-        "case {:?}: the fixture {name:?} must be created, got {} with body {}",
-        door.label, created.status, created.body
-    );
-}
-
-/// Read `name` back at `door`.
-async fn read(emulator: &Emulator, door: &Door, name: &str) -> Reply {
-    emulator
-        .send(
-            "GET",
-            &format!("{}/{}", door.collection, encode_label(name)),
-            None,
-        )
         .await
 }
 
@@ -94,7 +71,7 @@ async fn a_name_carrying_no_characters_is_refused_by_every_named_delete() {
     let emulator = Emulator::new();
 
     for door in doors() {
-        create(&emulator, &door, PADDED_NAME).await;
+        create_resource(&emulator, &door, PADDED_NAME).await;
 
         for blank in blanks() {
             // The zero-length value is no path segment at all, so it addresses no
@@ -112,7 +89,7 @@ async fn a_name_carrying_no_characters_is_refused_by_every_named_delete() {
 
             // The refusal removed nothing: the one stored resource, whose name trims to
             // the same nothing the refused label does, is still there.
-            let survivor = read(&emulator, &door, PADDED_NAME).await;
+            let survivor = read_resource(&emulator, &door, PADDED_NAME).await;
             assert_eq!(
                 survivor.status, 200,
                 "case {case:?}: a refused delete must remove nothing, got {} with body {}",
@@ -143,7 +120,7 @@ async fn a_name_that_carries_characters_is_still_deleted() {
     let emulator = Emulator::new();
 
     for door in doors() {
-        create(&emulator, &door, PADDED_NAME).await;
+        create_resource(&emulator, &door, PADDED_NAME).await;
 
         // Whitespace is part of the key, so the padded resource is NOT addressed by its
         // trimmed spelling: that names nothing, which is the idempotent success, and it
@@ -157,7 +134,7 @@ async fn a_name_that_carries_characters_is_still_deleted() {
             &format!("DELETE {} with a name nothing is stored under", door.collection),
             &delete_label(&emulator, &door, &encode_label(ABSENT_NAME)).await,
         );
-        let survivor = read(&emulator, &door, PADDED_NAME).await;
+        let survivor = read_resource(&emulator, &door, PADDED_NAME).await;
         assert_eq!(
             survivor.status, 200,
             "case {:?}: a delete of another name must not remove the stored resource, got \
@@ -170,7 +147,7 @@ async fn a_name_that_carries_characters_is_still_deleted() {
             &format!("DELETE {} with the stored spelling", door.collection),
             &delete_label(&emulator, &door, &encode_label(PADDED_NAME)).await,
         );
-        let gone = read(&emulator, &door, PADDED_NAME).await;
+        let gone = read_resource(&emulator, &door, PADDED_NAME).await;
         assert_eq!(
             gone.status, 404,
             "case {:?}: the deleted resource must be gone, got {} with body {}",

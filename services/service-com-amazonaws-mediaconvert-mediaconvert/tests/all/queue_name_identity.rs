@@ -16,7 +16,7 @@
 //! Each case drives the real restJson1 wire path through the router (the harness is the
 //! one `job_lifecycle` builds), so what is asserted is the bytes a client would see.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::job_lifecycle::{arn, settings, Emulator, ROLE};
 use crate::queue_update::update_queue;
@@ -253,12 +253,43 @@ async fn a_name_carrying_no_characters_is_a_bad_request() {
             refused.body
         );
         if !path.is_empty() {
+            // The same rule holds on the READ door: a `{Name}` label carrying no
+            // characters names no queue either, so it is the same modelled bad request
+            // rather than a probe of the store (`tests/all/blank_read_name.rs` pins that
+            // for all three readers). What the refused create persisted is read from the
+            // listing below instead.
             let fetched = emulator.get_queue(path).await;
             assert_eq!(
-                fetched.status, 404,
-                "case {blank:?}: a refused create must persist nothing, got {} with body {}",
+                fetched.status, 400,
+                "case {blank:?}: expected HTTP 400 from the read door too, got {} with \
+                 body {}",
                 fetched.status, fetched.body
             );
         }
     }
+
+    // Nothing the refusals above would have stored is there: no queue carries a name made
+    // only of whitespace.
+    let listed = emulator.send("GET", "/2017-08-29/queues", None).await;
+    assert_eq!(
+        listed.status, 200,
+        "the queue listing must answer HTTP 200, got {} with body {}",
+        listed.status, listed.body
+    );
+    let blank_names: Vec<String> = listed
+        .at("/queues")
+        .as_array()
+        .map(|queues| {
+            queues
+                .iter()
+                .filter_map(|queue| queue.pointer("/name").and_then(Value::as_str))
+                .filter(|name| name.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        blank_names.is_empty(),
+        "a refused create must persist nothing, got the stored names {blank_names:?}"
+    );
 }

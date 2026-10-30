@@ -19,7 +19,8 @@
 //! share-and-tagging case covers `CreateResourceShare$JobId` and the `Arn` of the three
 //! tagging doors as well. The doors that DELETE a named resource carry the same kind of
 //! `{Name}` label, and `tests/all/blank_delete_name.rs` pins the rule there, reusing this
-//! suite's blank forms and door table.
+//! suite's blank forms and door table; `tests/all/blank_read_name.rs` pins it for the
+//! doors that READ or MODIFY a resource under that same label.
 //!
 //! The other side of the same rule is that a value which DOES carry characters is never
 //! normalised: surrounding whitespace is part of the key, so a padded name creates its own
@@ -162,6 +163,33 @@ pub(crate) fn create_request(door: &Door, name: &str) -> Value {
     body
 }
 
+/// Create the resource `name` names at `door`, asserting the fixture landed.
+///
+/// `pub(crate)` with the door table itself, because every suite that drives the rule
+/// through a door onto a STORED resource needs the same fixture: the delete suite and the
+/// read-and-modify suite both do, and one fixture beats a second copy of it.
+pub(crate) async fn create_resource(emulator: &Emulator, door: &Door, name: &str) {
+    let created = emulator
+        .send("POST", door.collection, Some(create_request(door, name)))
+        .await;
+    assert_eq!(
+        created.status, 201,
+        "case {:?}: the fixture {name:?} must be created, got {} with body {}",
+        door.label, created.status, created.body
+    );
+}
+
+/// Read `name` back at `door`, through the `{Name}` label its reader carries.
+pub(crate) async fn read_resource(emulator: &Emulator, door: &Door, name: &str) -> Reply {
+    emulator
+        .send(
+            "GET",
+            &format!("{}/{}", door.collection, encode_label(name)),
+            None,
+        )
+        .await
+}
+
 /// How this service words the refusal of a member that carries no characters — shared
 /// with the suites that drive the other halves of the same rule, so none of them can
 /// assert a different sentence.
@@ -237,6 +265,11 @@ async fn a_name_carrying_no_characters_is_refused_by_every_named_create() {
             assert_blank_refusal(&case, "Name", &refused);
 
             if !blank.path.is_empty() {
+                // The same rule holds on the READ door the blank name would be addressed
+                // through: the label carries no identity either, so it is the same bad
+                // request naming the member rather than a probe of the store.
+                // `tests/all/blank_read_name.rs` pins that for the three readers; what
+                // proves the refused create persisted nothing is the listing below.
                 let fetched = emulator
                     .send(
                         "GET",
@@ -244,12 +277,7 @@ async fn a_name_carrying_no_characters_is_refused_by_every_named_create() {
                         None,
                     )
                     .await;
-                assert_eq!(
-                    fetched.status, 404,
-                    "case {case:?}: a refused create must persist nothing, got {} with \
-                     body {}",
-                    fetched.status, fetched.body
-                );
+                assert_blank_refusal(&format!("{case}, read back"), "Name", &fetched);
             }
         }
 

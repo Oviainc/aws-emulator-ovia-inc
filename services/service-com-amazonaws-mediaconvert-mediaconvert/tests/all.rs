@@ -23,6 +23,8 @@ mod blank_filter_value;
 mod blank_job_reference;
 #[path = "all/blank_jobs_query_id.rs"]
 mod blank_jobs_query_id;
+#[path = "all/blank_read_name.rs"]
+mod blank_read_name;
 #[path = "all/blank_resource_name.rs"]
 mod blank_resource_name;
 #[path = "all/caller_sent_key_identity.rs"]

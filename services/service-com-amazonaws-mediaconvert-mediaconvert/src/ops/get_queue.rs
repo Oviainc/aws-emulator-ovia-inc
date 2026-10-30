@@ -155,6 +155,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `{Name}` arrives percent-decoded from the path, so a value made only of
+        // whitespace reaches here: it names no queue, so the read is refused naming the
+        // member it arrived in rather than probed for a key nothing could hold — the same
+        // test the sibling `DeleteQueue` door on this resource takes
+        // (`crate::state::carries_no_characters`), so the two doors onto one queue cannot
+        // disagree about which values are identities.
+        if crate::state::carries_no_characters(&input.name) {
+            return Err(GetQueueErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::blank_member_message("Name")),
+            })
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

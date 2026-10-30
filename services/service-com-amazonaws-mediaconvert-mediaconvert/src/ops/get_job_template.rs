@@ -153,6 +153,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `{Name}` arrives percent-decoded from the path, so a value made only of
+        // whitespace reaches here: it names no job template, so the read is refused naming
+        // the member it arrived in rather than probed for a key nothing could hold — the
+        // same test the sibling `DeleteJobTemplate` door on this resource takes
+        // (`crate::state::carries_no_characters`).
+        if crate::state::carries_no_characters(&input.name) {
+            return Err(GetJobTemplateErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::blank_member_message("Name")),
+            })
+            .into());
+        }
+
         let region = crate::state::request_region(ctx.parts());
         // The stored key is the name exactly as `CreateJobTemplate` persisted it, so the
         // label is read as sent rather than normalised.
