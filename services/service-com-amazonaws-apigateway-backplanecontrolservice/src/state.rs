@@ -2346,27 +2346,67 @@ pub enum PatchFailure {
     Conflict(String),
 }
 
-/// Which paths ONE resource can be addressed by, PER `op`.
+/// Which paths ONE resource PUBLISHES, per `op`.
 ///
-/// Which paths a patch may name is a property of the op as much as of the resource:
-/// a single-valued member is `replace`d, while an element is `add`ed to or `remove`d from
-/// a multi-valued one, so the two ops accept disjoint sets of pointers. A resource that
-/// enumerates its permitted paths in a refusal ([`InvalidPathRefusal::PathOpAndSupported`])
-/// therefore enumerates the set belonging to the op the request actually sent, and a
-/// handler gates the same op's edits on that same set — one table for both, so the message
-/// cannot name a path the handler refuses, nor omit one it accepts.
+/// Which paths a patch may name is a property of the op as much as of the resource: a
+/// single-valued member is `replace`d, while an element is `add`ed to or `remove`d from a
+/// multi-valued one, so the sets belonging to two ops differ and one of them can be empty.
+/// A resource that enumerates its permitted paths in a refusal
+/// ([`InvalidPathRefusal::PathOpAndSupported`]) therefore enumerates the set belonging to
+/// the op the request actually sent, and an op the resource publishes no path for is told
+/// to choose one it supports instead of being offered an empty list.
+///
+/// The table is what the SERVICE publishes, which is why it is given rather than derived
+/// from a handler's match arms: a resource may apply an op on a path its published list
+/// does not carry (an authorizer's `providerARNs`), and a handler that gates its own edits
+/// on this table ([`Self::accepts`]) says so where it does.
 #[derive(Debug, Clone, Copy)]
 pub struct SupportedPatchPaths {
-    /// The paths an `add` names: the resource's multi-valued members, one element at a
-    /// time.
+    /// The paths an `add` names: typically the resource's multi-valued members, one
+    /// element at a time, and the nested settings an `add` creates.
     pub add: &'static [&'static str],
-    /// The paths a `remove` names, which are multi-valued too — an element goes away.
+    /// The paths a `remove` names: the ones an element or a whole nested setting goes away
+    /// from.
     pub remove: &'static [&'static str],
     /// The paths a `replace` names: the resource's updateable single-valued members.
     pub replace: &'static [&'static str],
 }
 
 impl SupportedPatchPaths {
+    /// The table of a resource that publishes its patchable paths for `replace` ONLY.
+    ///
+    /// A recorded refusal of a path under `add` enumerates no list for these resources: it
+    /// tells the caller to choose an op the resource supports instead, so the set belonging
+    /// to `add` — and to `remove`, which these resources publish no path for either — is
+    /// empty, and `replace` is the op whose set is the published list. Which ops a given
+    /// member then admits is the member's own rule (an optional member can be cleared),
+    /// applied where that member is patched rather than by this table.
+    pub const fn replace_only(paths: &'static [&'static str]) -> Self {
+        Self {
+            add: &[],
+            remove: &[],
+            replace: paths,
+        }
+    }
+
+    /// The table of a resource that publishes ONE list of patchable paths, enumerated
+    /// whichever of `add`, `remove` and `replace` named the rejected path.
+    ///
+    /// Some of these resources publish their patchable paths per RESOURCE rather than per
+    /// op — a recorded refusal enumerates the same list for every op the resource takes —
+    /// and which of the three ops a given path admits is then the member's own rule (a
+    /// required member cannot be removed, a collection member is not replaced whole),
+    /// applied where that member is patched rather than by this table. A resource whose
+    /// recorded refusal enumerates DIFFERENT lists per op (an API key's) names the three
+    /// sets separately instead.
+    pub const fn for_every_op(paths: &'static [&'static str]) -> Self {
+        Self {
+            add: paths,
+            remove: paths,
+            replace: paths,
+        }
+    }
+
     /// The paths `op` may name on this resource, in the order the service prints them —
     /// or `None` for an op the resource supports NO path for, which is a refusal of the
     /// op rather than of the path ([`Patch::unsupported_op`]).
@@ -2396,23 +2436,33 @@ impl SupportedPatchPaths {
 /// How ONE operation words its refusal of a patch `path` it cannot apply.
 ///
 /// API Gateway does not word that refusal the same way for every resource: for some of
-/// them it is the bare sentence [`invalid_patch_path`] builds, and for others it also
-/// quotes the `op` the path rode in on and enumerates the paths the operation does
-/// accept. The wording is a property of the OPERATION, not of the mistake, so each
-/// handler names its own when it reads the request's `patchOperations`
-/// ([`parse_patches`] / [`parse_patches_refused_with`]) and every path refusal that
-/// request goes on to produce — a member the resource does not have, a pointer that is no
-/// JSON Pointer, one reaching into a single-valued member, one naming a map member with
-/// no key — reads the same.
+/// them it is the bare sentence [`invalid_patch_path`] builds, for others it also quotes
+/// the `op` the path rode in on and enumerates the paths that op may name, and for a
+/// pointer into a nested structure the structure itself owns the sentence. The wording is a
+/// property of the OPERATION, not of the mistake, so each handler names its own when it
+/// reads the request's `patchOperations` ([`parse_patches`] /
+/// [`parse_patches_refused_with`]) and every path refusal that request goes on to produce —
+/// a member the resource does not have, a pointer that is no JSON Pointer, one reaching
+/// into a single-valued member, one naming a map member with no key — reads the same.
 #[derive(Debug, Clone, Copy)]
 pub enum InvalidPathRefusal {
     /// The fixed sentence and the path the request sent, and nothing else.
     PathOnly,
     /// The path quoted, the `op` of the same `patchOperations` entry, and the paths that
-    /// op accepts on the resource — read from the resource's own [`SupportedPatchPaths`]
-    /// table, in the order the service itself prints them, which is why the table is
-    /// given rather than derived from a handler's match arms.
+    /// op may name on the resource — read from the resource's own [`SupportedPatchPaths`]
+    /// table, in the order the service itself prints them.
     PathOpAndSupported(SupportedPatchPaths),
+    /// The refusal a NESTED structure of the resource owns: the structure's own member
+    /// name and the full pointers into it, and nothing of the rejected path. A handler
+    /// that dispatches a pointer into such a structure re-labels the patch with this
+    /// ([`Patch::refused_with`]), so every refusal that subtree produces reads the
+    /// structure's sentence rather than the resource's.
+    NestedStructure {
+        /// The member the pointer entered, as the structure's sentence names it.
+        member: &'static str,
+        /// The pointers that structure accepts, spelled from the resource root, per `op`.
+        paths: SupportedPatchPaths,
+    },
 }
 
 impl InvalidPathRefusal {
@@ -2420,22 +2470,46 @@ impl InvalidPathRefusal {
     ///
     /// The enumerated set is the one belonging to `op`, so the sentence never offers a
     /// path the op that was submitted would refuse; an op the resource supports no path
-    /// for has nothing to enumerate and is refused as an op instead.
-    fn message(self, path: &str, op: PatchOpKind) -> String {
+    /// for has nothing to enumerate and is refused as an op instead, with the sentence
+    /// `unsupported_op` — the one the resource enumerates its OPS in.
+    fn message(self, path: &str, op: PatchOpKind, unsupported_op: &str) -> String {
         match self {
             Self::PathOnly => invalid_patch_path(path),
             Self::PathOpAndSupported(supported) => match supported.for_op(op) {
                 // The two spaces after `path` are the service's own, as is the bracketed,
                 // comma-separated list.
-                Some(paths) => format!(
+                Some(paths) if !paths.is_empty() => format!(
                     "Invalid patch path  '{path}' specified for op '{}'. Must be one of: [{}]",
                     op.as_str(),
                     paths.join(", ")
                 ),
-                None => INVALID_PATCH_OPERATION.to_string(),
+                // An op the resource publishes NO path for: there is no list to offer, so
+                // the sentence sends the caller to an op the resource does support instead
+                // of enumerating nothing, as a recorded refusal under such an op shows.
+                Some(_) => unsupported_patch_path_op(path, op),
+                None => unsupported_op.to_string(),
+            },
+            Self::NestedStructure { member, paths } => match paths.for_op(op) {
+                Some(paths) if !paths.is_empty() => invalid_nested_patch_path(member, paths),
+                Some(_) => unsupported_patch_path_op(path, op),
+                None => unsupported_op.to_string(),
             },
         }
     }
+}
+
+/// The `BadRequestException` message for a patch `path` named by an `op` the targeted
+/// resource publishes no path for at all.
+///
+/// Same opening as the enumerating sentence — the fixed text, the two spaces the service
+/// itself prints, the rejected path and the op that named it — and then, in place of a
+/// list it has nothing to fill, the fixed instruction to choose an op the resource
+/// supports.
+fn unsupported_patch_path_op(path: &str, op: PatchOpKind) -> String {
+    format!(
+        "Invalid patch path  '{path}' specified for op '{}'. Please choose supported operations",
+        op.as_str()
+    )
 }
 
 /// One parsed entry of `patchOperations`.
@@ -2455,6 +2529,9 @@ pub struct Patch {
     pub from: Option<String>,
     /// How the operation this patch was sent to words a refusal of its `path`.
     pub invalid_path: InvalidPathRefusal,
+    /// The sentence the resource this patch was sent to refuses an `op` it supports no
+    /// path for with — see [`INVALID_PATCH_OPERATION`] for the one most of them use.
+    pub unsupported_op: &'static str,
 }
 
 /// Decode one JSON Pointer reference token.
@@ -2468,10 +2545,12 @@ fn unescape_pointer_token(token: &str) -> String {
 
 impl Patch {
     /// Parse one wire `PatchOperation`, refusing a path it cannot read the way
-    /// `invalid_path` words it.
+    /// `invalid_path` words it and an op the resource takes no path for the way
+    /// `unsupported_op` words that.
     fn parse(
         operation: &crate::ops::types::PatchOperation,
         invalid_path: InvalidPathRefusal,
+        unsupported_op: &'static str,
     ) -> Result<Self, PatchFailure> {
         let op = operation.op.as_deref().ok_or_else(|| {
             PatchFailure::BadRequest(
@@ -2495,7 +2574,13 @@ impl Patch {
         // root, so it begins with `/` and names at least one member.
         let tokens: Vec<String> = match path.strip_prefix('/') {
             Some(rest) if !rest.is_empty() => rest.split('/').map(unescape_pointer_token).collect(),
-            _ => return Err(PatchFailure::BadRequest(invalid_path.message(path, op))),
+            _ => {
+                return Err(PatchFailure::BadRequest(invalid_path.message(
+                    path,
+                    op,
+                    unsupported_op,
+                )))
+            }
         };
         Ok(Self {
             op,
@@ -2504,13 +2589,15 @@ impl Patch {
             value: operation.value.clone(),
             from: operation.from.clone(),
             invalid_path,
+            unsupported_op,
         })
     }
 
     /// This patch's own refusal of its `path`, worded the way the operation it was sent
     /// to words one.
     fn invalid_path_message(&self) -> String {
-        self.invalid_path.message(&self.path, self.op)
+        self.invalid_path
+            .message(&self.path, self.op, self.unsupported_op)
     }
 
     /// The member the path's first reference token names.
@@ -2616,6 +2703,19 @@ impl Patch {
         Ok(parsed)
     }
 
+    /// This patch with a refusal of its `path` worded the way `invalid_path` words one,
+    /// for a handler that dispatches the pointer into a part of the resource whose
+    /// refusals the service words differently — a nested structure that enumerates its
+    /// own pointers ([`InvalidPathRefusal::NestedStructure`]). Re-labelled ONCE, where the
+    /// dispatch happens, so every refusal that subtree goes on to produce reads the same
+    /// sentence.
+    pub fn refused_with(&self, invalid_path: InvalidPathRefusal) -> Self {
+        Self {
+            invalid_path,
+            ..self.clone()
+        }
+    }
+
     /// This patch as it addresses a member of a NESTED structure: the first `depth`
     /// reference tokens — the ones naming the structure itself — are dropped, so the
     /// structure's own members are addressed exactly the way a top-level member is.
@@ -2650,10 +2750,11 @@ impl Patch {
     /// "Not all valid operations are supported for a given resource. Support of the
     /// operations depends on specific operational contexts. Attempts to apply an
     /// unsupported operation on a resource will return an error message"
-    /// (`PatchOperation$op`): see [`INVALID_PATCH_OPERATION`] for the ops these
-    /// resources support and the sentence they refuse the others with.
+    /// (`PatchOperation$op`): which ops a resource supports, and so the sentence it
+    /// enumerates them in, belongs to the resource — see [`INVALID_PATCH_OPERATION`] for
+    /// the one most of them use.
     pub fn unsupported_op(&self) -> PatchFailure {
-        PatchFailure::BadRequest(INVALID_PATCH_OPERATION.to_string())
+        PatchFailure::BadRequest(self.unsupported_op.to_string())
     }
 
     /// The entry of a collection member this patch names.
@@ -2693,14 +2794,33 @@ pub fn invalid_patch_path(path: &str) -> String {
     format!("Invalid patch path {path}")
 }
 
+/// The `BadRequestException` message for a patch path that names a NESTED structure of a
+/// resource, or reaches into one, where the structure rather than the resource owns the
+/// refusal.
+///
+/// API Gateway words this one by the STRUCTURE: it names the member the pointer entered
+/// and enumerates that member's full pointers, spelled from the resource root, and carries
+/// no part of the rejected path at all — so the same sentence answers the structure named
+/// as a whole, a sub-member it does not have, and a pointer reaching past one it does. The
+/// spacing around the colon is the service's own, as is the bracketed, comma-separated
+/// list. See [`InvalidPathRefusal::NestedStructure`].
+pub fn invalid_nested_patch_path(member: &str, paths: &[&str]) -> String {
+    format!(
+        "Invalid {member} path. Must be one of : [{}]",
+        paths.join(", ")
+    )
+}
+
 /// The `BadRequestException` message for an `op` the targeted resource supports no path
 /// for.
 ///
-/// The ops these resources support are `add`, `remove` and `replace` — `move`, `copy` and
-/// `test` name nothing on them — and a recorded AWS refusal of a `move` says exactly this,
-/// naming the three it does take and nothing about the path that rode in on it. One copy
-/// for every resource, so an op outside that set reads the same whichever one it was sent
-/// to and whichever pointer it carried.
+/// The ops MOST of these resources support are `add`, `remove` and `replace` — `move`,
+/// `copy` and `test` name nothing on them — and a recorded AWS refusal of a `move` says
+/// exactly this, naming the three it does take and nothing about the path that rode in on
+/// it. One copy for every resource that takes those three, so an op outside that set reads
+/// the same whichever one it was sent to and whichever pointer it carried; a resource whose
+/// recorded refusal enumerates ANOTHER set of ops (a stage, which takes a `copy`) passes
+/// its own sentence to [`parse_patches_refused_with_op`].
 pub const INVALID_PATCH_OPERATION: &str =
     "Invalid patch operation specified. Must be 'add'|'remove'|'replace'";
 
@@ -2721,13 +2841,23 @@ pub fn parse_patches_refused_with(
     operations: Option<&Vec<crate::ops::types::PatchOperation>>,
     invalid_path: InvalidPathRefusal,
 ) -> Result<Vec<Patch>, PatchFailure> {
+    parse_patches_refused_with_op(operations, invalid_path, INVALID_PATCH_OPERATION)
+}
+
+/// As [`parse_patches_refused_with`], for a resource that also enumerates ITS OWN ops when
+/// it refuses one it supports no path for — see [`INVALID_PATCH_OPERATION`].
+pub fn parse_patches_refused_with_op(
+    operations: Option<&Vec<crate::ops::types::PatchOperation>>,
+    invalid_path: InvalidPathRefusal,
+    unsupported_op: &'static str,
+) -> Result<Vec<Patch>, PatchFailure> {
     let operations: &[crate::ops::types::PatchOperation] =
         operations.map(Vec::as_slice).unwrap_or_default();
     bound_entries("patchOperations", operations.len(), MAX_COLLECTION_ENTRIES)
         .map_err(PatchFailure::BadRequest)?;
     operations
         .iter()
-        .map(|operation| Patch::parse(operation, invalid_path))
+        .map(|operation| Patch::parse(operation, invalid_path, unsupported_op))
         .collect()
 }
 

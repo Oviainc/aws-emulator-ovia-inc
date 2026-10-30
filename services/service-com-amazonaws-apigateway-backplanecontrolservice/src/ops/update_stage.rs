@@ -151,6 +151,37 @@ const THROTTLE_RATE_RANGE: ::std::ops::RangeInclusive<f64> = 0.0..=f64::MAX;
 /// least `$context.requestId`" (`AccessLogSettings$format`).
 const ACCESS_LOG_REQUIRED_CONTEXT_VARIABLE: &str = "$context.requestId";
 
+/// The sentence API Gateway refuses an `op` a stage supports no path for with.
+///
+/// The ops a stage takes are `replace` (its single-valued members), `remove` (its optional
+/// members and its nested structures) and `copy` (the canary promotion
+/// [`CANARY_DEPLOYMENT_POINTER`] documents), and a recorded refusal enumerates exactly
+/// those three, worded differently from the sentence the resources that take
+/// `add`/`remove`/`replace` use ([`crate::state::INVALID_PATCH_OPERATION`]).
+const STAGE_INVALID_PATCH_OPERATION: &str =
+    "Invalid patch operation specified. Must be one of: 'replace', 'remove', 'copy'";
+
+/// The pointers a patch may name inside a stage's `accessLogSettings`, spelled from the
+/// stage root: the two members the `AccessLogSettings` shape declares
+/// (`smithy_query(query="shape", shape="AccessLogSettings")` — `destinationArn` and
+/// `format`), which are the arms [`apply_access_log_patch`] has, in the order API
+/// Gateway's own refusal enumerates them.
+const ACCESS_LOG_PATHS: &[&str] = &[
+    "/accessLogSettings/destinationArn",
+    "/accessLogSettings/format",
+];
+
+/// How a refusal of a pointer inside `accessLogSettings` is worded: by the STRUCTURE, not
+/// by the stage — the member's name and the pointers above, with nothing of the rejected
+/// path, which is the sentence API Gateway answers such a pointer with. The three ops a
+/// stage takes on this structure enumerate the one list; `move`, `copy` and `test` name
+/// nothing inside it and are refused as ops.
+const ACCESS_LOG_REFUSAL: crate::state::InvalidPathRefusal =
+    crate::state::InvalidPathRefusal::NestedStructure {
+        member: "accessLogSettings",
+        paths: crate::state::SupportedPatchPaths::for_every_op(ACCESS_LOG_PATHS),
+    };
+
 /// The `cacheTtlInSeconds` a method-setting entry carries when the patch does not name
 /// it: "The default TTL value for API caching is 300 seconds."
 const DEFAULT_CACHE_TTL_SECONDS: i32 = 300;
@@ -397,6 +428,12 @@ fn apply_canary_patch(
 
 /// Apply one patch that names the `accessLogSettings` structure or reaches into it.
 fn apply_access_log_patch(entry: &mut StageEntry, patch: &Patch) -> Result<(), PatchFailure> {
+    // Re-labelled once, here: every way a pointer into this structure can fail to apply —
+    // the structure named as a whole by an op that cannot address it that way, a
+    // sub-member it does not have, a pointer reaching past one it does — is answered with
+    // the structure's own sentence (see [`ACCESS_LOG_REFUSAL`]), which the nested patch
+    // below inherits.
+    let patch = &patch.refused_with(ACCESS_LOG_REFUSAL);
     if patch.tokens.len() == 1 {
         return match patch.op {
             PatchOpKind::Remove => {
@@ -641,8 +678,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The list is read BEFORE the store lock is taken, so a malformed patch never
         // reaches the records at all.
-        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
-            .map_err(patch_failure)?;
+        let patches = crate::state::parse_patches_refused_with_op(
+            input.patch_operations.as_ref(),
+            crate::state::InvalidPathRefusal::PathOnly,
+            STAGE_INVALID_PATCH_OPERATION,
+        )
+        .map_err(patch_failure)?;
 
         let now = crate::state::now();
         let mut store = state.lock();

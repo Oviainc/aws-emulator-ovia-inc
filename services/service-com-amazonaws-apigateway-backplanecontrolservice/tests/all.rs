@@ -294,3 +294,6 @@ mod stage_refusal_error_class;
 // Appended for the reason the note above gives.
 #[path = "all/stage_variable_integration_target.rs"]
 mod stage_variable_integration_target;
+// Appended for the reason the note above gives.
+#[path = "all/patch_path_refusal_templates.rs"]
+mod patch_path_refusal_templates;

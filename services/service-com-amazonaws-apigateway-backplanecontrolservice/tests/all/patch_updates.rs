@@ -400,8 +400,9 @@ async fn an_unsupported_patch_path_is_refused_with_the_path_the_request_sent() {
     // answers a path the resource cannot be addressed by with one fixed sentence and the
     // path exactly as the request spelled it — a recorded refusal of a `replace` of `/id`
     // reads `Invalid patch path /id` — and names neither the op nor the paths the resource
-    // does have. `UpdateApiKey` words its own refusal, covered by the
-    // `update_api_key_patch_path_refusal` suite.
+    // does have. The operations that DO enumerate their published paths — `UpdateApiKey`,
+    // `UpdateResource` and the rest of that surface — are covered by the
+    // `update_api_key_patch_path_refusal` and `patch_path_refusal_templates` suites.
     let gateway = Gateway::new();
 
     // Rows differ in the member the path names and in the resource it was named on.
@@ -424,14 +425,14 @@ async fn an_unsupported_patch_path_is_refused_with_the_path_the_request_sent() {
     for (case, uri, path) in [
         ("UpdateRestApi", format!("/restapis/{api}"), "/rootResourceId"),
         (
-            "UpdateResource",
-            format!("/restapis/{api}/resources/{resource_id}"),
-            "/path",
-        ),
-        (
-            "UpdateMethod",
+            "UpdateMethod names the verb the URI addresses",
             format!("/restapis/{api}/resources/{resource_id}/methods/GET"),
             "/httpMethod",
+        ),
+        (
+            "UpdateMethod names the resource it hangs off",
+            format!("/restapis/{api}/resources/{resource_id}/methods/GET"),
+            "/resourceId",
         ),
     ] {
         let answer = patch(&gateway, &uri, vec![replace(path, "x")]).await;

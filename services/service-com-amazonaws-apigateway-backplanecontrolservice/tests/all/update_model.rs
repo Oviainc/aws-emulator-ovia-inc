@@ -417,15 +417,18 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
         assert_members(&read.body, &baseline_members, case, "GetModel");
     }
 
-    // A path the resource has no updateable member for is refused with the fixed sentence
-    // and the path the request sent, and nothing else.
+    // A path the resource has no updateable member for is refused with the path quoted,
+    // the `op` of the same entry and the paths a model publishes — the wording the
+    // `patch_path_refusal_templates` suite pins for every operation that enumerates them.
     let case = "the message of an unsupported path";
     baseline(&gateway, &api, case, "Wording", baseline_request()).await;
     let answer = update(&gateway, &api, "Wording", vec![replace("/name", "Renamed")]).await;
     let message = answer.body["message"].as_str().unwrap_or_default();
     assert_eq!(
-        message, "Invalid patch path /name",
-        "case {case}: expected the fixed sentence and the path, got {message:?}"
+        message,
+        "Invalid patch path  '/name' specified for op 'replace'. \
+         Must be one of: [/description, /schema]",
+        "case {case}: expected the path, the op and the model's own paths, got {message:?}"
     );
 }
 

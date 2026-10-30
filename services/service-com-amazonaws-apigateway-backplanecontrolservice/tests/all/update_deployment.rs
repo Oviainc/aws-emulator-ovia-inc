@@ -264,7 +264,7 @@ async fn a_patched_deployment_description_is_stored_and_read_back() {
 }
 
 #[tokio::test]
-async fn an_unsupported_patch_path_is_refused_with_the_path_the_request_sent() {
+async fn an_unsupported_patch_path_is_refused_with_the_path_the_op_and_the_published_paths() {
     let gateway = Gateway::new();
     let (api, _) = api_with_a_method(&gateway, "deployment-unsupported-path").await;
 
@@ -293,10 +293,21 @@ async fn an_unsupported_patch_path_is_refused_with_the_path_the_request_sent() {
         let answer =
             update_deployment(&gateway, &api, &deployment, vec![op(kind, path, Some("x"))]).await;
         assert_failure(&answer, 400, "BadRequestException", &case);
+        // A `replace` is the op a deployment publishes its path for, so its refusal
+        // enumerates that list; the ops it publishes none for are sent to the ops it does
+        // support instead.
+        let enumeration = if kind == "replace" {
+            "Must be one of: [/description]"
+        } else {
+            "Please choose supported operations"
+        };
         assert_eq!(
             answer.body["message"].as_str(),
-            Some(format!("Invalid patch path {path}").as_str()),
-            "case {case}: expected the fixed sentence and the path the request sent, got {:?}",
+            Some(
+                format!("Invalid patch path  '{path}' specified for op '{kind}'. {enumeration}")
+                    .as_str()
+            ),
+            "case {case}: expected the path, the op and the deployment's own paths, got {:?}",
             answer.body["message"]
         );
         // Nothing was applied: the stored record is the one the create wrote.

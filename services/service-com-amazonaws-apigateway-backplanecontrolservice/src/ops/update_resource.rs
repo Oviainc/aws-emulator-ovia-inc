@@ -81,7 +81,24 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{Patch, PatchFailure, PatchOpKind, ResourceEntry, RestApiEntry};
+use crate::state::{
+    InvalidPathRefusal, Patch, PatchFailure, PatchOpKind, ResourceEntry, RestApiEntry,
+    SupportedPatchPaths,
+};
+
+/// The paths a `Resource` can be addressed by, in the order API Gateway enumerates them
+/// when it refuses one it cannot apply: the resource's place in the tree and its own
+/// segment, as pointers from the record root. Published for a `replace`: see
+/// [`SupportedPatchPaths::replace_only`].
+const PATCH_PATHS: SupportedPatchPaths =
+    SupportedPatchPaths::replace_only(&["/parentId", "/pathPart"]);
+
+/// How this operation words a refusal of a patch `path` it cannot apply: the path quoted,
+/// the `op` that named it and the paths this resource publishes. Reaches every path
+/// refusal the request goes on to produce, so one unapplicable pointer reads the same
+/// whether it names no member of the resource, reaches into one of its single-valued
+/// members, or is no JSON Pointer at all.
+const INVALID_PATH: InvalidPathRefusal = InvalidPathRefusal::PathOpAndSupported(PATCH_PATHS);
 
 // The `path` values `UpdateResource` accepts are the ones `apply_patch` below has an arm
 // for: the resource's own segment and its place in the tree. `id` is assigned by the
@@ -326,8 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The list is read BEFORE the store lock is taken, so a malformed patch never
         // reaches the records at all.
-        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
-            .map_err(patch_failure)?;
+        let patches =
+            crate::state::parse_patches_refused_with(input.patch_operations.as_ref(), INVALID_PATH)
+                .map_err(patch_failure)?;
 
         let mut store = state.lock();
 

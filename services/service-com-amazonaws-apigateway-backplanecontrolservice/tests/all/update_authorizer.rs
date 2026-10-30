@@ -555,15 +555,20 @@ async fn an_op_or_path_the_resource_does_not_support_is_refused_and_changes_noth
         after.body, before.body
     );
 
-    // The refusal is the fixed sentence and the path the request sent, and nothing else:
-    // it names neither the op nor the paths the resource does have.
+    // The refusal quotes the path, names the `op` of the same entry and enumerates the
+    // paths an authorizer publishes — the wording the `patch_path_refusal_templates` suite
+    // pins for every operation that enumerates them.
     let answer = update(&gateway, &api, &id, vec![replace("/id", "0123456789")]).await;
     let message = answer.body["message"]
         .as_str()
         .unwrap_or_else(|| panic!("case the unsupported path message: expected a message, got {:?}", answer.body));
     assert_eq!(
-        message, "Invalid patch path /id",
-        "case the unsupported path message: expected the fixed sentence and the path, got {message:?}"
+        message,
+        "Invalid patch path  '/id' specified for op 'replace'. Must be one of: [/name, /type, \
+         /authType, /authorizerUri, /authorizerCredentials, /identitySource, \
+         /identityValidationExpression, /authorizerResultTtlInSeconds]",
+        "case the unsupported path message: expected the path, the op and the authorizer's \
+         own paths, got {message:?}"
     );
 }
 

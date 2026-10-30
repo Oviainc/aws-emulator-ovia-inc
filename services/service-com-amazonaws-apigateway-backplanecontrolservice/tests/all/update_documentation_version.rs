@@ -21,8 +21,8 @@
 //! * the members a patch does not name are untouched: the version identifier stays the
 //!   record's key and the creation date is not re-stamped by an update;
 //! * a path naming no updateable member of the `DocumentationVersion` shape is refused
-//!   with this service's one unaddressable-path sentence, carrying the path the request
-//!   sent and nothing else;
+//!   with the path quoted, the `op` of the same entry and the paths a documentation
+//!   version publishes;
 //! * an op the resource does not support is refused, over `move`, `copy` and `test`, and
 //!   over an entry carrying no op or no path at all;
 //! * a refusal changes nothing — the stored snapshot is re-read after each one, and a
@@ -31,9 +31,7 @@
 //!   a version identifier addressed through another API.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    invalid_patch_path, MAX_STRING_CHARS,
-};
+use service_com_amazonaws_apigateway_backplanecontrolservice::state::MAX_STRING_CHARS;
 
 use crate::documentation_versions::{create_version, get_version, snapshot_request};
 use crate::rest_api_lifecycle::{
@@ -50,6 +48,22 @@ const VERSION: &str = "1.0.0";
 /// The description they are created with, so a refused patch is seen not to have changed
 /// it.
 const ORIGINAL_DESCRIPTION: &str = "the original snapshot description";
+
+/// The message `UpdateDocumentationVersion` refuses a path it cannot apply with: the path
+/// quoted, the `op` of the same `patchOperations` entry, and then the one path a
+/// documentation version publishes for THAT op — `description`, the only member of the
+/// shape a patch can change, which the service publishes for a `replace`. An op it
+/// publishes no path for is sent to the ops it does support instead.
+fn unaddressable_path(path: &str, op: &str) -> String {
+    if op == "replace" {
+        return format!(
+            "Invalid patch path  '{path}' specified for op '{op}'. Must be one of: [/description]"
+        );
+    }
+    format!(
+        "Invalid patch path  '{path}' specified for op '{op}'. Please choose supported operations"
+    )
+}
 
 /// One API with one documentation version on it, as every case below starts.
 async fn api_with_version(gateway: &Gateway, name: &str) -> String {
@@ -323,9 +337,8 @@ async fn a_path_naming_no_updateable_member_is_refused_and_changes_nothing() {
     // Each row is a path naming a member of the `DocumentationVersion` shape that a patch
     // cannot change — the identifier the record is keyed by and the service-stamped
     // creation date — or a member the shape does not declare at all. The refusal's TEXT is
-    // part of the rule: this control plane answers every unaddressable path with the one
-    // sentence `invalid_patch_path` builds, carrying the path the request sent and nothing
-    // else, whichever op named it.
+    // part of the rule: every unaddressable path is answered with the path quoted, the op
+    // that named it and the paths this resource publishes, whichever op named it.
     for path in ["/version", "/createdDate", "/unknown"] {
         for op in ["replace", "add", "remove"] {
             let case = format!("op={op} {path}");
@@ -334,8 +347,8 @@ async fn a_path_naming_no_updateable_member_is_refused_and_changes_nothing() {
             assert_failure(&answer, 400, BAD_REQUEST, &case);
             assert_eq!(
                 answer.body["message"].as_str(),
-                Some(invalid_patch_path(path).as_str()),
-                "case {case}: the refusal must be the unaddressable-path sentence carrying the path alone, got {:?}",
+                Some(unaddressable_path(path, op).as_str()),
+                "case {case}: the refusal must quote the path, the op and the published paths, got {:?}",
                 answer.body["message"]
             );
             assert_description(
@@ -361,7 +374,7 @@ async fn a_path_naming_no_updateable_member_is_refused_and_changes_nothing() {
         assert_failure(&answer, 400, BAD_REQUEST, &case);
         assert_eq!(
             answer.body["message"].as_str(),
-            Some(invalid_patch_path(path).as_str()),
+            Some(unaddressable_path(path, "replace").as_str()),
             "case {case}: expected the unaddressable-path sentence, got {:?}",
             answer.body["message"]
         );

@@ -123,19 +123,12 @@ async fn a_patch_path_the_resource_cannot_be_addressed_by_is_refused_with_the_pa
         method_response.status, method_response.body
     );
     create_deployed_stage(&gateway, &api, "prod").await;
-    let documentation_part = created_part_id(
-        &gateway,
-        &api,
-        json!({ "type": "API" }),
-        &content_map("the part the patch rows target"),
-        "CreateDocumentationPart",
-    )
-    .await;
     // Rows differ along what the rule generalises over: the operation and so the resource
     // the pointer was applied to, and the FORM of the unaddressable pointer — a member the
     // service assigns, a member no shape declares, a pointer reaching into a single-valued
     // member, a pointer naming a map member with no key, and a path that is no JSON Pointer
-    // at all.
+    // at all. The operations that enumerate their published paths instead — which is most
+    // of the `Update*` surface — are the `patch_path_refusal_templates` suite's.
     let rows: Vec<(&str, String, &str)> = vec![
         (
             "UpdateRestApi names a service-assigned member",
@@ -163,14 +156,9 @@ async fn a_patch_path_the_resource_cannot_be_addressed_by_is_refused_with_the_pa
             "/statusCode",
         ),
         (
-            "UpdateDocumentationPart names the part's own location",
-            format!("/restapis/{api}/documentation/parts/{documentation_part}"),
-            "/location/type",
-        ),
-        (
-            "UpdateDocumentationPart sends a path that is no JSON Pointer",
-            format!("/restapis/{api}/documentation/parts/{documentation_part}"),
-            "properties",
+            "UpdateMethodResponse sends a path that is no JSON Pointer",
+            format!("/restapis/{api}/resources/{resource}/methods/GET/responses/200"),
+            "statusCode",
         ),
     ];
 

@@ -75,8 +75,22 @@
 use super::types::*;
 
 use crate::state::{
-    patch_optional_string, DocumentationVersionEntry, Patch, PatchFailure, MAX_STRING_CHARS,
+    patch_optional_string, DocumentationVersionEntry, InvalidPathRefusal, Patch, PatchFailure,
+    SupportedPatchPaths, MAX_STRING_CHARS,
 };
+
+/// The paths a `DocumentationVersion` can be addressed by, in the order API Gateway
+/// enumerates them when it refuses one it cannot apply: the one member below, as a pointer
+/// from the record root. Published for a `replace`: see
+/// [`SupportedPatchPaths::replace_only`].
+const PATCH_PATHS: SupportedPatchPaths = SupportedPatchPaths::replace_only(&["/description"]);
+
+/// How this operation words a refusal of a patch `path` it cannot apply: the path quoted,
+/// the `op` that named it and the paths this resource publishes. Reaches every path
+/// refusal the request goes on to produce, so one unapplicable pointer reads the same
+/// whether it names no member of the version, reaches into one of its single-valued
+/// members, or is no JSON Pointer at all.
+const INVALID_PATH: InvalidPathRefusal = InvalidPathRefusal::PathOpAndSupported(PATCH_PATHS);
 
 // The patch paths a `DocumentationVersion` accepts are the ones `apply_patch` below has an
 // arm for.
@@ -211,8 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The list is read BEFORE the store lock is taken, so a malformed patch never
         // reaches the records at all.
-        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
-            .map_err(patch_failure)?;
+        let patches =
+            crate::state::parse_patches_refused_with(input.patch_operations.as_ref(), INVALID_PATH)
+                .map_err(patch_failure)?;
 
         let mut store = state.lock();
         let api = store

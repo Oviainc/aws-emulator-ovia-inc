@@ -82,7 +82,24 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{patch_optional_string, Patch, PatchFailure};
+use crate::state::{
+    patch_optional_string, InvalidPathRefusal, Patch, PatchFailure, SupportedPatchPaths,
+};
+
+/// The paths an `Account` can be addressed by, in the order API Gateway enumerates them
+/// when it refuses one it cannot apply: the account's CloudWatch role
+/// ([`crate::state::ACCOUNT_CLOUDWATCH_ROLE_PATH`], as a pointer from the record root) is
+/// the one member a caller sets, which is the one arm `apply_patch` below has. Published
+/// for a `replace`: see [`SupportedPatchPaths::replace_only`].
+const PATCH_PATHS: SupportedPatchPaths =
+    SupportedPatchPaths::replace_only(&["/cloudwatchRoleArn"]);
+
+/// How this operation words a refusal of a patch `path` it cannot apply: the path quoted,
+/// the `op` that named it and the paths this resource publishes. Reaches every path
+/// refusal the request goes on to produce, so one unapplicable pointer reads the same
+/// whether it names no member of the account, reaches into one of its single-valued
+/// members, or is no JSON Pointer at all.
+const INVALID_PATH: InvalidPathRefusal = InvalidPathRefusal::PathOpAndSupported(PATCH_PATHS);
 
 /// The ARN vendor an account's CloudWatch role ARN names, and the resource type under
 /// it: the member is "the ARN of an Amazon CloudWatch role for the current Account", and
@@ -98,27 +115,36 @@ const ROLE_RESOURCE_TYPE: &str = "role";
 /// Only the ARN's SHAPE is judged, which is what this emulator can know without IAM:
 /// whether the role exists and whether API Gateway may assume it is a separate check
 /// that belongs to whatever resolves the role against IAM.
+/// The one sentence API Gateway refuses a `cloudwatchRoleArn` that is not an ARN it can
+/// read with: entirely fixed text, naming neither the rejected value nor the member that
+/// carried it, as a recorded refusal of such a value shows.
+const INVALID_ARN: &str = "Invalid ARN specified in the request";
+
+/// Refuse a `cloudwatchRoleArn` that is not an IAM role ARN.
+///
+/// Only the ARN's SHAPE is judged, which is what this emulator can know without IAM:
+/// whether the role exists and whether API Gateway may assume it is a separate check
+/// that belongs to whatever resolves the role against IAM.
 fn role_arn_violation(role_arn: &str) -> Option<String> {
     let names_a_role = ::service_common::arn::parse_of(role_arn, IAM_VENDOR)
         .is_some_and(|arn| arn.resource_type() == ROLE_RESOURCE_TYPE);
-    (!names_a_role).then(|| {
-        format!(
-            "Invalid role ARN specified: /{} takes an IAM role ARN of the form \
-             arn:{{partition}}:iam::{{account}}:role/{{name}}",
-            crate::state::ACCOUNT_CLOUDWATCH_ROLE_PATH
-        )
-    })
+    (!names_a_role).then(|| INVALID_ARN.to_string())
 }
 
 /// Apply one patch to a COPY of the stored account record.
 ///
 /// Only the CloudWatch role is a caller's to set: `throttleSettings`, `features` and
 /// `apiKeyVersion` are values API Gateway itself reports for the account, so a patch
-/// naming one of them is refused with the same "Invalid patch path" wording every other
-/// unsupported path on this surface earns.
+/// naming one of them is refused with the path, the `op` that named it and the paths the
+/// account does publish ([`PATCH_PATHS`]), the way every unsupported path on this resource
+/// is refused.
 fn apply_patch(account: &mut crate::state::AccountEntry, patch: &Patch) -> Result<(), PatchFailure> {
     match patch.member() {
         crate::state::ACCOUNT_CLOUDWATCH_ROLE_PATH => {
+            // The POINTER is judged before the value it carries: a path reaching into this
+            // single-valued member names nothing the account has, so it is refused as a
+            // path whatever value rode in on it.
+            patch.require_single_valued()?;
             if let Some(role_arn) = patch.value.as_deref() {
                 if let Some(violation) = role_arn_violation(role_arn) {
                     return Err(PatchFailure::BadRequest(violation));
@@ -212,8 +238,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The list is read BEFORE the store lock is taken, so a malformed patch never
         // reaches the record at all.
-        let patches = crate::state::parse_patches(input.patch_operations.as_ref())
-            .map_err(patch_failure)?;
+        let patches =
+            crate::state::parse_patches_refused_with(input.patch_operations.as_ref(), INVALID_PATH)
+                .map_err(patch_failure)?;
 
         let mut store = state.lock();
         // Patched on a COPY: a list whose later op is refused leaves the stored account

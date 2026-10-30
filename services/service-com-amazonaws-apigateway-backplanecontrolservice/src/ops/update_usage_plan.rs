@@ -88,9 +88,64 @@ use std::collections::BTreeMap;
 
 use crate::state::{
     patch_enum_string, patch_f64_checked, patch_i32_checked, patch_optional_string,
-    patch_required_string, Patch, PatchFailure, PatchOpKind, RestApiEntry, UsagePlanEntry,
-    MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
+    patch_required_string, InvalidPathRefusal, Patch, PatchFailure, PatchOpKind, RestApiEntry,
+    SupportedPatchPaths, UsagePlanEntry, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS,
 };
+
+/// The paths a `UsagePlan` publishes, per `op`, in the order API Gateway enumerates them
+/// when it refuses one it cannot apply: the plan's own members, its throttle and quota
+/// settings, the API stage associations its limits apply to, and the per-method throttle of
+/// one association — the last ones spelled as the TEMPLATES the service publishes,
+/// placeholders and all, because the association, the resource path and the method a caller
+/// names are its own.
+///
+/// The three sets differ in which ops a member admits: the plan's `name` and `description`
+/// are replaced and so appear under `replace` alone; an API stage association is one
+/// ELEMENT of a list, so it heads the `add` and `remove` sets and is in neither the replace
+/// one; and a `remove` drops a nested SETTING STRUCTURE whole (`/quota`, `/throttle`) where
+/// an `add` and a `replace` name the structure's individual members.
+const PATCH_PATHS: SupportedPatchPaths = SupportedPatchPaths {
+    add: &[
+        "/apiStages",
+        "/productCode",
+        "/quota/period",
+        "/quota/limit",
+        "/quota/offset",
+        "/throttle/rateLimit",
+        "/throttle/burstLimit",
+        "/apiStages/<apidId:stageName>/throttle/<resourcePath>/<httpMethod>/rateLimit",
+        "/apiStages/<apidId:stageName>/throttle/<resourcePath>/<httpMethod>/burstLimit",
+        "/apiStages/<apidId:stageName>/throttle",
+    ],
+    remove: &[
+        "/apiStages",
+        "/quota",
+        "/throttle",
+        "/productCode",
+        "/apiStages/<apidId:stageName>/throttle/<resourcePath>/<httpMethod>",
+        "/apiStages/<apidId:stageName>/throttle",
+    ],
+    replace: &[
+        "/name",
+        "/description",
+        "/productCode",
+        "/quota/period",
+        "/quota/limit",
+        "/quota/offset",
+        "/throttle/rateLimit",
+        "/throttle/burstLimit",
+        "/apiStages/<apidId:stageName>/throttle/<resourcePath>/<httpMethod>/rateLimit",
+        "/apiStages/<apidId:stageName>/throttle/<resourcePath>/<httpMethod>/burstLimit",
+        "/apiStages/<apidId:stageName>/throttle",
+    ],
+};
+
+/// How this operation words a refusal of a patch `path` it cannot apply: the path quoted,
+/// the `op` that named it and the paths this resource publishes. Reaches every path
+/// refusal the request goes on to produce, so one unapplicable pointer reads the same
+/// whether it names no member of the plan, reaches into one of its nested settings, or is
+/// no JSON Pointer at all.
+const INVALID_PATH: InvalidPathRefusal = InvalidPathRefusal::PathOpAndSupported(PATCH_PATHS);
 
 // The `path` values `UpdateUsagePlan` accepts are the ones `apply_patch` below has an arm
 // for: one per member of the `UsagePlan` shape a CALLER owns — its name, description and
@@ -461,7 +516,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The list is read BEFORE the store lock is taken, so a malformed patch never
         // reaches the records at all.
         let patches =
-            crate::state::parse_patches(input.patch_operations.as_ref()).map_err(patch_failure)?;
+            crate::state::parse_patches_refused_with(input.patch_operations.as_ref(), INVALID_PATH)
+                .map_err(patch_failure)?;
 
         let mut store = state.lock();
         // A usage plan belongs to the account, so the id is resolved against the account's

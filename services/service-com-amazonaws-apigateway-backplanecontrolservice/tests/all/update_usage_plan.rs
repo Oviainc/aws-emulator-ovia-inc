@@ -830,14 +830,21 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
         assert_members(&read.body, &baseline_members, case, "GetUsagePlan");
     }
 
-    // A path the resource has no updateable member for is refused with the fixed sentence
-    // and the path the request sent, and nothing else.
+    // A path the resource has no updateable member for is refused with the path quoted, the
+    // `op` of the same entry and the paths a plan publishes — the wording the
+    // `patch_path_refusal_templates` suite pins for every operation that enumerates them.
     let answer = update(&gateway, &id, vec![replace("/id", "zzzzzzzzzz")]).await;
     let message = answer.body["message"].as_str().unwrap_or_default();
     assert_eq!(
-        message, "Invalid patch path /id",
-        "case the message of an unsupported path: expected the fixed sentence and the path, \
-         got {message:?}"
+        message,
+        "Invalid patch path  '/id' specified for op 'replace'. Must be one of: [/name, \
+         /description, /productCode, /quota/period, /quota/limit, /quota/offset, \
+         /throttle/rateLimit, /throttle/burstLimit, \
+         /apiStages/<apidId:stageName>/throttle/<resourcePath>/<httpMethod>/rateLimit, \
+         /apiStages/<apidId:stageName>/throttle/<resourcePath>/<httpMethod>/burstLimit, \
+         /apiStages/<apidId:stageName>/throttle]",
+        "case the message of an unsupported path: expected the path, the op and the plan's \
+         own paths, got {message:?}"
     );
 }
 
