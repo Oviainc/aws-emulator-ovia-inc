@@ -97,6 +97,8 @@ mod invitation_delete;
 mod invitation_delivery;
 #[path = "all/invitation_listing.rs"]
 mod invitation_listing;
+#[path = "all/invite_members_no_send_clock.rs"]
+mod invite_members_no_send_clock;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
 #[path = "all/ip_set_listing.rs"]
