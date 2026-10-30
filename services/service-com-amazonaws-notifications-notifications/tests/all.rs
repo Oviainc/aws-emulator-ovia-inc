@@ -13,8 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/channel_associations.rs"]
 mod channel_associations;
+#[path = "all/channel_not_found_message.rs"]
+mod channel_not_found_message;
 #[path = "all/configuration_status.rs"]
 mod configuration_status;
+#[path = "all/event_rule_pair_uniqueness.rs"]
+mod event_rule_pair_uniqueness;
 #[path = "all/event_rule_updates.rs"]
 mod event_rule_updates;
 #[path = "all/event_rules.rs"]

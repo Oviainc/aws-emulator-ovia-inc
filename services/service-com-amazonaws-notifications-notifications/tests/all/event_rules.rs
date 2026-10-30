@@ -453,63 +453,36 @@ async fn creating_a_rule_for_a_configuration_that_does_not_exist_is_not_found() 
     }
 }
 
-/// RULE: `CreateEventRule` is `@idempotent` — repeating a request already served
-/// reports the rule it made instead of minting a second one, and Region order is
-/// not part of what was asked for; a request that differs in any member is a
-/// different request and makes its own rule.
+/// RULE: one EventRule per `(source, eventType)` pair per
+/// NotificationConfiguration — a create naming a pair one of that
+/// configuration's rules already covers is refused with the modelled
+/// `ConflictException` (HTTP 409) and persists nothing, whatever the rest of the
+/// request carries, while a create whose pair no rule of it covers mints a rule
+/// of its own.
 #[tokio::test]
-async fn a_repeated_create_reports_the_same_rule_and_a_changed_one_makes_another() {
+async fn a_create_for_an_already_covered_pair_conflicts_and_a_new_pair_makes_a_rule() {
     for case in cases() {
         let label = case.case;
         let emulator = Emulator::new();
         let configuration = emulator.create_configuration("rule-host").await;
         let body = request_body(&case, &configuration);
 
-        let (_, first) = emulator.create_event_rule(body.clone()).await;
-        let (status, repeated) = emulator.create_event_rule(body.clone()).await;
+        let (status, first) = emulator.create_event_rule(body.clone()).await;
         assert_eq!(
             status, 201,
-            "case {label:?}: a repeated create stays successful, got {repeated:?}"
-        );
-        assert_eq!(
-            repeated["arn"], first["arn"],
-            "case {label:?}: a repeated create reports the rule it already made, got {repeated:?}"
-        );
-        assert_eq!(
-            stored_event_rule_count(&emulator),
-            1,
-            "case {label:?}: a repeated create does not mint a second rule"
+            "case {label:?}: the first create of a pair succeeds, got {first:?}"
         );
 
-        // The same Regions in another order are the same request: the status map
-        // is keyed by Region, so their order carries nothing.
+        // Rows differ in how the second request for the covered pair varies from
+        // the first: not at all, in the order it lists the same Regions, in its
+        // `eventPattern`, and in the Regions it covers. The pair is what names a
+        // rule, so each of them is already covered.
         let mut reordered = body.clone();
         let mut regions = case.regions.clone();
         regions.reverse();
         reordered["regions"] = json!(regions);
-        let (status, same) = emulator.create_event_rule(reordered).await;
-        assert_eq!(
-            status, 201,
-            "case {label:?}: the same Regions reordered stays successful, got {same:?}"
-        );
-        assert_eq!(
-            same["arn"], first["arn"],
-            "case {label:?}: Region order is not part of the request, got {same:?}"
-        );
-        assert_eq!(
-            stored_event_rule_count(&emulator),
-            1,
-            "case {label:?}: reordering the Regions does not mint a second rule"
-        );
-
-        // A request that differs in a member is a different request. One row
-        // per member that identifies a rule.
         let mut different_pattern = body.clone();
         different_pattern["eventPattern"] = json!(r#"{"detail":{"other":["value"]}}"#);
-        let mut different_type = body.clone();
-        different_type["eventType"] = json!("Another Event Type");
-        let mut different_source = body.clone();
-        different_source["source"] = json!("aws.other");
         let mut extra_region = body.clone();
         let mut widened = case.distinct_regions.clone();
         assert!(
@@ -519,12 +492,39 @@ async fn a_repeated_create_reports_the_same_rule_and_a_changed_one_makes_another
         widened.push(UNLISTED_REGION.to_string());
         extra_region["regions"] = json!(widened);
 
+        for (variation, duplicate) in [
+            ("the identical request repeated", body.clone()),
+            ("the same Regions in another order", reordered),
+            ("a different eventPattern", different_pattern),
+            ("one more Region", extra_region),
+        ] {
+            let (status, refused) = emulator.create_event_rule(duplicate).await;
+            assert_eq!(
+                status, 409,
+                "case {label:?} / {variation}: a create for a covered pair answers the modelled 409, got {refused:?}"
+            );
+            assert!(
+                error_code(&refused).contains("ConflictException"),
+                "case {label:?} / {variation}: that refusal is a ConflictException, got {refused:?}"
+            );
+            assert_eq!(
+                stored_event_rule_count(&emulator),
+                1,
+                "case {label:?} / {variation}: a refused create persists nothing"
+            );
+        }
+
+        // A pair no rule of this configuration covers is its own rule. One row
+        // per member of the pair.
+        let mut different_type = body.clone();
+        different_type["eventType"] = json!("Another Event Type");
+        let mut different_source = body.clone();
+        different_source["source"] = json!("aws.other");
+
         let mut expected = 1;
         for (member, changed) in [
-            ("eventPattern", different_pattern),
             ("eventType", different_type),
             ("source", different_source),
-            ("regions", extra_region),
         ] {
             let (status, other) = emulator.create_event_rule(changed).await;
             assert_eq!(
@@ -715,12 +715,16 @@ async fn a_create_past_the_cap_is_refused_with_the_quota_error() {
         "a refused create does not grow the store"
     );
 
-    // A repeat of a create already served is still served at the cap: it asks
-    // for no new rule.
+    // A create for a pair already covered is refused for the pair, not for the
+    // cap: the conflict is what a caller at the ceiling is told.
     let (status, repeated) = emulator.create_event_rule(body_for(0)).await;
     assert_eq!(
-        status, 201,
-        "a repeat of an existing rule is served at the cap, got {repeated:?}"
+        status, 409,
+        "a create for a covered pair at the cap conflicts, got {repeated:?}"
+    );
+    assert!(
+        error_code(&repeated).contains("ConflictException"),
+        "that refusal is a ConflictException, got {repeated:?}"
     );
 
     // The cap is per configuration.

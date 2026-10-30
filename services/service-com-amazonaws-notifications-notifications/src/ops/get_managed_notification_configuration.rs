@@ -165,9 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = store.managed_configurations.get(&input.arn).ok_or_else(|| {
             GetManagedNotificationConfigurationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "no ManagedNotificationConfiguration exists with arn {}",
-                        input.arn
+                    message: crate::state::not_found_message(
+                        crate::state::MANAGED_CONFIGURATION_RESOURCE_LABEL,
+                        crate::state::ARN_IDENTIFIER_LABEL,
+                        &input.arn,
                     ),
                     resource_id: input.arn.clone(),
                 },

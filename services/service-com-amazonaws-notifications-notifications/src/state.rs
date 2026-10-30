@@ -277,6 +277,31 @@ pub fn regions_bound_field_message() -> String {
     format!("the list names more than the {MAX_REGIONS_PER_EVENT_RULE} Regions an EventRule covers")
 }
 
+/// How this service states a create of an `EventRule` for a `(source,
+/// eventType)` pair one of the configuration's rules already covers: the
+/// `message` of the `ConflictException` (HTTP 409) that refuses it.
+///
+/// The pair is what identifies a rule, so the sentence states the pair that is
+/// already covered and the configuration covering it, in the same lower-case
+/// prose this service's other refusals use. Spelled once so the refusal reads
+/// the same way wherever the uniqueness of a pair is enforced.
+///
+/// AWS's own sentence for this refusal is neither in the model (whose
+/// `ConflictException` carries only the generic documentation of the shape) nor
+/// among the refusals this service has been observed to state, so the wording
+/// here is this service's own and an observation of AWS's supersedes it; the
+/// variable parts come from the request either way.
+pub fn event_rule_pair_conflict_message(
+    configuration_arn: &str,
+    source: &str,
+    event_type: &str,
+) -> String {
+    format!(
+        "an event rule with source {source} and event type {event_type} already exists for \
+         notification configuration {configuration_arn}"
+    )
+}
+
 /// The Regions one `EventRule` covers, out of the list a request asked for: the
 /// Regions in the order they were named, without repeats.
 ///
@@ -1010,38 +1035,28 @@ impl ComAmazonawsNotificationsNotificationsState {
         self.event_rule_count(configuration_arn) < MAX_EVENT_RULES_PER_CONFIGURATION
     }
 
-    /// The stored `EventRule` of `configuration_arn` that the given create
-    /// request would produce, if the store already holds one.
+    /// The `EventRule` of `configuration_arn` that already covers the
+    /// `(source, eventType)` pair a create names, if the store holds one.
     ///
-    /// This is what makes `CreateEventRule` `@idempotent`, as the model marks
-    /// it: a repeat of a request that has already been served reports the rule
-    /// it made instead of minting a second one with a second arn. Two requests
-    /// are the same request when every member they carry agrees — and `regions`
-    /// agrees as a SET, because `statusSummaryByRegion` is keyed by Region, so
-    /// the order the Regions were listed in is not part of what was asked for.
-    pub fn matching_event_rule(
+    /// One rule per pair per configuration is what identifies a rule: that pair
+    /// is what the rule matches events on, so a configuration never holds two
+    /// rules for the same one. A create naming a pair a rule already covers is
+    /// therefore asking for a rule that exists, which the caller refuses with
+    /// the modelled conflict error rather than minting a second rule or
+    /// reporting the first; `eventPattern` and `regions` are what such a rule
+    /// CARRIES, not what names it, so they are no part of this lookup. The
+    /// caller holds this store's lock across the lookup and the insert that
+    /// follows it, so two creates for one pair cannot both pass the check.
+    pub fn event_rule_covering(
         &self,
         configuration_arn: &str,
         source: &str,
         event_type: &str,
-        event_pattern: Option<&str>,
-        regions: &[String],
     ) -> Option<&EventRuleRecord> {
-        let wanted: BTreeSet<&str> = regions.iter().map(String::as_str).collect();
         self.event_rules.values().find(|rule| {
             rule.notification_configuration_arn == configuration_arn
                 && rule.source == source
                 && rule.event_type == event_type
-                && rule.event_pattern.as_deref() == event_pattern
-                // A stored rule's `regions` is already deduplicated, so equal
-                // lengths plus containment IS set equality — and it needs no
-                // per-rule allocation, which keeps this scan linear in the
-                // stored Regions rather than sorting each rule's list again.
-                && rule.regions.len() == wanted.len()
-                && rule
-                    .regions
-                    .iter()
-                    .all(|region| wanted.contains(region.as_str()))
         })
     }
 
@@ -1449,6 +1464,14 @@ pub const CONFIGURATION_RESOURCE_LABEL: &str = "notification configuration";
 
 /// `event rule`, the resource label [`not_found_message`] names an `EventRule` by.
 pub const EVENT_RULE_RESOURCE_LABEL: &str = "event rule";
+
+/// `channel`, the resource label [`not_found_message`] names a `Channel` by —
+/// the resource a channel operation looks up in the configuration it names.
+pub const CHANNEL_RESOURCE_LABEL: &str = "channel";
+
+/// `managed notification configuration`, the resource label
+/// [`not_found_message`] names a `ManagedNotificationConfiguration` by.
+pub const MANAGED_CONFIGURATION_RESOURCE_LABEL: &str = "managed notification configuration";
 
 /// `arn`, the identifier label [`not_found_message`] names an arn-keyed resource
 /// by — the `arn` member every one of those operations takes.

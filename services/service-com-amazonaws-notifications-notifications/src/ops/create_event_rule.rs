@@ -8,6 +8,11 @@
 //! `{arn, notificationConfigurationArn, statusSummaryByRegion}` read back out of
 //! that record. The clock, not a read, settles those Regions to `ACTIVE`.
 //!
+//! One rule per `(source, eventType)` pair per NotificationConfiguration: a
+//! create naming a pair one of that configuration's rules already covers is
+//! refused with the modelled `ConflictException` (HTTP 409) rather than minting a
+//! second rule for it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -206,8 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Materialise the transitions the clock already owed at this instant, so
-        // the idempotent repeat below reports a rule's settled status rather than
-        // the one it was minted with.
+        // the rules this create is weighed against — the one covering its pair, and
+        // the count the quota is read from — are the ones a reader would see now.
         store.settle_due_event_rules(::std::time::SystemTime::now());
 
         // An EventRule is "associated with a specified NotificationConfiguration":
@@ -230,55 +235,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `@idempotent`: a repeat of a request already served reports the rule it
-        // made, rather than minting a second rule with a second arn.
-        let existing = store
-            .matching_event_rule(
-                &input.notification_configuration_arn,
-                &input.source,
-                &input.event_type,
-                input.event_pattern.as_deref(),
-                &input.regions,
+        // One EventRule per `(source, eventType)` pair per NotificationConfiguration:
+        // that pair is what the rule matches events on, so a create naming a pair a
+        // rule of this configuration already covers asks for a rule that exists and
+        // is refused with the modelled conflict error — whatever `eventPattern` and
+        // `regions` carry, since those are what a rule holds rather than what names
+        // it. `@idempotent` makes a RETRY of this request safe to send, not a second
+        // rule for a pair already covered: the retry is answered by the same refusal
+        // the first duplicate got, and the caller reads the covered rule instead.
+        // The check and the insert below share this one store lock, so two creates
+        // racing on one pair cannot both get past it: the first mints the rule, the
+        // second sees it.
+        if let Some(covering) = store.event_rule_covering(
+            &input.notification_configuration_arn,
+            &input.source,
+            &input.event_type,
+        ) {
+            return Err(CreateEventRuleErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::event_rule_pair_conflict_message(
+                        &input.notification_configuration_arn,
+                        &input.source,
+                        &input.event_type,
+                    ),
+                    // The rule that covers the pair, so the refused caller can read
+                    // it rather than guess which rule is in its way.
+                    resource_id: covering.arn.clone(),
+                },
             )
-            .map(|rule| rule.arn.clone());
+            .into());
+        }
 
-        let arn = match existing {
-            Some(arn) => arn,
-            None => {
-                // The store is bounded: past its ceiling a create is refused with
-                // the error the model declares for a quota, not served by growing
-                // the store further.
-                if !store.has_event_rule_capacity(&input.notification_configuration_arn) {
-                    return Err(CreateEventRuleErrorModeled::ServiceQuotaExceededException(
-                        ServiceQuotaExceededException {
-                            message: format!(
-                                "this NotificationConfiguration already holds the maximum of {} EventRules",
-                                crate::state::MAX_EVENT_RULES_PER_CONFIGURATION
-                            ),
-                            resource_type: "EventRule".to_string(),
-                            resource_id: Some(input.notification_configuration_arn.clone()),
-                            service_code: Some("notifications".to_string()),
-                            quota_code: None,
-                        },
-                    )
-                    .into());
-                }
+        // The store is bounded: past its ceiling a create is refused with the
+        // error the model declares for a quota, not served by growing the store
+        // further.
+        if !store.has_event_rule_capacity(&input.notification_configuration_arn) {
+            return Err(CreateEventRuleErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this NotificationConfiguration already holds the maximum of {} EventRules",
+                        crate::state::MAX_EVENT_RULES_PER_CONFIGURATION
+                    ),
+                    resource_type: "EventRule".to_string(),
+                    resource_id: Some(input.notification_configuration_arn.clone()),
+                    service_code: Some("notifications".to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
 
-                // `source`, `eventType`, `eventPattern` and every Region already
-                // satisfy their modelled constraints: the boundary validator
-                // refused the request before this handler ran otherwise. The one
-                // bound the model does not declare — how MANY Regions the list
-                // names — was refused above.
-                store.insert_event_rule(
-                    &input.notification_configuration_arn,
-                    input.source.clone(),
-                    input.event_type.clone(),
-                    input.event_pattern.clone(),
-                    &input.regions,
-                    ::std::time::SystemTime::now(),
-                )
-            }
-        };
+        // `source`, `eventType`, `eventPattern` and every Region already satisfy
+        // their modelled constraints: the boundary validator refused the request
+        // before this handler ran otherwise. The one bound the model does not
+        // declare — how MANY Regions the list names — was refused above.
+        let arn = store.insert_event_rule(
+            &input.notification_configuration_arn,
+            input.source.clone(),
+            input.event_type.clone(),
+            input.event_pattern.clone(),
+            &input.regions,
+            ::std::time::SystemTime::now(),
+        );
 
         // Read the response back out of the stored record rather than echoing the
         // values just written, so this response can only report what a later Get

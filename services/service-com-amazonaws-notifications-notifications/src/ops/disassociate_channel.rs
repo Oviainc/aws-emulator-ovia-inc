@@ -174,13 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // channel this configuration does not carry is a reference to a resource
         // that does not exist, which is the modelled 404 rather than a silent
         // success. `@idempotent` makes a RETRY safe, not a disassociation of
-        // something never associated.
+        // something never associated. The refusal states the CHANNEL that was
+        // looked up, in the one not-found sentence every lookup of this service
+        // states.
         if !store.disassociate_channel(&input.notification_configuration_arn, &input.arn) {
             return Err(DisassociateChannelErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Channel {} is not associated with NotificationConfiguration {}",
-                        input.arn, input.notification_configuration_arn
+                    message: crate::state::not_found_message(
+                        crate::state::CHANNEL_RESOURCE_LABEL,
+                        crate::state::ARN_IDENTIFIER_LABEL,
+                        &input.arn,
                     ),
                     resource_id: input.arn.clone(),
                 },
