@@ -51,6 +51,8 @@ mod record_flow;
 mod resource_policies;
 #[path = "all/resource_tag_listing.rs"]
 mod resource_tag_listing;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/retention_period.rs"]

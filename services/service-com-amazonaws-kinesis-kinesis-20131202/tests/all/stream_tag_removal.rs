@@ -93,12 +93,12 @@ struct RemovalCase {
 }
 
 /// Tag keys, spelled short.
-fn keys(keys: &[&str]) -> Vec<String> {
+pub(crate) fn keys(keys: &[&str]) -> Vec<String> {
     keys.iter().map(|key| (*key).to_string()).collect()
 }
 
 /// The keys of `tags`, in the order they are given.
-fn keys_of(tags: &[(String, String)]) -> Vec<String> {
+pub(crate) fn keys_of(tags: &[(String, String)]) -> Vec<String> {
     tags.iter().map(|(key, _)| key.clone()).collect()
 }
 

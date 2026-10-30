@@ -1546,10 +1546,12 @@ impl Stream {
     ///
     /// The counterpart of [`Self::assign_tags`] over the same stored map, so a removal can
     /// only ever take the stream further below the [`MAX_STREAM_TAGS`] ceiling.
+    ///
+    /// Deletes through the one rule every resource kind of this service deletes by
+    /// ([`unassign_tags`]), the counterpart of the one projection they are all reported
+    /// through.
     pub fn unassign_tags<'keys>(&mut self, keys: impl IntoIterator<Item = &'keys str>) {
-        for key in keys {
-            self.tags.remove(key);
-        }
+        unassign_tags(&mut self.tags, keys);
     }
 
     /// The enhanced monitoring configuration the stream reports: one entry carrying the
@@ -2404,6 +2406,33 @@ impl ComAmazonawsKinesisKinesis20131202State {
                 }
             })
     }
+
+    /// [`Self::resource_tags_by_arn`] for a caller that WRITES the set it finds: one rule,
+    /// one lookup, so the stored set a tag write changes is the very set a read reports.
+    ///
+    /// It spans exactly the resource kinds that read spans, because a stream and a channel
+    /// each carry ONE stored tag set: whichever kind the ARN names, an assignment and an
+    /// unassignment reach that very set.
+    pub fn resource_tags_by_arn_mut(
+        &mut self,
+        now: SystemTime,
+        region: &str,
+        arn: &str,
+    ) -> Option<&mut HashMap<String, String>> {
+        // Which kind the ARN names is decided through the immutable lookups, so a write
+        // addresses a resource by exactly the rule a read does; only the record it resolved
+        // is then borrowed mutably.
+        if self.channel_by_arn(region, arn).is_some() {
+            return self
+                .channel_by_arn_mut(region, arn)
+                .map(|channel| &mut channel.tags);
+        }
+        self.streams
+            .values_mut()
+            .filter(|stream| stream.region == region && stream.is_held(now))
+            .find(|stream| stream.arn == arn)
+            .map(|stream| &mut stream.tags)
+    }
 }
 
 /// Why a write places a record in no shard of the stream it addresses. The operation maps
@@ -3244,6 +3273,23 @@ pub fn tags_ordered(tags: &HashMap<String, String>) -> Vec<Tag> {
         .collect();
     tags.sort_by(|left, right| left.key.cmp(&right.key));
     tags
+}
+
+/// Unassign the tags `keys` names from a stored tag set: "Removed tags are deleted and can't
+/// be recovered after this operation completes successfully" (`UntagResource`), and "If you
+/// specify a tag that does not exist, it is ignored" (`RemoveTagsFromStream`), so a key the
+/// resource does not carry removes nothing and every tag the request does not name stays as
+/// it was.
+///
+/// ONE rule for every resource kind that carries tags, so no two removals of one service
+/// delete differently ([`Stream::unassign_tags`] is this function over a stream's own set).
+pub fn unassign_tags<'keys>(
+    tags: &mut HashMap<String, String>,
+    keys: impl IntoIterator<Item = &'keys str>,
+) {
+    for key in keys {
+        tags.remove(key);
+    }
 }
 
 /// The modelled timestamp for a stored instant.

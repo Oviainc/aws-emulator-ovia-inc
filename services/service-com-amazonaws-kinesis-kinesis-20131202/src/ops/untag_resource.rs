@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Unassigns the tag keys the request names from the stored tag set of the Kinesis resource
+//! its `ResourceARN` names in `crate::state`, and answers the modelled empty body. A key the
+//! resource carries is deleted and cannot be read back, a key it does not carry is ignored,
+//! and every tag the request does not name stays as it was; `ListTagsForResource` and
+//! `ListTagsForStream` report that stored set.
+//!
+//! A `ResourceARN` addresses a resource of EITHER kind this service holds (its pattern is
+//! `^arn:aws.*:kinesis:.*:\d{12}:.*(stream|channel)/\S+$`), and a stream and a channel each
+//! carry ONE stored tag set, so the ARN is resolved across both kinds through the mutable
+//! counterpart of the one lookup `ListTagsForResource` reads through
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resource_tags_by_arn_mut`]):
+//! the set this write deletes from is the very set that read reports. An ARN this account
+//! and region hold no resource under is the modelled `ResourceNotFoundException`, worded for
+//! the kind that ARN names.
+//!
+//! No tag ceiling is checked: a removal only ever leaves the resource carrying fewer tags.
+//! The write is served whatever lifecycle status the resource is in, because a resource's
+//! tags are metadata of the resource itself — the same rule `RemoveTagsFromStream` applies
+//! to the one stored tag set both delete from, and `TagResource` to the set it assigns into.
 //!
 //! ## Shape of an operation
 //!
@@ -109,7 +120,15 @@ impl ::aws_smithy_schema::serde::SerializableStruct for UntagResourceOutput {
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#UntagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#UntagResource",
+    // `InternalFailureException` is widened in with `extra_errors`, exactly as
+    // `RemoveTagsFromStream` and `TagResource` widen it: this SERVICE models it ("The
+    // processing of the request failed because of an unknown error, exception, or failure"),
+    // the operation shape does not list it, and it is the only honest answer for a service
+    // mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
@@ -117,6 +136,7 @@ pub enum UntagResourceErrorModeled {
     LimitExceededException(LimitExceededException),
     ResourceInUseException(ResourceInUseException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,6 +162,53 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
 /// concrete engine where it mounts the service, not here.
 pub struct UntagResource<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the resource lives in, and how the call
+/// ended. No resource ARN and no tag key: a log sink needs neither to attribute the change,
+/// and a tag key is caller data.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "UntagResource",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
+/// Unassign the request's tag keys from the resource its ARN names, or answer the modelled
+/// refusal that stands in the way. The whole write lives here so the caller holds the
+/// store's lock for exactly this long.
+fn unassign_tags(
+    store: &mut crate::state::ComAmazonawsKinesisKinesis20131202State,
+    region: &str,
+    now: ::std::time::SystemTime,
+    input: &UntagResourceInput,
+) -> Result<(), UntagResourceError> {
+    // The ARN is what this operation addresses a resource by; `StreamId` is documented
+    // "Not Implemented. Reserved for future use", so no resource carries one and it names
+    // nothing. The lookup spans every resource kind an ARN may name, so the stored set this
+    // deletes from is the one a read of that resource reports.
+    let tags = store
+        .resource_tags_by_arn_mut(now, region, input.resource_arn.as_str())
+        .ok_or_else(|| {
+            UntagResourceError::from(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            ))
+        })?;
+
+    // No ceiling is checked and no status is read or moved: a removal only ever leaves the
+    // resource carrying fewer tags, and a resource's tag set exists for as long as the
+    // resource does, so the write is served in any lifecycle status it is in.
+    crate::state::unassign_tags(tags, input.tag_keys.iter().map(String::as_str));
+    Ok(())
 }
 
 impl<Eng> UntagResource<Eng> {
@@ -170,18 +237,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region whose resources this request
+        // addresses, since a Kinesis resource "is also scoped by Amazon Web Services
+        // Region".
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            UntagResourceError::from(UntagResourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the stream store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let outcome = unassign_tags(&mut store, &region, now, &input);
+        drop(store);
+
+        audit(
+            &akid,
+            &region,
+            if outcome.is_ok() { "untagged" } else { "refused" },
+        );
+        // `UntagResource` models no output members, so a served request answers the modelled
+        // empty body.
+        outcome.map(|()| UntagResourceOutput)
     }
 }
