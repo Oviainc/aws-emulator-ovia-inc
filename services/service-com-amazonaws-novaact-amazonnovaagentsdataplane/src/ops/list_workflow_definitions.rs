@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkflowDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkflowDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkflowDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's stored workflow definitions, newest-last by default, in pages.
+//!
+//! WHAT IS COMPUTED FROM STATE. Every summary member is read off the stored definition —
+//! the ARN written at create time, the name it is keyed by, its creation instant and its
+//! current status — so a definition that was never created cannot appear and one whose
+//! deletion the clock has made due cannot either (the same
+//! [`crate::state::ComAmazonawsNovaactAmazonnovaagentsdataplaneState::complete_due_deletions`]
+//! every other read of this service runs first). A definition still in `DELETING` is
+//! reported, with that status: it is held until its removal falls due.
+//!
+//! ORDER. `sortOrder` orders the definitions by the one instant this operation reports,
+//! `createdAt` — `Ascending` (the order a request naming none is answered in) oldest
+//! first, `Descending` newest first — with the definition name as the tie-break so two
+//! definitions created in the same instant still order the same way on every call.
+//!
+//! PAGING. `maxResults` is the page size and `nextToken` resumes strictly after the last
+//! definition the previous page emitted, so a page boundary cannot repeat or skip a
+//! definition even when one is created or deleted between calls. The token carries that
+//! position and the order it was issued for, hex-encoded so it is opaque to the caller.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +162,271 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkflowDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkflowDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkflowDefinitions"))
+        // No request metadata is read: every member this operation needs is bound into
+        // `input`, and each summary reports the ARN stored on the definition rather than
+        // one rebuilt from the reading request's region.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWorkflowDefinitionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message:
+                        "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                            .to_string(),
+                    retry_after_seconds: None,
+                    reason: None,
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let order = PageOrder::from_input(input.sort_order.as_deref())?;
+        // `@range(1..100)` is refused at the boundary, so the clamp only keeps this
+        // arithmetic total; a request naming no page size is answered with the modelled
+        // maximum (`MaxResults`, range 1..100).
+        let page_size = input
+            .max_results
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE) as usize;
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_next_token(token, order)?),
+        };
+
+        let mut state = state.lock();
+        // A deletion the clock has already made due is completed first, exactly as every
+        // other read of this service does: it materialises a change that was owed at this
+        // instant whether or not anybody called, so this listing cannot report a
+        // definition a `GetWorkflowDefinition` at the same instant would refuse.
+        state.complete_due_deletions(now);
+
+        // The whole scan is bounded by `crate::state::MAX_WORKFLOW_DEFINITIONS`, so
+        // neither the sort nor the walk grows with request volume.
+        let mut ordered: Vec<&crate::state::WorkflowDefinition> =
+            state.workflow_definitions.values().collect();
+        ordered.sort_by(|left, right| order.compare(left, right));
+
+        // The list is already in the requested order, so the first definition that sorts
+        // strictly after the cursor is where the page resumes.
+        let start = match &cursor {
+            None => 0,
+            Some(cursor) => ordered
+                .iter()
+                .position(|definition| order.is_after(cursor, definition))
+                .unwrap_or(ordered.len()),
+        };
+        let page = &ordered[start..ordered.len().min(start + page_size)];
+
+        // A token is issued only when a definition is left over: the last page of a
+        // listing ends it.
+        let next_token = page
+            .last()
+            .filter(|_| start + page.len() < ordered.len())
+            .map(|last| encode_next_token(order, last));
+
+        Ok(ListWorkflowDefinitionsOutput {
+            workflow_definition_summaries: page
+                .iter()
+                .map(|definition| WorkflowDefinitionSummary {
+                    workflow_definition_arn: definition.arn.clone(),
+                    workflow_definition_name: definition.name.clone(),
+                    created_at: ::aws_smithy_types::DateTime::from(definition.created_at),
+                    status: definition.status.as_wire().to_string(),
+                })
+                .collect(),
+            next_token,
+        })
     }
+}
+
+/// The largest page this operation serves, and the page size a request naming no
+/// `maxResults` is answered with: `MaxResults`'s modelled maximum
+/// (`smithy_query(query="shape",shape="MaxResults")` reports `range 1..100`).
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The byte that separates the fields inside a `nextToken`. It is outside both
+/// `WorkflowDefinitionName`'s pattern (`^[a-zA-Z0-9_-]{1,40}$`) and the digits of the
+/// instant, so it cannot occur inside a field it separates.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// `SortOrder`: the order the definitions are reported in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageOrder {
+    /// Oldest `createdAt` first. The order a request that names no `sortOrder` is
+    /// answered in, so paging without naming one is still a total order.
+    Ascending,
+    /// Newest `createdAt` first.
+    Descending,
+}
+
+impl PageOrder {
+    /// The order the request asked for, or a refusal naming `sortOrder`.
+    ///
+    /// The model constrains the member to its enum, so the boundary walk refuses an
+    /// unknown value before this runs; reading it here means a value this operation can
+    /// order by, and anything else is refused rather than silently answered in some
+    /// other order.
+    fn from_input(sort_order: Option<&str>) -> Result<Self, ListWorkflowDefinitionsError> {
+        match sort_order {
+            None => Ok(Self::Ascending),
+            Some(value) if value == Self::Ascending.as_wire() => Ok(Self::Ascending),
+            Some(value) if value == Self::Descending.as_wire() => Ok(Self::Descending),
+            Some(other) => Err(field_validation_failed(
+                "sortOrder",
+                format!(
+                    "sortOrder must be one of {}, not {other}",
+                    SORT_ORDER_VALUES.join(" | ")
+                ),
+            )),
+        }
+    }
+
+    /// The value as the model spells it on the wire.
+    fn as_wire(self) -> &'static str {
+        match self {
+            Self::Ascending => "Ascending",
+            Self::Descending => "Descending",
+        }
+    }
+
+    /// Where `definition` sorts relative to `other` in this order.
+    ///
+    /// The tie-break is the NAME rather than `WorkflowDefinition::insertion_seq`, which
+    /// records the same creation order: the name is a key the summary itself carries, so
+    /// a resumption token can name the position it stopped at in terms a caller's next
+    /// request resolves against the store, which an internal counter could not.
+    fn compare(
+        self,
+        definition: &crate::state::WorkflowDefinition,
+        other: &crate::state::WorkflowDefinition,
+    ) -> ::std::cmp::Ordering {
+        let here = (definition.created_at, definition.name.as_str());
+        let there = (other.created_at, other.name.as_str());
+        match self {
+            Self::Ascending => here.cmp(&there),
+            Self::Descending => there.cmp(&here),
+        }
+    }
+
+    /// Whether `definition` sorts strictly after `cursor` in this order, i.e. whether it
+    /// belongs on the page that resumes from it.
+    fn is_after(self, cursor: &Cursor, definition: &crate::state::WorkflowDefinition) -> bool {
+        let here = (cursor.created_at, cursor.name.as_str());
+        let there = (definition.created_at, definition.name.as_str());
+        match self {
+            Self::Ascending => there > here,
+            Self::Descending => there < here,
+        }
+    }
+}
+
+/// Where a page stopped: the sort position of the last definition it emitted, which is
+/// everything the next page needs to resume even if that definition has since been
+/// deleted.
+#[derive(Debug)]
+struct Cursor {
+    created_at: ::std::time::SystemTime,
+    name: String,
+}
+
+/// The opaque `NextToken` for the last definition a page emitted.
+///
+/// Hex-encoded (`hex`, already a dependency of this crate) so the token is opaque to the
+/// caller and satisfies `NextToken`'s `^\S*$` pattern. The order is carried with the
+/// position because the position means nothing without it.
+fn encode_next_token(order: PageOrder, definition: &crate::state::WorkflowDefinition) -> String {
+    let since_epoch = definition
+        .created_at
+        .duration_since(::std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    ::hex::encode(format!(
+        "{}{TOKEN_SEPARATOR}{}.{:09}{TOKEN_SEPARATOR}{}",
+        order.as_wire(),
+        since_epoch.as_secs(),
+        since_epoch.subsec_nanos(),
+        definition.name,
+    ))
+}
+
+/// The modelled refusal for a request member this operation cannot use: HTTP 400
+/// `ValidationException` with `reason` `FieldValidationFailed` — one of the three values
+/// `ValidationExceptionReason` declares — and one `fieldList` entry naming the member, so
+/// a caller learns WHICH member to fix.
+fn field_validation_failed(member: &str, message: String) -> ListWorkflowDefinitionsError {
+    ListWorkflowDefinitionsErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: "FieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }]),
+    })
+    .into()
+}
+
+/// The [`Cursor`] inside a `nextToken`, or the refusal for a token this operation did not
+/// issue for this listing.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so nothing read out of
+/// it may panic the handler. The instant in particular is rebuilt with `checked_add`, since
+/// `SystemTime + Duration` panics on overflow and a forged token can name any `u64`.
+fn decode_next_token(
+    token: &str,
+    order: PageOrder,
+) -> Result<Cursor, ListWorkflowDefinitionsError> {
+    let invalid = || {
+        field_validation_failed(
+            "nextToken",
+            format!(
+                "nextToken is not a token ListWorkflowDefinitions issued for a {} listing",
+                order.as_wire()
+            ),
+        )
+    };
+    let decoded = ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid)?;
+    let mut fields = decoded.split(TOKEN_SEPARATOR);
+    let (token_order, created_at, name) = match (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) {
+        (Some(token_order), Some(created_at), Some(name), None) => (token_order, created_at, name),
+        _ => return Err(invalid()),
+    };
+    // A token carries the order it was issued for: resuming a `Descending` listing from an
+    // `Ascending` token would silently answer a page from neither order.
+    if token_order != order.as_wire() {
+        return Err(invalid());
+    }
+    if name.is_empty()
+        || name.len() > MAX_DEFINITION_NAME_LENGTH
+        || !name.chars().all(is_workflow_definition_name_char)
+    {
+        return Err(invalid());
+    }
+    let (secs, nanos) = created_at.split_once('.').ok_or_else(invalid)?;
+    let secs: u64 = secs.parse().map_err(|_| invalid())?;
+    let nanos: u32 = nanos.parse().map_err(|_| invalid())?;
+    if nanos >= 1_000_000_000 {
+        return Err(invalid());
+    }
+    let created_at = ::std::time::SystemTime::UNIX_EPOCH
+        .checked_add(::std::time::Duration::new(secs, nanos))
+        .ok_or_else(invalid)?;
+    Ok(Cursor {
+        created_at,
+        name: name.to_string(),
+    })
+}
+
+/// The longest name `WorkflowDefinitionName` admits (`^[a-zA-Z0-9_-]{1,40}$`, length
+/// 1..40), so a forged token cannot carry a name no definition could ever have.
+const MAX_DEFINITION_NAME_LENGTH: usize = 40;
+
+/// A character `WorkflowDefinitionName`'s pattern (`^[a-zA-Z0-9_-]{1,40}$`) admits.
+fn is_workflow_definition_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_' || character == '-'
 }
