@@ -9,6 +9,11 @@
 //! covered by [`crate::s3_table_integrations`]; what is asserted here is the pair of
 //! operations that walks the collection and the one that retires a member of it.
 //!
+//! A region holding SEVERAL integrations is a store state the create path does not
+//! reach — the account is served one integration per regional endpoint — so each case
+//! drives one create over the wire and fills the rest of the collection directly
+//! through the shared engine (`store_one_more`).
+//!
 //! The rules under test:
 //!
 //! 1. a listing reports a summary of every integration the store holds in the region
@@ -31,7 +36,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_observabilityadmin_observabilityadmin::state::{
-    s3_table_integration_arn, ComAmazonawsObservabilityadminObservabilityadminState,
+    new_s3_table_integration_id, s3_table_integration_arn, table_bucket_arn,
+    ComAmazonawsObservabilityadminObservabilityadminState, StoredS3TableIntegration,
     INTEGRATION_STATUS_ACTIVE,
 };
 
@@ -48,7 +54,8 @@ const OTHER_REGION: &str = "eu-west-1";
 /// what the create is held to, and this value satisfies it.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/telemetry-s3-tables";
 
-/// Create one integration in `region` and answer the ARN it was stored under.
+/// Create one integration in `region` over the wire and answer the ARN it was stored
+/// under.
 async fn create(emulator: &Emulator, region: &str, case: &str) -> String {
     let (status, response) = call(
         emulator,
@@ -69,6 +76,52 @@ async fn create(emulator: &Emulator, region: &str, case: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case {case:?}: a create answers an Arn, got {response:?}"))
         .to_string()
+}
+
+/// Store one more integration in `region` directly through the shared engine, and
+/// answer the ARN it was stored under.
+///
+/// `CreateS3TableIntegration` serves the account ONE integration per regional
+/// endpoint and refuses a second with the modelled 409, so a region holding several
+/// records is a store state only a direct insert reaches — and what these cases are
+/// about is the collection a listing walks, not how it was filled. The record is
+/// built exactly as the create path builds one: a minted id, that id's ARN, and the
+/// table bucket of the same id.
+fn store_one_more(emulator: &Emulator, region: &str) -> String {
+    let id = new_s3_table_integration_id();
+    let arn = s3_table_integration_arn(region, &id);
+    let state = emulator
+        .engine
+        .state::<ComAmazonawsObservabilityadminObservabilityadminState>();
+    state
+        .lock()
+        .insert_s3_table_integration(StoredS3TableIntegration {
+            id: id.clone(),
+            region: region.to_string(),
+            arn: arn.clone(),
+            role_arn: ROLE_ARN.to_string(),
+            sse_algorithm: "AES256".to_string(),
+            kms_key_arn: None,
+            destination_table_bucket_arn: table_bucket_arn(region, &id),
+            created_timestamp_ms: 1_700_000_000_000,
+            tags: Default::default(),
+        });
+    arn
+}
+
+/// Put `count` integrations in `region` and answer their ARNs: the first through the
+/// wire create, so the real create path is what the listing reads back, and any
+/// further ones through [`store_one_more`].
+async fn fill(emulator: &Emulator, region: &str, count: usize, case: &str) -> Vec<String> {
+    let mut arns: Vec<String> = Vec::new();
+    for index in 0..count {
+        arns.push(if index == 0 {
+            create(emulator, region, case).await
+        } else {
+            store_one_more(emulator, region)
+        });
+    }
+    arns
 }
 
 /// One listing page: its summaries and the `NextToken` it carried.
@@ -207,14 +260,8 @@ async fn a_listing_reports_this_regions_integrations_and_changes_nothing() {
         ("nothing here, several elsewhere", 0, 2),
     ] {
         let emulator = emulator();
-        let mut home_arns: Vec<String> = Vec::new();
-        for _ in 0..home {
-            home_arns.push(create(&emulator, HOME_REGION, case).await);
-        }
-        let mut other_arns: Vec<String> = Vec::new();
-        for _ in 0..other {
-            other_arns.push(create(&emulator, OTHER_REGION, case).await);
-        }
+        let home_arns: Vec<String> = fill(&emulator, HOME_REGION, home, case).await;
+        let other_arns: Vec<String> = fill(&emulator, OTHER_REGION, other, case).await;
 
         let (summaries, pages) = walk(&emulator, HOME_REGION, None, case).await;
         assert_eq!(
@@ -277,10 +324,12 @@ async fn max_results_bounds_a_page_and_next_token_resumes_after_it() {
     // one case where the count is an exact multiple of the size.
     let count = 6usize;
     let emulator = emulator();
-    let mut created: Vec<String> = Vec::new();
-    for _ in 0..count {
-        created.push(create(&emulator, HOME_REGION, "paged walk").await);
-    }
+    let created = fill(&emulator, HOME_REGION, count, "paged walk").await;
+    assert_eq!(
+        created.len(),
+        count,
+        "expected {count} integrations to walk, got {created:?}"
+    );
     let (unpaged, _) = walk(&emulator, HOME_REGION, None, "paged walk").await;
     let order: Vec<String> = unpaged.iter().map(|(arn, _)| arn.clone()).collect();
 
@@ -308,9 +357,7 @@ async fn max_results_bounds_a_page_and_next_token_resumes_after_it() {
 #[tokio::test]
 async fn a_next_token_this_operation_did_not_issue_is_refused() {
     let emulator = emulator();
-    for _ in 0..3 {
-        create(&emulator, HOME_REGION, "forged token").await;
-    }
+    fill(&emulator, HOME_REGION, 3, "forged token").await;
     let (_, issued) = list(
         &emulator,
         HOME_REGION,
@@ -413,9 +460,7 @@ async fn a_delete_retires_the_integration_and_leaves_the_rest() {
         ("the last of four", 4, 3),
     ] {
         let emulator = emulator();
-        for _ in 0..count {
-            create(&emulator, HOME_REGION, case).await;
-        }
+        fill(&emulator, HOME_REGION, count, case).await;
         // A listing is what fixes the store's order, so the row's index names a real
         // position in it rather than a creation order the service never promised.
         let (before, _) = walk(&emulator, HOME_REGION, None, case).await;

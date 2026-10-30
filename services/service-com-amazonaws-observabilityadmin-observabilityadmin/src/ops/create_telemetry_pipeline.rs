@@ -203,14 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 resource = %input.name,
                 "refused a telemetry pipeline create"
             );
+            // The conflict is on the name the request submitted, so the refusal
+            // names the INPUT MEMBER that carried it — in its fixed sentence and in
+            // `ResourceType` — and reports the value itself as `ResourceId`.
             return Err(CreateTelemetryPipelineErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "a telemetry pipeline named '{}' already exists in {region}",
-                        input.name
-                    )),
+                    message: Some(
+                        crate::state::PIPELINE_NAME_ALREADY_EXISTS_MESSAGE.to_string(),
+                    ),
                     resource_id: Some(input.name.clone()),
-                    resource_type: Some(crate::state::PIPELINE_RESOURCE_TYPE.to_string()),
+                    resource_type: Some(crate::state::PIPELINE_NAME_RESOURCE_TYPE.to_string()),
                 },
             )
             .into());

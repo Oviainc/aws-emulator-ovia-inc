@@ -560,7 +560,7 @@ async fn a_create_past_either_cap_is_refused_and_stores_nothing() {
         );
         assert_eq!(
             response.get("ResourceType").and_then(Value::as_str),
-            Some("telemetry-pipeline"),
+            Some("Pipeline"),
             "case {case:?}: the refusal names the resource type: {response:?}"
         );
         assert_eq!(

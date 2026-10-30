@@ -23,14 +23,18 @@
 //! 4. the rules the model states but cannot express as a constraint are refused with
 //!    the modelled 400 and store nothing: `SseAlgorithm` carries one of
 //!    `SSEAlgorithm`'s own values, and `KmsKeyArn` rides on the KMS algorithm alone;
-//! 5. a create past either emulator store cap is refused with the modelled 402 before
+//! 5. a create past the emulator's store cap is refused with the modelled 402 before
 //!    a record is allocated.
+//!
+//! The integration is also the account's ONE per regional endpoint, so each case
+//! below drives a create against a region that holds none; the conflict a second
+//! create is refused with is asserted by [`crate::refusal_contract`].
 
 use serde_json::{json, Value};
 use service_com_amazonaws_observabilityadmin_observabilityadmin::ops::types::INTEGRATION_STATUS_VALUES;
 use service_com_amazonaws_observabilityadmin_observabilityadmin::state::{
     s3_table_integration_arn, table_bucket_arn, ComAmazonawsObservabilityadminObservabilityadminState,
-    StoredS3TableIntegration, INTEGRATION_STATUS_ACTIVE, MAX_S3_TABLE_INTEGRATIONS,
+    StoredS3TableIntegration, INTEGRATION_STATUS_ACTIVE,
     MAX_STORED_S3_TABLE_INTEGRATION_RECORDS, TABLE_BUCKET_NAME_PREFIX,
 };
 
@@ -151,10 +155,12 @@ fn valid_requests() -> Vec<(&'static str, Value)> {
 /// reports comes from that record — for every request the model admits.
 #[tokio::test]
 async fn a_create_persists_the_integration_a_read_reports() {
-    let emulator = emulator();
     let mut minted: Vec<String> = Vec::new();
 
     for (case, request) in valid_requests() {
+        // One emulator per case: the account holds one integration per regional
+        // endpoint, so each create needs a region that holds none.
+        let emulator = emulator();
         let before = now_millis();
         let (status, response) = create(&emulator, HOME_REGION, &request).await;
         let after = now_millis();
@@ -235,15 +241,13 @@ async fn a_create_persists_the_integration_a_read_reports() {
             (before..=after).contains(&created),
             "case {case:?}: expected CreatedTimeStamp within [{before}, {after}], got {created}"
         );
+        assert_eq!(
+            stored_count(&emulator),
+            1,
+            "case {case:?}: expected the create to store exactly one record, got {}",
+            stored_count(&emulator)
+        );
     }
-
-    assert_eq!(
-        stored_count(&emulator),
-        minted.len(),
-        "expected one stored record per create, got {} for {} creates",
-        stored_count(&emulator),
-        minted.len()
-    );
 }
 
 /// Now, in the epoch milliseconds the modelled `CreatedTimeStamp` carries — read from
@@ -431,74 +435,63 @@ async fn a_request_outside_the_modelled_rules_is_refused_and_stores_nothing() {
     }
 }
 
-/// Both store caps are refused before a record is allocated: the per-region budget,
-/// and the store-wide one that dominates it because the region a record is keyed by
-/// comes from the caller's own credential scope. The store is pre-filled directly
-/// through the shared engine, so the test states the cap rather than paying for
-/// hundreds of requests to reach it.
+/// The store-wide cap is refused before a record is allocated: it bounds every
+/// regional endpoint together, where the singleton bounds one. The store is
+/// pre-filled directly through the shared engine, so the test states the cap rather
+/// than paying for hundreds of requests to reach it.
 #[tokio::test]
-async fn a_create_past_either_cap_is_refused_and_stores_nothing() {
-    for (case, per_region, records) in [
-        ("the per-region budget is full", true, MAX_S3_TABLE_INTEGRATIONS),
-        (
-            "the store-wide cap is reached from other regions",
-            false,
-            MAX_STORED_S3_TABLE_INTEGRATION_RECORDS,
-        ),
-    ] {
-        let emulator = emulator();
-        {
-            let state = emulator
-                .engine
-                .state::<ComAmazonawsObservabilityadminObservabilityadminState>();
-            let mut store = state.lock();
-            for index in 0..records {
-                // Spread the store-wide rows over many regions, so the per-region
-                // budget is NOT what refuses that case.
-                let region = if per_region {
-                    HOME_REGION.to_string()
-                } else {
-                    format!("{OTHER_REGION}-{}", index / 10)
-                };
-                let id = format!("filler-{index}");
-                store.insert_s3_table_integration(StoredS3TableIntegration {
-                    id: id.clone(),
-                    region: region.clone(),
-                    arn: s3_table_integration_arn(&region, &id),
-                    role_arn: "arn:aws:iam::000000000000:role/telemetry-s3-tables".to_string(),
-                    sse_algorithm: "AES256".to_string(),
-                    kms_key_arn: None,
-                    destination_table_bucket_arn: table_bucket_arn(&region, &id),
-                    created_timestamp_ms: 1_700_000_000_000,
-                    tags: Default::default(),
-                });
-            }
+async fn a_create_past_the_store_cap_is_refused_and_stores_nothing() {
+    let case = "the store-wide cap is reached from other regions";
+    let records = MAX_STORED_S3_TABLE_INTEGRATION_RECORDS;
+    let emulator = emulator();
+    {
+        let state = emulator
+            .engine
+            .state::<ComAmazonawsObservabilityadminObservabilityadminState>();
+        let mut store = state.lock();
+        for index in 0..records {
+            // Every pre-filled row sits in a region OTHER than the one the create
+            // below signs for, so it is the store-wide cap that refuses it and not
+            // the one-integration-per-endpoint conflict.
+            let region = format!("{OTHER_REGION}-{}", index / 10);
+            let id = format!("filler-{index}");
+            store.insert_s3_table_integration(StoredS3TableIntegration {
+                id: id.clone(),
+                region: region.clone(),
+                arn: s3_table_integration_arn(&region, &id),
+                role_arn: "arn:aws:iam::000000000000:role/telemetry-s3-tables".to_string(),
+                sse_algorithm: "AES256".to_string(),
+                kms_key_arn: None,
+                destination_table_bucket_arn: table_bucket_arn(&region, &id),
+                created_timestamp_ms: 1_700_000_000_000,
+                tags: Default::default(),
+            });
         }
-
-        let (status, response) = create(
-            &emulator,
-            HOME_REGION,
-            &json!({
-                "Encryption": { "SseAlgorithm": "AES256" },
-                "RoleArn": "arn:aws:iam::000000000000:role/telemetry-s3-tables",
-            }),
-        )
-        .await;
-        assert_eq!(
-            status, 402,
-            "case {case:?}: expected 402, got {status} {response:?}"
-        );
-        assert_eq!(
-            error_code(&response),
-            "ServiceQuotaExceededException",
-            "case {case:?}: expected ServiceQuotaExceededException, got {response:?}"
-        );
-        assert_eq!(
-            stored_count(&emulator),
-            records,
-            "case {case:?}: expected the refused create to allocate nothing, got {} records \
-             beside the {records} pre-filled ones",
-            stored_count(&emulator)
-        );
     }
+
+    let (status, response) = create(
+        &emulator,
+        HOME_REGION,
+        &json!({
+            "Encryption": { "SseAlgorithm": "AES256" },
+            "RoleArn": "arn:aws:iam::000000000000:role/telemetry-s3-tables",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 402,
+        "case {case:?}: expected 402, got {status} {response:?}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "ServiceQuotaExceededException",
+        "case {case:?}: expected ServiceQuotaExceededException, got {response:?}"
+    );
+    assert_eq!(
+        stored_count(&emulator),
+        records,
+        "case {case:?}: expected the refused create to allocate nothing, got {} records \
+         beside the {records} pre-filled ones",
+        stored_count(&emulator)
+    );
 }

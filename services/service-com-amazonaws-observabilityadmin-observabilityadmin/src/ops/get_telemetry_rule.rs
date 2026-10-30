@@ -176,14 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(record) = store.rule(&region, &input.rule_identifier, now) else {
+            // The read path's own fixed sentence; the identifier the request carried
+            // is reported as `ResourceId`, the member modelled for it.
             return Err(GetTelemetryRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no telemetry rule '{}' in {region}",
-                        input.rule_identifier
-                    )),
+                    message: Some(crate::state::RULE_NOT_FOUND_MESSAGE.to_string()),
                     resource_id: Some(input.rule_identifier),
-                    resource_type: Some("telemetry-rule".to_string()),
+                    resource_type: Some(crate::state::RULE_RESOURCE_TYPE.to_string()),
                 },
             )
             .into());

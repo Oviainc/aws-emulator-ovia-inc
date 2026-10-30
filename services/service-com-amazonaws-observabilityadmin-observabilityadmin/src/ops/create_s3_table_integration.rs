@@ -165,8 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The operation takes no caller-supplied identifier, so there is no name a
         // second create could collide on: each create mints a fresh id, stores one
         // record under it and answers that record's ARN, which is the only handle
-        // `GetS3TableIntegration` / `DeleteS3TableIntegration` accept. The modelled
-        // `ConflictException` therefore has no create-time case to report here.
+        // `GetS3TableIntegration` / `DeleteS3TableIntegration` accept. What the
+        // modelled `ConflictException` does report is the SINGLETON the integration
+        // is: an account holds at most one of them at the regional endpoint it calls,
+        // so a create while one is already there is refused instead of minting a
+        // second handle onto an account state the service cannot hold.
         //
         // `AccessDeniedException` has none either: this emulator verifies the request
         // signature centrally and models no IAM, so there is no policy evaluation here
@@ -206,35 +209,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let created_at = crate::state::now_epoch_millis();
-        let id = crate::state::new_s3_table_integration_id();
-        let arn = crate::state::s3_table_integration_arn(&region, &id);
-        let destination_table_bucket_arn = crate::state::table_bucket_arn(&region, &id);
-
         let mut store = state.lock();
 
-        // The store is finite, and the cap that dominates is store-WIDE: a record is
-        // keyed by the region of the caller's own credential scope, so the per-region
-        // budget alone would reset for every scope a caller signs with. Each cap is
-        // asked separately so the refusal names the one that actually refused, and a
-        // create past either is refused BEFORE a record is allocated.
-        let over_cap = if store.s3_table_integration_count(&region)
-            >= crate::state::MAX_S3_TABLE_INTEGRATIONS
-        {
-            Some(format!(
-                "this account already holds the maximum of {} S3 Table integrations in \
-                 {region}",
-                crate::state::MAX_S3_TABLE_INTEGRATIONS
-            ))
-        } else if store.would_exceed_s3_table_integration_store(1) {
-            Some(format!(
-                "this create would take the store past its {} S3 Table integration records",
-                crate::state::MAX_STORED_S3_TABLE_INTEGRATION_RECORDS
-            ))
-        } else {
-            None
-        };
-        if let Some(why) = over_cap {
+        // The integration is the account's one per regional endpoint, so the slot
+        // being occupied is a conflict with the resource's current state, not a
+        // quota: it is refused with the service's own fixed sentence, and nothing is
+        // allocated. A delete is what frees the slot.
+        if store.s3_table_integration_count(&region) > 0 {
+            drop(store);
+            ::tracing::info!(
+                target: "audit",
+                operation = Self::NAME,
+                outcome = "rejected-already-exists",
+                principal = %principal,
+                region = %region,
+                "refused an S3 Table integration create"
+            );
+            return Err(CreateS3TableIntegrationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        crate::state::ONE_INTEGRATION_PER_ACCOUNT_MESSAGE.to_string(),
+                    ),
+                    resource_type: Some(
+                        crate::state::S3_TABLE_INTEGRATION_RESOURCE_TYPE.to_string(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // The store is finite, and the cap is store-WIDE: a record is keyed by the
+        // region of the caller's own credential scope, so the singleton above bounds
+        // one endpoint while this bounds every endpoint together. A create past it is
+        // refused BEFORE a record is allocated.
+        if store.would_exceed_s3_table_integration_store(1) {
             drop(store);
             ::tracing::info!(
                 target: "audit",
@@ -247,7 +256,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateS3TableIntegrationErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: Some(why),
+                        message: Some(format!(
+                            "this create would take the store past its {} S3 Table \
+                             integration records",
+                            crate::state::MAX_STORED_S3_TABLE_INTEGRATION_RECORDS
+                        )),
                         resource_type: Some(
                             crate::state::S3_TABLE_INTEGRATION_RESOURCE_TYPE.to_string(),
                         ),
@@ -258,6 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+
+        // Nothing is minted until both refusals above are past, so a refused create
+        // consumes no id.
+        let created_at = crate::state::now_epoch_millis();
+        let id = crate::state::new_s3_table_integration_id();
+        let arn = crate::state::s3_table_integration_arn(&region, &id);
+        let destination_table_bucket_arn = crate::state::table_bucket_arn(&region, &id);
 
         store.insert_s3_table_integration(crate::state::StoredS3TableIntegration {
             id,

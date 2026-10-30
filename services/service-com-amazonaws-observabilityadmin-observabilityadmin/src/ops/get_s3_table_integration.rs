@@ -170,12 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(record) = store.s3_table_integration(&region, &input.arn) else {
+            // The refusal is the service's own fixed sentence: the requested ARN is
+            // reported as `ResourceId`, the member modelled for it, and not spliced
+            // into the message.
             return Err(GetS3TableIntegrationErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no S3 Table integration '{}' in {region}",
-                        input.arn
-                    )),
+                    message: Some(crate::state::INTEGRATION_NOT_FOUND_MESSAGE.to_string()),
                     resource_id: Some(input.arn),
                     resource_type: Some(
                         crate::state::S3_TABLE_INTEGRATION_RESOURCE_TYPE.to_string(),

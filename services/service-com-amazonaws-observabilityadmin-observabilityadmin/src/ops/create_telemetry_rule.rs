@@ -198,14 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // occupies, which is a record this region holds whether or not the fan-out
         // has come due.
         if store.name_taken(&region, &input.rule_name) {
+            // The service's own fixed sentence for a rule that is already there; the
+            // submitted name is reported as `ResourceId` and the input member that
+            // carried it as `ResourceType`, not spliced into the message.
             return Err(CreateTelemetryRuleErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "a telemetry rule named '{}' already exists in {region}",
-                        input.rule_name
-                    )),
+                    message: Some(crate::state::RULE_ALREADY_EXISTS_MESSAGE.to_string()),
                     resource_id: Some(input.rule_name.clone()),
-                    resource_type: Some("telemetry-rule".to_string()),
+                    resource_type: Some(crate::state::RULE_NAME_RESOURCE_TYPE.to_string()),
                 },
             )
             .into());
@@ -227,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             replication_targets.len(),
                             crate::state::MAX_STORED_RULE_RECORDS
                         )),
-                        resource_type: Some("telemetry-rule".to_string()),
+                        resource_type: Some(crate::state::RULE_RESOURCE_TYPE.to_string()),
                         service_code: Some(crate::state::ARN_SERVICE.to_string()),
                         ..Default::default()
                     },

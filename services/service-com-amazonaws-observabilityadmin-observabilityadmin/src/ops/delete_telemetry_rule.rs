@@ -177,14 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(record) = store.rule(&region, &input.rule_identifier, now) else {
+            // A mutating rule operation reports the resource it would have changed by
+            // ARN, which for an identifier nothing answers is derived from the
+            // request and this emulator's partition, region and account — a
+            // deliberately different sentence from the read path's.
+            let arn = crate::state::identified_rule_arn(&region, &input.rule_identifier);
             return Err(DeleteTelemetryRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no telemetry rule '{}' in {region}",
-                        input.rule_identifier
-                    )),
+                    message: Some(crate::state::resource_does_not_exist_message(&arn)),
                     resource_id: Some(input.rule_identifier),
-                    resource_type: Some("telemetry-rule".to_string()),
+                    resource_type: Some(crate::state::RULE_RESOURCE_TYPE.to_string()),
                 },
             )
             .into());

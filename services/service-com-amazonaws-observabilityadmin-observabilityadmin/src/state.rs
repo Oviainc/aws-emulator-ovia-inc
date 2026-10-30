@@ -39,7 +39,11 @@
 //! `GetS3TableIntegration` and `DeleteS3TableIntegration` take. No instant is stored
 //! on it: the modelled `IntegrationStatus` carries no transient creating value, only
 //! `ACTIVE` and `DELETING`, so a created integration is in service from the instant
-//! the create returns and the clock owes it no transition.
+//! the create returns and the clock owes it no transition. The integration is also a
+//! SINGLETON: an account holds at most one of them at the regional endpoint it calls,
+//! so a create while the caller's region already holds one is refused rather than
+//! stored ([`ONE_INTEGRATION_PER_ACCOUNT_MESSAGE`]) and a delete is what frees the
+//! slot.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -64,9 +68,41 @@ pub const ARN_SERVICE: &str = "observabilityadmin";
 /// reads `arn:aws:observabilityadmin:<region>:<account>:telemetry-rule/<RuleName>`.
 pub const RULE_ARN_RESOURCE_PREFIX: &str = "telemetry-rule/";
 
+/// The `ResourceType` a modelled error names the telemetry-rule RESOURCE by.
+///
+/// `ResourceNotFoundException$ResourceType` is "the type of the resource which could
+/// not be found", so it carries the resource's own API name — the noun the service's
+/// shapes and its own refusal sentences use — and never an ARN or store token.
+pub const RULE_RESOURCE_TYPE: &str = "Rule";
+
+/// The `ResourceType` a duplicate-name `ConflictException` names a telemetry rule by.
+///
+/// A create refused because the name is already in use conflicts on the INPUT MEMBER
+/// that carried the name, not on the resource, so that member is what the refusal
+/// names — `CreateTelemetryRule$RuleName` here.
+pub const RULE_NAME_RESOURCE_TYPE: &str = "RuleName";
+
+/// The `ResourceNotFoundException` message for a READ of a telemetry rule no record
+/// answers: fixed text, with no part of the request in it.
+pub const RULE_NOT_FOUND_MESSAGE: &str = "Rule not found.";
+
+/// The `ConflictException` message for a create whose rule name is already in use:
+/// fixed text, with the submitted name NOT interpolated.
+pub const RULE_ALREADY_EXISTS_MESSAGE: &str = "Telemetry Rule already exists.";
+
 /// The resource portion a telemetry-pipeline ARN carries before its name, so an ARN
 /// reads `arn:aws:observabilityadmin:<region>:<account>:telemetry-pipeline/<Name>`.
 pub const PIPELINE_ARN_RESOURCE_PREFIX: &str = "telemetry-pipeline/";
+
+/// The `ResourceNotFoundException` message for a read of a telemetry pipeline no
+/// record answers: fixed text, with no part of the request in it.
+pub const PIPELINE_NOT_FOUND_MESSAGE: &str = "Pipeline not found";
+
+/// The `ConflictException` message for a create whose pipeline name is already in
+/// use. Fixed text that names the INPUT MEMBER whose value collided
+/// (`CreateTelemetryPipeline$Name` is modelled as the pipeline name), not the value
+/// itself.
+pub const PIPELINE_NAME_ALREADY_EXISTS_MESSAGE: &str = "The specified PipelineName already exists";
 
 /// The resource portion an organization centralization rule's ARN carries before its
 /// name, so an ARN reads
@@ -163,8 +199,14 @@ pub const PIPELINE_STATUS_CREATING: &str = "CREATING";
 /// Status of a pipeline whose creation has come due.
 pub const PIPELINE_STATUS_ACTIVE: &str = "ACTIVE";
 
-/// The `ResourceType` this service names a pipeline by in a modelled error.
-pub const PIPELINE_RESOURCE_TYPE: &str = "telemetry-pipeline";
+/// The `ResourceType` a modelled error names the telemetry-pipeline RESOURCE by —
+/// its own API name, for the reason [`RULE_RESOURCE_TYPE`] states.
+pub const PIPELINE_RESOURCE_TYPE: &str = "Pipeline";
+
+/// The `ResourceType` a duplicate-name `ConflictException` names a pipeline by: the
+/// input member that carried the colliding name, for the reason
+/// [`RULE_NAME_RESOURCE_TYPE`] states.
+pub const PIPELINE_NAME_RESOURCE_TYPE: &str = "PipelineName";
 
 /// The resource portion an S3 Table integration's ARN carries before its id, so an
 /// ARN reads
@@ -177,9 +219,20 @@ pub const PIPELINE_RESOURCE_TYPE: &str = "telemetry-pipeline";
 /// `DeleteS3TableIntegration` both take `Arn`.
 pub const S3_TABLE_INTEGRATION_ARN_RESOURCE_PREFIX: &str = "s3-table-integration/";
 
-/// The `ResourceType` this service names an S3 Table integration by in a modelled
-/// error.
-pub const S3_TABLE_INTEGRATION_RESOURCE_TYPE: &str = "s3-table-integration";
+/// The `ResourceType` a modelled error names the S3 Table integration RESOURCE by —
+/// its own API name (the noun its summary, status and refusal shapes use), for the
+/// reason [`RULE_RESOURCE_TYPE`] states.
+pub const S3_TABLE_INTEGRATION_RESOURCE_TYPE: &str = "Integration";
+
+/// The `ResourceNotFoundException` message for a read of an S3 Table integration no
+/// record answers: fixed text, with the requested ARN NOT interpolated.
+pub const INTEGRATION_NOT_FOUND_MESSAGE: &str = "Integration not found";
+
+/// The `ConflictException` message for a create while the account already holds an
+/// integration at the regional endpoint the request was signed for: the integration
+/// is a SINGLETON, and the whole sentence is fixed text.
+pub const ONE_INTEGRATION_PER_ACCOUNT_MESSAGE: &str =
+    "Only one S3 Table integration is allowed per account";
 
 /// `IntegrationStatus` of an S3 Table integration that is in service. One of
 /// `IntegrationStatus`' own two values (`INTEGRATION_STATUS_VALUES`).
@@ -205,16 +258,6 @@ pub const TABLE_BUCKET_NAME_PREFIX: &str = "aws-cloudwatch-telemetry-";
 /// The `SSEAlgorithm` value that encrypts with a KMS key; the other one (`AES256`) is
 /// S3 managed encryption and takes none.
 pub const SSE_ALGORITHM_KMS: &str = "aws:kms";
-
-/// The most S3 Table integrations a caller may hold in ONE region.
-///
-/// Emulator resource guard, NOT an AWS quota: this service publishes no integration
-/// quota. [`MAX_STORED_S3_TABLE_INTEGRATION_RECORDS`] is the store-wide cap that
-/// dominates it, for the same reason it does for the pipelines above — the region a
-/// record is keyed by comes from the caller's own credential scope. A create past
-/// either cap is refused with the modelled `ServiceQuotaExceededException` before a
-/// record is allocated.
-pub const MAX_S3_TABLE_INTEGRATIONS: usize = 50;
 
 /// The most S3 Table integration records this emulator will hold ACROSS every
 /// region. Emulator resource guard, NOT an AWS quota.
@@ -1162,8 +1205,11 @@ impl ComAmazonawsObservabilityadminObservabilityadminState {
         self.s3_table_integrations.get(&key)
     }
 
-    /// How many S3 Table integrations `region` holds, which is what
-    /// [`MAX_S3_TABLE_INTEGRATIONS`] bounds.
+    /// How many S3 Table integrations `region` holds.
+    ///
+    /// The create path reads this to enforce the singleton the integration is (see
+    /// [`ONE_INTEGRATION_PER_ACCOUNT_MESSAGE`]), so through the wire it is 0 or 1;
+    /// a store pre-filled directly may hold more.
     pub fn s3_table_integration_count(&self, region: &str) -> usize {
         self.s3_table_integrations
             .keys()
@@ -1847,6 +1893,17 @@ fn replication_rejection(rule: &TelemetryRule, home_region: &str) -> Option<Stri
     )
 }
 
+/// The `ValidationException` message for a request that supplies BOTH forms of a
+/// multi-region scope.
+///
+/// Fixed text that names the two parameters in their lowerCamel wire form, which is
+/// how a client reads them off its own payload. Every member pair this service
+/// refuses here is named `Regions` / `AllRegions` — on `TelemetryRule` and on the
+/// `StartTelemetryEvaluation` family alike — so the one sentence covers them all.
+pub const MUTUALLY_EXCLUSIVE_SCOPE_MESSAGE: &str =
+    "Parameters 'regions' and 'allRegions' are mutually exclusive. Provide one or the \
+     other, not both.";
+
 /// Why a multi-region scope is unacceptable, or `None` when it is fine.
 ///
 /// The scope is the `AllRegions` / `Regions` pair, whose members this service names
@@ -1868,10 +1925,7 @@ pub fn multi_region_rejection(
     home_region: &str,
 ) -> Option<String> {
     if all_regions && !named.is_empty() {
-        return Some(format!(
-            "{member_prefix}Regions and {member_prefix}AllRegions are mutually exclusive; \
-             supply one of them"
-        ));
+        return Some(MUTUALLY_EXCLUSIVE_SCOPE_MESSAGE.to_string());
     }
     if named.len() > MAX_REPLICATION_TARGETS {
         return Some(format!(
@@ -1907,6 +1961,30 @@ pub fn rule_arn(region: &str, name: &str) -> String {
         region,
         &format!("{RULE_ARN_RESOURCE_PREFIX}{name}"),
     )
+}
+
+/// The ARN of the telemetry rule `identifier` names for a caller signed for `region`,
+/// whichever of the two forms `RuleIdentifier`'s documentation allows it took: an ARN
+/// is already one, and a bare name is resolved into the ARN of that name in the
+/// caller's own region.
+///
+/// This is the ARN a refusal reports for an identifier the store does not hold, so it
+/// is derived from the REQUEST and the emulator's partition, region and account —
+/// there is no record to read it off.
+pub fn identified_rule_arn(region: &str, identifier: &str) -> String {
+    if identifier.starts_with("arn:") {
+        return identifier.to_string();
+    }
+    rule_arn(region, identifier)
+}
+
+/// The `ResourceNotFoundException` message a MUTATING telemetry-rule operation reports
+/// for an identifier no record answers: the resource it would have changed, named by
+/// its ARN. Its only variable part is that ARN ([`identified_rule_arn`]); the rest is
+/// fixed text, and it is deliberately a different sentence from the read path's
+/// [`RULE_NOT_FOUND_MESSAGE`].
+pub fn resource_does_not_exist_message(arn: &str) -> String {
+    format!("Resource {arn} does not exist.")
 }
 
 /// The ARN of the telemetry pipeline `name` in `region`.

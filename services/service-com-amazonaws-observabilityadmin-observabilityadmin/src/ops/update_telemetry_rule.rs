@@ -184,14 +184,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(record) = store.rule(&region, &input.rule_identifier, now) else {
+            // A mutating rule operation reports the resource it would have changed by
+            // ARN, the same sentence the delete path reports; for an identifier
+            // nothing answers that ARN comes from the request and this emulator's
+            // partition, region and account.
+            let arn = crate::state::identified_rule_arn(&region, &input.rule_identifier);
             return Err(UpdateTelemetryRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no telemetry rule '{}' in {region}",
-                        input.rule_identifier
-                    )),
+                    message: Some(crate::state::resource_does_not_exist_message(&arn)),
                     resource_id: Some(input.rule_identifier),
-                    resource_type: Some("telemetry-rule".to_string()),
+                    resource_type: Some(crate::state::RULE_RESOURCE_TYPE.to_string()),
                 },
             )
             .into());
@@ -211,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          {home_region}; update it in its home region"
                     )),
                     resource_id: Some(rule_name),
-                    resource_type: Some("telemetry-rule".to_string()),
+                    resource_type: Some(crate::state::RULE_RESOURCE_TYPE.to_string()),
                 },
             )
             .into());
@@ -230,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             replication_targets.len(),
                             crate::state::MAX_STORED_RULE_RECORDS
                         )),
-                        resource_type: Some("telemetry-rule".to_string()),
+                        resource_type: Some(crate::state::RULE_RESOURCE_TYPE.to_string()),
                         service_code: Some(crate::state::ARN_SERVICE.to_string()),
                         ..Default::default()
                     },

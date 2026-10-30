@@ -14,6 +14,9 @@
 #[path = "all/centralization_rules.rs"]
 mod centralization_rules;
 
+#[path = "all/refusal_contract.rs"]
+mod refusal_contract;
+
 #[path = "all/s3_table_integration_listing.rs"]
 mod s3_table_integration_listing;
 
