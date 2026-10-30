@@ -1045,7 +1045,11 @@ async fn list_findings_applies_the_finding_criteria_it_is_given() {
     assert_eq!(status, 200, "create-sample-findings");
 
     // (criterion, how many of the three findings it selects)
-    let cases: [(Value, usize); 10] = [
+    //
+    // The `Condition` members the model offers only to the filter APIs are not among
+    // the rows: a findings read refuses them, which the `filter_only_conditions` suite
+    // asserts.
+    let cases: [(Value, usize); 7] = [
         (json!({"type": {"equals": ["Recon:EC2/PortProbeUnprotectedPort"]}}), 1),
         (json!({"type": {"notEquals": ["Recon:EC2/PortProbeUnprotectedPort"]}}), 2),
         (json!({"resource.resourceType": {"equals": ["Instance"]}}), 2),
@@ -1054,9 +1058,6 @@ async fn list_findings_applies_the_finding_criteria_it_is_given() {
         // below the High band.
         (json!({"severity": {"greaterThanOrEqual": 7}}), 2),
         (json!({"severity": {"lessThan": 7}}), 1),
-        (json!({"type": {"matches": ["Recon:*"]}}), 1),
-        (json!({"type": {"matches": ["*S3*"]}}), 1),
-        (json!({"type": {"notMatches": ["Recon:*"]}}), 2),
         (json!({"service.archived": {"equals": ["false"]}}), 3),
     ];
 
@@ -1129,11 +1130,11 @@ async fn list_findings_applies_the_finding_criteria_it_is_given() {
     }
 }
 
-/// `Matches` / `NotMatches` treat `*` as any run of characters. The rows cover the
-/// forms a pattern can take — literal, prefix, suffix, infix, several wildcards, and
-/// the bare `*` that matches everything.
+/// `Matches` / `NotMatches` are the two `Condition` members the model offers only to the
+/// filter APIs, so a findings read is REFUSED them. Their wildcard semantics, and the
+/// refusal on the read side, live in the `filter_only_conditions` suite.
 #[tokio::test]
-async fn a_matches_condition_follows_the_wildcard_pattern_it_is_given() {
+async fn list_findings_refuses_a_condition_the_filter_apis_alone_offer() {
     let router = new_router();
     let detector_id = enabled_detector(&router).await;
     let (status, _) = call(
@@ -1149,48 +1150,25 @@ async fn a_matches_condition_follows_the_wildcard_pattern_it_is_given() {
     .await;
     assert_eq!(status, 200, "create-sample-findings");
 
-    // (pattern, how many of the three finding types it matches)
-    let cases: [(&str, usize); 8] = [
-        ("Recon:EC2/PortProbeUnprotectedPort", 1), // literal, whole value
-        ("Recon:EC2/PortProbe", 0),                // literal, prefix only: no match
-        ("Recon:*", 1),                            // prefix
-        ("*IPCaller", 1),                          // suffix
-        ("*EC2*", 2),                              // infix
-        ("*:*/*", 3),                              // several wildcards
-        ("*", 3),                                  // matches everything
-        ("*NoSuchFamily*", 0),                     // matches nothing
-    ];
-
-    for case in cases {
-        let (pattern, expected) = case;
+    for case in [
+        json!({"type": {"matches": ["Recon:*"]}}),
+        json!({"type": {"notMatches": ["Recon:*"]}}),
+    ] {
         let (status, body) = call(
             &router,
             "POST",
             &format!("/detector/{detector_id}/findings"),
-            Some(json!({"findingCriteria": {"criterion": {"type": {"matches": [pattern]}}}})),
+            Some(json!({"findingCriteria": {"criterion": case}})),
         )
         .await;
-        assert_eq!(status, 200, "case {case:?}: list-findings got {status} {body:?}");
-        let count = body["findingIds"].as_array().map_or(0, Vec::len);
         assert_eq!(
-            count, expected,
-            "case {case:?}: expected {expected} match(es), got {count} in {body:?}"
+            status, 400,
+            "case {case:?}: a condition the reads do not offer must be refused, got {status} {body:?}"
         );
-
-        // `NotMatches` is the complement of `Matches` over the same three findings.
-        let (status, body) = call(
-            &router,
-            "POST",
-            &format!("/detector/{detector_id}/findings"),
-            Some(json!({"findingCriteria": {"criterion": {"type": {"notMatches": [pattern]}}}})),
-        )
-        .await;
-        assert_eq!(status, 200, "case {case:?}: list-findings got {status} {body:?}");
-        let count = body["findingIds"].as_array().map_or(0, Vec::len);
         assert_eq!(
-            count,
-            3 - expected,
-            "case {case:?}: notMatches must select the complement, got {count} in {body:?}"
+            error_code(&body),
+            "InvalidInputException",
+            "case {case:?}: got {body:?}"
         );
     }
 }

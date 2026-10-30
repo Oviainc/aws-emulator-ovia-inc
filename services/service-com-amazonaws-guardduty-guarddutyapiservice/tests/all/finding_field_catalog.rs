@@ -15,9 +15,8 @@
 //!    every field the model lists as available for filtering findings, whether or not
 //!    a finding this emulator stores carries a value for it.
 //! 2. A field no stored finding carries a value for selects NO finding and excludes
-//!    none: an absent value equals nothing and matches no pattern, so an equality, a
-//!    pattern or an ordering on it selects nothing while a negation of it selects
-//!    every finding.
+//!    none: an absent value equals nothing, so an equality or an ordering on it selects
+//!    nothing while a negation of it selects every finding.
 //! 3. A field a stored finding DOES carry is selected by the value the finding
 //!    reports.
 //! 4. A name that is no field of a finding is refused with HTTP 400 under this
@@ -353,15 +352,16 @@ async fn a_field_no_stored_finding_carries_selects_nothing_and_excludes_nothing(
     let all = ids.len();
 
     // (condition on the field, how many of the stored findings it selects)
-    let conditions: [(Value, usize); 8] = [
+    //
+    // The members the model offers only to the filter APIs are not among the rows: a
+    // findings read refuses them, and the same rule for a PATTERN on an unpopulated
+    // field is asserted on the filter surface by the `filter_only_conditions` suite.
+    let conditions: [(Value, usize); 5] = [
         (json!({"equals": ["anything"]}), 0),
         (json!({"eq": ["anything"]}), 0),
-        (json!({"matches": ["*"]}), 0),
-        (json!({"matches": ["prefix*"]}), 0),
         (json!({"greaterThan": 0}), 0),
         (json!({"lessThanOrEqual": 99}), 0),
         (json!({"notEquals": ["anything"]}), all),
-        (json!({"notMatches": ["*"]}), all),
     ];
 
     for (field, form) in UNPOPULATED_FIELDS {
@@ -436,7 +436,7 @@ async fn a_field_a_stored_finding_carries_selects_by_the_value_it_reports() {
         ("service.resourceRole", json!({"equals": [resource_role.clone()]}), all),
         ("service.resourceRole", json!({"notEquals": [resource_role]}), 0),
         ("service.serviceName", json!({"equals": [service_name.clone()]}), all),
-        ("service.serviceName", json!({"matches": ["guard*"]}), all),
+        ("service.serviceName", json!({"notEquals": ["not-guardduty"]}), all),
         ("service.serviceName", json!({"equals": ["not-guardduty"]}), 0),
         ("service.eventFirstSeen", json!({"equals": [event_first_seen]}), 1),
         ("service.eventFirstSeen", json!({"greaterThan": 0}), all),

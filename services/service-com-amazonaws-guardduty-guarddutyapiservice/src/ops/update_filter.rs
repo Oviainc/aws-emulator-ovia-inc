@@ -173,11 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose criterion names no field would select nothing. The check is the one
         // `ListFindings`/`GetFindings` apply and `CreateFilter` already refuses an
         // unknown key by, so an update cannot smuggle into a saved filter a criterion a
-        // create would have refused.
+        // create would have refused. This IS a filter API, so every `Condition` member
+        // is available to it, including the two the model offers only here.
         //
         // Validated before the store is touched, so a refused update changes nothing.
-        crate::state::validate_finding_criteria(input.finding_criteria.as_ref())
-            .map_err(|rejection| bad_request(rejection.message(FINDING_CRITERIA_MEMBER)))?;
+        crate::state::validate_finding_criteria(
+            input.finding_criteria.as_ref(),
+            crate::state::CriteriaSurface::Filter,
+        )
+        .map_err(|rejection| bad_request(rejection.message(FINDING_CRITERIA_MEMBER)))?;
 
         // The modelled constraints — `Rank` range 1..100, `Description` len 0..512,
         // `Action` within `FilterAction` — are refused BEFORE this handler runs, as

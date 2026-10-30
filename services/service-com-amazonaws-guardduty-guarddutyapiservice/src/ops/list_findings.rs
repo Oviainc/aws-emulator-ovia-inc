@@ -5,7 +5,8 @@
 //! filtered through `FindingCriteria` and paginated through `maxResults` / `nextToken`.
 //! An unknown detector id is refused with `BadRequestException`, and so is a criterion
 //! key or sort attribute that names no field of a finding — silently ignoring a filter
-//! would return findings the caller asked it to exclude.
+//! would return findings the caller asked it to exclude — and so is a criterion applying
+//! a `Condition` member the model offers only to the filter APIs.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -182,9 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut matched: Vec<&crate::state::FindingRecord> = Vec::new();
         // Validated up front, so a detector with no findings refuses an unevaluable
-        // criterion exactly as a populated one does.
-        crate::state::validate_finding_criteria(input.finding_criteria.as_ref())
-            .map_err(|rejection| refusal(&rejection, FINDING_CRITERIA_MEMBER))?;
+        // criterion exactly as a populated one does. This is a findings QUERY, so the
+        // `Condition` members the model offers only to the filter APIs are not
+        // available here and a criterion applying one is refused rather than evaluated.
+        crate::state::validate_finding_criteria(
+            input.finding_criteria.as_ref(),
+            crate::state::CriteriaSurface::FindingsQuery,
+        )
+        .map_err(|rejection| refusal(&rejection, FINDING_CRITERIA_MEMBER))?;
         for finding in detector.findings.values() {
             match crate::state::finding_matches(finding, input.finding_criteria.as_ref()) {
                 Ok(true) => matched.push(finding),

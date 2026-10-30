@@ -669,10 +669,11 @@ async fn the_account_and_date_groups_carry_their_own_keys() {
 // Rule 3: findingCriteria restricts the counted set.
 // ---------------------------------------------------------------------------
 
-/// The criteria rows span the condition operators this service evaluates and both ends
-/// of the selected set: everything, a severity band, an equality, a wildcard on the
+/// The criteria rows span the condition operators this operation offers and both ends
+/// of the selected set: everything, a severity band, an equality, an exclusion by
 /// finding type, a criterion nothing matches. Each row's expectation is the number of
-/// ids `ListFindings` selects with the SAME criteria.
+/// ids `ListFindings` selects with the SAME criteria — the two reads offer the same
+/// `Condition` members, so the same criteria reach both.
 #[tokio::test]
 async fn finding_criteria_restricts_the_counted_findings() {
     let cases: [(&str, Value); 7] = [
@@ -691,8 +692,8 @@ async fn finding_criteria_restricts_the_counted_findings() {
             json!({"criterion": {"severity": {"equals": ["5"]}}}),
         ),
         (
-            "a wildcard on the finding type",
-            json!({"criterion": {"type": {"matches": ["*:EC2/*"]}}}),
+            "an exclusion by finding type",
+            json!({"criterion": {"type": {"notEquals": [MIXED_TYPES[0]]}}}),
         ),
         (
             "a criterion nothing matches",
@@ -743,10 +744,22 @@ async fn finding_criteria_restricts_the_counted_findings() {
 /// textual field.
 #[tokio::test]
 async fn a_criterion_this_service_cannot_evaluate_is_refused() {
-    let cases: [(&str, Value); 4] = [
+    let cases: [(&str, Value); 6] = [
         (
             "a detail document rather than a field in it",
             json!({"criterion": {"resource.instanceDetails": {"equals": ["i-1"]}}}),
+        ),
+        // The two `Condition` members the model offers only to the filter APIs: this
+        // operation does not offer them, so a criterion applying one is refused rather
+        // than counted over. The `filter_only_conditions` suite asserts the rule in
+        // full.
+        (
+            "a condition the filter APIs alone offer",
+            json!({"criterion": {"type": {"matches": ["*:EC2/*"]}}}),
+        ),
+        (
+            "its negated form",
+            json!({"criterion": {"type": {"notMatches": ["*:EC2/*"]}}}),
         ),
         (
             "an attribute that is not a finding attribute at all",

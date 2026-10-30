@@ -207,15 +207,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ListFindings` and `GetFindings` apply
         // (`crate::state::validate_finding_criteria`), so there is ONE answer on
         // this service to "is this a finding field": a criterion a saved filter
-        // carries is one a findings read accepts. A field a finding may carry but
+        // carries is one a findings read accepts by KEY. What differs between the two
+        // is which `Condition` members apply, which the model states per member and
+        // the surface below selects: this is a filter API, so all of them do.
+        // A field a finding may carry but
         // this emulator's records do not populate is SAVED and selects nothing,
         // which is what the same filter does on the real service against findings
         // that have no value for it.
         //
         // Validated before the store is touched, so a refused request leaves no
         // filter behind.
-        crate::state::validate_finding_criteria(Some(&input.finding_criteria))
-            .map_err(|rejection| bad_request(rejection.message(FINDING_CRITERIA_MEMBER)))?;
+        crate::state::validate_finding_criteria(
+            Some(&input.finding_criteria),
+            crate::state::CriteriaSurface::Filter,
+        )
+        .map_err(|rejection| bad_request(rejection.message(FINDING_CRITERIA_MEMBER)))?;
 
         // The per-resource tag ceiling holds however the tags arrive, so a create
         // carrying more of them than a resource may hold is refused here rather

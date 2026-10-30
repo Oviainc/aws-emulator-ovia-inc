@@ -2,7 +2,9 @@
 
 //! @op GetFindingsStatistics
 //! IMPLEMENTED: reports statistics COMPUTED over the findings the detector holds —
-//! the set `FindingCriteria` selects, the same filter `ListFindings` applies.
+//! the set `FindingCriteria` selects, the same filter `ListFindings` applies, and with
+//! the same `Condition` members available: the two the model offers only to the filter
+//! APIs are refused here rather than evaluated.
 //!
 //! The caller picks ONE of the two shapes of answer: the deprecated
 //! `findingStatisticTypes` (`COUNT_BY_SEVERITY`, a count per severity) or `groupBy`
@@ -205,9 +207,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Validated up front, so a detector with no findings refuses an unevaluable
-        // criterion exactly as a populated one does.
-        crate::state::validate_finding_criteria(input.finding_criteria.as_ref())
-            .map_err(|rejection| refusal(&rejection))?;
+        // criterion exactly as a populated one does. This is a findings QUERY, so the
+        // `Condition` members the model offers only to the filter APIs are not
+        // available here and a criterion applying one is refused rather than evaluated.
+        crate::state::validate_finding_criteria(
+            input.finding_criteria.as_ref(),
+            crate::state::CriteriaSurface::FindingsQuery,
+        )
+        .map_err(|rejection| refusal(&rejection))?;
         let mut matched: Vec<&crate::state::FindingRecord> = Vec::new();
         for finding in detector.findings.values() {
             match crate::state::finding_matches(finding, input.finding_criteria.as_ref()) {

@@ -67,6 +67,8 @@ mod filter_detector_timestamp;
 mod filter_lifecycle;
 #[path = "all/filter_listing.rs"]
 mod filter_listing;
+#[path = "all/filter_only_conditions.rs"]
+mod filter_only_conditions;
 #[path = "all/filter_update_isolation.rs"]
 mod filter_update_isolation;
 #[path = "all/finding_field_catalog.rs"]

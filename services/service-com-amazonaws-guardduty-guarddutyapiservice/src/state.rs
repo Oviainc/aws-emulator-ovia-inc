@@ -5682,6 +5682,11 @@ pub enum CriterionRejection {
     UnknownField(String),
     /// It names a field, but not one an ordering condition can compare.
     NotOrderable(String),
+    /// The criterion applies a `Condition` member the model restricts to the filter
+    /// APIs — `matches` or `notMatches` — on an operation that is not one of them
+    /// (see [`filter_only_condition`]). Carries that member's `jsonName`, which is a
+    /// name from the MODEL and not a value from the request.
+    ConditionNotAvailable(&'static str),
 }
 
 impl CriterionRejection {
@@ -5691,12 +5696,12 @@ impl CriterionRejection {
     /// invalid-value sentence for that member ([`invalid_parameter_value_message`]):
     /// which key inside the structure was at fault, and why, is not echoed — the
     /// offending name came from the request, and a refusal does not quote request
-    /// input back. The two variants are the same refusal to a caller and differ only
-    /// in why this service would not take the name; they are kept apart because the
-    /// readers that produce them answer different questions.
+    /// input back. The variants are the same refusal to a caller and differ only
+    /// in why this service would not take the criterion; they are kept apart because
+    /// the readers that produce them answer different questions.
     pub fn message(&self, member: &str) -> String {
         match self {
-            Self::UnknownField(_) | Self::NotOrderable(_) => {
+            Self::UnknownField(_) | Self::NotOrderable(_) | Self::ConditionNotAvailable(_) => {
                 invalid_parameter_value_message(member)
             }
         }
@@ -5831,7 +5836,9 @@ pub fn condition_matches(
 
     // `Matches` / `NotMatches` compare the attribute against a pattern in which
     // `*` stands for any run of characters; like the equality lists, a list holds
-    // alternatives.
+    // alternatives. The model offers the two only to the filter APIs, so the criteria
+    // that reach here carrying them are a SAVED filter's — a findings read is refused
+    // them up front ([`validate_finding_criteria`]) instead of evaluating them.
     if let Some(patterns) = condition.matches.as_ref() {
         let selected = text
             .as_ref()
@@ -5901,13 +5908,58 @@ pub fn finding_matches(
     Ok(true)
 }
 
-/// Refuse a `FindingCriteria` this service cannot answer, naming the field path.
+/// Which OPERATION CLASS a `FindingCriteria` arrived at, and so which `Condition`
+/// members are available on it.
+///
+/// `Condition` is the one condition shape a `FindingCriteria.Criterion` targets, so the
+/// filter APIs and the findings reads are handed the same structure and the shape alone
+/// cannot say which members each of them takes; the model says it per member
+/// ([`filter_only_condition`]). Every caller of [`validate_finding_criteria`] therefore
+/// states which class it is, and a new operation taking a `FindingCriteria` cannot be
+/// written without answering the question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CriteriaSurface {
+    /// The filter APIs — the create and update that SAVE a `FindingCriteria` — on
+    /// which every `Condition` member is available.
+    Filter,
+    /// A findings read that QUERIES with a `FindingCriteria`, on which the members the
+    /// model reserves for the filter APIs are not available.
+    FindingsQuery,
+}
+
+/// The `Condition` member the model documents as available only to the filter APIs that
+/// `condition` applies, by `jsonName`, if it applies one.
+///
+/// The restriction is the model's, stated per member rather than by the shape: `Matches`
+/// is "available only for create-filter and update-filter APIs"
+/// (`smithy_query(query="doc",shape="Condition",member="Matches")`) and `NotMatches`
+/// says the same of itself
+/// (`smithy_query(query="doc",shape="Condition",member="NotMatches")`), while no other
+/// member of the shape is narrowed that way. The pair is read here, in one place, so the
+/// operations handed a `FindingCriteria` cannot disagree about which members a caller
+/// may apply.
+///
+/// PRESENCE is what counts, not whether the list holds a pattern: a member the caller
+/// sent is a condition the caller applied, and a member an operation does not offer is
+/// not offered emptily either.
+fn filter_only_condition(condition: &crate::ops::types::Condition) -> Option<&'static str> {
+    [
+        ("matches", condition.matches.is_some()),
+        ("notMatches", condition.not_matches.is_some()),
+    ]
+    .into_iter()
+    .find_map(|(member, present)| present.then_some(member))
+}
+
+/// Refuse a `FindingCriteria` this service cannot answer on `surface`, naming the field
+/// path or the unavailable condition.
 ///
 /// Checked BEFORE any finding is looked at, so whether a criterion is refused does
 /// not depend on how many findings happen to be stored: a detector with none must
 /// answer an unevaluable criterion exactly as a populated one does.
 pub fn validate_finding_criteria(
     criteria: Option<&crate::ops::types::FindingCriteria>,
+    surface: CriteriaSurface,
 ) -> Result<(), CriterionRejection> {
     let Some(criterion) = criteria.and_then(|c| c.criterion.as_ref()) else {
         return Ok(());
@@ -5915,6 +5967,15 @@ pub fn validate_finding_criteria(
     for (path, condition) in criterion {
         if !is_finding_field(path) {
             return Err(CriterionRejection::UnknownField(path.clone()));
+        }
+        // A condition the model offers only to the filter APIs is refused on a
+        // findings read rather than evaluated there: the operation does not offer it,
+        // so a caller who sends it is told so instead of being answered 200 with a
+        // page selected by a condition this operation does not have.
+        if surface == CriteriaSurface::FindingsQuery {
+            if let Some(member) = filter_only_condition(condition) {
+                return Err(CriterionRejection::ConditionNotAvailable(member));
+            }
         }
         let orders_numerically = condition.greater_than.is_some()
             || condition.greater_than_or_equal.is_some()

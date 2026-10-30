@@ -12,9 +12,12 @@
 //! call:
 //!
 //! 1. A saved filter whose action archives puts exactly the findings its criteria
-//!    select into the archived state, and leaves every other finding where it was. The
-//!    set it selects is the set a `ListFindings` carrying the same criteria reports, so
-//!    the suppression and the findings read cannot select different sets.
+//!    select into the archived state, and leaves every other finding where it was. For
+//!    criteria built from the `Condition` members a findings read also offers, the set
+//!    it selects is the set a `ListFindings` carrying the same criteria reports, so the
+//!    suppression and the findings read cannot select different sets; the members the
+//!    model offers only to the filter APIs have no findings read to compare against, so
+//!    those rows state the selection on their own.
 //! 2. The action decides whether a matching finding moves: the archiving member moves
 //!    it, the other member and a request naming no action leave it alone.
 //! 3. The rule holds whichever order the filter and the findings arrive in — a finding
@@ -269,6 +272,24 @@ async fn ids_of_types(router: &Router, detector_id: &str, types: &[&str]) -> Vec
         .collect()
 }
 
+/// Does `criteria` apply a `Condition` member the model offers only to the filter APIs?
+///
+/// `Matches` is "available only for create-filter and update-filter APIs"
+/// (`smithy_query(query="doc",shape="Condition",member="Matches")`) and `NotMatches`
+/// says the same of itself, so a findings read refuses criteria carrying either and
+/// cannot serve as the reference set for such a row.
+fn uses_filter_only_condition(criteria: &Value) -> bool {
+    criteria["criterion"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .any(|(_, condition)| {
+            ["matches", "notMatches"]
+                .iter()
+                .any(|member| condition.get(member).is_some())
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Rule 1: an archiving filter archives exactly the findings its criteria select.
 // ---------------------------------------------------------------------------
@@ -278,17 +299,24 @@ async fn ids_of_types(router: &Router, detector_id: &str, types: &[&str]) -> Vec
 /// finding, two, the complement of one, the two ends of a numeric range, a wildcard, an
 /// intersection of two criteria, and a selection that is empty.
 ///
-/// The expectation is stated twice over: the count the row names, and the set the
-/// service's own `ListFindings` reports for the same criteria — so a filter can neither
-/// suppress more than it selects nor less.
+/// The expectation is stated twice over wherever it can be: the findings the row names,
+/// and the set the service's own `ListFindings` reports for the same criteria — so a
+/// filter can neither suppress more than it selects nor less. A row built from a
+/// `Condition` member the model offers only to the filter APIs has no findings read to
+/// compare against ([`uses_filter_only_condition`]), so it stands on the set it names.
 #[tokio::test]
 async fn an_archiving_filter_archives_exactly_the_findings_its_criteria_select() {
-    let rows: [(&str, Value, usize); 9] = [
-        ("every finding (no criterion at all)", json!({"criterion": {}}), 5),
+    // (label, criteria, the indices of SAMPLES the criteria select)
+    let rows: [(&str, Value, &[usize]); 9] = [
+        (
+            "every finding (no criterion at all)",
+            json!({"criterion": {}}),
+            &[0, 1, 2, 3, 4],
+        ),
         (
             "one type",
             criteria("type", json!({"equals": [sample_type(1)]})),
-            1,
+            &[1],
         ),
         (
             "two types",
@@ -296,27 +324,27 @@ async fn an_archiving_filter_archives_exactly_the_findings_its_criteria_select()
                 "type",
                 json!({"equals": [sample_type(0), sample_type(3)]}),
             ),
-            2,
+            &[0, 3],
         ),
         (
             "the complement of one type",
             criteria("type", json!({"notEquals": [sample_type(1)]})),
-            4,
+            &[0, 2, 3, 4],
         ),
         (
             "the high end of the severity range",
             criteria("severity", json!({"greaterThanOrEqual": 8})),
-            2,
+            &[3, 4],
         ),
         (
             "the low end of the severity range",
             criteria("severity", json!({"lessThan": 4})),
-            1,
+            &[0],
         ),
         (
             "a wildcard on the type",
             criteria("type", json!({"matches": ["Recon:EC2/*"]})),
-            1,
+            &[1],
         ),
         (
             "two criteria, intersected",
@@ -324,25 +352,30 @@ async fn an_archiving_filter_archives_exactly_the_findings_its_criteria_select()
                 "severity": {"greaterThanOrEqual": 5},
                 "type": {"matches": ["*:S3/*"]},
             }}),
-            1,
+            &[3],
         ),
         (
             "a type no finding carries",
             criteria("type", json!({"equals": ["Recon:EC2/NoSuchFindingType"]})),
-            0,
+            &[],
         ),
     ];
 
-    for (label, criteria, expected_count) in rows {
+    for (label, criteria, selected) in rows {
         let router = new_router();
         let detector_id = detector_with_findings(&router).await;
 
-        let expected = selected_types(&router, &detector_id, &criteria).await;
-        assert_eq!(
-            expected.len(),
-            expected_count,
-            "case {label:?}: expected the criteria to select {expected_count} finding(s), got {expected:?}"
-        );
+        let expected: BTreeSet<String> = selected
+            .iter()
+            .map(|index| sample_type(*index).to_string())
+            .collect();
+        if !uses_filter_only_condition(&criteria) {
+            let listed = selected_types(&router, &detector_id, &criteria).await;
+            assert_eq!(
+                listed, expected,
+                "case {label:?}: expected the criteria to select {expected:?}, got {listed:?}"
+            );
+        }
 
         create_filter_ok(
             &router,
