@@ -162,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A resource that exists but carries no tags reports an empty tag set,
         // not an absent one: the caller asked what the resource's tags are, and
         // the answer is "none".
-        let tags = store.tags_of(&input.resource_arn).unwrap_or_default();
+        let tags = store.tags_of(&input.resource_arn);
 
         Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }

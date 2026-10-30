@@ -82,6 +82,32 @@ pub const MAX_AD_DECISION_SERVER_URL_LENGTH: usize = 25_000;
 /// characters."
 pub const MAX_VIDEO_CONTENT_SOURCE_URL_LENGTH: usize = 512;
 
+/// The ad-buffet mode a playback configuration reports for live and for VOD
+/// streams.
+///
+/// `LiveAdBuffetMode` and `VodAdBuffetMode` are projected on every read of a
+/// playback configuration, and no operation this service models carries them in
+/// a request, so every configuration this emulator holds reports the service's
+/// own default for both and there is no per-configuration value to persist.
+///
+/// The value is the one the service reports for a configuration that never set
+/// a mode. It lives here rather than in the model because the model this crate
+/// is generated from declares no such member and so no default for it either:
+/// should a later revision of that model carry the members, their declared
+/// default replaces this constant, and an operation that lets a request choose
+/// a mode makes it a field of [`PlaybackConfigurationRecord`] instead.
+pub const DEFAULT_AD_BUFFET_MODE: &str = "INSERT_ALL";
+
+/// The number of event types one log-configuration list names.
+///
+/// `EnabledLoggingStrategies` and the interaction-log event-type lists are
+/// caller-sized and the model declares no `length` constraint on any of them,
+/// so this figure is CHOSEN: its purpose is that one stored log configuration
+/// cannot grow without bound however many times logs are configured. It is far
+/// above every one of those lists' modelled value sets, so a request that names
+/// each event type it has to name never reaches it.
+pub const MAX_LOG_EVENT_TYPES_PER_LIST: usize = 100;
+
 /// The largest page `ListPlaybackConfigurations` serves, and the page size it
 /// applies when the request names none: `MaxResults`' modelled `range 1..100`,
 /// whose maximum is also the documented default ("The default value is 100.").
@@ -109,21 +135,30 @@ pub struct ComAmazonawsMediatailorMediatailorState {
     /// it from the request's `Tags`, and the playback-configuration reads render
     /// their `Tags` member from it — so a tag written through either surface is
     /// visible through both.
+    ///
+    /// Every key is a stored resource's OWN ARN — the tagging operations refuse
+    /// any other ARN (see [`Self::taggable_resource_exists`]), a replacement
+    /// that re-mints the ARN moves the entry, and a delete removes it — so this
+    /// map holds at most one entry per stored resource.
     pub tags_by_arn: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl ComAmazonawsMediatailorMediatailorState {
-    /// The tags of `arn` as the wire shape renders them, or `None` when the
-    /// resource carries no tags (an absent `Tags` member, not an empty object).
-    pub fn tags_of(&self, arn: &str) -> Option<HashMap<String, String>> {
+    /// The tags of `arn` as the wire shape renders them: the empty map when the
+    /// resource carries none.
+    ///
+    /// A read of a resource answers what that resource's tags ARE, and for an
+    /// untagged resource the answer is "none" — an empty map, not an absent
+    /// member — so the caller dereferences a map either way.
+    pub fn tags_of(&self, arn: &str) -> HashMap<String, String> {
         self.tags_by_arn
             .get(arn)
-            .filter(|tags| !tags.is_empty())
             .map(|tags| {
                 tags.iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect()
             })
+            .unwrap_or_default()
     }
 
     /// Whether a configuration named `name` can be stored: either it is already
@@ -143,17 +178,26 @@ impl ComAmazonawsMediatailorMediatailorState {
     /// Whether `arn` names a resource this emulator currently holds, so the
     /// tagging operations can refuse an ARN that addresses nothing.
     ///
+    /// The whole ARN has to match the one the resource itself reports — its
+    /// partition, region and account as well as its type and name — so an ARN
+    /// that merely ends in a stored resource's name addresses nothing. That is
+    /// also what bounds [`Self::tags_by_arn`]: every key it can ever hold is a
+    /// stored resource's own ARN, released when that resource is deleted, so
+    /// the tag store is bounded by the same ceilings the resource stores are.
+    ///
     /// Every MediaTailor resource type this emulator persists is listed here:
     /// an ARN naming a type it does not persist yet addresses nothing, and an
     /// ARN this service does not own is not a resource of this service at all.
     pub fn taggable_resource_exists(&self, arn: &str) -> bool {
-        match resource_from_arn(arn) {
-            Some(("playbackConfiguration", name)) => {
-                self.playback_configurations.contains_key(name)
-            }
-            Some(("channel", name)) => self.channels.contains_key(name),
-            _ => false,
-        }
+        let stored_arn = match resource_from_arn(arn) {
+            Some(("playbackConfiguration", name)) => self
+                .playback_configurations
+                .get(name)
+                .map(|record| record.arn.as_str()),
+            Some(("channel", name)) => self.channels.get(name).map(|record| record.arn.as_str()),
+            _ => None,
+        };
+        stored_arn == Some(arn)
     }
 }
 
@@ -267,10 +311,7 @@ pub struct PlaybackConfigurationRecord {
 /// struct. Implementing one rendering for all three is what keeps the Put
 /// response, the Get response and the list item from drifting apart.
 pub trait PlaybackConfigurationView: Sized {
-    fn from_record(
-        record: &PlaybackConfigurationRecord,
-        tags: Option<HashMap<String, String>>,
-    ) -> Self;
+    fn from_record(record: &PlaybackConfigurationRecord, tags: HashMap<String, String>) -> Self;
 }
 
 macro_rules! impl_playback_configuration_view {
@@ -278,7 +319,7 @@ macro_rules! impl_playback_configuration_view {
         $(impl PlaybackConfigurationView for $shape {
             fn from_record(
                 record: &PlaybackConfigurationRecord,
-                tags: Option<HashMap<String, String>>,
+                tags: HashMap<String, String>,
             ) -> Self {
                 Self {
                     name: Some(record.name.clone()),
@@ -319,7 +360,12 @@ macro_rules! impl_playback_configuration_view {
                     dual_stack_session_initialization_endpoint_prefix: Some(
                         record.dual_stack_session_initialization_endpoint_prefix.clone(),
                     ),
-                    tags,
+                    // Always present: the tag map (empty for an untagged
+                    // configuration) and the two ad-buffet modes, which every
+                    // read of a playback configuration reports.
+                    tags: Some(tags),
+                    live_ad_buffet_mode: Some(DEFAULT_AD_BUFFET_MODE.to_string()),
+                    vod_ad_buffet_mode: Some(DEFAULT_AD_BUFFET_MODE.to_string()),
                 }
             }
         })+

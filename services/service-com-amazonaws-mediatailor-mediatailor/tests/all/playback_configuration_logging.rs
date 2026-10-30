@@ -1,0 +1,475 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! What every read of a playback configuration reports, end to end over HTTP.
+//!
+//! The harness is the one `playback_configuration.rs` owns, so these assertions
+//! go through the router too: a request is built, dispatched to the mounted
+//! service, and the JSON response read back.
+//!
+//! Two rules are under test.
+//!
+//! * A playback configuration's log settings are the ones last written for it:
+//!   `ConfigureLogsForPlaybackConfiguration` defines the configuration's whole
+//!   `LogConfiguration`, and every projection of that configuration — the
+//!   configure-logs answer itself, `GetPlaybackConfiguration`,
+//!   `ListPlaybackConfigurations` and a later `PutPlaybackConfiguration` —
+//!   reports it unchanged until the next configure-logs call. The table spans
+//!   the class of log settings: the percentage at both documented bounds and in
+//!   between, every value of the logging-strategy catalog alone, both together
+//!   in either order, no strategy at all, and the two interaction-log settings.
+//! * The members MediaTailor reports for every configuration are always
+//!   present: the tag map under the wire key `tags`, as an empty object when
+//!   the configuration carries no tags, and the two ad-buffet modes. The table
+//!   spans tag counts from none to several.
+
+use serde_json::{json, Value};
+
+use crate::playback_configuration::{Emulator, Reply};
+
+/// The logging strategies this service accepts, from the model's
+/// `LoggingStrategy` enum (`smithy_query(query="shape",shape="LoggingStrategy")`
+/// → `VENDED_LOGS`, `LEGACY_CLOUDWATCH`).
+const LOGGING_STRATEGIES: [&str; 2] = ["VENDED_LOGS", "LEGACY_CLOUDWATCH"];
+
+/// The documented bounds of `PercentEnabled` ("Valid values: 0 - 100").
+const PERCENT_BOUNDS: [i64; 2] = [0, 100];
+
+/// The number of event types one log-configuration list may name
+/// (`crate::state::MAX_LOG_EVENT_TYPES_PER_LIST`): a capacity this emulator
+/// chooses, so one stored log configuration cannot grow without bound.
+const MAX_EVENT_TYPES_PER_LIST: usize = 100;
+
+/// The ad-buffet mode a configuration that never set one reports, for live and
+/// for VOD alike.
+const AD_BUFFET_MODE: &str = "INSERT_ALL";
+
+/// `PUT /configureLogs/playbackConfiguration` for one configuration.
+async fn configure_logs(emulator: &Emulator, name: &str, settings: &Value) -> Reply {
+    let mut body = settings.clone();
+    body.as_object_mut()
+        .expect("the row is an object")
+        .insert("PlaybackConfigurationName".to_string(), json!(name));
+    emulator
+        .request("PUT", "/configureLogs/playbackConfiguration", Some(body))
+        .await
+}
+
+/// The list item `ListPlaybackConfigurations` reports for `name`.
+async fn listed_item(emulator: &Emulator, name: &str) -> Value {
+    emulator
+        .list(Some(100), None)
+        .await
+        .get("/Items")
+        .as_array()
+        .expect("Items is a list")
+        .iter()
+        .find(|item| item.get("Name") == Some(&json!(name)))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The log settings the table spans: each row differs from the others in the
+/// percentage it enables, which strategies it names and in what order, and
+/// whether it carries the interaction-log settings.
+fn log_settings_table() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "the lower bound and no strategy named",
+            json!({ "PercentEnabled": PERCENT_BOUNDS[0] }),
+        ),
+        (
+            "half the sessions, vended logs",
+            json!({ "PercentEnabled": 50, "EnabledLoggingStrategies": [LOGGING_STRATEGIES[0]] }),
+        ),
+        (
+            "the upper bound, legacy CloudWatch",
+            json!({
+                "PercentEnabled": PERCENT_BOUNDS[1],
+                "EnabledLoggingStrategies": [LOGGING_STRATEGIES[1]],
+            }),
+        ),
+        (
+            "both strategies at once",
+            json!({ "PercentEnabled": 1, "EnabledLoggingStrategies": LOGGING_STRATEGIES }),
+        ),
+        (
+            "both strategies, the other order",
+            json!({
+                "PercentEnabled": 99,
+                "EnabledLoggingStrategies": [LOGGING_STRATEGIES[1], LOGGING_STRATEGIES[0]],
+            }),
+        ),
+        (
+            "an explicitly empty strategy list",
+            json!({ "PercentEnabled": 25, "EnabledLoggingStrategies": [] }),
+        ),
+        (
+            "the interaction-log settings too",
+            json!({
+                "PercentEnabled": 7,
+                "EnabledLoggingStrategies": [LOGGING_STRATEGIES[0]],
+                "AdsInteractionLog": {
+                    "PublishOptInEventTypes": ["RAW_ADS_RESPONSE"],
+                    "ExcludeEventTypes": ["BEACON_FIRED", "FILLED_AVAIL"],
+                },
+                "ManifestServiceInteractionLog": {
+                    "PublishOptInEventTypes": ["PRE_SESSION_INIT_HOOK_SUMMARY"],
+                    "ExcludeEventTypes": ["GENERATED_MANIFEST"],
+                },
+            }),
+        ),
+    ]
+}
+
+/// The `LogConfiguration` a configure-logs request leaves in force: the
+/// percentage it carried, the strategies it named (none at all when it named
+/// none) and the interaction-log settings it carried.
+fn expected_log_configuration(settings: &Value) -> Value {
+    let mut expected = json!({
+        "PercentEnabled": settings["PercentEnabled"].clone(),
+        "EnabledLoggingStrategies": settings
+            .get("EnabledLoggingStrategies")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    });
+    let members = expected.as_object_mut().expect("an object");
+    for member in ["AdsInteractionLog", "ManifestServiceInteractionLog"] {
+        if let Some(value) = settings.get(member) {
+            members.insert(member.to_string(), value.clone());
+        }
+    }
+    expected
+}
+
+#[tokio::test]
+async fn the_log_settings_a_configure_call_wrote_are_what_every_read_reports() {
+    let emulator = Emulator::new();
+
+    for (case, settings) in log_settings_table() {
+        let name = format!("logged-{}", case.replace([' ', ','], "-"));
+        let created = emulator.put(&json!({ "Name": name })).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected the configuration to be created, got {} {:?}",
+            created.status, created.body
+        );
+        // Nothing has configured logs yet: the structure's default is what a
+        // configuration reports until a configure-logs call writes one.
+        assert_eq!(
+            created.get("/LogConfiguration"),
+            &json!({ "PercentEnabled": 0, "EnabledLoggingStrategies": [] }),
+            "case {case:?}: expected logging to start at 0 percent with no strategy, got {:?}",
+            created.get("/LogConfiguration")
+        );
+
+        let configured = configure_logs(&emulator, &name, &settings).await;
+        assert_eq!(
+            configured.status, 200,
+            "case {case:?}: expected ConfigureLogsForPlaybackConfiguration to answer 200, got {} {:?}",
+            configured.status, configured.body
+        );
+        assert_eq!(
+            configured.string("/PlaybackConfigurationName"),
+            name,
+            "case {case:?}: expected the answer to name the configuration it wrote, got {:?}",
+            configured.get("/PlaybackConfigurationName")
+        );
+
+        let expected = expected_log_configuration(&settings);
+        for (source, body) in [
+            ("the configure-logs answer", {
+                // The configure-logs answer carries the same members as the
+                // configuration's `LogConfiguration`, minus the name it echoes.
+                let mut answer = configured.body.clone();
+                answer
+                    .as_object_mut()
+                    .expect("an object body")
+                    .remove("PlaybackConfigurationName");
+                answer
+            }),
+            ("the read", emulator.get(&name).await.get("/LogConfiguration").clone()),
+            (
+                "the list item",
+                listed_item(&emulator, &name)
+                    .await
+                    .get("LogConfiguration")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        ] {
+            assert_eq!(
+                body, expected,
+                "case {case:?}: expected {source} to report the stored log configuration \
+                 {expected:?}, got {body:?}"
+            );
+        }
+
+        // A later Put says nothing about logging, so it leaves the settings
+        // alone and reports them as they stand.
+        let replaced = emulator
+            .put(&json!({ "Name": name, "AdDecisionServerUrl": "https://ads.example.com/vast" }))
+            .await;
+        assert_eq!(
+            replaced.get("/LogConfiguration"),
+            &expected,
+            "case {case:?}: expected the replacement to carry the log settings forward, got {:?}",
+            replaced.get("/LogConfiguration")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_later_configure_call_replaces_the_whole_log_configuration() {
+    let emulator = Emulator::new();
+    let name = "reconfigured";
+    emulator.put(&json!({ "Name": name })).await;
+
+    // Each row is applied over the one before it, so what the read reports is
+    // the LAST call's settings and nothing of the previous one's.
+    for (case, settings) in log_settings_table() {
+        let configured = configure_logs(&emulator, name, &settings).await;
+        assert_eq!(
+            configured.status, 200,
+            "case {case:?}: expected the reconfigure to answer 200, got {} {:?}",
+            configured.status, configured.body
+        );
+        let expected = expected_log_configuration(&settings);
+        let got = emulator.get(name).await;
+        assert_eq!(
+            got.get("/LogConfiguration"),
+            &expected,
+            "case {case:?}: expected the read to report only the last settings written, got {:?}",
+            got.get("/LogConfiguration")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_configure_call_writes_nothing() {
+    let emulator = Emulator::new();
+    let name = "bounded-percent";
+    emulator.put(&json!({ "Name": name })).await;
+    let in_force = json!({ "PercentEnabled": 50, "EnabledLoggingStrategies": ["VENDED_LOGS"] });
+    assert_eq!(
+        configure_logs(&emulator, name, &in_force).await.status,
+        200,
+        "expected the settings under test to be written"
+    );
+
+    // One past each documented bound, and a strategy the enum does not list.
+    // The refusals outside the bound say which limit was exceeded, so the
+    // caller can fix the request from the message alone.
+    for (case, settings, expected_message) in [
+        (
+            "one below the lower bound",
+            json!({ "PercentEnabled": PERCENT_BOUNDS[0] - 1 }),
+            Some("PercentEnabled must not be less than 0"),
+        ),
+        (
+            "one above the upper bound",
+            json!({ "PercentEnabled": PERCENT_BOUNDS[1] + 1 }),
+            Some("PercentEnabled must not exceed 100"),
+        ),
+        (
+            "far above the upper bound",
+            json!({ "PercentEnabled": 1_000 }),
+            Some("PercentEnabled must not exceed 100"),
+        ),
+        (
+            "a strategy the model does not list",
+            json!({ "PercentEnabled": 10, "EnabledLoggingStrategies": ["SYSLOG"] }),
+            None,
+        ),
+        (
+            "one event type past the list capacity",
+            json!({
+                "PercentEnabled": 10,
+                "EnabledLoggingStrategies": vec![LOGGING_STRATEGIES[0]; MAX_EVENT_TYPES_PER_LIST + 1],
+            }),
+            Some(
+                "EnabledLoggingStrategies names at most 100 event types, \
+                 and this request names 101",
+            ),
+        ),
+        (
+            "an interaction-log list past the capacity",
+            json!({
+                "PercentEnabled": 10,
+                "AdsInteractionLog": {
+                    "ExcludeEventTypes": vec!["BEACON_FIRED"; MAX_EVENT_TYPES_PER_LIST + 1],
+                },
+            }),
+            Some(
+                "AdsInteractionLog.ExcludeEventTypes names at most 100 event types, \
+                 and this request names 101",
+            ),
+        ),
+    ] {
+        let refused = configure_logs(&emulator, name, &settings).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected the request to be refused, got {} {:?}",
+            refused.status, refused.body
+        );
+        if let Some(expected_message) = expected_message {
+            assert_eq!(
+                refused.string("/Message"),
+                expected_message,
+                "case {case:?}: expected the refusal to name the limit, got {:?}",
+                refused.body
+            );
+        }
+        assert_eq!(
+            emulator.get(name).await.get("/LogConfiguration"),
+            &expected_log_configuration(&in_force),
+            "case {case:?}: expected the refused call to leave the settings alone"
+        );
+    }
+
+    // A name no configuration is stored under addresses nothing to configure.
+    let unknown = configure_logs(&emulator, "never-created", &in_force).await;
+    assert_eq!(
+        unknown.status, 400,
+        "case {:?}: expected an unknown configuration to be refused, got {} {:?}",
+        "unknown configuration", unknown.status, unknown.body
+    );
+    assert_eq!(
+        unknown.error_code, "BadRequestException",
+        "case {:?}: expected the service's modelled client error, got {:?}",
+        "unknown configuration", unknown.error_code
+    );
+}
+
+#[tokio::test]
+async fn a_value_a_request_names_twice_round_trips_as_sent() {
+    let emulator = Emulator::new();
+    let name = "repeated-values";
+    emulator.put(&json!({ "Name": name })).await;
+
+    // The model constrains these lists' VALUES (each is an enum value the
+    // framework refuses anything outside of), not their order or their length,
+    // so a list is stored as the request sent it and the read reports it that
+    // way — the handler stores what it was given rather than normalising it.
+    for (case, settings) in [
+        (
+            "one strategy named twice",
+            json!({
+                "PercentEnabled": 10,
+                "EnabledLoggingStrategies": [LOGGING_STRATEGIES[0], LOGGING_STRATEGIES[0]],
+            }),
+        ),
+        (
+            "both strategies with one repeated in between",
+            json!({
+                "PercentEnabled": 20,
+                "EnabledLoggingStrategies": [
+                    LOGGING_STRATEGIES[0],
+                    LOGGING_STRATEGIES[1],
+                    LOGGING_STRATEGIES[0],
+                ],
+            }),
+        ),
+        (
+            "an interaction-log event type named twice",
+            json!({
+                "PercentEnabled": 30,
+                "AdsInteractionLog": {
+                    "ExcludeEventTypes": ["BEACON_FIRED", "BEACON_FIRED", "FILLED_AVAIL"],
+                },
+            }),
+        ),
+        (
+            "a list right at the capacity",
+            json!({
+                "PercentEnabled": 40,
+                "EnabledLoggingStrategies": vec![LOGGING_STRATEGIES[1]; MAX_EVENT_TYPES_PER_LIST],
+            }),
+        ),
+    ] {
+        let configured = configure_logs(&emulator, name, &settings).await;
+        assert_eq!(
+            configured.status, 200,
+            "case {case:?}: expected the request to be served, got {} {:?}",
+            configured.status, configured.body
+        );
+        let expected = expected_log_configuration(&settings);
+        assert_eq!(
+            emulator.get(name).await.get("/LogConfiguration"),
+            &expected,
+            "case {case:?}: expected the list stored as sent {expected:?}, got {:?}",
+            emulator.get(name).await.get("/LogConfiguration")
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_read_reports_the_tag_map_and_both_ad_buffet_modes() {
+    let emulator = Emulator::new();
+
+    // The rows differ in how many tags the configuration carries, from none to
+    // several: the `tags` key is present either way.
+    for (case, tags) in [
+        ("no Tags member at all", None),
+        ("an empty tag map", Some(json!({}))),
+        ("one tag", Some(json!({ "Env": "dev" }))),
+        (
+            "three tags",
+            Some(json!({ "Env": "prod", "Team": "video", "Cost-Center": "1234" })),
+        ),
+    ] {
+        let name = format!("tagged-{}", case.replace([' ', ','], "-"));
+        let mut request = json!({ "Name": name });
+        if let Some(tags) = tags.clone() {
+            request
+                .as_object_mut()
+                .expect("an object")
+                .insert("tags".to_string(), tags);
+        }
+        let created = emulator.put(&request).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected the configuration to be created, got {} {:?}",
+            created.status, created.body
+        );
+
+        let expected_tags = tags.unwrap_or_else(|| json!({}));
+        let got = emulator.get(&name).await;
+        let item = listed_item(&emulator, &name).await;
+        for (source, body) in [
+            ("the write", &created.body),
+            ("the read", &got.body),
+            ("the list item", &item),
+        ] {
+            assert_eq!(
+                body.get("tags"),
+                Some(&expected_tags),
+                "case {case:?}: expected {source} to report the tag map {expected_tags:?}, got {:?}",
+                body.get("tags")
+            );
+            for member in ["LiveAdBuffetMode", "VodAdBuffetMode"] {
+                assert_eq!(
+                    body.get(member),
+                    Some(&json!(AD_BUFFET_MODE)),
+                    "case {case:?}: expected {source} to report {member}, got {:?}",
+                    body.get(member)
+                );
+            }
+        }
+    }
+
+    // Tagging a configuration after the fact is visible through its own read,
+    // so the map a read reports is the resource's tag set and not the Put's.
+    let created = emulator.put(&json!({ "Name": "tagged-later" })).await;
+    let arn = created.string("/PlaybackConfigurationArn");
+    assert_eq!(
+        emulator.tag(&arn, json!({ "Env": "dev" })).await.status,
+        204,
+        "expected TagResource to answer 204"
+    );
+    assert_eq!(
+        emulator.get("tagged-later").await.get("/tags"),
+        &json!({ "Env": "dev" }),
+        "case {:?}: expected the read to report the tag written through the tagging surface",
+        "tagged later"
+    );
+}

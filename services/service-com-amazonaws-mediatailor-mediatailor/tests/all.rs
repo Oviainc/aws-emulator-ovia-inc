@@ -15,5 +15,7 @@
 mod channel_lifecycle;
 #[path = "all/playback_configuration.rs"]
 mod playback_configuration;
+#[path = "all/playback_configuration_logging.rs"]
+mod playback_configuration_logging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

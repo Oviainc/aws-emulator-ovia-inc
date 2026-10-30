@@ -49,5 +49,7 @@ pub struct GetPlaybackConfigurationOutput {
     pub ads_personalization_timeouts: Option<AdsPersonalizationTimeouts>,
     pub ads_personalization_concurrency: Option<AdsPersonalizationConcurrency>,
     pub beaconing_configuration: Option<BeaconingConfiguration>,
+    pub live_ad_buffet_mode: Option<String>,
+    pub vod_ad_buffet_mode: Option<String>,
 }
 

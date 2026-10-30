@@ -4,8 +4,11 @@
 //!
 //! Reports the playback configuration stored under `Name` — exactly the record
 //! `PutPlaybackConfiguration` persisted, including its ARN, its endpoint
-//! prefixes and its current tags. A name no configuration is stored under is
-//! refused; nothing here writes to the store.
+//! prefixes, the log settings `ConfigureLogsForPlaybackConfiguration` last
+//! wrote for it, and its current tags. The members MediaTailor reports for
+//! every configuration are always present: the tag map (empty when the
+//! configuration is untagged) and the two ad-buffet modes. A name no
+//! configuration is stored under is refused; nothing here writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -249,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let tags: Option<HashMap<String, String>> = store.tags_of(&record.arn);
+        let tags: HashMap<String, String> = store.tags_of(&record.arn);
 
         Ok(GetPlaybackConfigurationOutput::from_record(record, tags))
     }

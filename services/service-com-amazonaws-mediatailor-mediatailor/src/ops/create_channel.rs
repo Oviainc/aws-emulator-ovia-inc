@@ -428,7 +428,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .channels
             .insert(input.channel_name.clone(), record.clone());
-        let tags: HashMap<String, String> = store.tags_of(&arn).unwrap_or_default();
+        let tags: HashMap<String, String> = store.tags_of(&arn);
 
         Ok(record.create_output(tags))
     }

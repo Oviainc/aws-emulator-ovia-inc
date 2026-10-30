@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let tags: HashMap<String, String> = store.tags_of(&record.arn).unwrap_or_default();
+        let tags: HashMap<String, String> = store.tags_of(&record.arn);
 
         Ok(record.describe_output(tags))
     }

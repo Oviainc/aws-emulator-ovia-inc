@@ -525,11 +525,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // updates the configuration in place. Only the log settings survive the
         // replacement — they are owned by the logging operations, not by this
         // one, so a Put that does not mention them must not reset them.
-        let log_configuration = store
-            .playback_configurations
-            .get(&input.name)
+        let previous = store.playback_configurations.get(&input.name);
+        let log_configuration = previous
             .map(|existing| existing.log_configuration.clone())
             .unwrap_or_default();
+        let previous_arn = previous
+            .map(|existing| existing.arn.clone())
+            .filter(|previous| previous != &arn);
+
+        // The ARN a configuration reports carries the region its request was
+        // signed for, so a replacement signed for another region re-mints it.
+        // Tags belong to the configuration rather than to the string that
+        // addresses it, so they move with it and the old key is released:
+        // nothing is left behind under an ARN no resource reports.
+        if let Some(previous_arn) = previous_arn {
+            if let Some(tags) = store.tags_by_arn.remove(&previous_arn) {
+                store.tags_by_arn.insert(arn.clone(), tags);
+            }
+        }
 
         let record = PlaybackConfigurationRecord {
             name: input.name.clone(),
@@ -593,7 +606,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .playback_configurations
             .insert(input.name.clone(), record.clone());
-        let tags: Option<HashMap<String, String>> = store.tags_of(&arn);
+        let tags: HashMap<String, String> = store.tags_of(&arn);
 
         Ok(PutPlaybackConfigurationOutput::from_record(&record, tags))
     }

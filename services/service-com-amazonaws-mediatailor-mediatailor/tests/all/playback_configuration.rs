@@ -37,31 +37,31 @@ const ACCOUNT: &str = "000000000000";
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20260101/us-east-1/mediatailor/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
 /// One dispatched request's answer.
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     /// The `x-amzn-errortype` header restJson1 resolves an error shape from.
-    error_code: String,
+    pub(crate) error_code: String,
     /// The parsed JSON body, or `Value::Null` for an empty one.
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn get(&self, pointer: &str) -> &Value {
+    pub(crate) fn get(&self, pointer: &str) -> &Value {
         self.body.pointer(pointer).unwrap_or(&Value::Null)
     }
 
-    fn string(&self, pointer: &str) -> String {
+    pub(crate) fn string(&self, pointer: &str) -> String {
         self.get(pointer).as_str().unwrap_or_default().to_string()
     }
 }
 
 /// The emulator under test: this one service mounted on the real router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -71,7 +71,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn request(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn request(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
         let payload = match body {
             Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
             None => bytes::Bytes::new(),
@@ -105,12 +105,12 @@ impl Emulator {
         }
     }
 
-    async fn put(&self, configuration: &Value) -> Reply {
+    pub(crate) async fn put(&self, configuration: &Value) -> Reply {
         self.request("PUT", "/playbackConfiguration", Some(configuration.clone()))
             .await
     }
 
-    async fn get(&self, name: &str) -> Reply {
+    pub(crate) async fn get(&self, name: &str) -> Reply {
         self.request(
             "GET",
             &format!("/playbackConfiguration/{}", encode(name)),
@@ -128,7 +128,7 @@ impl Emulator {
         .await
     }
 
-    async fn list(&self, max_results: Option<u32>, next_token: Option<&str>) -> Reply {
+    pub(crate) async fn list(&self, max_results: Option<u32>, next_token: Option<&str>) -> Reply {
         let mut query: Vec<String> = Vec::new();
         if let Some(max) = max_results {
             query.push(format!("MaxResults={max}"));
@@ -149,7 +149,7 @@ impl Emulator {
             .await
     }
 
-    async fn tag(&self, arn: &str, tags: Value) -> Reply {
+    pub(crate) async fn tag(&self, arn: &str, tags: Value) -> Reply {
         self.request(
             "POST",
             &format!("/tags/{}", encode(arn)),
@@ -685,8 +685,9 @@ async fn tags_written_either_way_are_readable_both_ways() {
         "untag"
     );
 
-    // Every tag removed: the resource reports no tags at all, and its tag
-    // listing reports an empty set rather than failing.
+    // Every tag removed: the resource reports an empty tag map — the member
+    // MediaTailor always emits — and its tag listing reports an empty set
+    // rather than failing.
     let untagged = emulator.untag(&arn, &["Env"]).await;
     assert_eq!(
         untagged.status, 204,
@@ -695,8 +696,8 @@ async fn tags_written_either_way_are_readable_both_ways() {
     );
     assert_eq!(
         emulator.get("tagged").await.get("/tags"),
-        &Value::Null,
-        "case {:?}: expected no Tags member on an untagged resource",
+        &json!({}),
+        "case {:?}: expected an empty tag map on an untagged resource",
         "untag the rest"
     );
     assert_eq!(
@@ -707,11 +708,26 @@ async fn tags_written_either_way_are_readable_both_ways() {
     );
 
     // An ARN that names no resource of this service is refused, whatever the
-    // shape of the value.
+    // shape of the value — including one that ends in a stored configuration's
+    // name but whose partition, region or account is not the one the resource's
+    // own ARN carries. A tag is addressed by the resource's whole ARN, so an
+    // ARN no resource reports addresses nothing.
     for (case, bogus) in [
         ("unknown configuration", expected_arn("never-created")),
         ("another service's ARN", format!("arn:aws:s3:{REGION}:{ACCOUNT}:bucket/demo")),
         ("not an ARN at all", "tagged".to_string()),
+        (
+            "another account's ARN for a stored name",
+            format!("arn:aws:mediatailor:{REGION}:999999999999:playbackConfiguration/tagged"),
+        ),
+        (
+            "another region's ARN for a stored name",
+            format!("arn:aws:mediatailor:eu-west-1:{ACCOUNT}:playbackConfiguration/tagged"),
+        ),
+        (
+            "another partition's ARN for a stored name",
+            format!("arn:aws-cn:mediatailor:{REGION}:{ACCOUNT}:playbackConfiguration/tagged"),
+        ),
     ] {
         for reply in [
             emulator.list_tags(&bogus).await,
@@ -918,7 +934,7 @@ async fn an_empty_tag_map_on_a_put_clears_the_resource_tags() {
         .await;
     assert_eq!(
         replaced.get("/tags"),
-        &Value::Null,
+        &json!({}),
         "case {:?}: expected the tag set to be cleared, got {:?}",
         "empty tag map",
         replaced.get("/tags")

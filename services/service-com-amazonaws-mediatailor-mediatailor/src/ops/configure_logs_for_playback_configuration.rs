@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConfigureLogsForPlaybackConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConfigureLogsForPlaybackConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConfigureLogsForPlaybackConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: writes the log settings of the playback configuration named by
+//! `PlaybackConfigurationName` into [`crate::state`] — the percentage of
+//! sessions logged, the logging strategies in force and the two interaction-log
+//! settings — and answers with what it stored, so every later read of that
+//! configuration reports the same settings. The call defines the
+//! configuration's whole log configuration: a member the request omits is not
+//! in force afterwards. A name no configuration is stored under is refused.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -93,20 +93,66 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The percentage range `PercentEnabled` accepts, as the member documents it:
+/// "Valid values: 0 - 100". A request outside it is refused, so a stored log
+/// configuration always reports a percentage a caller can act on.
+const MIN_PERCENT_ENABLED: i32 = 0;
+/// See [`MIN_PERCENT_ENABLED`].
+const MAX_PERCENT_ENABLED: i32 = 100;
+
+/// The caller-sized lists one configure-logs request carries, as member name
+/// and values, so every one of them is bounded the same way wherever it sits in
+/// the request.
+fn listed_members(
+    input: &ConfigureLogsForPlaybackConfigurationInput,
+) -> Vec<(&'static str, &[String])> {
+    let mut members: Vec<(&'static str, &[String])> = Vec::new();
+    if let Some(values) = input.enabled_logging_strategies.as_deref() {
+        members.push(("EnabledLoggingStrategies", values));
+    }
+    if let Some(log) = input.ads_interaction_log.as_ref() {
+        if let Some(values) = log.publish_opt_in_event_types.as_deref() {
+            members.push(("AdsInteractionLog.PublishOptInEventTypes", values));
+        }
+        if let Some(values) = log.exclude_event_types.as_deref() {
+            members.push(("AdsInteractionLog.ExcludeEventTypes", values));
+        }
+    }
+    if let Some(log) = input.manifest_service_interaction_log.as_ref() {
+        if let Some(values) = log.publish_opt_in_event_types.as_deref() {
+            members.push((
+                "ManifestServiceInteractionLog.PublishOptInEventTypes",
+                values,
+            ));
+        }
+        if let Some(values) = log.exclude_event_types.as_deref() {
+            members.push(("ManifestServiceInteractionLog.ExcludeEventTypes", values));
+        }
+    }
+    members
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
 // `ConfigureLogsForPlaybackConfigurationError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ConfigureLogsForPlaybackConfigurationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediatailor#ConfigureLogsForPlaybackConfiguration")]
+/// This operation's modelled failures.
+///
+/// The model lists no error on `ConfigureLogsForPlaybackConfiguration` itself,
+/// so `BadRequestException` — the one client error this SERVICE declares ("A
+/// request contains unexpected data", HTTP 400) — is widened in with
+/// `extra_errors` to refuse a request that names no stored configuration. It is
+/// the only error shape the model gives this service, so it is what a miss is
+/// answered with rather than a status and code no model declares.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediatailor#ConfigureLogsForPlaybackConfiguration",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum ConfigureLogsForPlaybackConfigurationErrorModeled {
+    BadRequestException(BadRequestException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -158,20 +204,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConfigureLogsForPlaybackConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConfigureLogsForPlaybackConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConfigureLogsForPlaybackConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. Without the
+            // store nothing can be written, so answer the scaffold's 501 rather
+            // than report a write that did not happen.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ConfigureLogsForPlaybackConfiguration",
+            ));
+        };
+
+        // `PercentEnabled` is a percentage of this configuration's sessions:
+        // the member documents "Valid values: 0 - 100". The model declares no
+        // `range` on it, so the bound is checked here rather than by the
+        // framework's validation walk, and the refusal names the limit that
+        // was missed so the caller can fix the request from the message alone.
+        let out_of_range = if input.percent_enabled > MAX_PERCENT_ENABLED {
+            Some(format!(
+                "PercentEnabled must not exceed {MAX_PERCENT_ENABLED}"
+            ))
+        } else if input.percent_enabled < MIN_PERCENT_ENABLED {
+            Some(format!(
+                "PercentEnabled must not be less than {MIN_PERCENT_ENABLED}"
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = out_of_range {
+            return Err(
+                ConfigureLogsForPlaybackConfigurationErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Everything this call would store is bounded before any of it is
+        // stored: each caller-sized list is capped, so one configuration's log
+        // settings cannot grow without bound.
+        for (member, values) in listed_members(&input) {
+            if values.len() > crate::state::MAX_LOG_EVENT_TYPES_PER_LIST {
+                return Err(
+                    ConfigureLogsForPlaybackConfigurationErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(format!(
+                                "{member} names at most {} event types, and this request names {}",
+                                crate::state::MAX_LOG_EVENT_TYPES_PER_LIST,
+                                values.len()
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+        let Some(record) = store
+            .playback_configurations
+            .get_mut(&input.playback_configuration_name)
+        else {
+            return Err(
+                ConfigureLogsForPlaybackConfigurationErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(format!(
+                            "No playback configuration is named {}.",
+                            input.playback_configuration_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // This call defines where the configuration's logs go, so what it
+        // carries is the configuration's whole log configuration from here on:
+        // an omitted `EnabledLoggingStrategies` leaves no strategy in force,
+        // exactly as an omitted interaction-log setting leaves none. Each list
+        // is stored as the request sent it — the model constrains its values,
+        // not its order or its length, and the write replaces the previous log
+        // configuration rather than adding to it.
+        record.log_configuration = LogConfiguration {
+            percent_enabled: input.percent_enabled,
+            enabled_logging_strategies: input.enabled_logging_strategies.unwrap_or_default(),
+            ads_interaction_log: input.ads_interaction_log,
+            manifest_service_interaction_log: input.manifest_service_interaction_log,
+        };
+
+        // The response reports the settings AS STORED, so a caller reading the
+        // configuration back sees what this call answered.
+        let stored = record.log_configuration.clone();
+        Ok(ConfigureLogsForPlaybackConfigurationOutput {
+            percent_enabled: stored.percent_enabled,
+            playback_configuration_name: Some(record.name.clone()),
+            enabled_logging_strategies: Some(stored.enabled_logging_strategies),
+            ads_interaction_log: stored.ads_interaction_log,
+            manifest_service_interaction_log: stored.manifest_service_interaction_log,
+        })
     }
 }
