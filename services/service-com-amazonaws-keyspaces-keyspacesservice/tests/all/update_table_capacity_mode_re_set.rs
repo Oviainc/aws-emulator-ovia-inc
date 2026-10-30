@@ -11,9 +11,10 @@
 //! scaling settings here and of its scalable targets, scaling policies and their alarms
 //! in Application Auto Scaling — follow from the table's throughput mode CHANGING, so
 //! each fires only on the transition that produces it: the stamp on a move TO
-//! `PAY_PER_REQUEST`, the retirement on a move OUT of `PROVISIONED`. An update that
-//! re-sets the mode the table is already in changed no throughput capacity, so it leaves
-//! all of them exactly as they were.
+//! `PAY_PER_REQUEST` (a table CREATED in that mode is stamped by its create), the
+//! retirement on a move OUT of `PROVISIONED`. An update that re-sets the mode the table is
+//! already in changed no throughput capacity, so it leaves all of them exactly as they
+//! were.
 //!
 //! The rows differ along the mode the table starts in (the modelled default a create with
 //! no `capacitySpecification` leaves, and each mode set explicitly), the mode the update
@@ -97,6 +98,12 @@ impl Row {
     fn moves_to_pay_per_request(&self) -> bool {
         self.starting_mode() != keyspaces::PAY_PER_REQUEST_THROUGHPUT_MODE
             && self.requested == keyspaces::PAY_PER_REQUEST_THROUGHPUT_MODE
+    }
+
+    /// Whether the table was CREATED in `PAY_PER_REQUEST` mode — explicitly or by the
+    /// modelled default — so the create is what stamped the summary timestamp.
+    fn starts_in_pay_per_request(&self) -> bool {
+        self.starting_mode() == keyspaces::PAY_PER_REQUEST_THROUGHPUT_MODE
     }
 }
 
@@ -316,14 +323,16 @@ async fn update_table_retires_auto_scaling_only_on_a_move_out_of_provisioned_mod
             row.windows.len()
         );
         let (settings_before, capacity_before) = reported(&emulator, row).await;
+        let stamp_before = capacity_before
+            .get("lastUpdateToPayPerRequestTimestamp")
+            .cloned()
+            .unwrap_or(Value::Null);
         assert_eq!(
-            capacity_before
-                .get("lastUpdateToPayPerRequestTimestamp")
-                .cloned()
-                .unwrap_or(Value::Null),
-            Value::Null,
-            "case {case:?}: expected no pay-per-request stamp before any update, got \
-             {capacity_before}"
+            stamp_before != Value::Null,
+            row.starts_in_pay_per_request(),
+            "case {case:?}: before any update, the stamp belongs to a table CREATED in \
+             PAY_PER_REQUEST (created in it: {}), got {capacity_before}",
+            row.starts_in_pay_per_request()
         );
 
         let (status, body) = emulator
@@ -390,18 +399,27 @@ async fn update_table_retires_auto_scaling_only_on_a_move_out_of_provisioned_mod
             );
         }
 
-        // The sibling consequence in the same block, under the same rule: the stamp is a
-        // move TO `PAY_PER_REQUEST`, not a re-set of it.
+        // The sibling consequence in the same block, under the same rule: the stamp moves
+        // on a move TO `PAY_PER_REQUEST`, and on nothing else — a re-set of the mode the
+        // table already holds leaves it exactly where the create put it.
         let stamp = capacity_after
             .get("lastUpdateToPayPerRequestTimestamp")
             .cloned()
             .unwrap_or(Value::Null);
         assert_eq!(
             stamp != Value::Null,
+            row.moves_to_pay_per_request() || row.starts_in_pay_per_request(),
+            "case {case:?}: expected lastUpdateToPayPerRequestTimestamp exactly on a table \
+             that has been in PAY_PER_REQUEST (moved: {}, created in it: {}), got {stamp}",
             row.moves_to_pay_per_request(),
-            "case {case:?}: expected lastUpdateToPayPerRequestTimestamp to be stamped only \
-             by a move to PAY_PER_REQUEST (moved: {}), got {stamp}",
-            row.moves_to_pay_per_request()
+            row.starts_in_pay_per_request()
         );
+        if !row.moves_to_pay_per_request() {
+            assert_eq!(
+                stamp, stamp_before,
+                "case {case:?}: an update that did not move the table TO PAY_PER_REQUEST \
+                 leaves the stamp where it was ({stamp_before}), got {stamp}"
+            );
+        }
     }
 }

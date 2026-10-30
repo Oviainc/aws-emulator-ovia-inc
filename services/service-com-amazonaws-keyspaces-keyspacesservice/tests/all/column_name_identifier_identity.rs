@@ -24,7 +24,9 @@
 
 use serde_json::{json, Value};
 
-use crate::keyspace_table_lifecycle::{assert_failure, assert_ok, settle_wait, Emulator};
+use crate::keyspace_table_lifecycle::{
+    assert_failure, assert_ok, reported_schema, settle_wait, Emulator,
+};
 
 /// The `message` member of a failure body, for an assertion on the refusal's wording.
 fn message(body: &Value) -> String {
@@ -282,7 +284,8 @@ async fn create_table_compares_column_names_as_cql_identifiers() {
                 // are: the identity rule decides which column a name addresses, it does not
                 // rewrite what was stored.
                 assert_eq!(
-                    got["schemaDefinition"], definition,
+                    got["schemaDefinition"],
+                    reported_schema(&definition),
                     "case {case:?}: expected the stored schema {definition}, got {}",
                     got["schemaDefinition"]
                 );
@@ -382,7 +385,8 @@ async fn add_columns_compares_column_names_as_cql_identifiers() {
         );
         let got = assert_ok(case, get_table(&emulator, keyspace, table).await);
         assert_eq!(
-            got["schemaDefinition"], created,
+            got["schemaDefinition"],
+            reported_schema(&created),
             "case {case:?}: a refused update must leave the stored schema alone, got {}",
             got["schemaDefinition"]
         );

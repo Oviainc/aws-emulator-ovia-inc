@@ -59,6 +59,8 @@ mod page_token_codec;
 mod pagination_window;
 #[path = "all/point_in_time_recovery_window.rs"]
 mod point_in_time_recovery_window;
+#[path = "all/read_responses_serve_always_present_members.rs"]
+mod read_responses_serve_always_present_members;
 #[path = "all/region_scoped_page_tokens.rs"]
 mod region_scoped_page_tokens;
 #[path = "all/regional_partitioning.rs"]

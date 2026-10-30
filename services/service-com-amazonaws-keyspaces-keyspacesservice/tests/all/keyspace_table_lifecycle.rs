@@ -177,6 +177,23 @@ pub(crate) fn minimal_schema(partition_key: &str) -> Value {
     })
 }
 
+/// The `schemaDefinition` a read of a table reports for the schema `definition` it was
+/// created with: Amazon Keyspaces always serializes `clusteringKeys` and `staticColumns`,
+/// as EMPTY lists for a schema that declares neither, so an expectation written as the
+/// supplied schema fills them in.
+///
+/// Shared with the other suites of this test binary, so there is ONE statement of that
+/// convention rather than a copy per file.
+pub(crate) fn reported_schema(definition: &Value) -> Value {
+    let mut reported = definition.clone();
+    for member in ["clusteringKeys", "staticColumns"] {
+        if reported.get(member).is_none() {
+            reported[member] = json!([]);
+        }
+    }
+    reported
+}
+
 /// Create the keyspace `name`, tolerating a name a suite already took: a suite that
 /// shares a keyspace across its cases calls this per case rather than tracking which one
 /// created it.
@@ -387,17 +404,33 @@ async fn create_table_round_trips_through_get_table_with_the_modelled_defaults()
             case.name
         );
 
-        // The schema VERBATIM — the same nesting, order and types that were submitted.
+        // The schema VERBATIM — the same nesting, order and types that were submitted,
+        // with the two optional column lists reported empty where it declared neither.
         assert_eq!(
-            got["schemaDefinition"], request["schemaDefinition"],
+            got["schemaDefinition"],
+            reported_schema(&request["schemaDefinition"]),
             "case {:?}: the stored schema differs from the submitted one: {got}",
             case.name
         );
 
-        // The specifications: supplied where supplied, modelled default where not.
+        // The specifications: supplied where supplied, modelled default where not. The
+        // capacity summary additionally carries the instant the table became
+        // PAY_PER_REQUEST, which is this create for a table created in that mode.
+        let mut capacity = got["capacitySpecification"].clone();
+        let stamp = capacity
+            .as_object_mut()
+            .expect("capacitySpecification is a structure")
+            .remove("lastUpdateToPayPerRequestTimestamp");
         assert_eq!(
-            got["capacitySpecification"], case.capacity,
+            capacity, case.capacity,
             "case {:?}: unexpected capacitySpecification: {got}",
+            case.name
+        );
+        assert_eq!(
+            stamp.is_some(),
+            case.capacity["throughputMode"] == json!("PAY_PER_REQUEST"),
+            "case {:?}: lastUpdateToPayPerRequestTimestamp belongs to a table in \
+             PAY_PER_REQUEST mode: {got}",
             case.name
         );
         assert_eq!(
@@ -419,12 +452,26 @@ async fn create_table_round_trips_through_get_table_with_the_modelled_defaults()
             case.name
         );
 
-        // The optional settings are reported when supplied and absent when not.
-        for member in ["ttl", "defaultTimeToLive", "comment", "clientSideTimestamps"] {
+        // The optional settings Amazon Keyspaces reports only when they were configured.
+        for member in ["ttl", "clientSideTimestamps"] {
             let submitted = request.get(member).cloned().unwrap_or(Value::Null);
             assert_eq!(
                 got[member], submitted,
                 "case {:?}: member {member} must read back as submitted: {got}",
+                case.name
+            );
+        }
+        // And the two it always reports: what was submitted, or the zero / empty value for
+        // a table created without one.
+        for (member, unset) in [
+            ("defaultTimeToLive", json!(0)),
+            ("comment", json!({"message": ""})),
+        ] {
+            let expected = request.get(member).cloned().unwrap_or(unset);
+            assert_eq!(
+                got[member], expected,
+                "case {:?}: member {member} must read back as submitted, or as its unset \
+                 value {expected}: {got}",
                 case.name
             );
         }
@@ -487,7 +534,8 @@ async fn create_table_round_trips_through_get_table_with_the_modelled_defaults()
         let mut request = (case.request)();
         request["keyspaceName"] = json!(keyspace);
         assert_eq!(
-            got["schemaDefinition"], request["schemaDefinition"],
+            got["schemaDefinition"],
+            reported_schema(&request["schemaDefinition"]),
             "case {:?}: settling a status must not disturb the stored schema: {got}",
             case.name
         );

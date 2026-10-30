@@ -27,7 +27,8 @@
 //!    synchronized between all replicas".
 //! 4. `warmThroughputSpecification` is reported as the summary `GetTable` carries, whose
 //!    status is "`AVAILABLE` when the configuration is active, and `UPDATING` when changes
-//!    are being applied"; a later update of one unit count keeps the other.
+//!    are being applied"; a later update of one unit count keeps the other. A table nothing
+//!    pre-warmed reports the baseline its capacity mode already gives it.
 //! 5. A request that breaks a rule the model cannot state is refused with the error the
 //!    model declares for it — never with the scaffold's 501 — and the refusal leaves the
 //!    table exactly as it was.
@@ -634,11 +635,18 @@ async fn update_table_applies_warm_throughput_and_reports_the_summary() {
     )
     .await;
 
-    // Nothing pre-warmed the table yet, so it reports no warm throughput at all.
+    // Nothing pre-warmed the table yet, so it reports the baseline its provisioned
+    // capacity gives it, AVAILABLE because no change is being applied to it.
     let report = get_table(&emulator, "before_any_update", keyspace, table).await;
-    assert!(
-        report["warmThroughputSpecification"].is_null(),
-        "a table nothing pre-warmed reports no warmThroughputSpecification, got {report}"
+    assert_eq!(
+        report["warmThroughputSpecification"],
+        json!({
+            "readUnitsPerSecond": 5,
+            "writeUnitsPerSecond": 5,
+            "status": keyspaces::WARM_THROUGHPUT_STATUS_AVAILABLE,
+        }),
+        "a table nothing pre-warmed reports the warm throughput its provisioned capacity \
+         already gives it, got {report}"
     );
 
     for (case, members, expected_read, expected_write) in &cases {

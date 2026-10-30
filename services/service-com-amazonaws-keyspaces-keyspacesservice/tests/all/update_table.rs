@@ -13,8 +13,9 @@
 //! 2. The update is asynchronous: the table is `UPDATING` from the moment the call is
 //!    accepted until the clock owes it `ACTIVE` again, and a table that is not `ACTIVE`
 //!    cannot be updated.
-//! 3. `lastUpdateToPayPerRequestTimestamp` exists exactly on a table some update moved
-//!    to `PAY_PER_REQUEST`.
+//! 3. `lastUpdateToPayPerRequestTimestamp` exists exactly on a table that has BEEN in
+//!    `PAY_PER_REQUEST` mode — created in it (the modelled default) or moved into it by an
+//!    update — and records when it last entered that mode.
 //! 4. A request that breaks a rule the model cannot state is refused with the error the
 //!    model declares for it, and the refusal leaves the table untouched — including the
 //!    documented "you can only update one specific table setting per update operation".
@@ -72,6 +73,19 @@ async fn get_table(emulator: &Emulator, keyspace: &str, table: &str) -> Value {
     )
 }
 
+/// When the table of a row was last put in `PAY_PER_REQUEST` mode, which is what
+/// `lastUpdateToPayPerRequestTimestamp` records.
+#[derive(Debug, PartialEq, Eq)]
+enum Stamp {
+    /// By the create: the table was made in that mode, the modelled default.
+    AtCreate,
+    /// By this row's update, which moved the table into that mode.
+    AtUpdate,
+    /// Never: the table was created in another mode and no update moved it into this one,
+    /// so there is nothing to stamp.
+    Never,
+}
+
 /// One row of RULE 1: a table to create, the single setting to update it with, the
 /// `GetTable` members that may differ afterwards, and what they must then say.
 struct Case {
@@ -86,9 +100,8 @@ struct Case {
     touched: &'static [&'static str],
     /// `(JSON pointer, expected value)` pairs the updated table must report.
     expect: fn() -> Vec<(&'static str, Value)>,
-    /// Whether this update is a move to `PAY_PER_REQUEST`, which is the one thing that
-    /// stamps `lastUpdateToPayPerRequestTimestamp`.
-    stamps_pay_per_request: bool,
+    /// When this row's table last entered `PAY_PER_REQUEST` mode.
+    stamp: Stamp,
 }
 
 /// The rows: one per setting `UpdateTable` serves here, and more than one row for the
@@ -112,7 +125,7 @@ fn cases() -> Vec<Case> {
                     ]),
                 )]
             },
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // Several added columns at once, spanning scalar, collection and frozen
@@ -139,7 +152,7 @@ fn cases() -> Vec<Case> {
                     ]),
                 )]
             },
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // PAY_PER_REQUEST -> PROVISIONED, with the capacity units that mode
@@ -153,18 +166,20 @@ fn cases() -> Vec<Case> {
                     "writeCapacityUnits": 1,
                 }})
             },
-            touched: &["capacitySpecification"],
+            // A table with no warm throughput configuration of its own reports the
+            // baseline its capacity mode gives it, so moving the mode moves that too.
+            touched: &["capacitySpecification", "warmThroughputSpecification"],
             expect: || {
-                vec![(
-                    "/capacitySpecification",
-                    json!({
-                        "throughputMode": "PROVISIONED",
-                        "readCapacityUnits": 1,
-                        "writeCapacityUnits": 1,
-                    }),
-                )]
+                vec![
+                    (
+                        "/capacitySpecification/throughputMode",
+                        json!("PROVISIONED"),
+                    ),
+                    ("/capacitySpecification/readCapacityUnits", json!(1)),
+                    ("/capacitySpecification/writeCapacityUnits", json!(1)),
+                ]
             },
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // PROVISIONED -> PROVISIONED with different units: the mode did not move to
@@ -184,18 +199,20 @@ fn cases() -> Vec<Case> {
                     "writeCapacityUnits": 90,
                 }})
             },
-            touched: &["capacitySpecification"],
+            touched: &["capacitySpecification", "warmThroughputSpecification"],
             expect: || {
-                vec![(
-                    "/capacitySpecification",
-                    json!({
-                        "throughputMode": "PROVISIONED",
-                        "readCapacityUnits": 4000,
-                        "writeCapacityUnits": 90,
-                    }),
-                )]
+                vec![
+                    (
+                        "/capacitySpecification/throughputMode",
+                        json!("PROVISIONED"),
+                    ),
+                    ("/capacitySpecification/readCapacityUnits", json!(4000)),
+                    ("/capacitySpecification/writeCapacityUnits", json!(90)),
+                ]
             },
-            stamps_pay_per_request: false,
+            // Created PROVISIONED and still PROVISIONED: this table has never been in
+            // PAY_PER_REQUEST mode, so nothing stamps it.
+            stamp: Stamp::Never,
         },
         Case {
             // PROVISIONED -> PAY_PER_REQUEST: the capacity units belong to the mode that
@@ -209,7 +226,7 @@ fn cases() -> Vec<Case> {
                 }})
             },
             update: || json!({"capacitySpecification": {"throughputMode": "PAY_PER_REQUEST"}}),
-            touched: &["capacitySpecification"],
+            touched: &["capacitySpecification", "warmThroughputSpecification"],
             expect: || {
                 vec![
                     (
@@ -220,7 +237,7 @@ fn cases() -> Vec<Case> {
                     ("/capacitySpecification/writeCapacityUnits", Value::Null),
                 ]
             },
-            stamps_pay_per_request: true,
+            stamp: Stamp::AtUpdate,
         },
         Case {
             // PAY_PER_REQUEST re-set on a table already in it: no throughput capacity
@@ -235,7 +252,7 @@ fn cases() -> Vec<Case> {
                     json!("PAY_PER_REQUEST"),
                 )]
             },
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // AWS_OWNED_KMS_KEY -> CUSTOMER_MANAGED_KMS_KEY, which takes the key ARN.
@@ -257,7 +274,7 @@ fn cases() -> Vec<Case> {
                     }),
                 )]
             },
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // CUSTOMER_MANAGED_KMS_KEY -> AWS_OWNED_KMS_KEY, the other direction: the
@@ -272,7 +289,7 @@ fn cases() -> Vec<Case> {
             update: || json!({"encryptionSpecification": {"type": "AWS_OWNED_KMS_KEY"}}),
             touched: &["encryptionSpecification"],
             expect: || vec![("/encryptionSpecification", json!({"type": "AWS_OWNED_KMS_KEY"}))],
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // DISABLED -> ENABLED: continuous backups start now, so the table gains an
@@ -282,7 +299,7 @@ fn cases() -> Vec<Case> {
             update: || json!({"pointInTimeRecovery": {"status": "ENABLED"}}),
             touched: &["pointInTimeRecovery"],
             expect: || vec![("/pointInTimeRecovery/status", json!("ENABLED"))],
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // ENABLED -> DISABLED, the other published value of the pair.
@@ -299,7 +316,7 @@ fn cases() -> Vec<Case> {
                     ),
                 ]
             },
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // `ttl` is `status:enabled` and nothing else: `TimeToLiveStatus` models the
@@ -309,7 +326,7 @@ fn cases() -> Vec<Case> {
             update: || json!({"ttl": {"status": "ENABLED"}}),
             touched: &["ttl"],
             expect: || vec![("/ttl", json!({"status": "ENABLED"}))],
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // `defaultTimeToLive` at the bottom of its modelled `0..630720000` range.
@@ -318,7 +335,7 @@ fn cases() -> Vec<Case> {
             update: || json!({"defaultTimeToLive": 0}),
             touched: &["defaultTimeToLive"],
             expect: || vec![("/defaultTimeToLive", json!(0))],
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // ... and at the top of it.
@@ -327,7 +344,7 @@ fn cases() -> Vec<Case> {
             update: || json!({"defaultTimeToLive": 630_720_000}),
             touched: &["defaultTimeToLive"],
             expect: || vec![("/defaultTimeToLive", json!(630_720_000))],
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
         Case {
             // `ClientSideTimestampsStatus` models the single value ENABLED too.
@@ -336,7 +353,7 @@ fn cases() -> Vec<Case> {
             update: || json!({"clientSideTimestamps": {"status": "ENABLED"}}),
             touched: &["clientSideTimestamps"],
             expect: || vec![("/clientSideTimestamps", json!({"status": "ENABLED"}))],
-            stamps_pay_per_request: false,
+            stamp: Stamp::AtCreate,
         },
     ]
 }
@@ -459,17 +476,18 @@ async fn update_table_applies_the_one_named_setting_and_leaves_the_rest() {
             );
         }
 
-        // RULE 3: the stamp exists exactly on a table an update moved to
-        // PAY_PER_REQUEST, and it records WHEN that update ran.
+        // RULE 3: the stamp exists exactly on a table that has been in PAY_PER_REQUEST
+        // mode, and it records WHEN it last entered that mode — this row's create, or the
+        // update that moved it there.
         let stamp = at(&got, "/capacitySpecification/lastUpdateToPayPerRequestTimestamp");
         assert_eq!(
             !stamp.is_null(),
-            case.stamps_pay_per_request,
-            "case {:?}: lastUpdateToPayPerRequestTimestamp belongs to a move to \
-             PAY_PER_REQUEST only, got {got}",
+            case.stamp != Stamp::Never,
+            "case {:?}: lastUpdateToPayPerRequestTimestamp belongs to a table that has \
+             been in PAY_PER_REQUEST mode, got {got}",
             case.name
         );
-        if case.stamps_pay_per_request {
+        if case.stamp != Stamp::Never {
             let stamped = stamp.as_f64().unwrap_or_else(|| {
                 panic!(
                     "case {:?}: lastUpdateToPayPerRequestTimestamp must be a timestamp: {got}",
@@ -478,12 +496,35 @@ async fn update_table_applies_the_one_named_setting_and_leaves_the_rest() {
             });
             let floor = epoch_seconds(update_floor);
             let ceiling = epoch_seconds(update_ceiling);
-            assert!(
-                stamped >= floor - 1.0 && stamped <= ceiling + 1.0,
-                "case {:?}: lastUpdateToPayPerRequestTimestamp {stamped} is outside the \
-                 window [{floor}, {ceiling}] in which the update ran",
-                case.name
-            );
+            match case.stamp {
+                // The update moved the table into the mode, so the stamp is from the
+                // window that update ran in.
+                Stamp::AtUpdate => assert!(
+                    stamped >= floor - 1.0 && stamped <= ceiling + 1.0,
+                    "case {:?}: lastUpdateToPayPerRequestTimestamp {stamped} is outside the \
+                     window [{floor}, {ceiling}] in which the update ran",
+                    case.name
+                ),
+                // The create put the table in the mode, and no update moved it in again,
+                // so the stamp predates the update window and equals the creation instant.
+                Stamp::AtCreate => {
+                    assert!(
+                        stamped <= floor + 1.0,
+                        "case {:?}: lastUpdateToPayPerRequestTimestamp {stamped} is the \
+                         create's instant, so it predates the update window [{floor}, \
+                         {ceiling}]",
+                        case.name
+                    );
+                    assert_eq!(
+                        stamp,
+                        at(&got, "/creationTimestamp"),
+                        "case {:?}: a table created in PAY_PER_REQUEST entered that mode \
+                         when it was created: {got}",
+                        case.name
+                    );
+                }
+                Stamp::Never => unreachable!("a table with no stamp is handled above"),
+            }
         }
     }
 }
@@ -523,9 +564,11 @@ async fn updating_a_table_that_is_not_active_is_the_modelled_conflict() {
         json!(keyspaces::TABLE_STATUS_CREATING),
         "a refused update must not move the table's status: {refused}"
     );
-    assert!(
-        refused["defaultTimeToLive"].is_null(),
-        "a refused update must not apply its setting: {refused}"
+    assert_eq!(
+        refused["defaultTimeToLive"],
+        json!(0),
+        "a refused update must not apply its setting, so the table still reports the \
+         default TTL of a table nothing set one on: {refused}"
     );
 
     // Once the creation has settled the same call is accepted, so what was refused was

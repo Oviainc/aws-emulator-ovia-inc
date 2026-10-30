@@ -8,11 +8,11 @@
 //!
 //! 1. A report of a table carries one Region-specific entry per Region the OWNING keyspace
 //!    replicates the table to — that is, per Region of a `MULTI_REGION` keyspace's
-//!    `replicationSpecification.regionList`, in the keyspace's own order — and none at all
-//!    for a table of a keyspace under any other replication strategy, which is replicated
-//!    in one Region only. `GetTable$replicaSpecifications` ("Returns the Amazon Web
-//!    Services Region specific settings of all Regions a multi-Region table is replicated
-//!    in") carries the table's status and capacity summary in each such Region;
+//!    `replicationSpecification.regionList`, in the keyspace's own order — and an EMPTY
+//!    list for a table of a keyspace under any other replication strategy, which is
+//!    replicated in one Region only. `GetTable$replicaSpecifications` ("Returns the Amazon
+//!    Web Services Region specific settings of all Regions a multi-Region table is
+//!    replicated in") carries the table's status and capacity summary in each such Region;
 //!    `GetTableAutoScalingSettings$replicaSpecifications` ("Returns the settings for all
 //!    Regions the table is replicated in") carries its auto scaling settings there.
 //! 2. The Regions are the keyspace's CURRENT replication Regions, whether the keyspace was
@@ -65,15 +65,16 @@ async fn get_auto_scaling(emulator: &Emulator, case: &str, keyspace: &str, table
     )
 }
 
-/// The `replicaSpecifications` of a report, as a list, or `None` when the report carries
-/// none at all.
-fn replicas(report: &Value) -> Option<Vec<Value>> {
-    match &report["replicaSpecifications"] {
-        Value::Null => None,
-        other => Some(other.as_array().cloned().unwrap_or_else(|| {
-            panic!("replicaSpecifications must be a list when present, got {other}")
-        })),
-    }
+/// The `replicaSpecifications` of a report: the member is always served (`len 0..`), so a
+/// report that does not carry it as a list is a defect, and a single-Region table's list
+/// is empty.
+fn replicas(report: &Value) -> Vec<Value> {
+    report["replicaSpecifications"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("replicaSpecifications must be served as a list, got {report}")
+        })
 }
 
 /// RULE 1 for `GetTable`: the summaries are the owning keyspace's replication Regions,
@@ -91,9 +92,9 @@ async fn get_table_reports_one_replica_summary_per_replication_region() {
         replication: Option<Value>,
         /// The `capacitySpecification` to create the table with, if any.
         capacity: Option<Value>,
-        /// The Regions the report must carry one entry each for, in order, or `None` when
-        /// it must carry no `replicaSpecifications` at all.
-        expected: Option<Vec<&'static str>>,
+        /// The Regions the report must carry one entry each for, in order — empty for a
+        /// table of a single-Region keyspace, which has no Region-specific settings.
+        expected: Vec<&'static str>,
     }
 
     let provisioned = |read: i64, write: i64| {
@@ -110,20 +111,20 @@ async fn get_table_reports_one_replica_summary_per_replication_region() {
             name: "strategy_omitted",
             replication: None,
             capacity: None,
-            expected: None,
+            expected: Vec::new(),
         },
         Case {
             name: "single_region_provisioned",
             replication: Some(json!({"replicationStrategy": "SINGLE_REGION"})),
             capacity: Some(provisioned(5, 5)),
-            expected: None,
+            expected: Vec::new(),
         },
         Case {
             // The modelled minimum length of a regionList (2).
             name: "multi_region_pair",
             replication: Some(multi_region(&[REGION, OTHER_REGIONS[0]])),
             capacity: None,
-            expected: Some(vec![REGION, OTHER_REGIONS[0]]),
+            expected: vec![REGION, OTHER_REGIONS[0]],
         },
         Case {
             // The request's own Region in the MIDDLE of the list, so the entries follow the
@@ -135,7 +136,7 @@ async fn get_table_reports_one_replica_summary_per_replication_region() {
                 OTHER_REGIONS[2],
             ])),
             capacity: Some(provisioned(10, 7)),
-            expected: Some(vec![OTHER_REGIONS[1], REGION, OTHER_REGIONS[2]]),
+            expected: vec![OTHER_REGIONS[1], REGION, OTHER_REGIONS[2]],
         },
         Case {
             // A wider group, with the request's own Region last.
@@ -148,13 +149,13 @@ async fn get_table_reports_one_replica_summary_per_replication_region() {
                 REGION,
             ])),
             capacity: Some(provisioned(1, 40000)),
-            expected: Some(vec![
+            expected: vec![
                 OTHER_REGIONS[0],
                 OTHER_REGIONS[1],
                 OTHER_REGIONS[2],
                 OTHER_REGIONS[3],
                 REGION,
-            ]),
+            ],
         },
     ];
 
@@ -185,7 +186,7 @@ async fn get_table_reports_one_replica_summary_per_replication_region() {
     // per-Region status is the table's TRANSIENT status and not only ever `ACTIVE`.
     for case in &cases {
         let report = get_table(&emulator, case.name, case.name, case.name).await;
-        assert_replicas(case.name, &report, case.expected.as_deref(), &emulator).await;
+        assert_replicas(case.name, &report, &case.expected, &emulator).await;
         assert_eq!(
             report["status"],
             json!(keyspaces::TABLE_STATUS_CREATING),
@@ -205,7 +206,7 @@ async fn get_table_reports_one_replica_summary_per_replication_region() {
             "case {:?}: the creation span has elapsed, so the table is ACTIVE, got {report}",
             case.name
         );
-        assert_replicas(case.name, &report, case.expected.as_deref(), &emulator).await;
+        assert_replicas(case.name, &report, &case.expected, &emulator).await;
 
         // RULE 3: the report is a read — the next one answers identically.
         let again = get_table(&emulator, case.name, case.name, case.name).await;
@@ -219,34 +220,19 @@ async fn get_table_reports_one_replica_summary_per_replication_region() {
 
 /// Assert one `GetTable` body's `replicaSpecifications` against the Regions the owning
 /// keyspace replicates the table to: one entry per Region, in order, each carrying the
-/// table's own status and capacity summary in that Region.
-async fn assert_replicas(
-    case: &str,
-    report: &Value,
-    expected: Option<&[&str]>,
-    emulator: &Emulator,
-) {
-    let got = replicas(report);
-    let Some(expected) = expected else {
-        assert!(
-            got.is_none(),
-            "case {case:?}: a table of a single-Region keyspace reports no \
-             replicaSpecifications, got {report}"
-        );
-        return;
-    };
-    let entries = got.unwrap_or_else(|| {
-        panic!(
-            "case {case:?}: a table of a MULTI_REGION keyspace reports one entry per \
-             replication Region, got {report}"
-        )
-    });
+/// table's own status and capacity summary in that Region — and no entry at all, an empty
+/// list, for a table of a single-Region keyspace.
+async fn assert_replicas(case: &str, report: &Value, expected: &[&str], emulator: &Emulator) {
+    let entries = replicas(report);
     assert_eq!(
         entries.len(),
         expected.len(),
         "case {case:?}: expected {} replica summaries for {expected:?}, got {report}",
         expected.len()
     );
+    if expected.is_empty() {
+        return;
+    }
 
     // The Regions a report carries are the keyspace's CURRENT replication Regions, which
     // `GetKeyspace` reports from the same stored list.
@@ -282,10 +268,10 @@ async fn assert_replicas(
             "case {case:?}: with no per-Region override stored, the Region's capacity \
              summary is the table's, got {report}"
         );
-        assert!(
-            entry["warmThroughputSpecification"].is_null(),
-            "case {case:?}: nothing pre-warmed this table, so no warm throughput is \
-             reported per Region, got {report}"
+        assert_eq!(
+            entry["warmThroughputSpecification"], report["warmThroughputSpecification"],
+            "case {case:?}: warm throughput is configured for the table, so each Region \
+             reports the table's, got {report}"
         );
     }
 }
@@ -304,7 +290,9 @@ async fn get_table_auto_scaling_settings_reports_one_entry_per_replication_regio
         name: &'static str,
         replication: Option<Value>,
         auto_scaling: Value,
-        expected: Option<Vec<&'static str>>,
+        /// The Regions the report must carry one entry each for, in order — empty for a
+        /// table of a single-Region keyspace.
+        expected: Vec<&'static str>,
     }
 
     let enabled = |minimum: i64, maximum: i64, target: f64| {
@@ -326,13 +314,13 @@ async fn get_table_auto_scaling_settings_reports_one_entry_per_replication_regio
                 "readCapacityAutoScaling": enabled(5, 50, 60.0),
                 "writeCapacityAutoScaling": enabled(5, 50, 60.0),
             }),
-            expected: None,
+            expected: Vec::new(),
         },
         Case {
             name: "auto_scaling_pair_read_only",
             replication: Some(multi_region(&[REGION, OTHER_REGIONS[0]])),
             auto_scaling: json!({"readCapacityAutoScaling": enabled(1, 40000, 20.0)}),
-            expected: Some(vec![REGION, OTHER_REGIONS[0]]),
+            expected: vec![REGION, OTHER_REGIONS[0]],
         },
         Case {
             name: "auto_scaling_triple_disabled",
@@ -345,7 +333,7 @@ async fn get_table_auto_scaling_settings_reports_one_entry_per_replication_regio
                 "readCapacityAutoScaling": {"autoScalingDisabled": true},
                 "writeCapacityAutoScaling": {"autoScalingDisabled": true},
             }),
-            expected: Some(vec![OTHER_REGIONS[1], OTHER_REGIONS[2], REGION]),
+            expected: vec![OTHER_REGIONS[1], OTHER_REGIONS[2], REGION],
         },
     ];
 
@@ -388,44 +376,28 @@ async fn get_table_auto_scaling_settings_reports_one_entry_per_replication_regio
             "case {:?}: the report names the table it was asked for, got {report}",
             case.name
         );
-        let got = replicas(&report);
-        match &case.expected {
-            None => assert!(
-                got.is_none(),
-                "case {:?}: a table of a single-Region keyspace reports no \
-                 replicaSpecifications, got {report}",
+        let entries = replicas(&report);
+        assert_eq!(
+            entries.len(),
+            case.expected.len(),
+            "case {:?}: expected {} entries for {:?}, got {report}",
+            case.name,
+            case.expected.len(),
+            case.expected
+        );
+        for (entry, region) in entries.iter().zip(&case.expected) {
+            assert_eq!(
+                entry["region"],
+                json!(region),
+                "case {:?}: the entries follow the keyspace's Region list, got {report}",
                 case.name
-            ),
-            Some(expected) => {
-                let entries = got.unwrap_or_else(|| {
-                    panic!(
-                        "case {:?}: a multi-Region table reports one entry per replication \
-                         Region, got {report}",
-                        case.name
-                    )
-                });
-                assert_eq!(
-                    entries.len(),
-                    expected.len(),
-                    "case {:?}: expected {} entries for {expected:?}, got {report}",
-                    case.name,
-                    expected.len()
-                );
-                for (entry, region) in entries.iter().zip(expected) {
-                    assert_eq!(
-                        entry["region"],
-                        json!(region),
-                        "case {:?}: the entries follow the keyspace's Region list, got {report}",
-                        case.name
-                    );
-                    assert_eq!(
-                        entry["autoScalingSpecification"], report["autoScalingSpecification"],
-                        "case {:?}: with no per-Region override stored, the Region's auto \
-                         scaling settings are the table's, got {report}",
-                        case.name
-                    );
-                }
-            }
+            );
+            assert_eq!(
+                entry["autoScalingSpecification"], report["autoScalingSpecification"],
+                "case {:?}: with no per-Region override stored, the Region's auto \
+                 scaling settings are the table's, got {report}",
+                case.name
+            );
         }
 
         // RULE 3: the report is a read — the next one answers identically.
@@ -481,11 +453,12 @@ async fn widening_a_keyspace_gives_its_tables_per_region_settings() {
                 .await,
         );
 
-        // Before the widening, the table is replicated in one Region and reports nothing.
+        // Before the widening, the table is replicated in one Region and so reports an
+        // empty list of Region-specific settings.
         let report = get_table(&emulator, name, name, name).await;
         assert!(
-            replicas(&report).is_none(),
-            "case {name:?}: a table of a single-Region keyspace reports no \
+            replicas(&report).is_empty(),
+            "case {name:?}: a table of a single-Region keyspace reports an empty \
              replicaSpecifications, got {report}"
         );
     }
@@ -508,12 +481,7 @@ async fn widening_a_keyspace_gives_its_tables_per_region_settings() {
         );
 
         let report = get_table(&emulator, name, name, name).await;
-        let entries = replicas(&report).unwrap_or_else(|| {
-            panic!(
-                "case {name:?}: a widened keyspace's table reports one entry per \
-                 replication Region, got {report}"
-            )
-        });
+        let entries = replicas(&report);
         assert_eq!(
             entries.len(),
             regions.len(),
@@ -539,9 +507,7 @@ async fn widening_a_keyspace_gives_its_tables_per_region_settings() {
     tokio::time::sleep(settle_wait()).await;
     for (name, regions) in &rows {
         let report = get_table(&emulator, name, name, name).await;
-        let entries = replicas(&report).unwrap_or_else(|| {
-            panic!("case {name:?}: the widened keyspace still has its Regions, got {report}")
-        });
+        let entries = replicas(&report);
         assert_eq!(
             entries.len(),
             regions.len(),

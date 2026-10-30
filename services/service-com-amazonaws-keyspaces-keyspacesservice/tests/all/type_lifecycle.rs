@@ -173,15 +173,16 @@ async fn create_type_formats_the_name_and_round_trips_through_get_type() {
              {got}",
             case.submitted
         );
-        // A flat type nests nothing, and nothing refers to it yet.
+        // A flat type is one level deep — the level counts the type itself — and nothing
+        // refers to it yet.
         assert_eq!(
             (
                 &got["maxNestingDepth"],
                 &got["directParentTypes"],
                 &got["directReferringTables"]
             ),
-            (&json!(0), &json!([]), &json!([])),
-            "case {:?}: a flat type nests nothing and has no referrers: {got}",
+            (&json!(1), &json!([]), &json!([])),
+            "case {:?}: a flat type is one level deep and has no referrers: {got}",
             case.submitted
         );
 
@@ -473,9 +474,11 @@ async fn a_type_name_in_neither_documented_form_is_a_modelled_validation_failure
 #[tokio::test]
 async fn get_type_derives_nesting_depth_parents_and_referring_tables() {
     /// One row: the type to create, the field types it is created with, the nesting
-    /// depth that must follow from them, and the types that must report as its parents
-    /// (stated as literals, in the total order the store keeps its types in, so the
-    /// expectation does not depend on the implementation that derives it).
+    /// depth that must follow from them — the level counts the type ITSELF, so a type no
+    /// field of which reaches another user-defined type is 1 deep and each level of
+    /// nesting adds one — and the types that must report as its parents (stated as
+    /// literals, in the total order the store keeps its types in, so the expectation does
+    /// not depend on the implementation that derives it).
     struct Case {
         name: &'static str,
         field_types: &'static [&'static str],
@@ -491,7 +494,7 @@ async fn get_type_derives_nesting_depth_parents_and_referring_tables() {
         Case {
             name: "leaf",
             field_types: &["text", "int"],
-            depth: 0,
+            depth: 1,
             parents: &[
                 "refers_to_one_type_twice",
                 "wraps_in_a_collection",
@@ -502,37 +505,37 @@ async fn get_type_derives_nesting_depth_parents_and_referring_tables() {
         Case {
             name: "wraps_leaf_directly",
             field_types: &["leaf"],
-            depth: 1,
+            depth: 2,
             parents: &["diamond"],
         },
         Case {
             name: "wraps_leaf_frozen",
             field_types: &["frozen<leaf>", "text"],
-            depth: 1,
+            depth: 2,
             parents: &["diamond", "wraps_in_a_collection"],
         },
         Case {
             name: "wraps_in_a_collection",
             field_types: &["list<frozen<wraps_leaf_frozen>>", "map<text, frozen<leaf>>"],
-            depth: 2,
+            depth: 3,
             parents: &["wraps_in_a_tuple"],
         },
         Case {
             name: "wraps_in_a_tuple",
             field_types: &["tuple<int, frozen<wraps_in_a_collection>>"],
-            depth: 3,
+            depth: 4,
             parents: &[],
         },
         Case {
             name: "refers_to_one_type_twice",
             field_types: &["map<frozen<leaf>, frozen<leaf>>"],
-            depth: 1,
+            depth: 2,
             parents: &[],
         },
         Case {
             name: "diamond",
             field_types: &["frozen<wraps_leaf_directly>", "frozen<wraps_leaf_frozen>"],
-            depth: 2,
+            depth: 3,
             parents: &[],
         },
     ];

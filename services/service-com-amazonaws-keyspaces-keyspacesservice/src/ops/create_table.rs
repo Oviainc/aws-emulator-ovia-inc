@@ -486,6 +486,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cdc_stream_tags.insert(stream_arn, stream_tags);
         }
 
+        let last_update_to_pay_per_request =
+            crate::state::pay_per_request_since(Some(&capacity_specification), now);
         keyspace.tables.insert(
             input.table_name.clone(),
             crate::state::Table {
@@ -502,9 +504,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 schema_definition: Some(input.schema_definition),
                 capacity_specification: Some(capacity_specification),
                 auto_scaling_specification: auto_scaling_specification.clone(),
-                // Only an `UpdateTable` that moves the table to PAY_PER_REQUEST sets
-                // this; a table created in a mode was never updated into it.
-                last_update_to_pay_per_request: None,
+                // When this table last became PAY_PER_REQUEST: this create, when that is
+                // the mode it is created in (the modelled default), and never for a table
+                // created in any other mode.
+                last_update_to_pay_per_request,
                 encryption_specification: Some(encryption_specification),
                 // Continuous backups of this table begin now when the create asked for
                 // point-in-time recovery, and not at all while it is off: the restorable

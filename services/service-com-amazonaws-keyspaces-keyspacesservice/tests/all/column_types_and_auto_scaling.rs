@@ -26,7 +26,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_keyspaces_keyspacesservice::state as keyspaces;
 
 use crate::keyspace_table_lifecycle::{
-    assert_failure, assert_ok, keyspace_arn, minimal_schema, settle_wait, table_arn, Emulator,
+    assert_failure, assert_ok, keyspace_arn, minimal_schema, reported_schema, settle_wait,
+    table_arn, Emulator,
 };
 
 /// A schema whose partition key is a `text` column and whose one regular column declares
@@ -146,7 +147,7 @@ async fn create_table_resolves_a_native_column_type_and_refuses_an_unresolvable_
                 let got = assert_ok(&case, emulator.call("GetTable", read_back).await);
                 assert_eq!(
                     got["schemaDefinition"],
-                    schema_with_type(declared),
+                    reported_schema(&schema_with_type(declared)),
                     "case {case:?}: the stored schema must read back verbatim, got {got}"
                 );
             }
@@ -274,7 +275,7 @@ async fn a_column_type_resolves_against_the_user_defined_types_of_its_own_keyspa
         );
         assert_eq!(
             got["schemaDefinition"],
-            schema_with_type(declared),
+            reported_schema(&schema_with_type(declared)),
             "case {case:?}: the stored schema must read back verbatim, got {got}"
         );
 

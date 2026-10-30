@@ -21,7 +21,9 @@
 
 use serde_json::{json, Value};
 
-use crate::keyspace_table_lifecycle::{assert_failure, assert_ok, settle_wait, Emulator};
+use crate::keyspace_table_lifecycle::{
+    assert_failure, assert_ok, reported_schema, settle_wait, Emulator,
+};
 
 /// One column of `allColumns`.
 fn column(name: &str, column_type: &str) -> Value {
@@ -226,21 +228,23 @@ async fn a_static_column_requires_at_least_one_clustering_column() {
                     .await,
             );
             // An accepted create stored the schema it was given: the reader proves it,
-            // static columns included.
+            // static columns included — and reports the two optional lists as empty where
+            // the create named neither, which is the convention `reported_schema` states.
+            let expected = reported_schema(&definition);
             assert_eq!(
-                got["schemaDefinition"]["allColumns"], definition["allColumns"],
+                got["schemaDefinition"]["allColumns"], expected["allColumns"],
                 "case {case:?}: expected allColumns {}, got {}",
-                definition["allColumns"], got["schemaDefinition"]["allColumns"]
+                expected["allColumns"], got["schemaDefinition"]["allColumns"]
             );
             assert_eq!(
-                got["schemaDefinition"]["staticColumns"], definition["staticColumns"],
+                got["schemaDefinition"]["staticColumns"], expected["staticColumns"],
                 "case {case:?}: expected staticColumns {}, got {}",
-                definition["staticColumns"], got["schemaDefinition"]["staticColumns"]
+                expected["staticColumns"], got["schemaDefinition"]["staticColumns"]
             );
             assert_eq!(
-                got["schemaDefinition"]["clusteringKeys"], definition["clusteringKeys"],
+                got["schemaDefinition"]["clusteringKeys"], expected["clusteringKeys"],
                 "case {case:?}: expected clusteringKeys {}, got {}",
-                definition["clusteringKeys"], got["schemaDefinition"]["clusteringKeys"]
+                expected["clusteringKeys"], got["schemaDefinition"]["clusteringKeys"]
             );
         } else {
             let (_, body) = answer.clone();

@@ -147,10 +147,11 @@ struct Case {
     /// The `warmThroughputSpecification` the create carries, if any.
     warm: Option<Value>,
     /// One entry per Region the table is replicated in, in the keyspace's order; empty for
-    /// a table of a single-Region keyspace, which reports no `replicaSpecifications`.
+    /// a table of a single-Region keyspace, whose `replicaSpecifications` is the empty list.
     per_region: Vec<RegionExpectation>,
     /// The `(readUnitsPerSecond, writeUnitsPerSecond)` the warm throughput summary must
-    /// report, or `None` when nothing pre-warmed the table.
+    /// report, or `None` when the create named no `warmThroughputSpecification` — where the
+    /// summary is the baseline the table's capacity mode already gives it.
     warm_units: Option<(i64, i64)>,
 }
 
@@ -447,47 +448,60 @@ fn assert_settings(
 ) {
     let name = case.name;
 
-    match &case.warm_units {
-        None => assert!(
-            report["warmThroughputSpecification"].is_null(),
-            "case {name:?}: nothing pre-warmed this table, so it reports no \
-             warmThroughputSpecification, got {report}"
+    // Every table reports a warm throughput summary: the configuration the create carried,
+    // in the status the clock owes it, or — where the create named none — the baseline the
+    // table's capacity mode already gives it, which nothing is applying a change to.
+    let (expected_read, expected_write, warm_status) = match &case.warm_units {
+        Some((read, write)) => (
+            json!(read),
+            json!(write),
+            expected_warm_status.to_string(),
         ),
-        Some((read, write)) => {
-            for (pointer, expected) in [
-                ("readUnitsPerSecond", json!(read)),
-                ("writeUnitsPerSecond", json!(write)),
-                ("status", json!(expected_warm_status)),
-            ] {
-                assert_member(
-                    name,
-                    report,
-                    &format!("/warmThroughputSpecification/{pointer}"),
-                    &expected,
-                );
-            }
-            let reported = report["warmThroughputSpecification"]["status"]
-                .as_str()
-                .unwrap_or_default();
-            assert!(
-                WARM_THROUGHPUT_STATUS_VALUES.contains(&reported),
-                "case {name:?}: {reported:?} is not a modelled WarmThroughputStatus value, \
-                 got {report}"
-            );
+        None => {
+            // Every row that names no warm throughput creates a PROVISIONED table, so the
+            // baseline is the capacity that create provisioned.
+            let capacity = case.capacity.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "case {name:?}: a row with no warmThroughputSpecification states the \
+                     capacity its baseline comes from"
+                )
+            });
+            (
+                capacity["readCapacityUnits"].clone(),
+                capacity["writeCapacityUnits"].clone(),
+                keyspaces::WARM_THROUGHPUT_STATUS_AVAILABLE.to_string(),
+            )
         }
+    };
+    for (pointer, expected) in [
+        ("readUnitsPerSecond", expected_read),
+        ("writeUnitsPerSecond", expected_write),
+        ("status", json!(warm_status)),
+    ] {
+        assert_member(
+            name,
+            report,
+            &format!("/warmThroughputSpecification/{pointer}"),
+            &expected,
+        );
     }
+    let reported = report["warmThroughputSpecification"]["status"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        WARM_THROUGHPUT_STATUS_VALUES.contains(&reported),
+        "case {name:?}: {reported:?} is not a modelled WarmThroughputStatus value, got {report}"
+    );
 
     if case.per_region.is_empty() {
-        assert!(
-            report["replicaSpecifications"].is_null(),
-            "case {name:?}: a table of a single-Region keyspace reports no \
-             replicaSpecifications, got {report}"
-        );
-        assert!(
-            scaling["replicaSpecifications"].is_null(),
-            "case {name:?}: a table of a single-Region keyspace reports no per-Region auto \
-             scaling settings, got {scaling}"
-        );
+        for (source, body) in [("GetTable", report), ("GetTableAutoScalingSettings", scaling)] {
+            assert_eq!(
+                body["replicaSpecifications"],
+                json!([]),
+                "case {name:?}: a table of a single-Region keyspace is replicated in one \
+                 Region, so {source} reports an empty replicaSpecifications, got {body}"
+            );
+        }
         return;
     }
 

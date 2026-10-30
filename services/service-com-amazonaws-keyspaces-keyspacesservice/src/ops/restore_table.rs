@@ -566,9 +566,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 schema_definition: restored.schema_definition,
                 capacity_specification,
                 auto_scaling_specification: auto_scaling_specification.clone(),
-                // The restored table is a new table in whatever mode it was restored into;
-                // no update has moved it to `PAY_PER_REQUEST`.
-                last_update_to_pay_per_request: None,
+                // When the restored table last became PAY_PER_REQUEST: this restore, when
+                // that is the mode it is restored into (`effective_capacity`, the mode the
+                // request or the source table gives it, or the modelled default), and
+                // never for a table restored into any other mode.
+                last_update_to_pay_per_request: crate::state::pay_per_request_since(
+                    Some(&effective_capacity),
+                    now,
+                ),
                 encryption_specification,
                 // The restored table is a new table, so its own continuous backups begin
                 // with this restore when point-in-time recovery is on for it — the source

@@ -220,9 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // after it is released — the settings themselves live in Application Auto Scaling,
         // and no request holds two service stores at once.
         let table = table.clone();
-        let replica_regions: Option<Vec<String>> = keyspace
-            .table_replica_regions()
-            .map(<[String]>::to_vec);
+        let replica_regions: Vec<String> = keyspace.table_replica_regions().unwrap_or_default().to_vec();
         drop(store);
 
         // The settings of the table's two capacities as they stand now: the scalable
@@ -253,9 +251,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // table's auto scaling settings in that Region — the settings reported above,
             // with the Region's `replicaSpecifications.readCapacityAutoScaling` override
             // applied when one is stored. A table of a single-Region keyspace is
-            // replicated in one Region and reports none.
-            replica_specifications: replica_regions.map(|regions| {
-                regions
+            // replicated in one Region, so the list is EMPTY for it: the member is served
+            // either way (`len 0..`), and an empty list is what tells a caller iterating
+            // per-Region settings that there are none, where an absent member tells it
+            // nothing at all.
+            replica_specifications: Some(
+                replica_regions
                     .iter()
                     .map(|replication_region| ReplicaAutoScalingSpecification {
                         region: Some(replication_region.clone()),
@@ -264,8 +265,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             auto_scaling_specification.as_ref(),
                         ),
                     })
-                    .collect()
-            }),
+                    .collect(),
+            ),
         })
     }
 }

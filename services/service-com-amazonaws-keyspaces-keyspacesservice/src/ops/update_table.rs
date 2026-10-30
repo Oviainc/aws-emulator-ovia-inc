@@ -691,14 +691,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let was_provisioned =
                 stored_capacity.throughput_mode == crate::state::PROVISIONED_THROUGHPUT_MODE;
             // "The timestamp of the last operation that changed the provisioned
-            // throughput capacity of a table": the summary member is named for a move TO
-            // `PAY_PER_REQUEST`, so it is stamped only when this update is that move. An
-            // update that re-sets the mode a table is ALREADY in changed no throughput
-            // capacity, so it deliberately leaves the existing stamp where it is.
-            if !was_pay_per_request
-                && capacity.throughput_mode == crate::state::PAY_PER_REQUEST_THROUGHPUT_MODE
-            {
-                table.last_update_to_pay_per_request = Some(now);
+            // throughput capacity of a table": the instant the table last ENTERED
+            // `PAY_PER_REQUEST` mode, which this update is when it moves the table there.
+            // Which capacity specification counts as that mode is decided in ONE place,
+            // `crate::state::pay_per_request_since` — the same rule a create and a restore
+            // stamp through — so no write path can disagree with another. An update that
+            // re-sets the mode a table is ALREADY in changed no throughput capacity, so it
+            // deliberately leaves the existing stamp where it is.
+            if !was_pay_per_request {
+                if let Some(entered) = crate::state::pay_per_request_since(Some(&capacity), now) {
+                    table.last_update_to_pay_per_request = Some(entered);
+                }
             }
             // Auto scaling is "the optional auto scaling settings for a table in
             // provisioned capacity mode", so a table MOVED OUT of that mode has no

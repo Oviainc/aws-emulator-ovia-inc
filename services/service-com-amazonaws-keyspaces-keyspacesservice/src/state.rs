@@ -33,6 +33,7 @@ use crate::ops::types::{
     EncryptionSpecification, FieldDefinition, PointInTimeRecovery, ReplicaSpecification,
     ResourceNotFoundException, SchemaDefinition, Tag,
     TargetTrackingScalingPolicyConfiguration, TimeToLive, WarmThroughputSpecification,
+    WarmThroughputSpecificationSummary,
 };
 
 /// The CDC stream store, which the KeyspacesStreams service crate owns.
@@ -249,6 +250,22 @@ pub const WARM_THROUGHPUT_STATUS_AVAILABLE: &str = "AVAILABLE";
 /// while the change that set it is still being applied. See
 /// [`WARM_THROUGHPUT_STATUS_AVAILABLE`].
 pub const WARM_THROUGHPUT_STATUS_UPDATING: &str = "UPDATING";
+
+/// The read capacity a table in on-demand (`PAY_PER_REQUEST`) capacity mode can serve
+/// without being pre-warmed: Amazon Keyspaces documents that such a table "can serve up
+/// to 4,000 write request units per second and 12,000 read request units per second"
+/// before it has to scale, which is the warm throughput every on-demand table already
+/// has when nothing ever asked it to pre-warm more.
+///
+/// So this and [`DEFAULT_ON_DEMAND_WARM_WRITE_UNITS_PER_SECOND`] are the baseline
+/// [`Table::reported_warm_throughput`] reports for an on-demand table with no
+/// configuration of its own; a provisioned table's baseline is its own provisioned
+/// capacity, which is what IT can serve without scaling.
+pub const DEFAULT_ON_DEMAND_WARM_READ_UNITS_PER_SECOND: i64 = 12_000;
+
+/// The write half of the same documented baseline. See
+/// [`DEFAULT_ON_DEMAND_WARM_READ_UNITS_PER_SECOND`].
+pub const DEFAULT_ON_DEMAND_WARM_WRITE_UNITS_PER_SECOND: i64 = 4_000;
 
 /// `rs` (replication strategy) = `SINGLE_REGION`: a keyspace replicated only in
 /// the region it was created in, and the strategy a keyspace gets when
@@ -1015,11 +1032,18 @@ pub struct Table {
     /// for a table in provisioned capacity mode" — reported back by
     /// `GetTableAutoScalingSettings`.
     pub auto_scaling_specification: Option<AutoScalingSpecification>,
-    /// When an `UpdateTable` last moved this table's throughput mode to
-    /// `PAY_PER_REQUEST`, or `None` while no update ever has
-    /// (`CapacitySpecificationSummary$lastUpdateToPayPerRequestTimestamp`). An update
-    /// that re-sets the mode the table is already in changed no throughput capacity, so
-    /// it leaves this where it is.
+    /// When this table's throughput mode last BECAME `PAY_PER_REQUEST`, or `None` for a
+    /// table that has never been in that mode
+    /// (`CapacitySpecificationSummary$lastUpdateToPayPerRequestTimestamp`, "the timestamp
+    /// of the last operation that changed the provisioned throughput capacity of a
+    /// table").
+    ///
+    /// The operation that put the table in on-demand mode is the one stamped here,
+    /// whether that was the create (or restore) that made the table in that mode —
+    /// `PAY_PER_REQUEST` being the modelled default, that is every table no
+    /// `capacitySpecification` was supplied for ([`pay_per_request_since`]) — or a later
+    /// `UpdateTable` that moved it there. A call that re-sets the mode the table is
+    /// already in changed no throughput capacity, so it leaves this where it is.
     pub last_update_to_pay_per_request: Option<SystemTime>,
     /// The supplied encryption specification, or the modelled default; `None` for a
     /// service-managed table.
@@ -1237,6 +1261,117 @@ impl Table {
         }
         Some(earliest)
     }
+
+    /// Whether a CALL defined this table — a `CreateTable` or a `RestoreTable` — rather
+    /// than the service owning it.
+    ///
+    /// A table of a [service-managed keyspace][SERVICE_MANAGED_KEYSPACES] carries none of
+    /// the settings a call supplies ([`service_managed_keyspace`] builds it with every one
+    /// of them unset), so a report of it carries no settings member at all — not even the
+    /// empty or default value one of the always-served members below would otherwise take.
+    /// A table a call defined is exactly a table whose creation instant is known.
+    pub fn is_defined_by_a_call(&self) -> bool {
+        self.creation_timestamp.is_some()
+    }
+
+    /// The `comment` a report of this table carries: the one it was created with, and the
+    /// EMPTY comment for a table created without one.
+    ///
+    /// `Comment$message` is `@required` ("an optional description of the table"), so the
+    /// structure a table with no description reports is the one whose message is empty —
+    /// an absent `comment` would make a client reading `comment.message` read a null
+    /// instead.
+    pub fn reported_comment(&self) -> Option<Comment> {
+        self.is_defined_by_a_call()
+            .then(|| self.comment.clone().unwrap_or_default())
+    }
+
+    /// The `defaultTimeToLive` a report of this table carries: the value it was last set
+    /// to, and `0` for a table no call ever set it on.
+    ///
+    /// The member is "the default Time to Live settings in seconds of the specified
+    /// table", `@range 0..630720000`: no expiry is zero seconds of default TTL, which is
+    /// the bottom of that range and the value a caller may set explicitly, so a table
+    /// that has never been given one reports it rather than nothing.
+    pub fn reported_default_time_to_live(&self) -> Option<i32> {
+        self.is_defined_by_a_call()
+            .then(|| self.default_time_to_live.unwrap_or(0))
+    }
+
+    /// The `schemaDefinition` a report of this table carries: the stored schema, with its
+    /// two optional column lists filled in as EMPTY lists when the schema declares
+    /// neither.
+    ///
+    /// `SchemaDefinition$clusteringKeys` and `$staticColumns` are lists with no modelled
+    /// minimum length, and a table has a definite answer for each — the columns that are
+    /// part of its clustering key, and the columns it declared `STATIC` — so a table with
+    /// none of either reports two empty lists rather than two absent members, which is
+    /// what lets a client iterate them without a null check.
+    pub fn reported_schema_definition(&self) -> Option<SchemaDefinition> {
+        self.schema_definition.as_ref().map(|schema| SchemaDefinition {
+            all_columns: schema.all_columns.clone(),
+            partition_keys: schema.partition_keys.clone(),
+            clustering_keys: Some(schema.clustering_keys.clone().unwrap_or_default()),
+            static_columns: Some(schema.static_columns.clone().unwrap_or_default()),
+        })
+    }
+
+    /// The `warmThroughputSpecification` summary a report of this table carries: the
+    /// configuration a call pre-warmed it with, and otherwise the baseline its capacity
+    /// mode already gives it.
+    ///
+    /// "Contains the CURRENT warm throughput settings for a table, including the
+    /// configured capacity units and the current status of the warm throughput
+    /// configuration" — every table has them, because every table can serve some traffic
+    /// before it has to scale: a provisioned table the capacity it provisions, and an
+    /// on-demand one the documented
+    /// [baseline][DEFAULT_ON_DEMAND_WARM_READ_UNITS_PER_SECOND]. A configuration a call
+    /// set is reported with ITS status, which is `UPDATING` while the clock still owes
+    /// that change its completion ([`WarmThroughput::status`]); a baseline nothing is
+    /// changing is `AVAILABLE`.
+    pub fn reported_warm_throughput(&self) -> Option<WarmThroughputSpecificationSummary> {
+        if let Some(warm) = self.warm_throughput_specification.as_ref() {
+            return Some(WarmThroughputSpecificationSummary {
+                read_units_per_second: warm.read_units_per_second,
+                write_units_per_second: warm.write_units_per_second,
+                status: warm.status().to_string(),
+            });
+        }
+        let capacity = self.capacity_specification.as_ref()?;
+        let provisioned = capacity.throughput_mode == PROVISIONED_THROUGHPUT_MODE;
+        Some(WarmThroughputSpecificationSummary {
+            read_units_per_second: capacity
+                .read_capacity_units
+                .filter(|_| provisioned)
+                .unwrap_or(DEFAULT_ON_DEMAND_WARM_READ_UNITS_PER_SECOND),
+            write_units_per_second: capacity
+                .write_capacity_units
+                .filter(|_| provisioned)
+                .unwrap_or(DEFAULT_ON_DEMAND_WARM_WRITE_UNITS_PER_SECOND),
+            status: WARM_THROUGHPUT_STATUS_AVAILABLE.to_string(),
+        })
+    }
+}
+
+/// When a table CREATED or RESTORED at `now` with the capacity specification `capacity`
+/// last became `PAY_PER_REQUEST`: `now` when that is the mode it is made in — the
+/// modelled default, so every table no `capacitySpecification` was supplied for — and
+/// `None` when it is made in any other mode, which no operation has ever moved out of
+/// on-demand.
+///
+/// `CapacitySpecificationSummary$lastUpdateToPayPerRequestTimestamp` is "the timestamp of
+/// the last operation that changed the provisioned throughput capacity of a table", and
+/// for a table made in on-demand mode that operation is the call that made it. Every
+/// operation that creates a table stamps [`Table::last_update_to_pay_per_request`]
+/// through this, so a created and a restored table are stamped by the one rule
+/// `UpdateTable` moves the stamp by afterwards.
+pub fn pay_per_request_since(
+    capacity: Option<&CapacitySpecification>,
+    now: SystemTime,
+) -> Option<SystemTime> {
+    capacity
+        .filter(|capacity| capacity.throughput_mode == PAY_PER_REQUEST_THROUGHPUT_MODE)
+        .map(|_| now)
 }
 
 /// When the continuous backups of a table CREATED at `now` with the point-in-time-recovery
@@ -1443,11 +1578,17 @@ impl Keyspace {
 }
 
 /// `GetType`'s `maxNestingDepth` ("The level of nesting implemented for this type"):
-/// `0` for a type none of whose fields refers to another user-defined type, and
+/// `1` for a type none of whose fields refers to another user-defined type, and
 /// otherwise one more than the deepest type it refers to.
 ///
-/// Derived from the keyspace's types on read, so it is `Depth`'s modelled default of
-/// `0` exactly for a flat type.
+/// The level COUNTS THE TYPE ITSELF, so an existing type is nested at least one level
+/// deep and each user-defined type reached through a field adds one more. `Depth`'s
+/// modelled `@default 0` is the protocol default for an unset member — the value a
+/// client assumes when the service serialises none — and never the depth of a type the
+/// service holds.
+///
+/// Derived from the keyspace's types on read, so a type whose fields are changed, or
+/// whose nested types gain nesting of their own, is reported at the depth it then has.
 ///
 /// BOUNDED, and bounded by the stored data rather than by the shape of the type graph:
 /// the walk is iterative (no recursion to blow a stack) and MEMOISED in `depths`, so
@@ -1499,9 +1640,11 @@ pub fn nesting_depth(types: &BTreeMap<String, UserDefinedType>, type_name: &str)
                 stack.extend(pending.into_iter().map(Step::Expand));
             }
             Step::Resolve(name, references) => {
-                let deepest = references
+                // This type's own level, plus the deepest nesting any type it refers to
+                // contributes on top of it.
+                let deepest = 1 + references
                     .iter()
-                    .map(|reference| 1 + depths.get(reference).copied().unwrap_or(0))
+                    .map(|reference| depths.get(reference).copied().unwrap_or(0))
                     .max()
                     .unwrap_or(0);
                 expanding.remove(&name);

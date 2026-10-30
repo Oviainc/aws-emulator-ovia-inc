@@ -26,7 +26,7 @@
 use serde_json::{json, Value};
 
 use crate::keyspace_table_lifecycle::{
-    assert_failure, assert_ok, error_code, minimal_schema, settle_wait, Emulator,
+    assert_failure, assert_ok, error_code, minimal_schema, reported_schema, settle_wait, Emulator,
 };
 
 /// The modelled refusal a name already taken earns, on the client-error status every
@@ -319,7 +319,7 @@ async fn a_name_already_taken_is_graded_before_the_type_references_of_the_defini
     );
     assert_eq!(
         got["schemaDefinition"],
-        minimal_schema("pk"),
+        reported_schema(&minimal_schema("pk")),
         "case \"the table is unchanged\": the refused creates must not have touched its \
          schema, got {got}"
     );
@@ -516,7 +516,7 @@ async fn update_table_grades_a_table_that_cannot_take_the_change_before_the_adde
     );
     assert_eq!(
         got["schemaDefinition"],
-        minimal_schema("pk"),
+        reported_schema(&minimal_schema("pk")),
         "case \"the schema is unchanged\": the refused updates must leave the schema as it \
          was, got {got}"
     );

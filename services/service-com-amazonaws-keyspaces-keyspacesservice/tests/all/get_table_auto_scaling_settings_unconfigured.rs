@@ -53,8 +53,9 @@ struct Case {
     /// Whether the report must carry `autoScalingSpecification`.
     expect_specification: bool,
     /// The Regions the report must carry one `replicaSpecifications` entry each for, in
-    /// order, or `None` when it must carry no entries at all.
-    expect_regions: Option<Vec<&'static str>>,
+    /// order — empty for a table of a single-Region keyspace, which has no Region-specific
+    /// settings but is still served the member.
+    expect_regions: Vec<&'static str>,
 }
 
 /// RULE 1: a table that exists is reported, with `autoScalingSpecification` present only
@@ -85,7 +86,7 @@ async fn a_table_without_auto_scaling_settings_is_reported_with_the_member_absen
             capacity: None,
             auto_scaling: None,
             expect_specification: false,
-            expect_regions: None,
+            expect_regions: Vec::new(),
         },
         Case {
             name: "explicit_pay_per_request",
@@ -94,7 +95,7 @@ async fn a_table_without_auto_scaling_settings_is_reported_with_the_member_absen
             capacity: Some(json!({"throughputMode": "PAY_PER_REQUEST"})),
             auto_scaling: None,
             expect_specification: false,
-            expect_regions: None,
+            expect_regions: Vec::new(),
         },
         Case {
             name: "provisioned_without_auto_scaling",
@@ -103,7 +104,7 @@ async fn a_table_without_auto_scaling_settings_is_reported_with_the_member_absen
             capacity: Some(provisioned(5, 5)),
             auto_scaling: None,
             expect_specification: false,
-            expect_regions: None,
+            expect_regions: Vec::new(),
         },
         Case {
             // The longest name the shape allows, at the minimum of the unit members.
@@ -113,7 +114,7 @@ async fn a_table_without_auto_scaling_settings_is_reported_with_the_member_absen
             capacity: Some(provisioned(1, 1)),
             auto_scaling: None,
             expect_specification: false,
-            expect_regions: None,
+            expect_regions: Vec::new(),
         },
         Case {
             // A table of a MULTI_REGION keyspace is a multi-Region table, so it reports one
@@ -126,7 +127,7 @@ async fn a_table_without_auto_scaling_settings_is_reported_with_the_member_absen
             capacity: Some(provisioned(5, 5)),
             auto_scaling: None,
             expect_specification: false,
-            expect_regions: Some(vec![REGION, OTHER_REGION]),
+            expect_regions: vec![REGION, OTHER_REGION],
         },
         Case {
             // The contrast rows: a table that HAS settings reports them, so the member's
@@ -137,7 +138,7 @@ async fn a_table_without_auto_scaling_settings_is_reported_with_the_member_absen
             capacity: Some(provisioned(5, 5)),
             auto_scaling: Some(json!({"readCapacityAutoScaling": enabled(5, 50, 60.0)})),
             expect_specification: true,
-            expect_regions: None,
+            expect_regions: Vec::new(),
         },
         Case {
             // "autoScalingDisabled: true" is a setting the table HAS: auto scaling is off
@@ -151,7 +152,7 @@ async fn a_table_without_auto_scaling_settings_is_reported_with_the_member_absen
                 "writeCapacityAutoScaling": {"autoScalingDisabled": true},
             })),
             expect_specification: true,
-            expect_regions: None,
+            expect_regions: Vec::new(),
         },
     ];
 
@@ -219,23 +220,22 @@ async fn a_table_without_auto_scaling_settings_is_reported_with_the_member_absen
             case.expect_specification
         );
 
-        let got_regions: Option<Vec<String>> = report.get("replicaSpecifications").map(|entries| {
-            entries
-                .as_array()
-                .unwrap_or_else(|| {
-                    panic!(
-                        "case {:?}: replicaSpecifications must be a list, got {entries}",
-                        case.name
-                    )
-                })
-                .iter()
-                .map(|entry| entry["region"].as_str().unwrap_or_default().to_string())
-                .collect()
-        });
-        let expected_regions: Option<Vec<String>> = case
+        let got_regions: Vec<String> = report["replicaSpecifications"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: replicaSpecifications must be served as a list, got {report}",
+                    case.name
+                )
+            })
+            .iter()
+            .map(|entry| entry["region"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let expected_regions: Vec<String> = case
             .expect_regions
-            .as_ref()
-            .map(|regions| regions.iter().map(|region| (*region).to_string()).collect());
+            .iter()
+            .map(|region| (*region).to_string())
+            .collect();
         assert_eq!(
             got_regions, expected_regions,
             "case {:?}: expected replicaSpecifications for {expected_regions:?}, got {got_regions:?}",

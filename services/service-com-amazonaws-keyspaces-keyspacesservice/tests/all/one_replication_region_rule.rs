@@ -6,7 +6,7 @@
 //!
 //! The rule: the Regions a report carries for a keyspace, or for any table of it, are the
 //! stored `replicationSpecification.regionList` of that keyspace exactly when its
-//! `replicationStrategy` is `MULTI_REGION`, and are absent under any other strategy
+//! `replicationStrategy` is `MULTI_REGION`, and are NONE under any other strategy
 //! ("if the `replicationStrategy` of the keyspace is `MULTI_REGION`, a list of replication
 //! Regions is returned" —
 //! smithy_query(query="doc",shape="KeyspaceSummary",member="replicationRegions")). It is
@@ -16,6 +16,11 @@
 //! `GetTableAutoScalingSettings$replicaSpecifications` — cannot answer it differently,
 //! whether the keyspace was created `MULTI_REGION` or widened into one by
 //! `UpdateKeyspace`.
+//!
+//! How a report SERIALIZES "no Region" is the member's own convention and is asserted here
+//! too: the two `replicaSpecifications` members are served for every table (`len 0..`), so
+//! a single-Region table's list is empty, while the keyspace's own `replicationRegions`
+//! (modelled `len 2..`) is absent under any strategy but `MULTI_REGION`.
 
 use serde_json::{json, Value};
 
@@ -68,7 +73,8 @@ fn strings_of(case: &str, report: &Value, member: &str) -> Option<Vec<String>> {
 }
 
 /// Every report that names the keyspace's replication Regions, each labelled by the
-/// response member it was read from.
+/// response member it was read from and by whether that member is served even when it
+/// names no Region at all.
 ///
 /// The five span both former statements of the rule: `GetKeyspace$replicationRegions` and
 /// the `ListKeyspaces` summary report the keyspace itself, while
@@ -80,7 +86,7 @@ async fn every_report(
     case: &str,
     keyspace: &str,
     table: &str,
-) -> Vec<(&'static str, Option<Vec<String>>)> {
+) -> Vec<(&'static str, bool, Option<Vec<String>>)> {
     let identity = json!({"keyspaceName": keyspace, "tableName": table});
     let got_keyspace = assert_ok(
         case,
@@ -111,41 +117,56 @@ async fn every_report(
     vec![
         (
             "GetKeyspace$replicationRegions",
+            false,
             strings_of(case, &got_keyspace, "replicationRegions"),
         ),
         (
             "GetKeyspace$replicationGroupStatuses",
+            false,
             regions_of(case, &got_keyspace, "replicationGroupStatuses"),
         ),
         (
             "ListKeyspaces$keyspaces$replicationRegions",
+            false,
             strings_of(case, &summary, "replicationRegions"),
         ),
         (
             "GetTable$replicaSpecifications",
+            true,
             regions_of(case, &got_table, "replicaSpecifications"),
         ),
         (
             "GetTableAutoScalingSettings$replicaSpecifications",
+            true,
             regions_of(case, &got_scaling, "replicaSpecifications"),
         ),
     ]
 }
 
-/// Assert every report names exactly `expected`, so the rule is answered once.
+/// Assert every report names exactly `expected`, so the rule is answered once — and that a
+/// member served for every table carries the empty list where it names no Region, while one
+/// the model only returns under `MULTI_REGION` is absent there.
 fn assert_every_report(
     case: &str,
-    reports: &[(&'static str, Option<Vec<String>>)],
-    expected: Option<&[&str]>,
+    reports: &[(&'static str, bool, Option<Vec<String>>)],
+    expected: &[&str],
 ) {
-    let expected: Option<Vec<String>> = expected
-        .map(|regions| regions.iter().map(|region| (*region).to_string()).collect());
-    for (member, actual) in reports {
+    let expected: Vec<String> = expected.iter().map(|region| (*region).to_string()).collect();
+    for (member, always_served, actual) in reports {
         assert_eq!(
-            actual, &expected,
+            actual.clone().unwrap_or_default(),
+            expected,
             "case {case:?}: {member} answers the one replication-Region rule, so it names \
              {expected:?}, got {actual:?}"
         );
+        if expected.is_empty() {
+            assert_eq!(
+                actual.is_some(),
+                *always_served,
+                "case {case:?}: {member} naming no Region is served as an empty list only \
+                 where the model always serves it, got {actual:?}"
+            );
+        }
     }
 }
 
@@ -161,8 +182,8 @@ async fn every_report_of_a_keyspace_names_the_same_replication_regions() {
         /// Also the keyspace name and the table name.
         name: &'static str,
         replication: Option<Value>,
-        /// The Regions every report must name, or `None` when none must name any.
-        expected: Option<Vec<&'static str>>,
+        /// The Regions every report must name — empty when none must name any.
+        expected: Vec<&'static str>,
     }
 
     let cases: Vec<Case> = vec![
@@ -170,12 +191,12 @@ async fn every_report_of_a_keyspace_names_the_same_replication_regions() {
             // No replicationSpecification at all: a single-Region keyspace.
             name: "strategy_omitted",
             replication: None,
-            expected: None,
+            expected: Vec::new(),
         },
         Case {
             name: "explicit_single_region",
             replication: Some(json!({"replicationStrategy": "SINGLE_REGION"})),
-            expected: None,
+            expected: Vec::new(),
         },
         Case {
             // A region list under a strategy that is not MULTI_REGION names no Region the
@@ -185,19 +206,19 @@ async fn every_report_of_a_keyspace_names_the_same_replication_regions() {
                 "replicationStrategy": "SINGLE_REGION",
                 "regionList": [REGION, OTHER_REGIONS[0]],
             })),
-            expected: None,
+            expected: Vec::new(),
         },
         Case {
             // The modelled minimum length of a regionList (2).
             name: "multi_region_pair",
             replication: Some(multi_region(&[REGION, OTHER_REGIONS[0]])),
-            expected: Some(vec![REGION, OTHER_REGIONS[0]]),
+            expected: vec![REGION, OTHER_REGIONS[0]],
         },
         Case {
             // The request's own Region in the MIDDLE of the list.
             name: "multi_region_triple",
             replication: Some(multi_region(&[OTHER_REGIONS[1], REGION, OTHER_REGIONS[2]])),
-            expected: Some(vec![OTHER_REGIONS[1], REGION, OTHER_REGIONS[2]]),
+            expected: vec![OTHER_REGIONS[1], REGION, OTHER_REGIONS[2]],
         },
         Case {
             // A wider group, with the request's own Region last.
@@ -209,13 +230,13 @@ async fn every_report_of_a_keyspace_names_the_same_replication_regions() {
                 OTHER_REGIONS[3],
                 REGION,
             ])),
-            expected: Some(vec![
+            expected: vec![
                 OTHER_REGIONS[0],
                 OTHER_REGIONS[1],
                 OTHER_REGIONS[2],
                 OTHER_REGIONS[3],
                 REGION,
-            ]),
+            ],
         },
     ];
 
@@ -253,12 +274,12 @@ async fn every_report_of_a_keyspace_names_the_same_replication_regions() {
     // compared in a transient status too, and once after they have settled.
     for case in &cases {
         let reports = every_report(&emulator, case.name, case.name, case.name).await;
-        assert_every_report(case.name, &reports, case.expected.as_deref());
+        assert_every_report(case.name, &reports, &case.expected);
     }
     tokio::time::sleep(settle_wait()).await;
     for case in &cases {
         let reports = every_report(&emulator, case.name, case.name, case.name).await;
-        assert_every_report(case.name, &reports, case.expected.as_deref());
+        assert_every_report(case.name, &reports, &case.expected);
     }
 
     // The rule is about the STORED keyspace, so when `UpdateKeyspace` widens a
@@ -279,13 +300,13 @@ async fn every_report_of_a_keyspace_names_the_same_replication_regions() {
             .await,
     );
     let reports = every_report(&emulator, "widened", widened, widened).await;
-    assert_every_report("widened", &reports, Some(&widened_regions));
+    assert_every_report("widened", &reports, &widened_regions);
 
     for case in &cases {
         if case.name == widened {
             continue;
         }
         let reports = every_report(&emulator, case.name, case.name, case.name).await;
-        assert_every_report(case.name, &reports, case.expected.as_deref());
+        assert_every_report(case.name, &reports, &case.expected);
     }
 }

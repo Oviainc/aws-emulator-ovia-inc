@@ -5,8 +5,12 @@
 //! stored, plus the status the clock has settled it into, the table's CDC stream
 //! (`cdcSpecification`, `latestStreamArn`) as the shared CDC stream store holds it, and
 //! (for a table of a `MULTI_REGION` keyspace, which is a multi-Region table) one
-//! Region-specific summary per Region the keyspace replicates it to. This is the ONLY
-//! file to touch for `GetTable`.
+//! Region-specific summary per Region the keyspace replicates it to. A member Amazon
+//! Keyspaces always serializes for a table — the comment, the default TTL, the schema's
+//! two optional column lists, the Region-specific settings and the warm throughput
+//! summary — is reported with its empty, zero or derived value rather than skipped; see
+//! `crate::state::Table`, which decides each of them. This is the ONLY file to touch for
+//! `GetTable`.
 //!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
 //! how it reaches state; they still describe this file.
@@ -252,8 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     throughput_mode: capacity.throughput_mode.clone(),
                     read_capacity_units,
                     write_capacity_units: capacity.write_capacity_units,
-                    // Set by an `UpdateTable` that moved this table's throughput mode to
-                    // PAY_PER_REQUEST, and absent while no update ever has.
+                    // When this table last became PAY_PER_REQUEST — the create that made
+                    // it in that mode, or the update that moved it there — and absent for
+                    // a table that has never been in it.
                     last_update_to_pay_per_request_timestamp: table
                         .last_update_to_pay_per_request
                         .map(::aws_smithy_types::DateTime::from),
@@ -266,18 +271,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|capacity| capacity.read_capacity_units),
         );
-        // "Contains the current warm throughput settings for a table, including the
-        // configured capacity units and the current status of the warm throughput
-        // configuration": a table nothing ever pre-warmed has none to report.
-        let warm_throughput_specification =
-            table
-                .warm_throughput_specification
-                .as_ref()
-                .map(|warm| WarmThroughputSpecificationSummary {
-                    read_units_per_second: warm.read_units_per_second,
-                    write_units_per_second: warm.write_units_per_second,
-                    status: warm.status().to_string(),
-                });
+        // "Contains the current warm throughput settings for a table": the configuration
+        // this table was pre-warmed with, or the baseline its capacity mode already gives
+        // it, decided in `crate::state::Table::reported_warm_throughput`.
+        let warm_throughput_specification = table.reported_warm_throughput();
 
         Ok(GetTableOutput {
             keyspace_name: table.keyspace_name.clone(),
@@ -286,11 +283,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Every member from here down is one only a `CreateTable` (or a later
             // `UpdateTable`) could have filled, so a service-managed system table — which
             // no call created — reports none of them rather than a setting nobody
-            // configured. The model makes each of them optional; only the three names and
-            // the ARN above are `@required`.
+            // configured. For a table a call DID define, a member Amazon Keyspaces always
+            // serializes is reported with its empty, zero or derived value rather than
+            // skipped: `crate::state::Table` decides each of those in one place, so no
+            // reader of a table can report it differently. `replicaSpecifications` below is
+            // the exception on both counts: it derives from the owning KEYSPACE's
+            // replication rather than from any setting a call supplied, so it is served for
+            // every table, a system table included.
             creation_timestamp: table.creation_timestamp.map(::aws_smithy_types::DateTime::from),
             status: Some(table.status.clone()),
-            schema_definition: table.schema_definition.clone(),
+            // The stored schema, with `clusteringKeys` and `staticColumns` filled in as
+            // empty lists for a schema that declares neither.
+            schema_definition: table.reported_schema_definition(),
             capacity_specification,
             encryption_specification: table.encryption_specification.clone(),
             point_in_time_recovery: table.point_in_time_recovery.as_ref().map(|recovery| {
@@ -306,16 +310,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }),
             ttl: table.ttl.clone(),
-            default_time_to_live: table.default_time_to_live,
-            comment: table.comment.clone(),
+            // Zero seconds for a table no call set a default TTL on, and the empty comment
+            // for one created without a description: both members carry a value for every
+            // table a call defined, so neither is dropped.
+            default_time_to_live: table.reported_default_time_to_live(),
+            comment: table.reported_comment(),
             client_side_timestamps: table.client_side_timestamps.clone(),
             // "Returns the Amazon Web Services Region specific settings of all Regions a
             // multi-Region table is replicated in": one entry per Region the OWNING
             // keyspace replicates this table to, each carrying the table's status and
             // throughput in that Region. A table of a single-Region keyspace is replicated
-            // in one Region and reports none.
-            replica_specifications: keyspace.table_replica_regions().map(|regions| {
-                regions
+            // in one Region, so the list is EMPTY for it — the member is served either way,
+            // and an empty list is what tells a caller iterating per-Region settings that
+            // there are none, where an absent member tells it nothing at all.
+            replica_specifications: Some(
+                keyspace
+                    .table_replica_regions()
+                    .unwrap_or_default()
                     .iter()
                     .map(|replication_region| ReplicaSpecificationSummary {
                         region: Some(replication_region.clone()),
@@ -329,8 +340,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // replica reports the table's.
                         warm_throughput_specification: warm_throughput_specification.clone(),
                     })
-                    .collect()
-            }),
+                    .collect(),
+            ),
             // CDC IS served: a table that has a stream reports that stream's ARN as the
             // latest one and its status and view type as the table's CDC specification. A
             // table no `cdcSpecification` ever enabled a stream for has no CDC settings to
