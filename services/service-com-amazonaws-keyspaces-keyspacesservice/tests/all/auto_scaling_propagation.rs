@@ -55,9 +55,20 @@ impl Emulator {
         Self { router }
     }
 
-    /// Call an Amazon Keyspaces operation.
+    /// Call an Amazon Keyspaces operation as a client signed for [`REGION`].
     pub(crate) async fn keyspaces(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.keyspaces_in(REGION, operation, body).await
+    }
+
+    /// Call an Amazon Keyspaces operation as a client signed for `region`.
+    pub(crate) async fn keyspaces_in(
+        &self,
+        region: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
         self.dispatch(
+            region,
             "cassandra",
             "application/x-amz-json-1.0",
             &format!("KeyspacesService.{operation}"),
@@ -66,9 +77,20 @@ impl Emulator {
         .await
     }
 
-    /// Call an Application Auto Scaling operation.
+    /// Call an Application Auto Scaling operation as a client signed for [`REGION`].
     pub(crate) async fn auto_scaling(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.auto_scaling_in(REGION, operation, body).await
+    }
+
+    /// Call an Application Auto Scaling operation as a client signed for `region`.
+    pub(crate) async fn auto_scaling_in(
+        &self,
+        region: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
         self.dispatch(
+            region,
             "application-autoscaling",
             "application/x-amz-json-1.1",
             &format!("AnyScaleFrontendService.{operation}"),
@@ -79,6 +101,7 @@ impl Emulator {
 
     async fn dispatch(
         &self,
+        region: &str,
         signing_name: &str,
         content_type: &str,
         target: &str,
@@ -87,13 +110,13 @@ impl Emulator {
         let request = http::Request::builder()
             .method(http::Method::POST)
             .uri("/")
-            .header("host", format!("{signing_name}.{REGION}.amazonaws.com"))
+            .header("host", format!("{signing_name}.{region}.amazonaws.com"))
             .header("content-type", content_type)
             .header("x-amz-target", target)
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{signing_name}\
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/{signing_name}\
                      /aws4_request, SignedHeaders=host;x-amz-target, Signature=abc123"
                 ),
             )
@@ -112,11 +135,18 @@ impl Emulator {
         (status, parsed)
     }
 
-    /// Every `cassandra` scalable target Application Auto Scaling holds, ordered by
-    /// resource id and dimension.
+    /// Every `cassandra` scalable target [`REGION`] holds, ordered by resource id and
+    /// dimension.
     pub(crate) async fn cassandra_targets(&self) -> Vec<Value> {
+        self.cassandra_targets_in(REGION).await
+    }
+
+    /// Every `cassandra` scalable target `region` holds, ordered by resource id and
+    /// dimension.
+    pub(crate) async fn cassandra_targets_in(&self, region: &str) -> Vec<Value> {
         let (status, body) = self
-            .auto_scaling(
+            .auto_scaling_in(
+                region,
                 "DescribeScalableTargets",
                 json!({"ServiceNamespace": "cassandra"}),
             )
@@ -138,11 +168,18 @@ impl Emulator {
         targets
     }
 
-    /// Every `cassandra` scaling policy Application Auto Scaling holds, ordered by the
-    /// dimension it steers.
+    /// Every `cassandra` scaling policy [`REGION`] holds, ordered by the dimension it
+    /// steers.
     pub(crate) async fn cassandra_policies(&self) -> Vec<Value> {
+        self.cassandra_policies_in(REGION).await
+    }
+
+    /// Every `cassandra` scaling policy `region` holds, ordered by the dimension it
+    /// steers.
+    pub(crate) async fn cassandra_policies_in(&self, region: &str) -> Vec<Value> {
         let (status, body) = self
-            .auto_scaling(
+            .auto_scaling_in(
+                region,
                 "DescribeScalingPolicies",
                 json!({"ServiceNamespace": "cassandra"}),
             )
@@ -165,7 +202,7 @@ impl Emulator {
     }
 
     /// Create `keyspace`, then a PROVISIONED table in it carrying `specification` (when
-    /// one is given), and assert both calls succeeded.
+    /// one is given), in [`REGION`], and assert both calls succeeded.
     async fn given_provisioned_table(
         &self,
         case: &str,
@@ -173,8 +210,22 @@ impl Emulator {
         table: &str,
         specification: Option<&Value>,
     ) {
+        self.given_provisioned_table_in(REGION, case, keyspace, table, specification)
+            .await;
+    }
+
+    /// The same seed, in `region`: the keyspace and the table are resources of the Region
+    /// the creating request was signed for, so a suite spanning Regions seeds each one.
+    pub(crate) async fn given_provisioned_table_in(
+        &self,
+        region: &str,
+        case: &str,
+        keyspace: &str,
+        table: &str,
+        specification: Option<&Value>,
+    ) {
         let (status, body) = self
-            .keyspaces("CreateKeyspace", json!({"keyspaceName": keyspace}))
+            .keyspaces_in(region, "CreateKeyspace", json!({"keyspaceName": keyspace}))
             .await;
         // A keyspace a previous case already created answers the modelled conflict, which
         // this seed tolerates; what it does not tolerate is any OTHER answer.
@@ -202,7 +253,7 @@ impl Emulator {
         if let Some(specification) = specification {
             request["autoScalingSpecification"] = specification.clone();
         }
-        let (status, body) = self.keyspaces("CreateTable", request).await;
+        let (status, body) = self.keyspaces_in(region, "CreateTable", request).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected CreateTable to answer 200, got {status} {body}"
@@ -230,7 +281,7 @@ pub(crate) fn resource_id(keyspace: &str, table: &str) -> String {
 
 /// Compare one member of a JSON body, by pointer, tolerating the integer and the double
 /// spelling of the same number.
-fn assert_member(case: &str, body: &Value, pointer: &str, expected: &Value) {
+pub(crate) fn assert_member(case: &str, body: &Value, pointer: &str, expected: &Value) {
     let actual = body.pointer(pointer).unwrap_or(&Value::Null);
     let equal = match (actual.as_f64(), expected.as_f64()) {
         (Some(actual), Some(expected)) => (actual - expected).abs() < 1e-9,

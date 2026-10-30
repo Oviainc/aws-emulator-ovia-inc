@@ -29,6 +29,8 @@ mod column_name_identifier_identity;
 mod column_types_and_auto_scaling;
 #[path = "all/create_table_replicas_and_warm_throughput.rs"]
 mod create_table_replicas_and_warm_throughput;
+#[path = "all/cross_region_auto_scaling_identity.rs"]
+mod cross_region_auto_scaling_identity;
 #[path = "all/delete_keyspace_in_flight_resources.rs"]
 mod delete_keyspace_in_flight_resources;
 #[path = "all/delete_keyspace_lifecycle.rs"]
