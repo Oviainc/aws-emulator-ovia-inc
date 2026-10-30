@@ -179,6 +179,26 @@ fn invalid_definition(diagnostic: String) -> TestStateError {
     .into()
 }
 
+/// The modelled `InvalidDefinition` carrying `sentence` as its whole message.
+///
+/// A defect this operation states in a sentence of its own goes out as that
+/// sentence: there is no diagnostic to quote and no state machine to name, so the
+/// message is not the envelope [`invalid_definition`] builds.
+fn invalid_definition_sentence(sentence: &str) -> TestStateError {
+    TestStateErrorModeled::InvalidDefinition(InvalidDefinition {
+        message: Some(sentence.to_string()),
+    })
+    .into()
+}
+
+/// What this operation answers for a `definition` that is not JSON.
+///
+/// RECORDED text, and a FIXED sentence: `TestState` names the thing it was given —
+/// the definition of a STATE — and says what it had to be, quoting nothing of the
+/// document it could not read. The operations that take a state machine definition
+/// quote a parse diagnostic instead, which is why this is worded here.
+const DEFINITION_NOT_JSON: &str = "The state definition must be valid JSON";
+
 /// The mocked outcome `mock` names: "A JSON object that contains a mocked `result` or
 /// `errorOutput`" — exactly one of the two, since the state's invocation either
 /// produced a result or failed.
@@ -344,9 +364,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Err(error) = serde_json::from_str::<Value>(&state_input) {
             return Err(TestStateErrorModeled::InvalidExecutionInput(
                 InvalidExecutionInput {
+                    // This operation's refusal about the input carries the POSITION
+                    // the parse reached after the diagnostic, which the operations
+                    // that start an execution with an input do not: see
+                    // `crate::state::json_parse_diagnostic_with_source`.
                     message: Some(crate::state::resource_error_message(
                         crate::state::INVALID_STATE_MACHINE_EXECUTION_INPUT,
-                        &crate::state::json_parse_diagnostic(&state_input, &error),
+                        &crate::state::json_parse_diagnostic_with_source(&state_input, &error),
                     )),
                 },
             )
@@ -404,13 +428,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // The definition is JUDGED before it is read: with a `stateName` it is a
+        // The definition is JUDGED before it is read, and the first thing judged is
+        // whether it is a document at all: this operation takes the definition of a
+        // state rather than of a state machine, and it states THAT in its own words
+        // — one fixed sentence about the state definition, carrying nothing of the
+        // document it could not read ([`DEFINITION_NOT_JSON`]), where the operations
+        // that take a state machine definition quote a parse diagnostic for it.
+        let document = match serde_json::from_str::<Value>(&input.definition) {
+            Ok(document) => document,
+            Err(_) => return Err(invalid_definition_sentence(DEFINITION_NOT_JSON)),
+        };
+
+        // What is left is the SHAPE of the definition: with a `stateName` it is a
         // fully-formed state machine, refused in the words every state machine
         // definition of this service is refused in, and without one it "accepts the
         // definition of a single state", which is refused in ITS own terms — a state
         // object is not a state machine, so nothing about the refusal describes one.
-        // Either walk refuses a definition that is not JSON, so what the parse below
-        // could fail on is already reported in those words.
         match input.state_name {
             Some(_) => asl::validate(&input.definition).map_err(invalid_definition),
             None => asl::validate_single_state(&input.definition).map_err(|about_the_state| {
@@ -420,11 +453,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into()
             }),
         }?;
-        let Ok(document) = serde_json::from_str::<Value>(&input.definition) else {
-            return Err(invalid_definition(
-                "the definition is not valid JSON".to_string(),
-            ));
-        };
 
         // Which state is under test, and the name it carries.
         let (name, state) = match input.state_name.as_deref() {

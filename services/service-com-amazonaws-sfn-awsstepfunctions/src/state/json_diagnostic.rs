@@ -17,7 +17,12 @@
 //! the word and the classes a value could have begun with — the shared
 //! [`::service_common::json_parse_fault::VALUE_CLASSES`], so no two services list
 //! them differently — and it carries NO location clause, which is what this service
-//! is recorded answering.
+//! is recorded answering for an execution `input` and for a state machine
+//! `definition`.
+//!
+//! ONE refusal of this service does carry one: `TestState`'s, for the input a state
+//! is tested on, which is recorded carrying the parser's own source-location clause
+//! after the diagnostic ([`diagnostic_with_source`]).
 
 /// Where `document` stopped parsing, in the words this service's refusals quote.
 ///
@@ -50,4 +55,54 @@ pub fn diagnostic(document: &str, error: &serde_json::Error) -> String {
         ),
         None => fault::unexpected_input(document, error),
     }
+}
+
+/// The most characters of the submitted document a source-location clause quotes.
+///
+/// A document is caller-sized (the modelled `SensitiveData` is 256 KiB), so the
+/// clause quotes a SNIPPET of it and counts the characters it dropped, the way the
+/// parser whose clause this is does: a refusal cannot be made much larger than the
+/// request that caused it.
+const MAX_SOURCE_CHARS: usize = 500;
+
+/// [`diagnostic`] with the parser's SOURCE LOCATION clause after it: the document
+/// the parse was reading, and where in it the parse stopped.
+///
+/// `TestState` is recorded carrying this clause in its `input` refusal, where the
+/// operations that start an execution with an input are recorded carrying the
+/// diagnostic alone — which is why the clause is a construction of its own rather
+/// than part of [`diagnostic`].
+///
+/// The position is the parse's own, as the shared readings report it: the start of
+/// the word for a document that stopped on an unquoted word (the word is named in
+/// full, so the position is where it begins), and the line and column the parse
+/// reached otherwise, counted from one and in BYTES. The quoted source is the
+/// document as submitted, clipped by [`quoted_source`].
+///
+/// `error` is the parse that refused `document`: call this where that parse failed,
+/// and nowhere else.
+pub fn diagnostic_with_source(document: &str, error: &serde_json::Error) -> String {
+    use ::service_common::json_parse_fault as fault;
+
+    let (line, column) = match fault::unrecognized_token(document, error) {
+        Some((_, line, column)) => (line, column),
+        None => (error.line(), error.column()),
+    };
+    format!(
+        "{}\n at [Source: (String){}; line: {line}, column: {column}]",
+        diagnostic(document, error),
+        quoted_source(document)
+    )
+}
+
+/// `document` as the source-location clause quotes it: in quotes when it is short,
+/// and its first [`MAX_SOURCE_CHARS`] characters in quotes followed by the count of
+/// the characters dropped when it is not.
+fn quoted_source(document: &str) -> String {
+    let characters = document.chars().count();
+    if characters <= MAX_SOURCE_CHARS {
+        return format!("\"{document}\"");
+    }
+    let kept: String = document.chars().take(MAX_SOURCE_CHARS).collect();
+    format!("\"{kept}\"[truncated {} chars]", characters - MAX_SOURCE_CHARS)
 }

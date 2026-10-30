@@ -3529,14 +3529,11 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             ));
         };
 
-        let total = routing
-            .iter()
-            .map(|item| item.weight)
-            .fold(0_i32, i32::saturating_add);
+        let weights: Vec<i32> = routing.iter().map(|item| item.weight).collect();
+        let total = weights.iter().copied().fold(0_i32, i32::saturating_add);
         if total != ROUTING_WEIGHT_TOTAL {
-            return Err(RoutingRejection::InvalidRouting(format!(
-                "the weights of a routing configuration must add up to {ROUTING_WEIGHT_TOTAL}, \
-                 got {total}"
+            return Err(RoutingRejection::InvalidRouting(routing_weight_sum_message(
+                &weights,
             )));
         }
 
@@ -4859,6 +4856,39 @@ pub fn resource_not_found_message(resource_arn: &str) -> String {
     resource_error_message(RESOURCE_NOT_FOUND, resource_arn)
 }
 
+/// What the modelled `ResourceNotFound` says where the service states the condition
+/// as a SENTENCE OF ITS OWN instead of naming the ARN: the resource the request
+/// referenced is not there.
+///
+/// RECORDED text: `UpdateStateMachineAlias` answers this fixed sentence for an alias
+/// the store does not hold, where the alias's own readers
+/// (`DescribeStateMachineAlias`, `DeleteStateMachineAlias`) quote the ARN through
+/// [`resource_not_found_message`]. No value of the request appears in it — the ARN
+/// travels in the shape's `resourceName` member, which every raiser of this error
+/// fills — so a caller reads the refused resource from there rather than out of the
+/// sentence.
+pub const RESOURCE_DOES_NOT_EXIST: &str = "Request references a resource that does not exist.";
+
+/// What the modelled `ValidationException` says when the weights of a routing
+/// configuration do not add up to [`ROUTING_WEIGHT_TOTAL`].
+///
+/// RECORDED text: the service states the RULE the configuration broke — "the sum of
+/// the weights in the routing configuration must be equal to 100" — and then lists,
+/// in brackets, the weights the request submitted, in the order it listed them, so a
+/// caller sees which numbers it sent. The listed values are the request's own; the
+/// total they add up to is not stated, because the weights are what the caller has
+/// to change.
+pub fn routing_weight_sum_message(weights: &[i32]) -> String {
+    format!(
+        "Sum of routing configuration weights must equal {ROUTING_WEIGHT_TOTAL}. Received: [{}]",
+        weights
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<String>>()
+            .join(", ")
+    )
+}
+
 /// What the modelled `ResourceNotFound` says when a routing configuration names a
 /// state machine version that was never published.
 ///
@@ -5033,6 +5063,17 @@ pub fn version_referenced_by_aliases_message(alias_names: &[String]) -> String {
     )
 }
 
+/// What the modelled `MissingRequiredParameter` says when an `UpdateStateMachine`
+/// names no member that would change the state machine.
+///
+/// RECORDED text, and a FIXED sentence: it states the ALTERNATIVES an update may
+/// name — the definition, the role ARN, the logging configuration or the tracing
+/// configuration — and carries no value of the request, since the request's defect
+/// is everything it did not send.
+pub const UPDATE_NAMES_NO_MEMBER: &str = "Either the definition, the role ARN, the \
+                                          LoggingConfiguration, or the TracingConfiguration must \
+                                          be specified";
+
 /// `ActivityDoesNotExist`'s, for [`resource_error_message`]. The error's own name
 /// under the rule above — the condition in spaced Title Case, then the ARN the
 /// request named — not a recorded message.
@@ -5069,6 +5110,14 @@ pub const INVALID_STATE_MACHINE_EXECUTION_INPUT: &str = "Invalid State Machine E
 /// so every operation reaches it where it reaches the rest of this service's
 /// messages — and so there is one name for it rather than two.
 pub use json_diagnostic::diagnostic as json_parse_diagnostic;
+
+/// What `TestState`'s refusal about the input a state is tested on quotes: the same
+/// reading, with the parser's own SOURCE LOCATION clause after it.
+///
+/// Framed in [`json_diagnostic`] beside the clause-less construction above, and
+/// re-exported here for the same reason: one name for it, reached where every other
+/// message of this service is reached.
+pub use json_diagnostic::diagnostic_with_source as json_parse_diagnostic_with_source;
 
 /// What `StateMachineTypeNotSupported` says, whatever operation raises it and
 /// whatever state machine it was raised for.
@@ -5427,6 +5476,10 @@ pub fn read_state_machine_alias_arn(
 /// ARN, which is what `InvalidArn` reports, rather than a version that is absent.
 /// This is [`read_state_machine_alias_arn`] for the other qualified form, and the two
 /// are exclusive: a qualifier of nothing but digits is a version and never an alias.
+///
+/// An ARN carrying NO qualifier is reported through
+/// [`missing_version_qualifier_message`], which states that one condition rather than
+/// the generic one: see that function for why.
 pub fn read_state_machine_version_arn(
     arn: &str,
     endpoint_region: &str,
@@ -5435,7 +5488,7 @@ pub fn read_state_machine_version_arn(
     let not_a_version =
         || invalid_arn_message(format!("Invalid ARN {STATE_MACHINE_RESOURCE} version: {arn}"));
     let Some(qualifier) = parsed.qualifier.as_deref() else {
-        return Err(not_a_version());
+        return Err(missing_version_qualifier_message(arn));
     };
     if parsed.label().is_some() {
         return Err(not_a_version());
@@ -5544,6 +5597,19 @@ pub fn arn_region(arn: &str) -> String {
 /// refusal in this module goes through here, so one envelope serves every operation.
 pub fn invalid_arn_message(diagnosis: String) -> String {
     format!("Invalid Arn: '{diagnosis}'")
+}
+
+/// What the modelled `InvalidArn` says about an ARN an operation needs a VERSION
+/// qualifier on and which carries none.
+///
+/// RECORDED text: where the ARN is well formed but names the state machine itself
+/// rather than one of its versions, the service does not state the generic ARN
+/// diagnosis ([`invalid_arn_message`]) — it names the one thing the ARN is missing,
+/// in a sentence of its own, followed by the ARN the request sent. The condition is
+/// about the QUALIFIER rather than about the ARN's shape, which is why it is worded
+/// here and not through the envelope every other ARN diagnosis is wrapped in.
+pub fn missing_version_qualifier_message(arn: &str) -> String {
+    format!("Arn missing version qualifier: {arn}")
 }
 
 /// What the modelled `InvalidArn` says about an ARN whose RESOURCE TYPE is not one
@@ -5777,9 +5843,12 @@ pub fn is_valid_name(name: &str) -> bool {
 /// name also arrives as the QUALIFIER of an ARN
 /// ([`read_state_machine_alias_arn`]), where no modelled constraint reaches it.
 ///
-/// A refusal is reported through the modelled `InvalidName`, whose message states the
-/// condition and the rejected name — see [`resource_error_message`] with
-/// [`INVALID_NAME`], the same wording every other name refusal here carries.
+/// A refusal is reported as a MODELLED-CONSTRAINT violation, because that is what it
+/// is: the rule is the member's own `@pattern`, which the boundary could not enforce
+/// (its lookahead is outside the regex dialect the centralized walk compiles), so the
+/// refusal states the standard validation envelope the boundary would have stated —
+/// see [`pattern_violation_message`] with [`ALIAS_NAME_PATTERN`] — rather than a
+/// resource error of this service's own.
 pub fn is_valid_alias_name(name: &str) -> bool {
     (MIN_ALIAS_NAME_CHARS..=MAX_ALIAS_NAME_CHARS).contains(&name.chars().count())
         && name
@@ -5788,6 +5857,36 @@ pub fn is_valid_alias_name(name: &str) -> bool {
         && name
             .bytes()
             .any(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+/// The modelled `@pattern` of `CharacterRestrictedName`, the shape a state machine
+/// alias `name` targets, spelled exactly as the model declares it.
+///
+/// Source: the model itself — `smithy_query(query="operation",
+/// operation="CreateStateMachineAlias")` reports `name` as `{"target":
+/// "CharacterRestrictedName", "length": {"min": 1, "max": 80}, "pattern":
+/// "^(?=.*[a-zA-Z_\-\.])[a-zA-Z0-9_\-\.]+$"}`. The text is what the refusal QUOTES as
+/// the constraint the value failed, so it has to be the model's own spelling; the
+/// check itself is [`is_valid_alias_name`], which reads the same rule without a regex
+/// engine. A test reads the pattern off the model and fails if the two drift apart.
+pub const ALIAS_NAME_PATTERN: &str = r"^(?=.*[a-zA-Z_\-\.])[a-zA-Z0-9_\-\.]+$";
+
+/// The standard validation envelope for `value`, sent at the input member `member`,
+/// failing that member's modelled `@pattern`.
+///
+/// A modelled constraint the centralized walk cannot enforce is still a modelled
+/// constraint, so the refusal is worded by the SAME body every other constraint
+/// violation of this service is worded by (`crate::service`'s `validation` module,
+/// which reaches the tree's shared wording): one clause naming the rejected value,
+/// the member it sat at and the pattern it had to satisfy, inside the
+/// `N validation error(s) detected` envelope. Nothing about the sentence is written
+/// here, so a handler-side check cannot drift from the boundary's wording.
+pub fn pattern_violation_message(member: &str, pattern: &str, value: &str) -> String {
+    crate::service::validation::one_violation_message(::smithy_server_runtime::Violation {
+        path: member.to_string(),
+        kind: ::smithy_server_runtime::ViolationKind::Pattern(pattern.to_string()),
+        value: Some(value.to_string()),
+    })
 }
 
 /// Why `role_arn` is not the ARN of an IAM role, or `None` when it is — the

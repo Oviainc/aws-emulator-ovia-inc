@@ -295,7 +295,9 @@ async fn a_server_status_keeps_its_own() {
 /// The rows differ along the operation that resolved the ARN, along the RESOURCE
 /// KIND the ARN names (a Map Run, an activity, a state machine, an alias), along
 /// whether the call reports or writes, and along whether the resource's parent
-/// exists — which is what the rule generalises over.
+/// exists — which is what the rule generalises over. `UpdateStateMachineAlias` is
+/// the one operation recorded stating this condition as a sentence of its own
+/// instead, which `refusal_vocabulary` owns.
 #[tokio::test]
 async fn a_resource_absent_refusal_quotes_the_arn_the_request_named() {
     // RECORDED text: the wire recordings of this API answer
@@ -359,9 +361,9 @@ async fn a_resource_absent_refusal_quotes_the_arn_the_request_named() {
             &alias,
         ),
         (
-            "UpdateStateMachineAlias on an alias whose state machine is absent too",
-            "UpdateStateMachineAlias",
-            json!({ "stateMachineAliasArn": &foreign_alias, "description": "x" }),
+            "DescribeStateMachineAlias on an alias whose state machine is absent too",
+            "DescribeStateMachineAlias",
+            json!({ "stateMachineAliasArn": &foreign_alias }),
             &foreign_alias,
         ),
     ];

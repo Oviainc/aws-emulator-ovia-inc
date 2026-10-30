@@ -1238,6 +1238,88 @@ fn nested_at(prefix: &str, member: impl ::std::fmt::Display) -> String {
     clipped(&format!("{prefix}{member}"), MAX_LOCATION_CHARS)
 }
 
+/// Where a diagnostic about the state machine OBJECT itself was found: the object's
+/// own location, which for the definition as a whole is the document's root.
+///
+/// [`at`] answers `None` for the root, because a diagnostic about a MEMBER of the
+/// root carries that member's name; a diagnostic about the object carries the object,
+/// and the root object is `/`.
+fn machine_at(prefix: &str) -> Option<String> {
+    Some(if prefix.is_empty() {
+        "/".to_string()
+    } else {
+        clipped(prefix, MAX_LOCATION_CHARS)
+    })
+}
+
+/// The fields the Amazon States Language declares on a state machine object, in the
+/// order its schema states them.
+///
+/// From the language specification's "State Machine Structure": a state machine
+/// carries `Comment`, `StartAt`, `TimeoutSeconds`, `Version`, `States` and
+/// `QueryLanguage`. The set is CLOSED — a field outside it is a field the language
+/// does not define — which is what [`field_not_supported_message`] reports.
+const MACHINE_FIELDS: &[&str] = &[
+    "Comment",
+    "QueryLanguage",
+    "StartAt",
+    "States",
+    "TimeoutSeconds",
+    "Version",
+];
+
+/// The fields a state machine declared as a `Map` state's processor carries: the
+/// machine's own, and the `ProcessorConfig` that says how that state runs it.
+///
+/// A processor is the one position the language declares that field at, so a
+/// definition or a `Parallel` branch carrying it is carrying a field the language
+/// does not declare THERE — which is what [`machine_fields`] keys on.
+const PROCESSOR_FIELDS: &[&str] = &[
+    "Comment",
+    "ProcessorConfig",
+    "QueryLanguage",
+    "StartAt",
+    "States",
+    "TimeoutSeconds",
+    "Version",
+];
+
+/// Which closed set a state machine object's fields are judged against: a `Map`
+/// state's processor admits one field more than a definition or a branch does.
+fn machine_fields(processor: bool) -> &'static [&'static str] {
+    if processor {
+        PROCESSOR_FIELDS
+    } else {
+        MACHINE_FIELDS
+    }
+}
+
+/// The fields a state machine object must carry, in the order the refusal lists them.
+///
+/// "A State Machine MUST have an object field named `States`" and "a string field
+/// named `StartAt`", which are the two the schema requires; the order here is the
+/// order the service lists them in, and it is the LIST that is reported rather than
+/// one diagnostic per field.
+const MACHINE_REQUIRED_FIELDS: &[&str] = &["States", "StartAt"];
+
+/// What a schema diagnostic says about required fields an object does not carry: the
+/// fields, in brackets, as a list.
+///
+/// RECORDED text. One diagnostic names them all, so a caller is told everything the
+/// object owes rather than one field per attempt.
+fn required_fields_message(fields: &[&str]) -> String {
+    format!("These fields are required: [{}]", fields.join(", "))
+}
+
+/// What a schema diagnostic says about a field the language does not declare: the
+/// field, quoted, and that it is not supported.
+///
+/// RECORDED text. The field name is the caller's own JSON key, so it is clipped by
+/// [`echoed`] like every other caller value a diagnostic quotes.
+fn field_not_supported_message(field: &str) -> String {
+    format!("Field '{}' is not supported", echoed(field))
+}
+
 /// Everything ONE walk of a definition found: the diagnostics it reports, and
 /// whether it had to drop any of them.
 ///
@@ -1405,7 +1487,7 @@ fn collect(definition: &str, mut found: Diagnosis) -> Diagnosis {
         return found;
     }
     match serde_json::from_str::<Value>(definition) {
-        Ok(document) => diagnose_machine(&document, "", JSONPATH, 1, &mut found),
+        Ok(document) => diagnose_machine(&document, "", JSONPATH, 1, false, &mut found),
         // The diagnostic is the service's own, naming where the definition stopped
         // parsing and what was expected there — the one construction every document
         // this service reads is reported through.
@@ -1423,12 +1505,15 @@ fn collect(definition: &str, mut found: Diagnosis) -> Diagnosis {
 
 /// [`diagnose`] for one state machine — the definition itself, or one nested inside
 /// it — carrying where it was found (`prefix`), the query language it inherits from
-/// the state that declares it, and how deeply it is nested.
+/// the state that declares it, how deeply it is nested, and whether it is a `Map`
+/// state's PROCESSOR, which admits one field more than a definition or a `Parallel`
+/// branch does ([`machine_fields`]).
 fn diagnose_machine(
     document: &Value,
     prefix: &str,
     inherited: &str,
     depth: usize,
+    processor: bool,
     into: &mut Diagnosis,
 ) {
     if !into.looking() {
@@ -1437,7 +1522,7 @@ fn diagnose_machine(
     if depth > MAX_DEFINITION_DEPTH {
         into.push(error(
             TOO_DEEPLY_NESTED,
-            at(prefix, ""),
+            machine_at(prefix),
             format!(
                 "the definition nests state machines more than the {MAX_DEFINITION_DEPTH} levels \
                  this service reads"
@@ -1448,7 +1533,7 @@ fn diagnose_machine(
     let Some(document) = document.as_object() else {
         into.push(error(
             SCHEMA_VALIDATION_FAILED,
-            at(prefix, ""),
+            machine_at(prefix),
             "a state machine definition must be a JSON object",
         ));
         return;
@@ -1467,32 +1552,66 @@ fn diagnose_machine(
             inherited
         }
     };
-    let states = document.get("States").and_then(Value::as_object);
-    match document.get("StartAt").and_then(Value::as_str) {
-        Some(start_at) => {
-            if states.is_some_and(|states| !states.contains_key(start_at)) {
-                into.push(error(
-                    MISSING_TRANSITION_TARGET,
-                    at(prefix, "/StartAt"),
-                    format!(
-                        "'StartAt' names '{}', which 'States' does not declare",
-                        echoed(start_at)
-                    ),
-                ));
-            }
-        }
-        None => into.push(error(
-            SCHEMA_VALIDATION_FAILED,
-            at(prefix, "/StartAt"),
-            "a state machine definition must carry a string 'StartAt' member",
-        )),
-    }
-    let Some(states) = states else {
+    // The language's schema for a state machine object is CLOSED: it declares the
+    // fields a definition may carry ([`MACHINE_FIELDS`]) and the two it must
+    // ([`MACHINE_REQUIRED_FIELDS`]). Fields the object does not carry are reported
+    // TOGETHER, in one diagnostic that lists them, and each field the schema does
+    // not declare is reported on its own — both located at the OBJECT, which is
+    // what a field belongs to, rather than at a position the document has not got.
+    let object = machine_at(prefix);
+    let missing: Vec<&str> = MACHINE_REQUIRED_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| !document.contains_key(*field))
+        .collect();
+    if !missing.is_empty() {
         into.push(error(
             SCHEMA_VALIDATION_FAILED,
-            at(prefix, "/States"),
-            "a state machine definition must carry an object 'States' member",
+            object.clone(),
+            required_fields_message(&missing),
         ));
+    }
+    for field in document.keys() {
+        if !machine_fields(processor).contains(&field.as_str()) {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                object.clone(),
+                field_not_supported_message(field),
+            ));
+        }
+    }
+    let states = document.get("States").and_then(Value::as_object);
+    // A field the object DOES carry is judged on its own: that it is absent is
+    // already stated above, so what is left to say about it is its value.
+    if let Some(start_at) = document.get("StartAt") {
+        match start_at.as_str() {
+            Some(start_at) => {
+                if states.is_some_and(|states| !states.contains_key(start_at)) {
+                    into.push(error(
+                        MISSING_TRANSITION_TARGET,
+                        at(prefix, "/StartAt"),
+                        format!(
+                            "'StartAt' names '{}', which 'States' does not declare",
+                            echoed(start_at)
+                        ),
+                    ));
+                }
+            }
+            None => into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(prefix, "/StartAt"),
+                "a state machine definition must carry a string 'StartAt' member",
+            )),
+        }
+    }
+    let Some(states) = states else {
+        if document.contains_key("States") {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(prefix, "/States"),
+                "a state machine definition must carry an object 'States' member",
+            ));
+        }
         return;
     };
     if states.is_empty() {
@@ -1688,6 +1807,9 @@ fn diagnose_state(
                 &nested_at(&here, format_args!("/{member}")),
                 language,
                 depth + 1,
+                // A processor is the one position the language declares
+                // `ProcessorConfig` at.
+                true,
                 into,
             );
         }
@@ -1699,6 +1821,7 @@ fn diagnose_state(
                 &nested_at(&here, format_args!("/Branches/{index}")),
                 language,
                 depth + 1,
+                false,
                 into,
             );
         }
@@ -2205,7 +2328,7 @@ pub fn validate_single_state(definition: &str) -> Result<(), String> {
     }
     let machine = json!({ "StartAt": SINGLE_STATE_NAME, "States": Value::Object(states) });
     let mut found = Diagnosis::until_first_error();
-    diagnose_machine(&machine, "", JSONPATH, 1, &mut found);
+    diagnose_machine(&machine, "", JSONPATH, 1, false, &mut found);
     match found.diagnostics.iter().find(|found| found.is_error()) {
         Some(found) => Err(about_the_single_state(found)),
         None => Ok(()),

@@ -73,8 +73,14 @@ use std::sync::Arc;
 
 /// How this service words the input-constraint refusals the framework hands
 /// back — the one formatter every operation's boundary validation reaches.
-/// Private: it is reached through `override_refusal` below, not by a caller.
-mod validation;
+/// How this service words a boundary refusal, and which members it states no value
+/// for.
+///
+/// Reached through `override_refusal` below for a refusal the framework hands over,
+/// and through `crate::state`'s one handler-side constraint message for a modelled
+/// constraint the centralized walk cannot enforce — both word their clause through
+/// the one body there.
+pub(crate) mod validation;
 
 /// How this service serializes a response body's NESTED structures — the SWF
 /// type discriminator every awsJson recording of this API shows on them.

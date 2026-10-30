@@ -99,6 +99,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The input member an alias name arrives in, as the validation envelope spells a
+/// member path: the model's `name` member in lowerCamel, which is the casing a
+/// constraint violation reports a path in.
+const ALIAS_NAME_MEMBER: &str = "name";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -186,12 +191,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if !crate::state::is_valid_alias_name(&input.name) {
-            return Err(CreateStateMachineAliasErrorModeled::InvalidName(InvalidName {
-                message: Some(crate::state::resource_error_message(
-                    crate::state::INVALID_NAME,
-                    &input.name,
-                )),
-            })
+            // The rule the name broke is the member's own modelled `@pattern`,
+            // which the centralized walk cannot compile (its lookahead is outside
+            // that regex dialect), so the refusal is the standard constraint
+            // violation the walk would have answered — not a resource error of this
+            // service's own.
+            return Err(CreateStateMachineAliasErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::pattern_violation_message(
+                        ALIAS_NAME_MEMBER,
+                        crate::state::ALIAS_NAME_PATTERN,
+                        &input.name,
+                    )),
+                    // `ValidationExceptionReason` classifies another API's
+                    // rejections (a labeled ARN, a missing parameter, a completed
+                    // Map Run, a routing configuration); none of them classifies a
+                    // value outside a modelled constraint, which the envelope above
+                    // states in full.
+                    reason: None,
+                },
+            )
             .into());
         }
 

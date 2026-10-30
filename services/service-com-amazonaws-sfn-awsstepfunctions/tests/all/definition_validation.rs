@@ -411,9 +411,12 @@ async fn a_diagnostic_reports_where_the_problem_is() {
             "/States/M/ItemProcessor/States/I/Next",
         ),
         (
+            // A required field an object does not carry belongs to the OBJECT —
+            // there is no position in the document for a field that is absent — so
+            // the diagnostic is located at the nested machine itself.
             "a missing StartAt inside a Parallel branch",
             r#"{"StartAt":"P","States":{"P":{"Type":"Parallel","Branches":[{"States":{"B":{"Type":"Succeed"}}}],"End":true}}}"#,
-            "/States/P/Branches/0/StartAt",
+            "/States/P/Branches/0",
         ),
         (
             "a payload-template member of a JSONPath state",

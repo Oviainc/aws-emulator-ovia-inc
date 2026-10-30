@@ -703,27 +703,19 @@ async fn update_state_machine_refuses_what_it_cannot_serve() {
 
     // Rows here are the ones NOT already covered by
     // `state_machine_create_options.rs`'s update-refusal table (the ARN forms, the
-    // definition's structure, `versionDescription` without `publish` and an update
-    // naming neither required member at all): the documented boundary between a
-    // configuration-only update and one that names `definition` or `roleArn`, and a
-    // state machine whose deletion has begun.
+    // definition's structure and `versionDescription` without `publish`): an update
+    // that names no member that would change anything, and a state machine whose
+    // deletion has begun.
     let cases: Vec<(&str, Value, u16, &str)> = vec![
         (
-            "only a logging configuration, naming neither definition nor roleArn",
-            json!({
-                "stateMachineArn": &arn,
-                "loggingConfiguration": { "level": "OFF", "includeExecutionData": false },
-            }),
+            "an update naming no member that would change the state machine",
+            json!({ "stateMachineArn": &arn }),
             400,
             "MissingRequiredParameter",
         ),
         (
-            "only tracing and encryption, naming neither definition nor roleArn",
-            json!({
-                "stateMachineArn": &arn,
-                "tracingConfiguration": { "enabled": true },
-                "encryptionConfiguration": { "type": "AWS_OWNED_KEY" },
-            }),
+            "publish alone, which changes nothing about the state machine",
+            json!({ "stateMachineArn": &arn, "publish": true }),
             400,
             "MissingRequiredParameter",
         ),

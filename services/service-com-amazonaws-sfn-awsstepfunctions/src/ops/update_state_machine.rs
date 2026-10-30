@@ -274,14 +274,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You must include at least one of definition or roleArn or you will
-        // receive a MissingRequiredParameter error."
-        if input.definition.is_none() && input.role_arn.is_none() {
+        // receive a MissingRequiredParameter error." The error's own message names
+        // the whole set of members an update may name alone — the definition, the
+        // role ARN, the logging configuration and the tracing configuration — and
+        // `encryptionConfiguration` is a member this call stores too, so a request
+        // naming any ONE of them asks for a change and is served. A request naming
+        // none of them asks for no change at all, which is what this error reports;
+        // `publish` and `versionDescription` are not changes to the state machine,
+        // so neither makes an update out of a request that changes nothing.
+        let names_an_update = input.definition.is_some()
+            || input.role_arn.is_some()
+            || input.logging_configuration.is_some()
+            || input.tracing_configuration.is_some()
+            || input.encryption_configuration.is_some();
+        if !names_an_update {
             return Err(UpdateStateMachineErrorModeled::MissingRequiredParameter(
                 MissingRequiredParameter {
-                    message: Some(
-                        "either definition or roleArn must be given to update a state machine"
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::UPDATE_NAMES_NO_MEMBER.to_string()),
                 },
             )
             .into());

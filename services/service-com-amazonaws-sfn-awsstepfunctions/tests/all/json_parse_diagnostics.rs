@@ -16,6 +16,10 @@
 //! > it stopped on, or the end of the input, and what was expected there — never the
 //! > position a parser's cursor stopped at, which names none of those.
 //!
+//! `TestState`'s refusal about the input a state is tested on is the ONE recorded
+//! exception: it states the same reading and then the parser's own source-location
+//! clause, which `refusal_vocabulary` owns.
+//!
 //! The rows differ along the KIND of fault — a bare word, a non-ASCII word, an
 //! unquoted field name, a missing colon, a missing comma in each container, a missing
 //! value, a trailing comma in each container, a truncated object, array and string,
@@ -310,8 +314,10 @@ async fn a_refused_input_names_where_the_document_stopped_parsing() {
         assert_diagnostic(&case, document, &expected, detail);
 
         // `TestState` reads a caller's document as the input a state is tested on,
-        // and refuses it in the same words: the rule belongs to the document, not
-        // to one operation.
+        // and reports the same reading of where it stopped — with the parser's own
+        // SOURCE LOCATION after it, which is what this ONE refusal of the service
+        // is recorded carrying (the issue this suite's row was widened for records
+        // `[Source: (String)"…"; line: L, column: C]` for it).
         let case = format!("TestState with {kind} as its input");
         let (status, code, message) = failure(
             &emulator,
@@ -326,9 +332,20 @@ async fn a_refused_input_names_where_the_document_stopped_parsing() {
             "case {case:?}: expected 400 InvalidExecutionInput, got {status} {code} with message \
              {message:?}"
         );
-        assert_no_cursor(&case, &message);
         let detail = quoted_value(&case, &message, INVALID_STATE_MACHINE_EXECUTION_INPUT);
-        assert_diagnostic(&case, document, &expected, detail);
+        let (reading, located) = detail.split_once('\n').unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected the diagnostic to carry a source-location clause, got \
+                 {detail:?}"
+            )
+        });
+        assert_diagnostic(&case, document, &expected, reading);
+        let source = format!(" at [Source: (String)\"{document}\"; line: ");
+        assert!(
+            located.starts_with(&source) && located.ends_with(']'),
+            "case {case:?}: expected the clause to name the source and the position as \
+             {source:?}, got {located:?}"
+        );
 
         // `StartSyncExecution` reads the same member of the same API, and refuses
         // it in the same words.

@@ -31,7 +31,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
-    MAX_ALIASES_PER_STATE_MACHINE, MAX_ALIAS_NAME_CHARS,
+    ALIAS_NAME_PATTERN, MAX_ALIASES_PER_STATE_MACHINE, MAX_ALIAS_NAME_CHARS,
 };
 
 use crate::state_machine_lifecycle::{
@@ -461,10 +461,12 @@ async fn a_routing_configuration_that_cannot_be_pointed_at_is_refused() {
     );
 }
 
-/// An alias name outside the modelled character rule is the modelled `InvalidName`,
-/// and the refusal is taken before anything is looked up or stored.
+/// An alias name outside the modelled character rule is refused as the MODELLED
+/// CONSTRAINT violation it is — the standard validation envelope naming the member
+/// and the pattern it had to satisfy — and the refusal is taken before anything is
+/// looked up or stored.
 #[tokio::test]
-async fn an_alias_name_outside_the_character_rule_is_invalid_name() {
+async fn an_alias_name_outside_the_character_rule_is_a_constraint_violation() {
     let emulator = Emulator::new();
     let machine = machine_with_versions(&emulator, "named-aliases", 1).await;
     let routing = vec![route(&format!("{machine}:1"), 100)];
@@ -493,13 +495,18 @@ async fn an_alias_name_outside_the_character_rule_is_invalid_name() {
         let code = error_code(&body);
         assert_eq!(
             (status, code.as_str()),
-            (400, "InvalidName"),
-            "case {name:?}: expected 400 InvalidName, got {status} {code} with body {body:?}"
+            (400, "ValidationException"),
+            "case {name:?}: expected 400 ValidationException, got {status} {code} with body \
+             {body:?}"
+        );
+        let expected = format!(
+            "1 validation error detected: Value '{name}' at 'name' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: {ALIAS_NAME_PATTERN}"
         );
         assert_eq!(
             body.get("message").and_then(Value::as_str),
-            Some(format!("Invalid Name: '{name}'").as_str()),
-            "case {name:?}: unexpected message in {body:?}"
+            Some(expected.as_str()),
+            "case {name:?}: expected the message {expected:?}, got {body:?}"
         );
     }
 }

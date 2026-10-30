@@ -213,9 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(UpdateStateMachineAliasErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(crate::state::resource_not_found_message(
-                        &input.state_machine_alias_arn,
-                    )),
+                    // This operation states the condition as a sentence of its own
+                    // and names the alias in `resourceName` rather than in the
+                    // message — see `crate::state::RESOURCE_DOES_NOT_EXIST`.
+                    message: Some(crate::state::RESOURCE_DOES_NOT_EXIST.to_string()),
                     resource_name: Some(input.state_machine_alias_arn.clone()),
                 },
             )
@@ -308,9 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(crate::state::AliasUpdateRejection::NotFound) => {
                 Err(UpdateStateMachineAliasErrorModeled::ResourceNotFound(
                     ResourceNotFound {
-                        message: Some(crate::state::resource_not_found_message(
-                            &input.state_machine_alias_arn,
-                        )),
+                        message: Some(crate::state::RESOURCE_DOES_NOT_EXIST.to_string()),
                         resource_name: Some(input.state_machine_alias_arn.clone()),
                     },
                 )

@@ -456,7 +456,8 @@ async fn an_absent_version_is_reported_as_a_version() {
 /// Text that is not a state machine VERSION ARN of this service in the endpoint's
 /// region is the modelled `InvalidArn`, whose message names the first component that
 /// failed inside the service's `Invalid Arn: '...'` envelope — and nothing is
-/// removed.
+/// removed. A well-formed state machine ARN carrying NO qualifier is the one row with
+/// a sentence of its own, asserted after the table.
 #[tokio::test]
 async fn an_arn_that_names_no_version_is_invalid_arn() {
     let emulator = Emulator::new();
@@ -507,16 +508,6 @@ async fn an_arn_that_names_no_version_is_invalid_arn() {
             format!("Invalid ARN stateMachine name: {prefix}:stateMachine::1"),
         ),
         (
-            "an unqualified state machine ARN",
-            machine.clone(),
-            format!("Invalid ARN stateMachine version: {machine}"),
-        ),
-        (
-            "a Distributed Map labeled ARN",
-            format!("{machine}/mapStateLabel"),
-            format!("Invalid ARN stateMachine version: {machine}/mapStateLabel"),
-        ),
-        (
             "a labeled ARN qualified with a version",
             format!("{machine}/mapStateLabel:1"),
             format!("Invalid ARN stateMachine version: {machine}/mapStateLabel:1"),
@@ -558,6 +549,28 @@ async fn an_arn_that_names_no_version_is_invalid_arn() {
             body.get("message").and_then(Value::as_str),
             Some(format!("Invalid Arn: '{diagnosis}'").as_str()),
             "case {case:?}: unexpected message in {body:?}"
+        );
+    }
+
+    // An ARN that is a well-formed state machine ARN and names no version at all is
+    // refused for the one thing it is missing, in a sentence of its own: the
+    // condition is about the QUALIFIER rather than about the ARN's shape, so it is
+    // not stated inside the envelope the rows above carry. A Distributed Map labeled
+    // ARN carries no version qualifier either.
+    for unqualified in [machine.clone(), format!("{machine}/mapStateLabel")] {
+        let (status, body) = delete_version(&emulator, &unqualified).await;
+        let code = error_code(&body);
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidArn"),
+            "case {unqualified:?}: expected 400 InvalidArn, got {status} {code} with body \
+             {body:?}"
+        );
+        let expected = format!("Arn missing version qualifier: {unqualified}");
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "case {unqualified:?}: expected the message {expected:?}, got {body:?}"
         );
     }
 

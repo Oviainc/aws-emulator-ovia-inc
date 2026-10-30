@@ -10,23 +10,28 @@
 //! constraint of this service: one formatter, reached by every operation's
 //! boundary validation, so no operation can word a refusal its own way.
 //!
-//! Step Functions answers the framework's own validation envelope VERBATIM, with
-//! ONE difference: the clause echoes the REJECTED VALUE as the member's MODELLED
-//! TYPE renders it. A member whose target shape is a Smithy `float`/`double`
-//! renders with a fractional part (`150` -> `150.0`), where an integral member
-//! (`integer`, `long`) renders without one — and Rust's own `Display` for a float
-//! drops a zero fraction (`150f32.to_string() == "150"`), so the framework's
-//! default clause reports a float member's value in an integer's spelling.
+//! Almost all of it is the tree's shared wording
+//! ([`::service_common::validation_message::aws_validation_refusal_withholding_with`]),
+//! which is the framework's envelope over the framework's clauses with the two
+//! differences AWS states: the value half dropped from a clause that states none
+//! — a collection's `@length`, and a member whose value the refusal WITHHOLDS —
+//! and the `@pattern` expression quoted as this service's recordings show it,
+//! which is the model's own spelling, anchors and all. WHICH members are
+//! withheld is read off this service's MODEL
+//! ([`::service_common::sensitive_members::WithheldMembers`]), so nothing here
+//! lists a member name and the decision cannot fall behind a model that grows a
+//! `@sensitive` one.
 //!
-//! That one difference is ALL this module does. It does not restate the
-//! requirement wording, the subject, the clause shape or the envelope: it hands
-//! the framework a [`Violation`] whose `value` is spelled in the member's
-//! modelled type and lets [`aws_smithy_schema_server::envelope`] — the same
-//! renderer the default path uses — write the message. So this wording cannot
-//! drift from the framework's, and a [`ViolationKind`] added upstream is worded
-//! by the framework without a change here. (That is also why there is no copy of
-//! the rules staged in `services/common/src/validation.rs`, whose note asks each
-//! new inlining to cross-reference it: nothing is inlined here to migrate.)
+//! What is left for this module is ONE difference, which no shared entry point
+//! can make for it: Step Functions echoes a rejected value as the member's
+//! MODELLED TYPE renders it. A member whose target shape is a Smithy
+//! `float`/`double` renders with a fractional part (`150` -> `150.0`), where an
+//! integral member (`integer`, `long`) renders without one — and Rust's own
+//! `Display` for a float drops a zero fraction (`150f32.to_string() == "150"`),
+//! so the framework's default clause reports a float member's value in an
+//! integer's spelling. The violations are re-rendered that way and then handed
+//! to the shared wording, so the envelope, the clauses, the member paths, the
+//! requirements and the withholding are all stated in one place.
 //!
 //! Nothing here is keyed to an operation or to a particular value: the rule is
 //! applied to whatever [`Violation`] the walk produces, so it holds for every
@@ -36,16 +41,27 @@
 //! member's modelled numeric kind, or a framework that renders a value per
 //! modelled type — which would remove this module entirely.
 
+use std::sync::LazyLock;
+
 use smithy_server_runtime::{Refusal, Refused, Violation};
 
 use crate::state::FRACTIONAL_MEMBERS;
 
-/// The error code this service answers an input-constraint violation with: the
-/// modelled `ValidationException`, which every operation of this service lists
-/// with `@httpError 400`. It is the code the framework's default would have
-/// named too, restated because `override_refusal` replaces code and message
-/// TOGETHER.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
+/// This service's Smithy model: the one source for which of its members are
+/// `@sensitive`, and so for which values a refusal states none.
+const MODEL_JSON: &str = include_str!("../../smithy-model/com-amazonaws-sfn-awsstepfunctions.json");
+
+/// The members of this model whose value a refusal WITHHOLDS, read off
+/// [`MODEL_JSON`] rather than listed here.
+///
+/// This model marks the documents a caller submits and the data they carry:
+/// `Definition`, the `SensitiveData` members (an execution `input`, a tested
+/// state's `input`, `variables`, `context`, a mock's `result`, a task's
+/// `output`), a task token, a description, and a failure's `error` and `cause`.
+static WITHHELD_MEMBERS: LazyLock<::service_common::sensitive_members::WithheldMembers> =
+    LazyLock::new(|| {
+        ::service_common::sensitive_members::WithheldMembers::from_model(MODEL_JSON)
+    });
 
 /// The step segment the framework's paths carry for a move from a collection
 /// into one of its elements (`list.1.member`), which is not a member name.
@@ -102,7 +118,7 @@ fn rendered_value(path: &str, shown: &str) -> String {
 ///
 /// Everything else about the violation — its path, what it failed, and the fact
 /// that an absent member carries no value at all — is left exactly as the walk
-/// reported it, so the framework words the clause.
+/// reported it, so the shared wording and the framework word the clause.
 fn in_modelled_type(violation: &Violation) -> Violation {
     let mut rendered = violation.clone();
     if let Some(shown) = &rendered.value {
@@ -120,17 +136,35 @@ fn in_modelled_type(violation: &Violation) -> Violation {
 /// different failure with a different code and status, and nothing about it is
 /// this service's to word.
 pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
-    match refusal {
-        Refusal::Invalid(violations) => {
-            let in_modelled_types: Vec<Violation> =
-                violations.iter().map(in_modelled_type).collect();
-            Some(Refused {
-                code: VALIDATION_EXCEPTION.to_string(),
-                message: aws_smithy_schema_server::envelope(&in_modelled_types)?,
-            })
-        }
-        _ => None,
-    }
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    let in_modelled_types: Vec<Violation> = violations.iter().map(in_modelled_type).collect();
+    ::service_common::validation_message::aws_validation_refusal_withholding_with(
+        &Refusal::Invalid(in_modelled_types),
+        // The expression a `@pattern` clause advertises is the model's own, as
+        // the framework already quotes it: this service is recorded stating the
+        // alias-name pattern with the anchors the model writes, so only the
+        // value half below is restated.
+        |pattern| pattern.to_string(),
+        |path| WITHHELD_MEMBERS.withholds_value(path),
+    )
+}
+
+/// The standard validation envelope for ONE violation a HANDLER found, as the
+/// whole message it states.
+///
+/// A modelled constraint the centralized walk cannot enforce is still a modelled
+/// constraint, so a handler that enforces one words its refusal through the SAME
+/// body the boundary's refusals are worded by — [`refused`] — rather than
+/// building a second envelope: the clause, the requirement, the member path, the
+/// `@pattern` quoting and the withholding are all decided in the one place.
+pub(crate) fn one_violation_message(violation: Violation) -> String {
+    refused(&Refusal::Invalid(vec![violation]))
+        .map(|refused| refused.message)
+        // One violation always renders: the envelope answers `None` only for an
+        // empty list.
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -195,6 +229,50 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {path:?}/{shown:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The members this service withholds are the ones its MODEL marks
+    /// `@sensitive` on every input member of that name — read off the model
+    /// here, so the shared reading and this service's model cannot drift.
+    ///
+    /// The rows span the forms the model carries: the trait on the shape a
+    /// member targets (a definition, a document, a token), a member of a
+    /// structure the caller sends nested inside another
+    /// (`mock.result`), a member sensitive only in an OUTPUT shape (whose
+    /// clause still states its value), and members the model marks nowhere.
+    #[test]
+    fn the_model_decides_which_members_withhold_their_value() {
+        // (case, the member path a refusal reports, withheld?)
+        for (case, path, expected) in [
+            ("a state machine definition", "definition", true),
+            ("an execution input", "input", true),
+            ("a tested state's variables", "variables", true),
+            ("the state under test", "stateName", true),
+            ("a mocked result, nested in its structure", "mock.result", true),
+            ("an alias description", "description", true),
+            ("a version description", "versionDescription", true),
+            ("a task token", "taskToken", true),
+            ("a failure cause", "cause", true),
+            // Not withheld: the names this model constrains and echoes.
+            ("a state machine name", "name", false),
+            ("a state machine ARN", "stateMachineArn", false),
+            ("a Map Run's concurrency", "maxConcurrency", false),
+            (
+                "a Map Run's tolerated failure percentage",
+                "toleratedFailurePercentage",
+                false,
+            ),
+            ("a tag key", "tags.1.member.key", false),
+            ("a pagination token", "nextToken", false),
+        ] {
+            let withheld = WITHHELD_MEMBERS.withholds_value(path);
+            assert_eq!(
+                withheld, expected,
+                "case {case:?}: expected withholds_value({path:?}) to be {expected}, got \
+                 {withheld} (the withheld set is {:?})",
+                WITHHELD_MEMBERS.names()
             );
         }
     }
