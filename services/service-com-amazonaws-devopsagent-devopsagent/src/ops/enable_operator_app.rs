@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableOperatorApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableOperatorApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableOperatorApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enables one authentication flow of an AgentSpace's Operator App and
+//! persists it in [`crate::state`], leaving the flows already enabled as they were.
 //!
 //! ## Shape of an operation
 //!
@@ -103,11 +96,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-devopsagent-devopsagent
 // here — hence the `EnableOperatorAppError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.devopsagent#EnableOperatorApp")]
+// `ResourceNotFoundException` is widened in: this operation does not list it, but
+// the SERVICE models it as one of its common errors, and an enablement names the
+// AgentSpace it configures.
+#[smithy_macros::operation_error(
+    "com.amazonaws.devopsagent#EnableOperatorApp",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum EnableOperatorAppErrorModeled {
     IdentityCenterServiceException(IdentityCenterServiceException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
 
@@ -162,18 +162,236 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableOperatorApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableOperatorAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableOperatorApp"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            EnableOperatorAppErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        // Each `AuthFlow` configures the Operator App from its own members, and the
+        // configuration the flow is reported as carries all of them, so a flow whose
+        // members are absent cannot be enabled. The model cannot state that
+        // dependency, so it is refused here rather than stored half-configured.
+        let flow = input.auth_flow.as_str();
+        let mut missing: Vec<&str> = Vec::new();
+        match flow {
+            crate::state::AUTH_FLOW_IDC => {
+                if input.idc_instance_arn.is_none() {
+                    missing.push("idcInstanceArn");
+                }
+            }
+            crate::state::AUTH_FLOW_IDP => {
+                for (member, value) in [
+                    ("issuerUrl", input.issuer_url.is_some()),
+                    ("idpClientId", input.idp_client_id.is_some()),
+                    ("idpClientSecret", input.idp_client_secret.is_some()),
+                    ("provider", input.provider.is_some()),
+                ] {
+                    if !value {
+                        missing.push(member);
+                    }
+                }
+            }
+            // `iam` needs nothing beyond the role every flow carries.
+            _ => {}
+        }
+        if !missing.is_empty() {
+            return Err(EnableOperatorAppErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "{} must be provided when authFlow is {flow}",
+                        missing.join(", ")
+                    ),
+                    field_list: Some(
+                        missing
+                            .iter()
+                            .map(|member| ValidationExceptionField {
+                                path: (*member).to_string(),
+                                message: format!("must be provided when authFlow is {flow}"),
+                            })
+                            .collect(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The Operator App's IdC application lives in the IdC instance the request
+        // names, under the account and partition the operator role belongs to.
+        let Some((partition, account)) =
+            crate::state::role_arn_partition_and_account(&input.operator_app_role_arn)
+        else {
+            return Err(EnableOperatorAppErrorModeled::ValidationException(
+                ValidationException {
+                    message: "operatorAppRoleArn must be the ARN of an IAM role".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "operatorAppRoleArn".to_string(),
+                        message: "must be the ARN of an IAM role".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        };
+        let instance_id = match input.idc_instance_arn.as_deref() {
+            Some(instance_arn) => match crate::state::idc_instance_id(instance_arn) {
+                Some(instance_id) => Some(instance_id),
+                None => {
+                    return Err(EnableOperatorAppErrorModeled::ValidationException(
+                        ValidationException {
+                            message:
+                                "idcInstanceArn must be the ARN of an IAM Identity Center instance"
+                                    .to_string(),
+                            field_list: Some(vec![ValidationExceptionField {
+                                path: "idcInstanceArn".to_string(),
+                                message: "must be the ARN of an IAM Identity Center instance"
+                                    .to_string(),
+                            }]),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        let region = crate::state::region_of(ctx);
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The Operator App belongs to an AgentSpace, so there is nothing to enable it
+        // on until that AgentSpace exists. Checked before anything is minted, so a
+        // refused call leaves the store exactly as it was.
+        if !store.agent_spaces.contains_key(&input.agent_space_id) {
+            return Err(EnableOperatorAppErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("AgentSpace not found: {}", input.agent_space_id),
+                },
+            )
+            .into());
+        }
+
+        // An `idc` enablement reuses the application already created in the same
+        // instance and creates one otherwise, so re-enabling a flow does not leave a
+        // second application behind.
+        let application_arn = match (flow, instance_id) {
+            (crate::state::AUTH_FLOW_IDC, Some(instance_id)) => {
+                let kept = store
+                    .agent_spaces
+                    .get(&input.agent_space_id)
+                    .and_then(|record| record.operator_app.as_ref())
+                    .and_then(|operator_app| operator_app.idc.as_ref())
+                    .filter(|idc| {
+                        crate::state::idc_instance_id(&idc.idc_instance_arn) == Some(instance_id)
+                    })
+                    .and_then(|idc| idc.idc_application_arn.clone());
+                match kept {
+                    Some(arn) => Some(arn),
+                    None => {
+                        let application_id = store.mint_id("apl");
+                        Some(crate::state::idc_application_arn(
+                            partition,
+                            account,
+                            instance_id,
+                            &application_id,
+                        ))
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let url = crate::state::operator_app_url(&input.agent_space_id, &region);
+        let record = store
+            .agent_spaces
+            .get_mut(&input.agent_space_id)
+            .ok_or_else(|| {
+                EnableOperatorAppErrorModeled::InternalServerException(InternalServerException {
+                    message: format!("agent space {} was not persisted", input.agent_space_id),
+                })
+            })?;
+        let operator_app = record
+            .operator_app
+            .get_or_insert_with(|| crate::state::OperatorAppRecord::new(url));
+
+        // Enabling a flow that is already enabled reconfigures it: the enablement
+        // instant stays, and the update instant moves.
+        match flow {
+            crate::state::AUTH_FLOW_IDC => {
+                let idc_instance_arn = input.idc_instance_arn.clone().unwrap_or_default();
+                match operator_app.idc.as_mut() {
+                    Some(existing) => {
+                        existing.operator_app_role_arn = input.operator_app_role_arn.clone();
+                        existing.idc_instance_arn = idc_instance_arn;
+                        existing.idc_application_arn = application_arn;
+                        existing.updated_at = Some(now);
+                    }
+                    None => {
+                        operator_app.idc = Some(crate::state::IdcFlowRecord {
+                            operator_app_role_arn: input.operator_app_role_arn.clone(),
+                            idc_instance_arn,
+                            idc_application_arn: application_arn,
+                            created_at: now,
+                            updated_at: None,
+                        })
+                    }
+                }
+            }
+            crate::state::AUTH_FLOW_IDP => {
+                // The refusal above has already established that an `idp`
+                // enablement carries all four of these, so the write cannot store a
+                // half-configured flow.
+                let issuer_url = input.issuer_url.clone().unwrap_or_default();
+                let client_id = input.idp_client_id.clone().unwrap_or_default();
+                let client_secret = input.idp_client_secret.clone().unwrap_or_default();
+                let provider = input.provider.clone().unwrap_or_default();
+                match operator_app.idp.as_mut() {
+                    Some(existing) => {
+                        existing.operator_app_role_arn = input.operator_app_role_arn.clone();
+                        existing.issuer_url = issuer_url;
+                        existing.client_id = client_id;
+                        existing.client_secret = client_secret;
+                        existing.provider = provider;
+                        existing.updated_at = Some(now);
+                    }
+                    None => {
+                        operator_app.idp = Some(crate::state::IdpFlowRecord {
+                            operator_app_role_arn: input.operator_app_role_arn.clone(),
+                            issuer_url,
+                            client_id,
+                            client_secret,
+                            provider,
+                            created_at: now,
+                            updated_at: None,
+                        })
+                    }
+                }
+            }
+            // `iam`: `authFlow` is a modelled enum, so the only value left is the
+            // flow that needs nothing beyond the operator role.
+            _ => match operator_app.iam.as_mut() {
+                Some(existing) => {
+                    existing.operator_app_role_arn = input.operator_app_role_arn.clone();
+                    existing.updated_at = Some(now);
+                }
+                None => {
+                    operator_app.iam = Some(crate::state::IamFlowRecord {
+                        operator_app_role_arn: input.operator_app_role_arn.clone(),
+                        created_at: now,
+                        updated_at: None,
+                    })
+                }
+            },
+        }
+
+        // Read the response back out of the store, so what the caller sees is what
+        // was persisted — every enabled flow, which is what `GetOperatorApp` reports
+        // too.
+        Ok(EnableOperatorAppOutput {
+            agent_space_id: input.agent_space_id.clone(),
+            operator_app_url: operator_app.url_to_api(),
+            iam: operator_app.iam_to_api(),
+            idc: operator_app.idc_to_api(),
+            idp: operator_app.idp_to_api(),
+        })
     }
 }

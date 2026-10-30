@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOperatorApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOperatorApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOperatorApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Operator App configuration stored for one AgentSpace in
+//! [`crate::state`] — the authentication flows `EnableOperatorApp` enabled on it and the
+//! URL operators reach it at — as the empty configuration while no flow is enabled, and
+//! refuses as not found when the `agentSpaceId` names no AgentSpace.
 //!
 //! ## Shape of an operation
 //!
@@ -88,10 +83,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-devopsagent-devopsagent
 // here — hence the `GetOperatorAppError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.devopsagent#GetOperatorApp")]
+// `ResourceNotFoundException` is widened in: this operation does not list it, but
+// the SERVICE models it as one of its common errors, and this read names an
+// AgentSpace that may not exist.
+#[smithy_macros::operation_error(
+    "com.amazonaws.devopsagent#GetOperatorApp",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum GetOperatorAppErrorModeled {
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
 
@@ -146,18 +148,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOperatorApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOperatorAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetOperatorAppErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        // `@readonly`: this reports the stored Operator App and writes nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOperatorApp"))
+        // The Operator App belongs to an AgentSpace, so a request naming an
+        // AgentSpace this account does not hold names no Operator App either: the
+        // resource the read asks for is absent, not empty.
+        let store = state.lock();
+        let record = store.agent_spaces.get(&input.agent_space_id).ok_or_else(|| {
+            GetOperatorAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("AgentSpace not found: {}", input.agent_space_id),
+            })
+        })?;
+
+        // The Operator App of an AgentSpace nobody enabled an authentication flow on
+        // holds no configuration and has no URL, which is reported as the empty
+        // configuration: the AgentSpace itself exists, so there is nothing to refuse.
+        let Some(operator_app) = record
+            .operator_app
+            .as_ref()
+            .filter(|operator_app| operator_app.is_enabled())
+        else {
+            return Ok(GetOperatorAppOutput::default());
+        };
+
+        Ok(GetOperatorAppOutput {
+            operator_app_url: operator_app.url_to_api(),
+            iam: operator_app.iam_to_api(),
+            idc: operator_app.idc_to_api(),
+            idp: operator_app.idp_to_api(),
+        })
     }
 }

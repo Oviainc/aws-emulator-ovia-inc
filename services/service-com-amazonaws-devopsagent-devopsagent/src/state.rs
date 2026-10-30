@@ -12,7 +12,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{AgentSpace, ReferenceOutput, Task};
+use crate::ops::types::{
+    AgentSpace, IamAuthConfiguration, IdcAuthConfiguration, IdpAuthConfiguration, ReferenceOutput,
+    Task,
+};
 
 /// The most AgentSpaces this emulator stores for the account before
 /// `CreateAgentSpace` answers its modelled `ServiceQuotaExceededException`.
@@ -52,6 +55,112 @@ pub const MAX_CLIENT_TOKENS: usize = 10_000;
 /// constraint walk does not validate map KEYS, so the handler enforces it.
 pub const AGENT_SPACE_PREFERENCE_KEYS: &[&str] = &["elevatedActionsEnabled"];
 
+/// The `AuthFlow` value set: the authentication flows an Operator App can have
+/// enabled, each configured and reported independently of the others.
+///
+/// Source: the value set of the model's `AuthFlow` enum —
+/// `smithy_query(query="shape", shape="AuthFlow")`.
+pub const AUTH_FLOW_IAM: &str = "iam";
+pub const AUTH_FLOW_IDC: &str = "idc";
+pub const AUTH_FLOW_IDP: &str = "idp";
+
+/// This service's own endpoint and ARN namespace (`aidevops`), from the model's
+/// `aws.api#service` trait — `smithy_query(query="service_info")`.
+pub const ARN_NAMESPACE: &str = "aidevops";
+
+/// The region a request whose SigV4 credential scope names none is served in.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The longest credential-scope region field this service reads off a request.
+///
+/// Every region code AWS publishes is far shorter; the bound exists because the
+/// field is caller-controlled, so without it one request could put a host label of
+/// arbitrary size into a minted URL.
+const MAX_REGION_LEN: usize = 32;
+
+/// The region this request was signed for, or [`DEFAULT_REGION`] when it names
+/// none.
+///
+/// Constrained to the `[a-z0-9-]` segment a region code is made of and to
+/// [`MAX_REGION_LEN`], so a request signed for a nonsense region cannot mint a URL
+/// that fails its own modelled pattern.
+pub fn region_of(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .filter(|region| {
+            !region.is_empty()
+                && region.len() <= MAX_REGION_LEN
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The URL operators use to reach the Operator App of one AgentSpace.
+///
+/// One host per AgentSpace in the region the enabling request was signed for,
+/// under this service's own namespace. It satisfies `OperatorAppUrl`'s
+/// `^https://[a-zA-Z0-9.-]+(/.*)?$` for every `AgentSpaceId` (`^[a-zA-Z0-9-]{1,64}$`)
+/// and region [`region_of`] admits.
+pub fn operator_app_url(agent_space_id: &str, region: &str) -> String {
+    format!("https://{agent_space_id}.operator.{ARN_NAMESPACE}.{region}.on.aws")
+}
+
+/// The partition and account id of an IAM role ARN
+/// (`arn:<partition>:iam::<account>:role/<name>`).
+///
+/// `RoleArn`'s modelled pattern already holds for any value that reaches a
+/// handler, so this only splits what the pattern guarantees is there.
+pub fn role_arn_partition_and_account(role_arn: &str) -> Option<(&str, &str)> {
+    let mut fields = role_arn.split(':');
+    let (Some("arn"), Some(partition), Some("iam"), Some(_), Some(account)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    (!partition.is_empty() && !account.is_empty()).then_some((partition, account))
+}
+
+/// The instance id of an AWS Identity Center instance ARN
+/// (`arn:<partition>:sso:::instance/<instance id>`), or `None` when the value names
+/// no IdC instance.
+pub fn idc_instance_id(instance_arn: &str) -> Option<&str> {
+    let mut fields = instance_arn.split(':');
+    let (Some("arn"), Some(_), Some("sso"), Some(_), Some(_), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    let id = resource.strip_prefix("instance/")?;
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
+/// The ARN of the IdC application an `idc` enablement creates.
+///
+/// AWS Identity Center names an application
+/// `arn:<partition>:sso::<account>:application/<instance id>/<application id>`: the
+/// partition and account are the ones the caller's `operatorAppRoleArn` names, the
+/// instance the one its `idcInstanceArn` names, and the application id comes from
+/// this service's monotonic sequence, so no two enablements share one.
+pub fn idc_application_arn(
+    partition: &str,
+    account: &str,
+    instance_id: &str,
+    application_id: &str,
+) -> String {
+    format!("arn:{partition}:sso::{account}:application/{instance_id}/{application_id}")
+}
+
 /// Convert a stored instant into the modelled `Timestamp` representation.
 ///
 /// Every timestamp a response carries is derived from the stored instant, so two
@@ -75,6 +184,9 @@ pub struct AgentSpaceRecord {
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     pub tasks: HashMap<String, TaskRecord>,
+    /// The Operator App configured for this AgentSpace, absent until an
+    /// authentication flow is enabled for it.
+    pub operator_app: Option<OperatorAppRecord>,
 }
 
 impl AgentSpaceRecord {
@@ -95,6 +207,145 @@ impl AgentSpaceRecord {
     /// The stored tags, omitted entirely when the resource carries none.
     pub fn tags_to_api(&self) -> Option<HashMap<String, String>> {
         (!self.tags.is_empty()).then(|| self.tags.clone())
+    }
+}
+
+/// The persisted Operator App of one AgentSpace: the URL operators reach it at,
+/// and every authentication flow currently enabled on it.
+///
+/// The flows are independent — the model reports each one in its own output member
+/// and lets a disable name a single flow — so enabling one leaves the others as
+/// they were.
+#[derive(Debug, Clone)]
+pub struct OperatorAppRecord {
+    pub operator_app_url: String,
+    pub iam: Option<IamFlowRecord>,
+    pub idc: Option<IdcFlowRecord>,
+    pub idp: Option<IdpFlowRecord>,
+}
+
+impl OperatorAppRecord {
+    /// An Operator App reachable at `operator_app_url` with no flow enabled yet.
+    pub fn new(operator_app_url: String) -> Self {
+        Self {
+            operator_app_url,
+            iam: None,
+            idc: None,
+            idp: None,
+        }
+    }
+
+    /// Whether any authentication flow is enabled, which is what makes the
+    /// Operator App reachable at all.
+    pub fn is_enabled(&self) -> bool {
+        self.iam.is_some() || self.idc.is_some() || self.idp.is_some()
+    }
+
+    /// The URL to report, which exists only while a flow is enabled.
+    pub fn url_to_api(&self) -> Option<String> {
+        self.is_enabled().then(|| self.operator_app_url.clone())
+    }
+
+    /// The modelled `IamAuthConfiguration`, when the `iam` flow is enabled.
+    pub fn iam_to_api(&self) -> Option<IamAuthConfiguration> {
+        self.iam.as_ref().map(IamFlowRecord::to_api)
+    }
+
+    /// The modelled `IdcAuthConfiguration`, when the `idc` flow is enabled.
+    pub fn idc_to_api(&self) -> Option<IdcAuthConfiguration> {
+        self.idc.as_ref().map(IdcFlowRecord::to_api)
+    }
+
+    /// The modelled `IdpAuthConfiguration`, when the `idp` flow is enabled.
+    pub fn idp_to_api(&self) -> Option<IdpAuthConfiguration> {
+        self.idp.as_ref().map(IdpFlowRecord::to_api)
+    }
+}
+
+/// The enabled `iam` authentication flow of one Operator App.
+#[derive(Debug, Clone)]
+pub struct IamFlowRecord {
+    pub operator_app_role_arn: String,
+    pub created_at: SystemTime,
+    /// Set when a later enablement reconfigured this flow; absent while the flow
+    /// still holds what the first enablement stored.
+    pub updated_at: Option<SystemTime>,
+}
+
+impl IamFlowRecord {
+    pub fn to_api(&self) -> IamAuthConfiguration {
+        IamAuthConfiguration {
+            operator_app_role_arn: self.operator_app_role_arn.clone(),
+            created_at: to_date_time(self.created_at),
+            updated_at: self.updated_at.map(to_date_time),
+        }
+    }
+}
+
+/// The enabled `idc` authentication flow of one Operator App.
+#[derive(Debug, Clone)]
+pub struct IdcFlowRecord {
+    pub operator_app_role_arn: String,
+    pub idc_instance_arn: String,
+    /// The IdC application this enablement created in the named instance.
+    pub idc_application_arn: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: Option<SystemTime>,
+}
+
+impl IdcFlowRecord {
+    pub fn to_api(&self) -> IdcAuthConfiguration {
+        IdcAuthConfiguration {
+            operator_app_role_arn: self.operator_app_role_arn.clone(),
+            idc_instance_arn: self.idc_instance_arn.clone(),
+            idc_application_arn: self.idc_application_arn.clone(),
+            created_at: to_date_time(self.created_at),
+            updated_at: self.updated_at.map(to_date_time),
+        }
+    }
+}
+
+/// The enabled `idp` authentication flow of one Operator App.
+#[derive(Clone)]
+pub struct IdpFlowRecord {
+    pub operator_app_role_arn: String,
+    pub issuer_url: String,
+    pub client_id: String,
+    /// The OIDC client secret. `@sensitive` in the model and reported by no
+    /// operation: it is held only so a later update can replace it.
+    pub client_secret: String,
+    pub provider: String,
+    pub created_at: SystemTime,
+    pub updated_at: Option<SystemTime>,
+}
+
+/// `Debug` is written by hand rather than derived so the client secret is never
+/// rendered: this record reaches a formatter through the state struct's own
+/// `Debug`, and the secret is `@sensitive` in the model.
+impl ::std::fmt::Debug for IdpFlowRecord {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("IdpFlowRecord")
+            .field("operator_app_role_arn", &self.operator_app_role_arn)
+            .field("issuer_url", &self.issuer_url)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("provider", &self.provider)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+impl IdpFlowRecord {
+    pub fn to_api(&self) -> IdpAuthConfiguration {
+        IdpAuthConfiguration {
+            issuer_url: self.issuer_url.clone(),
+            client_id: self.client_id.clone(),
+            operator_app_role_arn: self.operator_app_role_arn.clone(),
+            provider: self.provider.clone(),
+            created_at: to_date_time(self.created_at),
+            updated_at: self.updated_at.map(to_date_time),
+        }
     }
 }
 
