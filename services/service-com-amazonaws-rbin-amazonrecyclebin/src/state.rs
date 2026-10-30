@@ -27,9 +27,30 @@ use crate::ops::types::{
     RuleSummary, ServiceQuotaExceededException, Tag, UnlockDelay, ValidationException,
 };
 
-/// The region an ARN carries when the request is unsigned, so no SigV4 credential
-/// scope names one. Every emulator defaults to `us-east-1`.
+/// The region an ARN carries when the request names none — it is unsigned, so no SigV4
+/// credential scope states a region, or the scope's region is no Region code at all
+/// ([`is_region_code`]). Every emulator defaults to `us-east-1`.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The longest Region an ARN this service reports can carry: the Region segment of the
+/// modelled `RuleArn` is `[a-z\-0-9]{0,63}`
+/// (smithy_query(query="shape", shape="RuleArn")).
+pub const REGION_CODE_MAX_LEN: usize = 63;
+
+/// Whether `region` is shaped like an Amazon Web Services Region code (`us-east-1`,
+/// `ap-southeast-4`, `us-gov-east-1`).
+///
+/// The shape is the one the Region segment of the modelled `RuleArn` admits — lowercase
+/// ASCII letters, digits and hyphens, non-empty and at most [`REGION_CODE_MAX_LEN`] of
+/// them — so a Region this answers for is a Region every ARN member of this service can
+/// hold, and one it rejects is a value no `RuleArn` could carry.
+pub fn is_region_code(region: &str) -> bool {
+    !region.is_empty()
+        && region.len() <= REGION_CODE_MAX_LEN
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
 
 /// `RuleIdentifier` is `^[0-9a-zA-Z]{11}$` — exactly 11 characters from the base62
 /// alphabet, per the Smithy model.
@@ -1004,7 +1025,10 @@ pub struct ComAmazonawsRbinAmazonrecyclebinState {
     pub rules: BTreeMap<String, Rule>,
     /// `RuleArn` -> `Identifier`, so the ARN-addressed tag operations resolve a rule
     /// without scanning the map. An ARN carries its rule's Region, so an entry is
-    /// still reached through a Region-scoped resolver.
+    /// still reached through a Region-scoped resolver. Every key is an ARN minted from a
+    /// Region the modelled `RuleArn` pattern admits ([`request_region`]), so it is a
+    /// value those operations can be asked for: a caller can always hand back what a
+    /// create reported.
     pub arn_index: HashMap<String, String>,
     /// Monotonic counter behind [`Self::mint_identifier`]. A fresh store starts it at
     /// [`INITIAL_IDENTIFIER_SEED`], the one seed whose rendering is never handed out.
@@ -1237,9 +1261,19 @@ pub fn is_rule_identifier(candidate: &str) -> bool {
 
 /// The region this request is for: the SigV4 credential scope's region, which is
 /// what the SDK signs an endpoint's region into, else [`DEFAULT_REGION`].
+///
+/// The scope's region is caller-written text that the scope parser checks only for being
+/// present, so it is held to the Region shape ([`is_region_code`]) before this service
+/// serves a request in it: the Region reaches the wire as the Region segment of every
+/// ARN this service mints and reports, and that segment can only hold a Region the
+/// modelled `RuleArn` pattern admits. A scope naming anything else names no Region of
+/// this service, so the request is served in [`DEFAULT_REGION`], exactly as an unsigned
+/// one is — rather than minting an ARN no member of this service may carry and no
+/// ARN-addressed operation could be asked for again.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_code(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 

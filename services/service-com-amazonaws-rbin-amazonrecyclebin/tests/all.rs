@@ -27,6 +27,8 @@ mod list_rules_settled_lock_state;
 mod lock_rule_idempotence;
 #[path = "all/lockable_rule_invariant.rs"]
 mod lockable_rule_invariant;
+#[path = "all/minted_arn_region_segment.rs"]
+mod minted_arn_region_segment;
 #[path = "all/not_found_error_body_members.rs"]
 mod not_found_error_body_members;
 #[path = "all/quota_refusal_bodies.rs"]
