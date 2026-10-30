@@ -743,9 +743,85 @@ async fn a_list_sync_resources_token_is_bound_to_the_filters_that_selected_its_p
                 json!([{"resourceType": SYNCED_ENTITY}, {"resourceId": "alphaEntity"}]),
                 false,
             ),
+            Resume::under(
+                "a type-and-external-id combination, listed id first",
+                json!([{"externalId": "resAlpha"}, {"resourceType": SYNCED_ENTITY}]),
+                false,
+            ),
         ],
     )
     .await;
+
+    // The rule in the other direction too: a token minted with NO filters names
+    // a position in the whole-job sequence, so a request that NARROWS the
+    // listing asks about another sequence and is refused — while either
+    // spelling of "no filters" is that same whole-job sequence and resumes.
+    check_resumes(
+        "ListSyncResources with no filter",
+        &page,
+        "syncResources",
+        "externalId",
+        None,
+        vec![
+            Resume::unfiltered("no filters again, as the minting request named none", true),
+            Resume::under(
+                "an empty filter list, which selects the whole job just as well",
+                json!([]),
+                true,
+            ),
+            Resume::under(
+                "a state filter, whose sequence leaves out the resources in other states",
+                json!([{"state": SYNCED}]),
+                false,
+            ),
+            Resume::under(
+                "another state filtered on",
+                json!([{"state": SYNCING}]),
+                false,
+            ),
+            Resume::under(
+                "a type-and-id combination, whose sequence holds a single resource",
+                json!([{"resourceType": SYNCED_ENTITY}, {"resourceId": "alphaEntity"}]),
+                false,
+            ),
+        ],
+    )
+    .await;
+
+    // What the refusal protects: a caller that changes its filters is sent back
+    // to the START of the sequence it now asks for, where every resource that
+    // sequence holds is still reported — none of them lost to a resume key
+    // taken in another sequence. Both sequences are read off the seeded rows,
+    // so this states what the job holds rather than restating a page.
+    let mut whole_job: Vec<String> = SEEDED_RESOURCES
+        .iter()
+        .map(|row| row.external_id.to_string())
+        .collect();
+    whole_job.sort();
+    let mut synced: Vec<String> = SEEDED_RESOURCES
+        .iter()
+        .filter(|row| row.state == SYNCED)
+        .map(|row| row.external_id.to_string())
+        .collect();
+    synced.sort();
+    assert!(
+        synced.len() < whole_job.len() && synced.first() == whole_job.first(),
+        "the seeded rows must make the two sequences differ while starting at the same resource, \
+         so a resume key of one names no position in the other: got {synced:?} of {whole_job:?}"
+    );
+
+    let whole = page(None, PAGE, None).await;
+    assert_eq!(
+        reported(&whole, "syncResources", "externalId"),
+        whole_job,
+        "the unfiltered listing must report every resource the job holds, got {whole:?}"
+    );
+    let filtered = page(Some(json!([{"state": SYNCED}])), PAGE, None).await;
+    assert_eq!(
+        reported(&filtered, "syncResources", "externalId"),
+        synced,
+        "the filtered listing must report every resource in that state, got {filtered:?}"
+    );
 }
 
 /// The workspace the metadata transfer jobs below name at an end.
