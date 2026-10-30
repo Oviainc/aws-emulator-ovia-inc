@@ -261,10 +261,10 @@ async fn describe_event_categories_reports_the_published_source_types() {
     }
 
     // A source type outside the published set is refused with the code AWS answers for
-    // a parameter value it does not accept, and the message names the value rejected
-    // and the set it is not in. `db-shard-group` is a value the model's `SourceType`
-    // enum carries but this operation's own documented valid values do not, and this
-    // front door publishes no categories for it (see `state::EVENT_CATEGORIES`).
+    // a parameter value it does not accept, in the one fixed sentence that names the set
+    // it is not in and does NOT echo the value. `db-shard-group` is a value the model's
+    // `SourceType` enum carries but this operation's own documented valid values do not,
+    // and this front door publishes no categories for it (see `state::EVENT_CATEGORIES`).
     for case in [
         "db-instances",
         "DB-INSTANCE",
@@ -279,9 +279,9 @@ async fn describe_event_categories_reports_the_published_source_types() {
         );
         let message = text(&body, "Message");
         assert!(
-            message.contains(case) && message.contains("db-instance"),
-            "case {case:?}: expected the refusal to name the rejected source type and the \
-             published ones, got {message:?}"
+            message.contains("db-instance") && !message.contains(case),
+            "case {case:?}: expected the refusal to name the published source types and not \
+             the rejected one, got {message:?}"
         );
     }
 
@@ -509,7 +509,9 @@ async fn default_only_with_no_resolvable_default_engine_version_is_refused() {
 
     // `DefaultOnly` reports "only the default version of the specified engine or the
     // engine and major version combination", so there has to BE a specified engine with a
-    // published default. (case, parameters)
+    // published default. (An `Engine` that names no engine at all is refused before this
+    // gate, as the value its member does not accept — see
+    // `tests/all/refusal_wording_and_input_guards.rs`.) (case, parameters)
     let refusals: Vec<RefusalRow> = vec![
         ("DefaultOnly with no engine at all", vec![("DefaultOnly", "true")]),
         (
@@ -519,10 +521,6 @@ async fn default_only_with_no_resolvable_default_engine_version_is_refused() {
         (
             "DefaultOnly for an engine this front door publishes no version for",
             vec![("DefaultOnly", "true"), ("Engine", "custom-oracle-ee")],
-        ),
-        (
-            "DefaultOnly for a value that is not an engine",
-            vec![("DefaultOnly", "true"), ("Engine", "not-an-engine")],
         ),
         (
             "DefaultOnly for a parameter group family no engine publishes",

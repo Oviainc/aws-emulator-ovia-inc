@@ -177,6 +177,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.target_db_cluster_parameter_group_description,
         )
         .map_err(CopyDBClusterParameterGroupError::validation)?;
+        // The description is a required member, so it carries a value: a blank one is
+        // refused rather than stored (see `crate::state::check_not_empty`).
+        crate::state::check_not_empty(
+            "TargetDBClusterParameterGroupDescription",
+            &input.target_db_cluster_parameter_group_description,
+        )
+        .map_err(CopyDBClusterParameterGroupError::invalid_parameter_value)?;
         let tags = input.tags.unwrap_or_default();
         crate::state::check_tags(&tags)
             .map_err(CopyDBClusterParameterGroupError::invalid_parameter_value)?;

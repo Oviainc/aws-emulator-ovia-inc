@@ -402,7 +402,8 @@ async fn modify(
 /// The rows span the forms a published domain takes and the ways a value falls outside one:
 /// below a range's low bound, above its high bound, outside an enumeration, and a value that
 /// is no number at all. Each row's admitted counterpart is written first, so the refusal is
-/// asserted against a parameter the group really carries a value for.
+/// asserted against a parameter the group really carries a value for. The two forms of
+/// domain carry the two wordings Amazon RDS gives this refusal, one each.
 #[tokio::test]
 async fn a_value_outside_a_parameters_published_domain_is_refused_naming_that_domain() {
     let router = emulator();
@@ -482,9 +483,16 @@ async fn a_value_outside_a_parameters_published_domain_is_refused_naming_that_do
             INVALID_PARAMETER_VALUE,
         );
         let message = text(&answered, "Message");
+        // Amazon RDS words the refusal by the FORM of the domain the value fell outside: a
+        // numeric `<low>-<high>` range is "outside of range", while a comma-separated value
+        // list is an invalid parameter value whose allowed values are listed.
+        let expected = if domain.contains(',') {
+            format!("Invalid parameter value: {refused} for: {name} allowed values are: {domain}")
+        } else {
+            format!("Value: {refused} is outside of range: {domain} for parameter: {name}")
+        };
         assert_eq!(
-            message,
-            format!("Value: {refused} is outside of range: {domain} for parameter: {name}"),
+            message, expected,
             "case {case:?}: the refusal must name the value, the published domain and the \
              parameter, got {message:?}"
         );

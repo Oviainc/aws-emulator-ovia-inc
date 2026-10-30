@@ -119,6 +119,18 @@ const ARN_RESOURCE_TYPE: &str = "db-proxy";
 /// The ARN resource type of a proxy's target group.
 const TARGET_GROUP_ARN_RESOURCE_TYPE: &str = "target-group";
 
+/// The message a `DBProxyNotFoundFault` carries for a `DBProxyName` that resolves no proxy:
+/// the fault reports "the DB proxy name doesn't refer to an existing DB proxy", and Amazon
+/// RDS words it with the requested name in SINGLE QUOTES inside the sentence.
+///
+/// It lives here rather than in one handler because every operation that resolves a
+/// `DBProxyName` answers the same one fault, and the quoting is part of the text a caller
+/// matches the refusal against. `named` is the value the REQUEST carried, which is the
+/// spelling a proxy is stored under too (`DBProxyName` is not folded).
+pub fn db_proxy_not_found_message(named: &str) -> String {
+    format!("DBProxy '{named}' not found.")
+}
+
 /// Refuse a `TargetGroupName` that is not the one target group a proxy has.
 ///
 /// "Currently, this name must be `default`" — each proxy has exactly one target group and

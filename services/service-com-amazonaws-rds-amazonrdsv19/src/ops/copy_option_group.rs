@@ -165,6 +165,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.target_option_group_description,
         )
         .map_err(CopyOptionGroupError::validation)?;
+        // The description is a required member, so it carries a value: a blank one is
+        // refused rather than stored (see `crate::state::check_not_empty`).
+        crate::state::check_not_empty(
+            "TargetOptionGroupDescription",
+            &input.target_option_group_description,
+        )
+        .map_err(CopyOptionGroupError::invalid_parameter_value)?;
         let tags = input.tags.unwrap_or_default();
         crate::state::check_tags(&tags).map_err(CopyOptionGroupError::invalid_parameter_value)?;
 

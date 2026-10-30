@@ -180,7 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         DescribeDBProxiesError::from(
                             DescribeDBProxiesErrorModeled::DBProxyNotFoundFault(
                                 DBProxyNotFoundFault {
-                                    message: Some(format!("DBProxy {requested} not found.")),
+                                    message: Some(crate::state::db_proxy_not_found_message(
+                                        requested,
+                                    )),
                                 },
                             ),
                         )

@@ -177,6 +177,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.db_security_group_description,
         )
         .map_err(CreateDBSecurityGroupError::validation)?;
+        // The description is a required member, so it carries a value: a blank one is
+        // refused rather than stored (see `crate::state::check_not_empty`).
+        crate::state::check_not_empty(
+            "DBSecurityGroupDescription",
+            &input.db_security_group_description,
+        )
+        .map_err(CreateDBSecurityGroupError::invalid_parameter_value)?;
         let tags = input.tags.unwrap_or_default();
         crate::state::check_tags(&tags).map_err(CreateDBSecurityGroupError::validation)?;
 

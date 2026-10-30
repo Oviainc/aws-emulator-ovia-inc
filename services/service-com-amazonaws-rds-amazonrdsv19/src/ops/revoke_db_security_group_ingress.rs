@@ -188,12 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // RDS is regional: the group is resolved in the region the request was signed
         // for, and a name that names no group there is the modelled 404
-        // ("DBSecurityGroupName doesn't refer to an existing DB security group").
+        // ("DBSecurityGroupName doesn't refer to an existing DB security group"), in the
+        // wording this front door gives that fault on a call that CHANGES the group's
+        // rules rather than reports them.
         if store.resolve_db_security_group(&region, &name).is_none() {
             return Err(
                 RevokeDBSecurityGroupIngressErrorModeled::DBSecurityGroupNotFoundFault(
                     DBSecurityGroupNotFoundFault {
-                        message: Some(crate::state::db_security_group_not_found_message(&name)),
+                        message: Some(crate::state::db_security_group_not_found_colon_message(
+                            &name,
+                        )),
                     },
                 )
                 .into(),

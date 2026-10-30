@@ -163,6 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // touched, so a request that is wrong in its parameters leaves nothing behind.
         crate::state::check_major_engine_version(&input.engine_name, &input.major_engine_version)
             .map_err(CreateOptionGroupError::invalid_parameter_combination)?;
+        // `OptionGroupDescription` is a required member, so it carries a value: a blank one
+        // is refused rather than stored (see `crate::state::check_not_empty`).
+        crate::state::check_not_empty(
+            "OptionGroupDescription",
+            &input.option_group_description,
+        )
+        .map_err(CreateOptionGroupError::invalid_parameter_value)?;
 
         // No store means this service was mounted on an engine it has no state in,
         // so it cannot serve the operation at all. Unreachable with the engine the

@@ -25,7 +25,7 @@
 //! reads back holding no ingress rule after every refusal above.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    db_security_group_not_found_message, VPC_DB_SECURITY_GROUP_NOT_MODIFIABLE,
+    db_security_group_not_found_colon_message, VPC_DB_SECURITY_GROUP_NOT_MODIFIABLE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -191,6 +191,10 @@ async fn modifying_a_vpc_group_is_refused_whichever_form_the_request_asks_for() 
 /// A group name no create stored is the modelled 404 from both operations, naming the
 /// group in the spelling the store keys it under — so a caller can tell a missing group
 /// from one it may not modify.
+///
+/// Both operations CHANGE the group they name, so the fault carries the wording Amazon RDS
+/// gives it on that path (`DBSecurityGroup not found: <name>`) and not the one the report
+/// of the same condition carries (`DBSecurityGroup <name> not found.`).
 #[tokio::test]
 async fn a_group_no_create_stored_is_the_modelled_not_found() {
     let router = emulator();
@@ -206,8 +210,8 @@ async fn a_group_no_create_stored_is_the_modelled_not_found() {
             );
             assert_eq!(
                 text(&body, "Message"),
-                db_security_group_not_found_message(&named.to_ascii_lowercase()),
-                "case {case:?}: expected the not-found wording this service shares, got {body}"
+                db_security_group_not_found_colon_message(&named.to_ascii_lowercase()),
+                "case {case:?}: expected the mutate-path not-found wording, got {body}"
             );
         }
     }

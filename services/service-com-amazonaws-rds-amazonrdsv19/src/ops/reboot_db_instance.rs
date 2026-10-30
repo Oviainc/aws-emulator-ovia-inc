@@ -197,15 +197,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Rebooting a DB instance restarts the database engine service", so there has to
-        // be a running engine to restart: an instance still coming up, or on its way out,
-        // cannot take one. The status the clock has yet to settle is real.
-        if instance.status != "available" {
+        // be a running engine to restart: a reboot is accepted only from the statuses
+        // [`crate::state::REBOOTABLE_DB_INSTANCE_STATUSES`] names, and an instance still
+        // coming up, or on its way out, cannot take one. The status the clock has yet to
+        // settle is real.
+        if !crate::state::reboot_is_accepted_from(&instance.status) {
             let status = instance.status.clone();
             return Err(RebootDBInstanceErrorModeled::InvalidDBInstanceStateFault(
                 InvalidDBInstanceStateFault {
-                    message: Some(format!(
-                        "DB instance {identifier} is not available for a reboot (status \
-                         {status})"
+                    message: Some(crate::state::reboot_db_instance_state_message(
+                        &identifier,
+                        &status,
                     )),
                 },
             )

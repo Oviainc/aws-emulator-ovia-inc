@@ -232,14 +232,15 @@ async fn every_modelled_engine_reports_its_own_versions_and_nothing_else() {
 }
 
 #[tokio::test]
-async fn an_unknown_engine_reports_nothing_rather_than_failing() {
+async fn a_version_or_family_that_names_nothing_reports_nothing_rather_than_failing() {
     let router = emulator();
 
-    // `Engine` narrows the report; a value that names no engine therefore selects
-    // nothing. The operation models no error for it, so an empty 200 — not a fault — is
-    // the answer, and the same holds for a version and a family that name nothing.
+    // `EngineVersion` and `DBParameterGroupFamily` narrow the report; a value that names
+    // no version or family therefore selects nothing, and an empty 200 — not a fault — is
+    // the answer. (An `Engine` that names no ENGINE is a different case: the engine name is
+    // resolved rather than matched, and is refused — see
+    // `tests/all/refusal_wording_and_input_guards.rs`.)
     for (case, member, value) in [
-        ("an engine that does not exist", "Engine", "not-an-engine"),
         ("a version no engine has", "EngineVersion", "0.0.0"),
         (
             "a parameter group family that does not exist",

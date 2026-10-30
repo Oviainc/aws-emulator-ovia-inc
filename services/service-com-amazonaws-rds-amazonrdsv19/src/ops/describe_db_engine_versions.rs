@@ -194,6 +194,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page_size = crate::state::check_max_records(input.max_records)
             .map_err(DescribeDBEngineVersionsError::invalid_parameter_value)?;
+        // `Engine`: "The database engine to return version details for." It RESOLVES an
+        // engine family rather than merely narrowing the rows, so a value that names no
+        // engine this front door publishes is refused instead of answered with an empty
+        // report that would read as "this engine has no versions". The `engine` FILTER
+        // below is a different member and keeps its filter semantics.
+        if let Some(engine) = &input.engine {
+            crate::state::check_published_engine(engine)
+                .map_err(DescribeDBEngineVersionsError::invalid_parameter_value)?;
+        }
         let filters = input.filters.clone().unwrap_or_default();
         check_filter_names(&filters)
             .map_err(DescribeDBEngineVersionsError::invalid_parameter_value)?;

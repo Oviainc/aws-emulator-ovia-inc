@@ -137,6 +137,8 @@ mod query_catalog_reads;
 mod query_error_envelope;
 #[path = "all/reboot_db_shard_group.rs"]
 mod reboot_db_shard_group;
+#[path = "all/refusal_wording_and_input_guards.rs"]
+mod refusal_wording_and_input_guards;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/sibling_control_plane_clusters.rs"]

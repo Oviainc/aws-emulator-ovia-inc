@@ -128,6 +128,20 @@ impl ClusterParameterSpec {
         Some((&values[..offset], &values[offset + 1..]))
     }
 
+    /// Whether [`Self::allowed_values`] publishes a numeric RANGE (`<low>-<high>`) rather
+    /// than an enumeration of admitted values.
+    ///
+    /// The two forms are refused in different words ([`validate_known_setting`]), and the
+    /// test is the one [`Self::admits`] already makes: a comma makes the entry an
+    /// enumeration, and otherwise it is a range only when it parses as one for this
+    /// parameter's numeric [`Self::data_type`]. Anything else is a single admitted value,
+    /// which is an enumeration of one.
+    pub fn publishes_a_range(&self) -> bool {
+        !self.allowed_values.contains(',')
+            && self.range().is_some()
+            && matches!(self.data_type, "integer" | "float")
+    }
+
     /// Whether this parameter admits `value`, reading [`Self::allowed_values`] the way
     /// [`Self::data_type`] says: a comma-separated enumeration is matched exactly, and a
     /// `<low>-<high>` range ([`Self::range`]) is parsed as the numeric type and
@@ -403,6 +417,14 @@ pub fn validate_setting_in_catalog(
 /// the values that parameter publishes and the parameter the caller named, in the wording
 /// Amazon RDS answers a value outside a parameter's published domain with — so the caller
 /// can fix the request from the text alone.
+///
+/// There are TWO such wordings, and which one a refusal carries is decided by the FORM of
+/// the domain the value fell outside ([`ClusterParameterSpec::publishes_a_range`]): a value
+/// outside a numeric range is "outside of range", while a value that is not one of an
+/// enumerated set is an invalid parameter value for which the admitted values are listed.
+/// Both name the same three things — the rejected value, the parameter and its published
+/// `AllowedValues` — and both come from the request and from that parameter's own catalog
+/// entry.
 pub fn validate_known_setting(
     catalog: Option<&'static [ClusterParameterSpec]>,
     name: &str,
@@ -417,10 +439,17 @@ pub fn validate_known_setting(
         ));
     }
     if !spec.admits(value) {
-        return Err(format!(
-            "Value: {value} is outside of range: {} for parameter: {name}",
-            spec.allowed_values
-        ));
+        return Err(if spec.publishes_a_range() {
+            format!(
+                "Value: {value} is outside of range: {} for parameter: {name}",
+                spec.allowed_values
+            )
+        } else {
+            format!(
+                "Invalid parameter value: {value} for: {name} allowed values are: {}",
+                spec.allowed_values
+            )
+        });
     }
     Ok(())
 }

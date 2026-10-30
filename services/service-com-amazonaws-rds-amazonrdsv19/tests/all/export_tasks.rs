@@ -10,7 +10,7 @@
 //!   record; narrowing members (`ExportTaskIdentifier`, `SourceArn`, `SourceType`) and the
 //!   four filter names the operation publishes intersect, pagination is by `MaxRecords` and
 //!   a `Marker` the service itself issued, and an `ExportTaskIdentifier` that names no
-//!   stored task is the modelled `ExportTaskNotFoundFault`.
+//!   stored task selects nothing — an empty report, since every member here narrows.
 //! * `CancelExportTask` moves a task that is still running to `CANCELING` and the clock
 //!   then makes it `CANCELED` with the `TaskEndTime` it stopped at; a task that has already
 //!   stopped — or whose cancellation was already accepted — is the modelled
@@ -553,6 +553,18 @@ async fn describe_export_tasks_narrows_by_the_members_and_filters_it_publishes()
             vec![spec.identifier],
         ));
     }
+    // `ExportTaskIdentifier` is a narrowing member like the others, so an identifier that
+    // names no task of this region selects none of them — an empty report, not a fault.
+    rows.push((
+        "an identifier that names no stored task".to_string(),
+        params(&[("ExportTaskIdentifier", "exp-no-such-task")]),
+        vec![],
+    ));
+    rows.push((
+        "an identifier of a task another region holds".to_string(),
+        params(&[("ExportTaskIdentifier", "exp-elsewhere")]),
+        vec![],
+    ));
 
     for (case, request, expected) in rows {
         let reported = describe(&router, &case, &request).await;
@@ -638,19 +650,7 @@ async fn describe_export_tasks_refuses_a_request_it_cannot_serve() {
     let router = emulator_with_seeded_tasks();
 
     // (case, parameters, HTTP status, wire error code)
-    let rows: [RefusalRow; 7] = [
-        (
-            "an identifier that names no stored task",
-            params(&[("ExportTaskIdentifier", "exp-no-such-task")]),
-            404,
-            "ExportTaskNotFound",
-        ),
-        (
-            "a task of another region",
-            params(&[("ExportTaskIdentifier", "exp-elsewhere")]),
-            404,
-            "ExportTaskNotFound",
-        ),
+    let rows: [RefusalRow; 5] = [
         (
             "a filter name the operation does not publish",
             params(&[

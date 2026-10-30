@@ -404,9 +404,19 @@ async fn a_refused_update_is_rolled_back_however_far_it_got() {
             .find(|group| group.logical_id == case.refused)
             .map(|group| group.parameter)
             .unwrap_or_default();
+        let refused_value = case
+            .groups
+            .iter()
+            .find(|group| group.logical_id == case.refused)
+            .map(|group| group.updated)
+            .unwrap_or_default();
         let reason = &refusals[0].2;
+        // RDS words its refusal from the parameter and the value the declaration carried,
+        // in the wording that parameter's published domain takes (a range refusal for the
+        // bounded parameters, a value-list refusal for the enumerated one), so the reason
+        // the event carries must name both.
         assert!(
-            reason.contains("is outside of range") && reason.contains(refused_parameter),
+            reason.contains(refused_parameter) && reason.contains(refused_value),
             "case {:?}: expected the refused resource's reason to carry Amazon RDS's own \
              refusal of {refused_parameter:?}, got {reason:?}",
             case.case

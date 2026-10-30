@@ -161,6 +161,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = input.db_subnet_group_name.to_ascii_lowercase();
         check_subnet_group_name(&name)
             .map_err(CreateDBSubnetGroupError::invalid_parameter_value)?;
+        // `DBSubnetGroupDescription` is a required member, so it carries a value: a blank
+        // one is refused rather than stored (see `crate::state::check_not_empty`).
+        crate::state::check_not_empty(
+            "DBSubnetGroupDescription",
+            &input.db_subnet_group_description,
+        )
+        .map_err(CreateDBSubnetGroupError::invalid_parameter_value)?;
 
         // The `SubnetIds` list a DB subnet group can be made of is the same list
         // whichever operation carries it, so the published allowance for one group, the

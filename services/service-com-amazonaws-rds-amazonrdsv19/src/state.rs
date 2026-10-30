@@ -124,12 +124,13 @@ pub use custom_engine_versions::{
     CUSTOM_ENGINE_VERSION_STATUS_CREATING, MEDIA_TYPE_CUSTOMER_PROVIDED,
 };
 pub use db_proxies::{
-    check_target_group_name, default_connection_pool_config, target_to_wire, DbProxyRecord,
-    DbProxyTargetGroupRecord, DbProxyTargetRecord, RegisteredDatabase, DEFAULT_AUTH_SCHEME_NONE,
-    DEFAULT_CONNECTION_BORROW_TIMEOUT, DEFAULT_DB_PROXY_TARGET_GROUP, DEFAULT_IDLE_CLIENT_TIMEOUT,
-    DEFAULT_MAX_CONNECTIONS_PERCENT, DEFAULT_MAX_CONNECTIONS_PERCENT_SQLSERVER,
-    DB_PROXY_QUOTA_PER_REGION, DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING,
-    DB_PROXY_TARGET_QUOTA_PER_PROXY, ENGINE_FAMILY_SQLSERVER, NETWORK_TYPE_IPV4,
+    check_target_group_name, db_proxy_not_found_message, default_connection_pool_config,
+    target_to_wire, DbProxyRecord, DbProxyTargetGroupRecord, DbProxyTargetRecord,
+    RegisteredDatabase, DEFAULT_AUTH_SCHEME_NONE, DEFAULT_CONNECTION_BORROW_TIMEOUT,
+    DEFAULT_DB_PROXY_TARGET_GROUP, DEFAULT_IDLE_CLIENT_TIMEOUT, DEFAULT_MAX_CONNECTIONS_PERCENT,
+    DEFAULT_MAX_CONNECTIONS_PERCENT_SQLSERVER, DB_PROXY_QUOTA_PER_REGION,
+    DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING, DB_PROXY_TARGET_QUOTA_PER_PROXY,
+    ENGINE_FAMILY_SQLSERVER, NETWORK_TYPE_IPV4,
 };
 pub use engine_log::InstanceLog;
 pub use export_tasks::{
@@ -192,6 +193,45 @@ pub const DB_INSTANCE_STATUS_STOPPED: &str = "stopped";
 /// Transient: the clock owes [`DB_INSTANCE_STATUS_AVAILABLE`]
 /// [`STATUS_TRANSITION_DELAY`] later.
 pub const DB_INSTANCE_STATUS_STARTING: &str = "starting";
+
+/// The DB instance statuses a reboot is accepted from, in the order Amazon RDS lists them
+/// in the refusal it answers a request made in any other status with
+/// ([`reboot_db_instance_state_message`]).
+///
+/// "Rebooting a DB instance restarts the database engine service", so there has to be an
+/// engine to restart: beyond the running instance, the states RDS reboots are the ones in
+/// which the instance is up and only its storage or its configuration is unsettled —
+/// including the two `incompatible-` states, where a reboot is how a caller picks up a
+/// corrected credential or parameter. Every other status (coming up, going down, stopped)
+/// is refused.
+pub const REBOOTABLE_DB_INSTANCE_STATUSES: [&str; 5] = [
+    DB_INSTANCE_STATUS_AVAILABLE,
+    "storage-optimization",
+    "storage-initialization",
+    "incompatible-credentials",
+    "incompatible-parameters",
+];
+
+/// Whether a reboot is accepted for an instance reporting `status`; see
+/// [`REBOOTABLE_DB_INSTANCE_STATUSES`].
+pub fn reboot_is_accepted_from(status: &str) -> bool {
+    REBOOTABLE_DB_INSTANCE_STATUSES.contains(&status)
+}
+
+/// The message the `InvalidDBInstanceStateFault` carries for a reboot asked of an instance
+/// in a status it is not accepted from.
+///
+/// Amazon RDS states the permitted set FIRST — it is what a caller reads to decide whether
+/// to wait or to fail — and then names the instance the request addressed and the status
+/// that instance is actually in, taken from this service's own state. The two sentences are
+/// separated by two spaces, as the service writes them.
+pub fn reboot_db_instance_state_message(identifier: &str, status: &str) -> String {
+    format!(
+        "Can only reboot db instances with state in: {}.  Instance {identifier} has state: \
+         {status}.",
+        REBOOTABLE_DB_INSTANCE_STATUSES.join(", ")
+    )
+}
 
 /// The ARN namespace and sigv4 signing name of this service, as its Smithy model's
 /// `aws.api#service` trait declares them (`arnNamespace: rds`).
@@ -988,16 +1028,38 @@ pub const ADVANCED_INSIGHTS_RETENTION_PERIOD: i32 = 465;
 /// period above.
 pub const DATABASE_INSIGHTS_MODE_ADVANCED: &str = "advanced";
 
+/// Whether `engine` names a database engine this front door publishes at all: one of the
+/// engines a DB instance can run ([`DB_INSTANCE_ENGINES`]) or one of the sibling control
+/// planes' ([`SIBLING_CONTROL_PLANE_ENGINES`]). Compared case-insensitively, the way every
+/// per-engine rule below compares an engine name.
+pub fn is_published_engine(engine: &str) -> bool {
+    DB_INSTANCE_ENGINES
+        .iter()
+        .chain(SIBLING_CONTROL_PLANE_ENGINES.iter())
+        .any(|known| known.eq_ignore_ascii_case(engine))
+}
+
+/// Refuse an `Engine` that names no database engine ([`is_published_engine`]) where the
+/// member RESOLVES an engine family for a catalogue read.
+///
+/// A report narrowed by an engine name is not asking "which of these entries has this
+/// engine" but "report this engine's entries": a value that is no engine names no engine
+/// family at all, so Amazon RDS refuses it rather than answering the empty report that
+/// would read as "this engine has no versions". The message is the one the real service
+/// answers that with, naming the value the request carried.
+pub fn check_published_engine(engine: &str) -> Result<(), String> {
+    if is_published_engine(engine) {
+        return Ok(());
+    }
+    Err(format!("Unrecognized engine name: {engine}"))
+}
+
 /// Refuse an `Engine` outside the value list its member publishes
 /// ([`DB_INSTANCE_ENGINES`], plus the sibling control planes'
 /// [`SIBLING_CONTROL_PLANE_ENGINES`]). A value that is not an engine names no database
 /// engine at all, which is what the real service refuses with `InvalidParameterValue`.
 pub fn check_engine(engine: &str) -> Result<(), String> {
-    if DB_INSTANCE_ENGINES
-        .iter()
-        .chain(SIBLING_CONTROL_PLANE_ENGINES.iter())
-        .any(|known| known.eq_ignore_ascii_case(engine))
-    {
+    if is_published_engine(engine) {
         return Ok(());
     }
     Err("Invalid DB engine".to_string())
@@ -3868,6 +3930,29 @@ pub fn check_free_form(member: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse an EMPTY value for a member the model marks required.
+///
+/// A required member carries a value, and the empty string is no value — so Amazon RDS
+/// refuses such a request rather than storing a resource whose required member says
+/// nothing. The one sentence it answers that with names the member, which is what the
+/// caller has to fix, and holds for every required member a request can leave empty, so it
+/// lives here next to the other free-form rules rather than in each create.
+///
+/// The test is emptiness, not blankness: a value made of whitespace is a value the caller
+/// chose, and it is stored and reported back exactly as sent, like any other.
+///
+/// It is not the model's own missing-member refusal either: a member that is ABSENT is
+/// refused at the boundary with the framework's text, and a member that is PRESENT and
+/// empty is this one.
+pub fn check_not_empty(member: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!(
+            "The parameter {member} must be provided and must not be blank."
+        ));
+    }
+    Ok(())
+}
+
 /// The message a `DBShardGroupNotFoundFault` carries: "the specified DB shard group name
 /// wasn't found", in the `<resource type> <name> not found.` wording this front door
 /// answers a named resource it cannot resolve with.
@@ -4071,7 +4156,8 @@ pub fn db_security_group_not_found_message(name: &str) -> String {
 }
 
 /// The message a `DBSecurityGroupNotFoundFault` carries where the DB security group is the
-/// SUBJECT of the call and the call acts on the group itself — the delete that removes it.
+/// SUBJECT of the call and the call acts on the group itself — the delete that removes it,
+/// and the two ingress calls that change the rules it holds.
 ///
 /// This front door words the one fault by the ROLE the resource plays in the call, the same
 /// way it words a DB cluster's ([`db_cluster_not_found_message`] beside
@@ -5793,14 +5879,24 @@ pub fn event_categories_of(source_type: &str) -> Option<&'static [&'static str]>
         .map(|(_, categories)| *categories)
 }
 
-/// The published event source types, comma-separated — what a refusal names as the set a
-/// rejected `SourceType` is not in.
-pub fn event_source_types() -> String {
-    EVENT_CATEGORIES
+/// The message the refusal of a `SourceType` that names no published event source type
+/// carries.
+///
+/// Amazon RDS words this one as a statement about the PARAMETER and not about the value:
+/// the fixed sentence says the source type is not valid and that the feature may be
+/// disabled, then names the types that ARE valid — it does not echo the offending value
+/// back, so neither does this. Each type is named in single quotes, the way the service
+/// writes a list of literal values inside a sentence, and in the order
+/// [`EVENT_CATEGORIES`] publishes them.
+pub fn invalid_event_source_type_message() -> String {
+    let quoted: Vec<String> = EVENT_CATEGORIES
         .iter()
-        .map(|(source_type, _)| *source_type)
-        .collect::<Vec<&str>>()
-        .join(", ")
+        .map(|(source_type, _)| format!("'{source_type}'"))
+        .collect();
+    format!(
+        "Invalid event source type. Feature may be disabled. Valid types are {}",
+        quoted.join(", ")
+    )
 }
 
 /// One source type's categories as the modelled `EventCategoriesMap`.

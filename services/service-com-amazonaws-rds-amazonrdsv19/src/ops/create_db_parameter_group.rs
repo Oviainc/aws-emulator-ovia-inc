@@ -179,6 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(CreateDBParameterGroupError::validation)?;
         crate::state::check_free_form("Description", &input.description)
             .map_err(CreateDBParameterGroupError::validation)?;
+        // `Description` is a required member, so it carries a value: a blank one is refused
+        // rather than stored (see `crate::state::check_not_empty`).
+        crate::state::check_not_empty("Description", &input.description)
+            .map_err(CreateDBParameterGroupError::invalid_parameter_value)?;
         crate::state::check_tags(input.tags.as_deref().unwrap_or_default())
             .map_err(CreateDBParameterGroupError::validation)?;
         // `DBParameterGroupName`: "This value is stored as a lowercase string."

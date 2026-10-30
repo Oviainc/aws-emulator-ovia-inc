@@ -187,7 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(proxy) = store.db_proxies.get(&key) else {
             return Err(DeregisterDBProxyTargetsErrorModeled::DBProxyNotFoundFault(
                 DBProxyNotFoundFault {
-                    message: Some(format!("DBProxy {} not found.", input.db_proxy_name)),
+                    message: Some(crate::state::db_proxy_not_found_message(
+                        &input.db_proxy_name,
+                    )),
                 },
             )
             .into());

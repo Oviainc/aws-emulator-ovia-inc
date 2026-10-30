@@ -175,30 +175,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions(&region);
 
         // RDS is regional: a request sees only the export tasks of the region it was
-        // signed for. Naming one task narrows the report to it, and an identifier that
-        // names no export task is the modelled not-found fault — the one condition this
-        // operation models an error for.
-        let candidates: Vec<&crate::state::ExportTaskRecord> =
-            match &input.export_task_identifier {
-                Some(requested) => {
-                    let record =
-                        store.resolve_export_task(&region, requested).ok_or_else(|| {
-                            DescribeExportTasksError::from(
-                                DescribeExportTasksErrorModeled::ExportTaskNotFoundFault(
-                                    ExportTaskNotFoundFault {
-                                        message: Some(format!(
-                                            "ExportTask {requested} not found."
-                                        )),
-                                    },
-                                ),
-                            )
-                        })?;
-                    vec![record]
-                }
-                None => store.export_tasks_in(&region),
-            };
+        // signed for. Naming one task NARROWS the report to it: the member is documented
+        // as "the identifier of the … export task to be described", which is a predicate
+        // over the catalogue like every other member here, so an identifier that names no
+        // export task selects none of them and the report is an empty success. The
+        // modelled not-found fault belongs to the operations that ACT on one named task.
+        let candidates: Vec<&crate::state::ExportTaskRecord> = store.export_tasks_in(&region);
         let matching: Vec<(String, CancelExportTaskOutput)> = candidates
             .into_iter()
+            .filter(|record| {
+                input
+                    .export_task_identifier
+                    .as_ref()
+                    .is_none_or(|wanted| *wanted == record.identifier)
+            })
             // `SourceArn` and `SourceType` select the exports OF one source and of one
             // kind of source: a report narrowed by either carries only the tasks whose
             // stored value equals it. `SourceType` targets the `ExportSourceType` enum, so

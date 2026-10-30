@@ -156,10 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(source_type) => {
                 let categories = crate::state::event_categories_of(source_type).ok_or_else(
                     || {
-                        DescribeEventCategoriesError::invalid_parameter_value(format!(
-                            "Invalid event source type: {source_type}. Valid values are: {}",
-                            crate::state::event_source_types()
-                        ))
+                        DescribeEventCategoriesError::invalid_parameter_value(
+                            crate::state::invalid_event_source_type_message(),
+                        )
                     },
                 )?;
                 vec![crate::state::event_categories_to_wire(

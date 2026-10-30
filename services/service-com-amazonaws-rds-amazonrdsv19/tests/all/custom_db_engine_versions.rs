@@ -18,6 +18,7 @@
 //! members; the engines that are refused are a row each; and every created CEV is read
 //! back through `DescribeDBEngineVersions`, which is the report a CEV joins.
 
+use service_com_amazonaws_rds_amazonrdsv19::state::is_published_engine;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{
@@ -629,6 +630,14 @@ async fn a_request_outside_the_rules_is_refused_and_stores_nothing() {
             .find(|(name, _)| *name == "EngineVersion")
             .map(|(_, value)| *value)
             .expect("every refusal row names an engine version");
+        // A refused create stores nothing: the engine version it named must not be
+        // reported, whatever status it would have had. A row whose `Engine` names no
+        // published engine cannot be asked of that report at all — the report RESOLVES
+        // that member and refuses a value that is no engine — so the create's own refusal
+        // above is the whole of that row.
+        if !is_published_engine(engine) {
+            continue;
+        }
         let entries = described(&router, REGION, case, engine, engine_version, true).await;
         let published = engine_version == "16.00.4165.4.v1";
         assert_eq!(
