@@ -84,13 +84,21 @@
 //!   the recorded refusal for an ABSENT `@required` member states
 //!   `Value at 'storageTier' failed to satisfy constraint: Member must not be null`,
 //!   with no `null` in the subject, exactly as a present-but-invalid value's clause reads;
-//! * an enum's admissible set is listed in ASCENDING ORDER of its values, not in the
-//!   model's declaration order: the recorded refusals list `StorageTier` as
+//! * an enum's admissible set is listed in the order AWS PUBLISHES for that enum
+//!   ([`PUBLISHED_ENUM_ORDERS`]) — the order its own documentation and its model
+//!   declaration state the values in — and, for an enum this service publishes no order
+//!   for, in ASCENDING ORDER of its values: the recorded refusals list `StorageTier` as
 //!   `[INTELLIGENT_TIERING, STANDARD]` where the model declares
 //!   `[STANDARD, INTELLIGENT_TIERING]`, and `ListAggregateLogGroupSummariesGroupBy` as
 //!   `[DATA_SOURCE_NAME_AND_TYPE, DATA_SOURCE_NAME_TYPE_AND_FORMAT]` where the model
 //!   declares the format value first — two enums whose declaration order differs from the
 //!   recorded one, and in both the recorded order is the sorted set.
+//!
+//! The published order is a property of the ENUM rather than of one member referencing it,
+//! so it is stated the same way wherever this service lists that enum's admissible
+//! values: in a constraint clause, and in the `Valid values are: [...]` catalogue the
+//! handler-side refusal in `crate::state` lists for a policy-document attribute
+//! ([`enum_value_set`]).
 //!
 //! A `@pattern` is reported as the MODEL spells it, anchors included; the reasoning for
 //! that one is on [`requirement`], which is also where the handler-side refusal in
@@ -258,11 +266,13 @@ const SUBJECT: &str = "Value at";
 /// `[\w-]*` — so no rule over the model can produce both and the expression is rendered
 /// rather than rewritten.
 ///
-/// THE ENUM ORDERING RULE: an enum's admissible set is listed in ascending order of its
-/// VALUES rather than in the model's declaration order, which is what the recordings show
-/// for the two enums whose orders differ (see "How this service words a refusal"). The
-/// order comes from the values themselves, so it holds for every enum this service
-/// declares rather than for the two the recordings happen to cover.
+/// THE ENUM ORDERING RULE: an enum's admissible set is listed in the order AWS publishes
+/// for that enum where there is one ([`PUBLISHED_ENUM_ORDERS`]), and otherwise in ascending
+/// order of its VALUES rather than in the model's declaration order, which is what the
+/// recordings show for the two enums whose orders differ (see "How this service words a
+/// refusal"). Both halves are keyed on the enum's own values rather than on the member or
+/// the operation carrying it, so they hold for every enum this service declares rather
+/// than for the ones the recordings happen to cover ([`enum_value_set`]).
 ///
 /// Returns `None` for a violation class this service has no wording for, which lets
 /// [`constraint_envelope`] decline the whole refusal and keep the framework's wording
@@ -287,15 +297,58 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
             format!("Member must satisfy regular expression pattern: {pattern}")
         }
         // A "value set" is just that: the requirement is WHICH values the model allows,
-        // listed in ascending order of the values (the enum ordering rule above).
+        // listed in the one order this service states that enum's values in (the enum
+        // ordering rule above).
         ViolationKind::EnumValue(allowed) => {
-            let mut values: Vec<&str> = allowed.iter().map(String::as_str).collect();
-            values.sort_unstable();
+            let values = enum_value_set(allowed.iter().map(String::as_str));
             format!("Member must satisfy enum value set: [{}]", values.join(", "))
         }
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
     })
+}
+
+/// The order this service STATES an enum's admissible set in, for an enum AWS publishes an
+/// order for that is not the ascending order of its values ([`enum_value_set`]'s default).
+///
+/// One entry per enum, each a permutation of that enum's declared values — pinned against
+/// the generated value-set constants by `a_published_order_is_the_models_set_reordered`.
+const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
+    // The grouping a subscription filter delivers log data under
+    // (`cloudwatchlogs#Distribution`), published with the random grouping first: the
+    // model's declaration and the documentation of the enum itself — "which can be either
+    // random or grouped by log stream" — state the values in that order.
+    &["Random", "ByLogStream"],
+];
+
+/// The order this service states the admissible set `allowed` in, or `None` when AWS
+/// publishes no order for that enum and the ascending order of the values stands.
+///
+/// The match is on membership and size, never on position, so a model that reordered its
+/// own declaration of the same enum would still be stated in the published order.
+fn published_enum_order<'a>(
+    allowed: impl IntoIterator<Item = &'a str>,
+) -> Option<&'static [&'static str]> {
+    let allowed: Vec<&str> = allowed.into_iter().collect();
+    PUBLISHED_ENUM_ORDERS.iter().copied().find(|published| {
+        published.len() == allowed.len() && published.iter().all(|value| allowed.contains(value))
+    })
+}
+
+/// An enum's admissible values in the one order this service lists them in: the order AWS
+/// publishes for that enum ([`published_enum_order`]), and otherwise the ascending order
+/// of the values.
+///
+/// Shared with the handler-side refusals in `crate::state`, which list a policy-document
+/// attribute's admissible values in a sentence of their own, so one enum reads the same
+/// way whichever refusal states it.
+pub(crate) fn enum_value_set<'a>(declared: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut values: Vec<&str> = declared.into_iter().collect();
+    if let Some(published) = published_enum_order(values.iter().copied()) {
+        return published.to_vec();
+    }
+    values.sort_unstable();
+    values
 }
 
 /// Render one constraint violation the way this service states it: the input position and
@@ -466,9 +519,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 #[cfg(test)]
 mod tests {
     use super::{
-        constraint_clause, constraint_envelope, refusal_code, served_refusal_code,
-        INVALID_PARAMETER_EXCEPTION, NO_REFUSAL_ERROR_OPERATIONS, SERVED_REFUSAL_CODE,
-        VALIDATION_EXCEPTION, VALIDATION_EXCEPTION_OPERATIONS,
+        constraint_clause, constraint_envelope, enum_value_set, published_enum_order, refusal_code,
+        served_refusal_code, INVALID_PARAMETER_EXCEPTION, NO_REFUSAL_ERROR_OPERATIONS,
+        PUBLISHED_ENUM_ORDERS, SERVED_REFUSAL_CODE, VALIDATION_EXCEPTION,
+        VALIDATION_EXCEPTION_OPERATIONS,
     };
     use smithy_server_runtime::{Violation, ViolationKind};
 
@@ -556,10 +610,57 @@ mod tests {
         );
     }
 
-    /// Every constraint class states `Value at '<member>'` and no value — an enum with its
-    /// admissible set sorted, a `@pattern` with the anchors the model writes, a bound, and
-    /// an absent member with no `null` in the subject — and several violations take the
-    /// plural envelope, counted and joined the way AWS counts and joins them.
+    /// Every published order is the SAME SET the model declares, only reordered — a value
+    /// the model does not declare would otherwise be stated as admissible — and it is the
+    /// order the set is stated in whatever order the values reach the renderer in, while an
+    /// enum with no published order is stated in the ascending order of its values.
+    #[test]
+    fn a_published_order_is_the_models_set_reordered() {
+        // The value sets the model declares, as the generated constants hold them (each
+        // sorted by the generator): `crate::ops::types::<ENUM>_VALUES`.
+        let declared: &[&[&str]] = &[
+            crate::ops::types::DISTRIBUTION_VALUES,
+            crate::ops::types::LOG_GROUP_CLASS_VALUES,
+            crate::ops::types::ORDER_BY_VALUES,
+            crate::ops::types::STORAGE_TIER_VALUES,
+        ];
+        let as_set = |values: &[&'static str]| {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            sorted
+        };
+        for published in PUBLISHED_ENUM_ORDERS {
+            let set = as_set(published);
+            assert!(
+                declared.iter().any(|values| as_set(values) == set),
+                "case {published:?}: a published order names a value set the model declares"
+            );
+            let reversed: Vec<&str> = published.iter().rev().copied().collect();
+            for arrival in [published.to_vec(), reversed] {
+                let stated = enum_value_set(arrival.iter().copied());
+                assert_eq!(
+                    stated,
+                    published.to_vec(),
+                    "case {arrival:?}: expected the published order {published:?}, got {stated:?}"
+                );
+            }
+        }
+        for values in declared {
+            let stated = enum_value_set(values.iter().copied());
+            let expected = published_enum_order(values.iter().copied())
+                .map_or_else(|| as_set(values), <[&str]>::to_vec);
+            assert_eq!(
+                stated, expected,
+                "case {values:?}: expected {expected:?}, got {stated:?}"
+            );
+        }
+    }
+
+    /// Every constraint class states `Value at '<member>'` and no value — an enum stated in
+    /// the one order this service lists its values in, a `@pattern` with the anchors the
+    /// model writes, a bound, and an absent member with no `null` in the subject — and
+    /// several violations take the plural envelope, counted and joined the way AWS counts
+    /// and joins them.
     #[test]
     fn a_clause_states_the_member_and_the_requirement_without_a_value() {
         let outside_enum = Violation {
@@ -570,6 +671,16 @@ mod tests {
                 "INTELLIGENT_TIERING".to_string(),
             ]),
             value: Some("GLACIER".to_string()),
+        };
+        let outside_published_enum = Violation {
+            path: "distribution".to_string(),
+            // An enum this service publishes an order for, handed to the renderer in the
+            // model's declaration order.
+            kind: ViolationKind::EnumValue(vec![
+                "Random".to_string(),
+                "ByLogStream".to_string(),
+            ]),
+            value: Some("ByShard".to_string()),
         };
         let outside_pattern = Violation {
             path: "lookupTableName".to_string(),
@@ -592,6 +703,12 @@ mod tests {
                 &outside_enum,
                 "Value at 'storageTier' failed to satisfy constraint: Member must satisfy \
                  enum value set: [INTELLIGENT_TIERING, STANDARD]",
+            ),
+            (
+                "a value outside an enum with a published order",
+                &outside_published_enum,
+                "Value at 'distribution' failed to satisfy constraint: Member must satisfy \
+                 enum value set: [Random, ByLogStream]",
             ),
             (
                 "a value outside a pattern",

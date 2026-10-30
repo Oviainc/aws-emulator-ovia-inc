@@ -4744,12 +4744,14 @@ fn check_subscription_filter_policy_document(document: &str) -> Result<(), Strin
     }
     // "the grouping can be set to Random for a more even distribution": the two values of
     // the model's `Distribution` enum, which no boundary validator holds a JSON document
-    // to.
+    // to, listed in the one order this service states that enum's values in.
     if let Some(distribution) = string("Distribution") {
         if !crate::ops::types::DISTRIBUTION_VALUES.contains(&distribution) {
             return Err(invalid_value_message(
                 "Distribution",
-                crate::ops::types::DISTRIBUTION_VALUES.iter().copied(),
+                crate::service::enum_value_set(
+                    crate::ops::types::DISTRIBUTION_VALUES.iter().copied(),
+                ),
             ));
         }
     }

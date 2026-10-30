@@ -63,6 +63,8 @@ mod destination_policies;
 mod destination_removal;
 #[path = "all/destinations.rs"]
 mod destinations;
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
 #[path = "all/event_cursor_envelope.rs"]
 mod event_cursor_envelope;
 #[path = "all/event_ingestion_time_independence.rs"]
