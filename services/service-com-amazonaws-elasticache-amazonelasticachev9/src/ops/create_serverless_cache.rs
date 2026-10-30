@@ -225,7 +225,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let engine = match crate::state::normalize_engine(&input.engine) {
+        // "The name of the cache engine to be used for creating the serverless
+        // cache": an engine the serverless surface does not run has no
+        // serverless cache to create, which is the capability rule the refusal
+        // states (`crate::state::normalize_serverless_engine`) rather than a
+        // vocabulary the caller could pick another entry from.
+        let engine = match crate::state::normalize_serverless_engine(&input.engine) {
             Ok(engine) => engine,
             Err(message) => return Err(invalid_value(message)),
         };

@@ -177,10 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Modifies the engine listed in a user group. The options are valkey or
-        // redis" — the same set a user is created for, so one implementation
-        // decides it (`crate::state::normalize_user_engine`).
+        // redis" — the same access-control capability rule a group is created
+        // under, so one implementation decides it
+        // (`crate::state::normalize_access_control_engine`).
         let engine = match input.engine.as_deref() {
-            Some(requested) => match crate::state::normalize_user_engine(requested) {
+            Some(requested) => match crate::state::normalize_access_control_engine(requested) {
                 Ok(engine) => Some(engine),
                 Err(message) => {
                     return Err(ModifyUserGroupErrorModeled::InvalidParameterValueException(

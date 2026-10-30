@@ -21,9 +21,11 @@
 //!    account, so every operation that names one answers the account-wide
 //!    `InvalidParameterValue` closure rather than a per-name not-found.
 //!
-//! 4. THE CLUSTER MESSAGES — every surface that reports a missing cache cluster
-//!    words it the one way the service does, and every surface that refuses a
-//!    malformed `CacheClusterId` states the one identifier rule and names the one
+//! 4. THE CLUSTER MESSAGES — every surface that resolves a `CacheClusterId`
+//!    words a missing cache cluster the way the service words it there (the
+//!    shape's own spelling on the surfaces that only resolve the id, AWS's prose
+//!    on the snapshot creator), and every surface that refuses a malformed
+//!    `CacheClusterId` states the one identifier rule and names the one
 //!    parameter.
 //!
 //! Everything goes over the wire through the same router the production emulator
@@ -606,10 +608,14 @@ async fn naming_a_cache_security_group_is_the_account_wide_closure() {
 }
 
 #[tokio::test]
-async fn a_missing_cache_cluster_is_worded_the_one_way_the_service_words_it() {
+async fn a_missing_cache_cluster_is_worded_the_way_each_surface_words_it() {
     let emulator = Emulator::new();
     let ghost = "ghost-cluster";
-    let expected = format!("CacheCluster not found: {ghost}");
+    // Every surface that RESOLVES a `CacheClusterId` names the resource the way
+    // the shape spells it; the snapshot creator is the one that words the same
+    // fault as prose, which is what AWS answers `CreateSnapshot` with.
+    let shape_wording = format!("CacheCluster not found: {ghost}");
+    let prose_wording = format!("Cache cluster not found: {ghost}");
 
     // `(case, Action, the form pairs)`: every surface that resolves a
     // `CacheClusterId` against the store.
@@ -664,6 +670,11 @@ async fn a_missing_cache_cluster_is_worded_the_one_way_the_service_words_it() {
     ];
 
     for (case, action, request) in cases {
+        let expected = if action == "CreateSnapshot" {
+            prose_wording.clone()
+        } else {
+            shape_wording.clone()
+        };
         let reply = emulator.call(action, &request).await;
         assert_eq!(
             reply.status, 404,

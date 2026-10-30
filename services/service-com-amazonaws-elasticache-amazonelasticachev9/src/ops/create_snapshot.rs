@@ -314,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = store.settled_cluster_mut(&cache_cluster_id, now) else {
             return Err(CreateSnapshotErrorModeled::CacheClusterNotFoundFault(
                 CacheClusterNotFoundFault {
-                    message: Some(crate::state::cache_cluster_not_found_message(
+                    message: Some(crate::state::snapshot_source_cluster_not_found_message(
                         &input.cache_cluster_id.unwrap_or_default(),
                     )),
                 },

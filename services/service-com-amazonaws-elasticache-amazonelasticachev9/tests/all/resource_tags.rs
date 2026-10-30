@@ -58,7 +58,15 @@ fn tag_form(index: usize, key: &str, value: Option<&str>) -> Vec<(String, String
 }
 
 /// `AddTagsToResource` on `arn`, carrying `tags` as its `Tags` member.
-async fn add_tags(emulator: &Emulator, arn: &str, tags: &[(&str, Option<&str>)]) -> Reply {
+///
+/// `pub(crate)` so the suite about WHICH rule a refusal states drives the same
+/// three tagging operations through the same request builders rather than
+/// carrying a second copy of them.
+pub(crate) async fn add_tags(
+    emulator: &Emulator,
+    arn: &str,
+    tags: &[(&str, Option<&str>)],
+) -> Reply {
     let mut pairs = params(&[("ResourceName", arn)]);
     for (index, (key, value)) in tags.iter().enumerate() {
         pairs.extend(tag_form(index + 1, key, *value));
@@ -75,7 +83,7 @@ async fn add_tags_raw(emulator: &Emulator, arn: &str, tags: &[(String, String)])
 }
 
 /// `ListTagsForResource` on `arn`.
-async fn list_tags(emulator: &Emulator, arn: &str) -> Reply {
+pub(crate) async fn list_tags(emulator: &Emulator, arn: &str) -> Reply {
     emulator
         .call("ListTagsForResource", &params(&[("ResourceName", arn)]))
         .await
@@ -85,7 +93,7 @@ async fn list_tags(emulator: &Emulator, arn: &str) -> Reply {
 ///
 /// `TagKeys.member.<n>`: `KeyList`'s member carries no `xmlName`
 /// (`smithy_query query="shape" shape="KeyList"`), so it keeps the default spelling.
-async fn remove_tags(emulator: &Emulator, arn: &str, keys: &[&str]) -> Reply {
+pub(crate) async fn remove_tags(emulator: &Emulator, arn: &str, keys: &[&str]) -> Reply {
     let mut pairs = params(&[("ResourceName", arn)]);
     for (index, key) in keys.iter().enumerate() {
         pairs.push((format!("TagKeys.member.{}", index + 1), (*key).to_string()));

@@ -197,10 +197,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateCacheParameterGroupErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(format!(
-                            "Invalid value {family} for CacheParameterGroupFamily: must be one of \
-                             {}.",
-                            crate::state::PARAMETER_GROUP_FAMILIES.join(" | ")
+                        message: Some(crate::state::invalid_parameter_group_family_message(
+                            &family,
                         )),
                     },
                 )

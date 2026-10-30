@@ -12,8 +12,10 @@
 //! `InvalidParameterCombination`. A reset parameter is reported by a later
 //! `DescribeCacheParameters` under `Source` `system` with the engine's own
 //! value, every value the request did not name stays the customer's, a group
-//! the account does not hold is refused 404 `CacheParameterGroupNotFound`, a
-//! family's own default group may not be reset, and a parameter whose
+//! name the service's identifier grammar does not admit is refused 400
+//! `InvalidParameterValue` before the name is resolved at all, a legal group
+//! name the account does not hold is refused 404
+//! `CacheParameterGroupNotFound`, and a parameter whose
 //! `ChangeType` the engine applies only at a restart leaves every cluster using
 //! the group owed a reboot.
 //!
@@ -292,8 +294,12 @@ async fn reset_all_parameters_puts_every_value_back() {
             &[("binding_protocol", "ascii"), ("cas_disabled", "1")][..],
         ),
     ] {
-        let group = format!("all-{family}");
-        let neighbour = format!("all-neighbour-{family}");
+        // A `CacheParameterGroupName` must be a legal identifier — letters,
+        // digits and hyphens only — so the family token is spelled with the
+        // hyphen its own line separator would be a '.' for.
+        let token = family.replace('.', "-");
+        let group = format!("all-{token}");
+        let neighbour = format!("all-neighbour-{token}");
         create_group(&emulator, &group, family).await;
         create_group(&emulator, &neighbour, family).await;
         for holder in [&group, &neighbour] {
@@ -591,16 +597,11 @@ async fn a_group_the_account_cannot_reset_is_refused() {
         removed.status, removed.body
     );
 
-    // The axis: the way the name misses — never created, created and deleted, a
-    // `default.` name of a family the service does not publish, the bare
-    // prefix, and a name that differs from a stored one by more than case.
-    for group in [
-        "no-such-group",
-        "gone",
-        "default.redis99",
-        "default.",
-        "holder-2",
-    ] {
+    // The axis: the way the name misses — never created, created and deleted,
+    // and a name that differs from a stored one by more than case. A name the
+    // identifier grammar does not admit never reaches the lookup at all; the
+    // block below covers those.
+    for group in ["no-such-group", "gone", "holder-2"] {
         let named = reset(&emulator, group, &["timeout"]).await;
         let message = refused(group, &named, 404, "CacheParameterGroupNotFound").to_string();
         assert!(
@@ -626,20 +627,49 @@ async fn a_group_the_account_cannot_reset_is_refused() {
         "CacheParameterGroupNotFound",
     );
 
-    // Every family's own default group is the service's, not the customer's:
-    // its values ARE the engine defaults, so none of its parameters can be put
-    // back to one, in either form of the request. The refusal states the rule
-    // rather than the group, which is how the service words it.
+    // The FORM of the name is applied before the name is interpreted as a
+    // group at all, so a value the service's identifier grammar does not admit
+    // is refused as the malformed parameter it is — including every family's
+    // own default group, whose name carries a '.' the grammar does not admit,
+    // and a `default.` name of a family the service does not publish. The rule
+    // the service states is wholly fixed text, naming the member and the
+    // grammar and no request value.
+    let identifier_rule = "The parameter CacheParameterGroupName is not a valid identifier. \
+                           Identifiers must begin with a letter; must contain only ASCII \
+                           letters, digits, and hyphens; and must not end with a hyphen or \
+                           contain two consecutive hyphens.";
+    let malformed: Vec<String> = state::PARAMETER_GROUP_FAMILIES
+        .iter()
+        .map(|family| format!("default.{family}"))
+        .chain([
+            "default.redis99".to_string(),
+            "default.".to_string(),
+            "9starts-with-a-digit".to_string(),
+            "two--hyphens".to_string(),
+            "ends-with-a-hyphen-".to_string(),
+            "under_scores".to_string(),
+        ])
+        .collect();
+    for group in &malformed {
+        let named = reset(&emulator, group, &["maxmemory-policy"]).await;
+        let message = refused(group, &named, 400, "InvalidParameterValue").to_string();
+        assert_eq!(
+            message, identifier_rule,
+            "case {group}: expected the service's identifier rule, got {message}"
+        );
+        // The whole-group form applies the same rule to the same name.
+        let whole = reset_all(&emulator, group).await;
+        let whole_message = refused(group, &whole, 400, "InvalidParameterValue").to_string();
+        assert_eq!(
+            whole_message, identifier_rule,
+            "case {group}: the whole-group form must state the same rule, got {whole_message}"
+        );
+    }
+
+    // Every family's own default group is the service's, not the customer's,
+    // and a refused request changed nothing on it either way.
     for family in state::PARAMETER_GROUP_FAMILIES {
         let group = format!("default.{family}");
-        let named = reset(&emulator, &group, &["maxmemory-policy"]).await;
-        let message = refused(&group, &named, 400, "InvalidParameterValue").to_string();
-        assert_eq!(
-            message, "Cannot modify a default parameter group.",
-            "case {group}: expected the service's default-group sentence, got {message}"
-        );
-        let whole = reset_all(&emulator, &group).await;
-        refused(&group, &whole, 400, "InvalidParameterValue");
         all_at_engine_default(&emulator, &group, &group).await;
     }
 

@@ -178,7 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A Global datastore is "for Valkey or Redis OSS only", so those are
         // the engines it can be moved to.
-        let engine = match input.engine.as_deref().map(crate::state::normalize_user_engine) {
+        let engine = match input
+            .engine
+            .as_deref()
+            .map(crate::state::normalize_global_datastore_engine)
+        {
             Some(Ok(engine)) => Some(engine),
             Some(Err(message)) => {
                 return Err(

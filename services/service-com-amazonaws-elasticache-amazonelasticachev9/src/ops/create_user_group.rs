@@ -177,7 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let engine = match crate::state::normalize_user_engine(&input.engine) {
+        // "Sets the engine listed in a user group. The options are valkey or
+        // redis": access control is a Valkey / Redis OSS feature, so an engine
+        // without it has no user groups to create — the capability rule the
+        // refusal states (`crate::state::normalize_access_control_engine`).
+        let engine = match crate::state::normalize_access_control_engine(&input.engine) {
             Ok(engine) => engine,
             Err(message) => {
                 return Err(CreateUserGroupErrorModeled::InvalidParameterValueException(

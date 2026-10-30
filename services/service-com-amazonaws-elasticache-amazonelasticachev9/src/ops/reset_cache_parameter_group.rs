@@ -178,6 +178,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The FORM of the name is checked before the request is interpreted at
+        // all: a value the service's identifier grammar does not admit names no
+        // group it could ever hold, so it is reported as the malformed
+        // parameter it is rather than as a group that does not exist or as one
+        // of the service's own default groups (whose names carry a `.`, which
+        // the grammar does not admit either). Worded by the one helper every
+        // identifier refusal of this service goes through
+        // (`crate::state::identifier_refusal`), the same precedence
+        // `DeleteCacheParameterGroup` applies to this member.
+        if let Some(message) = crate::state::identifier_refusal(
+            "Cache Parameter Group Name",
+            "CacheParameterGroupName",
+            &input.cache_parameter_group_name,
+            crate::state::PARAMETER_GROUP_NAME_MAX_LEN,
+        ) {
+            return Err(invalid_parameter_value(message));
+        }
+
         // "If `ResetAllParameters` is true, do not use `ParameterNameValues`. If
         // `ResetAllParameters` is false, you must specify the name of at least
         // one parameter to reset": exactly one of the two members says what is
@@ -237,7 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A family's own default group is the service's, not the customer's:
         // its values ARE the engine defaults, so no parameter of it can be put
-        // back to one.
+        // back to one. Only a name the identifier rule above admits reaches
+        // here, so this is the refusal of a legal identifier that falls in the
+        // reserved namespace.
         if name.starts_with(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX) {
             return Err(invalid_parameter_value(
                 crate::state::DEFAULT_PARAMETER_GROUP_IMMUTABLE.to_string(),

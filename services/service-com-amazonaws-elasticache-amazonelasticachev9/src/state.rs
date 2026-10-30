@@ -2568,6 +2568,18 @@ pub fn identifier_refusal(
     ))
 }
 
+/// How `CreateSnapshot` words the cache cluster it is asked to snapshot when
+/// this account holds no such cluster: `Cache cluster not found: <id>`, the
+/// resource named as PROSE rather than as the shape.
+///
+/// The snapshot creator words this fault its own way, as the two writers of
+/// parameter values word theirs (see
+/// [`parameter_writer_group_not_found_message`]); the id is reported as the
+/// request spelled it, because the message is built from the request.
+pub fn snapshot_source_cluster_not_found_message(cache_cluster_id: &str) -> String {
+    format!("Cache cluster not found: {cache_cluster_id}")
+}
+
 /// How ElastiCache words a cache cluster this account does not hold:
 /// `CacheCluster not found: <id>`.
 ///
@@ -2657,6 +2669,20 @@ pub fn parameter_writer_group_not_found_message(name: &str) -> String {
 /// values are the engine's, so there is no change to make. Stated once, so the
 /// two writers of parameter values cannot disagree about it.
 pub const DEFAULT_PARAMETER_GROUP_IMMUTABLE: &str = "Cannot modify a default parameter group.";
+
+/// How ElastiCache words a `CacheParameterGroupFamily` that names none of the
+/// families it publishes: `CacheParameterGroupFamily <family> is not a valid
+/// parameter group family.`
+///
+/// The service answers the RULE the value broke — the family vocabulary is the
+/// service's own, so a name outside it names no catalog — rather than listing
+/// the families back. The requested family is the one variable part, taken from
+/// the request. One helper, so every operation resolving a family (the engine
+/// defaults describe and the group create) words it the one way the service
+/// does; the published vocabulary itself is [`PARAMETER_GROUP_FAMILIES`].
+pub fn invalid_parameter_group_family_message(family: &str) -> String {
+    format!("CacheParameterGroupFamily {family} is not a valid parameter group family.")
+}
 
 /// How ElastiCache words a snapshot this account does not hold: the name the
 /// request asked for, which is all the service knows about a snapshot that does
@@ -2838,13 +2864,34 @@ pub enum TagTargetRejection {
     NotFound(TaggedResourceKind, String),
 }
 
+/// How many colon-separated components an ElastiCache resource ARN has:
+/// `arn:<partition>:elasticache:<region>:<account>:<type>:<name>` — the form
+/// every ARN this service mints carries (see [`parse_resource_arn`]).
+pub const RESOURCE_ARN_COMPONENTS: usize = 7;
+
+/// How ElastiCache words a `ResourceName` that names no resource of this
+/// service: it reports the STRUCTURAL rule it applied and interpolates no
+/// caller value at all.
+///
+/// The rule a value that is not ARN-shaped breaks is the component count, which
+/// is the only part of the form that can be counted without interpreting any
+/// field; a value that does carry the components but names no ElastiCache
+/// resource is answered with the rule the modelled `InvalidARNFault` itself
+/// states ("The requested Amazon Resource Name (ARN) does not refer to an
+/// existing resource"). Neither template carries the request's value, so the
+/// message is the same sentence for every caller.
+pub fn invalid_resource_arn_message(resource_arn: &str) -> String {
+    if resource_arn.split(':').count() != RESOURCE_ARN_COMPONENTS {
+        return format!("Input ARN string does not have {RESOURCE_ARN_COMPONENTS} components.");
+    }
+    "The requested Amazon Resource Name (ARN) does not refer to an existing resource.".to_string()
+}
+
 /// `resource_arn` parsed, or the `InvalidArn` rejection for a value that is not
 /// an ElastiCache resource ARN.
 fn tag_target_parts(resource_arn: &str) -> Result<ResourceArnParts<'_>, TagTargetRejection> {
     parse_resource_arn(resource_arn).ok_or_else(|| {
-        TagTargetRejection::InvalidArn(format!(
-            "{resource_arn} is not a valid ElastiCache resource ARN."
-        ))
+        TagTargetRejection::InvalidArn(invalid_resource_arn_message(resource_arn))
     })
 }
 
@@ -2973,6 +3020,32 @@ pub fn normalize_engine(engine: &str) -> Result<String, String> {
             "Invalid value {engine} for Engine: must be one of {}.",
             ENGINES.join(" | ")
         ))
+    }
+}
+
+/// How ElastiCache refuses an `Engine` a serverless cache cannot run: the
+/// CAPABILITY rule, stating that the engine named does not support serverless
+/// caches at all.
+///
+/// Wholly fixed text with no request value: the rule is about the engine's
+/// capability, not about a vocabulary the caller could pick another entry from.
+pub const SERVERLESS_ENGINE_UNSUPPORTED: &str = "Specified engine does not support serverless cache.";
+
+/// `engine` lowercased when it names an engine a serverless cache can run, else
+/// the capability refusal ([`SERVERLESS_ENGINE_UNSUPPORTED`]).
+///
+/// The engines a serverless cache runs are the ones
+/// `ModifyServerlessCache$Engine` documents ("The options are valkey, memcached
+/// or redis" \u2014 `smithy_query(query="doc", shape="ModifyServerlessCacheRequest",
+/// member="Engine")`), which is [`ENGINES`]; anything else is an engine without
+/// the capability rather than a value outside a list. One implementation, so the
+/// create and the modify of a serverless cache cannot disagree about it.
+pub fn normalize_serverless_engine(engine: &str) -> Result<String, String> {
+    let lowered = engine.to_ascii_lowercase();
+    if ENGINES.contains(&lowered.as_str()) {
+        Ok(lowered)
+    } else {
+        Err(SERVERLESS_ENGINE_UNSUPPORTED.to_string())
     }
 }
 
@@ -6856,12 +6929,41 @@ impl UpdateActionResource {
 /// not one of them.
 pub const USER_ENGINES: [&str; 2] = ["redis", "valkey"];
 
-/// `engine` lowercased, or the reason it names no engine a user can run on.
+/// How ElastiCache refuses an `Engine` that access control (RBAC) does not
+/// exist for: the CAPABILITY rule, naming the engine version from which the
+/// feature is available.
+///
+/// Wholly fixed text with no request value. The RBAC surface is "for Valkey
+/// engine version 7.2 onwards and Redis OSS 6.0 to 7.1" (the user and
+/// user-group operations' own documentation), so an engine outside it is
+/// refused for lacking the feature rather than for being outside a vocabulary
+/// the caller could pick another entry from.
+pub const ACCESS_CONTROL_ENGINE_UNSUPPORTED: &str =
+    "Access control options are available for Redis version 6.0 onwards.";
+
+/// `engine` lowercased when it names an engine access control exists for, else
+/// the capability refusal ([`ACCESS_CONTROL_ENGINE_UNSUPPORTED`]).
 ///
 /// ElastiCache stores engine names in lowercase, so the comparison and the
-/// stored value are both lowercase — the same rule [`normalize_engine`] applies
-/// to a cluster's engine, over the narrower set a user permits.
-pub fn normalize_user_engine(engine: &str) -> Result<String, String> {
+/// stored value are both lowercase. One implementation, so every operation that
+/// creates or changes a user or a user group answers the one sentence for an
+/// engine the feature does not exist for; the set itself is [`USER_ENGINES`].
+pub fn normalize_access_control_engine(engine: &str) -> Result<String, String> {
+    let lowered = engine.to_ascii_lowercase();
+    if USER_ENGINES.contains(&lowered.as_str()) {
+        Ok(lowered)
+    } else {
+        Err(ACCESS_CONTROL_ENGINE_UNSUPPORTED.to_string())
+    }
+}
+
+/// `engine` lowercased, or the reason it names no engine a Global datastore can
+/// be moved to.
+///
+/// A Global datastore is "for Valkey or Redis OSS only", so the engine set is
+/// the narrower one [`USER_ENGINES`] names; unlike the access-control surface
+/// above, the rule here IS the vocabulary, so the refusal states it.
+pub fn normalize_global_datastore_engine(engine: &str) -> Result<String, String> {
     let lowered = engine.to_ascii_lowercase();
     if USER_ENGINES.contains(&lowered.as_str()) {
         Ok(lowered)
@@ -7898,7 +8000,7 @@ pub struct UserRecord {
     /// `UserId`, as stored: "This value is stored as a lowercase string".
     pub user_id: String,
     pub user_name: String,
-    /// The engine, lowercased — see [`normalize_user_engine`].
+    /// The engine, lowercased — see [`normalize_access_control_engine`].
     pub engine: String,
     /// The ACL rule list, as [`canonical_access_string`] stores it.
     pub access_string: String,
@@ -9772,6 +9874,34 @@ pub fn user_group_state_refusal(group: &UserGroupRecord) -> Option<String> {
         format!(
             "User group {} is in status {}; it must be {} to be changed.",
             group.user_group_id, group.status, USER_STATUS_ACTIVE
+        )
+    })
+}
+
+/// `UserGroup$Status` of a group whose creation did not complete. Nothing in
+/// this emulator puts a group in it — a create either is refused or settles
+/// `active` — but it is one of the two statuses a DELETE admits, so the delete
+/// guard below names it rather than assuming `active` is the only one.
+pub const USER_GROUP_STATUS_CREATE_FAILED: &str = "create-failed";
+
+/// Why the user group cannot be DELETED at this instant, or `None` when it can.
+///
+/// A delete is not a change to the group: `InvalidUserGroupStateFault` ("the
+/// user group is not in an active state") refuses it while the group is still
+/// being created, is carrying a change the clock has not settled, or is already
+/// on its way out — but a group whose creation FAILED can be deleted, so the
+/// refusal names BOTH admissible statuses rather than only `active`. The
+/// group's own id and its current status are the variable parts; the tail
+/// states the retry condition, which is what a caller waiting to delete needs.
+pub fn user_group_delete_state_refusal(group: &UserGroupRecord) -> Option<String> {
+    let deletable = [USER_STATUS_ACTIVE, USER_GROUP_STATUS_CREATE_FAILED];
+    (!deletable.contains(&group.status.as_str())).then(|| {
+        format!(
+            "User group {} has status {}. Only {} or {} user groups can be deleted.",
+            group.user_group_id,
+            group.status,
+            USER_STATUS_ACTIVE,
+            USER_GROUP_STATUS_CREATE_FAILED
         )
     })
 }

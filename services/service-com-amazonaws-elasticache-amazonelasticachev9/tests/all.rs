@@ -192,3 +192,11 @@ mod read_validate_fidelity;
 // Appended for the same reason: the `StartMigration` suite.
 #[path = "all/start_migration.rs"]
 mod start_migration;
+
+// Appended for the same reason: the suite about WHICH rule a refusal states and
+// in whose words (the family vocabulary, the parameter-group name grammar, the
+// access-control and serverless engine capabilities, the ARN structure, the
+// snapshot creator's cluster resolution and the statuses a user-group delete
+// admits).
+#[path = "all/refusal_rule_statements.rs"]
+mod refusal_rule_statements;

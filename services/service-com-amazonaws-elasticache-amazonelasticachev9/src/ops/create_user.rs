@@ -198,8 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The options are valkey or redis": RBAC is a Valkey / Redis OSS feature,
-        // so a cluster engine that has no ACLs is not a user engine.
-        let engine = match crate::state::normalize_user_engine(&input.engine) {
+        // so a cluster engine that has no ACLs has no access control to configure —
+        // the capability rule the refusal states
+        // (`crate::state::normalize_access_control_engine`).
+        let engine = match crate::state::normalize_access_control_engine(&input.engine) {
             Ok(engine) => engine,
             Err(message) => {
                 return Err(CreateUserErrorModeled::InvalidParameterValueException(

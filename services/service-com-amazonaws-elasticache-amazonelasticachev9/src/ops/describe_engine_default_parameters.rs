@@ -206,9 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not an empty answer.
         let family = input.cache_parameter_group_family;
         let Some(parameters) = store.engine_defaults(&family) else {
-            return Err(invalid_parameter_value(format!(
-                "Invalid value {family} for CacheParameterGroupFamily."
-            )));
+            return Err(invalid_parameter_value(
+                crate::state::invalid_parameter_group_family_message(&family),
+            ));
         };
 
         // The marker is checked AGAINST the family: a token this operation did

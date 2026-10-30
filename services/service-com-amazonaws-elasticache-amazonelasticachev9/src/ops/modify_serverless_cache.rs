@@ -225,11 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored_user_group = cache.user_group_id.clone();
 
         // "Modifies the engine listed in a serverless cache request. The options
-        // are valkey, memcached or redis" — the same set a cache is created
-        // for, so one implementation decides it
-        // (`crate::state::normalize_engine`).
+        // are valkey, memcached or redis" — the same capability rule the create
+        // applies, so one implementation decides it
+        // (`crate::state::normalize_serverless_engine`).
         let engine = match input.engine.as_deref() {
-            Some(requested) => match crate::state::normalize_engine(requested) {
+            Some(requested) => match crate::state::normalize_serverless_engine(requested) {
                 Ok(engine) => engine,
                 Err(message) => return Err(invalid_value(message)),
             },

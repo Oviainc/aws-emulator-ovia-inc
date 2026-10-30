@@ -183,10 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // `InvalidUserGroupStateFault` is "the user group is not in an active
         // state": a group still being created, carrying a change the clock has
-        // not applied, or already on its way out takes no further change — the
-        // statuses a change is accepted in are stated once in
-        // `crate::state::user_group_state_refusal`.
-        if let Some(message) = crate::state::user_group_state_refusal(group) {
+        // not applied, or already on its way out cannot be deleted — and the
+        // refusal names the statuses a DELETE does admit, which a caller
+        // waiting to delete needs, stated once in
+        // `crate::state::user_group_delete_state_refusal`.
+        if let Some(message) = crate::state::user_group_delete_state_refusal(group) {
             return Err(DeleteUserGroupErrorModeled::InvalidUserGroupStateFault(
                 InvalidUserGroupStateFault {
                     message: Some(message),
