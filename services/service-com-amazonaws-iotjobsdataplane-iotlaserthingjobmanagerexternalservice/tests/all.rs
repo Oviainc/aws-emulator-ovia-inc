@@ -33,6 +33,8 @@ mod job_execution_lifecycle;
 mod job_execution_state_machine;
 #[path = "all/nested_document_completeness.rs"]
 mod nested_document_completeness;
+#[path = "all/refusals_report_the_execution_state.rs"]
+mod refusals_report_the_execution_state;
 #[path = "all/response_document_completeness.rs"]
 mod response_document_completeness;
 #[path = "all/start_next_against_a_passed_deadline.rs"]

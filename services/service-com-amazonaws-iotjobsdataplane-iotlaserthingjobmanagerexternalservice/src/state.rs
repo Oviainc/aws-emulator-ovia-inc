@@ -90,8 +90,12 @@ pub fn already_finished_message(job_id: &str, thing_name: &str, status: &str) ->
 
 /// The message of the `InvalidRequestException` (HTTP 400) an `expectedVersion` that
 /// does not match the stored version is refused with: it names BOTH versions — the
-/// one the request asked for and the one the service holds — so a device can re-read
-/// and retry without a separate `DescribeJobExecution`.
+/// one the request asked for and the one the service holds.
+///
+/// The message is only half of that refusal: the body also carries the execution's
+/// current state ([`to_execution_state`], written by
+/// `crate::ops::types::RefusalDocument`), which is what lets a device re-read and retry
+/// without a separate `DescribeJobExecution`.
 pub fn version_mismatch_message(expected: i64, stored: i64) -> String {
     format!("Expected version {expected} but found version {stored}")
 }
@@ -158,6 +162,10 @@ pub fn to_summary(record: &JobExecutionRecord) -> JobExecutionSummary {
 
 /// A stored record as the modeled `JobExecutionState`. `statusDetails` follows the
 /// same rule as in [`to_job_execution`]: no pairs, no map.
+///
+/// It is the projection BOTH an opted-in success response and a refusal decided against
+/// the stored execution report, so the state a device is refused against is the same
+/// object it would have been handed had the update been accepted.
 pub fn to_execution_state(record: &JobExecutionRecord) -> JobExecutionState {
     JobExecutionState {
         status: Some(record.status.clone()),

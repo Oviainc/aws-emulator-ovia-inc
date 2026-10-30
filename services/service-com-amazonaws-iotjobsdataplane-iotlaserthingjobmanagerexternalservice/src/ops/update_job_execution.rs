@@ -16,6 +16,12 @@
 //! so a device reporting after its own deadline is refused as having finished rather
 //! than overwriting the status the deadline already decided.
 //!
+//! Both of those refusals are decided against the STORED execution, so each reports
+//! that execution's current state in its error body — the `executionState` object the
+//! model's own documentation says such a body carries, written by
+//! [`super::types::RefusalDocument`]. A refusal decided from the request alone reports
+//! none.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -128,12 +134,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iotjobsdataplane-iotlas
 // here — hence the `UpdateJobExecutionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+//
+// The two client errors this operation decides from the STORED execution carry their
+// bodies as [`RefusalDocument`]s: the members the model declares, plus the
+// `executionState` the documentation says such a body also contains (see
+// `super::types::error_document`). Every other variant is the modelled struct itself.
 #[smithy_macros::operation_error("com.amazonaws.iotjobsdataplane#UpdateJobExecution")]
 #[derive(Debug)]
 pub enum UpdateJobExecutionErrorModeled {
     CertificateValidationException(CertificateValidationException),
-    InvalidRequestException(InvalidRequestException),
-    InvalidStateTransitionException(InvalidStateTransitionException),
+    InvalidRequestException(RefusalDocument<InvalidRequestException>),
+    InvalidStateTransitionException(RefusalDocument<InvalidStateTransitionException>),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
     ThrottlingException(ThrottlingException),
@@ -212,14 +223,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store's invariant local — only a value of the generated catalog is
         // ever written, so every stored status is classified pending or terminal.
         if !JOB_EXECUTION_STATUS_VALUES.contains(&input.status.as_str()) {
+            // Decided from the request alone, so there is no execution state to
+            // report with it.
             return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
-                InvalidRequestException {
+                RefusalDocument::message_only(InvalidRequestException {
                     message: Some(format!(
                         "status must be one of {}, got {}",
                         JOB_EXECUTION_STATUS_VALUES.join(", "),
                         input.status
                     )),
-                },
+                }),
             )
             .into());
         }
@@ -230,12 +243,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let acceptable = minutes == CANCEL_STEP_TIMER_MINUTES
                 || (MIN_STEP_TIMEOUT_MINUTES..=MAX_STEP_TIMEOUT_MINUTES).contains(&minutes);
             if !acceptable {
+                // A bound on the request's own member: no stored execution has been
+                // read yet, so this refusal reports none.
                 return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
+                    RefusalDocument::message_only(InvalidRequestException {
                         message: Some(format!(
                             "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, or {CANCEL_STEP_TIMER_MINUTES} to cancel the step timer, got {minutes}"
                         )),
-                    },
+                    }),
                 )
                 .into());
             }
@@ -279,15 +294,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (400) and not `InvalidStateTransitionException` (409), which is reserved
         // for a status the execution's own state refuses. The guard is an EXACT
         // match, not a floor: a version from the future is as wrong as a stale one.
+        //
+        // The refusal is decided against the STORED execution, so its body reports
+        // that execution's current state: "an ErrorResponse that contains the current
+        // job execution status data is returned. (This makes it unnecessary to perform
+        // a separate DescribeJobExecution request in order to obtain the job execution
+        // status data.)" — `UpdateJobExecutionRequest$expectedVersion`.
         if let Some(expected) = input.expected_version {
             if expected != record.version_number {
                 return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(crate::state::version_mismatch_message(
-                            expected,
-                            record.version_number,
-                        )),
-                    },
+                    RefusalDocument::with_execution_state(
+                        InvalidRequestException {
+                            message: Some(crate::state::version_mismatch_message(
+                                expected,
+                                record.version_number,
+                            )),
+                        },
+                        crate::state::to_execution_state(record),
+                    ),
                 )
                 .into());
             }
@@ -298,16 +322,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documents ("an attempt to change a request in state SUCCESS to state
         // IN_PROGRESS"). The 409 is what tells a client retrying after a terminal
         // transition apart from one naming an execution that does not exist (404).
+        //
+        // The status it finished in is what the device needs next, and a terminal
+        // execution's own read is refused (`DescribeJobExecution` answers 410), so the
+        // body reports the execution's state as well as the reason — "In this case, the
+        // body of the error message also contains the executionState field"
+        // (`InvalidStateTransitionException`).
         if record.is_terminal() {
             return Err(
                 UpdateJobExecutionErrorModeled::InvalidStateTransitionException(
-                    InvalidStateTransitionException {
-                        message: Some(crate::state::already_finished_message(
-                            &record.job_id,
-                            &record.thing_name,
-                            &record.status,
-                        )),
-                    },
+                    RefusalDocument::with_execution_state(
+                        InvalidStateTransitionException {
+                            message: Some(crate::state::already_finished_message(
+                                &record.job_id,
+                                &record.thing_name,
+                                &record.status,
+                            )),
+                        },
+                        crate::state::to_execution_state(record),
+                    ),
                 )
                 .into(),
             );
@@ -319,13 +352,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // or carry it forward (QUEUED straight to a terminal status included) but
         // never back — a device that already took the work up cannot return it to
         // the queue, and only queued work can be rejected. Checked before anything
-        // is written, so the refusal leaves status and version untouched.
+        // is written, so the refusal leaves status and version untouched — and the
+        // body reports the state the transition was refused against, so the device
+        // learns it without a second call.
         if let Some(reason) = record.transition_refusal(&input.status) {
             return Err(
                 UpdateJobExecutionErrorModeled::InvalidStateTransitionException(
-                    InvalidStateTransitionException {
-                        message: Some(reason),
-                    },
+                    RefusalDocument::with_execution_state(
+                        InvalidStateTransitionException {
+                            message: Some(reason),
+                        },
+                        crate::state::to_execution_state(record),
+                    ),
                 )
                 .into(),
             );
@@ -336,11 +374,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `expectedVersion`. A map the request CARRIES replaces the stored one; an
         // absent member leaves it alone ("If not specified, the statusDetails are
         // unchanged").
+        // A map outside what the record admits is the REQUEST's own fault, decided from
+        // the map it carries and nothing the execution holds, so this refusal reports
+        // no execution state.
         if let Err(reason) = record.try_replace_status_details(input.status_details.as_ref()) {
             return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
-                InvalidRequestException {
+                RefusalDocument::message_only(InvalidRequestException {
                     message: Some(reason),
-                },
+                }),
             )
             .into());
         }
