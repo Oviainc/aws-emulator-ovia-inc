@@ -2287,6 +2287,31 @@ impl EventStore {
         self.by_id.get_mut(event_id)
     }
 
+    /// The event an `eventId` names, as a reader that REPORTS it reaches one:
+    /// only while the event is still retrievable.
+    ///
+    /// An event created before the retrieval window ([`EVENT_RETRIEVAL_WINDOW`]
+    /// before `now`) is outside every query's reach, so a per-id reader answers
+    /// for it exactly as it answers for an id this store never held — nothing
+    /// a listing has dropped is reportable through an id. The window is checked
+    /// BEFORE the status transition the clock owes is materialised, so an
+    /// unreachable event is not written to on the way to being refused; a
+    /// reachable one is settled, so every reader of this store reports the same
+    /// status for it ([`StoredEvent::settle`]).
+    pub fn retrievable_mut(
+        &mut self,
+        event_id: &str,
+        now: SystemTime,
+    ) -> Option<&mut StoredEvent> {
+        let window_start = effective_window_start(None, now);
+        let event = self.by_id.get_mut(event_id)?;
+        if !within_window(event.created_timestamp, Some(window_start), None) {
+            return None;
+        }
+        event.settle(now);
+        Some(event)
+    }
+
     /// Materialise every status transition the clock has already made due, so
     /// each reader of this store reports the same status for an event (see
     /// [`StoredEvent::settle`]). A no-op for an event that owes none.

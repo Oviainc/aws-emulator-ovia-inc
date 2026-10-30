@@ -4,10 +4,12 @@
 //!
 //! IMPLEMENTED. Reports the stored automation event an `eventId` names, after
 //! materialising the status the clock has already made due for it; an id no
-//! event has is `ResourceNotFoundException` (404), and a caller whose account is
-//! not opted in to the service is refused with `OptInRequiredException` (403)
-//! ahead of that lookup (see `crate::state::…::opt_in_required`). Implemented
-//! alongside `StartAutomationEvent`, which mints the events this reads back.
+//! event has — or one naming an event created before the retrieval window, which
+//! is out of every query's reach — is `ResourceNotFoundException` (404), and a
+//! caller whose account is not opted in to the service is refused with
+//! `OptInRequiredException` (403) ahead of that lookup (see
+//! `crate::state::…::opt_in_required`). Implemented alongside
+//! `StartAutomationEvent`, which mints the events this reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -188,6 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut guard = state.lock();
+        // The clock is read AFTER the store lock is taken, so the instant this
+        // call judges the event's reachability and materialises its transition
+        // at is the instant it observes the store at.
+        let now = ::std::time::SystemTime::now();
         // The service-wide enrollment gate, AHEAD of the event lookup: an
         // account that is not opted in is refused the whole call, so it is never
         // told "no such event" when what it has to do is enroll. See
@@ -197,7 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetAutomationEventErrorModeled::OptInRequiredException(refusal).into(),
             );
         }
-        let Some(event) = guard.events.get_mut(&input.event_id) else {
+        // Only an event still inside the retrieval window is reportable, so this
+        // reader reaches one through the store's retrievable lookup: an event
+        // created before that floor is as absent as one the store never held,
+        // exactly as it is to the listings and to the step reader. That lookup
+        // also materialises the status transition the clock already owed the
+        // event — the only write a read makes, due at the event's stored instant
+        // whether or not anybody called, so nothing here is advanced BECAUSE the
+        // event was read.
+        let Some(event) = guard.events.retrievable_mut(&input.event_id, now) else {
             return Err(GetAutomationEventErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.into()),
@@ -205,10 +219,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The only write a read makes: the status transition the clock already
-        // owed this event, which was due at its stored instant whether or not
-        // anybody called. Nothing here is advanced BECAUSE the event was read.
-        event.settle(::std::time::SystemTime::now());
 
         Ok(GetAutomationEventOutput {
             event_id: Some(event.event_id.clone()),

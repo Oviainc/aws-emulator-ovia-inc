@@ -23,6 +23,8 @@ mod account_listing;
 mod automation_event_and_tagging;
 #[path = "all/automation_event_completion.rs"]
 mod automation_event_completion;
+#[path = "all/automation_event_retrieval_window.rs"]
+mod automation_event_retrieval_window;
 #[path = "all/automation_event_rollback.rs"]
 mod automation_event_rollback;
 #[path = "all/automation_event_steps.rs"]

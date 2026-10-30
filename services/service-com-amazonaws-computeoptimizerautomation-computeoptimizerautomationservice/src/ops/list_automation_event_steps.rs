@@ -206,10 +206,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call judges the event's reachability and materialises its transition
         // at is the instant it observes the store at.
         let now = ::std::time::SystemTime::now();
-        // "You can only list steps for events created within the past year": an
-        // event created before that floor is out of this operation's reach, so
-        // it is as absent as one the store never held.
-        let window_start = crate::state::effective_window_start(None, now);
         // The service-wide enrollment gate, AHEAD of the event lookup: an
         // account that is not opted in is refused the whole call, so it is never
         // told "no such event" when what it has to do is enroll. See
@@ -219,18 +215,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ListAutomationEventStepsErrorModeled::OptInRequiredException(refusal).into(),
             );
         }
-        let Some(event) = guard.events.get_mut(&input.event_id) else {
+        // "You can only list steps for events created within the past year": an
+        // event created before that floor is out of this operation's reach, so
+        // it is as absent as one the store never held. The one lookup every
+        // per-id reader of this store enters through also materialises the
+        // status transition the clock already owed this event and the step it
+        // was on, which was due at the event's stored instant whether or not
+        // anybody called. Nothing here is advanced BECAUSE the steps were read,
+        // so `GetAutomationEvent` and this reader agree on what the run reached.
+        let Some(event) = guard.events.retrievable_mut(&input.event_id, now) else {
             return Err(not_found());
         };
-        if !crate::state::within_window(event.created_timestamp, Some(window_start), None) {
-            return Err(not_found());
-        }
-        // The only write a read makes: the status transition the clock already
-        // owed this event and the step it was on, which was due at the event's
-        // stored instant whether or not anybody called. Nothing here is advanced
-        // BECAUSE the steps were read, so `GetAutomationEvent` and this reader
-        // agree on what the run reached.
-        event.settle(now);
 
         // The page walk is the one every paginated listing of this service
         // performs, entered the way a cursor enters it:
