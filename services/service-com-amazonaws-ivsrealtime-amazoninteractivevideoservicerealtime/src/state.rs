@@ -1953,9 +1953,12 @@ pub struct ParticipantRecord {
     pub participant_id: String,
     /// The customer-assigned name the token carried, when it carried one.
     pub user_id: Option<String>,
-    /// The attributes the token carried. No member of `ParticipantSummary` reports
-    /// them — `Participant$attributes` does, which `GetParticipant` reports — so they
-    /// are recorded here where the join supplies them.
+    /// The attributes the join carried: the ones its token was issued with, or — for a
+    /// replica — the ones the replication merged for it. No member of
+    /// `ParticipantSummary` reports them — `Participant$attributes` does, which
+    /// `GetParticipant` reports — so they are recorded here where the join supplies
+    /// them, and a later join of the same participant records its own
+    /// ([`join_stage_session`]).
     pub attributes: HashMap<String, String>,
     /// [`PARTICIPANT_STATE_CONNECTED`] or [`PARTICIPANT_STATE_DISCONNECTED`].
     pub state: String,
@@ -2758,7 +2761,10 @@ pub struct JoinedParticipant {
 /// A participant the session already holds REJOINS it: the model documents
 /// `firstJoinTime` as the first join and `published` as whether the participant ever
 /// published, so the record keeps its id, its first join instant and its page
-/// position, comes back to `CONNECTED`, and keeps `published` once set.
+/// position, comes back to `CONNECTED`, and keeps `published` once set. Everything else
+/// the join supplies is what the record reports from this join on — including the
+/// identity it carries, its user id and its attributes — because a record reports the
+/// connection it holds, not the one before it.
 ///
 /// The session itself is opened by [`ensure_active_session`], the one place a session
 /// of this service begins, so a participant that joins and a replica that is
@@ -2795,6 +2801,16 @@ pub fn join_stage_session(
         {
             rejoined.state = PARTICIPANT_STATE_CONNECTED.to_string();
             rejoined.published = rejoined.published || joined.published;
+            // The identity this join carries is what the record reports from now on:
+            // `attributes` is a member every join supplies, so the map it brings is the
+            // participant's whole set of attributes — an empty one means this join
+            // carries none, never that an earlier join's are kept — and a `user_id` the
+            // join names replaces the earlier one under the optional-member rule the
+            // rest of this block follows.
+            rejoined.attributes = joined.attributes.clone();
+            if joined.user_id.is_some() {
+                rejoined.user_id = joined.user_id.clone();
+            }
             if let Some(recording_state) = joined.recording_state.clone() {
                 rejoined.recording_state = recording_state;
             }
