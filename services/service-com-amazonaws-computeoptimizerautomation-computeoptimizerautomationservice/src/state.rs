@@ -2862,6 +2862,44 @@ pub fn recommended_action_types_violation(action_types: &[String]) -> Option<Str
     None
 }
 
+/// Why this rule's `ruleType` and `organizationConfiguration` do not go
+/// together, if they do not, as the service's own validation report
+/// ([`constraint_report`], which echoes no request value).
+///
+/// The configuration is the organization-wide half of a rule — the order
+/// organization rules apply in and the accounts they apply to — so the member
+/// and the `OrganizationRule` rule type stand and fall together, in BOTH
+/// directions: the type needs the configuration ("Required for OrganizationRule
+/// type", `smithy_query(query="doc",shape="CreateAutomationRuleRequest",member="organizationConfiguration")`),
+/// and the configuration names nothing for a rule type scoped to one account,
+/// where silently storing and reporting back a member that puts nothing into
+/// effect would be worse than reporting it — the same reading
+/// [`preview_selection_violation`] refuses an `organizationScope` outside that
+/// rule type by.
+///
+/// Both operations that can set either member (a create, and an update on the
+/// rule it MERGES into) judge the pair here, so the two cannot drift apart over
+/// which pairs they refuse or how they word the refusal.
+pub fn organization_configuration_violation(
+    rule_type: &str,
+    organization_configuration: Option<&OrganizationConfiguration>,
+) -> Option<String> {
+    match (
+        rule_type == "OrganizationRule",
+        organization_configuration.is_some(),
+    ) {
+        (true, false) => Some(constraint_report(
+            "organizationConfiguration",
+            "Member is required for the OrganizationRule rule type",
+        )),
+        (false, true) => Some(constraint_report(
+            "organizationConfiguration",
+            "Member is valid only for the OrganizationRule rule type",
+        )),
+        _ => None,
+    }
+}
+
 /// The cron expression a schedule expression carries: its text with the
 /// optional `cron(...)` function wrapper removed and trimmed.
 ///

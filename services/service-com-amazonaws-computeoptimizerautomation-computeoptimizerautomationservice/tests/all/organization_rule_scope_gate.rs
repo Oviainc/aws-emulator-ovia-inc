@@ -524,9 +524,20 @@ enum Answer {
     /// account the caller may not automate in.
     AccessDenied,
     /// 400 `InvalidParameterValueException`: the merged rule is one no create
-    /// could have made — an organization rule with no configuration at all.
-    NoConfiguration,
+    /// could have made, because its rule type and its organization
+    /// configuration do not go together. The payload is the requirement the
+    /// refusal must report on `organizationConfiguration`.
+    Refused(&'static str),
 }
+
+/// What a merged rule of the `OrganizationRule` type carrying no configuration
+/// is refused with.
+const CONFIGURATION_REQUIRED: &str = "Member is required for the OrganizationRule rule type";
+
+/// What a merged rule carrying a configuration outside the `OrganizationRule`
+/// type is refused with.
+const CONFIGURATION_ONLY_FOR_ORGANIZATION_RULES: &str =
+    "Member is valid only for the OrganizationRule rule type";
 
 /// A row of the retype table: the rule the update starts from, what happens to
 /// the association of the accounts that rule's stored configuration names, the
@@ -559,10 +570,12 @@ fn stored_rule(name: &str, rule_type: &str, configuration: &Value) -> Value {
     request
 }
 
-/// The table: every way an update can put a STORED scope into effect, or leave
-/// it where it is, with the association state that scope's accounts are in by
-/// the time the update lands. The rows differ along what the rule generalises
-/// over: the stored rule type, how many accounts the stored configuration names
+/// The table: every way an update can put a scope into effect, or leave it
+/// where it is, with the association state that scope's accounts are in by
+/// the time the update lands — together with the merged rules whose rule type
+/// and organization configuration do not go together, which no update may
+/// leave behind. The rows differ along what the rule generalises
+/// over: the stored rule type, how many accounts the configuration names
 /// (none, one, three, the fifty the model's
 /// `OrganizationConfigurationAccountIds` allows), where an unservable account
 /// sits in that list, the association state it is in (associated,
@@ -582,14 +595,16 @@ fn retype_rows() -> Vec<RetypeRow> {
     let corrected = member_ids(2501, 1);
     let de_escalated = member_ids(2601, 1);
     let untouched = member_ids(2701, 1);
+    let upgraded = member_ids(2801, 1);
+    let withdrawn = member_ids(2901, 1);
 
     vec![
         RetypeRow {
             // An update that asks for the organization type puts the STORED
             // configuration into effect, so it is judged on that scope — here an
             // account whose association is gone.
-            case: "retype-to-organization-with-a-disassociated-stored-scope",
-            stored_type: "AccountRule",
+            case: "re-assert-organization-with-a-disassociated-stored-scope",
+            stored_type: "OrganizationRule",
             stored_configuration: scope_configuration("BeforeAccountRules", Some(&lost)),
             associate: lost.clone(),
             then: vec![(false, lost)],
@@ -597,8 +612,8 @@ fn retype_rows() -> Vec<RetypeRow> {
             answer: Answer::AccessDenied,
         },
         RetypeRow {
-            case: "retype-to-organization-with-an-associated-stored-scope",
-            stored_type: "AccountRule",
+            case: "re-assert-organization-with-an-associated-stored-scope",
+            stored_type: "OrganizationRule",
             stored_configuration: scope_configuration("BeforeAccountRules", Some(&held)),
             associate: held.clone(),
             then: Vec::new(),
@@ -607,9 +622,9 @@ fn retype_rows() -> Vec<RetypeRow> {
         },
         RetypeRow {
             // A stored configuration naming no account names no OTHER account,
-            // so there is no association to hold the retype to.
-            case: "retype-to-organization-with-a-stored-scope-naming-no-account",
-            stored_type: "AccountRule",
+            // so there is no association to hold the re-assertion to.
+            case: "re-assert-organization-with-a-stored-scope-naming-no-account",
+            stored_type: "OrganizationRule",
             stored_configuration: scope_configuration("AfterAccountRules", None),
             associate: Vec::new(),
             then: Vec::new(),
@@ -618,8 +633,8 @@ fn retype_rows() -> Vec<RetypeRow> {
         },
         RetypeRow {
             // The caller's own account is nobody's associated member account.
-            case: "retype-to-organization-with-only-the-callers-own-account-stored",
-            stored_type: "AccountRule",
+            case: "re-assert-organization-with-only-the-callers-own-account-stored",
+            stored_type: "OrganizationRule",
             stored_configuration: scope_configuration(
                 "BeforeAccountRules",
                 Some(std::slice::from_ref(&caller)),
@@ -641,8 +656,8 @@ fn retype_rows() -> Vec<RetypeRow> {
             answer: Answer::AccessDenied,
         },
         RetypeRow {
-            case: "retype-to-organization-with-fifty-associated-stored-accounts",
-            stored_type: "AccountRule",
+            case: "re-assert-organization-with-fifty-associated-stored-accounts",
+            stored_type: "OrganizationRule",
             stored_configuration: scope_configuration("AfterAccountRules", Some(&fifty)),
             associate: fifty.clone(),
             then: Vec::new(),
@@ -652,8 +667,8 @@ fn retype_rows() -> Vec<RetypeRow> {
         RetypeRow {
             // The association is judged as it stands when the update lands, not
             // as it stood in between.
-            case: "retype-to-organization-after-a-re-association",
-            stored_type: "AccountRule",
+            case: "re-assert-organization-after-a-re-association",
+            stored_type: "OrganizationRule",
             stored_configuration: scope_configuration("BeforeAccountRules", Some(&re_associated)),
             associate: re_associated.clone(),
             then: vec![
@@ -664,11 +679,11 @@ fn retype_rows() -> Vec<RetypeRow> {
             answer: Answer::Served,
         },
         RetypeRow {
-            // The same retype, correcting the scope in the same call: the
+            // The same re-assertion, correcting the scope in the same call: the
             // configuration this request writes is the one the merged rule
             // carries, so the stale stored scope is not what is judged.
-            case: "retype-to-organization-correcting-the-scope-in-the-same-call",
-            stored_type: "AccountRule",
+            case: "re-scope-an-organization-rule-in-the-same-call",
+            stored_type: "OrganizationRule",
             stored_configuration: scope_configuration("BeforeAccountRules", Some(&corrected)),
             associate: corrected.clone(),
             then: vec![(false, corrected)],
@@ -682,15 +697,68 @@ fn retype_rows() -> Vec<RetypeRow> {
             answer: Answer::Served,
         },
         RetypeRow {
-            // Turning an organization rule into an account rule stops it
-            // applying anywhere else, so it is not held to the stale scope.
-            case: "retype-to-an-account-rule-after-a-disassociation",
+            // An account rule carries no configuration at all, so the type and
+            // the scope it puts into effect arrive in the SAME call, and the
+            // written scope is what the merged rule is judged on.
+            case: "turn-an-account-rule-into-an-organization-rule-over-an-associated-member",
+            stored_type: "AccountRule",
+            stored_configuration: Value::Null,
+            associate: upgraded.clone(),
+            then: Vec::new(),
+            update: json!({
+                "ruleType": "OrganizationRule",
+                "organizationConfiguration": {
+                    "ruleApplyOrder": "BeforeAccountRules",
+                    "accountIds": upgraded
+                }
+            }),
+            answer: Answer::Served,
+        },
+        RetypeRow {
+            case: "turn-an-account-rule-into-an-organization-rule-over-a-disassociated-member",
+            stored_type: "AccountRule",
+            stored_configuration: Value::Null,
+            associate: withdrawn.clone(),
+            then: vec![(false, withdrawn.clone())],
+            update: json!({
+                "ruleType": "OrganizationRule",
+                "organizationConfiguration": {
+                    "ruleApplyOrder": "AfterAccountRules",
+                    "accountIds": withdrawn
+                }
+            }),
+            answer: Answer::AccessDenied,
+        },
+        RetypeRow {
+            // Turning an organization rule into an account rule would leave the
+            // merged rule carrying a configuration the account type puts
+            // nothing into effect with, which is a rule no create could have
+            // made either — so the stale scope is not silently kept.
+            case: "retype-to-an-account-rule-with-a-stored-configuration",
             stored_type: "OrganizationRule",
             stored_configuration: scope_configuration("BeforeAccountRules", Some(&de_escalated)),
             associate: de_escalated.clone(),
             then: vec![(false, de_escalated)],
             update: json!({"ruleType": "AccountRule"}),
-            answer: Answer::Served,
+            answer: Answer::Refused(CONFIGURATION_ONLY_FOR_ORGANIZATION_RULES),
+        },
+        RetypeRow {
+            // The same clause the other way round: writing a configuration onto
+            // a rule that stays an account rule. The scope is the caller's own
+            // account, which every caller may automate in, so what the row is
+            // judged on is the clause and not the association gate.
+            case: "write-a-configuration-onto-a-stored-account-rule",
+            stored_type: "AccountRule",
+            stored_configuration: Value::Null,
+            associate: Vec::new(),
+            then: Vec::new(),
+            update: json!({
+                "organizationConfiguration": {
+                    "ruleApplyOrder": "BeforeAccountRules",
+                    "accountIds": [caller.clone()]
+                }
+            }),
+            answer: Answer::Refused(CONFIGURATION_ONLY_FOR_ORGANIZATION_RULES),
         },
         RetypeRow {
             // An update that writes neither member re-points nothing: a
@@ -713,7 +781,7 @@ fn retype_rows() -> Vec<RetypeRow> {
             associate: Vec::new(),
             then: Vec::new(),
             update: json!({"ruleType": "OrganizationRule"}),
-            answer: Answer::NoConfiguration,
+            answer: Answer::Refused(CONFIGURATION_REQUIRED),
         },
     ]
 }
@@ -762,7 +830,7 @@ async fn an_update_that_turns_a_rule_into_an_organization_rule_is_held_to_the_sc
                 );
             }
             Answer::AccessDenied => assert_access_denied(answer, case),
-            Answer::NoConfiguration => {
+            Answer::Refused(requirement) => {
                 let (status, body) = answer;
                 assert_refused(
                     (status, body.clone()),
@@ -772,12 +840,9 @@ async fn an_update_that_turns_a_rule_into_an_organization_rule_is_held_to_the_sc
                 );
                 assert_eq!(
                     string_member(&body, "message"),
-                    state::constraint_report(
-                        "organizationConfiguration",
-                        "Member is required for the OrganizationRule rule type"
-                    ),
-                    "case {case:?}: the refusal must report the member the merged rule lacks, \
-                     got {body}"
+                    state::constraint_report("organizationConfiguration", requirement),
+                    "case {case:?}: the refusal must report what the merged rule's \
+                     configuration fails, got {body}"
                 );
             }
         }

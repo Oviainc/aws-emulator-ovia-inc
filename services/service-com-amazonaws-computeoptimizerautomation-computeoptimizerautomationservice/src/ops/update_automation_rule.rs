@@ -361,20 +361,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 rule.rule_revision,
             )));
         }
-        // The merged rule must still satisfy the rules a create does: an
-        // `OrganizationRule` needs an organization configuration, whether it
-        // arrives in this request or is already stored. (The accounts that
-        // configuration names were judged above, ahead of the token ledger.)
+        // The merged rule must still satisfy the rules a create does: its
+        // `ruleType` and its organization configuration have to go together,
+        // whichever of the two this request replaces and whichever it leaves as
+        // stored. (The accounts that configuration names were judged above,
+        // ahead of the token ledger.)
         let merged_rule_type = input.rule_type.clone().unwrap_or(rule.rule_type.clone());
         let merged_org_config = input
             .organization_configuration
             .clone()
             .or_else(|| rule.organization_configuration.clone());
-        if merged_rule_type == "OrganizationRule" && merged_org_config.is_none() {
-            return Err(invalid_parameter(crate::state::constraint_report(
-                "organizationConfiguration",
-                "Member is required for the OrganizationRule rule type",
-            )));
+        if let Some(report) = crate::state::organization_configuration_violation(
+            &merged_rule_type,
+            merged_org_config.as_ref(),
+        ) {
+            return Err(invalid_parameter(report));
         }
 
         let updated_at = crate::state::now();

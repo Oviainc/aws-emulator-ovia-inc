@@ -65,6 +65,8 @@ mod member_account_initiation_gate;
 mod membership_page_token_spellings;
 #[path = "all/not_found_wording.rs"]
 mod not_found_wording;
+#[path = "all/organization_configuration_rule_type.rs"]
+mod organization_configuration_rule_type;
 #[path = "all/organization_rule_scope_gate.rs"]
 mod organization_rule_scope_gate;
 #[path = "all/page_cursor_spellings.rs"]

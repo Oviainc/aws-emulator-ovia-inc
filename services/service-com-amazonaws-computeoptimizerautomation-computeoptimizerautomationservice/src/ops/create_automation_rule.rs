@@ -418,7 +418,9 @@ fn access_denied() -> CreateAutomationRuleError {
 ///
 /// * `name` — "Must be 1-128 characters long" (the `@length` on `RuleName` has
 ///   `min: 0`, so the boundary admits an empty name).
-/// * `organizationConfiguration` — "Required for OrganizationRule type."
+/// * `organizationConfiguration` — the member and the `OrganizationRule` rule
+///   type stand and fall together, in both directions
+///   ([`crate::state::organization_configuration_violation`]).
 /// * `priority` — "a decimal number between 0 and 1 (having up to 30 digits
 ///   after the decimal point)"; the member is a plain `String`.
 /// * `recommendedActionTypes` — the action types the rule executes, so an empty
@@ -446,11 +448,11 @@ fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
             "Member must have length greater than or equal to 1",
         ));
     }
-    if input.rule_type == "OrganizationRule" && input.organization_configuration.is_none() {
-        return Some(crate::state::constraint_report(
-            "organizationConfiguration",
-            "Member is required for the OrganizationRule rule type",
-        ));
+    if let Some(report) = crate::state::organization_configuration_violation(
+        &input.rule_type,
+        input.organization_configuration.as_ref(),
+    ) {
+        return Some(report);
     }
     if let Some(priority) = input.priority.as_deref() {
         if !crate::state::priority_is_valid(priority) {
