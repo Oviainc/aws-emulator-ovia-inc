@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPortals
-//! IMPLEMENTED: reports one page of the persisted portals in `PortalId` order.
-//! This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports one page of the persisted portals, oldest first — the order the
+//! account created them in. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +154,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A reporting operation: it reads the store and writes nothing, so a later
         // caller sees exactly what this one saw.
         let store = state.lock();
-        let (page, next_token) = crate::state::page(
+        let scope = crate::state::page_scope(&["portals"]);
+        let position = crate::state::page_position(&scope, input.next_token.as_deref()).map_err(
+            |message| -> Self::Error {
+                ListPortalsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into()
+            },
+        )?;
+        // Oldest first: the account's portals are reported in the order it created them,
+        // which a minted `PortalId` does not carry (see `crate::state::CreatedInOrder`).
+        let (page, next_token) = crate::state::page_in_creation_order(
             &store.portals,
-            &crate::state::page_scope(&["portals"]),
-            input.next_token.as_deref(),
+            &scope,
+            position,
             max_results,
-        )
-        .map_err(|message| -> Self::Error {
-            ListPortalsErrorModeled::BadRequestException(BadRequestException {
-                message: Some(message),
-            })
-            .into()
-        })?;
+        );
 
         // Projected as of the clock, exactly as the single-portal reader projects it: a
         // publish, disable or preview build the service already owes a portal is

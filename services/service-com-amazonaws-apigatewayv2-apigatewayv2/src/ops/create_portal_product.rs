@@ -194,11 +194,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::PortalProduct {
             portal_product_arn: crate::state::portal_product_arn(&region, &portal_product_id),
             portal_product_id: portal_product_id.clone(),
+            // The seed the id was just minted from counts the products this account has
+            // created, so it IS this product's position in that order — what
+            // `ListPortalProducts` reports the collection in, since the minted id carries
+            // no ordering of its own.
+            creation_order: store.portal_product_id_seed,
             display_name: input.display_name,
             description: input.description,
             // A freshly created product owns no product pages and no product REST
-            // endpoint pages, so there is no ordering of them to report yet: nothing is
-            // invented for a member nothing has been added under.
+            // endpoint pages, so nothing orders them yet: the record stores no ordering
+            // of its own, and the readers report the EMPTY ordering a product in that
+            // state has (see `crate::state::PortalProduct::to_wire`).
             display_order: None,
             last_modified: ::std::time::SystemTime::now(),
             tags: input.tags.unwrap_or_default().into_iter().collect(),

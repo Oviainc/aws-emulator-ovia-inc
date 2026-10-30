@@ -2867,6 +2867,11 @@ impl PortalBuild {
 pub struct Portal {
     pub portal_id: String,
     pub portal_arn: String,
+    /// This portal's position in the order the account created its portals: the seed
+    /// [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_portal_id`] minted its id from,
+    /// which counts the portals created before it. `ListPortals` reports the collection
+    /// in this order (see [`CreatedInOrder`]), because a minted `PortalId` carries none.
+    pub creation_order: u64,
     /// The authorization the create accepted: exactly one of its alternatives, see
     /// [`validate_exclusive_choice`].
     pub authorization: wire::Authorization,
@@ -3138,6 +3143,12 @@ impl Portal {
     }
 }
 
+impl CreatedInOrder for Portal {
+    fn creation_order(&self) -> u64 {
+        self.creation_order
+    }
+}
+
 /// The most portal products one account may hold, after which CreatePortalProduct is
 /// refused.
 ///
@@ -3181,24 +3192,60 @@ pub const RESOURCE_OWNER_VALUES: &[&str] = &["OTHER_ACCOUNTS", "SELF"];
 /// else's.
 pub const OTHER_ACCOUNTS_RESOURCE_OWNER: &str = "OTHER_ACCOUNTS";
 
-/// Which portal products a `ResourceOwner` selects, or the message for the operation's
-/// `BadRequestException` when the value names no owner at all.
+/// Which GROUPS of portal products a request's `ResourceOwner` selects.
 ///
-/// `true` is "the products this account owns", which is what a request naming no owner
-/// gets: `SELF` is the owner a collection reader reports when the caller does not choose
-/// one, since the products an account can enumerate without naming an owner are its own.
-/// TOTAL over its input, so every string a caller can send either selects one of the two
-/// owners or is refused.
-pub fn resource_owner_selects_own_products(requested: Option<&str>) -> Result<bool, String> {
+/// The products an account can see fall into two groups — the ones it OWNS and the ones
+/// other accounts have SHARED with it through a product's sharing policy
+/// (`PutPortalProductSharingPolicy`) — and the collection reader enumerates the groups
+/// the request selects one after the other, so which groups those are is what decides
+/// both what a page reports and whether another group is left to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedProductOwners {
+    /// Whether the walk reports the products THIS account owns.
+    pub owned: bool,
+    /// Whether the walk reports the products other accounts shared with this one.
+    pub shared: bool,
+}
+
+/// Which groups of portal products a `ResourceOwner` selects, or the message for the
+/// operation's `BadRequestException` when the value names no owner at all.
+///
+/// A request naming NO owner enumerates everything the account can see: its own products
+/// and then those shared with it. Naming one owner restricts the walk to that owner's
+/// group. TOTAL over its input, so every string a caller can send either selects a group
+/// or is refused.
+pub fn resource_owner_selects(requested: Option<&str>) -> Result<SelectedProductOwners, String> {
     match requested {
-        None => Ok(true),
-        Some(OTHER_ACCOUNTS_RESOURCE_OWNER) => Ok(false),
-        Some(owner) if RESOURCE_OWNER_VALUES.contains(&owner) => Ok(true),
+        None => Ok(SelectedProductOwners {
+            owned: true,
+            shared: true,
+        }),
+        Some(OTHER_ACCOUNTS_RESOURCE_OWNER) => Ok(SelectedProductOwners {
+            owned: false,
+            shared: true,
+        }),
+        Some(owner) if RESOURCE_OWNER_VALUES.contains(&owner) => Ok(SelectedProductOwners {
+            owned: true,
+            shared: false,
+        }),
         Some(owner) => Err(format!(
             "Invalid value for ResourceOwner: '{owner}'. Valid values are: {}.",
             RESOURCE_OWNER_VALUES.join(", ")
         )),
     }
+}
+
+/// The pagination scope of the portal products this account OWNS: the first group
+/// `ListPortalProducts` walks, and the collection whose `NextToken`s resume it.
+pub fn owned_portal_products_scope() -> String {
+    page_scope(&["portalproducts"])
+}
+
+/// The pagination scope of the portal products other accounts have SHARED with this one:
+/// the group `ListPortalProducts` walks AFTER the account's own, so a token issued for it
+/// is what starts that second group.
+pub fn shared_portal_products_scope() -> String {
+    page_scope(&["portalproducts", OTHER_ACCOUNTS_RESOURCE_OWNER])
 }
 
 /// A persisted `PortalProduct` resource.
@@ -3209,6 +3256,13 @@ pub fn resource_owner_selects_own_products(requested: Option<&str>) -> Result<bo
 #[derive(Debug, Clone)]
 pub struct PortalProduct {
     pub portal_product_id: String,
+    /// This product's position in the order the account created its portal products: the
+    /// seed
+    /// [`ComAmazonawsApigatewayv2Apigatewayv2State::mint_portal_product_id`] minted its
+    /// id from, which counts the products created before it. `ListPortalProducts` reports
+    /// the collection in this order (see [`CreatedInOrder`]), because a minted
+    /// `PortalProductId` carries none.
+    pub creation_order: u64,
     /// The ARN every reader reports, built once at create time by
     /// [`portal_product_arn`] from the Region the creating request addressed: an ARN
     /// names the Region its resource was created in, so it cannot be rebuilt per read
@@ -3331,7 +3385,7 @@ impl PortalProduct {
         PortalProductView {
             description: self.description.clone(),
             display_name: Some(self.display_name.clone()),
-            display_order: self.display_order.clone(),
+            display_order: Some(display_order_view(self.display_order.as_ref())),
             last_modified: Some(to_timestamp(self.last_modified)),
             portal_product_arn: Some(self.portal_product_arn.clone()),
             portal_product_id: Some(self.portal_product_id.clone()),
@@ -3342,6 +3396,32 @@ impl PortalProduct {
                     .collect(),
             ),
         }
+    }
+}
+
+impl CreatedInOrder for PortalProduct {
+    fn creation_order(&self) -> u64 {
+        self.creation_order
+    }
+}
+
+/// The `DisplayOrder` a portal product reports, from the one it stores.
+///
+/// A product ALWAYS has a display order to report: "the visual ordering of the product
+/// pages and product REST endpoint pages in a published portal"
+/// (`PortalProduct$DisplayOrder`) of a product whose pages nothing has ordered is the
+/// EMPTY ordering, not the absence of one — so its two collection members
+/// (`DisplayOrder$Contents`, `DisplayOrder$ProductPageArns`) are reported as empty lists
+/// rather than left out, and a stored order that named only one of them reports the other
+/// the same way. `DisplayOrder$OverviewPageArn` is a single ARN rather than a collection,
+/// so a product with no overview page reports none: an empty list is a collection holding
+/// nothing, while there is no such thing as an ARN naming nothing.
+fn display_order_view(stored: Option<&wire::DisplayOrder>) -> wire::DisplayOrder {
+    let stored = stored.cloned().unwrap_or_default();
+    wire::DisplayOrder {
+        contents: Some(stored.contents.unwrap_or_default()),
+        overview_page_arn: stored.overview_page_arn,
+        product_page_arns: Some(stored.product_page_arns.unwrap_or_default()),
     }
 }
 
@@ -4735,6 +4815,25 @@ pub use paging::page_scope;
 
 /// One page of a key-ordered collection — see [`paging::page`].
 pub use paging::page;
+
+/// One page of a collection in the order its records were created — see
+/// [`paging::page_in_creation_order`].
+pub use paging::page_in_creation_order;
+
+/// The position a caller-supplied `NextToken` resumes a creation-ordered collection at —
+/// see [`paging::page_position`].
+pub use paging::page_position;
+
+/// Whether a token is one this service issued for a collection — see
+/// [`paging::token_is_for_scope`].
+pub use paging::token_is_for_scope;
+
+/// The token that resumes a collection at its first record — see
+/// [`paging::first_page_token`].
+pub use paging::first_page_token;
+
+/// A record a collection reader reports in creation order — see [`paging::CreatedInOrder`].
+pub use paging::CreatedInOrder;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

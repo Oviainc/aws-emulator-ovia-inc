@@ -6,7 +6,8 @@
 //!
 //! > `ListPortals` reports the `Portal` records the account holds, each one exactly as
 //! > the store holds it — the same projection the single-portal reader serves, settled
-//! > as of the clock — in `PortalId` order, in a page of at most `MaxResults` items (and
+//! > as of the clock — OLDEST FIRST, in the order the account created them, in a page of
+//! > at most `MaxResults` items (and
 //! > never more than the service's page maximum) chained through `NextToken`, so walking
 //! > the chain yields every portal exactly once whatever page size the caller asks for; a
 //! > `MaxResults` that is not a positive integer and a `NextToken` this service did not
@@ -146,9 +147,11 @@ async fn list_portals_pages_every_portal_exactly_once_at_every_page_size() {
     // walks both: each count is paged at every size from 1 up to one past it.
     for total in [0_usize, 1, 2, 5, 12] {
         let emulator = emulator();
-        let mut expected = BTreeSet::new();
+        // In CREATION order, which is the order the chain must report them in: a minted
+        // `PortalId` carries no ordering, so the ids below are in no particular order.
+        let mut created: Vec<String> = Vec::new();
         for index in 0..total {
-            expected.insert(
+            created.push(
                 create_plain_portal(
                     &emulator,
                     &format!("total={total}, portal #{index}"),
@@ -157,6 +160,7 @@ async fn list_portals_pages_every_portal_exactly_once_at_every_page_size() {
                 .await,
             );
         }
+        let expected: BTreeSet<String> = created.iter().cloned().collect();
 
         for page_size in 1..=total + 1 {
             let label = format!("total={total}, maxResults={page_size}");
@@ -171,11 +175,10 @@ async fn list_portals_pages_every_portal_exactly_once_at_every_page_size() {
                 expected,
                 "case {label:?}: expected exactly the stored portals, got {seen:?}"
             );
-            let mut sorted = seen.clone();
-            sorted.sort();
             assert_eq!(
-                seen, sorted,
-                "case {label:?}: expected the chain in PortalId order, got {seen:?}"
+                seen, created,
+                "case {label:?}: expected the chain oldest first, got {seen:?} against the \
+                 created order {created:?}"
             );
         }
 

@@ -126,6 +126,93 @@ fn decode_page_token(scope: &str, token: &str) -> Result<String, String> {
     Ok(key.to_string())
 }
 
+/// A record whose collection reader reports it in the order the account CREATED it,
+/// rather than in the order of the identifier the service minted for it.
+///
+/// A minted identifier carries no ordering — it is drawn from a bijection over the id
+/// space, so the identifier of the record created second may sort before the first's —
+/// which is why a reader that has to report a collection oldest-first needs the record's
+/// own position in that order.
+pub trait CreatedInOrder {
+    /// This record's position in the order its collection was created in. Strictly
+    /// increasing within one collection, so no two records share a position and the
+    /// order the reader walks is total.
+    fn creation_order(&self) -> u64;
+}
+
+/// The position in `scope` a caller-supplied `NextToken` resumes at, or the refusal of a
+/// token this service did not issue for that collection; `None` for a request carrying
+/// none, which starts at the beginning.
+///
+/// Split from [`page_in_creation_order`] so a reader that walks more than one collection
+/// resolves the position once and still refuses an unissued token whatever it goes on to
+/// report.
+pub fn page_position(scope: &str, next_token: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(token) = next_token else {
+        return Ok(None);
+    };
+    let key = decode_page_token(scope, token)?;
+    // A token this service minted for a creation-ordered collection carries a decimal
+    // position; anything else is not one of its own, however well-formed the rest is.
+    key.parse::<u64>()
+        .map(Some)
+        .map_err(|_| INVALID_NEXT_TOKEN_MESSAGE.to_string())
+}
+
+/// Whether `token` is one this service issued for `scope`.
+///
+/// The check a reader with more than one collection to walk makes to decide WHICH of them
+/// a token resumes: a token travels with the collection it was issued for (see
+/// [`encode_page_token`]), so this answers that question without reading the position out
+/// of it.
+pub fn token_is_for_scope(scope: &str, token: &str) -> bool {
+    decode_page_token(scope, token).is_ok()
+}
+
+/// The token that resumes `scope` at its FIRST record: the position before every
+/// creation-ordered record there is.
+///
+/// What a reader hands back when the collection it has just finished is not the last one
+/// its walk covers, so the caller's next request continues in the next collection rather
+/// than starting the walk again.
+pub fn first_page_token(scope: &str) -> String {
+    encode_page_token(scope, &FIRST_POSITION.to_string())
+}
+
+/// The position [`first_page_token`] resumes at: below every record's, since a collection
+/// counts the records it creates from one.
+const FIRST_POSITION: u64 = 0;
+
+/// One page of the collection `scope`, in the order its records were created.
+///
+/// Walks `items` oldest-first from `position` (exclusive of everything before it) and
+/// takes at most `max_results`, so the page a request can obtain is capped by the page
+/// size its handler resolved. The returned token resumes at the first record that did NOT
+/// fit, so it is present only when more of THIS collection remains; a reader whose walk
+/// covers another collection after this one decides what to report when it is absent.
+///
+/// The order is read off the records rather than off the map's keys, so one page costs a
+/// sort of the collection — bounded, because every collection served this way is itself
+/// bounded server-side (a store's growth bound, e.g. `crate::state::MAX_PORTAL_PRODUCTS`,
+/// caps how many records there can be to sort).
+pub fn page_in_creation_order<'a, V: CreatedInOrder>(
+    items: &'a BTreeMap<String, V>,
+    scope: &str,
+    position: Option<u64>,
+    max_results: usize,
+) -> (Vec<&'a V>, Option<String>) {
+    let mut ordered: Vec<&V> = items.values().collect();
+    ordered.sort_by_key(|record| record.creation_order());
+    let mut rest = ordered
+        .into_iter()
+        .skip_while(|record| position.is_some_and(|from| record.creation_order() < from));
+    let page: Vec<&V> = rest.by_ref().take(max_results).collect();
+    let token = rest
+        .next()
+        .map(|record| encode_page_token(scope, &record.creation_order().to_string()));
+    (page, token)
+}
+
 /// One page of the key-ordered collection `scope`.
 ///
 /// Walks `items` in key order from where `next_token` left off (inclusive) and takes at
@@ -165,7 +252,10 @@ pub fn page<'a, V>(
 
 #[cfg(test)]
 mod tests {
-    use super::{page, page_scope, parse_max_results, resolve_max_results, MAX_PAGE_SIZE};
+    use super::{
+        first_page_token, page, page_in_creation_order, page_position, page_scope,
+        parse_max_results, resolve_max_results, token_is_for_scope, CreatedInOrder, MAX_PAGE_SIZE,
+    };
     use std::collections::BTreeMap;
 
     /// A collection of `count` records, keyed the way the store keys its children.
@@ -173,6 +263,137 @@ mod tests {
         (0..count)
             .map(|index| (format!("key{index:04}"), index))
             .collect()
+    }
+
+    /// A record of a creation-ordered collection: its position in the creation order, and
+    /// the key it is stored under.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Created {
+        order: u64,
+        key: String,
+    }
+
+    impl CreatedInOrder for Created {
+        fn creation_order(&self) -> u64 {
+            self.order
+        }
+    }
+
+    /// A collection of `count` records whose KEY order is the REVERSE of their creation
+    /// order, so a reader that walks keys and one that walks creation order cannot agree
+    /// by accident.
+    fn created_collection(count: u64) -> BTreeMap<String, Created> {
+        (1..=count)
+            .map(|order| {
+                let key = format!("key{:04}", count - order);
+                (
+                    key.clone(),
+                    Created {
+                        order,
+                        key: key.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_creation_ordered_page_reports_the_oldest_record_first() {
+        let items = created_collection(5);
+        let scope = page_scope(&["portals"]);
+        let (page, token) = page_in_creation_order(&items, &scope, None, 100);
+        let seen: Vec<u64> = page.iter().map(|record| record.order).collect();
+        assert_eq!(
+            seen,
+            vec![1, 2, 3, 4, 5],
+            "expected the records oldest first whatever their keys sort like, got {seen:?}"
+        );
+        assert_eq!(
+            token, None,
+            "expected nothing left to resume at the end of the walk, got {token:?}"
+        );
+    }
+
+    #[test]
+    fn a_creation_ordered_walk_resumed_by_its_own_token_reports_every_record_once() {
+        let items = created_collection(23);
+        let scope = page_scope(&["portalproducts"]);
+        for page_size in [1_usize, 2, 7, 23, 24] {
+            let mut seen: Vec<u64> = Vec::new();
+            let mut next_token: Option<String> = None;
+            loop {
+                let position = page_position(&scope, next_token.as_deref())
+                    .expect("the token is this walk's own");
+                let (records, token) =
+                    page_in_creation_order(&items, &scope, position, page_size);
+                assert!(
+                    records.len() <= page_size,
+                    "case {page_size}: expected at most the page size, got {}",
+                    records.len()
+                );
+                seen.extend(records.iter().map(|record| record.order));
+                match token {
+                    Some(token) => next_token = Some(token),
+                    None => break,
+                }
+            }
+            let expected: Vec<u64> = (1..=23).collect();
+            assert_eq!(
+                seen, expected,
+                "case {page_size}: expected every record once in creation order, got {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_page_token_of_a_collection_resumes_it_at_its_oldest_record() {
+        let items = created_collection(3);
+        let scope = page_scope(&["portalproducts", "OTHER_ACCOUNTS"]);
+        let token = first_page_token(&scope);
+        assert!(
+            token_is_for_scope(&scope, &token),
+            "expected the collection to recognise its own first-page token, got {token:?}"
+        );
+        assert!(
+            !token_is_for_scope(&page_scope(&["portalproducts"]), &token),
+            "expected another collection not to recognise it, got {token:?}"
+        );
+        let position = page_position(&scope, Some(&token)).expect("its own token");
+        let (records, _) = page_in_creation_order(&items, &scope, position, 100);
+        let seen: Vec<&String> = records.iter().map(|record| &record.key).collect();
+        assert_eq!(
+            seen.len(),
+            items.len(),
+            "expected the whole collection from its first page, got {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_creation_ordered_reader_refuses_a_position_it_did_not_issue() {
+        let scope = page_scope(&["portals"]);
+        // The rows span what can arrive in place of a position this reader issued: text
+        // that is not hex, hex carrying no separator, a token issued for another
+        // collection, a token whose key is no position at all, and nothing.
+        let other = page_scope(&["portalproducts"]);
+        let rows: Vec<(&str, String)> = vec![
+            ("text that is not hex", "not-a-token".to_string()),
+            ("hex carrying no separator", ::hex::encode("no separator")),
+            ("another collection's token", first_page_token(&other)),
+            (
+                "a key that is no position",
+                ::hex::encode(format!("{scope}\u{1f}somewhere")),
+            ),
+            ("a negative position", ::hex::encode(format!("{scope}\u{1f}-1"))),
+            ("the empty token", String::new()),
+        ];
+        for (case, token) in rows {
+            let refused = page_position(&scope, Some(&token));
+            assert!(
+                refused.is_err(),
+                "case {case:?}: expected the refusal of a position this reader never \
+                 issued, got {refused:?}"
+            );
+        }
     }
 
     #[test]

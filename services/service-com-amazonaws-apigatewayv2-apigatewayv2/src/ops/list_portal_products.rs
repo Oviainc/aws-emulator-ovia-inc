@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPortalProducts
-//! IMPLEMENTED: reports one page of the persisted portal products in `PortalProductId`
-//! order. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports one page of the persisted portal products, oldest first — the
+//! order the account created them in — and resumes the walk in the group of products
+//! other accounts shared with it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,12 +153,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // readers of this service resolve them.
         let max_results = crate::state::parse_max_results(input.max_results.as_deref())
             .map_err(bad_request)?;
-        // "The resource owner of the portal product" selects WHOSE products to report;
-        // see `crate::state::OTHER_ACCOUNTS_RESOURCE_OWNER` for why this emulator's one
-        // account owns every product it holds.
-        let own_products =
-            crate::state::resource_owner_selects_own_products(input.resource_owner.as_deref())
-                .map_err(bad_request)?;
+        // "The resource owner of the portal product" selects WHOSE products to report:
+        // the ones this account owns, the ones other accounts shared with it, or — for a
+        // request naming no owner — both, in that order.
+        let owners = crate::state::resource_owner_selects(input.resource_owner.as_deref())
+            .map_err(bad_request)?;
+
+        // The products an account can see are enumerated one GROUP after the other — the
+        // products it owns, then the products other accounts shared with it — so a walk
+        // that was not restricted to one owner still has the shared group left to report
+        // when the account's own products run out, and the token the last page of the
+        // first group carries is what starts the second. A client therefore sees a
+        // `NextToken` on the page that already holds the last product it owns, and the
+        // walk ends on the group that has nothing after it.
+        let owned_scope = crate::state::owned_portal_products_scope();
+        let shared_scope = crate::state::shared_portal_products_scope();
+
+        // The group this page continues, and the refusal of a token that names a position
+        // in neither. A token travels with the group it was issued for, so the shared
+        // group is the one that recognises its own tokens and every other token has to be
+        // one the owned group issued — and a position in a group this request's walk does
+        // not cover is no position in that walk, so the token is refused rather than
+        // answered with a page of some other group. The refusal is the one sentence this
+        // service refuses every unreadable position with, whichever owner was asked for.
+        let carried = input.next_token.as_deref();
+        if let Some(token) = carried {
+            if crate::state::token_is_for_scope(&shared_scope, token) {
+                if !owners.shared {
+                    return Err(bad_request(
+                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                    ));
+                }
+                // This emulator serves one account and every product it holds was created
+                // by that account's own call, so no other account has shared one with it:
+                // the shared group reports nothing, and nothing follows it to resume.
+                return Ok(ListPortalProductsOutput {
+                    items: Some(::std::vec::Vec::new()),
+                    next_token: ::std::option::Option::None,
+                });
+            }
+            if !owners.owned {
+                return Err(bad_request(
+                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                ));
+            }
+        }
+        if !owners.owned {
+            // Only the shared group was selected, and it holds nothing.
+            return Ok(ListPortalProductsOutput {
+                items: Some(::std::vec::Vec::new()),
+                next_token: ::std::option::Option::None,
+            });
+        }
+        // Not the shared group's and not one of the two groups' to skip: the position has
+        // to be one the owned group issued, which is what this reads out of it.
+        let position = crate::state::page_position(&owned_scope, carried).map_err(bad_request)?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator — see the note in `create_api`.
@@ -169,27 +219,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller sees exactly what this one saw.
         let store = state.lock();
 
-        // A page of the products owned elsewhere is a page of nothing — and a walk of
-        // nothing has nothing to resume — but a token the request carries is still one
-        // this collection has to have issued, so the refusal of a token does not depend
-        // on which owner was asked for.
-        let (page, next_token) = crate::state::page(
+        // Oldest first: the account's products are reported in the order it created them,
+        // which a minted `PortalProductId` does not carry (see
+        // `crate::state::CreatedInOrder`).
+        let (page, remaining) = crate::state::page_in_creation_order(
             &store.portal_products,
-            &crate::state::page_scope(&["portalproducts"]),
-            input.next_token.as_deref(),
+            &owned_scope,
+            position,
             max_results,
-        )
-        .map_err(bad_request)?;
-
-        let (items, next_token) = if own_products {
-            (
-                page.into_iter()
-                    .map(crate::state::PortalProduct::to_summary)
-                    .collect(),
-                next_token,
-            )
-        } else {
-            (::std::vec::Vec::new(), ::std::option::Option::None)
+        );
+        let items = page
+            .into_iter()
+            .map(crate::state::PortalProduct::to_summary)
+            .collect();
+        // While products this account owns remain, the walk resumes in this group; once
+        // they are exhausted it resumes at the start of the shared group, unless the
+        // request restricted the walk to the account's own products, in which case the
+        // group just finished is the last one there is.
+        let next_token = match remaining {
+            Some(token) => Some(token),
+            None if owners.shared => Some(crate::state::first_page_token(&shared_scope)),
+            None => ::std::option::Option::None,
         };
         Ok(ListPortalProductsOutput {
             items: Some(items),

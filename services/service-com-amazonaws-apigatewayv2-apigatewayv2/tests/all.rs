@@ -103,6 +103,8 @@ mod portal_lifecycle;
 mod portal_pagination;
 #[path = "all/portal_product_lifecycle.rs"]
 mod portal_product_lifecycle;
+#[path = "all/portal_product_listing_order.rs"]
+mod portal_product_listing_order;
 #[path = "all/portal_product_pagination.rs"]
 mod portal_product_pagination;
 #[path = "all/portal_product_sharing_policy.rs"]

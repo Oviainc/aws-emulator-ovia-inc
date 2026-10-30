@@ -5,14 +5,18 @@
 //! The rule these cases assert, one level above the recorded case that filed the issue:
 //!
 //! > `ListPortalProducts` reports the portal products the account holds, each one
-//! > projected exactly as the single-product reader reports it, in `PortalProductId`
-//! > order, in a page of at most `MaxResults` items (and never more than the service's
+//! > projected exactly as the single-product reader reports it, OLDEST FIRST — in the
+//! > order the account created them — in a page of at most `MaxResults` items (and never
+//! > more than the service's
 //! > page maximum) chained through `NextToken`, so walking the chain yields every product
 //! > exactly once whatever page size the caller asks for; `ResourceOwner` selects whose
 //! > products are reported, so a request naming the owner that is not this account gets
 //! > an empty page; a `MaxResults` that is not a positive integer, a `NextToken` this
 //! > service did not issue for this collection and a `ResourceOwner` outside the owner
 //! > catalog are each 400 `BadRequestException`; and the listing changes nothing.
+//!
+//! The groups a walk covers and the token that carries it from one to the next are
+//! asserted in `portal_product_listing_order`.
 //!
 //! The rows vary what the rule generalises over: how many products the account holds (0
 //! up to one past the page maximum), the page size (1 up to one past the total, plus the
@@ -117,9 +121,12 @@ async fn list_portal_products_pages_every_product_exactly_once_at_every_page_siz
     // walks both: each count is paged at every size from 1 up to one past it.
     for total in [0_usize, 1, 2, 5, 12] {
         let emulator = emulator();
-        let mut expected = BTreeSet::new();
+        // In CREATION order, which is the order the chain must report them in: a minted
+        // `PortalProductId` carries no ordering, so the ids below are in no particular
+        // order.
+        let mut created: Vec<String> = Vec::new();
         for index in 0..total {
-            expected.insert(
+            created.push(
                 create_plain_product(
                     &emulator,
                     &format!("total={total}, product #{index}"),
@@ -128,6 +135,7 @@ async fn list_portal_products_pages_every_product_exactly_once_at_every_page_siz
                 .await,
             );
         }
+        let expected: BTreeSet<String> = created.iter().cloned().collect();
 
         for page_size in 1..=total + 1 {
             let label = format!("total={total}, maxResults={page_size}");
@@ -142,16 +150,18 @@ async fn list_portal_products_pages_every_product_exactly_once_at_every_page_siz
                 expected,
                 "case {label:?}: expected exactly the stored products, got {seen:?}"
             );
-            let mut sorted = seen.clone();
-            sorted.sort();
             assert_eq!(
-                seen, sorted,
-                "case {label:?}: expected the chain in PortalProductId order, got {seen:?}"
+                seen, created,
+                "case {label:?}: expected the chain oldest first, got {seen:?} against the \
+                 created order {created:?}"
             );
         }
 
-        // Unpaged: every product in one answer, with nothing left to report. An account
-        // holding none still reports an empty collection rather than no collection.
+        // Unpaged: every product the account owns in one answer. The walk is not over —
+        // the products other accounts shared with this one are the group still to come —
+        // so the answer carries the token that starts it, and resuming there ends the
+        // chain. An account holding none still reports an empty collection rather than no
+        // collection.
         let body = list_products(&emulator, &format!("total={total}"), "").await;
         assert_eq!(
             items(&body).len(),
@@ -159,10 +169,20 @@ async fn list_portal_products_pages_every_product_exactly_once_at_every_page_siz
             "case total={total}: an unpaged ListPortalProducts must report every product, \
              got {body}"
         );
+        let token = as_str(&body, "nextToken");
         assert!(
-            carries_nothing(&body, "nextToken"),
-            "case total={total}: an unpaged ListPortalProducts has nothing left to report, \
-             got {body}"
+            !token.is_empty(),
+            "case total={total}: expected the token that starts the shared group, got {body}"
+        );
+        let shared = list_products(
+            &emulator,
+            &format!("total={total}, the shared group"),
+            &format!("?nextToken={token}"),
+        )
+        .await;
+        assert!(
+            items(&shared).is_empty() && carries_nothing(&shared, "nextToken"),
+            "case total={total}: expected the shared group to end the chain, got {shared}"
         );
     }
 }
@@ -302,7 +322,11 @@ async fn list_portal_products_reports_the_products_the_selected_owner_owns() {
     // is not this account owns none of them.
     let rows: Vec<(&str, String, usize)> = vec![
         ("no owner at all", String::new(), stored.len()),
-        ("this account's own products", "?resourceOwner=SELF".to_string(), stored.len()),
+        (
+            "this account's own products",
+            "?resourceOwner=SELF".to_string(),
+            stored.len(),
+        ),
         (
             "the products owned by other accounts",
             format!("?resourceOwner={OTHER_ACCOUNTS_RESOURCE_OWNER}"),

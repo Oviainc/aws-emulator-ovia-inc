@@ -273,6 +273,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = crate::state::Portal {
             portal_arn: crate::state::portal_arn(&region, &portal_id),
+            // The seed the id was just minted from counts the portals this account has
+            // created, so it IS this portal's position in that order — what `ListPortals`
+            // reports the collection in, since the minted id carries no ordering of its
+            // own.
+            creation_order: store.portal_id_seed,
             authorization: input.authorization,
             endpoint_configuration: crate::state::resolve_portal_endpoint_configuration(
                 &portal_id,

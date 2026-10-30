@@ -9,7 +9,8 @@
 //!   the modelled `__stringMin10Max30PatternAZ09`), the `PortalProductArn` naming the
 //!   Region the request addressed, a `LastModified` reading the creation instant, and
 //!   the `DisplayName`, `Description` and `Tags` the request carried — nothing invented
-//!   for a member the request left out. `GetPortalProduct` reports that same record,
+//!   for a member the request left out — and the EMPTY `DisplayOrder` a product that owns
+//!   no pages has. `GetPortalProduct` reports that same record,
 //!   member for member.
 //! * **A portal product is addressed by its own minted id**: an id nothing minted is
 //!   404 `NotFoundException`, and so is a read that names another account as the
@@ -251,8 +252,7 @@ async fn create_portal_product_persists_the_record_and_get_reports_it_back() {
             row.case
         );
 
-        // Nothing is invented for a member the request left out, and a product that owns
-        // no pages has no ordering of them.
+        // Nothing is invented for a member the request left out.
         if row.request.get("description").is_none() {
             assert!(
                 fetched.get("description").is_none_or(Value::is_null),
@@ -260,10 +260,21 @@ async fn create_portal_product_persists_the_record_and_get_reports_it_back() {
                 row.case
             );
         }
-        assert!(
-            fetched.get("displayOrder").is_none_or(Value::is_null),
-            "case {:?}: expected a freshly created product to report no displayOrder, got \
-             {fetched}",
+        // A product that owns no pages is ordered EMPTY rather than unordered: the
+        // display order is reported with its two collection members present and empty, so
+        // a client that reads them dereferences nothing.
+        assert_eq!(
+            fetched.get("displayOrder"),
+            Some(&json!({ "contents": [], "productPageArns": [] })),
+            "case {:?}: expected the empty display order on a product that owns no pages, \
+             got {fetched}",
+            row.case
+        );
+        assert_eq!(
+            created.get("displayOrder"),
+            fetched.get("displayOrder"),
+            "case {:?}: expected CreatePortalProduct to report the display order \
+             GetPortalProduct reports, got {created} against {fetched}",
             row.case
         );
     }
