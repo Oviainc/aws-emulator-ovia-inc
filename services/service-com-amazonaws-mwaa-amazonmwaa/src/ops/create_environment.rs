@@ -189,6 +189,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::collections::BTreeMap;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -394,16 +395,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(validation)?;
         spec.validate().map_err(validation)?;
 
+        // The pairs this create asks to associate to its environment, as the record keeps
+        // them. Resolved beside the configuration above and before the comparison below,
+        // because `Tags` is a member this create WRITES — so it is one of the members a
+        // replay has to match — and a create that named none asks for an untagged
+        // environment, which is what it then reads back as.
+        let tags: BTreeMap<String, String> =
+            input.tags.clone().unwrap_or_default().into_iter().collect();
+
         // The tags in the reserved namespace are AWS's own to apply, so a create may not
         // seed one either: refused before the environment is recorded, so nothing is
         // provisioned for a request AWS would not accept.
-        if let Some(reserved) = crate::state::first_reserved_tag_key(
-            input
-                .tags
-                .iter()
-                .flat_map(|tags| tags.keys())
-                .map(String::as_str),
-        ) {
+        if let Some(reserved) =
+            crate::state::first_reserved_tag_key(tags.keys().map(String::as_str))
+        {
             return Err(validation(crate::state::reserved_tag_key_message(
                 "Tags", reserved,
             )));
@@ -415,18 +420,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The operation is `@idempotent`: replaying the SAME create of a name that is
         // already stored IN THIS REGION answers with the stored ARN and writes nothing. A
-        // create of that name with different members is a different request, and is
-        // refused rather than allowed to clobber the stored record. (Tags are deliberately
-        // outside the comparison: `TagResource` / `UntagResource` own them after the
-        // create.) A name stored in ANOTHER Region is a different environment and no
-        // obstacle here: a name identifies an environment only within its Region.
+        // create of that name that differs in ANY member it records — the configuration or
+        // the tag pairs, which this create writes just as it writes the configuration — is
+        // a different request, and is refused rather than allowed to clobber the stored
+        // record or answered success with that member thrown away. A name stored in
+        // ANOTHER Region is a different environment and no obstacle here: a name identifies
+        // an environment only within its Region.
         //
         // An environment whose teardown is running still HOLDS its name, so the name is
         // not free yet; but it is on its way out, so there is no live environment for a
         // replay to answer with and a create of that name is refused until the teardown
         // frees it.
         if let Some(existing) = store.environment(&region, &input.name) {
-            if existing.spec == spec && !existing.is_deleting() {
+            if existing.matches_create(&spec, &tags) && !existing.is_deleting() {
                 return Ok(CreateEnvironmentOutput {
                     arn: Some(existing.arn.clone()),
                 });
@@ -468,7 +474,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             spec,
             last_update: None,
-            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+            tags,
             // The Apache Airflow metadata database the new environment's web server
             // serves: empty but for the pool Apache Airflow seeds every database with.
             airflow: crate::state::AirflowMetadata::new(),

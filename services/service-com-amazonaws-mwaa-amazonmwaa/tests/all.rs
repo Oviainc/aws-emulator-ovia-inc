@@ -17,6 +17,8 @@ mod airflow_description_bound_single_rule;
 mod airflow_rest_api;
 #[path = "all/airflow_rest_api_entity_keys.rs"]
 mod airflow_rest_api_entity_keys;
+#[path = "all/create_replay_member_comparison.rs"]
+mod create_replay_member_comparison;
 #[path = "all/endpoint_host_prefix_census.rs"]
 mod endpoint_host_prefix_census;
 #[path = "all/env_endpoint_front_door.rs"]

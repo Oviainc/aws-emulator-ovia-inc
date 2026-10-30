@@ -628,7 +628,9 @@ impl NetworkConfigurationRecord {
 ///
 /// Kept apart from the values the SERVICE minted (ARN, URLs, queue, endpoint service
 /// names) so `CreateEnvironment` — which is `@idempotent` — can tell a replay of the same
-/// create from a different create of a name that is already taken, by comparing specs.
+/// create from a different create of a name that is already taken. The create records one
+/// more member of its own beside this one, the tag pairs, so that comparison is
+/// [`EnvironmentRecord::matches_create`] rather than a bare spec equality.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvironmentSpec {
     pub execution_role_arn: String,
@@ -1101,6 +1103,25 @@ impl EnvironmentRecord {
     /// cannot drift apart about what an environment's tags are.
     pub fn tags_member(&self) -> Option<HashMap<String, String>> {
         (!self.tags.is_empty()).then(|| map_of(&self.tags))
+    }
+
+    /// Whether a `CreateEnvironment` asking for `spec` with `tags` is a REPLAY of the
+    /// create this environment was stored by, rather than a different create of a name
+    /// that is already taken.
+    ///
+    /// The operation is `@idempotent`, so a create repeated byte for byte has to answer
+    /// with the stored environment and write nothing. That holds only when the repeat asks
+    /// for exactly what is stored in EVERY member the create records — the configuration a
+    /// caller chose ([`EnvironmentSpec`]) and the tag pairs it asked to associate alike:
+    /// `CreateEnvironment` is one of the writers of the tag map `GetEnvironment` and
+    /// `ListTagsForResource` read, so a create carrying different pairs is asking for a
+    /// different environment and must be refused rather than answered success with that
+    /// member thrown away.
+    ///
+    /// Asked by `CreateEnvironment` alone, so the set of members a replay has to match is
+    /// decided in one place beside the record whose members they are.
+    pub fn matches_create(&self, spec: &EnvironmentSpec, tags: &BTreeMap<String, String>) -> bool {
+        self.spec == *spec && self.tags == *tags
     }
 
     /// Whether this environment is in a status an `UpdateEnvironment` can be applied to:
