@@ -48,3 +48,24 @@ In cause 2 the diverging requirement is the whole response: status 204, no error
 1. Replay the wire corpus against the emulator.
 2. Cause 1 - fixture apigatewayv2-multiple-product-pages-isolation, step task#5: create a portal product, create a product page under it, then DELETE /v2/portalproducts/{PortalProductId}/productpages/{ProductPageId} and dump the raw response headers. The emulator answers 204 with no Content-Length header; the recording has `content-length: 0`.
 3. Cause 2 - fixture apigatewayv2-product-page-error-paths, step task#6: create a product page (task#4), DELETE it once (task#5, 204), then issue the identical DELETE a second time. The emulator answers 404 with `{"__type":"NotFoundException","message":"Invalid ProductPage identifier specified"}`; the recording answers 204 with an empty body.
+
+## Resolution
+
+Cause 1 (`content-length: 0` on the empty 204): the service now states that framing on every
+answer it serializes with no content, at the one place every modelled response passes through —
+`Service::override_protocol` in `src/service.rs` serves the model's own protocol with a `204`
+emptied of its body and framed `content-length: 0`. It therefore holds for every operation of
+this model whose success is 204 over `Unit`, not only this delete. CAVEAT: a client reached over
+HTTP/1.1 still does not see the header, because the HTTP writer the vendored transport serves
+with removes `content-length` from a `204` — that writer is under the read-only vendored tree, so
+the wire-level half of this cause is a platform limitation rather than something this service can
+state its way out of. The serializer seam is pinned by `tests/all/empty_answer_framing.rs`.
+
+Cause 2 (the repeat delete): deleting a page of a portal product the account holds is now
+idempotent — a product that holds no page under the addressed id is already in the state the call
+asks for, so it is answered with the same empty 204 as the delete that removed one. Both page
+kinds bound under a portal product follow the rule (`DeleteProductPage` and
+`DeleteProductRestEndpointPage`), as `DeletePortalProductSharingPolicy` already did for the policy
+it clears. A `PortalProductId` the account holds no product under is still refused 404
+`NotFoundException`, now naming the identifier that resolved to nothing. Pinned by
+`tests/all/absent_page_delete_idempotence.rs`.

@@ -6,7 +6,8 @@
 //!
 //! * **A product page its portal product holds is removed**: the delete answers 204 with
 //!   an empty body, `GetProductPage` then reports 404 `NotFoundException`, and a second
-//!   delete of the same id is a 404 rather than a second removal. A page created
+//!   delete of the same id answers the same empty 204 — the delete is idempotent, so a
+//!   page that is already gone is already in the state the call asks for. A page created
 //!   afterwards is a NEW page, with a freshly minted id and the content of ITS create.
 //! * **The delete reaches exactly one page**: every sibling product page of the same
 //!   product survives and still reports its own content, and so do the product itself,
@@ -15,10 +16,12 @@
 //! * **A page is addressed by its product and its own minted id, not by the Region the
 //!   caller signs for**: a page created through a request signed for one Region is deleted
 //!   through a request signed for another, the way `GetProductPage` reads one.
-//! * **An identifier that resolves to nothing is a 404** `NotFoundException` carrying the
-//!   sentence this API refuses an unresolved product page with, and it removes nothing: a
-//!   product nothing minted, a page id nothing minted (short and at the modelled 30-char
-//!   maximum), the id's uppercase form, and a page addressed under another product.
+//! * **The PRODUCT is the resource that has to exist**: a `PortalProductId` nothing minted
+//!   is a 404 `NotFoundException` carrying the sentence this API refuses an unresolved
+//!   portal product with, and removes nothing; a `ProductPageId` that resolves to nothing
+//!   UNDER a product the account holds is a 204 that removes nothing — a page id nothing
+//!   minted (short and at the modelled 30-char maximum), the id's uppercase form, and a
+//!   page of one product addressed under another.
 //!
 //! The rows vary what the rules generalise over: the deleted page's title and body
 //! (shortest accepted, multi-line, non-ASCII, both members at their modelled maxima), how
@@ -33,10 +36,10 @@ use crate::api_lifecycle::{as_str, assert_minted_id, call, call_in_region, emula
 use crate::product_page_lifecycle::{pages_of, BODY_MAX_LENGTH, TITLE_MAX_LENGTH};
 use crate::product_rest_endpoint_page_lifecycle::{product, PRODUCTS};
 
-/// The sentence this API refuses a product page identifier that resolves to nothing with,
-/// the one `GetProductPage` and `UpdateProductPage` already answer. Written out here
-/// rather than taken from the service, so the table asserts the rule.
-const NOT_FOUND_MESSAGE: &str = "Invalid ProductPage identifier specified";
+/// The sentence this API refuses a portal product identifier that resolves to nothing with,
+/// the one `CreateProductPage` and `DeletePortalProductSharingPolicy` already answer.
+/// Written out here rather than taken from the service, so the table asserts the rule.
+const PRODUCT_NOT_FOUND_MESSAGE: &str = "Invalid PortalProduct identifier specified";
 
 /// Create one product page under `portal_product_id` and answer its `ProductPageId`.
 async fn create_page(
@@ -257,17 +260,18 @@ async fn delete_product_page_removes_the_record_and_a_later_read_is_not_found() 
             row.case
         );
 
-        // A second delete removes nothing: the id now resolves to nothing.
+        // A second delete asks for a state the store is already in, so it answers the same
+        // empty 204 as the first and removes nothing again.
         let (status, body) = delete_page(&emulator, &product_id, &page_id).await;
         assert_eq!(
-            status, 404,
-            "case {:?}: expected 404 from the second DeleteProductPage, got {status} {body}",
+            status, 204,
+            "case {:?}: expected 204 from the second DeleteProductPage, got {status} {body}",
             row.case
         );
         assert_eq!(
-            error_code(&body),
-            "NotFoundException",
-            "case {:?}: expected NotFoundException, got {body}",
+            body,
+            Value::Null,
+            "case {:?}: expected an empty body from the second DeleteProductPage, got {body}",
             row.case
         );
 
@@ -434,7 +438,7 @@ async fn a_product_page_is_deleted_whatever_region_the_request_is_signed_for() {
 }
 
 #[tokio::test]
-async fn delete_product_page_answers_not_found_for_an_unresolved_identifier() {
+async fn delete_product_page_refuses_only_an_unresolved_portal_product() {
     let emulator = emulator();
 
     let owner = product(&emulator, "Owner").await;
@@ -456,12 +460,9 @@ async fn delete_product_page_answers_not_found_for_an_unresolved_identifier() {
     // An id at the modelled 30-character maximum, which nothing minted either.
     let longest_page_id = "z".repeat(30);
 
+    // A page id that resolves to nothing under a product the account HOLDS: the delete
+    // asks for a state that product is already in, so it answers the empty 204.
     for (case, product_id, target_id) in [
-        (
-            "a portal product nothing minted",
-            "nosuchproduct",
-            page_id.as_str(),
-        ),
         ("a page id nothing minted", owner.as_str(), "nosuchpage1"),
         (
             "an id at the modelled maximum length, which nothing minted",
@@ -481,26 +482,39 @@ async fn delete_product_page_answers_not_found_for_an_unresolved_identifier() {
     ] {
         let (status, body) = delete_page(&emulator, product_id, target_id).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404 from DeleteProductPage, got {status} {body}"
+            status, 204,
+            "case {case:?}: expected 204 from DeleteProductPage, got {status} {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "NotFoundException",
-            "case {case:?}: expected NotFoundException, got {body}"
-        );
-        assert_eq!(
-            body.get("message").and_then(Value::as_str),
-            Some(NOT_FOUND_MESSAGE),
-            "case {case:?}: expected the sentence this API refuses an unresolved product \
-             page with, got {body}"
+            body,
+            Value::Null,
+            "case {case:?}: expected an empty DeleteProductPage body, got {body}"
         );
     }
 
-    // None of those refusals removed the page they named.
+    // A PortalProductId nothing minted names no product to delete a page from at all.
+    let (status, body) = delete_page(&emulator, "nosuchproduct", &page_id).await;
+    assert_eq!(
+        status, 404,
+        "case \"a portal product nothing minted\": expected 404 from DeleteProductPage, got \
+         {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "NotFoundException",
+        "case \"a portal product nothing minted\": expected NotFoundException, got {body}"
+    );
+    assert_eq!(
+        body.get("message").and_then(Value::as_str),
+        Some(PRODUCT_NOT_FOUND_MESSAGE),
+        "case \"a portal product nothing minted\": expected the sentence this API refuses an \
+         unresolved portal product with, got {body}"
+    );
+
+    // None of those calls removed the page the owning product holds.
     let (status, body) = get_page(&emulator, &owner, &page_id).await;
     assert_eq!(
         status, 200,
-        "expected page {page_id} to survive every refused delete, got {status} {body}"
+        "expected page {page_id} to survive every delete of another id, got {status} {body}"
     );
 }

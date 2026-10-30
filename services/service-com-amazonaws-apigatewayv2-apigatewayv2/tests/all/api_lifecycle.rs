@@ -88,6 +88,21 @@ pub(crate) async fn call_at_host(
     uri: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    let (status, _headers, parsed) =
+        call_at_host_reading_headers(emulator, host, region, method, uri, body).await;
+    (status, parsed)
+}
+
+/// [`call_at_host`] keeping the response HEADERS as well, for a case that asserts on how an
+/// answer is FRAMED (the length it states) and not only on its status and body.
+pub(crate) async fn call_at_host_reading_headers(
+    emulator: &MultiServiceRouter,
+    host: &str,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, http::HeaderMap, Value) {
     let payload = match &body {
         Some(value) => Bytes::from(serde_json::to_vec(value).expect("serialize request body")),
         None => Bytes::new(),
@@ -109,13 +124,32 @@ pub(crate) async fn call_at_host(
 
     let response = emulator.dispatch(request).await;
     let status = response.status().as_u16();
+    let headers = response.headers().clone();
     let bytes = response.into_body();
     let parsed = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
-    (status, parsed)
+    (status, headers, parsed)
+}
+
+/// [`call`] keeping the response headers: `(status, headers, parsed body)`.
+pub(crate) async fn call_reading_headers(
+    emulator: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, http::HeaderMap, Value) {
+    call_at_host_reading_headers(
+        emulator,
+        &format!("apigateway.{REGION}.amazonaws.com"),
+        REGION,
+        method,
+        uri,
+        body,
+    )
+    .await
 }
 
 /// The `__type` / error code a failure response carries.

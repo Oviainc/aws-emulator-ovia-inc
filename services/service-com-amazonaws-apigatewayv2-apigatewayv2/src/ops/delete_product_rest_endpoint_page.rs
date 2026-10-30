@@ -3,7 +3,9 @@
 //! @op DeleteProductRestEndpointPage
 //! IMPLEMENTED: removes the [`crate::state::ProductRestEndpointPage`] record the portal
 //! product the URI names holds under the requested `ProductRestEndpointPageId`, and
-//! answers 204. This is the ONLY file to touch for this operation.
+//! answers 204 — including when the product holds no such page, since a delete of a page
+//! that is already gone asks for a state the store is already in. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,41 +173,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // A page is addressed UNDER its product
-        // (`/v2/portalproducts/{PortalProductId}/productrestendpointpages/{Id}`), so an
-        // unknown product and an unknown page under a known one both name no page: 404
-        // `NotFoundException`, with the sentence every reader and writer of one page
-        // refuses an unresolved identifier with (see
-        // [`crate::state::PRODUCT_REST_ENDPOINT_PAGE_NOT_FOUND_MESSAGE`]). An id the store
-        // no longer holds is also what a SECOND delete of the same page meets, so that one
-        // refuses instead of removing anything again.
-        //
-        // The product OWNS its pages, so taking the entry out is the whole delete: a later
-        // read of that id finds nothing, while every sibling page, the product itself and
-        // its other sub-resources are untouched. Nothing in the store holds a reference TO
-        // a page, so there is no dependent for this delete to refuse over: the product's
-        // `DisplayOrder` is a configured VALUE of the product, written by
-        // `UpdatePortalProduct` and resolved against no page, so this delete leaves it as
-        // its last writer set it. The REMOVED entry is what says the page was there to
-        // delete, so one lookup both decides the refusal and performs the removal.
-        let removed = store
-            .portal_products
-            .get_mut(&input.portal_product_id)
-            .and_then(|product| {
-                product
-                    .product_rest_endpoint_pages
-                    .remove(&input.product_rest_endpoint_page_id)
-            });
-        if removed.is_none() {
+        // (`/v2/portalproducts/{PortalProductId}/productrestendpointpages/{Id}`), so the
+        // PRODUCT is the resource that has to exist for this delete to mean anything: an
+        // identifier the account holds no product under resolves to nothing, and is refused
+        // 404 `NotFoundException` with the sentence every operation that works UNDER a
+        // product refuses an unknown one with (`CreateProductRestEndpointPage`,
+        // `DeletePortalProductSharingPolicy`; see
+        // [`crate::state::invalid_identifier_message`]).
+        let Some(product) = store.portal_products.get_mut(&input.portal_product_id) else {
             return Err(DeleteProductRestEndpointPageErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(
-                        crate::state::PRODUCT_REST_ENDPOINT_PAGE_NOT_FOUND_MESSAGE.to_string(),
-                    ),
+                    message: Some(crate::state::invalid_identifier_message(
+                        crate::state::PORTAL_PRODUCT_RESOURCE,
+                    )),
                     resource_type: ::std::option::Option::None,
                 },
             )
             .into());
-        }
+        };
+
+        // Taking the entry out IS the whole delete, and it is IDEMPOTENT: a product holding
+        // no page under this id is already in the state the call asks for, so a page that is
+        // already gone — a second delete of the same id, a teardown that races another
+        // cleanup — is answered with the same empty 204 as the first, removing nothing
+        // again. That is what `DeletePortalProductSharingPolicy` already does for the
+        // policy it clears, and what `DeleteProductPage` does for the sibling page kind.
+        //
+        // The product OWNS its pages, so nothing else has to be touched: a later read of
+        // that id finds nothing, while every sibling page, the product itself and its other
+        // sub-resources are untouched. Nothing in the store holds a reference TO a page, so
+        // there is no dependent for this delete to refuse over: the product's `DisplayOrder`
+        // is a configured VALUE of the product, written by `UpdatePortalProduct` and
+        // resolved against no page, so this delete leaves it as its last writer set it.
+        product
+            .product_rest_endpoint_pages
+            .remove(&input.product_rest_endpoint_page_id);
 
         Ok(DeleteProductRestEndpointPageOutput)
     }
