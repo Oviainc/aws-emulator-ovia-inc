@@ -5,12 +5,13 @@
 //! `PropertyNameHint` begins — the members the model binds that resource type to in
 //! `SearchRecord`, plus the dotted path of every key the resources stored in
 //! `crate::state` carry in a keyed member of that entity (`Tags.<key>`,
-//! `Parameters.<key>`, `InputArtifacts.<key>`, `OutputArtifacts.<key>`,
-//! `CustomerMetadataProperties.<key>`). This is the ONLY file to touch for this operation.
+//! `hyperparameters.<key>`, `Environment.<key>`, `Parameters.<key>`,
+//! `InputArtifacts.<key>`, `OutputArtifacts.<key>`, `CustomerMetadataProperties.<key>`).
+//! This is the ONLY file to touch for this operation.
 //!
-//! KNOWN GAP, same class as `HyperParameters.<name>` below: a trial component's
-//! `Metrics.<name>` are NOT suggested. The metric series a trial component carries are
-//! written by the SageMaker METRICS service's `BatchPutMetrics` and live in THAT service's
+//! KNOWN GAP: a trial component's `Metrics.<name>` are NOT suggested. The metric series
+//! a trial component carries are written by the SageMaker METRICS service's
+//! `BatchPutMetrics` and live in THAT service's
 //! state; this service stores none, and a suggestion is only ever made for a name some
 //! stored resource actually carries — never for work nothing reported. Whichever change
 //! brings those series within reach of this service's state (a store here, or a shared
@@ -216,6 +217,32 @@ fn search_entity(resource: &str) -> Option<&'static ::aws_smithy_schema::Schema>
     })
 }
 
+/// The facet segment the keys of a training job's `HyperParameters` map are suggested
+/// under.
+///
+/// A caller-named key is suggested as the PATH a `Search` filter accepts for it, and that
+/// path's facet segment is the name the search index publishes for the facet rather than
+/// always the modelled member's own casing: recorded SageMaker answers
+/// `hyperparameters.<key>` — this lowercase facet, then the key verbatim as the request
+/// spelled it — for a key supplied on `CreateTrainingJob`. The modelled member name
+/// `HyperParameters` is still suggested on its own, like every other member of the entity.
+const HYPER_PARAMETERS_FACET: &str = "hyperparameters";
+
+/// The segment a suggested path carries for the entity member `member`: the name
+/// SageMaker publishes for that facet, which is the member's own name except for the
+/// hyperparameters facet, published lowercased (see [`HYPER_PARAMETERS_FACET`]).
+///
+/// A member not named here keeps its modelled name, which is the only name the model
+/// gives it — the form every other facet of this operation has always been answered with
+/// and the one `Search`'s `Filter.Name` documents ("For valid property names, see
+/// SearchRecord"). A facet the service turns out to publish differently is one line here.
+fn published_facet(member: &str) -> &str {
+    match member {
+        "HyperParameters" => HYPER_PARAMETERS_FACET,
+        other => other,
+    }
+}
+
 /// Whether `schema` declares a member called `member`.
 fn declares(schema: &::aws_smithy_schema::Schema, member: &str) -> bool {
     schema
@@ -254,11 +281,12 @@ fn hint_begins(name: &str, hint: &str) -> bool {
 ///
 /// ONE rule decides which members those are, and it is the operation's own doc: it
 /// "provides suggestions for `HyperParameters`, `Tags`, and `Metrics`". Those three, plus
-/// the entity's other MAP members (`Parameters`, `InputArtifacts`, `OutputArtifacts`,
-/// `CustomerMetadataProperties`), are the members whose entries the CALLER names and
-/// which `Search` addresses BY that name, so `<Member>.<name>` is a property name and the
-/// stored resources are the only place those names can come from. A member that is a list
-/// of MODELLED structures is not one of them — `PipelineParameters` and `FeatureMetadata`'s
+/// the entity's other MAP members (`Environment`, `Parameters`, `InputArtifacts`,
+/// `OutputArtifacts`, `CustomerMetadataProperties`), are the members whose entries the
+/// CALLER names and which `Search` addresses BY that name, so the path of a key under one
+/// of them is a property name and the stored resources are the only place those names can
+/// come from. A member that is a list of MODELLED structures is not one of them —
+/// `PipelineParameters` and `FeatureMetadata`'s
 /// `Parameters` are addressed through their structure's own members (`.Name`, `.Value`),
 /// which the entity already declares, not through the value a caller put in them — so no
 /// caller-chosen name is emitted under those.
@@ -273,6 +301,10 @@ fn hint_begins(name: &str, hint: &str) -> bool {
 /// accepts for an entry inside a member. A caller part-way through typing the key still
 /// reaches it — [`hint_begins`] matches the hint against each segment of the path, so
 /// typing a tag's key offers `Tags.<key>`.
+///
+/// The path's facet segment carries the name the search index publishes for the facet,
+/// which is the modelled member name except where the index lowercases it (see
+/// [`HYPER_PARAMETERS_FACET`]); the key after the dot is always the caller's own, verbatim.
 ///
 /// A name is emitted only when `entity` declares the member the path's first segment
 /// names, so no entry is ever offered under a member the resource does not have.
@@ -289,14 +321,45 @@ fn stored_property_names(
     entity: Option<&'static ::aws_smithy_schema::Schema>,
     names: &mut Suggestions<'_>,
 ) {
+    // `container` names the entity members the key sits under BY THEIR MODELLED NAMES, so
+    // the guard below asks the model for them; the path the caller is answered carries the
+    // name the service publishes for each of those facets ([`published_facet`]).
     let mut push = |container: &str, key: &str| {
         let first = container.split('.').next().unwrap_or(container);
         if !key.is_empty() && entity.is_some_and(|schema| declares(schema, first)) {
-            names.offer(format!("{container}.{key}"));
+            let mut path = String::new();
+            for member in container.split('.') {
+                if !path.is_empty() {
+                    path.push('.');
+                }
+                path.push_str(published_facet(member));
+            }
+            path.push('.');
+            path.push_str(key);
+            names.offer(path);
         }
     };
 
     match resource {
+        "TrainingJob" => {
+            for job in store.training_jobs.values() {
+                for tag in &job.tags {
+                    push("Tags", &tag.key);
+                }
+                // The two maps a training job's entity declares whose entries the CALLER
+                // names: the algorithm's hyperparameters — the first facet this
+                // operation's own doc names — and the container environment. Both are
+                // read off the request the job was stored with, so a key is offered only
+                // while a job carrying it is held, and only in the spelling it was sent
+                // in.
+                for parameter in job.request.hyper_parameters.iter().flat_map(|map| map.keys()) {
+                    push("HyperParameters", parameter);
+                }
+                for variable in job.request.environment.iter().flat_map(|map| map.keys()) {
+                    push("Environment", variable);
+                }
+            }
+        }
         "Endpoint" => {
             for endpoint in store.endpoints.values() {
                 for tag in &endpoint.tags {
@@ -397,14 +460,8 @@ fn stored_property_names(
         // caller-named entry for, for one of three reasons. (1) This service keeps no
         // store for the resource: there is no project, feature-metadata, pipeline-version
         // or unified-`Job` map on `ComAmazonawsSagemakerSagemakerState`. (2) The store
-        // exists but its records carry no caller-named entry: the training-job record is
-        // the `TrainingJobSummary` projection `ListTrainingJobs` needs, so it keeps
-        // neither tags nor hyperparameters (`CreateTrainingJob` and
-        // `DescribeTrainingJob` are still scaffold stubs, each with its own issue, and
-        // whichever lands extends that record) — which is also why no
-        // `HyperParameters.<name>` is suggested yet, since `TrainingJob` is the only
-        // entity declaring that member whose store could ever hold one; this emulator's
-        // hub-content record likewise keeps no tags. (3) The store exists and the records
+        // exists but its records carry no caller-named entry: this emulator's hub-content
+        // record keeps no tags. (3) The store exists and the records
         // carry caller-named values, but not in a member `Search` addresses by that name:
         // a pipeline execution's parameters are the entity's `PipelineParameters`, a list
         // of modelled `Parameter` structures addressed through `.Name`/`.Value`, which the

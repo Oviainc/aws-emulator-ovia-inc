@@ -15,17 +15,25 @@
 //! to in `SearchRecord` (`Filter`'s `Name` doc: "For valid property names, see
 //! SearchRecord") plus, for every key the account's stored resources of that type carry
 //! in a keyed member of that entity, the dotted PATH that key sits at (the operation's
-//! doc: "Provides suggestions for HyperParameters, Tags, and Metrics"). A key is never
-//! offered bare: the path is the form `Filter`'s `Name` accepts. The tests assert that
-//! rule over a TABLE of resource types, hints and stored keys, and sweep every property
-//! name of every `ResourceType` value for the prefix invariant rather than trusting one
-//! row.
+//! doc: "Provides suggestions for HyperParameters, Tags, and Metrics"), whose facet
+//! segment carries the name SageMaker publishes for that facet — lowercase
+//! `hyperparameters` for a training job's hyperparameters — and the caller's key verbatim.
+//! A key is never offered bare: the path is the form `Filter`'s `Name` accepts. The tests
+//! assert that rule over a TABLE of resource types, hints and stored keys, and sweep every
+//! property name of every `ResourceType` value for the prefix invariant rather than
+//! trusting one row.
 
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
 use crate::inference_deployment_lifecycle::{one_variant_config, primary_container, Emulator};
+use crate::training_job_admission::{image_specification, training_body};
+
+/// The facet segment the keys of a training job's `HyperParameters` map are answered
+/// under: LOWERCASE, which is the form SageMaker answers (and `Search`'s `Filter.Name`
+/// accepts) for that facet, whatever case the modelled member name carries.
+const HYPER_PARAMETERS_FACET: &str = "hyperparameters";
 
 /// The most property names one answer carries, as the handler documents it. Read from the
 /// crate rather than copied, so the test tracks the bound the operation enforces.
@@ -66,7 +74,10 @@ const WITHOUT_A_SEARCH_RECORD_MEMBER: [&str; 2] = ["Image", "ImageVersion"];
 /// Every caller-chosen key [`seeded`] stores, spelled bare. None of them is a property
 /// name a `Search` filter accepts — `Filter`'s `Name` takes the path the key sits at
 /// (`Tags.Project`, not `Project`) — so none may be suggested on its own.
-const BARE_KEYS: [&str; 16] = [
+const BARE_KEYS: [&str; 19] = [
+    "momentum",
+    "VERBOSITY",
+    "unit",
     "learning_rate",
     "batch_size",
     "optimiser",
@@ -179,10 +190,23 @@ async fn suggestions(emulator: &Emulator, resource: &str, hint: Option<&str>) ->
 /// Seed one resource in each store this emulator keeps for a searchable resource type,
 /// each carrying caller-chosen keys: a trial component with parameters, artifacts and
 /// tags, a tagged model, a tagged endpoint (through its configuration), a tagged model
-/// package group, a tagged experiment, a tagged trial, a tagged hyperparameter tuning job
-/// and a tagged feature group.
+/// package group, a tagged experiment, a tagged trial, a tagged hyperparameter tuning job,
+/// a tagged feature group and a training job carrying a hyperparameter, an environment
+/// variable and a tag.
 async fn seeded() -> Emulator {
     let emulator = Emulator::new();
+
+    // A training job, whose entity declares three members whose entries the CALLER names:
+    // `HyperParameters`, `Environment` and `Tags`.
+    let mut job = training_body(
+        "suggestions-training-job",
+        image_specification(),
+        "s3://demo/output/",
+    );
+    job["HyperParameters"] = json!({ "momentum": "0.9" });
+    job["Environment"] = json!({ "VERBOSITY": "2" });
+    job["Tags"] = json!([{ "Key": "unit", "Value": "integration" }]);
+    emulator.ok("CreateTrainingJob", &job).await;
 
     emulator
         .ok(
@@ -610,7 +634,10 @@ async fn keys_stored_on_a_resource_are_suggested_at_the_path_they_sit_at() {
 
     // A key belongs to the resource that stores it: no OTHER resource type suggests it.
     // The hint is the name itself, which begins it.
-    let stored: [(&str, &str); 10] = [
+    let stored: [(&str, &str); 13] = [
+        ("TrainingJob", "hyperparameters.momentum"),
+        ("TrainingJob", "Environment.VERBOSITY"),
+        ("TrainingJob", "Tags.unit"),
         ("ExperimentTrialComponent", "Parameters.learning_rate"),
         ("ExperimentTrialComponent", "InputArtifacts.dataset"),
         ("ExperimentTrialComponent", "Tags.Project"),
@@ -696,9 +723,16 @@ async fn every_suggestion_is_a_modelled_member_or_a_path_under_one() {
             // Every name the stored resources added is a PATH under a modelled member:
             // the key's own spelling is never a suggestion on its own, because it is not
             // the name a `Search` filter accepts.
+            // The facet segment carries the name SageMaker publishes for that member,
+            // which is the member's own name for every facet but the hyperparameters one
+            // — published lowercase — so an otherwise mis-cased segment is still a failure.
             let head = name.split('.').next().unwrap_or(name.as_str());
             assert!(
-                name.contains('.') && modelled.iter().any(|member| member == head),
+                name.contains('.')
+                    && modelled.iter().any(|member| {
+                        member == head
+                            || (head == HYPER_PARAMETERS_FACET && member == "HyperParameters")
+                    }),
                 "case {resource}: {name} is neither a modelled member nor a path under \
                  one: {modelled:?}"
             );
@@ -876,4 +910,210 @@ async fn an_unmatched_hint_answers_an_empty_list_and_no_read_changes_the_state()
         before, after,
         "case repeated-read: GetSearchSuggestions must not change the resources it reads"
     );
+}
+
+/// A `CreateTrainingJob` body naming `name` and carrying `hyper_parameters`, so one seed
+/// row differs from the next only in the keys under test.
+fn training_job_with(name: &str, hyper_parameters: Value) -> Value {
+    let mut body = training_body(name, image_specification(), "s3://demo/output/");
+    body["HyperParameters"] = hyper_parameters;
+    body
+}
+
+/// RULE: every key a stored resource carries in a caller-named map of its searchable
+/// entity is suggested as the dotted property name a `Search` filter accepts for it — the
+/// facet segment as SageMaker names that facet, then the caller's key VERBATIM — so each
+/// key supplied in a training job's `HyperParameters` is answered as
+/// `hyperparameters.<key>`, lowercase facet and key untouched.
+#[tokio::test]
+async fn a_training_jobs_hyperparameter_keys_are_suggested_under_the_lowercase_facet() {
+    let emulator = Emulator::new();
+
+    // The longest key `HyperParameterKey` admits (smithy_query query="shape"
+    // shape="HyperParameterKey": len 0..256, pattern `.*`), so a key at the published
+    // bound is offered like any other.
+    let longest = "k".repeat(256);
+    // Rows differ along what the rule generalises over: the key's case, its characters
+    // (ASCII, non-ASCII, an underscore, an embedded dot), and its length (one character,
+    // the modelled maximum) — the recorded case is one row among them.
+    let keys: Vec<(&str, String)> = vec![
+        ("plain", "momentum".to_string()),
+        ("mixed-case", "LearningRate".to_string()),
+        ("upper-case", "WEIGHT_DECAY".to_string()),
+        ("underscored", "max_depth".to_string()),
+        // A non-ASCII key: only ASCII case is folded, so this one is matched byte-exactly.
+        ("non-ascii", "größe_hp".to_string()),
+        ("one-character", "n".to_string()),
+        ("dotted", "tree.depth".to_string()),
+        ("longest", longest.clone()),
+    ];
+
+    // Every key goes on its own job, so the answer is the keys of EVERY stored job rather
+    // than of one, and a key supplied with the empty string rides along: SageMaker keeps
+    // no such entry, so there is no key to suggest for it.
+    for (index, (_, key)) in keys.iter().enumerate() {
+        let mut supplied = serde_json::Map::new();
+        supplied.insert(key.clone(), json!("0.5"));
+        supplied.insert("unset".to_string(), json!(""));
+        let body =
+            training_job_with(&format!("suggestions-job-{index}"), Value::Object(supplied));
+        emulator.ok("CreateTrainingJob", &body).await;
+    }
+    // A key that is the empty string is admitted by the model (len 0..256) and names no
+    // property, so it contributes no path.
+    let mut empty_key = serde_json::Map::new();
+    empty_key.insert(String::new(), json!("0.5"));
+    emulator
+        .ok(
+            "CreateTrainingJob",
+            &training_job_with("suggestions-job-empty-key", Value::Object(empty_key)),
+        )
+        .await;
+
+    // `PropertyNameHint` is modelled len 0..100 (smithy_query query="shape"
+    // shape="PropertyNameQuery"), so a hint for a key longer than that is the first 100
+    // characters of the path — which still BEGINS it.
+    let bounded = |hint: String| -> String { hint.chars().take(100).collect() };
+
+    for (case, key) in &keys {
+        let expected = format!("{HYPER_PARAMETERS_FACET}.{key}");
+        let leaf = key.rsplit('.').next().unwrap_or(key.as_str()).to_string();
+        let cut: String = expected
+            .chars()
+            .take(expected.chars().count().saturating_sub(2))
+            .collect();
+        // Hints differ along how far through the property name the caller has typed and
+        // which case they typed the facet in: the whole path, the path cut inside the key
+        // (what an autocompleting console sends), the key's last segment on its own, the
+        // facet alone, and the facet in the modelled member's casing.
+        let hints = [
+            bounded(expected.clone()),
+            bounded(cut),
+            bounded(leaf),
+            HYPER_PARAMETERS_FACET.to_string(),
+            bounded(format!("HyperParameters.{key}")),
+        ];
+        for hint in &hints {
+            let answered = suggestions(&emulator, "TrainingJob", Some(hint)).await;
+            assert!(
+                answered.contains(&expected),
+                "case {case:?} hint {hint:?}: expected {expected:?} among the \
+                 suggestions, got {answered:?}"
+            );
+            // The facet is answered lowercase and the key verbatim: neither the modelled
+            // casing of the member nor a folded key is a property name SageMaker answers.
+            for wrong in [
+                format!("HyperParameters.{key}"),
+                format!("{HYPER_PARAMETERS_FACET}.{}", key.to_lowercase()),
+            ] {
+                assert!(
+                    wrong == expected || !answered.contains(&wrong),
+                    "case {case:?} hint {hint:?}: {wrong:?} is not the property name for \
+                     this key, got {answered:?}"
+                );
+            }
+            // A key is never offered bare: the path is the form `Filter`'s `Name` accepts.
+            assert!(
+                !answered.iter().any(|suggested| suggested == key),
+                "case {case:?} hint {hint:?}: {key:?} is a bare key, not a Search \
+                 property name, got {answered:?}"
+            );
+        }
+    }
+
+    // Neither an entry supplied with the empty string nor one whose key is empty names a
+    // property, so no path is offered for either.
+    let under_the_facet = suggestions(&emulator, "TrainingJob", Some(HYPER_PARAMETERS_FACET)).await;
+    for absent in [
+        format!("{HYPER_PARAMETERS_FACET}.unset"),
+        format!("{HYPER_PARAMETERS_FACET}."),
+        HYPER_PARAMETERS_FACET.to_string(),
+    ] {
+        assert!(
+            !under_the_facet.contains(&absent),
+            "case not-a-property {absent:?}: it names no stored hyperparameter, got \
+             {under_the_facet:?}"
+        );
+    }
+    // Every key that IS stored is under that facet, and the answer is stable across reads.
+    let again = suggestions(&emulator, "TrainingJob", Some(HYPER_PARAMETERS_FACET)).await;
+    assert_eq!(
+        under_the_facet, again,
+        "case repeated-read: two identical calls must answer the same list, got \
+         {under_the_facet:?} and {again:?}"
+    );
+    for (case, key) in &keys {
+        let expected = format!("{HYPER_PARAMETERS_FACET}.{key}");
+        assert!(
+            under_the_facet.contains(&expected),
+            "case {case:?}: the facet hint must answer every stored key, {expected:?} is \
+             missing from {under_the_facet:?}"
+        );
+    }
+
+    // A hyperparameter key belongs to the training jobs that store it: no OTHER resource
+    // type suggests it, whatever its searchable entity declares.
+    for (case, key) in &keys {
+        let expected = format!("{HYPER_PARAMETERS_FACET}.{key}");
+        let hint = bounded(expected.clone());
+        for other in RESOURCE_TYPES.iter().filter(|other| **other != "TrainingJob") {
+            let elsewhere = suggestions(&emulator, other, Some(&hint)).await;
+            assert!(
+                !elsewhere.contains(&expected),
+                "case {case:?}: {expected:?} is a property of TrainingJob, but {other} \
+                 suggested it too: {elsewhere:?}"
+            );
+        }
+    }
+}
+
+/// RULE (the same one, over the OTHER caller-named members a training job's entity
+/// declares): a key stored in the job's `Environment` or `Tags` is answered at the path it
+/// sits at, so the facet a key is offered under is the one the request put it in.
+#[tokio::test]
+async fn a_training_jobs_environment_and_tag_keys_are_suggested_at_their_own_paths() {
+    let emulator = Emulator::new();
+
+    let mut body = training_body(
+        "suggestions-facets",
+        image_specification(),
+        "s3://demo/output/",
+    );
+    // `TrainingEnvironmentKey` is `^[a-zA-Z_][a-zA-Z0-9_]*$` (smithy_query query="shape"
+    // shape="TrainingEnvironmentKey"), so the rows below span its case and its leading
+    // underscore rather than inventing characters it refuses.
+    body["HyperParameters"] = json!({ "eta": "0.2" });
+    body["Environment"] = json!({ "VERBOSITY": "2", "_private": "1", "mixedCase": "x" });
+    body["Tags"] = json!([
+        { "Key": "unit", "Value": "integration" },
+        { "Key": "Owner.Team", "Value": "science" },
+    ]);
+    emulator.ok("CreateTrainingJob", &body).await;
+
+    // Rows differ along the facet the key sits in and the key's own shape; each is checked
+    // with the full path and with a prefix of it.
+    let rows: Vec<(&str, &str)> = vec![
+        ("hyperparameter", "hyperparameters.eta"),
+        ("environment-upper", "Environment.VERBOSITY"),
+        ("environment-leading-underscore", "Environment._private"),
+        ("environment-mixed-case", "Environment.mixedCase"),
+        ("tag", "Tags.unit"),
+        ("tag-with-a-dot-in-the-key", "Tags.Owner.Team"),
+    ];
+    for (case, expected) in &rows {
+        // The whole path, and the path one CHARACTER short of it (char-wise, so a row
+        // carrying non-ASCII text cannot split a character).
+        let short: String = expected
+            .chars()
+            .take(expected.chars().count().saturating_sub(1))
+            .collect();
+        for hint in [expected.to_string(), short] {
+            let answered = suggestions(&emulator, "TrainingJob", Some(&hint)).await;
+            assert!(
+                answered.iter().any(|suggested| suggested == expected),
+                "case {case:?} hint {hint:?}: expected {expected:?} among the \
+                 suggestions, got {answered:?}"
+            );
+        }
+    }
 }
