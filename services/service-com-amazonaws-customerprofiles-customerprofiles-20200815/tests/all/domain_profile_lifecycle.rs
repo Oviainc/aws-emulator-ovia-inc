@@ -36,7 +36,7 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 
 /// One emulator: a single shared engine behind the router, so every request in a test
 /// observes the same state.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The same engine the router handed the service, so a test can seed the store
     /// directly when driving a store bound through thousands of HTTP calls would only
@@ -45,7 +45,7 @@ struct Emulator {
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -53,7 +53,12 @@ impl Emulator {
         Self { router, engine }
     }
 
-    async fn send(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (u16, Value) {
         let payload = match &body {
             Some(value) => bytes::Bytes::from(serde_json::to_vec(value).expect("serialize body")),
             None => bytes::Bytes::new(),
@@ -76,7 +81,7 @@ impl Emulator {
         (status, value)
     }
 
-    async fn post(&self, path: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, path: &str, body: Value) -> (u16, Value) {
         self.send("POST", path, Some(body)).await
     }
 
@@ -89,7 +94,7 @@ impl Emulator {
     }
 
     /// `CreateDomain` with the given expiration, asserting it succeeded.
-    async fn create_domain(&self, domain: &str, expiration_days: u32) -> Value {
+    pub(crate) async fn create_domain(&self, domain: &str, expiration_days: u32) -> Value {
         let (status, body) = self
             .post(
                 &format!("/domains/{domain}"),
@@ -104,7 +109,7 @@ impl Emulator {
     }
 
     /// `CreateProfile`, asserting it succeeded, and returning the minted `ProfileId`.
-    async fn create_profile(&self, domain: &str, profile: Value) -> String {
+    pub(crate) async fn create_profile(&self, domain: &str, profile: Value) -> String {
         let (status, body) = self
             .post(&format!("/domains/{domain}/profiles"), profile.clone())
             .await;
@@ -126,7 +131,7 @@ impl Emulator {
 }
 
 /// The wire error code restJson1 carries in the body's `__type` discriminator.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 
