@@ -23,6 +23,8 @@ mod child_listing_cursor_scope;
 mod child_listing_error_set;
 #[path = "all/clock_sampled_under_the_store_lock.rs"]
 mod clock_sampled_under_the_store_lock;
+#[path = "all/create_replay_after_later_calls.rs"]
+mod create_replay_after_later_calls;
 #[path = "all/definition_declared_schedule_trigger.rs"]
 mod definition_declared_schedule_trigger;
 #[path = "all/deleted_workflow_run_cleanup.rs"]

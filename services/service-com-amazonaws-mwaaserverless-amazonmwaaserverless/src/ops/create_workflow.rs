@@ -3,7 +3,10 @@
 //! @op CreateWorkflow
 //! IMPLEMENTED: mints a workflow plus its first immutable version and persists both in
 //! this service's store (`crate::state`). Every value in the response is read back out
-//! of that record, so `GetWorkflow`/`ListWorkflows` report exactly what was stored. A
+//! of that record, so `GetWorkflow`/`ListWorkflows` report exactly what was stored, and
+//! the answer so read is kept in the idempotency ledger, so repeating the
+//! `ClientToken` answers what this call answered rather than what a later caller's
+//! update or delete left behind. A
 //! workflow whose snapshotted definition declares a schedule also gets its automated
 //! trigger configured, so the service runs it without any caller starting a run.
 //!
@@ -310,10 +313,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .map_err(CreateWorkflowErrorModeled::ConflictException)?;
         if let Some(recorded) = replayed {
-            let workflow = store
-                .workflow_in(&region, recorded.workflow_arn())
-                .ok_or_else(unavailable)?;
-            return Ok(response_for(workflow));
+            // The answer the token's FIRST use gave, as that use recorded it
+            // (`crate::state::CreatedWorkflow`) — not one rebuilt from the workflow as
+            // it now stands. A created workflow is returned ready and owes the clock no
+            // transition, so nothing but another caller's later call can move the
+            // version it reports, that version's revision, whether it is still the
+            // latest or the workflow's status; rebuilding the answer here would report
+            // a version this create never created. The record is dropped with the
+            // workflow it names
+            // (`crate::state::IdempotencyLedger::forget_workflow`, run by the teardown
+            // `advance_clock` above completes), so a replay is only ever served while
+            // that workflow is still stored.
+            let crate::state::IdempotentResult::CreateWorkflow { answered, .. } = &recorded else {
+                return Err(unavailable());
+            };
+            return Ok(response_for(recorded.workflow_arn(), answered));
         }
 
         // "You must use unique workflow names within your account" — a second create
@@ -450,21 +464,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store.claim_workflow_name(&region, &input.name, &arn);
         store.workflows.insert(arn.clone(), workflow);
-        // The other half of the shared rule: what this call produced, remembered under
-        // the same key the replay above reads.
+
+        // Read what this call answers back out of the STORED record, so the answer can
+        // only ever be what was persisted.
+        let answered = crate::state::CreatedWorkflow::of(
+            store.workflow_in(&region, &arn).ok_or_else(unavailable)?,
+        );
+
+        // The other half of the shared rule: what this call produced — the workflow and
+        // the answer it gave for the version it created — remembered under the same key
+        // the replay above reads, so a repeat of this token answers exactly this again.
         tokens.record(
             &mut store.idempotency,
             input.client_token.as_deref(),
             crate::state::IdempotentResult::CreateWorkflow {
                 request_fingerprint: fingerprint,
                 workflow_arn: arn.clone(),
+                answered: answered.clone(),
             },
         );
 
-        // Read the response back out of the stored record, so the answer can only ever
-        // be what was persisted.
-        let stored = store.workflow_in(&region, &arn).ok_or_else(unavailable)?;
-        Ok(response_for(stored))
+        Ok(response_for(&arn, &answered))
     }
 }
 
@@ -532,20 +552,22 @@ fn unavailable() -> CreateWorkflowError {
     .into()
 }
 
-/// The `CreateWorkflowResponse` for a stored workflow — every member read out of
-/// the record.
-fn response_for(workflow: &crate::state::Workflow) -> CreateWorkflowOutput {
+/// The `CreateWorkflowResponse` for the workflow a create stored and the answer that
+/// create read out of the record ([`crate::state::CreatedWorkflow`]).
+///
+/// The one place this response is built, so the answer a first use gives and the answer
+/// a replay of its `ClientToken` gives are the same values carried the same way.
+fn response_for(
+    workflow_arn: &str,
+    answered: &crate::state::CreatedWorkflow,
+) -> CreateWorkflowOutput {
     CreateWorkflowOutput {
-        workflow_arn: workflow.arn.clone(),
-        created_at: Some(crate::state::timestamp(workflow.created_at)),
-        revision_id: Some(workflow.revision_id.clone()),
-        workflow_status: Some(workflow.status.clone()),
-        workflow_version: Some(workflow.current_version.clone()),
-        is_latest_version: Some(
-            workflow
-                .version(Some(&workflow.current_version))
-                .is_some_and(|rec| rec.is_latest),
-        ),
+        workflow_arn: workflow_arn.to_string(),
+        created_at: Some(crate::state::timestamp(answered.created_at)),
+        revision_id: Some(answered.revision_id.clone()),
+        workflow_status: Some(answered.workflow_status.clone()),
+        workflow_version: Some(answered.workflow_version.clone()),
+        is_latest_version: Some(answered.is_latest_version),
         warnings: None,
     }
 }

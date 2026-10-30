@@ -865,13 +865,63 @@ impl Workflow {
     }
 }
 
+/// What a `CreateWorkflow` call ANSWERED for the workflow it created, beside the
+/// workflow's identity: the version that call created and everything the call reported
+/// about it.
+///
+/// Kept in the ledger because none of it can be re-derived from the workflow later. A
+/// created workflow owes the clock no transition of its own — it is returned
+/// [`WORKFLOW_STATUS_READY`] — so every one of these values changes only when ANOTHER
+/// caller acts: appending a version moves [`Workflow::current_version`],
+/// [`Workflow::revision_id`] and the latest-version flag
+/// ([`Workflow::promote_newest_version`]), and starting a teardown moves
+/// [`Workflow::status`]. Recomputing them at replay time would therefore answer values
+/// the first use never produced, so the first use's own values are recorded here.
+#[derive(Debug, Clone)]
+pub struct CreatedWorkflow {
+    /// `CreatedAt`: when the workflow was created.
+    pub created_at: SystemTime,
+    /// `WorkflowVersion`: the version the create itself created.
+    pub workflow_version: String,
+    /// `RevisionId`: the revision the create reported for that version.
+    pub revision_id: String,
+    /// `WorkflowStatus`: the status the create reported for the workflow.
+    pub workflow_status: String,
+    /// `IsLatestVersion`: whether the created version was the workflow's latest one.
+    pub is_latest_version: bool,
+}
+
+impl CreatedWorkflow {
+    /// What a create answers for the workflow record it just stored: the active
+    /// version, its revision, the workflow's status and whether that version is the
+    /// latest — every value read out of the record, never computed beside it.
+    pub fn of(workflow: &Workflow) -> Self {
+        Self {
+            created_at: workflow.created_at,
+            workflow_version: workflow.current_version.clone(),
+            revision_id: workflow.revision_id.clone(),
+            workflow_status: workflow.status.clone(),
+            is_latest_version: workflow
+                .version(Some(&workflow.current_version))
+                .is_some_and(|record| record.is_latest),
+        }
+    }
+}
+
 /// What a `ClientToken` already produced, so repeating it replays rather than
 /// creating a second resource.
+///
+/// A variant keeps whatever its operation's replay cannot read back out of the live
+/// record: the workflow a create created ANSWERED for ([`CreatedWorkflow`]), because a
+/// later call can move every value of that answer, while a start keeps only the run's
+/// identity, because a run's own answer moves with nothing but the clock that was
+/// already running when it was started ([`WorkflowRun::settle`]).
 #[derive(Debug, Clone)]
 pub enum IdempotentResult {
     CreateWorkflow {
         request_fingerprint: String,
         workflow_arn: String,
+        answered: CreatedWorkflow,
     },
     StartWorkflowRun {
         request_fingerprint: String,

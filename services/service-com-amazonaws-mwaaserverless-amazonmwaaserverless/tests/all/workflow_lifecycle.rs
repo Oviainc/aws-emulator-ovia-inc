@@ -1263,7 +1263,8 @@ async fn deleting_one_named_version_keeps_the_workflow_until_no_version_is_left(
 #[tokio::test]
 async fn the_caller_driven_stores_are_bounded() {
     use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-        IdempotentResult, MAX_IDEMPOTENCY_TOKENS, MAX_RUNS_PER_WORKFLOW, MAX_WORKFLOWS,
+        CreatedWorkflow, IdempotentResult, MAX_IDEMPOTENCY_TOKENS, MAX_RUNS_PER_WORKFLOW,
+        MAX_WORKFLOWS, WORKFLOW_STATUS_READY,
     };
 
     let harness = Harness::new("us-east-1");
@@ -1362,6 +1363,16 @@ async fn the_caller_driven_stores_are_bounded() {
             IdempotentResult::CreateWorkflow {
                 request_fingerprint: format!("fingerprint-{index}"),
                 workflow_arn: format!("arn-{index}"),
+                // The answer that token's first use gave, which the entry carries so a
+                // repeat can replay it. What this bound is about is how many entries the
+                // ledger keeps, so each one here carries an answer of its own.
+                answered: CreatedWorkflow {
+                    created_at: std::time::SystemTime::now(),
+                    workflow_version: format!("version-{index}"),
+                    revision_id: format!("revision-{index}"),
+                    workflow_status: WORKFLOW_STATUS_READY.to_string(),
+                    is_latest_version: true,
+                },
             },
         );
     }
