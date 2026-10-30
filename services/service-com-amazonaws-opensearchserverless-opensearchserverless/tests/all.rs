@@ -39,6 +39,8 @@ mod collection_lifecycle;
 mod effective_lifecycle_policy;
 #[path = "all/encryption_indexes_and_tagging.rs"]
 mod encryption_indexes_and_tagging;
+#[path = "all/index_delete.rs"]
+mod index_delete;
 #[path = "all/index_name_rule.rs"]
 mod index_name_rule;
 #[path = "all/index_schema_update.rs"]

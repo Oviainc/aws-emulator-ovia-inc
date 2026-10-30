@@ -2456,8 +2456,8 @@ pub fn validate_access_policy_document(
 }
 
 /// How the index operations word a collection id that names no collection. `CreateIndex`,
-/// `GetIndex` and `UpdateIndex` address the COLLECTION by id, so the refusal names that
-/// collection.
+/// `GetIndex`, `UpdateIndex` and `DeleteIndex` address the COLLECTION by id, so the
+/// refusal names that collection.
 pub fn index_collection_not_found_message(id: &str) -> String {
     format!("The Collection with Id '{id}' does not exist.")
 }
@@ -2465,8 +2465,9 @@ pub fn index_collection_not_found_message(id: &str) -> String {
 /// How the index operations word an index that is not there, from the index name and the
 /// id of the collection it was looked for in.
 ///
-/// `GetIndex` and `UpdateIndex` both address an existing index this way, so the wording of
-/// that one refusal is read off one place and the two cannot disagree about it.
+/// `GetIndex`, `UpdateIndex` and `DeleteIndex` each address an existing index this way, so
+/// the wording of that one refusal is read off one place and the three cannot disagree
+/// about it.
 pub fn index_not_found_message(index_name: &str, collection_id: &str) -> String {
     format!("The index '{index_name}' does not exist in the collection with Id '{collection_id}'.")
 }

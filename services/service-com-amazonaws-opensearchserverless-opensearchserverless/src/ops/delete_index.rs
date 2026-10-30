@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the `IndexRecord` the requested collection id and index name
+//! address, so a following `GetIndex` reports that index as absent. Refuses an index name
+//! the `IndexName` rule rejects with `ValidationException`, and an id that names no
+//! collection, or an index name that names no index in it, with
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +137,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteIndexErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `IndexName` carries no `@pattern`, so the boundary validator does not narrow it;
+        // the rule belongs to the MEMBER, stated in its own documentation ("Index names
+        // must be lowercase and can't begin with underscores (_) or hyphens (-)"), so a
+        // name it refuses is invalid input here exactly as it is on the create, the read
+        // and the update. Held by the one helper those use, so the four cannot disagree
+        // about one and the same string.
+        if let Err(reason) = crate::state::validate_index_name(&input.index_name) {
+            return Err(
+                DeleteIndexErrorModeled::ValidationException(ValidationException {
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        let Some(collection) = store.collections.get_mut(&input.id) else {
+            return Err(DeleteIndexErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::index_collection_not_found_message(&input.id)),
+                },
+            )
+            .into());
+        };
+        // This operation deletes an EXISTING index, so a name that addresses none is the
+        // missing resource `ResourceNotFoundException` describes ("accessing or deleting a
+        // resource that does not exist") rather than a silent success — worded by the one
+        // helper `GetIndex` and `UpdateIndex` answer with. `@idempotent` makes a retry of
+        // this request safe to send, not a delete of what is no longer there successful.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIndex"))
+        // The collection's own status is no refusal channel here: this operation models no
+        // `ConflictException` at all, so an index that is addressable is removed.
+        if collection.indexes.remove(&input.index_name).is_none() {
+            return Err(DeleteIndexErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::index_not_found_message(
+                        &input.index_name,
+                        &input.id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `DeleteIndexResponse` models no members: the observable effect is the record's
+        // absence, which `GetIndex` reports.
+        Ok(DeleteIndexOutput {})
     }
 }
