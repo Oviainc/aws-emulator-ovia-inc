@@ -5,13 +5,13 @@
 //! one the key holds under the only name KMS serves a policy under
 //! (`crate::state::KEY_POLICY_NAME_DEFAULT`), and `GetKeyPolicy` reads it back.
 //!
-//! The document is judged by `crate::state::validate_key_policy` — the criteria the
-//! `Policy` member states, shared with `CreateKey` — and bounded by KMS's key policy
-//! quota (`crate::state::MAX_KEY_POLICY_BYTES`). `BypassPolicyLockoutSafetyCheck` is
-//! accepted and has no effect, for the reason `create_key.rs` records: the lockout
-//! check asks whether the policy lets the CALLING PRINCIPAL make a subsequent
-//! `PutKeyPolicy` request, which needs the caller's IAM identity this emulator does
-//! not model. A refused request persists nothing: the key keeps the policy it had.
+//! The document is judged by `crate::state::judge_key_policy` — the criteria the
+//! `Policy` member states, shared with `CreateKey` and `ReplicateKey` — and bounded by
+//! KMS's key policy quota (`crate::state::MAX_KEY_POLICY_BYTES`). That judgement
+//! includes the POLICY LOCKOUT SAFETY CHECK: a document leaving the calling principal no
+//! path to a subsequent `PutKeyPolicy` on this key is refused unless
+//! `BypassPolicyLockoutSafetyCheck` is set, the member's own documented default. A
+//! refused request persists nothing: the key keeps the policy it had.
 //!
 //! ## Shape of an operation
 //!
@@ -229,6 +229,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .unwrap_or_else(|| crate::state::KEY_POLICY_NAME_DEFAULT.to_string());
 
+        // Who the request speaks for, read BEFORE this service's store is locked: the
+        // lockout safety check below is about the CALLING PRINCIPAL, and the stores that
+        // answer for it are other services'.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
         let key = match state.resolve_mut(&region, &input.key_id) {
@@ -286,10 +291,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        if let Err(reason) = crate::state::validate_key_policy(&input.policy) {
+        if let Err(refusal) = crate::state::judge_key_policy(
+            &input.policy,
+            &caller,
+            &key.arn,
+            input.bypass_policy_lockout_safety_check,
+        ) {
             return Err(PutKeyPolicyErrorModeled::MalformedPolicyDocumentException(
                 MalformedPolicyDocumentException {
-                    message: Some(reason),
+                    message: refusal.message(),
                 },
             )
             .into());

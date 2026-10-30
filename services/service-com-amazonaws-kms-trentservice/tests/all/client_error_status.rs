@@ -45,6 +45,18 @@ const WORDLESS_REFUSALS: &[&str] = &[
     "InvalidMarkerException",
 ];
 
+/// The refusals one OPERATION words with no message where its error CODE alone does not
+/// say so: KMS refuses a `PendingWindowInDays` outside the documented window with a bare
+/// `ValidationException` (recorded behavior), while every other `ValidationException`
+/// below carries the sentence saying what was wrong with the request.
+///
+/// `MalformedPolicyDocumentException` is deliberately in NEITHER list: a document KMS
+/// cannot read is refused with no message, while the same code carries the policy-lockout
+/// sentence for a well-formed document that locks the caller out, so the property belongs
+/// to the refusal and not to the code. Both halves are asserted where they are produced
+/// (`super::key_policy` and `super::key_policy_lockout`).
+const WORDLESS_BY_OPERATION: &[(&str, &str)] = &[("ScheduleKeyDeletion", "ValidationException")];
+
 /// Create a key with `description` and return its `KeyMetadata`.
 async fn described_key(
     router: &smithy_server_runtime::MultiServiceRouter,
@@ -278,7 +290,9 @@ async fn every_client_error_answers_http_400_with_its_own_type() {
             code, expected_code,
             "case {case:?}: expected __type {expected_code}, got {code:?} in {payload}"
         );
-        if WORDLESS_REFUSALS.contains(&code.as_str()) {
+        if WORDLESS_REFUSALS.contains(&code.as_str())
+            || WORDLESS_BY_OPERATION.contains(&(operation, code.as_str()))
+        {
             assert!(
                 error_message(&payload).is_empty(),
                 "case {case:?}: AWS words this refusal with no message at all, got {payload}"

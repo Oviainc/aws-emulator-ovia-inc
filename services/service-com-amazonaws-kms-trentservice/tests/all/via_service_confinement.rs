@@ -67,11 +67,20 @@ fn allow(actions: Value, condition: Value) -> Value {
 }
 
 /// Attach `document` to `key_id`, requiring the empty 200 `PutKeyPolicy` answers.
+///
+/// Every document below is a SINGLE statement under test, so it leaves the caller no path
+/// to a later `PutKeyPolicy` and the policy-lockout safety check would refuse it. These
+/// tests are about what the statement confines, not about that check, so they attach the
+/// document the way the model provides for: `BypassPolicyLockoutSafetyCheck`.
 async fn put_policy(router: &MultiServiceRouter, case: &str, key_id: &str, document: &str) {
     let answer = ok(
         router,
         "PutKeyPolicy",
-        &json!({"KeyId": key_id, "Policy": document}),
+        &json!({
+            "KeyId": key_id,
+            "Policy": document,
+            "BypassPolicyLockoutSafetyCheck": true,
+        }),
     )
     .await;
     assert_empty(case, "PutKeyPolicy", &answer);

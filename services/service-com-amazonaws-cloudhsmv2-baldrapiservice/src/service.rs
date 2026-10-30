@@ -45,6 +45,17 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The service key `::emulator_server::service_from_target` reads out of the
+/// `X-Amz-Target` header this service's awsJson1_1 operations carry: that reader takes
+/// the segment before the `.`, strips a `_<version>` suffix and lower-cases it, so
+/// `BaldrApiService.<Operation>` normalises to this key — while CloudHSM Classic's own
+/// `CloudHsmFrontendService.<Operation>` normalises to `cloudhsmfrontendservice`.
+///
+/// It is the discriminator both crates read, because the two services share ONE SigV4
+/// signing name (`cloudhsm`, `smithy_query(query="service_info")` on either model) and
+/// the signing name is all the generated routing key carries.
+const TARGET_SERVICE_KEY: &str = "baldrapiservice";
+
 /// The `com-amazonaws-cloudhsmv2-baldrapiservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,11 +85,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // CloudHSM V2 and CloudHSM Classic are two services behind ONE SigV4 signing
+        // name (`cloudhsm`), which the model cannot express, so the default
+        // signing-name match makes BOTH claim every CloudHSM-signed request and the
+        // router rejects all of it rather than serving it from an arbitrary one. On
+        // awsJson1_1 the request names its service in `X-Amz-Target`, so that prefix is
+        // the discriminator: this service claims its own target and the Classic crate's
+        // `can_handle` declines it for the same reason.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
+            Some(key) if key == self.entry.identity().signing_name() => {
+                ::emulator_server::service_from_target(&parts.headers).as_deref()
+                    == Some(TARGET_SERVICE_KEY)
+            }
+            // An UNSIGNED request carries no credential scope, so the resolver's next
+            // signal is the `X-Amz-Target` prefix itself: a key that IS this service's
+            // target prefix names this service by the same discriminator.
+            Some(key) => key == TARGET_SERVICE_KEY,
             None => false,
         }
     }

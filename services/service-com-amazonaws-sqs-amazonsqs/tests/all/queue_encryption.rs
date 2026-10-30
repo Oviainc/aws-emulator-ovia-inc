@@ -131,7 +131,17 @@ impl Emulator {
 
     /// One KMS call, as the account's own credential. KMS is an awsJson1_1 service reached
     /// by `X-Amz-Target: TrentService.<Operation>`.
+    ///
+    /// A key policy these suites attach is the document UNDER TEST — it says what the
+    /// QUEUE's key permits a caller, so it need not leave this caller a path to a later
+    /// `kms:PutKeyPolicy`, which KMS's policy-lockout safety check otherwise requires.
+    /// That check has its own tests in the KMS crate, so the operations that attach a
+    /// document do it the way the KMS model provides for.
     async fn kms(&self, operation: &str, body: Value) -> Value {
+        let mut body = body;
+        if matches!(operation, "CreateKey" | "PutKeyPolicy") {
+            body["BypassPolicyLockoutSafetyCheck"] = json!(true);
+        }
         let request = http::Request::builder()
             .method("POST")
             .uri("/")

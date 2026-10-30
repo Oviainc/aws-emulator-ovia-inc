@@ -125,6 +125,11 @@ async fn kms_ok(router: &MultiServiceRouter, case: &str, operation: &str, body: 
 }
 
 /// A symmetric encryption key carrying `document` as its key policy, as `(key id, ARN)`.
+///
+/// `document` is the policy UNDER TEST — it says what the PARAMETER's key permits this
+/// caller and need not leave it a path to a later `kms:PutKeyPolicy`, which KMS's
+/// policy-lockout safety check otherwise requires. That check has its own tests in the
+/// KMS crate, so the key is created the way the KMS model provides for.
 async fn key_with_policy(
     router: &MultiServiceRouter,
     case: &str,
@@ -134,7 +139,11 @@ async fn key_with_policy(
         router,
         case,
         "CreateKey",
-        &json!({ "Description": case, "Policy": document }),
+        &json!({
+            "Description": case,
+            "Policy": document,
+            "BypassPolicyLockoutSafetyCheck": true,
+        }),
     )
     .await;
     let metadata = &created["KeyMetadata"];

@@ -365,11 +365,19 @@ async fn a_key_policy_must_reach_the_caller_whatever_the_identity_policy_says() 
     ];
 
     for (case, document, served) in rows {
+        // `withheld` names only another principal, so it leaves the caller no path to a
+        // later `PutKeyPolicy`: this test is about whose requests the document serves,
+        // not about the policy-lockout safety check, so it is attached the way the model
+        // provides for.
         emulator
             .ok(
                 ACCOUNT_KEY,
                 "PutKeyPolicy",
-                &json!({"KeyId": key_id, "Policy": document}),
+                &json!({
+                    "KeyId": key_id,
+                    "Policy": document,
+                    "BypassPolicyLockoutSafetyCheck": true,
+                }),
             )
             .await;
 

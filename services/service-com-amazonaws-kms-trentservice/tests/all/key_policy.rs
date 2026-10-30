@@ -28,8 +28,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    assert_empty, call, create_key, error_code, failure, failure_in, ok, ok_in, router, text,
-    REGION,
+    assert_empty, call, create_key, error_code, failure, failure_in, ok, ok_in, refused, router,
+    text, REGION,
 };
 
 /// KMS's key policy document quota, "Key policy document size: 32 KB" (Quotas in the
@@ -43,6 +43,12 @@ const MAX_KEY_POLICY_BYTES: usize = 32 * 1024;
 
 /// Attach `policy` to `key`, under `policy_name` when one is given, requiring the
 /// empty 200 AWS documents for `PutKeyPolicy`.
+///
+/// The rows these tests attach are about the SHAPE of a key policy document, so many of
+/// them leave the caller no path to a later `PutKeyPolicy` and the policy-lockout safety
+/// check would refuse them. That check has its own tests
+/// (`super::key_policy_lockout`), so the documents here are attached the way the model
+/// provides for: `BypassPolicyLockoutSafetyCheck`.
 async fn put_policy(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
@@ -50,7 +56,11 @@ async fn put_policy(
     policy: &str,
     policy_name: Option<&str>,
 ) {
-    let mut request = json!({"KeyId": key, "Policy": policy});
+    let mut request = json!({
+        "KeyId": key,
+        "Policy": policy,
+        "BypassPolicyLockoutSafetyCheck": true,
+    });
     if let Some(policy_name) = policy_name {
         request["PolicyName"] = json!(policy_name);
     }
@@ -518,8 +528,9 @@ async fn a_malformed_key_policy_is_refused_and_changes_nothing() {
     ];
 
     for (case, document) in cases {
-        let (status, code) = failure(
+        let (status, code, message) = refused(
             &router,
+            REGION,
             "PutKeyPolicy",
             &json!({"KeyId": key_id, "Policy": document}),
         )
@@ -531,6 +542,13 @@ async fn a_malformed_key_policy_is_refused_and_changes_nothing() {
         assert_eq!(
             code, "MalformedPolicyDocumentException",
             "case {case:?}: expected MalformedPolicyDocumentException, got {code:?}"
+        );
+        // Which criterion the document failed is not disclosed: AWS words this refusal
+        // with no message at all (recorded behavior), and a parser's account of the
+        // request's bytes is exactly what it does not disclose.
+        assert!(
+            message.is_empty(),
+            "case {case:?}: AWS words this refusal with no message, got {message:?}"
         );
         let served = get_policy(&router, case, &key_id).await;
         assert_eq!(

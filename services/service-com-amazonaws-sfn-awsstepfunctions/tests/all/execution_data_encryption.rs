@@ -311,22 +311,38 @@ impl Chain {
     }
 
     /// A symmetric encryption key carrying `policy`, as its key ARN.
+    ///
+    /// `policy` is the document UNDER TEST — some rows withhold every action from the
+    /// caller — so it need not leave the caller a path to a later `PutKeyPolicy`, which
+    /// KMS's policy-lockout safety check otherwise requires. These suites are about what
+    /// the document says to Step Functions, not about that check, so the key is created
+    /// the way the KMS model provides for.
     pub(crate) async fn create_key(&self, policy: &Value) -> String {
         let created = self
             .kms(
                 "CreateKey",
-                &json!({ "KeySpec": "SYMMETRIC_DEFAULT", "Policy": policy.to_string() }),
+                &json!({
+                    "KeySpec": "SYMMETRIC_DEFAULT",
+                    "Policy": policy.to_string(),
+                    "BypassPolicyLockoutSafetyCheck": true,
+                }),
             )
             .await;
         string(&created["KeyMetadata"], "Arn")
     }
 
     /// Replace the key's policy, which is how a caller withdraws a grant and puts it
-    /// back.
+    /// back. It bypasses the policy-lockout safety check for the reason
+    /// [`Self::create_key`] records.
     pub(crate) async fn put_policy(&self, key: &str, policy: &Value) {
         self.kms(
             "PutKeyPolicy",
-            &json!({ "KeyId": key, "PolicyName": POLICY_NAME, "Policy": policy.to_string() }),
+            &json!({
+                "KeyId": key,
+                "PolicyName": POLICY_NAME,
+                "Policy": policy.to_string(),
+                "BypassPolicyLockoutSafetyCheck": true,
+            }),
         )
         .await;
     }

@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 // in this crate.
 use super::harness::{
     b64, contains, create_key, describe, enabled_key, failure, failure_in, is_key_id, ok, ok_in,
-    router, text, unb64, REGION,
+    refused, router, text, unb64, REGION,
 };
 
 // ---------------------------------------------------------------------------
@@ -910,12 +910,15 @@ async fn schedule_key_deletion_honours_the_documented_waiting_period() {
         );
     }
 
-    // Rows outside the documented window, each refused before anything changes.
+    // Rows outside the documented window, each refused before anything changes. The
+    // refusal carries NO message: the member's own documentation is the whole of what is
+    // wrong with the value, and KMS does not restate it on the wire (recorded behavior).
     let metadata = create_key(&router, &json!({"Description": "untouched"})).await;
     let key_id = metadata["KeyId"].as_str().expect("a key id").to_string();
     for days in [1, 6, 31, 365] {
-        let (status, code) = failure(
+        let (status, code, message) = refused(
             &router,
+            REGION,
             "ScheduleKeyDeletion",
             &json!({"KeyId": key_id, "PendingWindowInDays": days}),
         )
@@ -927,6 +930,10 @@ async fn schedule_key_deletion_honours_the_documented_waiting_period() {
         assert_eq!(
             code, "ValidationException",
             "case {days} days: expected ValidationException, got {code}"
+        );
+        assert!(
+            message.is_empty(),
+            "case {days} days: AWS words this refusal with no message, got {message:?}"
         );
     }
     // And rows outside the modelled range, which the boundary refuses.

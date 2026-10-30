@@ -358,6 +358,43 @@ pub fn authorize_use(
     Err(no_allow_message(delegates))
 }
 
+/// Whether a key policy document the request is attaching to the key `key_arn` leaves
+/// `caller` a path to a subsequent `kms:PutKeyPolicy` on that key — the POLICY LOCKOUT
+/// SAFETY CHECK.
+///
+/// "The key policy must allow the calling principal to make a subsequent PutKeyPolicy
+/// request on the KMS key. This reduces the risk that the KMS key becomes unmanageable"
+/// (`smithy_query(query="doc",shape="PutKeyPolicyRequest",member="Policy")`), so the
+/// question is the one [`authorize_use`] answers for every other request, asked of the
+/// CANDIDATE document and of the one action that can replace it.
+///
+/// A statement naming the caller ITSELF keeps the path open outright, and one naming the
+/// caller's ACCOUNT keeps it open through that account's own identity policies, which the
+/// account can still write — the delegation the module docs record, which is why the
+/// default key policy passes this check. An explicit `Deny` over the caller or its
+/// account closes the path whatever else the document allows, and a conditioned allow
+/// this gate cannot decide for a future request leaves no path either.
+///
+/// Identity-based policies and grants are not consulted: neither can authorize an action
+/// on a key whose own policy withholds it, and a grant carries only the cryptographic
+/// operations a grant may carry.
+#[must_use]
+pub fn permits_policy_management(caller: &Caller, policy: &str, key_arn: &str) -> bool {
+    let action = format!("{}:{POLICY_MANAGEMENT_OPERATION}", super::ARN_SERVICE);
+    let conditions = request_conditions(caller, None, None);
+    let mut principals = caller.principals.clone();
+    principals.extend_from_slice(&caller.account);
+    let request = iam::Request::new(&action, key_arn, &principals)
+        .with_context(&conditions.carried)
+        .with_published_keys(&conditions.published);
+    iam::resource_decision(policy, &request) == Decision::Allowed
+}
+
+/// The operation whose availability the policy-lockout safety check is about: the one
+/// that REPLACES a key's policy, so a document that withholds it is a document nothing
+/// can replace.
+const POLICY_MANAGEMENT_OPERATION: &str = "PutKeyPolicy";
+
 /// Whether the authorities in force let `caller` perform an ACCOUNT-LEVEL
 /// `kms:<operation>` — one that names no KMS key — and the refusal message when they do
 /// not.

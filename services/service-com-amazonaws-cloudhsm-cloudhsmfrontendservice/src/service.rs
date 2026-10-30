@@ -45,6 +45,23 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The service key `::emulator_server::service_from_target` reads out of a CloudHSM V2
+/// request's `X-Amz-Target` header. That service signs as `cloudhsm` too
+/// (`smithy_query(query="service_info")` on either model gives the same `sigv4Name`), so
+/// this key is what tells its traffic apart from ours: the shared reader takes the segment
+/// before the `.`, strips a `_<version>` suffix and lower-cases it, so
+/// `BaldrApiService.<Operation>` normalises to this key while this service's own
+/// `CloudHsmFrontendService.<Operation>` normalises to `cloudhsmfrontendservice`. The V2
+/// crate's `can_handle` compares against the same key, so one discriminator is read one way
+/// on both sides.
+const V2_TARGET_SERVICE_KEY: &str = "baldrapiservice";
+
+/// The service key this service's OWN `X-Amz-Target` prefix resolves to
+/// (`CloudHsmFrontendService.<Operation>`), read by the same shared reader. An unsigned
+/// request carries no credential scope, so that prefix is the routing key the resolver
+/// hands back, and it names this service.
+const TARGET_SERVICE_KEY: &str = "cloudhsmfrontendservice";
+
 /// The `com-amazonaws-cloudhsm-cloudhsmfrontendservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,11 +91,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // CloudHSM Classic and CloudHSM V2 are two services behind ONE SigV4 signing
+        // name (`cloudhsm`), which the model cannot express, so the default
+        // signing-name match makes BOTH claim every CloudHSM-signed request and the
+        // router rejects all of it rather than serving it from an arbitrary one. On
+        // awsJson1_1 the request names its service in `X-Amz-Target`, so a
+        // `BaldrApiService.*` target belongs to the V2 service and is declined here.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
+            Some(key) if key == self.entry.identity().signing_name() => {
+                ::emulator_server::service_from_target(&parts.headers).as_deref()
+                    != Some(V2_TARGET_SERVICE_KEY)
+            }
+            // An UNSIGNED request carries no credential scope, so the resolver's next
+            // signal is the `X-Amz-Target` prefix itself: a key that IS this service's
+            // target prefix names this service by the same discriminator.
+            Some(key) => key == TARGET_SERVICE_KEY,
             None => false,
         }
     }

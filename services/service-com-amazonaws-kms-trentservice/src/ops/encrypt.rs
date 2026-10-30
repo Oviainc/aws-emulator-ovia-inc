@@ -4,11 +4,14 @@
 //! IMPLEMENTED: seals a plaintext under the key material of the KMS key a `KeyId`
 //! names. This is the ONLY file to touch for this operation.
 //!
-//! The returned `CiphertextBlob` is an AES-256-GCM envelope built by
-//! [`crate::state::seal`]: it names the key that sealed it, authenticates the
-//! encryption context, and is the exact input `Decrypt` inverts. It is opaque — the
-//! plaintext does not appear in it — and a blob sealed by one key cannot be opened
-//! by another.
+//! For a symmetric encryption key the returned `CiphertextBlob` is an AES-256-GCM
+//! envelope built by [`crate::state::seal`]: it names the key that sealed it,
+//! authenticates the encryption context, and is the exact input `Decrypt` inverts. For an
+//! asymmetric encryption key it is the plaintext sealed to the PUBLIC half of the key's
+//! key pair under the declared algorithm ([`crate::state::encrypt_asymmetric`]), which
+//! only the private half held here opens and which carries no encryption context. Either
+//! way it is opaque — the plaintext does not appear in it — and a blob sealed by one key
+//! cannot be opened by another.
 //!
 //! Permission is the service's one authorization decision
 //! ([`crate::state::authorization`]): a request that presents NO `GrantTokens` is judged
@@ -360,35 +363,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::access_denied(message));
         }
 
-        // "For encrypting, decrypting, re-encrypting, and generating data keys, the
-        // KeyUsage must be ENCRYPT_DECRYPT", and the algorithm must be one the key's
-        // key spec supports
-        // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
-        if key.key_usage != crate::state::KEY_USAGE_ENCRYPT_DECRYPT {
+        // Which algorithms this key encrypts under is exactly the key's own
+        // `EncryptionAlgorithms` — the list `DescribeKey` and `GetPublicKey` report for
+        // it, which follows from its key spec — and a key with no such list cannot
+        // encrypt at all: "for encrypting, decrypting, re-encrypting, and generating data
+        // keys, the KeyUsage must be ENCRYPT_DECRYPT"
+        // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`). The same
+        // judgement `Decrypt` makes, so the two cannot disagree about what a key can do.
+        let Some(supported) = key.algorithms_under(crate::state::KEY_USAGE_ENCRYPT_DECRYPT) else {
             return Err(invalid_key_usage(crate::state::wrong_key_usage_message(
                 key,
                 Self::NAME,
             )));
-        }
-        // The AES-GCM encryption this service performs is what a `SYMMETRIC_DEFAULT`
-        // key does. An asymmetric ENCRYPT_DECRYPT key (an RSA or SM2 key pair) is a
-        // valid key for `Encrypt`, but it has no key pair here and the RSAES-OAEP /
-        // SM2PKE encryption it calls for is not implemented, so the request is
-        // answered as not implemented rather than with a ciphertext some other scheme
-        // produced.
-        if key.key_spec != crate::state::KEY_SPEC_SYMMETRIC_DEFAULT {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "Encrypt with an asymmetric KMS key",
-            ));
-        }
+        };
+        // "This parameter is required only for asymmetric KMS keys. The default value,
+        // SYMMETRIC_DEFAULT, is the algorithm used for symmetric encryption KMS keys"
+        // (`smithy_query(query="doc",shape="EncryptRequest",member="EncryptionAlgorithm")`),
+        // so an asymmetric key is reached only by a request that names its algorithm: the
+        // default is not one such a key's spec advertises.
         let algorithm = input
             .encryption_algorithm
             .clone()
             .unwrap_or_else(|| crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT.to_string());
-        if algorithm != crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT {
+        if !supported.contains(&algorithm) {
             return Err(invalid_key_usage(
                 crate::state::incompatible_algorithm_message(&algorithm, &key.key_spec),
             ));
+        }
+        // "An encryption context is valid only for cryptographic operations with a
+        // symmetric encryption KMS key. The standard asymmetric encryption algorithms and
+        // HMAC algorithms that KMS uses do not support an encryption context"
+        // (`smithy_query(query="doc",shape="EncryptRequest",member="EncryptionContext")`):
+        // a context the scheme cannot bind is refused rather than accepted and dropped,
+        // which would hand the caller a ciphertext nothing had authenticated it into.
+        let symmetric = algorithm == crate::state::ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT;
+        if !symmetric && input.encryption_context.as_ref().is_some_and(|c| !c.is_empty()) {
+            return Err(invalid_key_usage(
+                crate::state::unsupported_encryption_context_message(&algorithm),
+            ));
+        }
+        // The plaintext a scheme carries is bounded by the scheme itself, and for an
+        // asymmetric key the bound follows from the key spec and the algorithm
+        // (`crate::state::max_asymmetric_plaintext_len`). The modelled `@length(1..4096)`
+        // on `PlaintextType` is the widest of them, so this is the bound a handler still
+        // gets to enforce.
+        if !symmetric {
+            let Some(ceiling) =
+                crate::state::max_asymmetric_plaintext_len(&key.key_spec, &algorithm)
+            else {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "Encrypt with the {algorithm} encryption algorithm"
+                )));
+            };
+            if input.plaintext.len() > ceiling {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Algorithm {algorithm} and key spec {} cannot encrypt data larger than \
+                     {ceiling} bytes.",
+                    key.key_spec
+                )));
+            }
         }
 
         // "The request was rejected because the DryRun parameter was specified"
@@ -407,13 +440,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(ciphertext_blob) =
-            crate::state::seal(key, &input.plaintext, input.encryption_context.as_ref())
-        else {
-            return Err(EncryptErrorModeled::KMSInternalException(KMSInternalException {
-                message: Some("the plaintext could not be encrypted".to_string()),
-            })
-            .into());
+        // A symmetric encryption key seals the plaintext into the AES-256-GCM envelope
+        // `Decrypt` inverts; an asymmetric one seals it to the PUBLIC half of its key
+        // pair, under the scheme the declared algorithm names, so the result is a
+        // ciphertext only the private half held here opens — the same bytes a party
+        // holding the published public key would have produced without calling KMS.
+        let ciphertext_blob = if symmetric {
+            let Some(ciphertext_blob) =
+                crate::state::seal(key, &input.plaintext, input.encryption_context.as_ref())
+            else {
+                return Err(EncryptErrorModeled::KMSInternalException(KMSInternalException {
+                    message: Some("the plaintext could not be encrypted".to_string()),
+                })
+                .into());
+            };
+            ciphertext_blob
+        } else {
+            match crate::state::encrypt_asymmetric(key, &algorithm, &input.plaintext) {
+                Ok(ciphertext_blob) => ciphertext_blob,
+                Err(crate::state::AsymmetricRefusal::Unsupported) => {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                        "Encrypt with the {algorithm} encryption algorithm"
+                    )));
+                }
+                // Nothing about the request explains either of these: the ciphertext
+                // direction has no ciphertext to reject, and the ceiling is judged above.
+                Err(crate::state::AsymmetricRefusal::NotThisCiphertext)
+                | Err(crate::state::AsymmetricRefusal::Failed) => {
+                    return Err(EncryptErrorModeled::KMSInternalException(
+                        KMSInternalException {
+                            message: Some("the plaintext could not be encrypted".to_string()),
+                        },
+                    )
+                    .into());
+                }
+            }
         };
         // KMS answers with the key ARN, not the identifier the request used.
         let key_arn = key.arn.clone();

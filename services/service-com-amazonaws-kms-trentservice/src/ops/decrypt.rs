@@ -654,6 +654,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "Decrypt with the {algorithm} encryption algorithm"
                     )));
                 }
+                // The scheme is implemented and the library refused the operation itself,
+                // which says nothing about the request: a server fault, not a refusal.
+                Err(crate::state::AsymmetricRefusal::Failed) => {
+                    return Err(DecryptErrorModeled::KMSInternalException(
+                        KMSInternalException {
+                            message: Some("the ciphertext could not be decrypted".to_string()),
+                        },
+                    )
+                    .into());
+                }
             },
         };
         let key_arn = key.arn.clone();

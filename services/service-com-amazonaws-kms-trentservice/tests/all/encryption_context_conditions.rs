@@ -116,11 +116,21 @@ fn caller() -> String {
 }
 
 /// Attach `document` to `key_id`, requiring the empty 200 `PutKeyPolicy` answers.
+///
+/// A document here carries the statement under test and, where the row needs it, the
+/// account-root statement — so some of them leave the caller no path to a later
+/// `PutKeyPolicy` and the policy-lockout safety check would refuse them. These tests are
+/// about which requests a conditioned statement covers, not about that check, so they
+/// attach the document the way the model provides for: `BypassPolicyLockoutSafetyCheck`.
 async fn put_policy(router: &MultiServiceRouter, case: &str, key_id: &str, document: &str) {
     let answer = ok(
         router,
         "PutKeyPolicy",
-        &json!({"KeyId": key_id, "Policy": document}),
+        &json!({
+            "KeyId": key_id,
+            "Policy": document,
+            "BypassPolicyLockoutSafetyCheck": true,
+        }),
     )
     .await;
     assert_empty(case, "PutKeyPolicy", &answer);

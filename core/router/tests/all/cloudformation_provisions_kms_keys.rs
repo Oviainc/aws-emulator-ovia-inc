@@ -889,7 +889,23 @@ async fn an_update_applies_each_changed_key_property_through_the_kms_call_that_o
     let key_id = output(&outputs, case, "KeyRef");
     let key_arn = output(&outputs, case, "KeyArn");
 
-    let narrowed = key_policy("kms:DescribeKey", None);
+    // Narrower than the document the create wrote, and still one the key's own
+    // policy-lockout safety check accepts: KMS refuses a replacement key policy that
+    // leaves no principal a path to a later `kms:PutKeyPolicy`, and CloudFormation does
+    // not ask for that check to be bypassed.
+    let narrowed = json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            root_key_policy()["Statement"][0].clone(),
+            {
+                "Sid": "grant",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "kms:DescribeKey",
+                "Resource": "*",
+            },
+        ],
+    });
     let body = update_and_settle(
         &router,
         case,

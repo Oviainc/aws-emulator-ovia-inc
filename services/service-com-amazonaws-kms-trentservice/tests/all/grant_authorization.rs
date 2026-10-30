@@ -291,10 +291,17 @@ impl Emulator {
     }
 
     /// Create a symmetric encryption key carrying `policy`, and answer its key id and ARN.
+    ///
+    /// A `policy` here is the document UNDER TEST — it names whichever principal the row
+    /// is about, so it need not reach the caller at all and the policy-lockout safety
+    /// check would refuse it. These suites are about whose requests a document serves, not
+    /// about that check, so the key is created the way the model provides for:
+    /// `BypassPolicyLockoutSafetyCheck`.
     pub(crate) async fn key(&self, policy: Option<&str>) -> (String, String) {
         let mut request = json!({"Description": "authorization"});
         if let Some(policy) = policy {
             request["Policy"] = json!(policy);
+            request["BypassPolicyLockoutSafetyCheck"] = json!(true);
         }
         let metadata = self.ok(ACCOUNT_KEY, "CreateKey", &request).await["KeyMetadata"].clone();
         (

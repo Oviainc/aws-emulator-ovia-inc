@@ -351,6 +351,11 @@ mod cloudformation_provisions_scheduler_schedules;
 mod cloudformation_provisions_stack_resources;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]
 mod cloudfront_key_value_store_handshake;
+// Declared HERE, in the sorted list, rather than appended at the end of this file: the
+// tail is where every suite landing in the same window appends, so it is the contended
+// region, while this span of the list is stable.
+#[path = "all/cloudhsm_signing_name_routing.rs"]
+mod cloudhsm_signing_name_routing;
 // Declared here, in the SORTED block rather than appended at the end: the tail is where
 // every suite landing in the same window appends, so it is the contended region, while
 // this span of the list is stable.

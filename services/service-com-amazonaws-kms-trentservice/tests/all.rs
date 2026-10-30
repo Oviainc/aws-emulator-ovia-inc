@@ -19,6 +19,8 @@ mod alias_lifecycle;
 mod aliases;
 #[path = "all/asymmetric_decrypt.rs"]
 mod asymmetric_decrypt;
+#[path = "all/asymmetric_encrypt.rs"]
+mod asymmetric_encrypt;
 #[path = "all/aws_managed_keys.rs"]
 mod aws_managed_keys;
 #[path = "all/client_error_status.rs"]
@@ -71,6 +73,8 @@ mod key_policy;
 mod key_policy_conditions;
 #[path = "all/key_policy_deny_scope.rs"]
 mod key_policy_deny_scope;
+#[path = "all/key_policy_lockout.rs"]
+mod key_policy_lockout;
 #[path = "all/key_rotation_on_demand.rs"]
 mod key_rotation_on_demand;
 #[path = "all/key_rotation_schedule.rs"]

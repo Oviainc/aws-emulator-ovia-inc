@@ -26,12 +26,12 @@
 //! every operation that would use the private key answers the scaffold's 501 rather
 //! than a fabricated signature, public key or ciphertext.
 //!
-//! `BypassPolicyLockoutSafetyCheck` is accepted and has no effect: the lockout check
-//! asks whether the key policy lets the CALLING PRINCIPAL make a subsequent
-//! `PutKeyPolicy` request, which needs the caller's IAM identity this emulator does
-//! not model. The document itself is judged by `crate::state::validate_key_policy`
-//! instead — the criteria the `Policy` member states, shared with `PutKeyPolicy` —
-//! which is the part that can be decided here.
+//! A `Policy` the request carries is judged by `crate::state::judge_key_policy` — the
+//! criteria the `Policy` member states, shared with `PutKeyPolicy` and `ReplicateKey` —
+//! including the POLICY LOCKOUT SAFETY CHECK: a document leaving the calling principal no
+//! path to a subsequent `PutKeyPolicy` on the key being created is refused unless
+//! `BypassPolicyLockoutSafetyCheck` is set, the member's own documented default. A
+//! request with no `Policy` gets the default key policy, which KMS itself words.
 //!
 //! The store this writes into is bounded: past `crate::state::MAX_KEYS` the request
 //! is refused with the modelled `LimitExceededException` and nothing is persisted.
@@ -361,6 +361,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before any key is minted.
         crate::state::authorization::check_account_action(&*self.engine, ctx, Self::NAME)?;
 
+        // Who the request speaks for, read BEFORE this service's store is locked: the
+        // policy-lockout safety check below is about the CALLING PRINCIPAL, and the
+        // stores that answer for it are other services'.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+
         // "The KeySpec and CustomerMasterKeySpec parameters work the same way. Only
         // the names differ."
         // (`smithy_query(query="doc",shape="CreateKeyRequest",member="CustomerMasterKeySpec")`)
@@ -461,10 +466,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The name the key will be known by, needed before the policy is judged: a key
+        // policy is judged against the key it is attached to.
+        // "For a single-Region KMS key, omit this parameter or set it to False. The
+        // default value is False."
+        // (`smithy_query(query="doc",shape="CreateKeyRequest",member="MultiRegion")`)
+        let multi_region = input.multi_region.unwrap_or(false);
+        let region = crate::state::request_region(ctx);
+        let key_id = crate::state::mint_key_id(multi_region);
+        let key_arn = crate::state::key_arn(&region, &key_id);
+
         // A supplied key policy must be "syntactically or semantically correct"
-        // (`MalformedPolicyDocumentException`): `crate::state::validate_key_policy`
-        // holds the criteria the `Policy` member states, shared with every other
-        // operation that takes a key policy.
+        // (`MalformedPolicyDocumentException`): `crate::state::judge_key_policy` holds
+        // the criteria the `Policy` member states — including the policy-lockout safety
+        // check and the `BypassPolicyLockoutSafetyCheck` that omits it — shared with
+        // every other operation that takes a key policy. The default policy KMS itself
+        // builds is not judged: it is the document the member documents as the default.
         let policy = match input.policy.as_deref() {
             None => crate::state::default_key_policy(),
             Some(policy) => {
@@ -478,10 +495,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         policy.len()
                     )));
                 }
-                if let Err(reason) = crate::state::validate_key_policy(policy) {
+                if let Err(refusal) = crate::state::judge_key_policy(
+                    policy,
+                    &caller,
+                    &key_arn,
+                    input.bypass_policy_lockout_safety_check,
+                ) {
                     return Err(CreateKeyErrorModeled::MalformedPolicyDocumentException(
                         MalformedPolicyDocumentException {
-                            message: Some(reason),
+                            message: refusal.message(),
                         },
                     )
                     .into());
@@ -511,8 +533,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         };
-
-        let multi_region = input.multi_region.unwrap_or(false);
 
         // The store is bounded, and the bound is read BEFORE any material is generated
         // so a request that will be refused for quota costs no key pair. It is read
@@ -588,11 +608,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let key = crate::state::Cmk::new(
-            // "For a single-Region KMS key, omit this parameter or set it to False.
-            // The default value is False."
-            // (`smithy_query(query="doc",shape="CreateKeyRequest",member="MultiRegion")`)
-            crate::state::mint_key_id(multi_region),
-            crate::state::request_region(ctx),
+            key_id,
+            region,
             input.description.clone().unwrap_or_default(),
             key_usage,
             key_spec,

@@ -4138,9 +4138,7 @@ pub const KEY_POLICY_NAME_DEFAULT: &str = "default";
 /// this store.
 pub const MAX_KEY_POLICY_BYTES: usize = 32 * 1024;
 
-/// Whether `policy` is a key policy document KMS would accept, and why not when it
-/// is not — the sentence a `MalformedPolicyDocumentException` ("the specified policy
-/// is not syntactically or semantically correct") carries.
+/// Whether `policy` is a key policy document KMS would accept.
 ///
 /// The criteria are the `Policy` member's own
 /// (`smithy_query(query="doc",shape="PutKeyPolicyRequest",member="Policy")`, which
@@ -4157,19 +4155,19 @@ pub const MAX_KEY_POLICY_BYTES: usize = 32 * 1024;
 /// `Resource`: "if either of the required `Resource` or `Action` elements are
 /// missing from a key policy statement, the policy statement has no effect … but the
 /// `PutKeyPolicy` API request succeeds, even though the policy statement is
-/// ineffective" (same doc). Nor does it judge the policy-lockout safety check: that
-/// check asks whether the policy lets the CALLING PRINCIPAL make a subsequent
-/// `PutKeyPolicy` request, which needs the caller's IAM identity — something this
-/// emulator does not model — so `BypassPolicyLockoutSafetyCheck` is accepted and has
-/// no effect, exactly as `CreateKey` already records.
+/// ineffective" (same doc). The policy-lockout safety check is the OTHER half of
+/// judging a document and is [`authorization::permits_policy_management`]; both are
+/// reached through [`judge_key_policy`], which every operation that attaches a key
+/// policy calls.
 ///
-/// The sentences are this emulator's wording; what this function pins is WHICH
-/// documents are refused.
-pub fn validate_key_policy(policy: &str) -> Result<(), String> {
-    let document: ::serde_json::Value = ::serde_json::from_str(policy)
-        .map_err(|error| format!("The key policy is not valid JSON: {error}."))?;
+/// This answers WHICH documents are refused and nothing about why: the refusal carries
+/// no message (see [`KeyPolicyRefusal`]), so there is no sentence to word here.
+pub fn is_well_formed_key_policy(policy: &str) -> bool {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+        return false;
+    };
     let Some(object) = document.as_object() else {
-        return Err("The key policy must be a JSON object.".to_string());
+        return false;
     };
     // An IAM JSON policy document's `Statement` is either one statement or a list
     // of them; a key policy with no statement at all grants nothing and is not a
@@ -4179,34 +4177,81 @@ pub fn validate_key_policy(policy: &str) -> Result<(), String> {
             statements.iter().collect()
         }
         Some(statement @ ::serde_json::Value::Object(_)) => vec![statement],
-        Some(_) => {
-            return Err(
-                "The key policy's Statement must be a statement or a non-empty list of \
-                 statements."
-                    .to_string(),
-            )
-        }
-        None => return Err("The key policy must contain a Statement.".to_string()),
+        Some(_) | None => return false,
     };
-    for (index, statement) in statements.iter().enumerate() {
+    statements.iter().all(|statement| {
         let Some(statement) = statement.as_object() else {
-            return Err(format!(
-                "Statement {index} of the key policy must be a JSON object."
-            ));
+            return false;
         };
-        match statement.get("Effect").and_then(::serde_json::Value::as_str) {
-            Some("Allow" | "Deny") => {}
-            _ => {
-                return Err(format!(
-                    "Statement {index} of the key policy must have an Effect of Allow or Deny."
-                ))
-            }
+        matches!(
+            statement.get("Effect").and_then(::serde_json::Value::as_str),
+            Some("Allow" | "Deny")
+        ) && names_a_principal(statement)
+    })
+}
+
+/// How KMS words the refusal of a key policy that would lock the calling principal out
+/// of managing the key: the safety check's own sentence, entirely FIXED text that names
+/// neither the principal nor the key.
+pub const POLICY_LOCKOUT_MESSAGE: &str =
+    "The new key policy will not allow you to update the key policy in the future.";
+
+/// Why KMS will not attach a key policy document a request carried. Both classes are
+/// the modelled `MalformedPolicyDocumentException` ("the specified policy is not
+/// syntactically or semantically correct") and differ only in the message they carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyPolicyRefusal {
+    /// The document is not one KMS accepts ([`is_well_formed_key_policy`]).
+    ///
+    /// It carries NO message. Which criterion the document failed is not disclosed —
+    /// and a parser's own account of it (a position in the request's bytes) is not
+    /// something KMS tells a caller.
+    Malformed,
+    /// The document would leave the calling principal no path to a subsequent
+    /// `PutKeyPolicy` on the key, and the request did not ask for the safety check to be
+    /// bypassed: [`POLICY_LOCKOUT_MESSAGE`].
+    Lockout,
+}
+
+impl KeyPolicyRefusal {
+    /// The message this refusal carries on the wire, `None` where it carries none.
+    #[must_use]
+    pub fn message(self) -> Option<String> {
+        match self {
+            Self::Malformed => None,
+            Self::Lockout => Some(POLICY_LOCKOUT_MESSAGE.to_string()),
         }
-        if !names_a_principal(statement) {
-            return Err(format!(
-                "Statement {index} of the key policy must contain one or more principals."
-            ));
-        }
+    }
+}
+
+/// Whether `policy` is a document this request may attach to the key `key_arn`, judged
+/// for the principal that made the request.
+///
+/// Two criteria, in the order KMS states them on the `Policy` member
+/// (`smithy_query(query="doc",shape="PutKeyPolicyRequest",member="Policy")`): the
+/// document has to be a key policy document at all, and it "must allow the calling
+/// principal to make a subsequent PutKeyPolicy request on the KMS key. This reduces the
+/// risk that the KMS key becomes unmanageable. … (To omit this condition, set
+/// BypassPolicyLockoutSafetyCheck to true.)" — so the second criterion is skipped for
+/// exactly the request that asks for it, and is in force by default, the default the
+/// member itself declares.
+///
+/// Nothing is written by judging, so a refused document leaves the key the policy it
+/// had. One function for every operation that attaches a key policy, so `CreateKey`,
+/// `PutKeyPolicy` and `ReplicateKey` cannot accept different documents.
+pub fn judge_key_policy(
+    policy: &str,
+    caller: &authorization::Caller,
+    key_arn: &str,
+    bypass_policy_lockout_safety_check: bool,
+) -> Result<(), KeyPolicyRefusal> {
+    if !is_well_formed_key_policy(policy) {
+        return Err(KeyPolicyRefusal::Malformed);
+    }
+    if !bypass_policy_lockout_safety_check
+        && !authorization::permits_policy_management(caller, policy, key_arn)
+    {
+        return Err(KeyPolicyRefusal::Lockout);
     }
     Ok(())
 }
@@ -4309,6 +4354,22 @@ pub fn wrong_key_usage_message(key: &Cmk, operation: &str) -> String {
 /// algorithm and a MAC algorithm are all refused in the same words.
 pub fn incompatible_algorithm_message(algorithm: &str, key_spec: &str) -> String {
     format!("Algorithm {algorithm} is incompatible with key spec {key_spec}.")
+}
+
+/// How KMS refuses an encryption context an algorithm cannot bind: "an encryption context
+/// is valid only for cryptographic operations with a symmetric encryption KMS key. The
+/// standard asymmetric encryption algorithms and HMAC algorithms that KMS uses do not
+/// support an encryption context"
+/// (`smithy_query(query="doc",shape="EncryptRequest",member="EncryptionContext")`).
+///
+/// The sentence names the algorithm the request asked for, which is the half of the pair
+/// the caller can change — the member it carried is the other half and is in the request.
+///
+/// One function for the whole service, beside [`wrong_key_usage_message`] and
+/// [`incompatible_algorithm_message`], so the refusals an algorithm meets are worded in
+/// one place.
+pub fn unsupported_encryption_context_message(algorithm: &str) -> String {
+    format!("Algorithm {algorithm} does not support an encryption context.")
 }
 
 /// How a refusal caused by the key's own key state is worded.
@@ -4564,7 +4625,8 @@ fn encryption_context_aad(context: Option<&HashMap<String, String>>) -> Vec<u8> 
 // ---------------------------------------------------------------------------
 
 /// Why a ciphertext presented for an asymmetric KMS key could not be opened with the
-/// private half this store holds.
+/// private half this store holds, or why a plaintext could not be sealed to its public
+/// half.
 #[derive(Debug)]
 pub enum AsymmetricRefusal {
     /// No library reachable from here performs the encryption scheme this key pair and
@@ -4576,6 +4638,10 @@ pub enum AsymmetricRefusal {
     /// parameters: they were produced for another key, under another algorithm, or
     /// they have been altered.
     NotThisCiphertext,
+    /// The library implements the scheme and refused this particular operation, with the
+    /// request already judged against every rule the scheme states. Nothing about the
+    /// request explains it, so it is a server fault rather than a refusal.
+    Failed,
 }
 
 /// The plaintext of `ciphertext`, which was encrypted under the PUBLIC half of `key`'s
@@ -4649,6 +4715,81 @@ fn rsa_oaep_algorithm(
         ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_256 => Some(&::aws_lc_rs::rsa::OAEP_SHA256_MGF1SHA256),
         _ => None,
     }
+}
+
+/// The ciphertext of `plaintext` under the PUBLIC half of `key`'s key pair, with
+/// `encryption_algorithm` — the other direction of [`decrypt_asymmetric`], for the caller
+/// that asks KMS to encrypt rather than holding the published public key itself.
+///
+/// The public half is COMPUTED from the private half this store holds, by the same
+/// library that implements the scheme, so what seals a plaintext here is the public key
+/// `GetPublicKey` publishes ([`public_key_spki`]) and nothing else can open the result.
+/// The ciphertext carries no additional authenticated data: "the standard asymmetric
+/// encryption algorithms ... that KMS uses do not support an encryption context"
+/// (`smithy_query(query="doc",shape="DecryptRequest",member="EncryptionContext")`).
+///
+/// The plaintext must already be within the scheme's ceiling
+/// ([`max_asymmetric_plaintext_len`]), which is a documented property of the key spec and
+/// the algorithm and so is a REFUSAL the handler answers, not a failure here.
+pub fn encrypt_asymmetric(
+    key: &Cmk,
+    encryption_algorithm: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, AsymmetricRefusal> {
+    let (Some(private_key), Some(key_pair)) = (
+        key.material.private_key_pkcs8(),
+        key_pair_kind(&key.key_spec),
+    ) else {
+        return Err(AsymmetricRefusal::Unsupported);
+    };
+
+    match key_pair {
+        KeyPairKind::Rsa(_) => {
+            let oaep_algorithm =
+                rsa_oaep_algorithm(encryption_algorithm).ok_or(AsymmetricRefusal::Unsupported)?;
+            let private_key = ::aws_lc_rs::rsa::PrivateDecryptingKey::from_pkcs8(private_key)
+                .map_err(|_| AsymmetricRefusal::Unsupported)?;
+            // An RSA ciphertext is exactly one modulus wide.
+            let mut ciphertext = vec![0u8; private_key.key_size_bytes()];
+            let public_key = ::aws_lc_rs::rsa::OaepPublicEncryptingKey::new(private_key.public_key())
+                .map_err(|_| AsymmetricRefusal::Unsupported)?;
+            let len = public_key
+                .encrypt(oaep_algorithm, plaintext, &mut ciphertext, None)
+                .map_err(|_| AsymmetricRefusal::Failed)?
+                .len();
+            ciphertext.truncate(len);
+            Ok(ciphertext)
+        }
+        // The same scheme coverage [`decrypt_asymmetric`] has: SM2PKE is the one
+        // encryption scheme no library reachable from here performs, and the remaining
+        // key pairs advertise no encryption algorithm at all.
+        KeyPairKind::Sm2 | KeyPairKind::Ecdsa(_) | KeyPairKind::Ed25519 => {
+            Err(AsymmetricRefusal::Unsupported)
+        }
+    }
+}
+
+/// The largest plaintext an asymmetric KMS key of `key_spec` encrypts under
+/// `encryption_algorithm`, in bytes, or `None` when the pair names no scheme with a
+/// ceiling this computes.
+///
+/// For RSAES-OAEP the ceiling is the scheme's own: a message of at most `k - 2*hLen - 2`
+/// bytes, where `k` is the modulus in bytes and `hLen` the digest's output length (RFC
+/// 8017 §7.1.1). It is therefore derived from the KEY SPEC and the ALGORITHM rather than
+/// listed, and it reproduces every ceiling the operation documents — "RSA_2048
+/// RSAES_OAEP_SHA_1: 214 bytes RSAES_OAEP_SHA_256: 190 bytes RSA_3072 RSAES_OAEP_SHA_1:
+/// 342 bytes RSAES_OAEP_SHA_256: 318 bytes RSA_4096 RSAES_OAEP_SHA_1: 470 bytes
+/// RSAES_OAEP_SHA_256: 446 bytes" (`smithy_query(query="doc",shape="Encrypt")`).
+pub fn max_asymmetric_plaintext_len(key_spec: &str, encryption_algorithm: &str) -> Option<usize> {
+    let KeyPairKind::Rsa(modulus_bits) = key_pair_kind(key_spec)? else {
+        return None;
+    };
+    let digest_len = match encryption_algorithm {
+        ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_1 => ::aws_lc_rs::digest::SHA1_OUTPUT_LEN,
+        ENCRYPTION_ALGORITHM_RSAES_OAEP_SHA_256 => ::aws_lc_rs::digest::SHA256_OUTPUT_LEN,
+        _ => return None,
+    };
+    (modulus_bits / 8).checked_sub(2 * digest_len + 2)
 }
 
 // ---------------------------------------------------------------------------

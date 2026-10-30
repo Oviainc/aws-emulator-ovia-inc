@@ -263,6 +263,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let replica_region = input.replica_region.clone();
+        // Who the request speaks for, read BEFORE this service's store is locked: the
+        // policy-lockout safety check below is about the CALLING PRINCIPAL, and the
+        // stores that answer for it are other services'.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let mut state = state.lock();
 
         // "Specify the key ID or key ARN of a multi-Region primary key"
@@ -387,10 +391,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         policy.len()
                     )));
                 }
-                if let Err(reason) = crate::state::validate_key_policy(policy) {
+                if let Err(refusal) = crate::state::judge_key_policy(
+                    policy,
+                    &caller,
+                    &crate::state::key_arn(&replica_region, &key.key_id),
+                    input.bypass_policy_lockout_safety_check,
+                ) {
                     return Err(ReplicateKeyErrorModeled::MalformedPolicyDocumentException(
                         MalformedPolicyDocumentException {
-                            message: Some(reason),
+                            message: refusal.message(),
                         },
                     )
                     .into());

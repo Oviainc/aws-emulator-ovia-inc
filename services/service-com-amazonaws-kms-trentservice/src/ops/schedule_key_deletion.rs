@@ -223,12 +223,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(query="doc",shape="ScheduleKeyDeletionRequest",member="PendingWindowInDays")`)
         // The modelled range on `PendingWindowInDaysType` is wider (1..365) because the
         // shape is shared, so the documented window is enforced here.
+        //
+        // The refusal carries NO message: the member's own documentation is the whole of
+        // what is wrong with the value, and KMS does not restate it on the wire.
         let pending_window_in_days = input.pending_window_in_days.unwrap_or(DEFAULT_PENDING_WINDOW);
         if !(MIN_PENDING_WINDOW..=MAX_PENDING_WINDOW).contains(&pending_window_in_days) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "PendingWindowInDays must be between {MIN_PENDING_WINDOW} and \
-                 {MAX_PENDING_WINDOW}, inclusive, but was {pending_window_in_days}"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(String::new()));
         }
 
         let region = crate::state::request_region(ctx);

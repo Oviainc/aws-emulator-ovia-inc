@@ -827,14 +827,6 @@ async fn cryptographic_operations_over_a_non_symmetric_key_are_never_fabricated(
     let plaintext = b64(b"attack at dawn");
     let cases: Vec<(&str, &str, Value, u16, &str)> = vec![
         (
-            "Encrypt with an asymmetric encryption key",
-            "Encrypt",
-            json!({"KeyId": rsa_encrypt["KeyId"], "Plaintext": plaintext,
-                   "EncryptionAlgorithm": "RSAES_OAEP_SHA_256"}),
-            501,
-            "NotImplemented",
-        ),
-        (
             "Encrypt with a signing key",
             "Encrypt",
             json!({"KeyId": rsa_sign["KeyId"], "Plaintext": plaintext}),
