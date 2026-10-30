@@ -830,7 +830,9 @@ async fn a_plan_an_execution_still_holds_refuses_a_second_start_and_a_delete() {
 }
 
 /// RULE 4: every operation that looks a plan up by the ARN the request carries answers
-/// the same not-found message, built from that ARN.
+/// the same not-found message, built from that ARN — the Region-scoped (`...InRegion`)
+/// reads included, which answer it at a status of their own (see
+/// [`crate::in_region_unresolvable_plan`]).
 #[tokio::test]
 async fn a_plan_this_emulator_holds_no_plan_for_is_one_message_built_from_the_arn() {
     let emulator = Emulator::new();
@@ -857,22 +859,36 @@ async fn a_plan_this_emulator_holds_no_plan_for_is_one_message_built_from_the_ar
     ];
     for (why, arn) in arns {
         assert_ne!(arn, kept, "case {why:?}: the case must not name the stored plan");
-        let requests: Vec<(&str, Value)> = vec![
-            ("GetPlan", json!({"arn": arn})),
-            ("DeletePlan", json!({"arn": arn})),
+        // The expected status goes with the operation: the Region-agnostic reads answer
+        // the status `ResourceNotFoundException`'s `@httpError` names, the Region-scoped
+        // one answers the status this service answers an `arn` it cannot resolve from the
+        // Region reached with.
+        let requests: Vec<(&str, Value, u16)> = vec![
+            ("GetPlan", json!({"arn": arn}), 404),
+            ("DeletePlan", json!({"arn": arn}), 404),
             (
                 "StartPlanExecution",
                 json!({"planArn": arn, "targetRegion": "us-west-2", "action": "activate"}),
+                404,
             ),
-            ("ListRoute53HealthChecks", json!({"arn": arn})),
-            ("ListRoute53HealthChecksInRegion", json!({"arn": arn})),
+            ("ListRoute53HealthChecks", json!({"arn": arn}), 404),
+            (
+                "ListRoute53HealthChecksInRegion",
+                json!({"arn": arn}),
+                state::IN_REGION_NOT_FOUND_STATUS,
+            ),
+            (
+                "GetPlanInRegion",
+                json!({"arn": arn}),
+                state::IN_REGION_NOT_FOUND_STATUS,
+            ),
         ];
-        for (operation, request) in requests {
+        for (operation, request, expected_status) in requests {
             let case = format!("{operation} on {why}");
             let (status, body) = emulator.call(operation, &request).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected 404, got {status} with {body}"
+                status, expected_status,
+                "case {case:?}: expected {expected_status}, got {status} with {body}"
             );
             assert_eq!(
                 error_code(&body),

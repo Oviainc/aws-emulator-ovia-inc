@@ -279,26 +279,28 @@ pub fn region_pair_violation(regions: &[String]) -> Option<String> {
     ))
 }
 
-/// The `ResourceNotFoundException` message for a plan ARN this emulator holds no plan
-/// under, built from the ARN the REQUEST carried.
+/// The `ResourceNotFoundException` message for a plan ARN this emulator cannot resolve a
+/// plan from, built from the ARN the REQUEST carried.
 ///
-/// One function so every operation that looks a plan up by ARN — `GetPlan`, `DeletePlan`,
-/// `StartPlanExecution`, `ListRoute53HealthChecks`, `ListRoute53HealthChecksInRegion` —
-/// renders that refusal identically.
+/// One function so every operation that looks a plan up by ARN renders that refusal
+/// identically — `GetPlan`, `DeletePlan`, `StartPlanExecution`,
+/// `ListRoute53HealthChecks`, and the Region-scoped reads, which answer the same shape
+/// and the same message at [`IN_REGION_NOT_FOUND_STATUS`] instead of the status the
+/// shape's `@httpError` names.
 pub fn plan_not_found_message(arn: &str) -> String {
     format!("Plan not found for ARN: {arn}")
 }
 
-/// The `ResourceNotFoundException` message for a plan this emulator holds, read through a
-/// Region-scoped operation from a Region the plan is not available in. It names the
-/// Region the request reached and the Regions the plan does cover, so a caller that
-/// pointed the SDK at the wrong endpoint is told which one holds it.
-pub fn plan_not_in_region_message(arn: &str, region: &str, plan_regions: &[String]) -> String {
-    format!(
-        "Plan not found for ARN: {arn} in Region {region}; the plan is available in {}",
-        plan_regions.join(", ")
-    )
-}
+/// The HTTP status a Region-scoped (`...InRegion`) read answers a plan `arn` it cannot
+/// resolve from the Region the call reached with.
+///
+/// `ResourceNotFoundException` carries `@httpError 404`, and 404 is what the
+/// Region-agnostic reads of a plan answer with. The recorded responses of this service's
+/// Region-scoped reads carry that same shape, `__type` and message at HTTP 400: from one
+/// Region's endpoint an ARN that names no plan available there is answered as a plain
+/// client error. Only the status is the service's own — everything on the wire stays the
+/// modelled shape's.
+pub const IN_REGION_NOT_FOUND_STATUS: u16 = 400;
 
 /// The page size a paginated operation of this service serves.
 ///
@@ -365,8 +367,8 @@ impl StoredPlan {
     /// A plan's `regions` are the Amazon Web Services Regions it covers (`RegionList`,
     /// len 2..2), and `ListPlansInRegion` is documented to list the plans "available in
     /// the current Amazon Web Services Region" — so a plan is available in exactly the
-    /// Regions its own `regions` names. The Region-scoped reads (`GetPlanInRegion`, and
-    /// `ListPlansInRegion` once it is written) decide with this.
+    /// Regions its own `regions` names. The Region-scoped reads decide with this, through
+    /// [`ComAmazonawsArcregionswitchArcregionswitchState::plan_available_in_region`].
     pub fn is_available_in_region(&self, region: &str) -> bool {
         self.plan.regions.iter().any(|r| r == region)
     }
@@ -929,6 +931,19 @@ impl ComAmazonawsArcregionswitchArcregionswitchState {
     pub fn next_seed(&mut self) -> u64 {
         self.seed += 1;
         self.seed
+    }
+
+    /// The plan a Region-scoped (`...InRegion`) read's `arn` names, resolved from the
+    /// Region the call reached: `None` when no plan is stored under that ARN, and when
+    /// the plan stored under it does not cover `region`.
+    ///
+    /// One function so every Region-scoped read resolves its argument the same way. Both
+    /// `None` cases are one refusal — from that Region's endpoint there is no such plan —
+    /// so both answer [`plan_not_found_message`] at [`IN_REGION_NOT_FOUND_STATUS`].
+    pub fn plan_available_in_region(&self, arn: &str, region: &str) -> Option<&StoredPlan> {
+        self.plans
+            .get(arn)
+            .filter(|record| record.is_available_in_region(region))
     }
 
     /// Apply the state changes the clock already made due at `now`.

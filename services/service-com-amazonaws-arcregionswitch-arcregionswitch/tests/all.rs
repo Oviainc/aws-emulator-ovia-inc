@@ -17,6 +17,8 @@ mod approve_plan_execution_step;
 mod execution_progression;
 #[path = "all/get_plan_in_region.rs"]
 mod get_plan_in_region;
+#[path = "all/in_region_unresolvable_plan.rs"]
+mod in_region_unresolvable_plan;
 #[path = "all/plan_evaluation_status.rs"]
 mod plan_evaluation_status;
 #[path = "all/plan_execution_listing.rs"]

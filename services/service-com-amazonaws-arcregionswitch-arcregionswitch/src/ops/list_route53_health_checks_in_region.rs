@@ -9,6 +9,16 @@
 //! scope (the input names no Region), then by the request's `hostedZoneId` and
 //! `recordName` filters, and paged by `maxResults`/`nextToken`.
 //!
+//! Being Region-scoped, it resolves its `arn` through
+//! [`crate::state::ComAmazonawsArcregionswitchArcregionswitchState::plan_available_in_region`]:
+//! an `arn` no plan is stored under, and a stored plan the Region the call reached is not
+//! one of, are one refusal — from that Region there is no such plan — answered with the
+//! modelled `ResourceNotFoundException` and its message at
+//! [`crate::state::IN_REGION_NOT_FOUND_STATUS`], the status this service answers a
+//! Region-scoped read's unresolvable `arn` with. `ListRoute53HealthChecks`, the
+//! Region-agnostic read of the same projection, answers the status the shape's
+//! `@httpError` names.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -79,7 +89,8 @@
 //! * `InternalServerException` (HTTP 500) — The request processing has failed because of an
 //!   unknown error, exception, or failure. HTTP Status Code: 500
 //! * `ResourceNotFoundException` (HTTP 404) — The specified resource was not found. HTTP
-//!   Status Code: 404
+//!   Status Code: 404. This Region-scoped read answers it at
+//!   [`crate::state::IN_REGION_NOT_FOUND_STATUS`] instead — see the error channel below.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -105,9 +116,95 @@ pub enum ListRoute53HealthChecksInRegionErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::list_route53_health_checks_in_region::ListRoute53HealthChecksInRegionError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type ListRoute53HealthChecksInRegionError = crate::scaffolded::Scaffolded<ListRoute53HealthChecksInRegionErrorModeled>;
+/// (`crate::ops::list_route53_health_checks_in_region::ListRoute53HealthChecksInRegionError`).
+///
+/// Two variants, because the status is not always the one the model gives the shape:
+/// [`Self::Scaffolded`] is the usual channel (a modelled error, the 501, or a refusal the
+/// model cannot express), rendered exactly as every other operation renders it, and
+/// [`Self::AtStatus`] is a modelled error this service answers at a status of its own —
+/// the shape, its `__type` and its message stay the modelled ones.
+#[derive(Debug)]
+pub enum ListRoute53HealthChecksInRegionError {
+    /// A modelled error, the scaffold 501, or a handler refusal, at the status the model
+    /// gives its shape.
+    Scaffolded(crate::scaffolded::Scaffolded<ListRoute53HealthChecksInRegionErrorModeled>),
+    /// A modelled error at the HTTP status THIS service answers it with.
+    AtStatus(ListRoute53HealthChecksInRegionErrorModeled, u16),
+}
+
+impl ListRoute53HealthChecksInRegionError {
+    /// The refusal of an `arn` this read cannot resolve a plan from, in the Region the
+    /// call reached: the modelled `ResourceNotFoundException` and its message, at
+    /// [`crate::state::IN_REGION_NOT_FOUND_STATUS`].
+    pub fn not_resolvable_in_region(arn: &str) -> Self {
+        Self::AtStatus(
+            ListRoute53HealthChecksInRegionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::plan_not_found_message(arn),
+                },
+            ),
+            crate::state::IN_REGION_NOT_FOUND_STATUS,
+        )
+    }
+}
+
+impl ::std::fmt::Display for ListRoute53HealthChecksInRegionError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Scaffolded(error) => write!(f, "{error}"),
+            Self::AtStatus(error, _) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl ::std::error::Error for ListRoute53HealthChecksInRegionError {
+    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        match self {
+            Self::Scaffolded(error) => error.source(),
+            Self::AtStatus(error, _) => error.source(),
+        }
+    }
+}
+
+/// Every method delegates to the modelled error the active variant carries, so the wire
+/// shape, the error code and the message are the model's in both variants; only
+/// [`Self::AtStatus`] answers a status of the service's own.
+impl smithy_server_runtime::OperationError for ListRoute53HealthChecksInRegionError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Scaffolded(error) => error.as_serializable(),
+            Self::AtStatus(error, _) => error.as_serializable(),
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Scaffolded(error) => error.variant_schema(),
+            Self::AtStatus(error, _) => error.variant_schema(),
+        }
+    }
+
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Scaffolded(error) => error.shape_name(),
+            Self::AtStatus(error, _) => error.shape_name(),
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Scaffolded(error) => error.http_status(),
+            Self::AtStatus(_, status) => *status,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Scaffolded(error) => error.query_error_code(),
+            Self::AtStatus(error, _) => error.query_error_code(),
+        }
+    }
+}
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -115,7 +212,18 @@ pub type ListRoute53HealthChecksInRegionError = crate::scaffolded::Scaffolded<Li
 /// this operation is implemented.
 impl From<ListRoute53HealthChecksInRegionErrorModeled> for ListRoute53HealthChecksInRegionError {
     fn from(modeled: ListRoute53HealthChecksInRegionErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
+    }
+}
+
+/// The same for a refusal the scaffold channel words (`Scaffolded::validation`).
+impl From<crate::scaffolded::Scaffolded<ListRoute53HealthChecksInRegionErrorModeled>>
+    for ListRoute53HealthChecksInRegionError
+{
+    fn from(
+        scaffolded: crate::scaffolded::Scaffolded<ListRoute53HealthChecksInRegionErrorModeled>,
+    ) -> Self {
+        Self::Scaffolded(scaffolded)
     }
 }
 
@@ -202,14 +310,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        let Some(record) = store.plans.get(&input.arn) else {
+        // An `arn` no plan is stored under and a stored plan this Region is not one of
+        // are the same refusal: from this Region's endpoint there is no such plan.
+        let Some(record) = store.plan_available_in_region(&input.arn, &region) else {
             return Err(
-                ListRoute53HealthChecksInRegionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: crate::state::plan_not_found_message(&input.arn),
-                    },
-                )
-                .into(),
+                ListRoute53HealthChecksInRegionError::not_resolvable_in_region(&input.arn),
             );
         };
 

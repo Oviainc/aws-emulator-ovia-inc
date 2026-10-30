@@ -87,7 +87,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// The `recordSets` of a health-check block, one per Region in `regions`.
-fn record_sets(regions: &[&str]) -> Value {
+pub(crate) fn record_sets(regions: &[&str]) -> Value {
     Value::Array(
         regions
             .iter()
@@ -102,7 +102,7 @@ fn record_sets(regions: &[&str]) -> Value {
 }
 
 /// A `Route53HealthCheck` step whose configuration carries `record_sets`.
-fn health_check_step(
+pub(crate) fn health_check_step(
     name: &str,
     hosted_zone_id: &str,
     record_name: &str,
@@ -151,9 +151,21 @@ fn parallel_step(name: &str, steps: Vec<Value>) -> Value {
 
 /// Create a plan whose `activate` workflow runs `steps`, and return its ARN.
 async fn create_plan(router: &MultiServiceRouter, name: &str, steps: Vec<Value>) -> String {
+    create_plan_covering(router, name, ["us-east-1", "us-west-2"], steps).await
+}
+
+/// Create a plan covering `regions` whose `activate` workflow runs `steps`, and return its
+/// ARN. The Region pair matters to the Region-scoped list, which resolves its `arn` only
+/// from a Region the plan covers.
+async fn create_plan_covering(
+    router: &MultiServiceRouter,
+    name: &str,
+    regions: [&str; 2],
+    steps: Vec<Value>,
+) -> String {
     let request = json!({
         "name": name,
-        "regions": ["us-east-1", "us-west-2"],
+        "regions": regions,
         "recoveryApproach": "activePassive",
         "executionRole": format!("arn:aws:iam::{ACCOUNT}:role/ArcRegionSwitchRole"),
         "workflows": [{
@@ -658,6 +670,10 @@ async fn unknown_plan_and_unissued_token_are_refused() {
 /// `ListRoute53HealthChecksInRegion` reports the same projection narrowed to the Region
 /// the call was made in — the Region of its SigV4 credential scope, since the input
 /// names none — and its filters and paging behave like the global list's.
+///
+/// Being Region-scoped it reports only from a Region the plan covers; from any other
+/// Region the `arn` resolves to no plan, which is
+/// [`crate::in_region_unresolvable_plan`]'s subject.
 #[tokio::test]
 async fn in_region_reports_only_the_health_checks_of_the_calling_region() {
     let router = router();
@@ -676,12 +692,27 @@ async fn in_region_reports_only_the_health_checks_of_the_calling_region() {
         ),
     ];
     let arn = create_plan(&router, "in-region-plan", steps).await;
+    // A second plan, covering another Region pair, so a Region a plan covers but
+    // configures no health check in is a case of its own.
+    let eu_arn = create_plan_covering(
+        &router,
+        "eu-in-region-plan",
+        ["eu-west-1", "eu-central-1"],
+        vec![health_check_step(
+            "hc-eu",
+            "Zgamma",
+            "eu.example.com",
+            record_sets(&["eu-west-1"]),
+        )],
+    )
+    .await;
 
-    // Rows differ along the Region called from: one holding two checks, ones holding
-    // one, and one the plan configures nothing in.
+    // Rows differ along the Region called from, among the Regions the row's plan covers:
+    // one holding two checks, ones holding one, and one the plan configures nothing in.
     #[allow(clippy::type_complexity)]
-    let cases: Vec<(&str, Vec<(&str, &str, &[&str])>)> = vec![
+    let cases: Vec<(&str, &str, Vec<(&str, &str, &[&str])>)> = vec![
         (
+            &arn,
             "us-east-1",
             vec![
                 ("Zalpha", "example.com", &["us-east-1"][..]),
@@ -689,22 +720,24 @@ async fn in_region_reports_only_the_health_checks_of_the_calling_region() {
             ],
         ),
         (
+            &arn,
             "us-west-2",
             vec![("Zalpha", "example.com", &["us-west-2"][..])],
         ),
         (
+            &eu_arn,
             "eu-west-1",
-            vec![("Zalpha", "example.com", &["eu-west-1"][..])],
+            vec![("Zgamma", "eu.example.com", &["eu-west-1"][..])],
         ),
-        ("ap-southeast-2", vec![]),
+        (&eu_arn, "eu-central-1", vec![]),
     ];
 
-    for (region, blocks) in cases {
+    for (plan, region, blocks) in cases {
         let (status, body) = call_in_region(
             &router,
             region,
             "ListRoute53HealthChecksInRegion",
-            &json!({"arn": arn}),
+            &json!({"arn": plan}),
         )
         .await;
         assert_eq!(
@@ -720,11 +753,15 @@ async fn in_region_reports_only_the_health_checks_of_the_calling_region() {
         assert_check_members(region, &body);
 
         // The filters narrow the regional list the same way they narrow the global one.
+        let hosted_zone_id = expected
+            .first()
+            .map(|(hosted_zone_id, _, _)| hosted_zone_id.clone())
+            .unwrap_or_else(|| "Zalpha".to_string());
         let (status, filtered) = call_in_region(
             &router,
             region,
             "ListRoute53HealthChecksInRegion",
-            &json!({"arn": arn, "hostedZoneId": "Zalpha"}),
+            &json!({"arn": plan, "hostedZoneId": hosted_zone_id}),
         )
         .await;
         assert_eq!(
@@ -733,7 +770,7 @@ async fn in_region_reports_only_the_health_checks_of_the_calling_region() {
         );
         let expected_filtered: Vec<(String, String, String)> = expected
             .iter()
-            .filter(|(hosted_zone_id, _, _)| hosted_zone_id == "Zalpha")
+            .filter(|(zone, _, _)| *zone == hosted_zone_id)
             .cloned()
             .collect();
         let reported_filtered = reported_triples(&filtered);
@@ -744,8 +781,8 @@ async fn in_region_reports_only_the_health_checks_of_the_calling_region() {
         );
     }
 
-    // An unknown plan is refused the same way, and paging one check at a time walks the
-    // Region's whole list.
+    // An `arn` this Region cannot resolve a plan from is the not-found refusal at the
+    // status a Region-scoped read answers it with.
     let (status, body) = call_in_region(
         &router,
         "us-east-1",
@@ -754,8 +791,8 @@ async fn in_region_reports_only_the_health_checks_of_the_calling_region() {
     )
     .await;
     assert_eq!(
-        status, 404,
-        "case \"absent plan\": expected 404, got {status} with {body}"
+        status, 400,
+        "case \"absent plan\": expected 400, got {status} with {body}"
     );
     let code = error_code(&body);
     assert_eq!(

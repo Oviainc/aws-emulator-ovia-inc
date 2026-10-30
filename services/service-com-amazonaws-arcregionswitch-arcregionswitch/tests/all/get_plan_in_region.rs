@@ -4,11 +4,15 @@
 //!
 //! The rule under test: a Region-scoped read of a plan reports the stored plan record its
 //! `arn` names — the same projection `GetPlan` reports — when the plan is available in the
-//! Region the request reached, and the modelled `ResourceNotFoundException` (HTTP 404)
-//! otherwise; a plan is available in exactly the Regions its own `regions` names
-//! (`ListPlansInRegion` is documented to list the plans "available in the current Amazon
-//! Web Services Region", and `regions` is the plan's Region pair). The Region a request
-//! reached is the Region of its SigV4 credential scope.
+//! Region the request reached, and answers the modelled `ResourceNotFoundException` at the
+//! status a Region-scoped read refuses an unresolvable `arn` with (HTTP 400) otherwise; a
+//! plan is available in exactly the
+//! Regions its own `regions` names (`ListPlansInRegion` is documented to list the plans
+//! "available in the current Amazon Web Services Region", and `regions` is the plan's
+//! Region pair). The Region a request reached is the Region of its SigV4 credential scope.
+//!
+//! The refusal's status, and the Region-agnostic reads that keep the modelled 404, are
+//! [`crate::in_region_unresolvable_plan`]'s subject.
 //!
 //! The request/response helpers are shared with [`crate::plan_lifecycle`]: both suites
 //! drive the emulator through the same `MultiServiceRouter::dispatch` the router serves
@@ -142,8 +146,8 @@ async fn get_plan_in_region_reports_the_stored_plan_from_each_region_the_plan_co
             let (status, body) =
                 call_in_region(&router, region, "GetPlanInRegion", &json!({"arn": arn})).await;
             assert_eq!(
-                status, 404,
-                "case {case:?} in {region}: expected 404, got {status} with {body}"
+                status, 400,
+                "case {case:?} in {region}: expected 400, got {status} with {body}"
             );
             assert_eq!(
                 error_code(&body),
@@ -156,7 +160,7 @@ async fn get_plan_in_region_reports_the_stored_plan_from_each_region_the_plan_co
 
 /// A plan that covers neither the Region the create was signed for nor the Region the
 /// emulator attributes an unscoped request to is still readable from the Regions it does
-/// cover, and still absent from the ones it does not: no Region is privileged.
+/// cover, and still unresolvable from the ones it does not: no Region is privileged.
 #[tokio::test]
 async fn get_plan_in_region_privileges_no_region() {
     let router = router();
@@ -173,20 +177,20 @@ async fn get_plan_in_region_privileges_no_region() {
             "the Region every write in this suite is signed for",
             ["eu-west-1", "eu-central-1"],
             "us-east-1",
-            404,
+            400,
         ),
         (
             "a Region bordering on one of the plan's",
             ["eu-west-1", "eu-central-1"],
             "eu-west-2",
-            404,
+            400,
         ),
         ("a plan covering the signing Region", ["us-east-1", "us-west-2"], "us-east-1", 200),
         (
             "a plan covering the signing Region, read elsewhere",
             ["us-east-1", "us-west-2"],
             "eu-west-1",
-            404,
+            400,
         ),
     ];
 
@@ -235,7 +239,8 @@ async fn get_plan_in_region_privileges_no_region() {
 }
 
 /// An ARN the store holds no plan under — never minted, minted for a plan since deleted,
-/// or naming another plan's suffix — is the modelled 404, from a Region a plan does cover.
+/// or naming another plan's suffix — is the not-found refusal at the Region-scoped status,
+/// from a Region a plan does cover.
 #[tokio::test]
 async fn get_plan_in_region_refuses_an_arn_no_plan_is_stored_under() {
     let router = router();
@@ -302,8 +307,8 @@ async fn get_plan_in_region_refuses_an_arn_no_plan_is_stored_under() {
         let (status, body) =
             call_in_region(&router, "eu-west-1", "GetPlanInRegion", &json!({"arn": arn})).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404, got {status} with {body}"
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {body}"
         );
         assert_eq!(
             error_code(&body),

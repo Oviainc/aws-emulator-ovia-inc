@@ -12,8 +12,10 @@
 //! `ListPlansInRegion` is documented to list "plans in your account that are available in
 //! the current Region", so the plan's Region pair is what availability-per-Region means.
 //! An `arn` no plan is stored under, and a stored plan the Region the call reached is not
-//! one of, both answer the modelled `ResourceNotFoundException` (HTTP 404): from that
-//! Region there is no such plan to report.
+//! one of, are one refusal — from that Region there is no such plan to report — answered
+//! with the modelled `ResourceNotFoundException` and its message at
+//! [`crate::state::IN_REGION_NOT_FOUND_STATUS`], the status this service answers a
+//! Region-scoped read's unresolvable `arn` with.
 //!
 //! Nothing Region-specific lives in the `Plan` shape itself (every member of it is a
 //! property of the global plan — its ARN carries an empty Region segment), so the
@@ -59,7 +61,8 @@
 //! * `AccessDeniedException` (HTTP 403) — You do not have sufficient access to perform this
 //!   action. HTTP Status Code: 403
 //! * `ResourceNotFoundException` (HTTP 404) — The specified resource was not found. HTTP
-//!   Status Code: 404
+//!   Status Code: 404. This Region-scoped read answers it at
+//!   [`crate::state::IN_REGION_NOT_FOUND_STATUS`] instead — see the error channel below.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -90,9 +93,93 @@ pub enum GetPlanInRegionErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::get_plan_in_region::GetPlanInRegionError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type GetPlanInRegionError = crate::scaffolded::Scaffolded<GetPlanInRegionErrorModeled>;
+/// (`crate::ops::get_plan_in_region::GetPlanInRegionError`).
+///
+/// Two variants, because the status is not always the one the model gives the shape:
+/// [`Self::Scaffolded`] is the usual channel (a modelled error, the 501, or a refusal the
+/// model cannot express), rendered exactly as every other operation renders it, and
+/// [`Self::AtStatus`] is a modelled error this service answers at a status of its own —
+/// the shape, its `__type` and its message stay the modelled ones.
+#[derive(Debug)]
+pub enum GetPlanInRegionError {
+    /// A modelled error, the scaffold 501, or a handler refusal, at the status the model
+    /// gives its shape.
+    Scaffolded(crate::scaffolded::Scaffolded<GetPlanInRegionErrorModeled>),
+    /// A modelled error at the HTTP status THIS service answers it with.
+    AtStatus(GetPlanInRegionErrorModeled, u16),
+}
+
+impl GetPlanInRegionError {
+    /// The refusal of an `arn` this read cannot resolve a plan from, in the Region the
+    /// call reached: the modelled `ResourceNotFoundException` and its message, at
+    /// [`crate::state::IN_REGION_NOT_FOUND_STATUS`].
+    pub fn not_resolvable_in_region(arn: &str) -> Self {
+        Self::AtStatus(
+            GetPlanInRegionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: crate::state::plan_not_found_message(arn),
+            }),
+            crate::state::IN_REGION_NOT_FOUND_STATUS,
+        )
+    }
+}
+
+impl ::std::fmt::Display for GetPlanInRegionError {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Scaffolded(error) => write!(f, "{error}"),
+            Self::AtStatus(error, _) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl ::std::error::Error for GetPlanInRegionError {
+    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        match self {
+            Self::Scaffolded(error) => error.source(),
+            Self::AtStatus(error, _) => error.source(),
+        }
+    }
+}
+
+/// Every method delegates to the modelled error the active variant carries, so the wire
+/// shape, the error code and the message are the model's in both variants; only
+/// [`Self::AtStatus`] answers a status of the service's own.
+impl smithy_server_runtime::OperationError for GetPlanInRegionError {
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Scaffolded(error) => error.as_serializable(),
+            Self::AtStatus(error, _) => error.as_serializable(),
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Scaffolded(error) => error.variant_schema(),
+            Self::AtStatus(error, _) => error.variant_schema(),
+        }
+    }
+
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Scaffolded(error) => error.shape_name(),
+            Self::AtStatus(error, _) => error.shape_name(),
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Scaffolded(error) => error.http_status(),
+            Self::AtStatus(_, status) => *status,
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Scaffolded(error) => error.query_error_code(),
+            Self::AtStatus(error, _) => error.query_error_code(),
+        }
+    }
+}
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
@@ -100,7 +187,14 @@ pub type GetPlanInRegionError = crate::scaffolded::Scaffolded<GetPlanInRegionErr
 /// this operation is implemented.
 impl From<GetPlanInRegionErrorModeled> for GetPlanInRegionError {
     fn from(modeled: GetPlanInRegionErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Scaffolded(crate::scaffolded::Scaffolded::Modeled(modeled))
+    }
+}
+
+/// The same for a refusal the scaffold channel words (`Scaffolded::validation`).
+impl From<crate::scaffolded::Scaffolded<GetPlanInRegionErrorModeled>> for GetPlanInRegionError {
+    fn from(scaffolded: crate::scaffolded::Scaffolded<GetPlanInRegionErrorModeled>) -> Self {
+        Self::Scaffolded(scaffolded)
     }
 }
 
@@ -160,26 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        let Some(record) = store.plans.get(&input.arn) else {
-            return Err(GetPlanInRegionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::plan_not_found_message(&input.arn),
-                },
-            )
-            .into());
+        // One resolution step for the whole Region-scoped read: an `arn` no plan is
+        // stored under and a stored plan this Region is not one of are the same refusal.
+        let Some(record) = store.plan_available_in_region(&input.arn, &region) else {
+            return Err(GetPlanInRegionError::not_resolvable_in_region(&input.arn));
         };
-        if !record.is_available_in_region(&region) {
-            return Err(GetPlanInRegionErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::plan_not_in_region_message(
-                        &input.arn,
-                        &region,
-                        &record.plan.regions,
-                    ),
-                },
-            )
-            .into());
-        }
         Ok(GetPlanInRegionOutput {
             plan: Some(record.as_plan()),
         })

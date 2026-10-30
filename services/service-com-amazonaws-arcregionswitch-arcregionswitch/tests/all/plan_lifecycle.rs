@@ -105,6 +105,14 @@ pub(crate) fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The `message` of an error response.
+pub(crate) fn error_message(body: &Value) -> String {
+    body.get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+        .to_string()
+}
+
 /// One workflow with `step_names` manual-approval steps.
 pub(crate) fn workflow(action: &str, step_names: &[&str]) -> Value {
     let steps: Vec<Value> = step_names
