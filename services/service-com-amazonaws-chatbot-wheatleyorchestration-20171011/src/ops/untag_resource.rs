@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: removes every `TagKeys` entry from the tag set stored on the chatbot
+//! resource named by `ResourceARN`, keyed by `TagKey`. Removal is by key alone, so a key
+//! the resource does not carry removes nothing and the call still succeeds — repeating an
+//! untag is a no-op — and the keys the request does not name stay attached.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ResourceARN` is any chatbot ARN, so the resource type in the ARN decides where the tags
+//! live and how an ARN the store does not hold is refused: a chat configuration (Slack
+//! channel or Chime webhook) answers the modelled 404 `ResourceNotFoundException`, a custom
+//! action the modelled 403 `UnauthorizedException` — see [`crate::state::ChatbotResourceKind`].
+//!
+//! `ListTagsForResource` then reports the remaining set.
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +72,9 @@
 //!   request
 //! * `ServiceUnavailableException` (HTTP 429) — We can’t process your request right now
 //!   because of a server issue. Try again later.
+//! * `UnauthorizedException` (HTTP 403) — The request was rejected because it doesn't have
+//!   valid credentials for the target resource. NOT listed on this operation by the model;
+//!   widened in below, because a custom-action ARN is authorized before it is looked up.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -85,12 +90,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chatbot-wheatleyorchest
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chatbot#UntagResource")]
+// `UnauthorizedException` is widened in through `extra_errors`: this SERVICE models it
+// (`@error("client") @httpError(403)`, and the custom-action operations list it) while the
+// model's `errors` list for UntagResource does not, and it is what a custom-action ARN this
+// account holds no action for is refused with — see `crate::state::ChatbotResourceKind`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chatbot#UntagResource",
+    extra_errors = ["UnauthorizedException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     InternalServiceError(InternalServiceError),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
+    UnauthorizedException(UnauthorizedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -144,18 +157,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServiceError(InternalServiceError {
+                message: Some("the chatbot configuration store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        // The ARN names the resource and its type, so the type decides which store holds the
+        // tags and — when nothing is held under that ARN — how the request is refused. A
+        // custom action is authorized against the ARN before it is looked up, so an unknown
+        // one is 403 and never discloses non-existence; a chat configuration (of either
+        // chat client) answers the 404 the model documents for this operation.
+        let stored_tags = match crate::state::chatbot_resource_kind(&input.resource_arn) {
+            crate::state::ChatbotResourceKind::CustomAction => {
+                &mut store
+                    .custom_actions
+                    .get_mut(&input.resource_arn)
+                    .ok_or_else(|| {
+                        UntagResourceErrorModeled::UnauthorizedException(UnauthorizedException {
+                            message: Some(crate::state::UNAUTHORIZED_MESSAGE.to_string()),
+                        })
+                    })?
+                    .tags
+            }
+            crate::state::ChatbotResourceKind::ChatConfiguration
+            | crate::state::ChatbotResourceKind::Other => store
+                .chat_configuration_tags_mut(&input.resource_arn)
+                .ok_or_else(|| {
+                    UntagResourceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("no resource with ARN {}", input.resource_arn)),
+                        },
+                    )
+                })?,
+        };
+
+        // Detaching is by key: a key the resource does not carry leaves the set as it is, so
+        // the same request repeated answers the same success without removing anything more,
+        // and the keys this request does not name stay attached.
+        for tag_key in &input.tag_keys {
+            stored_tags.remove(tag_key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }

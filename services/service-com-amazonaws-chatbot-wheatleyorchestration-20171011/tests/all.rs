@@ -29,5 +29,7 @@ mod slack_channel_configuration;
 mod slack_workspace_authorization;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/untag_resource.rs"]
+mod untag_resource;
 #[path = "all/wire.rs"]
 mod wire;
