@@ -121,6 +121,8 @@ mod slo_lifecycle;
 mod slo_list_selection_binding;
 #[path = "all/slo_metric_source_filter.rs"]
 mod slo_metric_source_filter;
+#[path = "all/slo_metric_source_kind.rs"]
+mod slo_metric_source_kind;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stated_instant_rendering.rs"]

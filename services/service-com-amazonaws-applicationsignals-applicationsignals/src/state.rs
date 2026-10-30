@@ -1095,6 +1095,38 @@ fn reported_metric_type(
     requested.filter(|_| selects_standard_metric).cloned()
 }
 
+/// The queries a `MonitoredRequestCountMetric` holds, whichever of the union's two variants
+/// names them: both target the same `MetricDataQueries` list, and which variant a request
+/// chose says whether the queries count good or bad requests, not whether there are any.
+fn monitored_request_count_queries(
+    monitored: &MonitoredRequestCountMetricDataQueries,
+) -> &[MetricDataQuery] {
+    match monitored {
+        MonitoredRequestCountMetricDataQueries::GoodCountMetric(queries) => queries,
+        MonitoredRequestCountMetricDataQueries::BadCountMetric(queries) => queries,
+    }
+}
+
+/// Whether a request-based SLI — a config or the stored indicator it built — spells
+/// CloudWatch metric queries of its OWN.
+///
+/// A request-based SLI states its metric through TWO members, and the model leaves both
+/// optional on the config: `TotalRequestCountMetric` ("the metric that you want to use as the
+/// \"total requests\" number") and `MonitoredRequestCountMetric` ("the metric that you want to
+/// use as the \"good request\" or \"bad request\" value"). Either one carrying at least one
+/// query is the SLI naming its own metric, so this is the single place both derivations over
+/// such an SLI — the standard-metric test and the metric source kind — ask the question, and
+/// neither can count one member while ignoring the other. An EMPTY query list names no
+/// metric, exactly as an empty `MetricDataQueries` does on the period-based side.
+fn names_own_request_count_queries(
+    total_request_count_metric: Option<&[MetricDataQuery]>,
+    monitored_request_count_metric: Option<&MonitoredRequestCountMetricDataQueries>,
+) -> bool {
+    total_request_count_metric.is_some_and(|queries| !queries.is_empty())
+        || monitored_request_count_metric
+            .is_some_and(|monitored| !monitored_request_count_queries(monitored).is_empty())
+}
+
 /// The `MetricDataQueries` the indicator of a period-based SLI config reports.
 ///
 /// An SLI config describes the metric the SLO evaluates in one of two ways, and the
@@ -1232,11 +1264,10 @@ pub fn request_based_sli_from_config(
                 metric.key_attributes.as_ref(),
                 metric.metric_name.as_deref(),
                 metric.metric_source.as_ref(),
-                metric
-                    .total_request_count_metric
-                    .as_ref()
-                    .is_some_and(|queries| !queries.is_empty())
-                    || metric.monitored_request_count_metric.is_some(),
+                names_own_request_count_queries(
+                    metric.total_request_count_metric.as_deref(),
+                    metric.monitored_request_count_metric.as_ref(),
+                ),
             ),
             total_request_count_metric: metric
                 .total_request_count_metric
@@ -1348,12 +1379,16 @@ pub fn stored_evaluation_type(slo: &ServiceLevelObjective) -> Option<&'static st
 /// metrics, and `CloudWatchMetric` is the enum's only value for a non-Application-Signals
 /// source. Reporting `None` would drop a source kind the request did state, and reporting
 /// `Service` would claim an Application Signals entity the request did not name.
+///
+/// `names_own_metric_queries` is that last test: whether the SLI spells CloudWatch metric
+/// queries of its own, in whichever member(s) its kind of indicator states them — so the
+/// caller answers it over EVERY such member rather than over one of them.
 fn metric_source_type(
     key_attributes: Option<&HashMap<String, String>>,
     operation_name: Option<&str>,
     dependency_config: Option<&DependencyConfig>,
     metric_source: Option<&MetricSource>,
-    metric_data_queries: &[MetricDataQuery],
+    names_own_metric_queries: bool,
 ) -> Option<String> {
     if let Some(source) = metric_source {
         // A key-attribute `Type` is a CloudFormation-style name such as
@@ -1381,7 +1416,7 @@ fn metric_source_type(
     if key_attributes.is_some() {
         return Some("Service".to_string());
     }
-    if !metric_data_queries.is_empty() {
+    if names_own_metric_queries {
         return Some("CloudWatchMetric".to_string());
     }
     None
@@ -1399,7 +1434,7 @@ pub fn derive_metric_source_type(
             metric.operation_name.as_deref(),
             metric.dependency_config.as_ref(),
             metric.metric_source.as_ref(),
-            &metric.metric_data_queries,
+            !metric.metric_data_queries.is_empty(),
         );
     }
     if let Some(request_based_sli) = request_based_sli {
@@ -1409,7 +1444,10 @@ pub fn derive_metric_source_type(
             metric.operation_name.as_deref(),
             metric.dependency_config.as_ref(),
             metric.metric_source.as_ref(),
-            &metric.total_request_count_metric,
+            names_own_request_count_queries(
+                Some(&metric.total_request_count_metric),
+                Some(&metric.monitored_request_count_metric),
+            ),
         );
     }
     None
@@ -3944,11 +3982,11 @@ fn assessed_metric_graph(
     if let Some(request_based_sli) = slo.request_based_sli.as_ref() {
         let metric = &request_based_sli.request_based_sli_metric;
         queries.extend(metric.total_request_count_metric.iter().cloned());
-        let monitored = match &metric.monitored_request_count_metric {
-            MonitoredRequestCountMetricDataQueries::GoodCountMetric(queries) => queries,
-            MonitoredRequestCountMetricDataQueries::BadCountMetric(queries) => queries,
-        };
-        queries.extend(monitored.iter().cloned());
+        queries.extend(
+            monitored_request_count_queries(&metric.monitored_request_count_metric)
+                .iter()
+                .cloned(),
+        );
     }
     MetricGraph {
         // An absent fact is an absent member: an objective whose indicator holds no query
