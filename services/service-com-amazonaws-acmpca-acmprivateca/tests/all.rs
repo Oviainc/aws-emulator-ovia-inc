@@ -17,6 +17,8 @@ mod ca_arn_resolution_stages;
 mod certificate_authority_listing;
 #[path = "all/certificate_authority_tags.rs"]
 mod certificate_authority_tags;
+#[path = "all/certificate_revocation.rs"]
+mod certificate_revocation;
 #[path = "all/constraint_refusal_messages.rs"]
 mod constraint_refusal_messages;
 #[path = "all/create_idempotency.rs"]

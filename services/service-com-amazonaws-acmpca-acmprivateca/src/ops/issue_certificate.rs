@@ -415,6 +415,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             available_at: now + crate::state::SETTLE_AFTER,
             serial,
             arn: arn.clone(),
+            // Nothing is revoked at issuance; `RevokeCertificate` is what records one.
+            revocation: None,
         };
 
         record.next_serial += 1;

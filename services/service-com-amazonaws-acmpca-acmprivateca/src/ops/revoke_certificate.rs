@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +192,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeCertificate"))
+        // The certificate a revocation names is the one the request's own members
+        // identify, under the CA that issued it; nothing is read off the request's
+        // metadata.
+        let _ = ctx;
+        let ca_arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&ca_arn).is_none() {
+            return Err(invalid_arn(crate::state::INVALID_ARN_MESSAGE.to_string()));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RevokeCertificateErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // `certificate_authority_mut` materialises the status change the clock already
+        // owed, which came due at the same instant whether or not anybody called.
+        let Some(record) = state.certificate_authority_mut(&ca_arn, now) else {
+            return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
+        };
+
+        // A revocation is signed with the CA's own private key and published in the CA's
+        // revocation information, so only a CA that holds its certificate and can still
+        // sign with it revokes one: in any other status the CA is not one that has issued
+        // the certificates a revocation could name, whatever serial the request carries.
+        if !crate::state::REVOCABLE_STATUSES.contains(&record.status.as_str()) {
+            return Err(invalid_state(
+                crate::state::not_in_state_to_have_issued_message(&ca_arn),
+            ));
+        }
+
+        // "You cannot revoke a root CA self-signed certificate." (this operation's docs):
+        // the CA's own certificate is the one its revocation information is signed under,
+        // so it is refused before any certificate of the CA is looked up — the CA holds it
+        // whether or not it was issued through this emulator.
+        if record.is_own_self_signed_serial(&input.certificate_serial) {
+            return Err(invalid_request(
+                crate::state::ROOT_SELF_SIGNED_REVOCATION_MESSAGE.to_string(),
+            ));
+        }
+
+        // The certificate is named by its serial, which identifies it among the ones THIS
+        // CA issued: a serial no certificate of the CA carries, in any spelling, names no
+        // certificate at all. A certificate whose issuance has not settled yet is one of
+        // them: the CA allocated its serial when it accepted the issuance, and revocation
+        // is about the certificate the CA has issued rather than about the body a caller
+        // can already fetch, so the window `GetCertificate` answers
+        // `RequestInProgressException` in is deliberately not a refusal here.
+        let Some(certificate) = record.certificate_with_serial_mut(&input.certificate_serial)
+        else {
+            return Err(not_found(
+                crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
+            ));
+        };
+        // Revocation is terminal, so a second request for one certificate is a request
+        // this service has already completed rather than one it performs again: the
+        // reason and the instant the first call recorded stay as they are.
+        if certificate.is_revoked() {
+            return Err(already_processed(
+                crate::state::CERTIFICATE_ALREADY_REVOKED_MESSAGE.to_string(),
+            ));
+        }
+        certificate.revocation = Some(crate::state::CertificateRevocation {
+            revoked_at: now,
+            reason: input.revocation_reason,
+        });
+
+        Ok(RevokeCertificateOutput)
     }
+}
+
+/// "The requested Amazon Resource Name (ARN) does not refer to an existing resource."
+fn invalid_arn(message: String) -> RevokeCertificateError {
+    RevokeCertificateErrorModeled::InvalidArnException(InvalidArnException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy
+/// cannot be found." — the CA the request named, or the certificate it named on that CA.
+fn not_found(message: String) -> RevokeCertificateError {
+    RevokeCertificateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// "The state of the private CA does not allow this action to occur."
+fn invalid_state(message: String) -> RevokeCertificateError {
+    RevokeCertificateErrorModeled::InvalidStateException(InvalidStateException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// "The request action cannot be performed or is prohibited."
+fn invalid_request(message: String) -> RevokeCertificateError {
+    RevokeCertificateErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// "Your request has already been completed."
+fn already_processed(message: String) -> RevokeCertificateError {
+    RevokeCertificateErrorModeled::RequestAlreadyProcessedException(
+        RequestAlreadyProcessedException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

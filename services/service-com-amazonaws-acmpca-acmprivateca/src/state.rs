@@ -174,6 +174,47 @@ pub const ROOT_CA_CERTIFICATE_TEMPLATE: &str = ":template/RootCACertificate/";
 pub const ISSUANCE_INVALID_STATE_MESSAGE: &str =
     "The certificate authority is not in a valid state for issuing certificates";
 
+/// The `CertificateAuthorityStatus` members a CA can REVOKE one of its certificates in.
+///
+/// Revocation is done with the CA's private key and published in the CA's CRL, so the CA
+/// has to hold its certificate and still be usable: "ACTIVE — the CA is active and can be
+/// used to issue and revoke certificates", and a CA that was disabled "can no longer issue
+/// certificates, but it continues to revoke them and to publish CRLs" (the private CA
+/// lifecycle). Every other status either has no certificate of its own yet
+/// (`CREATING`, `PENDING_CERTIFICATE`), cannot sign with it any more (`EXPIRED`,
+/// `FAILED`), or is waiting to be restored (`DELETED`).
+pub const REVOCABLE_STATUSES: &[&str] = &[STATUS_ACTIVE, STATUS_DISABLED];
+
+/// What Amazon Web Services Private CA answers when the private CA a request names is not
+/// in a status it could have issued the certificates the request is about from (for a
+/// revocation, [`REVOCABLE_STATUSES`]): one sentence about the CA, fixed text around the
+/// `CertificateAuthorityArn` the request carried, which is the only value in it.
+///
+/// Named after the SENTENCE rather than after one operation, because it is the answer
+/// every operation of this service that reaches for a certificate of a CA in such a status
+/// carries.
+pub fn not_in_state_to_have_issued_message(certificate_authority_arn: &str) -> String {
+    format!(
+        "The certificate authority {certificate_authority_arn} is not in the correct \
+         state to have issued certificates."
+    )
+}
+
+/// What Amazon Web Services Private CA answers when the certificate a revocation names
+/// has already been revoked: NOTHING — the refusal's `RequestAlreadyProcessedException`
+/// carries an empty message, so the code alone says the request was already completed.
+pub const CERTIFICATE_ALREADY_REVOKED_MESSAGE: &str = "";
+
+/// What Amazon Web Services Private CA answers when the certificate a revocation names is
+/// the self-signed certificate of the root CA that holds it: the refusal's own sentence,
+/// wholly fixed text that interpolates no value from the request or the store.
+///
+/// The RULE is the documented one — "You cannot revoke a root CA self-signed certificate."
+/// (`RevokeCertificate` docs) — while the sentence below is the one a recorded refusal of
+/// Amazon Web Services Private CA carries for it, which is shorter than the documentation's
+/// phrasing of the rule.
+pub const ROOT_SELF_SIGNED_REVOCATION_MESSAGE: &str = "Self-signed certificate can not be revoked.";
+
 /// What Amazon Web Services Private CA answers for a certificate ARN no certificate of
 /// the CA matches: one sentence about the certificate, naming no ARN of its own.
 pub const CERTIFICATE_NOT_FOUND_MESSAGE: &str = "Could not find specified certificate.";
@@ -388,6 +429,8 @@ pub struct IssuedCertificate {
     /// When issuance is due to complete; `GetCertificate` answers
     /// `RequestInProgressException` before it.
     pub available_at: SystemTime,
+    /// The revocation of this certificate, once `RevokeCertificate` has accepted one.
+    pub revocation: Option<CertificateRevocation>,
 }
 
 impl IssuedCertificate {
@@ -395,6 +438,24 @@ impl IssuedCertificate {
     pub fn is_available(&self, now: SystemTime) -> bool {
         now >= self.available_at
     }
+
+    /// Whether this certificate has been revoked.
+    pub fn is_revoked(&self) -> bool {
+        self.revocation.is_some()
+    }
+}
+
+/// The revocation of one issued certificate.
+///
+/// Revocation is terminal — a revoked certificate is never un-revoked — so this is what a
+/// second `RevokeCertificate` for the same certificate is refused from, and what the
+/// CA's revocation information (its CRL and its audit report) is read off.
+#[derive(Debug, Clone)]
+pub struct CertificateRevocation {
+    /// When `RevokeCertificate` accepted the revocation.
+    pub revoked_at: SystemTime,
+    /// The `RevocationReason` the request named.
+    pub reason: String,
 }
 
 /// One permission granted on a private CA to a service principal.
@@ -1040,6 +1101,60 @@ impl CertificateAuthorityRecord {
             && self.is_own_certification_request(certification_request)
     }
 
+    /// The certificate this CA issued under the serial number `serial` names, when it
+    /// holds one.
+    ///
+    /// A certificate is identified inside its CA by the VALUE of its serial, which a
+    /// request carries "in hexadecimal format"
+    /// (`RevokeCertificateRequest$CertificateSerial`), so the two spellings of one value
+    /// name the same certificate ([`normalized_serial`]).
+    pub fn certificate_with_serial(&self, serial: &str) -> Option<&IssuedCertificate> {
+        let wanted = normalized_serial(serial)?;
+        self.certificates
+            .values()
+            .find(|certificate| certificate_has_serial(certificate, &wanted))
+    }
+
+    /// The same certificate [`certificate_with_serial`](Self::certificate_with_serial)
+    /// resolves, to write to.
+    pub fn certificate_with_serial_mut(
+        &mut self,
+        serial: &str,
+    ) -> Option<&mut IssuedCertificate> {
+        let wanted = normalized_serial(serial)?;
+        self.certificates
+            .values_mut()
+            .find(|certificate| certificate_has_serial(certificate, &wanted))
+    }
+
+    /// Whether `serial` names this CA's OWN self-signed certificate, which is the one
+    /// certificate of a CA that cannot be revoked: "You cannot revoke a root CA
+    /// self-signed certificate." (`RevokeCertificate` docs).
+    ///
+    /// A root CA's certificate is signed by the CA itself, so revoking it would have the
+    /// CA attest its own revocation; a subordinate CA's certificate is signed by its
+    /// parent, which revokes it, so only a root holds such a certificate at all. The
+    /// serial is read off the certificate the CA was activated with, so it holds whether
+    /// or not that certificate was issued through this emulator.
+    pub fn is_own_self_signed_serial(&self, serial: &str) -> bool {
+        if self.ca_type != CA_TYPE_ROOT {
+            return false;
+        }
+        let Some(wanted) = normalized_serial(serial) else {
+            return false;
+        };
+        self.own_certificate_serial()
+            .is_some_and(|own| own == wanted)
+    }
+
+    /// The serial number of the certificate this CA was activated with, as the value it
+    /// denotes, when the CA holds one this service can read.
+    pub fn own_certificate_serial(&self) -> Option<String> {
+        let der = parse_pem_block(self.ca_certificate_pem.as_deref()?, PEM_LABEL_CERTIFICATE)?;
+        let certificate = Certificate::from_der(&der).ok()?;
+        normalized_serial(&::hex::encode(certificate.tbs_certificate.serial_number.as_bytes()))
+    }
+
     /// Whether `presented` carries the very certification request this CA published
     /// ([`derive_csr_pem`]), compared as the DER it frames so the PEM's own line breaks
     /// and framing do not decide it.
@@ -1624,6 +1739,48 @@ pub fn parse_certificate_arn(arn: &str) -> Option<(String, String)> {
     }
     parse_certificate_authority_arn(ca_arn)?;
     Some((ca_arn.to_string(), serial.to_string()))
+}
+
+/// The serial number `serial` names, as the hexadecimal VALUE it denotes: lower case,
+/// with no leading zeros and no separators, or `None` when `serial` is not a hexadecimal
+/// number at all.
+///
+/// `RevokeCertificateRequest$CertificateSerial` is "the serial number of the certificate
+/// to be revoked. This must be in hexadecimal format", and the docs have it read off
+/// `openssl x509 -text`, which prints a serial as colon-separated octets
+/// (`0a:1b:2c:3d`) — so the separators between octets, the case of the digits and a
+/// leading zero are all spellings of one number rather than part of it (the DER integer a
+/// certificate carries its serial as drops leading zeros, and carries one only to keep the
+/// value positive). The serial a request names and the serial a certificate holds are
+/// therefore compared as the numbers they are, not as the text they arrived in.
+pub fn normalized_serial(serial: &str) -> Option<String> {
+    let digits: String = serial
+        .chars()
+        .filter(|character| !SERIAL_SEPARATORS.contains(character))
+        .collect();
+    if digits.is_empty() || !digits.chars().all(|digit| digit.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = digits.trim_start_matches('0');
+    Some(if value.is_empty() {
+        "0".to_string()
+    } else {
+        value.to_ascii_lowercase()
+    })
+}
+
+/// The character that separates the octets of a serial number rather than spelling its
+/// value: the colon `openssl x509 -text` prints between them, which is the listing
+/// `RevokeCertificateRequest$CertificateSerial`'s docs have the serial copied out of.
+///
+/// Nothing else is accepted as a separator: a serial carrying anything but hexadecimal
+/// digits and these is not "in hexadecimal format" and names no certificate.
+const SERIAL_SEPARATORS: &[char] = &[':'];
+
+/// Whether `certificate`'s serial number is the value `wanted` holds, which is already
+/// normalised ([`normalized_serial`]).
+fn certificate_has_serial(certificate: &IssuedCertificate, wanted: &str) -> bool {
+    normalized_serial(&certificate.serial).as_deref() == Some(wanted)
 }
 
 /// Every private CA whose owner account `owned_by` accepts, in the order a listing
