@@ -107,7 +107,10 @@ async fn create(emulator: &Emulator, case: &CreateCase) -> Reply {
 }
 
 /// Read the instance `account_id` owns in `region`.
-async fn get(emulator: &Emulator, account_id: &str, region: &str) -> Reply {
+///
+/// `pub(crate)` because the sibling refusal suite reads an instance back the
+/// same way rather than writing this again.
+pub(crate) async fn get(emulator: &Emulator, account_id: &str, region: &str) -> Reply {
     call_in_region(
         &emulator.router,
         region,

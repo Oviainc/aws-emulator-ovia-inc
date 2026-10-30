@@ -60,7 +60,10 @@ const NO_SUCH_GRANT_MESSAGE: &str = "The specified access grant does not exist";
 
 /// Deregister the location `location_id` names from the account's instance in
 /// `region`.
-async fn delete_location(
+///
+/// `pub(crate)` because the sibling refusal suite deregisters a location the
+/// same way rather than writing this again.
+pub(crate) async fn delete_location(
     emulator: &Emulator,
     account_id: &str,
     region: &str,
@@ -78,7 +81,14 @@ async fn delete_location(
 }
 
 /// Delete the grant `grant_id` names from the account's instance in `region`.
-async fn delete_grant(emulator: &Emulator, account_id: &str, region: &str, grant_id: &str) -> Reply {
+///
+/// `pub(crate)` for the reason [`delete_location`] is.
+pub(crate) async fn delete_grant(
+    emulator: &Emulator,
+    account_id: &str,
+    region: &str,
+    grant_id: &str,
+) -> Reply {
     call_in_region(
         &emulator.router,
         region,
@@ -254,7 +264,7 @@ async fn a_location_is_deregistered_only_once_no_grant_references_it() {
                 delete_location(&emulator, case.account_id, case.region, &location_id).await;
             assert_eq!(
                 (refused.status, refused.code()),
-                (409, "AccessGrantsLocationNotEmptyError".to_string()),
+                (400, "AccessGrantsLocationNotEmptyError".to_string()),
                 "case {:?}: expected the deregistration to be refused with {} of {} grants \
                  deleted, got {} with body {}",
                 case.case,
@@ -451,7 +461,7 @@ async fn only_the_grants_on_this_location_hold_its_deregistration_back() {
     let refused = delete_location(&emulator, ACCOUNT, REGION, &granted_id).await;
     assert_eq!(
         (refused.status, refused.code()),
-        (409, "AccessGrantsLocationNotEmptyError".to_string()),
+        (400, "AccessGrantsLocationNotEmptyError".to_string()),
         "expected the referenced location to be refused, got {} with body {}",
         refused.status,
         refused.body

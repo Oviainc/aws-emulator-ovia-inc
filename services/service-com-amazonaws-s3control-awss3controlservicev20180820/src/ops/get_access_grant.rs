@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(record) = store.access_grant(&input.account_id, &region, &input.access_grant_id)
         else {
-            return Err(crate::state::no_such_access_grant());
+            return Err(crate::state::no_such_access_grant(&input.access_grant_id));
         };
 
         Ok(GetAccessGrantOutput {

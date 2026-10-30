@@ -175,7 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let mut store = state.lock();
         if !store.access_grants_locations.contains_key(&key) {
-            return Err(crate::state::no_such_access_grants_location());
+            return Err(crate::state::no_such_access_grants_location(
+                &input.access_grants_location_id,
+            ));
         }
 
         // "You can only delete a location registration from an S3 Access
@@ -189,7 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &input.access_grants_location_id,
         ) {
-            return Err(crate::state::access_grants_location_not_empty());
+            return Err(crate::state::access_grants_location_not_empty(
+                &input.access_grants_location_id,
+            ));
         }
 
         store.access_grants_locations.remove(&key);

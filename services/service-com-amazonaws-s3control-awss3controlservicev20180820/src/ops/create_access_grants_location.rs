@@ -184,10 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .access_grants_instances
             .contains_key(&(input.account_id.clone(), region.clone()))
         {
-            return Err(crate::state::no_such_access_grants_instance(
-                &input.account_id,
-                &region,
-            ));
+            return Err(crate::state::no_such_access_grants_instance());
         }
 
         // One registration per S3 path: a second one over the same scope would

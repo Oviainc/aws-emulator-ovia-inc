@@ -151,10 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .access_grants_instances
             .get_mut(&(input.account_id.clone(), region.clone()))
         else {
-            return Err(crate::state::no_such_access_grants_instance(
-                &input.account_id,
-                &region,
-            ));
+            return Err(crate::state::no_such_access_grants_instance());
         };
 
         // A resource policy is an IAM policy document, so one that is not JSON

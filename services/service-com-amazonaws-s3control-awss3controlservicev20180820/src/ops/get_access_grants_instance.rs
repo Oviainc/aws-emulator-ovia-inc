@@ -166,10 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = (input.account_id.clone(), region.clone());
         let store = state.lock();
         let Some(record) = store.access_grants_instances.get(&key) else {
-            return Err(crate::state::no_such_access_grants_instance(
-                &input.account_id,
-                &region,
-            ));
+            return Err(crate::state::no_such_access_grants_instance());
         };
 
         Ok(GetAccessGrantsInstanceOutput {

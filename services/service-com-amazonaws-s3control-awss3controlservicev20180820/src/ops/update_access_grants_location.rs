@@ -172,7 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // missing resource, and the store cannot grow past the bound
         // `CreateAccessGrantsLocation` holds it to.
         let Some(record) = store.access_grants_locations.get_mut(&key) else {
-            return Err(crate::state::no_such_access_grants_location());
+            return Err(crate::state::no_such_access_grants_location(
+                &input.access_grants_location_id,
+            ));
         };
 
         // "Updates the IAM role of a registered location": the role is the ONE

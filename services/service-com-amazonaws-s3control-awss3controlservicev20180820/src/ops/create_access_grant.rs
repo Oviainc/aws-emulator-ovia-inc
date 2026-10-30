@@ -213,10 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .access_grants_instances
             .contains_key(&(input.account_id.clone(), region.clone()))
         {
-            return Err(crate::state::no_such_access_grants_instance(
-                &input.account_id,
-                &region,
-            ));
+            return Err(crate::state::no_such_access_grants_instance());
         }
 
         // "You must also have registered at least one S3 data location in your
@@ -228,7 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &input.access_grants_location_id,
         ) else {
-            return Err(crate::state::no_such_access_grants_location());
+            return Err(crate::state::no_such_access_grants_location(
+                &input.access_grants_location_id,
+            ));
         };
         let location_scope = location.location_scope.clone();
 

@@ -401,10 +401,10 @@ async fn registering_without_an_instance_in_the_signing_region_is_refused_and_re
             refused.body
         );
         let message = refused.text("Message").unwrap_or_default();
-        assert!(
-            message.contains(case.account_id) && message.contains(case.region),
-            "case {:?}: expected the refusal to name the account and Region looked up, got \
-             {message:?}",
+        assert_eq!(
+            message, "Access Grants Instance does not exist",
+            "case {:?}: expected the refusal to state the missing instance in fixed words, \
+             naming neither the account nor the Region looked up, got {message:?}",
             case.case
         );
 

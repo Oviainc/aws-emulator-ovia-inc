@@ -1919,6 +1919,38 @@ impl ComAmazonawsS3controlAwss3controlservicev20180820State {
         })
     }
 
+    /// Whether `account_id`'s instance in `region` still holds a registered
+    /// location or a grant.
+    ///
+    /// The instance is what both of those belong to, which is what makes
+    /// deleting it a refusal while one of them is still there — the same
+    /// referential integrity [`Self::access_grants_location_is_referenced`]
+    /// states one resource down.
+    pub fn access_grants_instance_is_referenced(&self, account_id: &str, region: &str) -> bool {
+        let locations = self
+            .access_grants_locations
+            .values()
+            .any(|location| location.account_id == account_id && location.region == region);
+        let grants = self
+            .access_grants
+            .values()
+            .any(|grant| grant.account_id == account_id && grant.region == region);
+        locations || grants
+    }
+
+    /// Remove the S3 Access Grants instance `account_id` owns in `region` and
+    /// answer it, or `None` when that account has none there — what
+    /// `DeleteAccessGrantsInstance` releases, keyed exactly as the reads resolve
+    /// it, so a later read of that pair is the missing-instance refusal.
+    pub fn remove_access_grants_instance(
+        &mut self,
+        account_id: &str,
+        region: &str,
+    ) -> Option<AccessGrantsInstanceRecord> {
+        self.access_grants_instances
+            .remove(&(account_id.to_string(), region.to_string()))
+    }
+
     /// The grant in `account_id`'s instance in `region` whose scope covers
     /// `target` for `permission` and is CLOSEST to it — the authorization
     /// decision `GetDataAccess` makes.
@@ -3462,6 +3494,55 @@ static ACCOUNT_ID_MEMBER: Schema = Schema::new_member(
 )
 .with_xml_name("AccountId");
 
+/// The `<Error>` member a refusal names the access grant it was asked about in.
+/// See [`MULTI_REGION_ACCESS_POINT_NAME_MEMBER`] for why a member of a refusal
+/// this service's model declares no error shape for exists only on the wire.
+static ACCESS_GRANT_ID_MEMBER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.s3control#ErrorDetails$AccessGrantId",
+        "com.amazonaws.s3control",
+        "AccessGrantId",
+    ),
+    ShapeType::String,
+    "AccessGrantId",
+    1,
+)
+.with_xml_name("AccessGrantId");
+
+/// The `<Error>` member a refusal names the registered location it was asked
+/// about in. See [`ACCESS_GRANT_ID_MEMBER`].
+static ACCESS_GRANTS_LOCATION_ID_MEMBER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.s3control#ErrorDetails$AccessGrantsLocationId",
+        "com.amazonaws.s3control",
+        "AccessGrantsLocationId",
+    ),
+    ShapeType::String,
+    "AccessGrantsLocationId",
+    1,
+)
+.with_xml_name("AccessGrantsLocationId");
+
+/// The `<Error>` member the referential-integrity refusal
+/// ([`access_grants_location_not_empty`]) names the registered location in.
+///
+/// The SAME identity as [`ACCESS_GRANTS_LOCATION_ID_MEMBER`] under a different
+/// element name: S3 Access Grants spells the element `AccessGrantsLocationID`
+/// for this refusal and `AccessGrantsLocationId` for the missing-location one,
+/// so the two spellings are what the wire carries and a client reads the id out
+/// of whichever its refusal names.
+static ACCESS_GRANTS_LOCATION_ID_UPPERCASE_MEMBER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.s3control#ErrorDetails$AccessGrantsLocationID",
+        "com.amazonaws.s3control",
+        "AccessGrantsLocationID",
+    ),
+    ShapeType::String,
+    "AccessGrantsLocationID",
+    1,
+)
+.with_xml_name("AccessGrantsLocationID");
+
 /// How many hex characters the `RequestId` of an error envelope carries — the
 /// length of the `x-amz-request-id` an S3-family service answers with.
 const ERROR_REQUEST_ID_LEN: usize = 16;
@@ -3536,22 +3617,23 @@ fn correlation_hex(label: &str, sequence: u64, nanos: u128) -> String {
 /// names has no S3 Access Grants instance in the Region the request was signed
 /// for, because none was created there (or it was deleted).
 ///
-/// An instance is a Region-scoped resource of which an account has at most one,
-/// so the refusal names the pair that was looked up rather than an id: every
-/// instance carries the same id, [`ACCESS_GRANTS_INSTANCE_ID`].
-pub fn no_such_access_grants_instance<E>(
-    account_id: &str,
-    region: &str,
-) -> crate::scaffolded::Scaffolded<E> {
+/// The message is FIXED text, with no variable part at all: an instance is a
+/// Region-scoped resource of which an account has at most one and every instance
+/// carries the same id ([`ACCESS_GRANTS_INSTANCE_ID`]), so there is no instance
+/// identity to name — the account and the Region the request named are the
+/// request's own, and a refusal that interpolated them would make a client match
+/// on prose built from what it had just sent.
+pub fn no_such_access_grants_instance<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
         "AccessGrantsInstanceNotExistsError",
         404,
-        format!(
-            "Access Grants Instance does not exist: account {account_id} has no S3 Access \
-             Grants instance in {region}."
-        ),
+        NO_SUCH_ACCESS_GRANTS_INSTANCE_MESSAGE,
     )
 }
+
+/// The message of [`no_such_access_grants_instance`], which is also what the
+/// operations that need an instance before they can act answer.
+pub const NO_SUCH_ACCESS_GRANTS_INSTANCE_MESSAGE: &str = "Access Grants Instance does not exist";
 
 /// `AccessGrantsInstanceAlreadyExistsError` (HTTP 409): the account already has
 /// an S3 Access Grants instance in this Region, and
@@ -3595,33 +3677,63 @@ pub fn access_grants_instance_store_full<E>() -> crate::scaffolded::Scaffolded<E
 /// it, or because the registration was deleted.
 ///
 /// The message is the fixed sentence S3 Access Grants answers for a location id
-/// it holds no registration for, whichever id was asked about: it names no id,
-/// so every caller asking about a location that is not there is told the same
-/// thing. Carried in the S3-style XML envelope because the model declares no
-/// error here.
-pub fn no_such_access_grants_location<E>() -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure(
+/// it holds no registration for, whichever id was asked about: the message
+/// states the CLASS of failure and the `AccessGrantsLocationId` member BESIDE it
+/// states the instance — the id the request named — which is where a client
+/// reads the offending identity from (see
+/// [`no_such_multi_region_access_point`]). Carried in the S3-style XML envelope
+/// because the model declares no error here.
+pub fn no_such_access_grants_location<E>(location_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure_naming(
         "NoSuchAccessGrantsLocationError",
         404,
         "The specified access grants location does not exist",
+        vec![crate::scaffolded::ErrorDetail::new(
+            &ACCESS_GRANTS_LOCATION_ID_MEMBER,
+            location_id,
+        )],
     )
 }
 
-/// `AccessGrantsLocationNotEmptyError` (HTTP 409): grants of this instance still
+/// `AccessGrantsLocationNotEmptyError` (HTTP 400): grants of this instance still
 /// reference the location, and `DeleteAccessGrantsLocation` documents the rule —
 /// "You can only delete a location registration from an S3 Access Grants
 /// instance if there are no grants associated with this location."
 ///
-/// A conflict with the state the instance is in rather than a missing resource,
-/// so the status is the one [`access_grants_location_already_exists`] answers
-/// for the other conflict this resource has. The message is fixed text, as the
-/// missing-location refusal's is: what the caller must do about it — delete the
-/// grants first — is the same whichever location and however many grants.
-pub fn access_grants_location_not_empty<E>() -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure(
+/// A REFERENTIAL-INTEGRITY refusal: nothing about the service's state will clear
+/// it, so the caller has to send a different sequence of requests — delete the
+/// grants first — which is the 400 this service answers a request it will not
+/// carry out with, and not the 409 an identity conflict carries (see
+/// [`access_grants_location_already_exists`], where retrying the create under
+/// another identity is what resolves it). The message is fixed text, as the
+/// missing-location refusal's is: what the caller must do about it is the same
+/// whichever location and however many grants, and the id it is about travels in
+/// the member beside it.
+pub fn access_grants_location_not_empty<E>(location_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure_naming(
         "AccessGrantsLocationNotEmptyError",
-        409,
+        400,
         "Please delete access grants before deleting access grants location",
+        vec![crate::scaffolded::ErrorDetail::new(
+            &ACCESS_GRANTS_LOCATION_ID_UPPERCASE_MEMBER,
+            location_id,
+        )],
+    )
+}
+
+/// `AccessGrantsInstanceNotEmptyError` (HTTP 400): locations are still
+/// registered in the instance, or grants still held by it, and
+/// `DeleteAccessGrantsInstance` documents the rule — "You must first delete the
+/// access grants and locations before S3 Access Grants can delete the instance."
+///
+/// The referential-integrity refusal one resource up from
+/// [`access_grants_location_not_empty`], so it carries that refusal's code shape
+/// and status; it names no id because every instance carries the same one.
+pub fn access_grants_instance_not_empty<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        "AccessGrantsInstanceNotEmptyError",
+        400,
+        "Please delete access grants and locations before deleting access grants instance",
     )
 }
 
@@ -3656,14 +3768,19 @@ pub fn access_grants_location_store_full<E>() -> crate::scaffolded::Scaffolded<E
 }
 
 /// `NoSuchAccessGrantError` (HTTP 404): the instance has no grant under that id,
-/// because none was created under it or the grant was deleted. The code, status
-/// and fixed message follow the Access Grants surface's missing-resource refusal
-/// one resource up; see [`no_such_access_grants_location`].
-pub fn no_such_access_grant<E>() -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure(
+/// because none was created under it or the grant was deleted. The code, status,
+/// fixed message and the member naming the id the request asked about follow the
+/// Access Grants surface's missing-resource refusal one resource up; see
+/// [`no_such_access_grants_location`].
+pub fn no_such_access_grant<E>(grant_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure_naming(
         "NoSuchAccessGrantError",
         404,
         "The specified access grant does not exist",
+        vec![crate::scaffolded::ErrorDetail::new(
+            &ACCESS_GRANT_ID_MEMBER,
+            grant_id,
+        )],
     )
 }
 

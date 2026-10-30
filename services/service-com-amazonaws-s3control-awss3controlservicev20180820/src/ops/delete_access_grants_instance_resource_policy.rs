@@ -163,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .access_grants_instances
             .get_mut(&(input.account_id.clone(), region.clone()))
         else {
-            return Err(crate::state::no_such_access_grants_instance(
-                &input.account_id,
-                &region,
-            ));
+            return Err(crate::state::no_such_access_grants_instance());
         };
 
         // Deleting the policy of an instance that carries none leaves the same

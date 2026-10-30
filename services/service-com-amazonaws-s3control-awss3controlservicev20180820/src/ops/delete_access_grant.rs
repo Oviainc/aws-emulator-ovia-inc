@@ -167,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove_access_grant(&input.account_id, &region, &input.access_grant_id)
             .is_none()
         {
-            return Err(crate::state::no_such_access_grant());
+            return Err(crate::state::no_such_access_grant(&input.access_grant_id));
         }
         Ok(DeleteAccessGrantOutput)
     }

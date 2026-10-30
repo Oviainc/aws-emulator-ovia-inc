@@ -25,6 +25,8 @@ mod access_grants_location_delete;
 mod access_grants_location_register;
 #[path = "all/access_grants_location_update.rs"]
 mod access_grants_location_update;
+#[path = "all/access_grants_refusal_identities.rs"]
+mod access_grants_refusal_identities;
 #[path = "all/access_point_lifecycle.rs"]
 mod access_point_lifecycle;
 #[path = "all/access_point_policy_delete.rs"]

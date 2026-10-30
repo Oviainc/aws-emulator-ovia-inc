@@ -146,10 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .access_grants_instances
             .get(&(input.account_id.clone(), region.clone()))
         else {
-            return Err(crate::state::no_such_access_grants_instance(
-                &input.account_id,
-                &region,
-            ));
+            return Err(crate::state::no_such_access_grants_instance());
         };
         // An instance created without a policy, or one whose policy has been
         // deleted, carries none: there is nothing to report.

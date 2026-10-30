@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccessGrantsInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccessGrantsInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccessGrantsInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the S3 Access Grants instance of the account the request names, in
+//! the Region the request was signed for — the one instance an account has per
+//! Region — so every later read of that pair is refused as not existing and a
+//! create for it records a new instance rather than conflicting. An account with
+//! no instance in that Region is refused as not existing, and an instance that
+//! still holds a registered location or a grant is refused as not empty: "You
+//! must first delete the access grants and locations before S3 Access Grants can
+//! delete the instance." Either refusal deletes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -83,10 +83,12 @@ impl DeleteAccessGrantsInstanceOutput {
         ::aws_smithy_schema::ShapeType::Structure,
         &[],
     )
+    // The status is the 204 No Content this service answers an empty-body
+    // delete with on the wire; the model's declared 200 for it is stale.
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "DELETE",
         "/v20180820/accessgrantsinstance",
-        Some(200u16),
+        Some(204u16),
     ));
 }
 
@@ -150,25 +152,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteAccessGrantsInstance";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_ACCESS_GRANTS_INSTANCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_ACCESS_GRANTS_INSTANCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAccessGrantsInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAccessGrantsInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccessGrantsInstance"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        // An S3 Access Grants instance is Region-scoped — one per Region per
+        // account — so the Region the request was signed for is half the
+        // resource's identity, exactly as it is for the create that recorded it
+        // and the reads that report it.
+        let region = crate::state::signing_region(ctx.parts());
+        let mut store = state.lock();
+        if !store
+            .access_grants_instances
+            .contains_key(&(input.account_id.clone(), region.clone()))
+        {
+            return Err(crate::state::no_such_access_grants_instance());
+        }
+
+        // "You must first delete the access grants and locations before S3
+        // Access Grants can delete the instance": while the instance still
+        // holds either, nothing is removed — the caller's next read finds the
+        // instance, its locations and its grants exactly as they were.
+        if store.access_grants_instance_is_referenced(&input.account_id, &region) {
+            return Err(crate::state::access_grants_instance_not_empty());
+        }
+
+        store.remove_access_grants_instance(&input.account_id, &region);
+        Ok(DeleteAccessGrantsInstanceOutput)
     }
 }
