@@ -6225,6 +6225,37 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         Some(stored)
     }
 
+    /// Replace the configuration of the key group `id` names, and report the record as it
+    /// now stands.
+    ///
+    /// `UpdateKeyGroup` replaces the configuration WHOLE — "When you update a key group, all
+    /// the fields are updated with the values provided in the request. You cannot update some
+    /// fields independent of others." — so the stored configuration becomes the one
+    /// submitted, down to the members the request left out; `LastModifiedTime` becomes `now`
+    /// ("the date and time when the key group was last modified"), and the version token is
+    /// freshly minted, so the token the caller matched on no longer satisfies an `If-Match`
+    /// against this group. Nothing else about a key group changes: the id is the one it was
+    /// created under, and a group carries no status and no propagation deadline.
+    ///
+    /// `None` when the store holds no such key group, checked BEFORE the mint so a version
+    /// token is never spent on a group that is not there.
+    pub fn apply_key_group_config(
+        &mut self,
+        id: &str,
+        config: KeyGroupConfig,
+        now: SystemTime,
+    ) -> Option<&StoredKeyGroup> {
+        if !self.key_groups.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.key_groups.get_mut(id)?;
+        stored.config = config;
+        stored.last_modified_time = now;
+        stored.etag = etag;
+        Some(stored)
+    }
+
     /// Replace the configuration of the continuous deployment policy `id` names, and
     /// report the record as it now stands.
     ///
@@ -9260,6 +9291,17 @@ pub const PRECONDITION_FAILED_MESSAGE: &str =
     "The request failed because it didn't meet the preconditions in one or more \
      request-header fields.";
 
+/// `PreconditionFailed`'s message on the key group surface, as CloudFront sends it: "The
+/// request failed because it didn't meet the preconditions for this operation."
+///
+/// CloudFront words this one refusal per API FAMILY, and the sentence is fixed text that
+/// names no request value either way. The distribution and origin access identity surfaces
+/// — whose `ETag` is the version of a resource DOCUMENT a caller conditionally rewrites —
+/// report it of the request's header fields ([`PRECONDITION_FAILED_MESSAGE`]); the key
+/// group surface reports it of the OPERATION, which is the sentence below.
+pub const PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE: &str =
+    "The request failed because it didn't meet the preconditions for this operation.";
+
 /// `InvalidIfMatchVersion`'s message, as CloudFront sends it: "The If-Match version is
 /// missing or not valid for the resource."
 ///
@@ -9311,6 +9353,15 @@ pub fn no_such_invalidation() -> NoSuchInvalidation {
 pub fn precondition_failed() -> crate::ops::types::PreconditionFailed {
     crate::ops::types::PreconditionFailed {
         message: Some(PRECONDITION_FAILED_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `PreconditionFailed` for an `If-Match` that is a well-formed version token
+/// but not the current one, worded as the key group surface words it
+/// ([`PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE`]).
+pub fn precondition_failed_for_this_operation() -> crate::ops::types::PreconditionFailed {
+    crate::ops::types::PreconditionFailed {
+        message: Some(PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE.to_string()),
     }
 }
 

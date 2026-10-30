@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateKeyGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateKeyGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateKeyGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the configuration of the key group an id names, WHOLE: "when you update a key
+//! group, all the fields are updated with the values provided in the request. You cannot
+//! update some fields independent of others" — so the stored configuration becomes the
+//! submitted one down to the members it leaves out, `LastModifiedTime` moves to now, and a
+//! fresh version token is minted, which is the one a later `If-Match` against this group is
+//! checked against. Reports the record as it then stands, read from the store rather than
+//! from the request.
+//!
+//! The refusals, in the order they are checked — each one BEFORE anything is written, so a
+//! refused update leaves the stored group, its version token and its `LastModifiedTime`
+//! exactly as they were:
+//!
+//! * an id no stored key group holds — `NoSuchResource` (HTTP 404);
+//! * an `If-Match` that is absent or is not a version token at all —
+//!   `InvalidIfMatchVersion` (HTTP 400), "The If-Match version is missing or not valid";
+//!   one that carries a token that is not this group's current one — `PreconditionFailed`
+//!   (HTTP 412), worded as the key group surface words an unmet precondition — of the
+//!   OPERATION rather than of the request's header fields
+//!   ([`crate::state::PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE`]) — so an update only
+//!   lands on the configuration its caller actually read
+//!   ([`crate::state::check_if_match`]);
+//! * a configuration that names no public key at all, or whose `Comment` is past the
+//!   documented 128 characters — `InvalidArgument` (HTTP 400), the SAME checks the create
+//!   path applies, because each states a rule about the CONFIGURATION rather than about the
+//!   call that submits it, so an update cannot store one a create would have refused;
+//! * a configuration naming more public keys than the published quota on one group's key
+//!   list — `TooManyPublicKeysInKeyGroup` (HTTP 400);
+//! * a `Name` ANOTHER key group already holds — `KeyGroupConfig$Name` is "a name to identify
+//!   the key group", so renaming a group onto a name that is taken is
+//!   `KeyGroupAlreadyExists` (HTTP 409); the name this group already holds is its own, so an
+//!   update that keeps its name is not a conflict with itself.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +107,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,18 +184,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateKeyGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateKeyGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateKeyGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let config = input.key_group_config;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call reads
+        // it, as every handler here does. A key group itself has no transition owed: the
+        // model gives it no status, so one this service accepts is usable at once.
+        store.settle(now);
+
+        // The group being updated is looked up first: every refusal below is about the
+        // record this id names, and nothing is minted for an id the store does not hold.
+        let Some(current_etag) = store.key_group(&input.id).map(|stored| stored.etag.clone())
+        else {
+            return Err(UpdateKeyGroupErrorModeled::NoSuchResource(
+                crate::state::no_such_key_group(),
+            )
+            .into());
+        };
+
+        // The precondition is checked against the STORED version, so an update only lands
+        // on the configuration its caller actually read.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(UpdateKeyGroupErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(UpdateKeyGroupErrorModeled::PreconditionFailed(
+                    // CloudFront words this refusal per API family: the key group surface
+                    // reports the unmet precondition of the OPERATION rather than of the
+                    // request's header fields.
+                    crate::state::precondition_failed_for_this_operation(),
+                )
+                .into());
+            }
+        }
+
+        // "You must specify at least one public key for the key group" is a rule about the
+        // configuration, so it holds on every payload that states one: an update cannot
+        // leave a stored group naming no key, and the group keeps the keys it held.
+        if config.items.is_empty() {
+            return Err(UpdateKeyGroupErrorModeled::InvalidArgument(
+                crate::state::key_group_without_a_public_key(),
+            )
+            .into());
+        }
+
+        // "A comment to describe the key group. The comment cannot be longer than 128
+        // characters." The documented bound holds on every payload that states a
+        // configuration, so an update cannot store one the create would have refused.
+        let comment_length = config.comment.as_deref().unwrap_or_default().chars().count();
+        if comment_length > crate::state::MAX_KEY_GROUP_COMMENT {
+            return Err(UpdateKeyGroupErrorModeled::InvalidArgument(
+                crate::state::comment_too_long(comment_length),
+            )
+            .into());
+        }
+
+        // The published quota on ONE group's key list: the list is stored whole and every
+        // read of the group reports it, so a configuration past the bound is refused with
+        // the error the operation models for it rather than stored cut short.
+        if config.items.len() > crate::state::MAX_PUBLIC_KEYS_IN_KEY_GROUP {
+            return Err(UpdateKeyGroupErrorModeled::TooManyPublicKeysInKeyGroup(
+                crate::state::too_many_public_keys_in_key_group(),
+            )
+            .into());
+        }
+
+        // "A name to identify the key group": a name identifies ONE group, so a name another
+        // group holds cannot be moved onto this one, and the group that holds it is left
+        // exactly as it was. The group being updated already holds its own name, which is
+        // why the holder's id is compared.
+        if store
+            .key_group_named(&config.name)
+            .is_some_and(|holder| holder.id != input.id)
+        {
+            return Err(UpdateKeyGroupErrorModeled::KeyGroupAlreadyExists(
+                crate::state::key_group_already_exists(),
+            )
+            .into());
+        }
+
+        // Defensive: the id was confirmed present above under this same lock, so the write
+        // cannot miss. The `None` arm is the modelled 404 rather than a panic.
+        let Some(stored) = store.apply_key_group_config(&input.id, config, now) else {
+            return Err(UpdateKeyGroupErrorModeled::NoSuchResource(
+                crate::state::no_such_key_group(),
+            )
+            .into());
+        };
+
+        Ok(UpdateKeyGroupOutput {
+            // "The key group that was just updated." — read from the record just written,
+            // never from the request.
+            key_group: Some(stored.to_key_group()),
+            // "The identifier for this version of the key group" — a fresh token, so the
+            // version this caller just replaced no longer satisfies an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

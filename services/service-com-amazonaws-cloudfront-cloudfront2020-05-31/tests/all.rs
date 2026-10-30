@@ -149,6 +149,8 @@ mod invalidation_list;
 mod key_group_config_read;
 #[path = "all/key_group_lifecycle.rs"]
 mod key_group_lifecycle;
+#[path = "all/key_group_update.rs"]
+mod key_group_update;
 #[path = "all/key_value_store_delete.rs"]
 mod key_value_store_delete;
 #[path = "all/key_value_store_lifecycle.rs"]
