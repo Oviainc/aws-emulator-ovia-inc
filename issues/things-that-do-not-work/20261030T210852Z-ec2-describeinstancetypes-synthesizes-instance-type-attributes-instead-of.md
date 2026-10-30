@@ -1,0 +1,374 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: ec2-catalog-describe-instance-types-a1-c9g
+Issue-Step: task#4
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: ec2-catalog-describe-instance-types-a1-c9g ec2-catalog-describe-instance-types-c9gd-m6gd ec2-catalog-describe-instance-types-r9g-z1d
+Issue-Shape-Id: com.amazonaws.ec2#AmazonEC2
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].currentGeneration
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].ebsInfo.attachmentLimitType
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].networkInfo.connectionTrackingConfiguration
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].networkInfo.enaSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.2xlarge"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].currentGeneration
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].ebsInfo.attachmentLimitType
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].networkInfo.connectionTrackingConfiguration
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].networkInfo.enaSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.4xlarge"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].currentGeneration
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].ebsInfo.attachmentLimitType
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].networkInfo.connectionTrackingConfiguration
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].networkInfo.enaSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].vCpuInfo.defaultCores
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].vCpuInfo.defaultVCpus
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.8xlarge"].vCpuInfo.validCores.item[*]
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].currentGeneration
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].ebsInfo.attachmentLimitType
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].networkInfo.connectionTrackingConfiguration
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].networkInfo.enaSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.large"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].currentGeneration
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].ebsInfo.attachmentLimitType
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].networkInfo.connectionTrackingConfiguration
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].networkInfo.enaSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="c4.xlarge"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item.inferenceAcceleratorInfo
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item.vCpuInfo.validCores.item[*]
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].autoRecoverySupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].instanceStorageInfo.disks.item.count
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].instanceStorageInfo.disks.item.sizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].instanceStorageInfo.totalSizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].networkInfo.efaSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.16xlarge"].vCpuInfo.validCores.item[*]
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].autoRecoverySupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].instanceStorageInfo.disks.item.count
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].instanceStorageInfo.disks.item.sizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].instanceStorageInfo.totalSizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].networkInfo.efaSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.24xlarge"].vCpuInfo.validCores.item[*]
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].autoRecoverySupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].instanceStorageInfo.disks.item.sizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].instanceStorageInfo.totalSizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.2xlarge"].vCpuInfo.validCores.item[*]
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].autoRecoverySupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].instanceStorageInfo.disks.item.count
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].instanceStorageInfo.disks.item.sizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].instanceStorageInfo.totalSizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.32xlarge"].vCpuInfo.validCores.item[*]
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].autoRecoverySupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].instanceStorageInfo.disks.item.sizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].instanceStorageInfo.totalSizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.4xlarge"].vCpuInfo.validCores.item[*]
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].autoRecoverySupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].instanceStorageInfo.disks.item.sizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].instanceStorageInfo.totalSizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.8xlarge"].vCpuInfo.validCores.item[*]
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].autoRecoverySupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].instanceStorageInfo.disks.item.count
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].instanceStorageInfo.disks.item.sizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].instanceStorageInfo.totalSizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].nitroTpmSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].rebootMigrationSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.metal"].supportedBootModes.item
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].autoRecoverySupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].cpuBurstModel
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].ebsInfo.ebsOptimizedInfo.baselineIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].ebsInfo.ebsOptimizedInfo.baselineThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].ebsInfo.ebsOptimizedInfo.maximumBandwidthInMbps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].ebsInfo.ebsOptimizedInfo.maximumIops
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].ebsInfo.ebsOptimizedInfo.maximumThroughputInMBps
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].ebsInfo.maximumEbsAttachments
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].instanceStorageInfo.disks.item.sizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].instanceStorageInfo.totalSizeInGB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].memoryInfo.sizeInMiB
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].networkInfo.defaultNetworkCardIndex
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].networkInfo.enaSrdSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].networkInfo.flexibleEnaQueuesSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].networkInfo.maximumNetworkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].networkInfo.networkCards
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].networkInfo.networkPerformance
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].networkInfo.secondaryNetworkSupported
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].networkInfo.trafficMirroringSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].phcSupport
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].processorInfo.sustainedClockSpeedInGhz
+Issue-Key: ec2|DescribeInstanceTypes|2xx->2xx|$.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType="x2iedn.xlarge"].rebootMigrationSupport
+Issue-Related: 20261029T200817Z-ec2-read-paths-omit-modeled-members-and-serve.md
+Issue-Related: 20261030T063325Z-ec2-static-catalogs-diverge-from-aws-instance-type.md
+Issue-Related: 20261030T124526Z-ec2-describeinstancetypes-serves-a-synthesized-instance-type-catalog.md
+Issue-Commit: 57b303ffac73a2f2fe8b11084ee3a9c28d52eaaf
+
+# EC2 DescribeInstanceTypes synthesizes instance-type attributes instead of serving AWS values
+
+> _Note: this issue was identified against the code base at commit `57b303ffac73a2f2fe8b11084ee3a9c28d52eaaf`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeInstanceTypes
+
+## Description
+DescribeInstanceTypes answers HTTP 200 but the InstanceTypeInfo it projects is computed from the instance-type NAME (family letter + size multiplier) rather than served from AWS's published per-instance-type attribute set, and a fixed group of modeled members is never emitted at all. This single root cause produces 161 net-new divergence clusters in this replay, every one of them in the ec2-catalog-describe-instance-types-* fixture family; three representative clusters are named as causes below, one per instance-type page, and a fix must be validated by re-replaying the whole ec2-catalog-describe-instance-types-* family, not just these three steps.
+
+Neighbouring open issues do NOT carry these replay keys: 20261030T124526Z-ec2-describeinstancetypes-serves-a-synthesized-instance-type-catalog.md, 20261030T063325Z-ec2-static-catalogs-diverge-from-aws-instance-type.md and 20261029T200817Z-ec2-read-paths-omit-modeled-members-and-serve.md own OTHER clusters of the same family (the replay marks those clusters owned, and the three clusters below are reported with no owner), so the steps named here are not exercised by any open issue's pointer.
+
+AWS (common to all three causes): Smithy (services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json) models DescribeInstanceTypes{DryRun, InstanceTypes(InstanceType, 0..100), Filters, MaxResults(5..100), NextToken, IncludeUnsupportedInRegion} -> {InstanceTypes(instanceTypeSet, InstanceTypeInfoList), NextToken(nextToken)}, no error shapes. For each requested instance type AWS returns that type's real, published attributes - they are catalog facts, not values derivable from the name: currentGeneration, dedicatedHostsSupported, autoRecoverySupported, freeTierEligible, instanceStorageSupported, memoryInfo.sizeInMiB, vCpuInfo.defaultVCpus/defaultCores/validCores, processorInfo.manufacturer/sustainedClockSpeedInGhz, ebsInfo.attachmentLimitType/maximumEbsAttachments and ebsInfo.ebsOptimizedInfo (baseline/maximum Bandwidth-Iops-Throughput), instanceStorageInfo.disks/totalSizeInGB, gpuInfo, inferenceAcceleratorInfo, networkInfo.* (networkPerformance, maximumNetworkInterfaces, ipv4/ipv6AddressesPerInterface, efaSupported, encryptionInTransitSupported), placementGroupInfo.supportedStrategies, supportedBootModes, nitroTpmSupport. AWS also always emits the members the emulator omits entirely: cpuBurstModel, networkInfo.defaultNetworkCardIndex, networkInfo.enaSrdSupported, networkInfo.enaSupport, networkInfo.flexibleEnaQueuesSupport, networkInfo.maximumNetworkCards, networkInfo.networkCards, networkInfo.secondaryNetworkSupported, networkInfo.trafficMirroringSupport, networkInfo.ipv4AddressesPerSecondaryInterface, networkInfo.connectionTrackingConfiguration, phcSupport and rebootMigrationSupport.
+Emulator (common): emits a synthesized InstanceTypeInfo - EBS baseline/maximum bandwidth, IOPS and throughput scale smoothly with the size suffix instead of matching the published per-type figures, memory and vCPU counts are derived, storage/GPU/accelerator presence is guessed, and the members listed above are absent - so essentially every item of instanceTypeSet differs from the recording.
+Why (common): clients size workloads, choose placement and validate capacity from these attributes. A caller reading maximumEbsAttachments, ebsOptimizedInfo throughput, memoryInfo.sizeInMiB, instanceStorageInfo or gpuInfo gets numbers that are wrong for the type it asked about; a caller reading the omitted members (networkCards, maximumNetworkCards, enaSrdSupported, cpuBurstModel, phcSupport, rebootMigrationSupport, connectionTrackingConfiguration) finds the field missing and cannot make the decision at all. Nothing in the response signals that the data is synthetic.
+Fix (common): the instance-type catalog the operation reads plus its projection (services/service-com-amazonaws-ec2-amazonec2/src/ops/describe_instance_types.rs and the instance-type catalog data it loads) - serve the recorded per-type attribute set verbatim and emit the full modeled member list.
+
+Cause 1 of 3: the a1..c9g page. Replay: instanceTypeSet items keyed by instanceType diverge on cpuBurstModel (missing, expected 'none'), currentGeneration ('false' expected, 'true' served), ebsInfo.attachmentLimitType ('shared' vs 'dedicated'), all six ebsOptimizedInfo figures, ebsInfo.maximumEbsAttachments, memoryInfo.sizeInMiB, vCpuInfo.defaultCores/defaultVCpus/validCores, processorInfo.sustainedClockSpeedInGhz, and the whole networkInfo.connectionTrackingConfiguration / networkCards / maximumNetworkCards / enaSrdSupported / enaSupport / flexibleEnaQueuesSupport / secondaryNetworkSupported / trafficMirroringSupport group, plus phcSupport and rebootMigrationSupport.
+Traces: ec2-catalog-describe-instance-types-a1-c9g#task#4.
+
+Cause 2 of 3: the c9gd..m6gd page. Same root cause on a single-type request: cpuBurstModel missing, the six ebsOptimizedInfo figures and maximumEbsAttachments wrong, inferenceAcceleratorInfo missing entirely where AWS reports an accelerator block, instanceStorageSupported inverted, networkInfo.encryptionInTransitSupported inverted, and the omitted networkInfo/phcSupport/rebootMigrationSupport/nitroTpmSupport group absent.
+Traces: ec2-catalog-describe-instance-types-c9gd-m6gd#task#5.
+
+Cause 3 of 3: the r9g..z1d page. Same root cause: autoRecoverySupported inverted, cpuBurstModel missing, the ebsOptimizedInfo figures and maximumEbsAttachments wrong, instanceStorageInfo.disks.item.count/sizeInGB and totalSizeInGB wrong, memoryInfo.sizeInMiB wrong, networkInfo.efaSupported wrong, and the same omitted-member group absent across every item of the page.
+Traces: ec2-catalog-describe-instance-types-r9g-z1d#task#24.
+
+## Evidence
+Replay output (trace set simparity-wire-aws-v1); all three clusters are verdict=mismatch with expected_status 200 and actual_status 200, and all are reported with owned_by [] (net-new) and no stub_path.
+
+- ec2-catalog-describe-instance-types-a1-c9g#task#4 (DescribeInstanceTypes): "$...instanceTypeSet.item[instanceType=\"c4.large\"].cpuBurstModel: missing (expected 'none', got None)"; "...currentGeneration: value_mismatch (expected 'false', got 'true')"; "...ebsInfo.attachmentLimitType: value_mismatch (expected 'shared', got 'dedicated')"; "...ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps: value_mismatch (expected '500', got '575')"; "...baselineIops: value_mismatch (expected '4000', got '3000')"; "...baselineThroughputInMBps: value_mismatch (expected '62.5', got '71.875')"; "...maximumIops: value_mismatch (expected '4000', got '3000')"; "...ebsInfo.maximumEbsAttachments: value_mismatch (expected '40', got '27')"; "...memoryInfo.sizeInMiB: value_mismatch (expected '3840', got '4096')"; "...networkInfo.connectionTrackingConfiguration: missing (expected {'defaultTcpEstablishedTimeout': '432000', 'defaultUdpStreamTimeout': '180', 'defaultUdpTimeout': '30'}, got None)"; the cluster's key list repeats the same member set for c4.xlarge, c4.2xlarge, c4.4xlarge and c4.8xlarge (including vCpuInfo.defaultCores/defaultVCpus/validCores).
+- ec2-catalog-describe-instance-types-c9gd-m6gd#task#5: "...item.cpuBurstModel: missing (expected 'none', got None)"; "...ebsOptimizedInfo.baselineBandwidthInMbps: value_mismatch (expected '19000', got '20400')"; "...baselineIops: (expected '80000', got '90000')"; "...baselineThroughputInMBps: (expected '2375.0', got '2550')"; "...maximumEbsAttachments: (expected '19', got '28')"; "...inferenceAcceleratorInfo: missing (expected {'accelerators': {'member': {'count': '8', 'manufacturer': 'Qualcomm', 'memoryInfo': {'sizeInMiB': '16000'}, 'name': 'Qualcomm AI100'}}, 'totalInferenceMemoryInMiB': '128000'}, got None)"; "...instanceStorageSupported: value_mismatch (expected 'false', got 'true')"; "...networkInfo.encryptionInTransitSupported: value_mismatch (expected 'true', got 'false')"; plus the missing networkInfo.defaultNetworkCardIndex / enaSrdSupported / flexibleEnaQueuesSupport / maximumNetworkCards / networkCards / secondaryNetworkSupported / trafficMirroringSupport / ipv4AddressesPerSecondaryInterface, nitroTpmSupport, phcSupport and rebootMigrationSupport.
+- ec2-catalog-describe-instance-types-r9g-z1d#task#24: "...item[instanceType=\"x2iedn.16xlarge\"].autoRecoverySupported: value_mismatch (expected 'true', got 'false')"; "...cpuBurstModel: missing (expected 'none', got None)"; "...ebsOptimizedInfo.baselineBandwidthInMbps: (expected '40000', got '13600')"; "...baselineIops: (expected '130000', got '60000')"; "...baselineThroughputInMBps: (expected '5000.0', got '1700')"; "...maximumEbsAttachments: (expected '26', got '28')"; "...instanceStorageInfo.disks.item.count: (expected '1', got '2')"; "...instanceStorageInfo.disks.item.sizeInGB: (expected '1900', got '1888')"; same member set repeated for x2iedn.2xlarge/4xlarge/24xlarge/32xlarge including memoryInfo.sizeInMiB, networkInfo.efaSupported and the omitted-member group.
+
+The individual numbers above are the recorded per-type catalog values for those types; the requirement is that each requested instance type is answered with ITS published attribute values and the full modeled member set, not that these particular numbers appear for other types. Replay summary for context: 541 divergence clusters, of which 170 are net-new and 161 belong to this DescribeInstanceTypes catalog root cause.
+
+## Steps to Reproduce
+1. Replay the ec2-catalog-describe-instance-types-* fixtures from trace set simparity-wire-aws-v1 against the emulator; ec2-catalog-describe-instance-types-a1-c9g#task#4, ec2-catalog-describe-instance-types-c9gd-m6gd#task#5 and ec2-catalog-describe-instance-types-r9g-z1d#task#24 are the three representative clusters here, and 161 clusters in that family diverge in total.
+2. Minimal repro: ec2.describe_instance_types(InstanceTypes=['c4.large']) -> compare the returned instanceTypeSet item against AWS: currentGeneration must be 'false', ebsInfo.attachmentLimitType 'shared', ebsInfo.ebsOptimizedInfo.baselineBandwidthInMbps 500 / baselineIops 4000 / baselineThroughputInMBps 62.5, ebsInfo.maximumEbsAttachments 40, memoryInfo.sizeInMiB 3840, and cpuBurstModel, networkInfo.defaultNetworkCardIndex, networkInfo.enaSrdSupported, networkInfo.flexibleEnaQueuesSupport, networkInfo.maximumNetworkCards, networkInfo.networkCards, networkInfo.connectionTrackingConfiguration, phcSupport and rebootMigrationSupport must all be present. Observe derived values and the missing members.
+3. Repeat for any type in another family (e.g. ec2.describe_instance_types(InstanceTypes=['x2iedn.16xlarge'])) to see the same synthesized-attribute pattern on storage, GPU/accelerator and network members.
+4. After fixing, re-replay the entire ec2-catalog-describe-instance-types-* family - the three named steps are representatives of one root cause, not its full extent.
