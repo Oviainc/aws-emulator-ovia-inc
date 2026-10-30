@@ -33,7 +33,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::error_messages::assert_refusal;
 use crate::job_runs::{emulator_with_engine, far_future};
 use crate::trigger_starts::{
-    register_targets, set_due_instant, stored_run_ids, trigger_state, CRAWLER, JOB,
+    register_targets, set_due_instant, stored_run_ids, trigger_state, CRAWLER, JOB, OTHER_JOB,
 };
 use crate::wire::{call_in_region, ok, REGION};
 
@@ -107,14 +107,16 @@ fn stop_cases() -> Vec<StopCase> {
             state_after_restart: TRIGGER_STATE_ACTIVATED,
         },
         StopCase {
-            // "This field is required when the trigger type is CONDITIONAL."
+            // "This field is required when the trigger type is CONDITIONAL." The predicate
+            // waits on a job no action of this trigger runs: a conditional trigger may not
+            // name one job in both places.
             case: "conditional, started by a call",
             trigger: json!({
                 "Type": "CONDITIONAL",
                 "Predicate": {
                     "Conditions": [{
                         "LogicalOperator": "EQUALS",
-                        "JobName": JOB,
+                        "JobName": OTHER_JOB,
                         "State": "SUCCEEDED",
                     }],
                 },
@@ -132,7 +134,7 @@ fn stop_cases() -> Vec<StopCase> {
                 "Predicate": {
                     "Logical": "ANY",
                     "Conditions": [
-                        { "LogicalOperator": "EQUALS", "JobName": JOB, "State": "FAILED" },
+                        { "LogicalOperator": "EQUALS", "JobName": OTHER_JOB, "State": "FAILED" },
                         { "CrawlState": "SUCCEEDED", "CrawlerName": CRAWLER },
                     ],
                 },

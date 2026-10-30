@@ -12,7 +12,12 @@
 //! registered on it: a `DatabaseName` the catalog holds no database for, or a `TableName`
 //! that database holds no table for, is refused with `EntityNotFoundException` and NOTHING
 //! is stored — so the `GetTableOptimizer` that follows such a refusal reports the miss
-//! too. A table carries at most one optimizer per type
+//! too. A stored table that carries no Iceberg metadata filepath is refused with
+//! `InvalidInputException`: registering an optimizer reads that metadata file, which is
+//! what names the data files the optimizer would work on. So is a table that names one
+//! while declaring another table type, which the read and the delete refuse to address an
+//! optimizer on. A table carries at most
+//! one optimizer per type
 //! ([`crate::state::TableEntry::optimizers`]), so a second create of the same type is
 //! refused with `AlreadyExistsException` rather than replacing the stored configuration.
 //!
@@ -185,12 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // The optimizer's table is resolved through the Data Catalog, so a database or a
+        // table that resolves to nothing is the catalog's own read miss, reported as this
+        // surface reports it (`crate::state::messages::table_optimizer_entity_not_found`).
         let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
             return Err(CreateTableOptimizerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::database_not_found(
-                        &input.database_name,
-                    )),
+                    message: Some(crate::state::messages::table_optimizer_entity_not_found()),
                     from_federation_source: None,
                 },
             )
@@ -202,12 +208,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(CreateTableOptimizerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    message: Some(crate::state::messages::table_optimizer_entity_not_found()),
                     from_federation_source: None,
                 },
             )
             .into());
         };
+        // Registering an optimizer reads the table's current Iceberg metadata file, which is
+        // what names the data files an optimizer works on — so a table that carries no
+        // metadata filepath is refused whatever its declared type is, before the stored
+        // optimizers are consulted.
+        if table.iceberg_metadata_location().is_none() {
+            return Err(CreateTableOptimizerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::table_metadata_filepath_missing()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+        // A table that names a metadata file while declaring another type is still a table
+        // no optimizer could belong to, and the read and the delete refuse to address one
+        // on it — so the create is refused the same way they are rather than storing an
+        // optimizer nothing can reach.
+        if !table.is_iceberg_table() {
+            return Err(CreateTableOptimizerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::unsupported_table_type()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
         if table.optimizers.contains_key(&input.r#type) {
             return Err(CreateTableOptimizerErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {

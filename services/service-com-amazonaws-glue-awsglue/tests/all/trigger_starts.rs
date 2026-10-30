@@ -45,8 +45,10 @@ use crate::wire::{call_in_region, ok, REGION};
 /// served in, and which job it is is not an axis of the rule under test.
 pub(crate) const JOB: &str = "trigger-start-target-job";
 
-/// A second job, so a row can initiate more than one action.
-const OTHER_JOB: &str = "trigger-start-other-job";
+/// A second job, so a row can initiate more than one action, or a conditional trigger's
+/// predicate can wait on a job none of its actions runs ("Job cannot be a Predicate and
+/// Action for Conditional Trigger.").
+pub(crate) const OTHER_JOB: &str = "trigger-start-other-job";
 
 /// The crawler an action can name instead of a job, so a row can carry two actions of
 /// different kinds.

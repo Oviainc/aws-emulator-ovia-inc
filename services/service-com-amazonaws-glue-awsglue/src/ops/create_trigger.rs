@@ -10,10 +10,19 @@
 //! `InvalidInputException` when a member the named `Type` requires is missing (a
 //! `Schedule` for a scheduled trigger, a `Predicate` for a conditional one), when the
 //! `Schedule` is no cron expression, when `StartOnCreation` asks to start a type that
-//! cannot be started on creation, or when the trigger would initiate nothing; and with
+//! cannot be started on creation, when the trigger would initiate nothing, or when a
+//! conditional trigger names one job both in its `Predicate` and in its `Actions`; and with
 //! `EntityNotFoundException` when the trigger names a workflow, or an action or condition
 //! names a job or crawler, that this account does not hold (see
-//! [`crate::state::missing_trigger_reference`]).
+//! [`crate::state::missing_trigger_reference`]). Every definition refusal is decided BEFORE
+//! the entities it names are looked up, so a definition the service could not fire is
+//! reported as the input error it is rather than as a missing entity.
+//!
+//! The trigger's name is also this create's idempotency identifier, so a name the Region
+//! already holds a trigger under is refused as `AlreadyExistsException` when the request
+//! submits the definition that is stored, and as
+//! `IdempotentParameterMismatchException` when it submits another one
+//! ([`crate::state::TriggerEntry::matches_create_input`]).
 //!
 //! ## Shape of an operation
 //!
@@ -232,8 +241,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // A trigger is addressed by name alone, so the name has to be free in THIS Region:
-        // the same name in another Region names another trigger.
-        if store.trigger(&region, &input.name).is_some() {
+        // the same name in another Region names another trigger. The name is also this
+        // create's idempotency identifier, so a create under a name already taken is told
+        // which of the two it is: a retry of the create that stored the trigger, or one
+        // request associating that identifier with a second, different trigger.
+        if let Some(stored) = store.trigger(&region, &input.name) {
+            if !stored.matches_create_input(&input) {
+                return Err(
+                    CreateTriggerErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                crate::state::messages::
+                                    already_submitted_with_different_configuration("Trigger"),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
             return Err(CreateTriggerErrorModeled::AlreadyExistsException(
                 AlreadyExistsException {
                     message: Some(crate::state::messages::TRIGGER_ALREADY_EXISTS.to_string()),

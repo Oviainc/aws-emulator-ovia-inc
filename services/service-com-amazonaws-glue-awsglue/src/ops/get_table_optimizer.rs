@@ -9,8 +9,12 @@
 //! table it belongs to.
 //!
 //! An optimizer is addressed by its table and its type, so each step of that address is
-//! resolved in turn and a miss at any of them — the database, the table, or an optimizer of
-//! that type — is the operation's modelled `EntityNotFoundException`. The reported
+//! resolved in turn: a database or table the catalog does not hold is the catalog's own
+//! read miss (`EntityNotFoundException`), a stored table whose type cannot be optimized is
+//! the request validation `InvalidInputException` — an optimizer works on the data files of
+//! an open-table-format table, so no optimizer of any type could belong to any other kind
+//! of table — and only for such a table is a type it holds no optimizer of the operation's
+//! modelled `EntityNotFoundException`. The reported
 //! `configuration` is the one the create or the last update wrote, and no `lastRun` is
 //! reported: nothing here performs the work an optimizer run does, so there is no run to
 //! report ([`crate::state::TableOptimizerEntry`]).
@@ -189,12 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let store = state.lock();
+        // The optimizer's table is resolved through the Data Catalog, so a database or a
+        // table that resolves to nothing is the catalog's own read miss, reported as this
+        // surface reports it (`crate::state::messages::table_optimizer_entity_not_found`).
         let Some(database) = store.database(&catalog_id, &input.database_name) else {
             return Err(GetTableOptimizerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::database_not_found(
-                        &input.database_name,
-                    )),
+                    message: Some(crate::state::messages::table_optimizer_entity_not_found()),
                     from_federation_source: None,
                 },
             )
@@ -206,17 +211,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(GetTableOptimizerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    message: Some(crate::state::messages::table_optimizer_entity_not_found()),
                     from_federation_source: None,
                 },
             )
             .into());
         };
+        // Whether the table can carry an optimizer at all is a question about the REQUEST,
+        // decided before the optimizer itself is looked up: an optimizer compacts, retains
+        // and cleans up the data files of an open-table-format table, so a table of any
+        // other type is one no optimizer of any type could ever belong to, and the caller is
+        // told its request was not valid rather than that an optimizer is missing.
+        if !table.is_iceberg_table() {
+            return Err(GetTableOptimizerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::unsupported_table_type()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
         let Some(optimizer) = table.optimizers.get(&input.r#type) else {
             return Err(GetTableOptimizerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
                     message: Some(crate::state::messages::table_optimizer_not_found(
-                        &input.table_name,
+                        &table.name,
                         &input.r#type,
                     )),
                     from_federation_source: None,

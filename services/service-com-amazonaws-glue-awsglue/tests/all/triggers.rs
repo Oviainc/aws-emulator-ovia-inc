@@ -39,6 +39,12 @@ const JOB: &str = "trigger-target-job";
 /// A second job, so a row can carry more than one action.
 const OTHER_JOB: &str = "trigger-other-job";
 
+/// The job a conditional trigger's predicate waits on. A conditional trigger may not name
+/// one job both in its `Predicate` and in its `Actions` ("Job cannot be a Predicate and
+/// Action for Conditional Trigger."), so the condition rows below wait on a job no action
+/// of theirs runs.
+const PREDICATE_JOB: &str = "trigger-predicate-job";
+
 /// The crawler an action or a condition can name instead of a job.
 const CRAWLER: &str = "trigger-target-crawler";
 
@@ -49,7 +55,7 @@ const WORKFLOW: &str = "trigger-workflow";
 /// workflow, action and condition targets resolve.
 async fn register_targets(router: &MultiServiceRouter) {
     ok(router, "CreateWorkflow", &json!({ "Name": WORKFLOW })).await;
-    for job in [JOB, OTHER_JOB] {
+    for job in [JOB, OTHER_JOB, PREDICATE_JOB] {
         ok(
             router,
             "CreateJob",
@@ -89,7 +95,7 @@ fn trigger_body(name: &str, trigger_type: &str) -> Value {
             body["Predicate"] = json!({
                 "Conditions": [{
                     "LogicalOperator": "EQUALS",
-                    "JobName": JOB,
+                    "JobName": PREDICATE_JOB,
                     "State": "SUCCEEDED",
                 }],
             });
@@ -160,7 +166,11 @@ async fn created_triggers_are_read_back_from_the_store() {
                 "Predicate": {
                     "Logical": "AND",
                     "Conditions": [
-                        { "LogicalOperator": "EQUALS", "JobName": JOB, "State": "SUCCEEDED" },
+                        {
+                            "LogicalOperator": "EQUALS",
+                            "JobName": PREDICATE_JOB,
+                            "State": "SUCCEEDED",
+                        },
                         {
                             "LogicalOperator": "EQUALS",
                             "CrawlerName": CRAWLER,
@@ -348,7 +358,8 @@ async fn a_definition_the_service_could_not_fire_is_refused() {
     let router = emulator();
     register_targets(&router).await;
 
-    let condition = json!({ "LogicalOperator": "EQUALS", "JobName": JOB, "State": "SUCCEEDED" });
+    let condition =
+        json!({ "LogicalOperator": "EQUALS", "JobName": PREDICATE_JOB, "State": "SUCCEEDED" });
     let cases: Vec<(&str, Value)> = vec![
         (
             "scheduled with no schedule",
@@ -646,18 +657,37 @@ async fn absent_and_duplicate_triggers_answer_the_modelled_errors() {
         );
     }
 
-    // The duplicate create is refused, and leaves the stored trigger as it was.
+    // The duplicate create is refused, and leaves the stored trigger as it was. A create
+    // under a taken name that submits ANOTHER definition has reused the trigger's name —
+    // which is the create's idempotency identifier — for a different record, so it is the
+    // mismatch rather than the plain duplicate; the identical create is the duplicate.
     let stored = get_trigger(&router, "present-trigger").await;
     let mut duplicate = trigger_body("present-trigger", "ON_DEMAND");
     duplicate["Description"] = json!("a second create must not overwrite the first");
     let (status, body) = call(&router, "CreateTrigger", &duplicate).await;
     assert_eq!(
         status, 400,
-        "case duplicate create: expected 400, got {status} with {body}"
+        "case duplicate create with another definition: expected 400, got {status} with {body}"
+    );
+    assert!(
+        error_code(&body).contains("IdempotentParameterMismatchException"),
+        "case duplicate create with another definition: expected \
+         IdempotentParameterMismatchException, got {body}"
+    );
+    let (status, body) = call(
+        &router,
+        "CreateTrigger",
+        &trigger_body("present-trigger", "ON_DEMAND"),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case duplicate create of the stored definition: expected 400, got {status} with {body}"
     );
     assert!(
         error_code(&body).contains("AlreadyExistsException"),
-        "case duplicate create: expected AlreadyExistsException, got {body}"
+        "case duplicate create of the stored definition: expected AlreadyExistsException, got \
+         {body}"
     );
     assert_eq!(
         get_trigger(&router, "present-trigger").await,

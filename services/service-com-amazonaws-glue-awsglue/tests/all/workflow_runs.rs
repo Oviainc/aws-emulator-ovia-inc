@@ -47,6 +47,11 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/sim2real-glue-job-role";
 /// create is served in, and which job it is is not an axis of the rule under test.
 const JOB: &str = "workflow-run-target-job";
 
+/// The job a conditional trigger's predicate waits on. A conditional trigger may not name
+/// one job both in its `Predicate` and in its `Actions` ("Job cannot be a Predicate and
+/// Action for Conditional Trigger."), so the predicates here wait on a job no action runs.
+const PREDICATE_JOB: &str = "workflow-run-predicate-job";
+
 /// The crawler an action can name instead of a job, so a row can carry two actions of
 /// different kinds.
 const CRAWLER: &str = "workflow-run-target-crawler";
@@ -70,6 +75,16 @@ async fn register_targets(router: &MultiServiceRouter) {
             // row's run is still holding. The ceiling's own effect on a firing is the
             // subject of `trigger_action_runs`.
             "ExecutionProperty": { "MaxConcurrentRuns": 10 },
+        }),
+    )
+    .await;
+    ok(
+        router,
+        "CreateJob",
+        &json!({
+            "Name": PREDICATE_JOB,
+            "Role": ROLE_ARN,
+            "Command": { "Name": "glueetl", "ScriptLocation": "s3://etl-scripts/etl.py" },
         }),
     )
     .await;
@@ -267,7 +282,7 @@ fn start_cases() -> Vec<StartCase> {
                 "Predicate": {
                     "Conditions": [{
                         "LogicalOperator": "EQUALS",
-                        "JobName": JOB,
+                        "JobName": PREDICATE_JOB,
                         "State": "SUCCEEDED",
                     }],
                 },
@@ -589,7 +604,7 @@ async fn starting_a_workflow_with_no_entry_point_is_refused() {
         "Predicate": {
             "Conditions": [{
                 "LogicalOperator": "EQUALS",
-                "JobName": JOB,
+                "JobName": PREDICATE_JOB,
                 "State": "SUCCEEDED",
             }],
         },

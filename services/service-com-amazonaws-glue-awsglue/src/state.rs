@@ -254,6 +254,7 @@ use crate::ops::types::{
     Classifier,
     CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, ColumnStatisticsTaskSettings,
     ConfigurationObject,
+    Condition,
     Connection, ConnectionInput,
     ConnectionPasswordEncryption, ConnectionsList, Crawler, CrawlerTargets, CreateClassifierInput,
     CreateColumnStatisticsTaskSettingsInput, CreateCrawlerInput,
@@ -2627,32 +2628,6 @@ impl ComAmazonawsGlueAwsglueState {
         self.form_types.remove(identifier)
     }
 
-    /// The names of the asset types that still reference the form type `form_type` names,
-    /// in this namespace's own order.
-    ///
-    /// An asset type's `Forms` entry holds the form type identifier its put sent, resolved
-    /// against this store when it was stored ([`Self::form_type_by_reference`]), and a form
-    /// type's identifier is its name ([`FormTypeEntry::id`]) — so an entry references this
-    /// form type exactly when it names it. An asset type is reported ONCE however many of
-    /// its entries name the form type, because it is one dependency either way.
-    ///
-    /// This is a LIVE scan of what the store holds now, so an asset type deleted since the
-    /// reference was written is no longer a dependency. One copy, shared, so the delete
-    /// that refuses on a dependency and anything that reports one agree on what a
-    /// reference is.
-    pub fn asset_types_referencing_form_type(&self, form_type: &str) -> Vec<String> {
-        self.asset_types
-            .values()
-            .filter(|asset_type| {
-                asset_type
-                    .forms
-                    .values()
-                    .any(|form_type_identifier| form_type_identifier == form_type)
-            })
-            .map(|asset_type| asset_type.name.clone())
-            .collect()
-    }
-
     /// Whether the store can hold another asset type, i.e. is below [`MAX_ASSET_TYPES`].
     pub fn can_store_asset_type(&self) -> bool {
         self.asset_types.len() < MAX_ASSET_TYPES
@@ -4065,6 +4040,38 @@ impl TableEntry {
         self.partition_keys.as_ref().map_or(0, Vec::len)
     }
 
+    /// Whether this table is an open-table-format (Iceberg) table, i.e. whether its
+    /// parameters carry the marker an Iceberg table is recognised by
+    /// ([`ICEBERG_TABLE_TYPE_PARAMETER`] holding [`ICEBERG_TABLE_TYPE`]).
+    ///
+    /// That marker is what every client and every service that consumes Glue tables tells
+    /// an Iceberg table from a Hive one by, so it is read off the STORED parameters
+    /// whichever write put it there: the create that minted the table's Iceberg metadata
+    /// ([`IcebergTableMarker::parameters`]) or a `TableInput` that carried the parameter
+    /// itself. The value is compared without regard to case, because the parameter is a
+    /// client-written table property.
+    pub fn is_iceberg_table(&self) -> bool {
+        self.parameters.as_ref().is_some_and(|parameters| {
+            parameters
+                .get(ICEBERG_TABLE_TYPE_PARAMETER)
+                .is_some_and(|table_type| table_type.eq_ignore_ascii_case(ICEBERG_TABLE_TYPE))
+        })
+    }
+
+    /// The location of this table's current Iceberg metadata file, from the parameter an
+    /// Iceberg table carries it in ([`ICEBERG_METADATA_LOCATION_PARAMETER`]), or `None` for
+    /// a table whose parameters name none.
+    ///
+    /// An empty value is no filepath: the parameter is client-writable, so a table can carry
+    /// the key with nothing in it.
+    pub fn iceberg_metadata_location(&self) -> Option<&str> {
+        self.parameters
+            .as_ref()?
+            .get(ICEBERG_METADATA_LOCATION_PARAMETER)
+            .map(String::as_str)
+            .filter(|location| !location.is_empty())
+    }
+
     /// The stored partition addressed by `values`, or `None` when this table holds no
     /// such partition.
     pub fn partition(&self, values: &[String]) -> Option<&PartitionEntry> {
@@ -4733,6 +4740,14 @@ pub struct TriggerEntry {
     /// fire", absent for a trigger created without one.
     pub predicate: Option<Predicate>,
     pub event_batching_condition: Option<EventBatchingCondition>,
+    /// The request's `StartOnCreation`, as the create that stored this record sent it.
+    ///
+    /// Kept beside the definition because it is a member of the REQUEST rather than of the
+    /// `Trigger` shape — no read reports it — and because [`Self::state`] is no record of
+    /// it: a later start or stop moves the state, so what the create asked for would be
+    /// lost. It is what the idempotency comparison reads
+    /// ([`Self::matches_create_input`]).
+    pub start_on_creation: bool,
     /// The request's `Tags`, which are not part of the `Trigger` shape.
     pub tags: HashMap<String, String>,
 }
@@ -4754,8 +4769,41 @@ impl TriggerEntry {
             actions: input.actions.clone(),
             predicate: input.predicate.clone(),
             event_batching_condition: input.event_batching_condition.clone(),
+            start_on_creation: input.start_on_creation,
             tags: input.tags.clone().unwrap_or_default(),
         }
+    }
+
+    /// Whether this stored trigger is the one `input` asks to create, member for member.
+    ///
+    /// A trigger is addressed by its name, so the name is what a create reuses when it
+    /// submits a definition under one already taken: such a create is a RETRY of the create
+    /// that stored this record only when it asks for the very same trigger, and otherwise it
+    /// has associated one identifier with two different records. The comparison is over
+    /// every member a create sets, the tags included, because any of them is part of the
+    /// trigger the caller asked for.
+    pub fn matches_create_input(&self, input: &CreateTriggerInput) -> bool {
+        // The name is compared too, so the comparison is member for member and holds for
+        // any pair rather than only for a lookup already keyed by the requested name.
+        self.name == input.name
+            && self.trigger_type == input.r#type
+            // The REQUEST member, not the trigger's state, which a later start or stop
+            // moves: an identical retry is still a retry of a trigger that has been
+            // started since.
+            && self.start_on_creation == input.start_on_creation
+            && self.workflow_name == input.workflow_name
+            && self.description == input.description
+            && self.schedule == input.schedule
+            && same_trigger_actions(&self.actions, &input.actions)
+            && same_trigger_predicate(self.predicate.as_ref(), input.predicate.as_ref())
+            && same_event_batching_condition(
+                self.event_batching_condition.as_ref(),
+                input.event_batching_condition.as_ref(),
+            )
+            && input
+                .tags
+                .as_ref()
+                .map_or(self.tags.is_empty(), |tags| &self.tags == tags)
     }
 
     /// Whether this trigger CAN START the job `job_name`, i.e. whether firing it would
@@ -4831,6 +4879,93 @@ impl TriggerEntry {
     }
 }
 
+/// Whether two action lists are the same actions, in the same order. The modelled `Action`
+/// derives no equality, so its members are compared here, as
+/// [`same_data_quality_target_table`] compares its own shape's.
+fn same_trigger_actions(stored: &[Action], requested: &[Action]) -> bool {
+    stored.len() == requested.len()
+        && stored
+            .iter()
+            .zip(requested.iter())
+            .all(|(stored, requested)| {
+                stored.job_name == requested.job_name
+                    && stored.crawler_name == requested.crawler_name
+                    && stored.arguments == requested.arguments
+                    && stored.timeout == requested.timeout
+                    && stored.security_configuration == requested.security_configuration
+                    && same_notification_property(
+                        stored.notification_property.as_ref(),
+                        requested.notification_property.as_ref(),
+                    )
+            })
+}
+
+/// Whether two optional `NotificationProperty` values are the same delay.
+fn same_notification_property(
+    stored: Option<&NotificationProperty>,
+    requested: Option<&NotificationProperty>,
+) -> bool {
+    match (stored, requested) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => {
+            stored.notify_delay_after == requested.notify_delay_after
+        }
+        _ => false,
+    }
+}
+
+/// Whether two optional `Predicate` values are the same predicate: the same `Logical` over
+/// the same conditions, in the same order.
+fn same_trigger_predicate(stored: Option<&Predicate>, requested: Option<&Predicate>) -> bool {
+    match (stored, requested) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => {
+            stored.logical == requested.logical
+                && same_trigger_conditions(
+                    stored.conditions.as_deref(),
+                    requested.conditions.as_deref(),
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Whether two optional condition lists are the same conditions, in the same order.
+fn same_trigger_conditions(stored: Option<&[Condition]>, requested: Option<&[Condition]>) -> bool {
+    match (stored, requested) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => {
+            stored.len() == requested.len()
+                && stored
+                    .iter()
+                    .zip(requested.iter())
+                    .all(|(stored, requested)| {
+                        stored.logical_operator == requested.logical_operator
+                            && stored.job_name == requested.job_name
+                            && stored.state == requested.state
+                            && stored.crawler_name == requested.crawler_name
+                            && stored.crawl_state == requested.crawl_state
+                    })
+        }
+        _ => false,
+    }
+}
+
+/// Whether two optional `EventBatchingCondition` values are the same batch condition.
+fn same_event_batching_condition(
+    stored: Option<&EventBatchingCondition>,
+    requested: Option<&EventBatchingCondition>,
+) -> bool {
+    match (stored, requested) {
+        (None, None) => true,
+        (Some(stored), Some(requested)) => {
+            stored.batch_size == requested.batch_size
+                && stored.batch_window == requested.batch_window
+        }
+        _ => false,
+    }
+}
+
 /// One Glue entity a trigger's definition names: the workflow it belongs to, the job an
 /// action runs or a condition waits on, or the crawler of either.
 ///
@@ -4887,19 +5022,19 @@ pub fn trigger_definition_refusal(
     // A trigger that names no action initiates nothing when it fires, so a definition
     // without one is refused rather than stored.
     if actions.is_empty() {
-        return Some(messages::TRIGGER_ACTIONS_REQUIRED.to_string());
+        return Some(messages::trigger_member_required("Actions"));
     }
 
     // Without the member its type requires, the service would hold a trigger with nothing
     // to decide when it fires.
     if trigger_type == TRIGGER_TYPE_SCHEDULED && schedule.is_none() {
-        return Some(messages::trigger_member_required("Schedule", trigger_type));
+        return Some(messages::trigger_member_required("Schedule"));
     }
     let conditions = predicate
         .and_then(|predicate| predicate.conditions.as_ref())
         .map_or(0, Vec::len);
     if trigger_type == TRIGGER_TYPE_CONDITIONAL && conditions == 0 {
-        return Some(messages::trigger_member_required("Predicate", trigger_type));
+        return Some(messages::trigger_member_required("Predicate"));
     }
 
     // Without a `Logical`, a multi-condition predicate does not say whether all or any of
@@ -4916,7 +5051,41 @@ pub fn trigger_definition_refusal(
         }
     }
 
+    // A conditional trigger fires the actions it carries when the conditions it watches
+    // are met, so a job that is BOTH what the trigger waits on and what it runs describes
+    // a trigger that would fire on its own output: the definition is refused rather than
+    // stored, whether or not that job exists.
+    if trigger_type == TRIGGER_TYPE_CONDITIONAL && job_is_predicate_and_action(actions, predicate)
+    {
+        return Some(messages::JOB_IN_PREDICATE_AND_ACTION.to_string());
+    }
+
     None
+}
+
+/// Whether one job is named both by a condition of `predicate` and by an action of
+/// `actions` — the overlap a conditional trigger's definition may not carry.
+///
+/// A job is named exactly as the request spells it (job definitions are keyed by their
+/// name, unfolded), so the comparison is over those names as sent. The condition names are
+/// collected into a SET first and each action is then one probe of it, so the work is the
+/// number of conditions PLUS the number of actions rather than their product: neither
+/// factor, both of which the one request body carries, can multiply the other. A definition
+/// that names no job in one of the two places cannot overlap at all.
+fn job_is_predicate_and_action(actions: &[Action], predicate: Option<&Predicate>) -> bool {
+    let condition_jobs: BTreeSet<&str> = predicate
+        .and_then(|predicate| predicate.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|condition| condition.job_name.as_deref())
+        .collect();
+    if condition_jobs.is_empty() {
+        return false;
+    }
+    actions
+        .iter()
+        .filter_map(|action| action.job_name.as_deref())
+        .any(|action_job| condition_jobs.contains(action_job))
 }
 
 /// The first workflow, job or crawler a trigger's definition names that this store holds
@@ -7906,15 +8075,20 @@ impl AssetTypeEntry {
 /// The message the catalog's asset type surface refuses an identifier it holds no asset
 /// type under with: the value of that refusal's `EntityNotFoundException$Message`.
 ///
-/// Wording for this slice is pinned by no recording or doc, so the refusal is derived from
-/// the request: it names the resource kind and the identifier that resolved to nothing.
-/// What is pinned is the behaviour — 400 with `EntityNotFoundException`.
+/// Worded the way this surface words a miss, exactly as the form type, asset and business
+/// glossary ones do ([`form_type_not_found_message`]): the refusal text is itself a JSON
+/// document carrying the sentence under a `Message` key, so that text — braces and all —
+/// is what the modelled member carries, and a client reading `Message` reads the document
+/// rather than a bare sentence. `serde_json` renders it, so an identifier carrying a quote
+/// or a backslash still yields a well-formed document.
+///
+/// `identifier` is the text's one variable part and is taken from the request.
 ///
 /// One copy, shared by every operation that resolves an asset type identifier
 /// ([`ComAmazonawsGlueAwsglueState::asset_type_by_reference`]), so two of them cannot
 /// disagree about how the one miss is worded.
 pub fn asset_type_not_found_message(identifier: &str) -> String {
-    format!("Asset type {identifier} not found")
+    catalog_refusal_document(&format!("Asset type {identifier} not found."))
 }
 
 /// The message the catalog's asset surface refuses an identifier it holds no asset under
@@ -7968,32 +8142,6 @@ pub fn glossary_term_not_found_message(identifier: &str) -> String {
 /// identifier list that resolved to nothing, taken verbatim.
 pub fn unassociable_glossary_term_message(identifier: &str) -> String {
     catalog_refusal_document(&format!("Glossary term not found: {identifier}"))
-}
-
-/// The message the catalog refuses the delete of a form type an ASSET TYPE still
-/// references with: the value of that refusal's `ConflictException$Message`.
-///
-/// Worded the way this surface words a dependency refusal — the text is a JSON document
-/// carrying the sentence under a `Message` key, as every refusal of the metadata form type
-/// surface is ([`form_type_not_found_message`]) — and the sentence names the form type and
-/// then each dependency that holds it, as a catalog type reference: the kind, the asset
-/// namespace of the account the catalog belongs to, and the dependent's own name.
-///
-/// The variable parts come from the request and the store: `form_type_name` is the name of
-/// the form type the request's `Identifier` resolved to, the account is this emulator's,
-/// and `asset_type_names` are the names of the asset types that still reference it, in the
-/// namespace's own order so two refusals of one delete read the same.
-pub fn form_type_dependency_message(form_type_name: &str, asset_type_names: &[String]) -> String {
-    let account_id = ::engine::emulator_account_id();
-    let dependencies = asset_type_names
-        .iter()
-        .map(|asset_type| format!("gluetype glueAsset#glue_{account_id}#{asset_type}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    catalog_refusal_document(&format!(
-        "Form type {form_type_name} cannot be deleted because of the following \
-         dependencies: {dependencies}"
-    ))
 }
 
 /// A stored asset: one catalog entity `PutAsset` registers as an instance of an asset
@@ -10674,28 +10822,51 @@ pub mod messages {
         format!("Trigger {name} not found.")
     }
 
-    /// `CreateTrigger` for a name the request's Region already holds a trigger under. NOT
+    /// `CreateTrigger` for a name the request's Region already holds a trigger under, where
+    /// the definition submitted is the stored one. NOT
     /// recorded: inferred from the recorded `CreateDatabase` duplicate, like
     /// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
     /// the requested name.
     pub const TRIGGER_ALREADY_EXISTS: &str = "Trigger already exists.";
 
-    /// A trigger definition whose `Actions` list is absent or empty, on the create that
-    /// would store it or the update that would overwrite one with it. RECORDED wording,
-    /// with no trailing period: the refusal names the member that has to name something and
-    /// says that neither no list nor an empty one will do, and it discloses neither the
-    /// trigger nor the operation, so one constant serves every definition this service
-    /// judges.
-    pub const TRIGGER_ACTIONS_REQUIRED: &str = "Actions cannot be null or empty";
-
-    /// A trigger create missing the member its `Type` requires: `Schedule` for a scheduled
-    /// trigger ("This field is required when the trigger type is SCHEDULED" —
-    /// `CreateTriggerRequest$Schedule`) and `Predicate` for a conditional one ("This field
-    /// is required when the trigger type is CONDITIONAL"). The sentence is those modelled
-    /// requirements, with the member and the type the request named.
-    pub fn trigger_member_required(member: &str, trigger_type: &str) -> String {
-        format!("{member} is required when the trigger type is {trigger_type}")
+    /// A create for a resource name already taken whose request asks for a DIFFERENT
+    /// resource than the stored one, on an operation that models
+    /// `IdempotentParameterMismatchException` ("The same unique identifier was associated
+    /// with two different records") and so treats that name as the create's idempotency
+    /// identifier.
+    ///
+    /// RECORDED template: fixed text with ONE variable part, the RESOURCE kind as the
+    /// service names it. It discloses neither the name the request addressed nor which
+    /// member of the definition differs.
+    pub fn already_submitted_with_different_configuration(resource: &str) -> String {
+        format!("{resource} already submitted with different configuration.")
     }
+
+    /// A trigger definition whose `Actions` list is absent or empty, on the create that
+    /// would store it or the update that would overwrite one with it, and every other
+    /// member a trigger's `Type` requires it to carry: a `Schedule` for a scheduled
+    /// trigger ("This field is required when the trigger type is SCHEDULED" —
+    /// `CreateTriggerRequest$Schedule`) and a `Predicate` for a conditional one ("This
+    /// field is required when the trigger type is CONDITIONAL").
+    ///
+    /// RECORDED template, with no trailing period: the refusal names the MEMBER that has
+    /// to carry something and says that neither no value nor an empty one will do, and it
+    /// discloses neither the trigger nor the operation nor the type the request named — so
+    /// one sentence serves every definition member this service judges, whichever write
+    /// submitted it.
+    pub fn trigger_member_required(member: &str) -> String {
+        format!("{member} cannot be null or empty")
+    }
+
+    /// A CONDITIONAL trigger definition naming one job both in a condition of its
+    /// `Predicate` and in one of its `Actions` ([`super::job_is_predicate_and_action`]).
+    ///
+    /// RECORDED constant, and the whole message: it states the rule the definition breaks
+    /// and names neither the job it was broken over nor the trigger, so a client sees the
+    /// same sentence whichever job it doubled up. It is a refusal of the DEFINITION, so it
+    /// is answered whether or not that job exists.
+    pub const JOB_IN_PREDICATE_AND_ACTION: &str =
+        "Job cannot be a Predicate and Action for Conditional Trigger.";
 
     /// A trigger create that asks for a type that cannot be started on creation ("True is
     /// not supported for ON_DEMAND triggers" — `CreateTriggerRequest$StartOnCreation`).
@@ -10804,15 +10975,140 @@ pub mod messages {
         )
     }
 
-    /// A table-optimizer lookup (`GetTableOptimizer`, and the `DeleteTableOptimizer` that
-    /// addresses one the same way) for a type the addressed table has no optimizer of.
+    /// A table-optimizer READ (`GetTableOptimizer`) for a type the addressed table has no
+    /// optimizer of.
     ///
-    /// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
-    /// `EntityNotFoundException` — and a sentence following the per-resource template of
-    /// [`database_not_found`], built from the table and the optimizer type the request
-    /// addressed, which together are the whole address of an optimizer.
+    /// RECORDED template: the sentence names the optimizer type and then the table the
+    /// request addressed, which together are the whole address of an optimizer, and it is
+    /// followed by the diagnostic clause this service appends to such a refusal
+    /// ([`with_diagnostic`]) — stating the 404 the catalog raised the miss with, even
+    /// though the call itself is answered with the `EntityNotFoundException` shape's own
+    /// status.
     pub fn table_optimizer_not_found(table_name: &str, optimizer_type: &str) -> String {
-        format!("Table optimizer of type {optimizer_type} for table {table_name} not found.")
+        with_diagnostic(
+            &format!("No optimizer of type {optimizer_type} found for the table: {table_name}"),
+            DIAGNOSTIC_SERVICE_GLUE,
+            DIAGNOSTIC_STATUS_NOT_FOUND,
+            DIAGNOSTIC_CODE_ENTITY_NOT_FOUND,
+        )
+    }
+
+    /// The DELETE (`DeleteTableOptimizer`) for the same miss. Recorded template, and a
+    /// DIFFERENT sentence from the read's above — which is why the two are not one shared
+    /// string: it states that no optimizer of that type exists ON the table, carrying the
+    /// same two variable parts and the same diagnostic clause.
+    pub fn table_optimizer_not_found_for_delete(table_name: &str, optimizer_type: &str) -> String {
+        with_diagnostic(
+            &format!("An optimizer of type {optimizer_type} does not exist on table {table_name}"),
+            DIAGNOSTIC_SERVICE_GLUE,
+            DIAGNOSTIC_STATUS_NOT_FOUND,
+            DIAGNOSTIC_CODE_ENTITY_NOT_FOUND,
+        )
+    }
+
+    /// Any table-optimizer operation whose `TableName` names a stored table whose type
+    /// cannot be optimized — one that is no open-table-format table
+    /// ([`super::TableEntry::is_iceberg_table`]).
+    ///
+    /// RECORDED template: the fixed validation sentence plus the diagnostic clause
+    /// ([`with_diagnostic`]) stating the status and the code the validation was raised
+    /// with. It is a refusal of the REQUEST rather than a miss, so it names neither the
+    /// table nor the type the request asked for.
+    pub fn unsupported_table_type() -> String {
+        with_diagnostic(
+            "Request Validation Failed: Unsupported Table type",
+            DIAGNOSTIC_SERVICE_GLUE,
+            DIAGNOSTIC_STATUS_VALIDATION,
+            DIAGNOSTIC_CODE_INVALID_INPUT,
+        )
+    }
+
+    /// `CreateTableOptimizer` for a table whose parameters name no Iceberg metadata file
+    /// ([`super::TableEntry::iceberg_metadata_location`]).
+    ///
+    /// Registering an optimizer reads the table's current metadata file, because that is
+    /// what names the data files the optimizer would work on — so a table that carries no
+    /// filepath is refused whatever its declared type is.
+    ///
+    /// RECORDED template: the fixed sentence plus the diagnostic clause
+    /// ([`with_diagnostic`]), naming neither the table nor the parameter it was read from.
+    pub fn table_metadata_filepath_missing() -> String {
+        with_diagnostic(
+            "Glue table metadata filepath is null",
+            DIAGNOSTIC_SERVICE_GLUE,
+            DIAGNOSTIC_STATUS_VALIDATION,
+            DIAGNOSTIC_CODE_INVALID_INPUT,
+        )
+    }
+
+    /// Any table-optimizer operation whose `DatabaseName`/`TableName` resolves to no table
+    /// of the addressed Data Catalog.
+    ///
+    /// RECORDED template: this surface resolves the table through the Data Catalog, so what
+    /// a client is shown is the CATALOG's own refusal of that read — the same constant the
+    /// catalog's table read answers ([`TABLE_ENTITY_NOT_FOUND`]), carrying the catalog
+    /// component's diagnostic clause — wrapped in this service's clause, each with its own
+    /// request id. It names neither the table nor the database, because the catalog's read
+    /// miss names neither.
+    pub fn table_optimizer_entity_not_found() -> String {
+        with_diagnostic(
+            &with_diagnostic(
+                TABLE_ENTITY_NOT_FOUND,
+                DIAGNOSTIC_SERVICE_DATA_CATALOG,
+                DIAGNOSTIC_STATUS_VALIDATION,
+                DIAGNOSTIC_CODE_ENTITY_NOT_FOUND,
+            ),
+            DIAGNOSTIC_SERVICE_GLUE,
+            DIAGNOSTIC_STATUS_NOT_FOUND,
+            DIAGNOSTIC_CODE_ENTITY_NOT_FOUND,
+        )
+    }
+
+    /// The component a diagnostic clause names for a refusal THIS service raised.
+    const DIAGNOSTIC_SERVICE_GLUE: &str = "glue";
+
+    /// The component a diagnostic clause names for a refusal the DATA CATALOG raised, which
+    /// this service surfaces wrapped in its own
+    /// ([`table_optimizer_entity_not_found`]).
+    const DIAGNOSTIC_SERVICE_DATA_CATALOG: &str = "AmazonDataCatalog";
+
+    /// The `Error Code` a clause states for a reference that resolved to nothing.
+    const DIAGNOSTIC_CODE_ENTITY_NOT_FOUND: &str = "EntityNotFoundException";
+
+    /// The `Error Code` a clause states for a request the service would not accept.
+    const DIAGNOSTIC_CODE_INVALID_INPUT: &str = "InvalidInputException";
+
+    /// The `Status Code` a clause states for a reference that resolved to nothing: the
+    /// status the component RAISED the miss with, which is not the status the endpoint
+    /// answers the call with — the awsJson client-error status the modelled shape carries.
+    /// As recorded, including for the clause the catalog's own refusal is wrapped in.
+    const DIAGNOSTIC_STATUS_NOT_FOUND: u16 = 404;
+
+    /// The `Status Code` a clause states for a refused request, and the one the CATALOG
+    /// component states for the miss it raises: as recorded.
+    const DIAGNOSTIC_STATUS_VALIDATION: u16 = 400;
+
+    /// `sentence` followed by the diagnostic clause this service appends to a refusal its
+    /// framework raised:
+    /// ` (Service: <component>; Status Code: <status>; Error Code: <code>; Request ID: <id>; Proxy: null)`.
+    ///
+    /// The request id is the clause's only per-run field: nothing in the request carries
+    /// one, so it is minted per call from the emulator's one request-id mint
+    /// (`service_common::query_error_envelope::new_request_id`, a fresh v4 UUID) and is
+    /// indistinguishable from the one the framework's own renderers report. A clause
+    /// wrapping another's text states its own component, status and code, so one refusal
+    /// can carry the inner component's clause and this service's both.
+    fn with_diagnostic(
+        sentence: &str,
+        service: &str,
+        status_code: u16,
+        error_code: &str,
+    ) -> String {
+        format!(
+            "{sentence} (Service: {service}; Status Code: {status_code}; Error Code: \
+             {error_code}; Request ID: {}; Proxy: null)",
+            ::service_common::query_error_envelope::new_request_id()
+        )
     }
 
     /// `CreateTableOptimizer` for a type the addressed table already has an optimizer of.

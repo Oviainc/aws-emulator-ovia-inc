@@ -170,9 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 EntityNotFoundException {
                     // The one wording the catalog's asset type surface refuses an
                     // identifier it holds no asset type under with
-                    // (`crate::state::asset_type_not_found_message`): it names the member
-                    // that resolved to nothing. What is pinned is the behaviour — 400 with
-                    // `EntityNotFoundException`.
+                    // (`crate::state::asset_type_not_found_message`): a JSON document
+                    // carrying the sentence under a `Message` key, as every refusal of this
+                    // surface is worded, naming the identifier that resolved to nothing.
                     message: Some(crate::state::asset_type_not_found_message(
                         &input.identifier,
                     )),

@@ -115,12 +115,14 @@ fn trigger_before_update(name: &str, trigger_type: &str, start_on_creation: bool
     match trigger_type {
         // "This field is required when the trigger type is SCHEDULED."
         "SCHEDULED" => body["Schedule"] = json!("cron(15 12 * * ? *)"),
-        // "This field is required when the trigger type is CONDITIONAL."
+        // "This field is required when the trigger type is CONDITIONAL." The predicate
+        // waits on the job no action of this definition runs: a conditional trigger may not
+        // name one job both in its `Predicate` and in its `Actions`.
         "CONDITIONAL" => {
             body["Predicate"] = json!({
                 "Logical": "AND",
                 "Conditions": [
-                    { "LogicalOperator": "EQUALS", "JobName": JOB, "State": "SUCCEEDED" },
+                    { "LogicalOperator": "EQUALS", "JobName": OTHER_JOB, "State": "SUCCEEDED" },
                     {
                         "LogicalOperator": "EQUALS",
                         "CrawlerName": CRAWLER,
@@ -531,19 +533,19 @@ async fn a_refused_update_leaves_the_stored_definition_unchanged() {
             "a scheduled trigger left with no schedule",
             "SCHEDULED",
             json!({ "Actions": actions }),
-            messages::trigger_member_required("Schedule", "SCHEDULED"),
+            messages::trigger_member_required("Schedule"),
         ),
         (
             "a conditional trigger left with no predicate",
             "CONDITIONAL",
             json!({ "Actions": actions }),
-            messages::trigger_member_required("Predicate", "CONDITIONAL"),
+            messages::trigger_member_required("Predicate"),
         ),
         (
             "a conditional trigger left with no condition",
             "CONDITIONAL",
             json!({ "Predicate": { "Logical": "AND", "Conditions": [] }, "Actions": actions }),
-            messages::trigger_member_required("Predicate", "CONDITIONAL"),
+            messages::trigger_member_required("Predicate"),
         ),
         (
             "two conditions and no logical",

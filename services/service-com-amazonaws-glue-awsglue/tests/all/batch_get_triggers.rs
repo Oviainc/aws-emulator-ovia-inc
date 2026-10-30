@@ -33,23 +33,30 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/sim2real-glue-trigger-rol
 /// is served in, so each suite registers it first.
 const JOB: &str = "batch-trigger-job";
 
+/// The job the conditional row's predicate waits on. A conditional trigger may not name
+/// one job both in its `Predicate` and in its `Actions` ("Job cannot be a Predicate and
+/// Action for Conditional Trigger."), so the predicate waits on a job no action runs.
+const PREDICATE_JOB: &str = "batch-trigger-predicate-job";
+
 /// Create the job [`JOB`] through `region`'s endpoint, so an action may name it.
 async fn given_job_in(router: &MultiServiceRouter, region: &str) {
-    let (status, body) = call_in_region(
-        router,
-        region,
-        "CreateJob",
-        &json!({
-            "Name": JOB,
-            "Role": ROLE_ARN,
-            "Command": { "Name": "glueetl", "ScriptLocation": "s3://etl-scripts/etl.py" },
-        }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {region:?}: CreateJob must answer 200, got {status} with {body}"
-    );
+    for job in [JOB, PREDICATE_JOB] {
+        let (status, body) = call_in_region(
+            router,
+            region,
+            "CreateJob",
+            &json!({
+                "Name": job,
+                "Role": ROLE_ARN,
+                "Command": { "Name": "glueetl", "ScriptLocation": "s3://etl-scripts/etl.py" },
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {region:?}: CreateJob must answer 200 for {job}, got {status} with {body}"
+        );
+    }
 }
 
 /// An `ON_DEMAND` trigger definition that runs [`JOB`], with a description so each stored
@@ -276,7 +283,7 @@ async fn a_batched_trigger_is_the_trigger_get_trigger_reports() {
                     "Logical": "ANY",
                     "Conditions": [{
                         "LogicalOperator": "EQUALS",
-                        "JobName": JOB,
+                        "JobName": PREDICATE_JOB,
                         "State": "SUCCEEDED",
                     }],
                 },

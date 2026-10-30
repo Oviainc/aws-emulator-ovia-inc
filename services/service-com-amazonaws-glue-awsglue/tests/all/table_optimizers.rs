@@ -9,9 +9,12 @@
 //! The rule under test: an optimizer is a resource OF a table, addressed by that table and
 //! by its `TableOptimizerType`. So it can only be registered on a table that exists — a
 //! database or a table the catalog does not hold refuses the create with
-//! `EntityNotFoundException` and persists nothing — a table carries at most one optimizer
-//! per type, a read reports the configuration the create wrote together with the resource
-//! it belongs to, and a delete returns the table to the state where that type is a miss.
+//! `EntityNotFoundException` and persists nothing — and only on a table whose type can be
+//! optimized, which is an open-table-format table (the ineligible table is refused with
+//! `InvalidInputException`, which [`crate::error_classification`] covers). A table carries
+//! at most one optimizer per type, a read reports the configuration the create wrote
+//! together with the resource it belongs to, and a delete returns the table to the state
+//! where that type is a miss.
 //!
 //! The rows below differ along what the rule generalises over: which optimizer type is in
 //! play (every value of the modelled enum), which part of the address is missing, and which
@@ -30,7 +33,8 @@ const OPTIMIZER_TYPES: [&str; 3] = ["compaction", "retention", "orphan_file_dele
 /// The role an optimizer configuration passes to the service.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/glue-table-optimizer";
 
-/// Create `database` holding `table`.
+/// Create `database` holding `table`, as an open-table-format table: only such a table can
+/// carry an optimizer, because an optimizer works on the data files of one.
 async fn seed(router: &MultiServiceRouter, database: &str, table: &str) {
     ok(
         router,
@@ -46,7 +50,8 @@ async fn seed(router: &MultiServiceRouter, database: &str, table: &str) {
             "TableInput": {
                 "Name": table,
                 "StorageDescriptor": { "Location": "s3://lake/events/" }
-            }
+            },
+            "OpenTableFormatInput": { "IcebergInput": { "MetadataOperation": "CREATE" } }
         }),
     )
     .await;

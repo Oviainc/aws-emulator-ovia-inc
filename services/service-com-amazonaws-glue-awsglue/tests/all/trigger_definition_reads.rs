@@ -204,6 +204,10 @@ async fn every_stored_trigger_definition_is_reported_and_paged() {
 async fn a_reported_definition_carries_the_members_its_type_requires() {
     let router = emulator();
     given_job_in(&router, REGION, "definition-job").await;
+    // A conditional trigger may not name one job both in its `Predicate` and in its
+    // `Actions` ("Job cannot be a Predicate and Action for Conditional Trigger."), so the
+    // conditional row below waits on a job of its own.
+    given_job_in(&router, REGION, "definition-predicate-job").await;
     let workflow = ok(
         &router,
         "CreateWorkflow",
@@ -279,7 +283,7 @@ async fn a_reported_definition_carries_the_members_its_type_requires() {
                     "Logical": "ANY",
                     "Conditions": [{
                         "LogicalOperator": "EQUALS",
-                        "JobName": "definition-job",
+                        "JobName": "definition-predicate-job",
                         "State": "SUCCEEDED",
                     }],
                 },
@@ -293,7 +297,7 @@ async fn a_reported_definition_carries_the_members_its_type_requires() {
                     "Logical": "ANY",
                     "Conditions": [{
                         "LogicalOperator": "EQUALS",
-                        "JobName": "definition-job",
+                        "JobName": "definition-predicate-job",
                         "State": "SUCCEEDED",
                     }],
                 },

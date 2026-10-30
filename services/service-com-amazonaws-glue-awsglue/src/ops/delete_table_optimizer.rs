@@ -9,8 +9,11 @@
 //! `CreateTableOptimizer` of that type is accepted.
 //!
 //! The optimizer is addressed exactly as the read addresses it (see
-//! [`crate::ops::get_table_optimizer`]), so each step of that address is resolved in turn
-//! and a miss at any of them is the operation's modelled `EntityNotFoundException`.
+//! [`crate::ops::get_table_optimizer`]), so each step of that address is resolved in turn:
+//! a database or table the catalog does not hold is the catalog's own read miss, a stored
+//! table whose type cannot be optimized is the request validation `InvalidInputException`,
+//! and a type the table holds no optimizer of is the operation's modelled
+//! `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,12 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // The optimizer's table is resolved through the Data Catalog, so a database or a
+        // table that resolves to nothing is the catalog's own read miss, reported as this
+        // surface reports it (`crate::state::messages::table_optimizer_entity_not_found`).
         let Some(database) = store.database_mut(&catalog_id, &input.database_name) else {
             return Err(DeleteTableOptimizerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::database_not_found(
-                        &input.database_name,
-                    )),
+                    message: Some(crate::state::messages::table_optimizer_entity_not_found()),
                     from_federation_source: None,
                 },
             )
@@ -192,19 +196,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DeleteTableOptimizerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::table_not_found(&input.table_name)),
+                    message: Some(crate::state::messages::table_optimizer_entity_not_found()),
                     from_federation_source: None,
                 },
             )
             .into());
         };
+        // Whether the table can carry an optimizer at all is a question about the REQUEST,
+        // decided before the stored optimizers are consulted, exactly as the read decides
+        // it: a table that is no open-table-format table is one no optimizer could belong
+        // to.
+        if !table.is_iceberg_table() {
+            return Err(DeleteTableOptimizerErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::messages::unsupported_table_type()),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
         if table.optimizers.remove(&input.r#type).is_none() {
             return Err(DeleteTableOptimizerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::table_optimizer_not_found(
-                        &input.table_name,
-                        &input.r#type,
-                    )),
+                    // The DELETE words this miss its own way, which is why it does not share
+                    // the read's sentence (`crate::state::messages`).
+                    message: Some(
+                        crate::state::messages::table_optimizer_not_found_for_delete(
+                            &table.name,
+                            &input.r#type,
+                        ),
+                    ),
                     from_federation_source: None,
                 },
             )

@@ -11,15 +11,12 @@
 //!
 //! Two things this delete does:
 //!
-//! * It REFUSES a form type an ASSET TYPE still references. "A form type cannot be deleted
-//!   if it is still referenced by an asset type" is what the operation documents, and the
-//!   reference is the `Forms` entry an asset type's own put wrote
-//!   ([`crate::state::ComAmazonawsGlueAwsglueState::asset_types_referencing_form_type`]),
-//!   so such a delete is answered with the modelled `ConflictException` naming every asset
-//!   type that still holds the form type and nothing is removed. The scan is LIVE, over
-//!   what the store holds when the delete is served: once the asset types that referenced
-//!   the form type are themselves gone, the same delete is served, so the guard is not a
-//!   latch.
+//! * It serves the delete of a form type an ASSET TYPE still references. The operation's
+//!   documentation states that "a form type cannot be deleted if it is still referenced by
+//!   an asset type", but the service does not hold the delete up for such a reference: the
+//!   form type is removed and the asset type keeps reporting the `Forms` entry its own put
+//!   wrote, which then resolves to nothing. Only a put writing a NEW reference has to
+//!   resolve one (`PutAssetType`), so this operation scans no dependants.
 //! * It reports no miss. `GetFormType` models `EntityNotFoundException` and this operation
 //!   does not model it at all, so an identifier this account holds no form type under is
 //!   answered as the delete of something already absent: the caller asked for the state the
@@ -175,32 +172,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // "A form type cannot be deleted if it is still referenced by an asset type": the
-        // dependants are scanned under the same lock the removal happens under, so a
-        // reference written between the scan and the removal cannot be missed. The scan
-        // runs over the form type the identifier RESOLVED to, so an identifier that
-        // resolves to nothing has no dependants to find and falls through to the served
-        // delete of something already absent below.
-        if let Some(form_type) = store.form_type_by_reference(&input.identifier) {
-            let form_type_name = form_type.name.clone();
-            let dependants = store.asset_types_referencing_form_type(&form_type.id);
-            if !dependants.is_empty() {
-                return Err(DeleteFormTypeErrorModeled::ConflictException(
-                    ConflictException {
-                        // The one wording this surface refuses a dependency with
-                        // (`crate::state::form_type_dependency_message`): the form type
-                        // named by the request and every asset type in the store that still
-                        // holds it.
-                        message: Some(crate::state::form_type_dependency_message(
-                            &form_type_name,
-                            &dependants,
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
-
+        // An asset type that still references the form type does NOT hold the delete up:
+        // the service removes the form type and leaves that reference standing, so the
+        // asset type keeps reporting the identifier its own put wrote and the reference it
+        // carries resolves to nothing afterwards. Only a put writing a NEW reference has to
+        // resolve one (`PutAssetType`), which is why nothing is scanned here.
+        //
         // The record is removed under the name it is keyed by, which is the identifier a
         // client addresses it by. An identifier that resolves to nothing removes nothing
         // and is still served: this operation models no miss.
