@@ -37,6 +37,8 @@ mod export_refusal_classes;
 mod iam_authorization;
 #[path = "all/job_identifier_syntax.rs"]
 mod job_identifier_syntax;
+#[path = "all/non_canonical_page_token_spellings.rs"]
+mod non_canonical_page_token_spellings;
 #[path = "all/owed_status_due_instants.rs"]
 mod owed_status_due_instants;
 #[path = "all/owed_transition_settle_step.rs"]

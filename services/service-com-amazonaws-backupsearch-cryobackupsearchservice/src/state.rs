@@ -2168,11 +2168,25 @@ pub fn decode_next_token(
             "NextToken '{token}' was issued for a different request and cannot resume this one"
         ));
     }
-    let position: usize = position.parse().map_err(|_| malformed())?;
+    let position = token_position(position).ok_or_else(malformed)?;
     let offset = anchor.offset(len, position).ok_or_else(|| {
         format!("NextToken '{token}' resumes past the end of the results")
     })?;
     Ok(PageCursor { offset, anchor })
+}
+
+/// The resume position the text before a token's `@` names, and `None` when that text is
+/// not the one [`encode_next_token`] would have written for any position.
+///
+/// A cursor is resumable only AS THE STRING the service handed out, so the number has to
+/// be held to the single spelling the encoder renders it in — a `usize`'s canonical
+/// decimal. `usize::from_str` by itself is wider than that: it also admits a leading `+`
+/// and any number of leading zeros, spellings no token this service issued can carry, so
+/// the parse is confirmed by rendering the number back and requiring the text to be what
+/// the encoder would have put there.
+fn token_position(text: &str) -> Option<usize> {
+    let position: usize = text.parse().ok()?;
+    (text == position.to_string()).then_some(position)
 }
 
 /// One page of `items` starting at `cursor`, with the token that resumes after it — the
