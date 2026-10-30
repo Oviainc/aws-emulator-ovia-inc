@@ -270,8 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = ctx.credential_store();
         let now = ::std::time::SystemTime::now();
 
-        // A session policy must be a JSON policy document, and the refusal
-        // "describes the specific error" the submitted document has.
+        // A session policy must be a JSON policy document, and the refusal describes
+        // the specific error the submitted document has where it gives one to point at
+        // (see `state::policy_document_error`).
         if let Some(why) = input.policy.as_deref().and_then(policy_document_error) {
             return Err(GetFederationTokenErrorModeled::MalformedPolicyDocumentException(
                 MalformedPolicyDocumentException {

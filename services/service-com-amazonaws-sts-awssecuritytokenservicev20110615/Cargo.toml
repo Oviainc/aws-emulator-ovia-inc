@@ -37,6 +37,10 @@ service-common = { path = "../common" }
 # expression over Unicode properties, so it is matched with a maintained regex engine
 # rather than by hand; see `src/state.rs`.
 regex = "1.12"
+# An encoded authorization message is read with a configured base64 decoder — the
+# padding optional and the trailing bits of a partial final group discarded, the
+# latitude the service that DECODES one has; see `src/state.rs`.
+base64 = "0.22"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

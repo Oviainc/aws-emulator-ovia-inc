@@ -580,16 +580,34 @@ pub fn decode_authorization_message(
         .ok_or_else(|| invalid_authorization_message(&bytes))
 }
 
+/// The codec an encoded authorization message is READ with.
+///
+/// A blob that reached this service was written by something else, so it is decoded
+/// with the latitude the service that decodes one has rather than with the strictness
+/// an ENCODER is held to: the padding is optional, because it carries no data, and the
+/// bits left over in a final group that is not a whole number of bytes are discarded
+/// rather than being required to be zero. A message whose last group carries such bits
+/// is base64 all the same — it names the same bytes under either reading — so refusing
+/// to read it would report a blob's own characters as the bytes it carried.
+const ENCODED_MESSAGE_CODEC: ::base64::engine::GeneralPurpose =
+    ::base64::engine::GeneralPurpose::new(
+        &::base64::alphabet::STANDARD,
+        ::base64::engine::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(::base64::engine::DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+
 /// The bytes an encoded message carries, or `None` when it is not base64 at all.
 ///
 /// Read in BOTH base64 alphabets — the standard one (`+`, `/`) and the URL-safe one
 /// (`-`, `_`), which is the one AWS's own encoded authorization messages travel in —
-/// and with the padding optional, because the padding carries no data. Whitespace and
-/// anything outside those alphabets — "invalid characters, such as line breaks", as
-/// the modelled error puts it — is not base64 here, so such a message carries no
-/// bytes at all. The decoding itself is `aws_smithy_types::base64`, the codec the wire
-/// serializer already uses for every blob.
+/// with the latitude [`ENCODED_MESSAGE_CODEC`] states. Whitespace and anything outside
+/// those alphabets — "invalid characters, such as line breaks", as the modelled error
+/// puts it — is not base64 here, so such a message carries no bytes at all, and
+/// neither does one whose final group is a single character, which names no byte.
 fn encoded_message_bytes(encoded: &str) -> Option<Vec<u8>> {
+    use ::base64::Engine as _;
+
     // Only a message in the URL-safe alphabet needs a copy; one already in the
     // standard alphabet is decoded where it lies.
     let standard: std::borrow::Cow<'_, str> = if encoded.contains(['-', '_']) {
@@ -606,18 +624,7 @@ fn encoded_message_bytes(encoded: &str) -> Option<Vec<u8>> {
     } else {
         std::borrow::Cow::Borrowed(encoded)
     };
-    if let Ok(bytes) = ::aws_smithy_types::base64::decode(standard.as_ref()) {
-        return Some(bytes);
-    }
-    let missing_padding = (4 - standard.len() % 4) % 4;
-    if missing_padding == 0 || standard.ends_with('=') {
-        return None;
-    }
-    let mut padded = standard.into_owned();
-    for _ in 0..missing_padding {
-        padded.push('=');
-    }
-    ::aws_smithy_types::base64::decode(padded).ok()
+    ENCODED_MESSAGE_CODEC.decode(standard.as_ref()).ok()
 }
 
 /// The wording a message this service cannot decode is refused with: the sentence
@@ -1963,16 +1970,30 @@ pub fn inherited_transitive_tags(
         .collect()
 }
 
+/// The whole message `GetFederationToken` answers a malformed session policy with.
+///
+/// Fixed text: every part of it, so nothing of the submitted document reaches it. A
+/// document that stops while a value, object, array or string is still open has no
+/// offending character to point at — the parse ran out of input rather than meeting
+/// something it could not accept — so there is no specific error to describe and this
+/// one sentence is the whole refusal.
+pub const SYNTAX_ERRORS_IN_POLICY: &str = "Syntax errors in policy.";
+
 /// Why a session policy is not a JSON policy document, as the message
 /// `MalformedPolicyDocumentException` carries — `None` when it is one.
 ///
-/// An IAM policy document is a JSON object, and the refusal's message "describes the
-/// specific error" (`MalformedPolicyDocumentException`, this service's model), so it
-/// is built from the submitted document rather than restating the member's type: a
-/// document that does not parse is reported with the first offending character and
-/// its character code, what the parser expected in its place, and the line and column
-/// the failure sits at; a document that parses but is not an object is reported with
-/// the JSON type it carries instead.
+/// The refusal's message "describes the specific error"
+/// (`MalformedPolicyDocumentException`, this service's model) WHERE the document gives
+/// one to point at, so it is built from the submitted document rather than restating the
+/// member's type: a document whose parse stopped ON a character is reported with that
+/// character and its character code, what the parser expected in its place, and the line
+/// and column the failure sits at; a document that parses but is not an object is
+/// reported with the JSON type it carries instead. A document that merely RAN OUT of
+/// input names nothing to describe, and is refused with the fixed sentence
+/// [`SYNTAX_ERRORS_IN_POLICY`].
+///
+/// One reading for every operation that takes an inline session policy: the wording
+/// follows the document's defect, not the operation it was passed to.
 pub fn policy_document_error(policy: &str) -> Option<String> {
     match serde_json::from_str::<serde_json::Value>(policy) {
         Ok(value) if value.is_object() => None,
@@ -1980,6 +2001,12 @@ pub fn policy_document_error(policy: &str) -> Option<String> {
             "The policy document must be a JSON object, not {}",
             json_type_name(&value)
         )),
+        // `Category::Eof` is the parser's own classification of "ran out of input"
+        // (`serde_json::error::Category`), so the two cases are told apart by the parse
+        // that actually ran rather than by re-reading the document.
+        Err(parse) if parse.classify() == serde_json::error::Category::Eof => {
+            Some(SYNTAX_ERRORS_IN_POLICY.to_string())
+        }
         Err(parse) => Some(policy_parse_message(policy, &parse)),
     }
 }
@@ -1996,13 +2023,15 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// The parse failure of a policy document, as the refusal reports it: the offending
-/// character and its code (or end-of-input), what was expected there, and the
+/// The parse failure of a policy document the parse STOPPED ON, as the refusal reports
+/// it: the offending character and its code, what was expected there, and the
 /// position of the failure in the submitted document.
 ///
 /// Both readings are the tree's shared one
 /// ([`::service_common::json_parse_fault`]), so a document this service and another
-/// refuse cannot be reported as failing in two different places.
+/// refuse cannot be reported as failing in two different places. A document that ran out
+/// of input does not reach this: it has nothing to point at, and
+/// [`SYNTAX_ERRORS_IN_POLICY`] is its whole refusal.
 fn policy_parse_message(document: &str, parse: &serde_json::Error) -> String {
     format!(
         "Unexpected IOException: {}{}",

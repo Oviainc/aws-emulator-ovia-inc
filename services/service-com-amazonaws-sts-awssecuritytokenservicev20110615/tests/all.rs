@@ -17,11 +17,17 @@ mod decode_authorization_message;
 #[path = "all/delegated_access_token.rs"]
 mod delegated_access_token;
 
+#[path = "all/encoded_message_decoding.rs"]
+mod encoded_message_decoding;
+
 #[path = "all/malformed_session_policy.rs"]
 mod malformed_session_policy;
 
 #[path = "all/packed_policy_budget.rs"]
 mod packed_policy_budget;
+
+#[path = "all/query_error_envelope.rs"]
+mod query_error_envelope;
 
 #[path = "all/query_parameter_signing.rs"]
 mod query_parameter_signing;
