@@ -209,23 +209,11 @@ fn stored(emu: &Emulator, arn: &str) -> ModelCustomizationJobRecord {
 }
 
 /// Age the stored job `arn` names by `by`, as though it had been submitted that much
-/// earlier: its own timeline is untouched and only how much of it has elapsed changes, so a
-/// rule about a span of wall-clock time needs no sleep.
+/// earlier: the ONE shift of a job's instants this crate's suites share
+/// ([`crate::support::age_model_customization_job`]), so a rule about a span of wall-clock
+/// time needs no sleep.
 fn age(emu: &Emulator, arn: &str, by: Duration) {
-    let state = bedrock::state::service_state(&*emu.engine)
-        .expect("the shared engine carries this service's store");
-    let mut store = state.lock();
-    let job = store
-        .model_customization_jobs
-        .get_mut(arn)
-        .unwrap_or_else(|| panic!("the store must hold the seeded job {arn}"));
-    job.created_at -= by;
-    job.last_modified_at -= by;
-    for due in [&mut job.completed_due_at, &mut job.stopped_due_at] {
-        if let Some(instant) = due.as_mut() {
-            *instant -= by;
-        }
-    }
+    crate::support::age_model_customization_job(emu, arn, by);
 }
 
 // ---------------------------------------------------------------------------------------

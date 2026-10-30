@@ -41,6 +41,8 @@ mod batch_delete_evaluation_jobs;
 mod control_plane_authorization;
 #[path = "all/custom_model_authorization.rs"]
 mod custom_model_authorization;
+#[path = "all/custom_model_deletion.rs"]
+mod custom_model_deletion;
 #[path = "all/custom_model_deployments.rs"]
 mod custom_model_deployments;
 #[path = "all/custom_model_source_bucket.rs"]

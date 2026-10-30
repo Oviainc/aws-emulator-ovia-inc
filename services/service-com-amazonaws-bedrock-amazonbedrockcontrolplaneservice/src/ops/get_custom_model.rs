@@ -19,8 +19,12 @@
 //!   both spellings address the same model
 //!   ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::custom_model`]);
 //!   an unresolvable one is refused as the spelling it IS — `ResourceNotFoundException`
-//!   (404) names the ARN it could not find, which is what that error documents ("The
-//!   specified resource Amazon Resource Name (ARN) was not found"), while a bare NAME that
+//!   (404) for an ARN, which is what that error documents ("The specified resource Amazon
+//!   Resource Name (ARN) was not found"), carrying this resource's own not-found sentence
+//!   ([`crate::state::CUSTOM_MODEL_NOT_FOUND_MESSAGE`]) — the sentence RECORDED for a
+//!   `DeleteCustomModel` of a model this account does not hold, carried over here because it
+//!   is a sentence about the RESOURCE rather than about one operation and no recording of
+//!   this read words it differently; while a bare NAME that
 //!   resolves to no model of the signing region is no ARN to report missing but an
 //!   identifier this service could not resolve, so it is 400 `ValidationException`;
 //! * every member reported comes out of the stored record, and the members that describe a
@@ -215,7 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is documented as being about an ARN — "The specified resource Amazon
             // Resource Name (ARN) was not found. Check the Amazon Resource Name (ARN) and
             // try your request again" — so an ARN that names no model of this account and
-            // Region is what it reports. A bare name is no ARN to report missing: it is an
+            // Region is what it reports, carrying the one sentence Amazon Bedrock states for
+            // a custom model it cannot find
+            // ([`crate::state::CUSTOM_MODEL_NOT_FOUND_MESSAGE`]) — the sentence every
+            // operation of this resource refuses that class with. A bare name is no ARN to
+            // report missing: it is an
             // identifier this service could not resolve to a model at all, which is the
             // modelled `ValidationException` carrying the one sentence Amazon Bedrock
             // states for an identifier it cannot resolve
@@ -227,10 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(GetCustomModelErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no custom model {} exists in this account",
-                            input.model_identifier
-                        )),
+                        message: Some(crate::state::CUSTOM_MODEL_NOT_FOUND_MESSAGE.to_string()),
                     },
                 )
                 .into());

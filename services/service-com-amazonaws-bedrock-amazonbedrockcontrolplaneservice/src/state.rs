@@ -70,9 +70,9 @@
 //! one's non-terminal `status` is owed its move to `InService`.
 //!
 //! And it holds the custom models `ops/create_custom_model.rs` mints,
-//! `ops/get_custom_model.rs` reads back and `ops/list_custom_models.rs` reports,
-//! together with the instant each one's non-terminal `modelStatus` is owed its move to
-//! `Active`.
+//! `ops/get_custom_model.rs` reads back, `ops/list_custom_models.rs` reports and
+//! `ops/delete_custom_model.rs` removes, together with the instant each one's non-terminal
+//! `modelStatus` is owed its move to `Active`.
 //!
 //! And it holds the custom model deployments `ops/create_custom_model_deployment.rs`
 //! mints, `ops/get_custom_model_deployment.rs` reads back and
@@ -947,6 +947,17 @@ pub const CUSTOM_MODEL_IMPORTED_BASE: &str = "imported";
 /// model names, or with fresh regions, which is why the bound is over the whole store
 /// rather than per region.
 pub const MAX_CUSTOM_MODELS_PER_ACCOUNT: usize = 100;
+
+/// What a request addressing a custom model this store cannot resolve answers as its
+/// `ResourceNotFoundException` message.
+///
+/// RECORDED behaviour: Amazon Bedrock states one FIXED sentence for that class and quotes
+/// no part of the request in it — not the identifier, not the account and not the region —
+/// so the sentence has no variable part to fill in. Stated once here because the message
+/// belongs to the RESOURCE rather than to one operation, exactly as
+/// [`provisioned_model_not_found_message`] is, so every operation that addresses a custom
+/// model refuses an identifier it cannot resolve to one the same way.
+pub const CUSTOM_MODEL_NOT_FOUND_MESSAGE: &str = "Custom model not found.";
 
 /// `ModelCustomizationJobStatus` — the customization job Amazon Bedrock accepted is
 /// training.
@@ -4516,6 +4527,42 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         for record in self.custom_models.values_mut() {
             record.settle(now);
         }
+    }
+
+    /// Forget the custom model `arn` names, together with its name index entry and the
+    /// idempotency tokens that minted it — so a delete leaves nothing behind for a later
+    /// create of the same name to collide with, and the token map stays bounded by the LIVE
+    /// custom models, exactly as [`Self::remove_provisioned_model_throughput`] keeps that
+    /// family's maps bounded.
+    pub fn remove_custom_model(&mut self, arn: &str) -> Option<CustomModelRecord> {
+        let record = self.custom_models.remove(arn)?;
+        self.custom_model_names
+            .remove(&(record.region.clone(), record.name.clone()));
+        self.custom_model_create_tokens
+            .retain(|_, minted| minted != arn);
+        Some(record)
+    }
+
+    /// The ARN of the custom model deployment serving the custom model `arn` names, or
+    /// `None` when no stored deployment serves it.
+    ///
+    /// A deployment carries "the custom model this deployment serves"
+    /// ([`CustomModelDeploymentRecord::model_arn`]), so it holds a live association to that
+    /// one model — the association a delete of the model would leave pointing at a resource
+    /// that no longer exists. The SMALLEST such ARN is reported, so a refusal names the same
+    /// deployment however the map happens to be ordered.
+    ///
+    /// Only this family is asked: a Provisioned Throughput of this store is associated with
+    /// a FOUNDATION model (`ops/create_provisioned_model_throughput.rs` resolves its
+    /// `modelId` through the published catalog and stores that model's ARN), so none of them
+    /// can hold an association to a custom model.
+    #[must_use]
+    pub fn custom_model_deployment_serving(&self, arn: &str) -> Option<String> {
+        self.custom_model_deployments
+            .values()
+            .filter(|record| record.model_arn == arn)
+            .map(|record| record.arn.clone())
+            .min()
     }
 
     /// Mint a fresh model customization job id: the resource half of a

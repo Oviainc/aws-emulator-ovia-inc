@@ -183,6 +183,32 @@ pub fn seed_build_workflow(
     id
 }
 
+/// Age the stored model customization job `arn` names by `by`, as though it had been
+/// submitted that much earlier: its own timeline is untouched and only how much of it has
+/// elapsed changes, so a rule about a span of wall-clock time needs no sleep — neither the
+/// job's own completion nor the custom model that completion brings into being.
+///
+/// Here rather than in one suite because two of them age this record (the job suite, for the
+/// job's own status, and the custom-model deletion suite, for the model a completed job
+/// produced), and ONE shift of a job's instants is what keeps them from drifting apart when
+/// [`bedrock::state::ModelCustomizationJobRecord`] gains another due instant.
+pub fn age_model_customization_job(emu: &Emulator, arn: &str, by: Duration) {
+    let state = bedrock::state::service_state(&*emu.engine)
+        .expect("the shared engine carries this service's store");
+    let mut store = state.lock();
+    let job = store
+        .model_customization_jobs
+        .get_mut(arn)
+        .unwrap_or_else(|| panic!("the store must hold the job {arn}"));
+    job.created_at -= by;
+    job.last_modified_at -= by;
+    for due in [&mut job.completed_due_at, &mut job.stopped_due_at] {
+        if let Some(instant) = due.as_mut() {
+            *instant -= by;
+        }
+    }
+}
+
 /// The emulator under test: one shared engine, one registered service, dispatched
 /// in-process.
 pub struct Emulator {
