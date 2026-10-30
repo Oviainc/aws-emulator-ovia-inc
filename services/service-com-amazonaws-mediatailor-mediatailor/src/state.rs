@@ -17,6 +17,41 @@ use crate::ops::types::*;
 /// existing configuration never consumes more.
 pub const MAX_PLAYBACK_CONFIGURATIONS: usize = 500;
 
+/// The number of channels this emulator will hold at once.
+///
+/// As with [`MAX_PLAYBACK_CONFIGURATIONS`] this figure is CHOSEN, not AWS's:
+/// its purpose is that the store cannot grow without bound on request-chosen
+/// channel names, and that the ceiling is reached through the service's
+/// modelled client error rather than by exhausting memory. `DeleteChannel`
+/// releases capacity.
+pub const MAX_CHANNELS: usize = 500;
+
+/// The number of outputs one channel carries, and the number of audiences.
+///
+/// `RequestOutputs` and `Audiences` are caller-sized lists and the model
+/// declares no `length` constraint on either, so both figures are CHOSEN: their
+/// purpose is that one stored channel cannot grow without bound. They are far
+/// above any real channel's output or audience set.
+pub const MAX_OUTPUTS_PER_CHANNEL: usize = 20;
+/// See [`MAX_OUTPUTS_PER_CHANNEL`].
+pub const MAX_AUDIENCES_PER_CHANNEL: usize = 100;
+
+/// `TimeShiftConfiguration$MaxTimeDelaySeconds`' documented bounds: "The
+/// minimum allowed maximum time delay is 0 seconds, and the maximum allowed
+/// maximum time delay is 21600 seconds (6 hours)."
+pub const MIN_TIME_SHIFT_DELAY_SECONDS: i32 = 0;
+/// See [`MIN_TIME_SHIFT_DELAY_SECONDS`].
+pub const MAX_TIME_SHIFT_DELAY_SECONDS: i32 = 21_600;
+
+/// `Tier`'s value for a channel whose request names no tier: BASIC is the
+/// channel tier MediaTailor assigns unless STANDARD is asked for.
+pub const DEFAULT_CHANNEL_TIER: &str = "BASIC";
+
+/// The state a channel is in once it has been created: a new channel is not
+/// playing until `StartChannel` starts it (`ChannelState` is `RUNNING |
+/// STOPPED`, so this is the one a channel that has never been started is in).
+pub const INITIAL_CHANNEL_STATE: &str = "STOPPED";
+
 /// The number of tags one resource holds: AWS's documented tagging limit of 50
 /// tags per resource. `PutPlaybackConfiguration` and `TagResource` refuse a
 /// request that would leave a resource above it.
@@ -62,6 +97,12 @@ pub struct ComAmazonawsMediatailorMediatailorState {
     /// `ListPlaybackConfigurations` walks the configurations in one stable order
     /// and a continuation token can name the page boundary.
     pub playback_configurations: BTreeMap<String, PlaybackConfigurationRecord>,
+    /// Every channel this emulator holds, keyed by its `ChannelName` — the
+    /// identifier `POST /channel/{ChannelName}` creates it under and every other
+    /// channel route addresses it by. A `BTreeMap` so `ListChannels` walks the
+    /// channels in one stable order and a continuation token can name the page
+    /// boundary.
+    pub channels: BTreeMap<String, ChannelRecord>,
     /// The tags of every taggable resource, keyed by resource ARN. This is the
     /// SINGLE source of truth for tags: `TagResource`/`UntagResource`/
     /// `ListTagsForResource` read and write it, `PutPlaybackConfiguration` seeds
@@ -93,15 +134,26 @@ impl ComAmazonawsMediatailorMediatailorState {
             || self.playback_configurations.len() < MAX_PLAYBACK_CONFIGURATIONS
     }
 
+    /// Whether one more channel can be stored: the store holds at most
+    /// [`MAX_CHANNELS`] of them, and `DeleteChannel` releases capacity.
+    pub fn can_hold_channel(&self) -> bool {
+        self.channels.len() < MAX_CHANNELS
+    }
+
     /// Whether `arn` names a resource this emulator currently holds, so the
     /// tagging operations can refuse an ARN that addresses nothing.
     ///
-    /// Only the playback configuration is implemented so far; an ARN naming any
-    /// other MediaTailor resource type addresses nothing yet, and an ARN this
-    /// service does not own is not a resource of this service at all.
+    /// Every MediaTailor resource type this emulator persists is listed here:
+    /// an ARN naming a type it does not persist yet addresses nothing, and an
+    /// ARN this service does not own is not a resource of this service at all.
     pub fn taggable_resource_exists(&self, arn: &str) -> bool {
-        playback_configuration_name_from_arn(arn)
-            .is_some_and(|name| self.playback_configurations.contains_key(name))
+        match resource_from_arn(arn) {
+            Some(("playbackConfiguration", name)) => {
+                self.playback_configurations.contains_key(name)
+            }
+            Some(("channel", name)) => self.channels.contains_key(name),
+            _ => false,
+        }
     }
 }
 
@@ -133,13 +185,13 @@ pub fn tag_set_violation(tags: &BTreeMap<String, String>) -> Option<String> {
     None
 }
 
-/// The configuration name a playback-configuration ARN addresses, or `None`
-/// when `arn` is not a MediaTailor playback-configuration ARN.
+/// The resource type and name a MediaTailor ARN addresses, or `None` when `arn`
+/// is not an ARN of this service's resources.
 ///
-/// The ARN form is the one `PutPlaybackConfiguration` mints:
-/// `arn:aws:mediatailor:<region>:<account>:playbackConfiguration/<Name>`, with
-/// `mediatailor` the service's modelled `arnNamespace`.
-pub fn playback_configuration_name_from_arn(arn: &str) -> Option<&str> {
+/// The ARN form is the one this service mints:
+/// `arn:aws:mediatailor:<region>:<account>:<type>/<name>`, with `mediatailor`
+/// the service's modelled `arnNamespace`.
+pub fn resource_from_arn(arn: &str) -> Option<(&str, &str)> {
     let mut fields = arn.splitn(6, ':');
     let (Some("arn"), Some(_partition), Some("mediatailor"), Some(_region), Some(_account), Some(resource)) = (
         fields.next(),
@@ -151,9 +203,17 @@ pub fn playback_configuration_name_from_arn(arn: &str) -> Option<&str> {
     ) else {
         return None;
     };
-    resource
-        .strip_prefix("playbackConfiguration/")
-        .filter(|name| !name.is_empty())
+    let (kind, name) = resource.split_once('/')?;
+    (!kind.is_empty() && !name.is_empty()).then_some((kind, name))
+}
+
+/// The region an ARN a request mints is scoped to: the region the caller signed
+/// for, which is the region whose endpoint the request addressed. Emulators
+/// default to `us-east-1` when the request carries no SigV4 scope.
+pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| "us-east-1".to_string())
 }
 
 /// One persisted playback configuration: the members the request carried, plus
@@ -271,6 +331,102 @@ impl_playback_configuration_view!(
     GetPlaybackConfigurationOutput,
     PlaybackConfiguration,
 );
+
+/// One persisted channel: the members the request carried, the fields the
+/// service derives when it mints the channel (its ARN, each output's playback
+/// URLs, its timestamps and its initial state) and the log settings the logging
+/// operation owns.
+///
+/// `Tags` is deliberately NOT here: tags live once, in
+/// [`ComAmazonawsMediatailorMediatailorState::tags_by_arn`], keyed by this
+/// record's `arn`.
+#[derive(Debug, Clone)]
+pub struct ChannelRecord {
+    pub name: String,
+    pub arn: String,
+    /// `RUNNING` or `STOPPED`: a created channel starts [`INITIAL_CHANNEL_STATE`]
+    /// and the start/stop operations move it.
+    pub channel_state: String,
+    pub creation_time: ::aws_smithy_types::DateTime,
+    pub last_modified_time: ::aws_smithy_types::DateTime,
+    /// The channel's outputs as they are REPORTED: each request output plus the
+    /// playback URLs the service derives for it.
+    pub outputs: Vec<ResponseOutputItem>,
+    pub playback_mode: String,
+    pub tier: String,
+    pub filler_slate: Option<SlateSource>,
+    pub time_shift_configuration: Option<TimeShiftConfiguration>,
+    pub audiences: Option<Vec<String>>,
+    /// Owned by `ConfigureLogsForChannel`, not by the create path: the log types
+    /// enabled on this channel, none until that operation enables some.
+    pub log_types: Vec<String>,
+}
+
+impl ChannelRecord {
+    /// The stored channel as the create path reports it.
+    ///
+    /// `Tags` is ALWAYS reported: the member says what tags the channel
+    /// carries, and an untagged channel carries none, so the answer is an empty
+    /// tag set rather than an absent member.
+    ///
+    /// Every channel-shaped response is this one rendering of the stored
+    /// record: [`ChannelRecord::describe_output`] re-uses it member for member,
+    /// so the create response and the read cannot drift apart.
+    pub fn create_output(&self, tags: HashMap<String, String>) -> CreateChannelOutput {
+        CreateChannelOutput {
+            arn: Some(self.arn.clone()),
+            channel_name: Some(self.name.clone()),
+            channel_state: Some(self.channel_state.clone()),
+            creation_time: Some(self.creation_time),
+            filler_slate: self.filler_slate.clone(),
+            last_modified_time: Some(self.last_modified_time),
+            outputs: Some(self.outputs.clone()),
+            playback_mode: Some(self.playback_mode.clone()),
+            tags: Some(tags),
+            tier: Some(self.tier.clone()),
+            time_shift_configuration: self.time_shift_configuration.clone(),
+            audiences: self.audiences.clone(),
+        }
+    }
+
+    /// The stored channel as the read reports it: the create view's members,
+    /// plus the log settings `ConfigureLogsForChannel` owns — the one member
+    /// `DescribeChannelResponse` adds, and a required one, so a channel with no
+    /// log types enabled reports an empty list rather than nothing.
+    pub fn describe_output(&self, tags: HashMap<String, String>) -> DescribeChannelOutput {
+        let CreateChannelOutput {
+            arn,
+            channel_name,
+            channel_state,
+            creation_time,
+            filler_slate,
+            last_modified_time,
+            outputs,
+            playback_mode,
+            tags,
+            tier,
+            time_shift_configuration,
+            audiences,
+        } = self.create_output(tags);
+        DescribeChannelOutput {
+            arn,
+            channel_name,
+            channel_state,
+            creation_time,
+            filler_slate,
+            last_modified_time,
+            outputs,
+            playback_mode,
+            tags,
+            tier,
+            log_configuration: LogConfigurationForChannel {
+                log_types: Some(self.log_types.clone()),
+            },
+            time_shift_configuration,
+            audiences,
+        }
+    }
+}
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

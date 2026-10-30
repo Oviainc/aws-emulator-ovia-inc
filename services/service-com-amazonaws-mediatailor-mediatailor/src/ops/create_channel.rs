@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates the channel named by `ChannelName` in [`crate::state`] and
+//! answers with the PERSISTED record — the members the request carried, plus the ARN,
+//! the per-output playback URLs, the timestamps and the initial channel state this
+//! service derives when it mints the channel. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +93,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{request_region, tag_set_violation, ChannelRecord};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -104,19 +102,27 @@ use super::types::*;
 // `CreateChannelError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `CreateChannelError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediatailor#CreateChannel")]
+/// This operation's modelled failures.
+///
+/// The model lists no error on `CreateChannel` itself, so `BadRequestException`
+/// — the one client error this SERVICE declares ("A request contains unexpected
+/// data", HTTP 400) — is widened in with `extra_errors` to refuse a request that
+/// names a channel the account already has, or values the stored channel cannot
+/// be built from. It is the only error shape the model gives this service, so it
+/// is what such a request is answered with rather than a status and code no
+/// model declares.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediatailor#CreateChannel",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum CreateChannelErrorModeled {
+    BadRequestException(BadRequestException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::create_channel::CreateChannelError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// (`crate::ops::create_channel::CreateChannelError`). The wrapper is kept for the
+/// `validation` refusal channel it carries.
 pub type CreateChannelError = crate::scaffolded::Scaffolded<CreateChannelErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -127,6 +133,116 @@ impl From<CreateChannelErrorModeled> for CreateChannelError {
     fn from(modeled: CreateChannelErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The playback mode whose schedule plays its programs once, back to back.
+/// `FillerSlate` is the slate that fills the gaps between those programs, and
+/// this operation's own documentation states it is required for this mode: "You
+/// must configure filler slate if your channel uses the LINEAR PlaybackMode."
+const PLAYBACK_MODE_LINEAR: &str = "LINEAR";
+
+/// The per-channel host label this emulator's generated playback URLs carry: a
+/// 28-character label derived from the channel's ARN, so every output of one
+/// channel shares a host that is stable for the life of the channel and is
+/// distinct between channels.
+fn playback_host_label(arn: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(format!("{arn}#channel-playback").as_bytes()));
+    digest[..28].to_string()
+}
+
+/// The single-stack and dual-stack playback URLs of one channel output.
+///
+/// The single-stack host is the service's regional endpoint
+/// (`mediatailor.<region>.amazonaws.com`) under this channel's own label; the
+/// dual-stack host is the dual-stack endpoint the model declares for the `aws`
+/// partition (`standardRegionalEndpoints.partitionSpecialCases.aws`:
+/// `https://mediatailor.{region}.{dualStackDnsSuffix}`, whose suffix is
+/// `api.aws`). The path names the channel and the output's manifest — so one URL
+/// addresses exactly one output of one channel — and the manifest carries the
+/// extension of the playlist form the output asked for: a DASH-only output is an
+/// `.mpd` manifest, every other output an `.m3u8` playlist.
+fn playback_urls(
+    label: &str,
+    region: &str,
+    channel: &str,
+    output: &RequestOutputItem,
+) -> (String, String) {
+    let dash_only =
+        output.dash_playlist_settings.is_some() && output.hls_playlist_settings.is_none();
+    let (kind, extension) = if dash_only {
+        ("dash", "mpd")
+    } else {
+        ("channel", "m3u8")
+    };
+    let path = format!("/v1/{kind}/{channel}/{}.{extension}", output.manifest_name);
+    (
+        format!("https://{label}.mediatailor.{region}.amazonaws.com{path}"),
+        format!("https://{label}.mediatailor.{region}.api.aws{path}"),
+    )
+}
+
+/// Why the channel this request would store cannot be held, or `None` when it
+/// can.
+///
+/// One stored channel must not be unbounded in the size a caller chooses for
+/// it, so the caller-sized lists are held to the bounds in [`crate::state`];
+/// the member that carries documented bounds is held to those; and a manifest
+/// name, which is bound into every playback URL this channel reports, has to
+/// address one output of one channel. Members the model constrains itself (the
+/// `PlaybackMode` and `Tier` enums, the required members) are already refused by
+/// the boundary validator before this runs.
+fn stored_channel_violation(input: &CreateChannelInput) -> Option<String> {
+    if input.outputs.len() > crate::state::MAX_OUTPUTS_PER_CHANNEL {
+        return Some(format!(
+            "a channel carries at most {} outputs, and this request carries {}",
+            crate::state::MAX_OUTPUTS_PER_CHANNEL,
+            input.outputs.len()
+        ));
+    }
+    let mut manifest_names: BTreeSet<&str> = BTreeSet::new();
+    for output in &input.outputs {
+        if output.manifest_name.is_empty() || output.manifest_name.contains('/') {
+            return Some(format!(
+                "ManifestName must be a non-empty name that contains no '/': {}",
+                output.manifest_name
+            ));
+        }
+        if !manifest_names.insert(output.manifest_name.as_str()) {
+            return Some(format!(
+                "each output of a channel has its own ManifestName, and {} names more than one",
+                output.manifest_name
+            ));
+        }
+    }
+    if let Some(audiences) = input.audiences.as_ref() {
+        if audiences.len() > crate::state::MAX_AUDIENCES_PER_CHANNEL {
+            return Some(format!(
+                "a channel carries at most {} audiences, and this request carries {}",
+                crate::state::MAX_AUDIENCES_PER_CHANNEL,
+                audiences.len()
+            ));
+        }
+    }
+    if let Some(time_shift) = input.time_shift_configuration.as_ref() {
+        let delay = time_shift.max_time_delay_seconds;
+        if !(crate::state::MIN_TIME_SHIFT_DELAY_SECONDS
+            ..=crate::state::MAX_TIME_SHIFT_DELAY_SECONDS)
+            .contains(&delay)
+        {
+            return Some(format!(
+                "MaxTimeDelaySeconds is between {} and {} seconds: {delay}",
+                crate::state::MIN_TIME_SHIFT_DELAY_SECONDS,
+                crate::state::MAX_TIME_SHIFT_DELAY_SECONDS
+            ));
+        }
+    }
+    if input.playback_mode == PLAYBACK_MODE_LINEAR && input.filler_slate.is_none() {
+        return Some(format!(
+            "FillerSlate is required for a channel using the {PLAYBACK_MODE_LINEAR} PlaybackMode"
+        ));
+    }
+    None
 }
 
 /// The `CreateChannel` operation.
@@ -165,18 +281,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. Without the
+            // store there is no channel to persist or report, so answer the
+            // scaffold's 501 rather than a response nothing backs.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateChannel",
+            ));
+        };
+
+        // `ChannelName` is this channel's identifier: it keys the store, it is
+        // the last segment of the ARN, and it is the `@httpLabel` of every other
+        // channel route. A value that is empty, or that carries the URI path
+        // separator, can therefore address no channel.
+        if input.channel_name.is_empty() || input.channel_name.contains('/') {
+            return Err(CreateChannelErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "ChannelName must be a non-empty identifier that contains no '/': {}",
+                        input.channel_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Everything this channel would store is bounded, and the values the
+        // stored channel is built from are checked, before any of it is stored.
+        if let Some(violation) = stored_channel_violation(&input) {
+            return Err(CreateChannelErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(violation),
+                },
+            )
+            .into());
+        }
+
+        // The tag set this channel would be created with: `Tags` is the set the
+        // new resource carries, and a request that omits the member creates it
+        // with none.
+        let requested_tags: Option<BTreeMap<String, String>> = input
+            .tags
+            .as_ref()
+            .map(|tags| tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        if let Some(violation) = requested_tags.as_ref().and_then(tag_set_violation) {
+            return Err(CreateChannelErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(violation),
+                },
+            )
+            .into());
+        }
+
+        let region = request_region(ctx);
+        let arn = ::engine::emulator_arn(
+            "mediatailor",
+            &region,
+            &format!("channel/{}", input.channel_name),
+        );
+        let label = playback_host_label(&arn);
+        // Each request output is stored as the output the reads REPORT: the
+        // members the request carried, plus the playback URLs this service
+        // derives for it.
+        let outputs: Vec<ResponseOutputItem> = input
+            .outputs
+            .iter()
+            .map(|output| {
+                let (playback_url, dual_stack_playback_url) =
+                    playback_urls(&label, &region, &input.channel_name, output);
+                ResponseOutputItem {
+                    dash_playlist_settings: output.dash_playlist_settings.clone(),
+                    hls_playlist_settings: output.hls_playlist_settings.clone(),
+                    manifest_name: output.manifest_name.clone(),
+                    playback_url,
+                    dual_stack_playback_url: Some(dual_stack_playback_url),
+                    source_group: output.source_group.clone(),
+                }
+            })
+            .collect();
+        // A channel is created at one instant, and nothing has modified it
+        // since, so both of its timestamps are that instant.
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        let mut store = state.lock();
+
+        // A channel name identifies one channel in the account, so a request
+        // naming a channel the account already holds is unexpected data: it is
+        // refused, and the channel that is already stored is left exactly as it
+        // was.
+        if store.channels.contains_key(&input.channel_name) {
+            return Err(CreateChannelErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "Channel with name {} already exists.",
+                        input.channel_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store holds a bounded number of channels, so a caller cannot grow
+        // it without end on request-chosen names; `DeleteChannel` releases
+        // capacity.
+        if !store.can_hold_channel() {
+            return Err(CreateChannelErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "this emulator holds at most {} channels; delete one before creating {}",
+                        crate::state::MAX_CHANNELS,
+                        input.channel_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = ChannelRecord {
+            name: input.channel_name.clone(),
+            arn: arn.clone(),
+            channel_state: crate::state::INITIAL_CHANNEL_STATE.to_string(),
+            creation_time: now,
+            last_modified_time: now,
+            outputs,
+            playback_mode: input.playback_mode.clone(),
+            tier: input
+                .tier
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_CHANNEL_TIER.to_string()),
+            filler_slate: input.filler_slate.clone(),
+            time_shift_configuration: input.time_shift_configuration.clone(),
+            audiences: input.audiences.clone(),
+            // Owned by `ConfigureLogsForChannel`: a channel is created with no
+            // log type enabled.
+            log_types: Vec::new(),
+        };
+
+        // Tags are stored once, under the resource's ARN, so `TagResource` and
+        // the channel reads see one tag set. An empty `Tags` map is a tag set
+        // with nothing in it, so it leaves the channel untagged.
+        if let Some(tags) = requested_tags.filter(|tags| !tags.is_empty()) {
+            store.tags_by_arn.insert(arn.clone(), tags);
+        }
+
+        store
+            .channels
+            .insert(input.channel_name.clone(), record.clone());
+        let tags: HashMap<String, String> = store.tags_of(&arn).unwrap_or_default();
+
+        Ok(record.create_output(tags))
     }
 }

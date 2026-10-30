@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the channel named by `ChannelName` from [`crate::state`] — the
+//! stored record `CreateChannel` minted, plus the log settings
+//! `ConfigureLogsForChannel` owns. A pure read: it changes nothing. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +75,8 @@
 //! * `TimeShiftConfiguration` (TimeShiftConfiguration) — The time-shifted viewing
 //!   configuration for the channel.
 
+use std::collections::HashMap;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -89,19 +86,26 @@ use super::types::*;
 // `DescribeChannelError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DescribeChannelError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediatailor#DescribeChannel")]
+/// This operation's modelled failures.
+///
+/// The model lists no error on `DescribeChannel` itself, so `BadRequestException`
+/// — the one client error this SERVICE declares ("A request contains unexpected
+/// data", HTTP 400) — is widened in with `extra_errors` to refuse a read of a
+/// channel this emulator does not hold. It is the only error shape the model
+/// gives this service, so it is what a miss is answered with rather than a
+/// status and code no model declares.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediatailor#DescribeChannel",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum DescribeChannelErrorModeled {
+    BadRequestException(BadRequestException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::describe_channel::DescribeChannelError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// (`crate::ops::describe_channel::DescribeChannelError`). The wrapper is kept for the
+/// `validation` refusal channel it carries.
 pub type DescribeChannelError = crate::scaffolded::Scaffolded<DescribeChannelErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -148,20 +152,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeChannel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. Without the
+            // store there is nothing to report, so answer the scaffold's 501
+            // rather than a response nothing backs.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeChannel",
+            ));
+        };
+
+        let store = state.lock();
+        let Some(record) = store.channels.get(&input.channel_name) else {
+            return Err(DescribeChannelErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!("Channel {} not found.", input.channel_name)),
+                },
+            )
+            .into());
+        };
+        let tags: HashMap<String, String> = store.tags_of(&record.arn).unwrap_or_default();
+
+        Ok(record.describe_output(tags))
     }
 }

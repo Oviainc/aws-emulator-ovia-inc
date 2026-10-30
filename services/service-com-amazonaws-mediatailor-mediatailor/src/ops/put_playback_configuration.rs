@@ -220,7 +220,9 @@ use std::collections::{BTreeMap, HashMap};
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{tag_set_violation, PlaybackConfigurationRecord, PlaybackConfigurationView};
+use crate::state::{
+    request_region, tag_set_violation, PlaybackConfigurationRecord, PlaybackConfigurationView,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -272,15 +274,6 @@ const DEFAULT_MPD_LOCATION: &str = "EMT_DEFAULT";
 /// `DashConfiguration$OriginManifestType`'s documented default: "The default
 /// setting is `MULTI_PERIOD`."
 const DEFAULT_ORIGIN_MANIFEST_TYPE: &str = "MULTI_PERIOD";
-
-/// The region an ARN this request mints is scoped to: the region the caller
-/// signed for, which is the region whose endpoint the request addressed.
-/// Emulators default to `us-east-1` when the request carries no SigV4 scope.
-fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
-        .map(|scope| scope.region)
-        .unwrap_or_else(|| "us-east-1".to_string())
-}
 
 /// Why the configuration this request would store cannot be held, or `None`
 /// when it can.
