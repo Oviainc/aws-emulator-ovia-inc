@@ -3054,7 +3054,8 @@ pub fn too_many_tags(member: &str, resource_arn: &str, resulting: usize) -> Vali
 /// A workflow in [`WORKFLOW_STATUS_DELETING`] is on its way out and accepts no
 /// change ([`Workflow::is_deleting`]), so every operation that would write to it
 /// refuses the request and writes nothing. An operation that models
-/// `ConflictException` refuses such a write with it; one that does not —
+/// `ConflictException` refuses such a write with it
+/// ([`tearing_down_conflict`]); one that does not —
 /// `TagResource` and `UntagResource` model no conflict
 /// (`smithy_query(query="operation", operation="TagResource,UntagResource")`) —
 /// refuses it with the error it does model for a request inconsistent with the
@@ -3062,10 +3063,34 @@ pub fn too_many_tags(member: &str, resource_arn: &str, resulting: usize) -> Vali
 /// the request carried, so no field is named and the reason is [`REASON_OTHER`].
 pub fn tearing_down_resource(resource_arn: &str, action: &str) -> ValidationException {
     ValidationException {
-        message: format!("Workflow {resource_arn} is {WORKFLOW_STATUS_DELETING} and {action}"),
+        message: tearing_down_message(resource_arn, action),
         reason: REASON_OTHER.to_string(),
         field_list: None,
     }
+}
+
+/// The modelled `ConflictException` form of that SAME refusal, for an operation
+/// that models the conflict — `UpdateWorkflow` and `StartWorkflowRun` — where
+/// `action` completes the clause (`cannot be updated`).
+///
+/// "The resource is in a state that prevents the requested operation"
+/// (`smithy_query(query="shape", shape="ConflictException")`) is exactly a
+/// workflow in [`WORKFLOW_STATUS_DELETING`] asked for a write, so the refusal
+/// names the workflow as the resource whose state blocks the call. The handler
+/// keeps only what it cannot share: wrapping this in its own error variant.
+pub fn tearing_down_conflict(resource_arn: &str, action: &str) -> ConflictException {
+    ConflictException {
+        message: tearing_down_message(resource_arn, action),
+        resource_id: resource_arn.to_string(),
+        resource_type: WORKFLOW_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The message every form of the teardown refusal carries: the workflow, the
+/// status its teardown put it in, and the clause `action` completes. One home,
+/// so a change to the wording reaches both forms at once.
+fn tearing_down_message(resource_arn: &str, action: &str) -> String {
+    format!("Workflow {resource_arn} is {WORKFLOW_STATUS_DELETING} and {action}")
 }
 
 /// The modelled `ValidationException` for a pagination cursor this service did

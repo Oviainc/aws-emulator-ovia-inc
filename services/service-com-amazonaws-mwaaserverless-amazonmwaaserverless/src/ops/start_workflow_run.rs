@@ -311,13 +311,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cleanup "stop[s] any running executions" — so starting a NEW run on it is
         // the modelled `ConflictException`: "the resource is in a state that prevents
         // the requested operation" (`smithy_query(query="shape",
-        // shape="ConflictException")`). Checked after the replay above, so a repeated
-        // `ClientToken` still answers with the run it already started.
+        // shape="ConflictException")`). The refusal itself is the shared one
+        // (`crate::state::tearing_down_conflict`), so this handler keeps only the
+        // clause and the error variant that wraps it. Checked after the replay above,
+        // so a repeated `ClientToken` still answers with the run it already started.
         if store
             .workflow_in(&region, &input.workflow_arn)
             .is_some_and(crate::state::Workflow::is_deleting)
         {
-            return Err(tearing_down(&input.workflow_arn));
+            return Err(StartWorkflowRunErrorModeled::ConflictException(
+                crate::state::tearing_down_conflict(&input.workflow_arn, "cannot start a run"),
+            )
+            .into());
         }
 
         let version = store
@@ -436,20 +441,6 @@ fn validate_input(input: &StartWorkflowRunInput) -> Result<(), ValidationExcepti
         return Ok(());
     }
     Err(crate::state::constraint_validation_exception(&violations))
-}
-
-/// The modelled refusal for a run asked of a workflow whose teardown has already
-/// started: the cleanup stops executions rather than admitting new ones.
-fn tearing_down(workflow_arn: &str) -> StartWorkflowRunError {
-    StartWorkflowRunErrorModeled::ConflictException(ConflictException {
-        message: format!(
-            "Workflow {workflow_arn} is {} and cannot start a run",
-            crate::state::WORKFLOW_STATUS_DELETING
-        ),
-        resource_id: workflow_arn.to_string(),
-        resource_type: crate::state::WORKFLOW_RESOURCE_TYPE.to_string(),
-    })
-    .into()
 }
 
 /// The modelled server error for a store this handler could not reach.

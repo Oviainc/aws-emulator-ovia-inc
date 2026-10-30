@@ -71,6 +71,8 @@ mod task_instance_listing;
 mod task_instance_reads;
 #[path = "all/task_operator_reporting.rs"]
 mod task_operator_reporting;
+#[path = "all/teardown_refusal_wording.rs"]
+mod teardown_refusal_wording;
 #[path = "all/validation_errors.rs"]
 mod validation_errors;
 #[path = "all/workflow_configuration_digest.rs"]

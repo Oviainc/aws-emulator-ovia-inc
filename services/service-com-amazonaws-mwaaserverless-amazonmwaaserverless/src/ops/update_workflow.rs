@@ -264,9 +264,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // it holds, so a new version cannot be appended to it. That is what the
             // modelled `ConflictException` is for: "the resource is in a state that
             // prevents the requested operation"
-            // (`smithy_query(query="shape", shape="ConflictException")`).
+            // (`smithy_query(query="shape", shape="ConflictException")`). The refusal
+            // itself is the shared one (`crate::state::tearing_down_conflict`), so this
+            // handler keeps only the clause and the error variant that wraps it.
             if workflow.is_deleting() {
-                return Err(tearing_down(&workflow.arn));
+                return Err(UpdateWorkflowErrorModeled::ConflictException(
+                    crate::state::tearing_down_conflict(&workflow.arn, "cannot be updated"),
+                )
+                .into());
             }
             (
                 workflow.arn.clone(),
@@ -360,20 +365,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             warnings: None,
         })
     }
-}
-
-/// The modelled refusal for a workflow whose teardown has already started: it is on
-/// its way out with every version it holds, so it cannot take a new one.
-fn tearing_down(workflow_arn: &str) -> UpdateWorkflowError {
-    UpdateWorkflowErrorModeled::ConflictException(ConflictException {
-        message: format!(
-            "Workflow {workflow_arn} is {} and cannot be updated",
-            crate::state::WORKFLOW_STATUS_DELETING
-        ),
-        resource_id: workflow_arn.to_string(),
-        resource_type: crate::state::WORKFLOW_RESOURCE_TYPE.to_string(),
-    })
-    .into()
 }
 
 /// The modelled server error for a store this handler could not reach.
