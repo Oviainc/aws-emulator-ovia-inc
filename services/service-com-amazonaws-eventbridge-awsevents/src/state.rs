@@ -19,7 +19,9 @@
 //! came of handing that event to each target of each matched rule is appended to
 //! [`ComAmazonawsEventbridgeAwseventsState::invocations`]. Whether EventBridge
 //! may invoke a target at all is decided against the account's OWN IAM records
-//! ([`delivery_refusal`]), and what came of each handover is counted on the
+//! ([`delivery_refusal`]) and, for a publication onto an event bus, against that
+//! bus's own resource policy ([`publication_refusal`]), and what came of each
+//! handover is counted on the
 //! rule's own `Invocations` or `FailedInvocations` metric in the CloudWatch store
 //! ([`count_invocation`], [`count_failed_invocation`]) — both reached through the
 //! same shared engine this service's store lives in, so there is one copy of each
@@ -3508,6 +3510,97 @@ pub fn delivery_refusal(
             assumed_role_principal(role_arn, &role.role_name, attempt)
         ),
     ))
+}
+
+/// Why the event bus whose resource policy is `policy` does not accept a
+/// publication made as `role_arn`, or `None` when that policy shows nothing
+/// against it.
+///
+/// A publication onto an event bus is authorized against THAT bus's resource
+/// policy — "the policy that enables the external account to send events to
+/// your account" (`DescribeEventBus$Policy`) — under the identity the
+/// publication is made as, so a statement of it that explicitly denies that
+/// identity the publication refuses it, whatever the identity's own policies
+/// allow: an explicit deny wins over every allow, which is the ONE evaluation
+/// in [`::service_common::iam_authorization`]. The condition is
+/// [`NO_PERMISSIONS`], the same one a refusal for want of a permission carries
+/// anywhere else ([`delivery_refusal`]).
+///
+/// Nothing ELSE is refused here, for the reason [`delivery_refusal`] gives: the
+/// emulator refuses only what it can show. Within one account "the
+/// resource-based policy and the identity-based policy are evaluated together,
+/// and access is granted if either allows it", so a policy that states nothing
+/// about the publication withholds nothing and the identity half of the same
+/// decision stays [`delivery_refusal`]'s.
+///
+/// `policy` is the bus's policy document ([`BusPolicy::document`]), and `None`
+/// — a bus nothing has installed a statement on — shows nothing either.
+///
+/// The decision is the SAME-ACCOUNT one, which is what this emulator's single
+/// account can hold: a principal of ANOTHER account, for which AWS requires an
+/// explicit resource-policy allow rather than merely no deny, is out of scope
+/// here and is left to the change that gives this emulator a second account.
+pub fn publication_refusal(
+    policy: Option<&str>,
+    role_arn: Option<&str>,
+    attempt: &DeliveryAttempt<'_>,
+) -> Option<(String, String)> {
+    let document = policy?;
+    let principals = publication_principals(role_arn, attempt);
+    let (action, resource) = (attempt.action, attempt.resource);
+    let request = ::service_common::iam_authorization::Request::new(action, resource, &principals);
+    if ::service_common::iam_authorization::resource_decision(document, &request)
+        != ::service_common::iam_authorization::Decision::Denied
+    {
+        return None;
+    }
+    Some((
+        NO_PERMISSIONS.to_string(),
+        format!(
+            "User: {} is not authorized to perform: {action} on resource: {resource} \
+             with an explicit deny in a resource-based policy",
+            publication_principal(role_arn, attempt)
+        ),
+    ))
+}
+
+/// Every spelling of the identity a publication is made as that a resource
+/// policy may name it by: the role itself, the SESSION of that role the
+/// publication is made under ([`assumed_role_principal`]) and the spellings of
+/// the account the role belongs to.
+///
+/// The account's own spellings are included because this decides a DENY, and a
+/// statement that denies an account refuses each of its principals
+/// (`::service_common::iam_authorization::account_principals`); a GRANT would be
+/// decided with the principal's spellings alone. A publication under NO role is
+/// made by EventBridge itself, so the only identity to name is its service
+/// principal — which a statement denying every principal still names.
+fn publication_principals(role_arn: Option<&str>, attempt: &DeliveryAttempt<'_>) -> Vec<String> {
+    let Some(role_arn) = role_arn else {
+        return vec![SERVICE_PRINCIPAL.to_string()];
+    };
+    let mut principals = vec![
+        role_arn.to_string(),
+        publication_principal(Some(role_arn), attempt),
+    ];
+    principals.extend(::service_common::iam_authorization::account_principals(
+        role_arn,
+    ));
+    principals
+}
+
+/// The identity a refused publication is REPORTED as: the session of the role it
+/// was made under, or EventBridge's own service principal for one made under no
+/// role at all.
+fn publication_principal(role_arn: Option<&str>, attempt: &DeliveryAttempt<'_>) -> String {
+    let Some(role_arn) = role_arn else {
+        return SERVICE_PRINCIPAL.to_string();
+    };
+    // The role's NAME comes from its ARN through the shared reading of one
+    // (`::service_common::iam_role`), so the session principal is spelled the
+    // same way whether or not this account holds a record of the role.
+    let role_name = ::service_common::iam_role::role_name(role_arn).unwrap_or_default();
+    assumed_role_principal(role_arn, role_name, attempt)
 }
 
 /// Which invocation the delivery gate is deciding: the API call EventBridge is

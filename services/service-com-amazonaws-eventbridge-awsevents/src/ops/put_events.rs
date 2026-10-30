@@ -23,6 +23,15 @@
 //! [`crate::state::ComAmazonawsEventbridgeAwseventsState::invocations`] (see
 //! [`deliver`]).
 //!
+//! A target that names another EVENT BUS is reached by publishing onto that bus
+//! instead ([`republish`]), and that publication is authorized the way any
+//! publication onto a bus is: under the identity the forward is made as — the
+//! target's `RoleArn` — against the DESTINATION bus's own resource policy
+//! ([`crate::state::publication_refusal`]) as well as that role's policies. A
+//! forward the destination bus denies publishes nothing onto it, so none of its
+//! rules sees the event, and the refused event goes to the target's dead-letter
+//! queue carrying the condition.
+//!
 //! Routing also feeds the ARCHIVES of the entry's bus: "if you do not specify a
 //! pattern to filter events sent to the archive, all events are sent to the
 //! archive" (`CreateArchive`), so every archive of that bus that has reached
@@ -439,7 +448,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // rather than by an API call to another service, so it is
                     // served here, from the store, instead of through a client.
                     let outcome = if let Some(bus) = event_bus_target(&target.arn) {
-                        republish(
+                        let outcome = republish(
                             &state,
                             &bus,
                             &dispatch,
@@ -451,7 +460,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             &mut budget,
                             &mut republished_matching,
                         )
-                        .await
+                        .await;
+                        // A forward the destination bus refused is an event
+                        // EventBridge could not deliver, so it goes to the
+                        // target's dead-letter queue carrying the condition —
+                        // the ONE signal the owner of a mis-scoped destination
+                        // policy has. Every outcome this acts on has already
+                        // spent the request's delivery budget ([`republish`]
+                        // charges before it decides anything), so the dead
+                        // letters one request can write are bounded by the same
+                        // budget its deliveries are. Nothing is counted on the
+                        // rule's `FailedInvocations` for it: no target
+                        // invocation was made, and a refusal for want of a
+                        // permission is not one AWS counts there.
+                        dead_letter_refusal(
+                            ctx,
+                            &mut clients,
+                            &dispatch.region,
+                            &handover,
+                            &dispatch.rendered,
+                            &outcome,
+                            None,
+                        )
+                        .await;
+                        outcome
                     } else {
                         let Some(outcome) = deliver(
                             ctx,
@@ -1363,42 +1395,57 @@ pub(crate) async fn deliver(
     // the dead-letter queue configured for that target" and counts it on
     // `FailedInvocations`. Both follow from the SAME outcome, so they happen in
     // one place.
-    if let crate::state::InvocationOutcome::Failed { code, message } = &outcome {
-        ::tracing::warn!(
-            target = %target.arn,
-            rule = %handover.rule,
-            %code,
-            "an EventBridge target could not be invoked"
-        );
-        if let Some(dead_letter_arn) = target.dead_letter_arn.as_deref() {
-            if let Some(queue) = sqs_queue(dead_letter_arn) {
-                // The dead-letter queue is reached in ITS OWN Region, which is
-                // not necessarily the target's or the request's.
-                let dlq_region = ::service_common::arn::region_of(
-                    dead_letter_arn,
-                    SQS_ARN_NAMESPACE,
-                )
-                .unwrap_or(region);
-                dead_letter(
-                    ctx,
-                    clients,
-                    dlq_region,
-                    &queue,
-                    handover,
-                    body,
-                    code,
-                    message,
-                    retries.as_ref(),
-                )
-                .await;
-            }
-        }
-    }
+    dead_letter_refusal(ctx, clients, region, handover, body, &outcome, retries.as_ref()).await;
     // Every handover that reached the target's API is counted on the rule's own
     // invocation metrics, whichever way it went — a rule that is delivering is
     // as observable as one that is failing.
     count_invocation(cloudwatch, handover, &outcome);
     Some(outcome)
+}
+
+/// Send the event to the target's dead-letter queue when `outcome` is a refusal,
+/// and do nothing for any other outcome.
+///
+/// "If EventBridge can't deliver an event to a target, it sends the event to the
+/// dead-letter queue configured for that target" — whichever way the target was
+/// to be reached, so the handovers served through a target's own API
+/// ([`deliver`]) and the one served by publishing onto another event bus
+/// ([`republish`]) record a refusal the same way. A handover that was NOT
+/// ATTEMPTED is nothing AWS would dead-letter: a gap in this emulator is not an
+/// event the target refused.
+async fn dead_letter_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    clients: &mut Clients,
+    region: &str,
+    handover: &Handover<'_>,
+    body: &str,
+    outcome: &crate::state::InvocationOutcome,
+    retries: Option<&Retries>,
+) {
+    let target = handover.target;
+    let crate::state::InvocationOutcome::Failed { code, message } = outcome else {
+        return;
+    };
+    ::tracing::warn!(
+        target = %target.arn,
+        rule = %handover.rule,
+        %code,
+        "an EventBridge target could not be invoked"
+    );
+    let Some(dead_letter_arn) = target.dead_letter_arn.as_deref() else {
+        return;
+    };
+    let Some(queue) = sqs_queue(dead_letter_arn) else {
+        return;
+    };
+    // The dead-letter queue is reached in ITS OWN Region, which is not
+    // necessarily the target's or the request's.
+    let dlq_region =
+        ::service_common::arn::region_of(dead_letter_arn, SQS_ARN_NAMESPACE).unwrap_or(region);
+    dead_letter(
+        ctx, clients, dlq_region, &queue, handover, body, code, message, retries,
+    )
+    .await;
 }
 
 /// What a target that asks for the event to be RESHAPED receives, or `Ok(None)`
@@ -1502,12 +1549,23 @@ fn event_bus_target(arn: &str) -> Option<BusTarget> {
 /// of the envelope is carried over, the `region` it was published in included,
 /// so a rule of the other Region sees where the event came from.
 ///
-/// The re-publication spends the request's own delivery budget, and the copies
-/// one request makes share ONE matching budget ([`route_within`]), so a bus
-/// target cannot route an event in a way a direct publication could not and
+/// The handover spends the request's own delivery budget — charged BEFORE
+/// anything about it is decided, so every outcome it can have, a refusal and the
+/// dead letter that records one included, is bounded by that budget — and the
+/// copies one request makes share ONE matching budget ([`route_within`]), so a
+/// bus target cannot route an event in a way a direct publication could not and
 /// cannot spend more matching work than one entry may. The copy is appended to
 /// `pending` rather than delivered here, so the chain is one loop with one
 /// budget rather than a recursion.
+///
+/// The forward is AUTHORIZED before anything is published, under the identity it
+/// is made as: the role the target names has to be one EventBridge can act as
+/// and whose policies allow the publication ([`role_refusal`]), and the
+/// DESTINATION bus's own resource policy must not deny that identity
+/// ([`crate::state::publication_refusal`]) — the policy a bus owner scopes who
+/// may publish onto it with. A forward either of them refuses is a handover that
+/// FAILED, so the destination bus holds no copy of the event and none of its
+/// rules sees one.
 #[allow(clippy::too_many_arguments)]
 async fn republish(
     state: &::engine::ServiceState<crate::state::ComAmazonawsEventbridgeAwseventsState>,
@@ -1522,6 +1580,19 @@ async fn republish(
     matching: &mut crate::state::event_pattern::Budget,
 ) -> crate::state::InvocationOutcome {
     let target = handover.target;
+    // The handover spends the request's delivery budget BEFORE anything about it
+    // is decided, exactly as one made through a target's own API does
+    // ([`deliver`] charges before its own role gate): what comes of it — a copy
+    // published onto the other bus, or a refusal written to the target's
+    // dead-letter queue — is work this request does either way, so a request
+    // that has reached its budget does neither and nothing further is attempted
+    // for this target.
+    if !budget.charge(handover.rendered.len()) {
+        return crate::state::InvocationOutcome::NotAttempted(format!(
+            "this request reached the emulator's delivery budget of \
+             {MAX_DELIVERIES_PER_REQUEST} deliveries and {MAX_DELIVERED_BYTES_PER_REQUEST} bytes"
+        ));
+    }
     // EventBridge publishes onto the other bus ACTING AS the role the target
     // names, so a role it cannot assume or whose policies withhold the
     // publication is a delivery that fails before anything is published.
@@ -1540,12 +1611,6 @@ async fn republish(
              target(s), which is this emulator's bound on such a chain"
         ));
     }
-    if !budget.charge(handover.rendered.len()) {
-        return crate::state::InvocationOutcome::NotAttempted(format!(
-            "this request reached the emulator's delivery budget of \
-             {MAX_DELIVERIES_PER_REQUEST} deliveries and {MAX_DELIVERED_BYTES_PER_REQUEST} bytes"
-        ));
-    }
     let mut envelope = match crate::state::parse_delivered_event(handover.rendered) {
         Some(::serde_json::Value::Object(fields)) => fields,
         _ => {
@@ -1561,8 +1626,15 @@ async fn republish(
     } else {
         bus.region.clone()
     };
-    let (rules, event_id) = {
-        let mut store = state.lock();
+    // The forward IS a publication onto the destination bus, so the DESTINATION
+    // bus's resource policy authorizes it exactly as it authorizes a publication
+    // a client makes: a statement of that policy denying the identity the
+    // forward is made as refuses it, and a refused publication reaches neither
+    // that bus's event stream nor any of its rules. The policy document and the
+    // rules are READ under the guard; deciding and matching happen with none
+    // held.
+    let (policy, rules) = {
+        let store = state.lock();
         let Some(record) = store.bus(&bus_region, &bus.name) else {
             return crate::state::InvocationOutcome::NotAttempted(format!(
                 "the target ARN names no event bus {} of this account in {bus_region}",
@@ -1574,8 +1646,17 @@ async fn republish(
             .values()
             .filter_map(|rule| CompiledRule::of(rule, &store))
             .collect();
-        (rules, store.next_event_id(now))
+        (record.policy.document(), rules)
     };
+    if let Some((code, message)) =
+        crate::state::publication_refusal(policy.as_deref(), target.role_arn.as_deref(), &attempt)
+    {
+        return crate::state::InvocationOutcome::Failed { code, message };
+    }
+    // The copy's OWN event id, minted once the publication is authorized: a
+    // forward the destination bus refuses publishes nothing, so it consumes no
+    // id.
+    let event_id = state.lock().next_event_id(now);
     envelope.insert(
         EVENT_ID_FIELD.to_string(),
         ::serde_json::Value::String(event_id.clone()),
