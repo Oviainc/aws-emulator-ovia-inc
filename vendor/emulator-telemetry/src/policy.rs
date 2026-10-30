@@ -128,8 +128,10 @@ pub const fn run_mode_token(run_mode: RunMode) -> &'static str {
     }
 }
 
-/// Environment variable whose presence identifies CI execution.
-pub const CI_ENV: &str = "CI";
+/// Environment variables whose presence identifies CI execution. Most CI
+/// systems set `CI`; the others are for the systems that never set it
+/// (AWS CodeBuild, Jenkins, Azure Pipelines).
+pub const CI_ENVS: &[&str] = &["CI", "CODEBUILD_BUILD_ID", "JENKINS_URL", "TF_BUILD"];
 
 /// SDK token before any recognized request has been observed.
 pub const SDK_UNKNOWN: &str = "unknown";
@@ -243,6 +245,11 @@ pub const fn arch_token(arch: Arch) -> &'static str {
 /// Install channel used when no closed compile-time channel is injected.
 pub const INSTALL_CHANNEL_UNKNOWN: &str = "unknown";
 
+/// Whether this is the project's release build: the release pipeline stamps
+/// `EMULATOR_VERSION`, and nothing else sets it. Only a release build is the
+/// downloadable binary.
+pub const RELEASE_BUILD: bool = option_env!("EMULATOR_VERSION").is_some();
+
 /// The exact wire token for each closed [`InstallChannel`] value.
 pub const fn install_channel_token(channel: InstallChannel) -> &'static str {
     match channel {
@@ -299,6 +306,9 @@ pub const fn container_runtime_token(runtime: ContainerRuntime) -> &'static str 
 /// KiB-to-MiB divisor used before closed bucketing.
 pub const KIBIBYTES_PER_MIB: u64 = 1024;
 
+/// Byte-to-MiB divisor used before closed bucketing.
+pub const BYTES_PER_MIB: u64 = KIBIBYTES_PER_MIB * KIBIBYTES_PER_MIB;
+
 /// Closed memory-usage buckets; raw byte counts never reach the wire.
 pub const MEMORY_LESS_THAN_256_MIB: &str = "less_than_256_mib";
 pub const MEMORY_256_TO_512_MIB: &str = "256_to_512_mib";
@@ -307,7 +317,7 @@ pub const MEMORY_1_TO_2_GIB: &str = "1_to_2_gib";
 pub const MEMORY_2_TO_4_GIB: &str = "2_to_4_gib";
 pub const MEMORY_GREATER_THAN_4_GIB: &str = "greater_than_4_gib";
 
-/// Fold a process resident-set size into the closed memory taxonomy.
+/// Fold a process's peak resident-set size into the closed memory taxonomy.
 pub const fn memory_usage_bucket(mebibytes: u64) -> MemoryBucket {
     match mebibytes {
         0..=255 => MemoryBucket::LessThan256Mib,
@@ -331,14 +341,19 @@ pub const fn memory_bucket_token(bucket: MemoryBucket) -> &'static str {
     }
 }
 
-/// The `performance.startupOutcome` token reported once the emulator's
-/// telemetry worker is running.
+/// The `performance.startupOutcome` token reported once the emulator is ready
+/// to serve.
 pub const STARTUP_OUTCOME_SUCCESS: &str = "success";
+
+/// The `performance.startupOutcome` token reported when the emulator stopped
+/// before it was ready to serve.
+pub const STARTUP_OUTCOME_FAILURE: &str = "failure";
 
 /// The exact wire token for each closed [`StartupOutcome`] value.
 pub const fn startup_outcome_token(outcome: StartupOutcome) -> &'static str {
     match outcome {
         StartupOutcome::Success => STARTUP_OUTCOME_SUCCESS,
+        StartupOutcome::Failure => STARTUP_OUTCOME_FAILURE,
     }
 }
 
@@ -1675,13 +1690,11 @@ mod tests {
             "262144", "1048576", "86400", "604800", "100000", "10000", "8192", "3600", "2048",
             "1024", "501", "300", "256", "60", "24", "14",
         ];
-        let environment_detection_fragments = [
-            CI_ENV,
-            DOCKER_MARKER_PATH,
-            PODMAN_MARKER_PATH,
-            KUBERNETES_ENV,
-            ECS_ENV,
-        ];
+        let environment_detection_fragments: Vec<&str> = CI_ENVS
+            .iter()
+            .copied()
+            .chain([DOCKER_MARKER_PATH, PODMAN_MARKER_PATH, KUBERNETES_ENV, ECS_ENV])
+            .collect();
         let user_agent_marker_fragments: Vec<&str> = SDK_USER_AGENT_MARKERS
             .iter()
             .flat_map(|(_, markers)| markers.iter().copied())
@@ -1760,7 +1773,9 @@ mod tests {
                     ]
                     .map(memory_bucket_token),
                 )
-                .chain([StartupOutcome::Success].map(startup_outcome_token))
+                .chain(
+                    [StartupOutcome::Success, StartupOutcome::Failure].map(startup_outcome_token),
+                )
                 .chain([RunMode::Standalone, RunMode::Embedded].map(run_mode_token))
                 .collect();
 
@@ -1784,7 +1799,7 @@ mod tests {
                     );
                 }
                 if matches!(*file, "client.rs" | "metadata.rs") {
-                    for fragment in environment_detection_fragments {
+                    for &fragment in &environment_detection_fragments {
                         assert!(
                             !literal.contains(fragment),
                             "{file}: environment detection literal containing {fragment:?} must live in policy.rs"

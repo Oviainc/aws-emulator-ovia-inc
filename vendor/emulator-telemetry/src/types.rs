@@ -848,6 +848,7 @@ token_enum!(MemoryBucket, policy::memory_bucket_token);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StartupOutcome {
     Success,
+    Failure,
 }
 
 token_enum!(StartupOutcome, policy::startup_outcome_token);
@@ -1605,6 +1606,7 @@ mod tests {
             assert_eq!(value.as_str(), token);
         }
         assert_eq!(StartupOutcome::Success.as_str(), "success");
+        assert_eq!(StartupOutcome::Failure.as_str(), "failure");
     }
 
     #[test]

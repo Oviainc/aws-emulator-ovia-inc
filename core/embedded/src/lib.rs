@@ -25,7 +25,7 @@ use std::sync::Once;
 const TELEMETRY_PROJECT_ID: &str = "proj-a85d506b35244f71850223e92be29acb";
 
 /// The telemetry configuration endpoint. `None` leaves telemetry off.
-const TELEMETRY_CONFIG_ENDPOINT: Option<&str> = Some("https://e871klluo0.execute-api.us-west-2.amazonaws.com/prod/v1/config");
+const TELEMETRY_CONFIG_ENDPOINT: Option<&str> = Some("https://aws-emulator-telemetry.us-west-2.api.aws/v1/config");
 
 /// The emulator's folder in the user's home (config file, telemetry state).
 const EMULATOR_HOME_DIR: &str = ".aws/emulator";
@@ -48,6 +48,9 @@ impl AwsEmulatorEmbedded {
         start_telemetry(options.telemetry);
         let engine = std::sync::Arc::new(engine::InMemoryEngine::new());
         let mut router = aws_emulator_router::build_router(engine);
+        if let Some(telemetry) = emulator_telemetry::global() {
+            telemetry.mark_ready();
+        }
         router.set_request_authentication(options.authentication == Authentication::On);
         // The emulator is the one in-process surface: it serves both the SDK
         // `HttpClient` a host hands to a config's `.http_client(..)` (the router

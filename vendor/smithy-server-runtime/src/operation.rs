@@ -391,6 +391,12 @@ pub async fn run_operation_http<'r, O: Operation>(
             crate::RequestTelemetry::from_headers(&ctx.parts().headers).into_metadata(),
         )
     });
+    // Counts this operation as in flight for peak concurrency until the sequence
+    // returns; dropping the guard on any exit, including unwinding, ends it.
+    let _in_flight = recording
+        .then(emulator_telemetry::global)
+        .flatten()
+        .map(emulator_telemetry::TelemetryClient::begin_request);
 
     // The deserialize -> validate -> handle -> serialize sequence, with every
     // framework-level failure travelling as a `ProtocolError` so the single

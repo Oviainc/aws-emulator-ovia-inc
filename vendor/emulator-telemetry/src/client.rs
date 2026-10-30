@@ -351,6 +351,7 @@ struct RuntimePerformance {
     peak_concurrency: AtomicU64,
     cold_start_millis: AtomicU64,
     ready: AtomicBool,
+    startup_failed: AtomicBool,
 }
 
 impl RuntimePerformance {
@@ -361,6 +362,7 @@ impl RuntimePerformance {
             peak_concurrency: AtomicU64::new(0),
             cold_start_millis: AtomicU64::new(0),
             ready: AtomicBool::new(false),
+            startup_failed: AtomicBool::new(false),
         }
     }
 
@@ -377,6 +379,22 @@ impl RuntimePerformance {
             .is_ok()
         {
             self.ready.store(true, Ordering::Release);
+        }
+    }
+
+    fn mark_startup_failed(&self) {
+        if !self.ready.load(Ordering::Acquire) {
+            self.startup_failed.store(true, Ordering::Release);
+        }
+    }
+
+    fn startup_outcome(&self) -> Option<StartupOutcome> {
+        if self.ready.load(Ordering::Acquire) {
+            Some(StartupOutcome::Success)
+        } else if self.startup_failed.load(Ordering::Acquire) {
+            Some(StartupOutcome::Failure)
+        } else {
+            None
         }
     }
 }
@@ -696,10 +714,20 @@ impl TelemetryClient {
         self.inner.cache_failure.get()
     }
 
-    /// Mark generated router initialization complete for cold-start telemetry.
+    /// Mark the emulator ready to serve, for cold-start telemetry. The first
+    /// call sets the startup time; later calls change nothing.
     pub fn mark_ready(&self) {
         if let Some(live) = &self.inner.live {
             live.performance.mark_ready();
+        }
+    }
+
+    /// Record that the emulator stopped before it was ready to serve, so the
+    /// session reports a failed startup. No effect once [`Self::mark_ready`]
+    /// has run: an error after that is not a startup failure.
+    pub fn mark_startup_failed(&self) {
+        if let Some(live) = &self.inner.live {
+            live.performance.mark_startup_failed();
         }
     }
 
@@ -1099,23 +1127,74 @@ fn performance_block(
                 .load(Ordering::Relaxed)
                 .saturating_sub(1)
         }),
-        startup_outcome: ready.then_some(StartupOutcome::Success),
+        startup_outcome: performance.startup_outcome(),
     }
 }
 
+/// The session's peak memory use, bucketed. Left out on an OS with no peak
+/// reading.
 fn memory_usage_bucket() -> Option<crate::types::MemoryBucket> {
+    peak_memory_mebibytes().map(policy::memory_usage_bucket)
+}
+
+/// Linux: the kernel's resident-set high-water mark (`VmHWM`). Any other OS
+/// without `/proc/self/status` reads nothing.
+#[cfg(not(any(windows, target_vendor = "apple")))]
+fn peak_memory_mebibytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let kibibytes = status.lines().find_map(|line| {
-        let value = line.strip_prefix("VmRSS:")?.trim();
+    Some(peak_resident_kibibytes(&status)? / policy::KIBIBYTES_PER_MIB)
+}
+
+/// macOS: the peak resident set from `getrusage`, which macOS reports in bytes.
+#[cfg(target_vendor = "apple")]
+fn peak_memory_mebibytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` fully writes `usage` when it returns 0.
+    let usage = unsafe {
+        if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
+            return None;
+        }
+        usage.assume_init()
+    };
+    Some(u64::try_from(usage.ru_maxrss).ok()? / policy::BYTES_PER_MIB)
+}
+
+/// Windows: the process's peak working set.
+#[cfg(windows)]
+fn peak_memory_mebibytes() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let size = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>()).ok()?;
+    let mut counters = std::mem::MaybeUninit::<PROCESS_MEMORY_COUNTERS>::uninit();
+    // SAFETY: the pseudo-handle needs no closing, and `GetProcessMemoryInfo`
+    // fully writes `counters` (of `size` bytes) when it returns nonzero.
+    let counters = unsafe {
+        if GetProcessMemoryInfo(GetCurrentProcess(), counters.as_mut_ptr(), size) == 0 {
+            return None;
+        }
+        counters.assume_init()
+    };
+    Some(u64::try_from(counters.PeakWorkingSetSize).ok()? / policy::BYTES_PER_MIB)
+}
+
+#[cfg_attr(any(windows, target_vendor = "apple"), allow(dead_code))]
+fn peak_resident_kibibytes(status: &str) -> Option<u64> {
+    status.lines().find_map(|line| {
+        let value = line.strip_prefix("VmHWM:")?.trim();
         value.split_ascii_whitespace().next()?.parse::<u64>().ok()
-    })?;
-    let mebibytes = kibibytes / policy::KIBIBYTES_PER_MIB;
-    Some(policy::memory_usage_bucket(mebibytes))
+    })
+}
+
+/// Whether any CI marker variable is set, `is_set` reporting one variable.
+fn detect_ci(is_set: impl Fn(&str) -> bool) -> bool {
+    policy::CI_ENVS.iter().any(|name| is_set(name))
 }
 
 /// Detect coarse, non-identifying environment dimensions.
 fn detect_environment(feature_flags: TelemetryFeatureFlags, run_mode: RunMode) -> EnvironmentBlock {
-    let is_ci = std::env::var_os(policy::CI_ENV).is_some();
+    let is_ci = detect_ci(|name| std::env::var_os(name).is_some());
     let container_runtime = if std::env::var_os(policy::ECS_ENV).is_some() {
         ContainerRuntime::Ecs
     } else if std::env::var_os(policy::KUBERNETES_ENV).is_some() {
@@ -1148,10 +1227,26 @@ fn detect_environment(feature_flags: TelemetryFeatureFlags, run_mode: RunMode) -
         agent_client: None,
         region: None,
         run_mode,
-        install_channel: InstallChannel::Unknown,
+        install_channel: install_channel(run_mode, policy::RELEASE_BUILD, container_runtime),
         is_ci,
         container_runtime,
         feature_flags,
+    }
+}
+
+/// How this emulator was installed. Embedded, it is a crate the host builds.
+/// Standalone, the release build is the downloadable binary, and that binary
+/// in a container is the Docker image; any other build is from source.
+fn install_channel(
+    run_mode: RunMode,
+    release_build: bool,
+    container_runtime: ContainerRuntime,
+) -> InstallChannel {
+    match (run_mode, release_build, container_runtime) {
+        (RunMode::Embedded, _, _) => InstallChannel::Cargo,
+        (RunMode::Standalone, false, _) => InstallChannel::Source,
+        (RunMode::Standalone, true, ContainerRuntime::None) => InstallChannel::Binary,
+        (RunMode::Standalone, true, _) => InstallChannel::Docker,
     }
 }
 
@@ -1761,8 +1856,11 @@ impl WorkerState {
         let now = epoch_seconds_now();
         let _ = self.outbox.enforce_bounds(now);
         let config = if deadline.is_some() {
+            // A missing cache falls back to this session's decision before the shipped
+            // defaults, so the final flush never sends on terms the server did not set.
             let config = match load_cached_config(&self.config_cache, &self.context.project_id) {
-                Ok(cached) => Some(cached.map(|cached| cached.config).unwrap_or_default()),
+                Ok(Some(cached)) => Some(cached.config),
+                Ok(None) => Some(self.session_config(now).unwrap_or_default()),
                 Err(error) => {
                     self.report_cache_error(error);
                     self.session_config(now)
@@ -2126,6 +2224,62 @@ pub(crate) fn dispatch_generated_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_ci_marker_counts_as_ci_not_only_the_generic_one() {
+        assert!(!detect_ci(|_| false));
+        // Each marker alone is enough, including the CI systems that never
+        // set the generic one.
+        for &marker in policy::CI_ENVS {
+            assert!(detect_ci(|name| name == marker), "{marker} alone must mean CI");
+        }
+    }
+
+    #[test]
+    fn install_channel_follows_run_mode_release_build_and_container() {
+        use ContainerRuntime::{Docker, Kubernetes, None as Bare};
+        use InstallChannel::{Binary, Cargo, Docker as Image, Source};
+        for (run_mode, release_build, container, expected) in [
+            (RunMode::Embedded, true, Bare, Cargo),
+            (RunMode::Embedded, false, Docker, Cargo),
+            (RunMode::Standalone, false, Bare, Source),
+            (RunMode::Standalone, false, Docker, Source),
+            (RunMode::Standalone, true, Bare, Binary),
+            (RunMode::Standalone, true, Docker, Image),
+            (RunMode::Standalone, true, Kubernetes, Image),
+        ] {
+            assert_eq!(
+                install_channel(run_mode, release_build, container),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn startup_reports_failure_only_when_it_ends_before_ready() {
+        let pending = RuntimePerformance::new();
+        assert_eq!(performance_block(&pending, None).startup_outcome, None);
+
+        let failed = RuntimePerformance::new();
+        failed.mark_startup_failed();
+        let block = performance_block(&failed, None);
+        assert_eq!(block.startup_outcome, Some(StartupOutcome::Failure));
+        assert_eq!(block.cold_start_time, None);
+
+        let ready = RuntimePerformance::new();
+        ready.mark_ready();
+        ready.mark_startup_failed();
+        let block = performance_block(&ready, None);
+        assert_eq!(block.startup_outcome, Some(StartupOutcome::Success));
+        assert!(block.cold_start_time.is_some());
+    }
+
+    #[test]
+    fn memory_usage_reads_the_peak_not_the_current_resident_set() {
+        let status = "Name:\temulator\nVmHWM:\t  812345 kB\nVmRSS:\t  204800 kB\n";
+        assert_eq!(peak_resident_kibibytes(status), Some(812_345));
+        assert_eq!(peak_resident_kibibytes("VmRSS:\t204800 kB\n"), None);
+    }
 
     #[test]
     fn park_resumes_on_time_under_a_sustained_stream_of_commands() {

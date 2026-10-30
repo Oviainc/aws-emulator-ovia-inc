@@ -11,6 +11,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use aws_smithy_schema_server::xml_escape;
+
 pub mod aws_credentials;
 pub mod credential_store;
 pub use credential_store::CredentialStore;
@@ -492,10 +494,9 @@ fn envelope_for(facts: &RequestFacts) -> ErrorEnvelope {
 /// (`bytes::Bytes` for the buffered [`EmulatorService`] paths, `axum::body::Body` on
 /// the axum router), so one builder serves every serve path.
 ///
-/// `message` MUST NOT carry internal detail: it is returned to the sender. It
-/// must also be free of XML metacharacters, since the XML envelopes interpolate
-/// it verbatim; both call sites pass a `const` that satisfies this (enforced by
-/// a test).
+/// `message` MUST NOT carry internal detail: it is returned to the sender. The
+/// XML envelopes escape `code` and `message`, so any text renders as well-formed
+/// XML.
 pub fn wire_error_response<B: From<bytes::Bytes>>(
     status: http::StatusCode,
     code: &str,
@@ -511,7 +512,12 @@ pub fn wire_error_response<B: From<bytes::Bytes>>(
     } else {
         (String::new(), String::new())
     };
-    let (body, response_content_type, smithy_protocol) = match envelope_for(facts) {
+    let envelope = envelope_for(facts);
+    let (xml_code, xml_message) = match envelope {
+        ErrorEnvelope::Xml | ErrorEnvelope::Ec2Query => (xml_escape(code), xml_escape(message)),
+        ErrorEnvelope::Json { .. } | ErrorEnvelope::Cbor => (String::new(), String::new()),
+    };
+    let (body, response_content_type, smithy_protocol) = match envelope {
         ErrorEnvelope::Json { content_type } => (
             bytes::Bytes::from(
                 serde_json::to_vec(&serde_json::json!({
@@ -533,8 +539,8 @@ pub fn wire_error_response<B: From<bytes::Bytes>>(
             // the flag, so it keeps the wrapper.
             let body = if facts.no_error_wrapping {
                 format!(
-                    "<?xml version=\"1.0\"?><Error><Code>{code}</Code>\
-                     <Message>{message}</Message><RequestId>{request_id}</RequestId>\
+                    "<?xml version=\"1.0\"?><Error><Code>{xml_code}</Code>\
+                     <Message>{xml_message}</Message><RequestId>{request_id}</RequestId>\
                      <HostId>{host_id}</HostId></Error>"
                 )
             } else {
@@ -550,7 +556,7 @@ pub fn wire_error_response<B: From<bytes::Bytes>>(
                 };
                 format!(
                     "<?xml version=\"1.0\"?><ErrorResponse><Error><Type>{fault}</Type>\
-                     <Code>{code}</Code><Message>{message}</Message></Error></ErrorResponse>"
+                     <Code>{xml_code}</Code><Message>{xml_message}</Message></Error></ErrorResponse>"
                 )
             };
             (bytes::Bytes::from(body), "application/xml", None)
@@ -562,7 +568,7 @@ pub fn wire_error_response<B: From<bytes::Bytes>>(
         ErrorEnvelope::Ec2Query => (
             bytes::Bytes::from(format!(
                 "<?xml version=\"1.0\"?><Response><Errors><Error>\
-                 <Code>{code}</Code><Message>{message}</Message>\
+                 <Code>{xml_code}</Code><Message>{xml_message}</Message>\
                  </Error></Errors></Response>"
             )),
             "application/xml",
@@ -588,7 +594,7 @@ pub fn wire_error_response<B: From<bytes::Bytes>>(
     // headers whose values the unwrapped body's `<RequestId>`/`<HostId>` mirror.
     // Only the XML envelope sets the flag's meaning, so this is a no-op for every
     // other protocol even if `no_error_wrapping` is somehow set.
-    if facts.no_error_wrapping && matches!(envelope_for(facts), ErrorEnvelope::Xml) {
+    if facts.no_error_wrapping && envelope == ErrorEnvelope::Xml {
         builder = builder
             .header(REQUEST_ID_HEADER, &request_id)
             .header(EXTENDED_REQUEST_ID_HEADER, &host_id);
@@ -1200,6 +1206,11 @@ pub async fn serve_production_on_address<S: EmulatorService>(
         %bind_address,
         "emulator server starting: serving the API and {HEALTH_PATH} over HTTPS on one port"
     );
+    // Ready means the port is bound and the client files are written: an error
+    // before this point is a failed startup.
+    if let Some(telemetry) = emulator_telemetry::global() {
+        telemetry.mark_ready();
+    }
 
     tokio::select! {
         result = axum_server::from_tcp_rustls(data_listener, tls_config)
@@ -1841,7 +1852,7 @@ pub async fn serve_emulator<R: EmulatorService>(router: R) -> ! {
 pub async fn serve_emulator_until_shutdown<R: EmulatorService>(
     router: R,
 ) -> Result<(), ServeError> {
-    serve_production(router).await
+    reporting_startup_failure(serve_production(router).await)
 }
 
 /// [`serve_emulator_until_shutdown`] with explicit bind address and port
@@ -1852,7 +1863,18 @@ pub async fn serve_emulator_on<R: EmulatorService>(
     bind_address: IpAddr,
     data_port: u16,
 ) -> Result<(), ServeError> {
-    serve_production_on_address(router, bind_address, data_port).await
+    reporting_startup_failure(serve_production_on_address(router, bind_address, data_port).await)
+}
+
+/// Telemetry reports a serve that ended in an error before it was ready as a
+/// failed startup; an error after ready leaves the startup outcome as it is.
+fn reporting_startup_failure(result: Result<(), ServeError>) -> Result<(), ServeError> {
+    if result.is_err()
+        && let Some(telemetry) = emulator_telemetry::global()
+    {
+        telemetry.mark_startup_failed();
+    }
+    result
 }
 
 // Initialize the standard JSON tracing subscriber for emulator binaries.
@@ -2328,6 +2350,8 @@ mod tests {
         // No test in this crate sets EMULATOR_DATA_PORT, so the resolver must
         // return the well-known port.
         check!(data_port_from_env() == DEFAULT_DATA_PORT);
+        // Customers copy this port from the AWS Emulator user guide. Changing
+        // it needs a user guide change in the same release.
         check!(DEFAULT_DATA_PORT == 9297);
     }
 
@@ -3313,16 +3337,24 @@ mod tests {
     }
 
     #[test]
-    fn boundary_error_messages_need_no_xml_escaping() {
-        // The XML envelopes interpolate the message verbatim, so every message
-        // the boundary can emit must be free of XML metacharacters.
-        for message in [INTERNAL_FAILURE_MESSAGE, INVALID_REQUEST_BODY_MESSAGE] {
-            for meta in ['&', '<', '>', '"', '\''] {
-                check!(
-                    !message.contains(meta),
-                    "boundary message must not need XML escaping: {message:?} contains {meta:?}"
-                );
-            }
+    fn xml_error_envelopes_escape_code_and_message() {
+        // restXml, awsQuery, and the EC2 query envelope.
+        let form = "application/x-www-form-urlencoded";
+        for request in [
+            facts(Some("application/xml")),
+            facts(Some(form)),
+            signed_facts(Some(form), Some("ec2")),
+        ] {
+            let response: http::Response<bytes::Bytes> = wire_error_response(
+                http::StatusCode::BAD_REQUEST,
+                "Bad<Code>",
+                "a & b </Message><Injected/>",
+                &request,
+            );
+            let xml = String::from_utf8(response.body().to_vec()).expect("utf-8 xml");
+            check!(xml.contains("<Code>Bad&lt;Code&gt;</Code>"));
+            check!(xml.contains("<Message>a &amp; b &lt;/Message&gt;&lt;Injected/&gt;</Message>"));
+            check!(!xml.contains("<Injected/>"));
         }
     }
 

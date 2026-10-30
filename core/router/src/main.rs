@@ -67,7 +67,7 @@ const TELEMETRY_PROJECT_ID: &str = "proj-a85d506b35244f71850223e92be29acb";
 const EMULATOR_HOME_DIR: &str = ".aws/emulator";
 
 /// The telemetry configuration endpoint. `None` leaves the client inert.
-const TELEMETRY_CONFIG_ENDPOINT: Option<&str> = Some("https://e871klluo0.execute-api.us-west-2.amazonaws.com/prod/v1/config");
+const TELEMETRY_CONFIG_ENDPOINT: Option<&str> = Some("https://aws-emulator-telemetry.us-west-2.api.aws/v1/config");
 
 /// Environment variable overriding [`EMULATOR_STACK_SIZE`], in BYTES, for a host that
 /// refuses a large thread stack. A malformed or too-small value falls back to the

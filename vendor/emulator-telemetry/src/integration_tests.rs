@@ -383,6 +383,36 @@ fn shutdown_uses_cached_config_without_revalidation() {
 }
 
 #[test]
+fn shutdown_without_a_cache_keeps_the_session_decision_not_the_defaults() {
+    // Two rows per batch is the envelope plus one metric, so the server's
+    // decision shows as one batch per operation; the shipped default does not.
+    let config =
+        default_config_json().replace("\"maxRowsPerBatch\": 1000", "\"maxRowsPerBatch\": 2");
+    let server = TestServer::start(&config);
+    let dir = tempfile::tempdir().unwrap();
+    opt_in(dir.path());
+
+    let client = client_for(&server.base_url, dir.path());
+    assert!(client.flush_blocking(WAIT));
+    std::fs::remove_file(dir.path().join(SERVER_CONFIG_CACHE_FILE)).unwrap();
+
+    record_sample_op(&client, "FirstOperation", Outcome::Success);
+    record_sample_op(&client, "SecondOperation", Outcome::Success);
+    client.shutdown(WAIT);
+
+    let final_bodies: Vec<String> = server
+        .ingest_bodies()
+        .into_iter()
+        .filter(|body| body.contains("Operation\""))
+        .collect();
+    assert_eq!(
+        final_bodies.len(),
+        2,
+        "the final flush must batch on the session's server decision, not the shipped default"
+    );
+}
+
+#[test]
 fn oversized_config_response_is_rejected_and_negatively_cached() {
     let oversized = format!(
         "{{\"enabled\":true,\"padding\":\"{}\"}}",
