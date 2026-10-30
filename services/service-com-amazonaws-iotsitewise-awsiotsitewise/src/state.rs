@@ -5981,6 +5981,42 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .count()
     }
 
+    /// The pipeline of `workspace_name` whose definition names `task_name` on a
+    /// compute node, as `(pipelineName, computeNodeName)`, or `None` when no
+    /// pipeline of that workspace references the task.
+    ///
+    /// A compute node "references a task" through its `taskName`, and the
+    /// definition that counts is the pipeline's CURRENT version: that is the one
+    /// a start of the pipeline runs its nodes from
+    /// (`crate::ops::start_pipeline_execution`), so a version a later write
+    /// superseded references nothing any more. The dependency a task carries as
+    /// something a pipeline points at, which is what the operation that removes
+    /// a task has to refuse on — the same question
+    /// [`Self::hierarchy_parent`] answers for an asset.
+    ///
+    /// The pipelines are held in a hash map, so the smallest
+    /// `(pipelineName, computeNodeName)` pair is reported rather than whichever
+    /// the map yields first: one store state then always names one reference,
+    /// whatever order the map iterates in.
+    pub fn pipeline_referencing_task(
+        &self,
+        workspace_name: &str,
+        task_name: &str,
+    ) -> Option<(&str, &str)> {
+        self.pipelines
+            .values()
+            .filter(|pipeline| pipeline.workspace_name == workspace_name)
+            .flat_map(|pipeline| {
+                pipeline
+                    .current
+                    .computations
+                    .iter()
+                    .filter(|node| node.task_name == task_name)
+                    .map(|node| (pipeline.name.as_str(), node.compute_node_name.as_str()))
+            })
+            .min()
+    }
+
     /// Forget a pipeline and everything keyed off it: every version it holds and
     /// its tags (both on the record) and the executions recorded against it — so
     /// no later read resolves to a pipeline this service no longer holds.

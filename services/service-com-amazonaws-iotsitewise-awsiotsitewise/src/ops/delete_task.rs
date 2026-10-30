@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +146,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTaskError::Modeled(DeleteTaskErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+
+        let key = crate::state::task_key(&input.workspace_name, &input.task_name);
+        let mut store = state.lock();
+        // The resources the path names are resolved OUTSIDE IN, as this service's
+        // other handlers resolve the resource a path names before the one inside
+        // it, so a request that names none of them reports the outermost absence.
+        if !store.workspaces.contains_key(&input.workspace_name) {
+            return Err(not_found(
+                crate::state::RESOURCE_WORKSPACE,
+                &input.workspace_name,
+            ));
+        }
+        // A task is identified by its workspace and its own name, so the lookup is
+        // scoped to the workspace the request names and an absence there is the
+        // modelled 404 — including for a workspace that holds no task of that name,
+        // and for a second delete of a task the first one already removed.
+        if !store.tasks.contains_key(&key) {
+            return Err(not_found(crate::state::RESOURCE_TASK, &input.task_name));
+        }
+
+        // "A task cannot be deleted if it is currently referenced by any existing
+        // pipeline. Remove the task from all pipelines before attempting to delete
+        // it." A compute node references the task its `taskName` names, so the
+        // delete is refused while any pipeline of this workspace still has such a
+        // node. This is a TERMINAL request error — the caller has to rewrite or
+        // delete those pipelines first, and no retry of this call can succeed — so
+        // it is `InvalidRequestException` (400) and not the retryable
+        // `ConflictingOperationException` (409), which states a transient conflict
+        // between two operations on one resource; the same rule, and the same
+        // mapping, as `DeleteAsset`, `DeleteAssetModel` and `DeleteWorkspace` give a
+        // delete whose resource is still depended on. The precondition is evaluated
+        // BEFORE anything is removed, so a refused delete leaves the task, its
+        // versions and its tags exactly as they were.
+        if let Some((pipeline, compute_node)) =
+            store.pipeline_referencing_task(&input.workspace_name, &input.task_name)
+        {
+            return Err(DeleteTaskError::Modeled(
+                DeleteTaskErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: format!(
+                        "The task {} is referenced by the compute node {compute_node} of \
+                         the pipeline {pipeline}. Remove the task from all pipelines \
+                         before attempting to delete it.",
+                        input.task_name
+                    ),
+                }),
+            ));
+        }
+
+        // The task's versions and its tags live on its record, so removing the
+        // record takes them with it: no later read resolves to the task, its tags
+        // stop resolving by ARN, and the name it held is free for another create.
+        // Nothing else in this store is keyed off a task — a pipeline execution
+        // keeps its OWN copy of what each of its nodes ran, and a pipeline that
+        // names this task could not have got past the refusal above — so there is
+        // nothing further to forget.
+        store.tasks.remove(&key);
+
+        Ok(DeleteTaskOutput {
+            // The lifecycle state of a resource this call has removed, as this
+            // service's other deletes report it.
+            status: ResourceStatus {
+                state: Some(crate::state::STATE_DELETING.to_string()),
+                error: None,
+            },
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` for the resource of `kind` the request
+/// named: a workspace this service does not hold, or a task that workspace does
+/// not hold.
+fn not_found(kind: &str, identifier: &str) -> DeleteTaskError {
+    DeleteTaskError::Modeled(DeleteTaskErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(kind, identifier),
+        },
+    ))
 }

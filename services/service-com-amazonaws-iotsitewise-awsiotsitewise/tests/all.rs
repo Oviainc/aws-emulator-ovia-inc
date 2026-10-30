@@ -17,6 +17,13 @@
 // stretches every concurrent iotsitewise change puts a declaration of its own in,
 // and each attempt to land this one in either collided with a branch that had just
 // inserted beside it. Fold it into the list once the churn settles.
+// `task_delete` is declared HERE, at the head of the file, rather than in the
+// sorted list or at the END: those are the two stretches every concurrent
+// iotsitewise change puts a declaration of its own in. Fold it into the list once
+// the churn settles.
+#[path = "all/task_delete.rs"]
+mod task_delete;
+
 #[path = "all/query_results.rs"]
 mod query_results;
 
