@@ -9,7 +9,7 @@
 //! behind, so an update cannot reach a workload a create would have refused: a
 //! workload always names at least one Region, every Region it names is a Region, its
 //! industry type is one the service publishes, and it is always reviewed in some pillar
-//! order.
+//! order, every entry of which resolves to a pillar the workload has.
 //!
 //! ## Shape of an operation
 //!
@@ -269,6 +269,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::either_regions_exception(),
                 )
                 .into());
+            }
+
+            // The same rule `CreateWorkload` applies to the order it creates a workload in:
+            // an entry of the order is a pillar IDENTIFIER
+            // ("Each pillar is represented by its `PillarReviewSummary$PillarId`",
+            // `PillarPriorities` doc), so it has to name a pillar this workload HAS — one
+            // of the framework's own, or one a lens it reviews defines. Judged on the order
+            // the merge WOULD leave behind and refused before anything is mutated, so an
+            // update cannot leave a workload reviewed in an order no create could have
+            // produced.
+            if let Some(priorities) = input.pillar_priorities.as_deref() {
+                if let Some(exception) = crate::state::undefined_pillar_priority_refusal(
+                    priorities,
+                    &store.reviewed_lens_content(&stored.reviewed_lens_versions()),
+                ) {
+                    return Err(
+                        UpdateWorkloadErrorModeled::ValidationException(exception).into()
+                    );
+                }
             }
         }
 

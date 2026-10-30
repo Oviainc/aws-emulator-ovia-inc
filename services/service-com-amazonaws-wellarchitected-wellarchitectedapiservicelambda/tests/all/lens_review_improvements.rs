@@ -1135,8 +1135,9 @@ struct Served {
 /// prioritised pillar's risk-bearing questions in turn, in the lens's own order inside one
 /// pillar, with the pillars those priorities do not name behind every pillar they do. Rows
 /// differ along how the workload came by its priorities and along the list itself — its
-/// length, its order, whether it names every pillar, a pillar the lens does not have, the
-/// same pillar twice, or nothing at all (which leaves the order the workload already has).
+/// length, its order (the framework's own, reversed, and rotated), whether it names every
+/// pillar or leaves some unranked, the same pillar twice, or nothing at all (which leaves
+/// the order the workload already has).
 #[tokio::test]
 async fn the_workloads_pillar_priorities_order_the_improvement_plan() {
     // The framework's own pillar order, which is what a workload that names no priorities
@@ -1145,6 +1146,13 @@ async fn the_workloads_pillar_priorities_order_the_improvement_plan() {
         .iter()
         .map(|(pillar_id, _, _)| *pillar_id)
         .collect();
+    // The framework's own order rotated, so the row that names it ranks every pillar
+    // differently from the rows that name the order itself or its reverse.
+    let rotated_order: Vec<&str> = {
+        let mut rotated = framework_order.clone();
+        rotated.rotate_left(2);
+        rotated
+    };
 
     let rows: Vec<Priorities> = vec![
         Priorities {
@@ -1172,10 +1180,15 @@ async fn the_workloads_pillar_priorities_order_the_improvement_plan() {
             priorities: vec!["costOptimization"],
         },
         Priorities {
-            case: "pillar-the-lens-does-not-have",
-            created_with: Some(vec!["notapillar", "performance"]),
+            // This row used to name a pillar no lens defines. An order whose entry resolves
+            // to no pillar of the workload never reaches a stored workload now — both
+            // operations that write the member refuse it, which
+            // `super::workload_pillar_identity` pins — so the row varies the ORDER the plan
+            // is served in instead.
+            case: "every-pillar-rotated",
+            created_with: Some(rotated_order.clone()),
             updated_to: None,
-            priorities: vec!["notapillar", "performance"],
+            priorities: rotated_order.clone(),
         },
         Priorities {
             case: "same-pillar-twice",

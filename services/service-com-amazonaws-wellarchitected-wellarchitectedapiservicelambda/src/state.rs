@@ -2136,6 +2136,20 @@ impl ReviewedLensContent {
             .get(lens_alias(lens))
             .unwrap_or_else(|| LensContentView::nothing())
     }
+
+    /// Every `PillarId` the lenses of this resource's reviews are organized into: the
+    /// union of their pillar sets ([`LensContentView::pillar_ids`]), which is the set of
+    /// pillars those reviews report a `PillarReviewSummary` for.
+    ///
+    /// Empty for a resource whose lenses this emulator holds no content for, which is
+    /// organized into no pillars HERE — so a caller judging a `PillarId` against this set
+    /// has nothing of that lens to judge it by.
+    pub fn pillar_ids(&self) -> BTreeSet<&str> {
+        self.lenses
+            .values()
+            .flat_map(LensContentView::pillar_ids)
+            .collect()
+    }
 }
 
 /// The pillars ONE lens review reports a summary for, each with the `PillarName` the lens
@@ -4339,6 +4353,63 @@ pub fn resolved_pillar_priorities(
         _ if !current.is_empty() => current.to_vec(),
         _ => default_pillar_priorities(),
     }
+}
+
+/// The modelled input member a pillar-priority finding names
+/// (`CreateWorkloadInput$PillarPriorities`, `UpdateWorkloadInput$PillarPriorities`), as
+/// `ValidationExceptionField$Name` reports it.
+pub const PILLAR_PRIORITIES_MEMBER: &str = "PillarPriorities";
+
+/// The refusal for a pillar priority order that names a pillar the workload has none of,
+/// or `None` when every entry of it resolves to a pillar.
+///
+/// "Each pillar is represented by its `PillarReviewSummary$PillarId`"
+/// (`WorkloadPillarPriorities` doc) and "a pillar is identified by its
+/// `PillarReviewSummary$PillarId`" (`PillarId` doc): an entry of the order a workload is
+/// reviewed in is a pillar IDENTIFIER, so it has to name a pillar that exists — one of the
+/// framework's own pillars ([`WELL_ARCHITECTED_PILLARS`], the order a workload that names
+/// none is reviewed in), or a pillar a lens the workload reviews defines, which is what
+/// that lens review reports a `PillarReviewSummary` for. An identifier outside both names
+/// no pillar of the workload and is refused rather than stored, exactly as
+/// [`undefined_pillar_refusal`] refuses one that names no pillar of the lens under review.
+///
+/// Unlike that sibling, this rule needs no carve-out for a lens this emulator holds no
+/// content for: every lens AWS publishes is organized into the framework's own pillars
+/// ([`WELL_ARCHITECTED_PILLARS`]), which the judged set always carries, and a CUSTOM lens
+/// whose document names pillars of its own cannot be reviewed by a workload until a version
+/// of it has been published ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::unapplicable_lenses_refusal`]) —
+/// at which point its content IS held. So a reviewed lens with no content here defines no
+/// pillar the set is missing, and nothing legitimate is refused for want of its content.
+///
+/// The offending ids are sorted and deduplicated, so the refusal does not depend on the
+/// order the request listed them in. Shared by both operations that write the member, so
+/// they cannot word it differently or hold the member to different sets.
+pub fn undefined_pillar_priority_refusal(
+    priorities: &[String],
+    reviewed: &ReviewedLensContent,
+) -> Option<crate::ops::types::ValidationException> {
+    let mut defined: BTreeSet<&str> = WELL_ARCHITECTED_PILLARS
+        .iter()
+        .map(|(pillar_id, _)| *pillar_id)
+        .collect();
+    defined.extend(reviewed.pillar_ids());
+    let mut undefined: Vec<&str> = priorities
+        .iter()
+        .map(String::as_str)
+        .filter(|pillar_id| !defined.contains(pillar_id))
+        .collect();
+    if undefined.is_empty() {
+        return None;
+    }
+    undefined.sort_unstable();
+    undefined.dedup();
+    Some(member_constraint_exception(
+        PILLAR_PRIORITIES_MEMBER,
+        &format!(
+            "every pillar must be a pillar the workload is reviewed in, which {} is not",
+            undefined.join(", ")
+        ),
+    ))
 }
 
 /// What a `CreateWorkload` idempotency token resolves to: the workload the original

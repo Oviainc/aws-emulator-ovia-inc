@@ -7,10 +7,11 @@
 //! A `ReviewTemplateArns` entry is resolved against the stored review templates, and the
 //! lenses, notes and recorded review content (the answers, and each lens review's notes
 //! and pillar notes) of an applied template carry over to the new workload. Every lens
-//! the request names is resolved against the service's lens catalog first, and a member
+//! the request names is resolved against the service's lens catalog first, a member
 //! whose documentation publishes a value set — the Regions the workload runs in, its
-//! industry type — is held to that set, so the store never holds a workload the real
-//! service would have refused.
+//! industry type — is held to that set, and every entry of the pillar order the workload
+//! is reviewed in has to resolve to a pillar the workload has, so the store never holds a
+//! workload the real service would have refused.
 //!
 //! ## Shape of an operation
 //!
@@ -553,6 +554,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The answers and the per-lens notes an applied review template pre-populated the
         // workload's reviews with, written onto the reviews just created.
         let answers = crate::state::apply_carried_review_content(carried, &mut lens_reviews);
+
+        // "Each pillar is represented by its `PillarReviewSummary$PillarId`"
+        // (`PillarPriorities` doc): an entry of the order is a pillar IDENTIFIER, so it has
+        // to name a pillar the created workload HAS — one of the framework's own, or one a
+        // lens it ends up reviewing defines — judged through the one place that rule lives,
+        // the same one `UpdateWorkload` judges the member it merges through. Judged here
+        // rather than earlier because the pillar set depends on the lenses the workload
+        // ends up with, the applied review templates' lenses included, and refused before
+        // the workload is minted, so the store never holds an order naming a pillar nothing
+        // defines.
+        // The lenses the workload ends up reviewing, each as the request named it beside the
+        // version its review pins — the projection
+        // `crate::state::WorkloadRecord::reviewed_lens_versions` makes of a STORED workload,
+        // built here from the same two halves, because a custom lens's content is reached by
+        // the ARN that names it rather than by the alias its review is keyed under.
+        let reviewed_lenses: Vec<(&str, Option<&str>)> = lenses
+            .iter()
+            .map(|lens| {
+                (
+                    lens.as_str(),
+                    lens_reviews
+                        .get(crate::state::lens_alias(lens))
+                        .and_then(|review| review.lens_version.as_deref()),
+                )
+            })
+            .collect();
+        if let Some(exception) = crate::state::undefined_pillar_priority_refusal(
+            &pillar_priorities,
+            &store.reviewed_lens_content(&reviewed_lenses),
+        ) {
+            return Err(CreateWorkloadErrorModeled::ValidationException(exception).into());
+        }
 
         let workload_id = store.mint_workload_id();
         let record = crate::state::WorkloadRecord {
