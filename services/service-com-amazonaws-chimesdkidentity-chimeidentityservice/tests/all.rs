@@ -25,3 +25,5 @@ mod resource_update;
 mod signing_name_route_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/user_expiration_settings.rs"]
+mod user_expiration_settings;

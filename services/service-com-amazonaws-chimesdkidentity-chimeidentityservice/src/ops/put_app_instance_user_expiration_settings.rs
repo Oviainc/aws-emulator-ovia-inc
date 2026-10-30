@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAppInstanceUserExpirationSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAppInstanceUserExpirationSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAppInstanceUserExpirationSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +151,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAppInstanceUserExpirationSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAppInstanceUserExpirationSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutAppInstanceUserExpirationSettingsErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    code: Some("ServiceFailure".to_string()),
+                    message: Some("the AppInstance store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        let Some(record) = state.user_mut(&input.app_instance_user_arn) else {
+            // This operation models no 404 shape, so an unknown ARN is refused with the
+            // modelled `BadRequestException` carrying the `NotFound` error code — the
+            // same refusal `DescribeAppInstanceUser` states for an absent user.
+            return Err(
+                PutAppInstanceUserExpirationSettingsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstanceUser {} does not exist",
+                            input.app_instance_user_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A PUT of the settings REPLACES whatever the user carried, and a request that
+        // carries no `ExpirationSettings` clears them: the member is optional on both
+        // the request and the response, so "absent" is how a caller says "this user
+        // never expires" and how the service reports that back.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAppInstanceUserExpirationSettings"))
+        // Nothing is deleted here. AWS expires a user through a background process that
+        // runs within 6 hours of the expiration instant, and a user whose expiration has
+        // passed but which has not been collected yet still reads as active and can have
+        // its settings replaced — which is exactly what this handler serves.
+        record.expiration_settings = input.expiration_settings;
+        // Writing the settings writes the user, so its last-updated instant moves, the
+        // way every other operation that changes a user stamps it.
+        record.last_updated_timestamp = ::std::time::SystemTime::now();
+
+        Ok(PutAppInstanceUserExpirationSettingsOutput {
+            app_instance_user_arn: Some(record.arn.clone()),
+            expiration_settings: record.expiration_settings.clone(),
+        })
     }
 }
