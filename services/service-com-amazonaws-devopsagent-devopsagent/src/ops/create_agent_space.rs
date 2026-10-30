@@ -241,6 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
             tasks: ::std::collections::HashMap::new(),
+            triggers: ::std::collections::HashMap::new(),
             operator_app: None,
         };
         if let Some(token) = input.client_token.as_deref() {

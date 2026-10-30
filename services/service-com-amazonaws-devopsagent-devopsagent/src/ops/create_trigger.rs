@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTrigger
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTrigger`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTrigger::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a new Trigger into [`crate::state`], so `GetTrigger` reads
+//! back what this operation stored.
 //!
 //! ## Shape of an operation
 //!
@@ -95,13 +88,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-devopsagent-devopsagent
 // here — hence the `CreateTriggerError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.devopsagent#CreateTrigger")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.devopsagent#CreateTrigger",
+    extra_errors = ["ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum CreateTriggerErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    // Widened in through `extra_errors`: the SERVICE declares
+    // `ServiceQuotaExceededException` (HTTP 402) as a common error, which is what a
+    // per-agent-space Trigger quota has to answer with.
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -120,6 +120,14 @@ impl From<CreateTriggerErrorModeled> for CreateTriggerError {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
+
+/// The status a Trigger created without one carries.
+///
+/// `TriggerStatus` is a free-form string in the model (len 1..64) with no value
+/// set, and `CreateTriggerInput$status` is documented as "The initial status of the
+/// Trigger" — so this is the CHOSEN status of a Trigger whose caller named none: a
+/// Trigger that was just created fires on its schedule.
+const INITIAL_TRIGGER_STATUS: &str = "ENABLED";
 
 /// The `CreateTrigger` operation.
 ///
@@ -157,18 +165,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTrigger` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTriggerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTrigger"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTriggerErrorModeled::InternalServerException(InternalServerException {
+                message: "the DevOps Agent state store is unavailable".to_string(),
+            })
+        })?;
+
+        // `TriggerCondition$schedule`: "On CreateTrigger supply exactly one of the
+        // schedule condition's expression or spec." The model cannot express a choice
+        // between two optional members, so a request naming both or neither is refused
+        // with the modelled client error.
+        let TriggerCondition::Schedule(schedule) = &input.condition;
+        let (expression, spec) = match (schedule.expression.as_deref(), schedule.spec.as_ref()) {
+            (Some(expression), None) => (expression.to_string(), None),
+            (None, Some(spec)) => {
+                // A structured schedule is the source of truth, and the expression it
+                // fires on is derived from it.
+                let derived =
+                    crate::state::derived_schedule_expression(spec).ok_or_else(|| {
+                        CreateTriggerErrorModeled::ValidationException(ValidationException {
+                            message: "condition.schedule.spec does not describe a schedule"
+                                .to_string(),
+                            field_list: Some(vec![ValidationExceptionField {
+                                path: "condition.schedule.spec".to_string(),
+                                message: "Member must describe a schedule".to_string(),
+                            }]),
+                        })
+                    })?;
+                (derived, Some(spec.clone()))
+            }
+            (expression, spec) => {
+                let supplied = if expression.is_some() && spec.is_some() {
+                    "both"
+                } else {
+                    "neither"
+                };
+                return Err(CreateTriggerErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "condition.schedule must supply exactly one of expression or spec, \
+                             but {supplied} was supplied"
+                        ),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: "condition.schedule".to_string(),
+                            message: "Member must supply exactly one of expression or spec"
+                                .to_string(),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let trigger_count = match store.agent_spaces.get(&input.agent_space_id) {
+            Some(space) => space.triggers.len(),
+            None => {
+                return Err(CreateTriggerErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Agent space not found: {}", input.agent_space_id),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // Every Trigger is a stored record under its agent space, so the number of
+        // them one space can hold is bounded: past the quota this operation answers
+        // the service's `ServiceQuotaExceededException` (HTTP 402) instead of growing
+        // the space without end.
+        if trigger_count >= crate::state::MAX_TRIGGERS_PER_AGENT_SPACE {
+            return Err(CreateTriggerErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the maximum number of triggers ({}) for agent space {}",
+                        crate::state::MAX_TRIGGERS_PER_AGENT_SPACE, input.agent_space_id
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotencyToken`: a repeat with the same token returns the Trigger the
+        // first call created instead of minting a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = store
+                .replayed_id(Self::NAME, token, now)
+                .and_then(|trigger_id| {
+                    store
+                        .agent_spaces
+                        .get(&input.agent_space_id)
+                        .and_then(|space| space.triggers.get(&trigger_id))
+                })
+            {
+                return Ok(CreateTriggerOutput {
+                    trigger: existing.to_api(),
+                });
+            }
+        }
+
+        // A Trigger is the schedule of a goal in this agent space, so the identifier
+        // it is minted with is a goal identifier — the one form an operation that
+        // names a Trigger accepts.
+        let trigger_id = store.mint_trigger_id();
+        let record = crate::state::TriggerRecord {
+            trigger_id: trigger_id.clone(),
+            agent_space_id: input.agent_space_id.clone(),
+            trigger_type: input.r#type,
+            schedule_expression: expression,
+            schedule_spec: spec,
+            action: input.action,
+            status: input
+                .status
+                .unwrap_or_else(|| INITIAL_TRIGGER_STATUS.to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+        if let Some(token) = input.client_token.as_deref() {
+            store.record_client_token(Self::NAME, token, &trigger_id, now);
+        }
+        let space = store
+            .agent_spaces
+            .get_mut(&input.agent_space_id)
+            .ok_or_else(|| {
+                CreateTriggerErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Agent space not found: {}", input.agent_space_id),
+                })
+            })?;
+        space.triggers.insert(trigger_id.clone(), record);
+
+        // Read the response back out of the store, so what the caller sees is what
+        // was persisted.
+        let stored = space.triggers.get(&trigger_id).ok_or_else(|| {
+            CreateTriggerErrorModeled::InternalServerException(InternalServerException {
+                message: format!("trigger {trigger_id} was not persisted"),
+            })
+        })?;
+        Ok(CreateTriggerOutput {
+            trigger: stored.to_api(),
+        })
     }
 }

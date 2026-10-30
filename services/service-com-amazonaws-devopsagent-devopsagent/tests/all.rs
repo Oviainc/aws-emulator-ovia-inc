@@ -17,3 +17,5 @@ mod agent_space_lifecycle;
 mod operator_app;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/triggers.rs"]
+mod triggers;

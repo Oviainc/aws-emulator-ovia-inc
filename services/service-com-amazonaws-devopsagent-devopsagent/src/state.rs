@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AgentSpace, IamAuthConfiguration, IdcAuthConfiguration, IdpAuthConfiguration, ReferenceOutput,
-    Task,
+    AgentSpace, IamAuthConfiguration, IdcAuthConfiguration, IdpAuthConfiguration, Recurrence,
+    ReferenceOutput, ScheduleCondition, ScheduleSpec, Task, Trigger, TriggerCondition,
 };
 
 /// The most AgentSpaces this emulator stores for the account before
@@ -29,6 +29,11 @@ pub const MAX_AGENT_SPACES: usize = 1_000;
 /// `ServiceQuotaExceededException`. CHOSEN for the same reason as
 /// [`MAX_AGENT_SPACES`]: the model states no task quota.
 pub const MAX_TASKS_PER_AGENT_SPACE: usize = 1_000;
+
+/// The most Triggers one AgentSpace holds before `CreateTrigger` answers
+/// `ServiceQuotaExceededException`. CHOSEN for the same reason as
+/// [`MAX_AGENT_SPACES`]: the model states no Trigger quota.
+pub const MAX_TRIGGERS_PER_AGENT_SPACE: usize = 1_000;
 
 /// How long a recorded `@idempotencyToken` replays the result of the create that
 /// first used it.
@@ -67,6 +72,34 @@ pub const AUTH_FLOW_IDP: &str = "idp";
 /// This service's own endpoint and ARN namespace (`aidevops`), from the model's
 /// `aws.api#service` trait — `smithy_query(query="service_info")`.
 pub const ARN_NAMESPACE: &str = "aidevops";
+
+/// The prefix every Trigger identifier carries.
+///
+/// A Trigger is the schedule of one goal in its agent space, so the identifier
+/// that names a Trigger IS that goal's identifier. The model constrains
+/// `triggerId` no further than `ResourceId` (`^[a-zA-Z0-9_.-]+$`, 1..128), so the
+/// narrower form a Trigger identifier takes is enforced here.
+pub const TRIGGER_ID_PREFIX: &str = "goal-";
+
+/// The form a Trigger identifier takes: [`TRIGGER_ID_PREFIX`] followed by a
+/// non-empty goal id, whose characters are the ones `ResourceId` already admits.
+/// Rendered into the refusal a malformed identifier gets, so the caller reads the
+/// requirement it missed.
+pub const TRIGGER_ID_PATTERN: &str = "^goal-[a-zA-Z0-9_.-]+$";
+
+/// Whether `value` has the form of a Trigger identifier, i.e. satisfies
+/// [`TRIGGER_ID_PATTERN`].
+///
+/// An identifier that does not is refused as invalid rather than looked up: it
+/// names no goal, so it can name no Trigger in any agent space.
+pub fn is_trigger_id(value: &str) -> bool {
+    value.strip_prefix(TRIGGER_ID_PREFIX).is_some_and(|goal| {
+        !goal.is_empty()
+            && goal
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
+    })
+}
 
 /// The region a request whose SigV4 credential scope names none is served in.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -184,6 +217,9 @@ pub struct AgentSpaceRecord {
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     pub tasks: HashMap<String, TaskRecord>,
+    /// The Triggers created in this AgentSpace, keyed by `triggerId`. Bounded by
+    /// [`MAX_TRIGGERS_PER_AGENT_SPACE`].
+    pub triggers: HashMap<String, TriggerRecord>,
     /// The Operator App configured for this AgentSpace, absent until an
     /// authentication flow is enabled for it.
     pub operator_app: Option<OperatorAppRecord>,
@@ -392,6 +428,103 @@ impl TaskRecord {
     }
 }
 
+/// A persisted Trigger: the schedule it fires on, the action it performs, and the
+/// status it is in.
+///
+/// The schedule is held as the structured specification the caller supplied, when
+/// they supplied one, plus the EventBridge expression the Trigger fires on — the
+/// caller's own expression, or the one derived from the specification. That is
+/// exactly what `ScheduleCondition` reports: "Trigger responses always use this
+/// condition, include the persisted or derived expression, and also include spec
+/// when the trigger was created from a structured schedule".
+#[derive(Debug, Clone)]
+pub struct TriggerRecord {
+    pub trigger_id: String,
+    pub agent_space_id: String,
+    pub trigger_type: String,
+    /// The EventBridge expression this Trigger fires on; always present, because
+    /// a structured schedule derives one.
+    pub schedule_expression: String,
+    /// The structured schedule this Trigger was created from, when it was.
+    pub schedule_spec: Option<ScheduleSpec>,
+    pub action: ::aws_smithy_types::Document,
+    pub status: String,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl TriggerRecord {
+    /// The modelled `Trigger` for this record.
+    pub fn to_api(&self) -> Trigger {
+        Trigger {
+            trigger_id: self.trigger_id.clone(),
+            agent_space_id: self.agent_space_id.clone(),
+            r#type: self.trigger_type.clone(),
+            condition: TriggerCondition::Schedule(ScheduleCondition {
+                expression: Some(self.schedule_expression.clone()),
+                spec: self.schedule_spec.clone(),
+            }),
+            action: self.action.clone(),
+            status: self.status.clone(),
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+        }
+    }
+}
+
+/// The EventBridge expression a structured schedule derives.
+///
+/// Cited: `ScheduleCondition$expression` — "For a structured schedule response,
+/// this is the expression derived by Backlog" — and `TimeRangeSchedule` — "The
+/// service derives an EventBridge expression anchored at startAfter and a
+/// flexible-window width from the interval to startBefore". A `cron`
+/// specification already carries the expression that anchors its window, so that
+/// expression IS the derived one. A `timeRange` is anchored at its `startAfter`
+/// time of day, and its recurrence chooses the day fields of the six-field
+/// EventBridge cron expression (minute, hour, day-of-month, month, day-of-week,
+/// year), exactly one of whose two day fields is `?`.
+///
+/// `None` only when `startAfter` is not a time of day, which `TimeOfDay`'s own
+/// `^([01]\d|2[0-3]):[0-5]\d$` pattern already rules out for any value that
+/// reaches a handler.
+///
+/// The flexible-window WIDTH the same sentence describes — the interval from
+/// `startAfter` to `startBefore` — has no output member in this model and no place
+/// in a cron expression, so it is persisted as part of the specification and
+/// reported back there rather than rendered into the derived expression.
+pub fn derived_schedule_expression(spec: &ScheduleSpec) -> Option<String> {
+    match spec {
+        ScheduleSpec::Cron(cron) => Some(cron.expression.clone()),
+        ScheduleSpec::timeRange(range) => {
+            let (hour, minute) = time_of_day(&range.start_after)?;
+            Some(match &range.recurrence {
+                Recurrence::Daily(_) => format!("cron({minute} {hour} * * ? *)"),
+                Recurrence::Weekly(weekly) => format!(
+                    "cron({minute} {hour} ? * {} *)",
+                    day_of_week_field(&weekly.day_of_week)
+                ),
+                Recurrence::Monthly(monthly) => {
+                    format!("cron({minute} {hour} {} * ? *)", monthly.day_of_month)
+                }
+            })
+        }
+    }
+}
+
+/// The hour and minute of a `TimeOfDay` (`HH:MM`, UTC).
+fn time_of_day(value: &str) -> Option<(u32, u32)> {
+    let (hour, minute) = value.split_once(':')?;
+    Some((hour.parse().ok()?, minute.parse().ok()?))
+}
+
+/// The day-of-week field an EventBridge cron expression names a `DayOfWeek` with:
+/// the first three letters of the model's enum value
+/// (`smithy_query(query="shape", shape="DayOfWeek")` — MONDAY..SUNDAY), which is
+/// the three-letter day name EventBridge cron takes.
+fn day_of_week_field(day_of_week: &str) -> String {
+    day_of_week.chars().take(3).collect()
+}
+
 /// What one recorded idempotency token remembers: the resource the first create
 /// made, and when that happened (so the entry can expire).
 #[derive(Debug, Clone)]
@@ -424,6 +557,15 @@ impl ComAmazonawsDevopsagentDevopsagentState {
     pub fn mint_id(&mut self, prefix: &str) -> String {
         self.next_id += 1;
         format!("{prefix}-{:016x}", self.next_id)
+    }
+
+    /// Mint a fresh Trigger identifier.
+    ///
+    /// A Trigger is the schedule of a goal, so the identifier is a goal identifier:
+    /// [`TRIGGER_ID_PREFIX`] and a sequence from [`mint_id`](Self::mint_id), which
+    /// satisfies [`is_trigger_id`] by construction.
+    pub fn mint_trigger_id(&mut self) -> String {
+        self.mint_id(TRIGGER_ID_PREFIX.trim_end_matches('-'))
     }
 
     /// The id a previous `@idempotent` create recorded for `client_token`, when
