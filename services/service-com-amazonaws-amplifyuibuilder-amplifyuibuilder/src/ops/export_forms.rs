@@ -156,10 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The token carries the app environment it was issued for and the cursor
         // the next page starts at. A malformed token, one issued for another app
-        // environment, or a cursor past everything handed out names no page of
-        // this export, so it is refused rather than served as an empty page.
+        // environment, or one whose cursor is not among those handed out names no
+        // page of this export, so it is refused rather than served as a page.
+        // With no token at all the export starts at the first cursor the service
+        // ever hands out, i.e. at the head of the list.
         let cursor = match input.next_token.as_deref() {
-            None => 0,
+            None => crate::state::FIRST_CURSOR,
             Some(token) => {
                 match crate::state::parse_page_token(token, &key, store.cursor_seq) {
                     Some(cursor) => cursor,

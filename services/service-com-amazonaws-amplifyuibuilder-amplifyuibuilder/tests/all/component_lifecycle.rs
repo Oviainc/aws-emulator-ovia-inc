@@ -680,7 +680,8 @@ async fn list_components_pages_over_one_stable_order() {
     // A token this operation never issued is a bad request, not an empty page. The rows
     // differ in how the token fails to name a page of this list: a shape it never emits,
     // a correctly shaped token issued while listing another app environment, and a
-    // correctly scoped token whose cursor was never handed out.
+    // correctly scoped token whose cursor was never handed out — above the highest one and
+    // below the first one alike.
     let issued = list(&router, "?maxResults=1")
         .await
         .body["nextToken"]
@@ -705,6 +706,7 @@ async fn list_components_pages_over_one_stable_order() {
             .to_string()
     };
     let never_issued_cursor = format!("{}{}", &issued[..issued.len() - 16], "f".repeat(16));
+    let cursor_below_the_first = format!("{}{}", &issued[..issued.len() - 16], "0".repeat(16));
     for token in [
         "not-a-token",
         "c-",
@@ -712,6 +714,7 @@ async fn list_components_pages_over_one_stable_order() {
         "0",
         &elsewhere,
         &never_issued_cursor,
+        &cursor_below_the_first,
     ] {
         let refused = list(&router, &format!("?nextToken={token}")).await;
         assert_eq!(
@@ -1123,10 +1126,11 @@ async fn a_reserved_property_name_is_refused() {
 
 /// A `nextToken` is arbitrary caller-supplied UTF-8, so the parser must ANSWER for every
 /// byte string rather than fail on one: it accepts exactly the tokens `page_token` issued
-/// for that app environment with a cursor the service handed out, and returns `None` for
-/// everything else — including a token whose byte length is right but whose bytes are not
-/// hex digits (a multi-byte scalar straddling the halves' boundary would panic a parser
-/// that split before checking).
+/// for that app environment with a cursor the service handed out — the span from the first
+/// cursor minted to the highest — and returns `None` for everything else, including a
+/// token whose byte length is right but whose bytes are not hex digits (a multi-byte
+/// scalar straddling the halves' boundary would panic a parser that split before
+/// checking).
 #[test]
 fn a_page_token_the_service_never_issued_is_answered_not_panicked() {
     let key = (APP_ID.to_string(), ENVIRONMENT.to_string());
@@ -1134,8 +1138,10 @@ fn a_page_token_the_service_never_issued_is_answered_not_panicked() {
     let other_environment = (APP_ID.to_string(), "production".to_string());
     let issued: u64 = 7;
 
-    // Every token the service can issue for cursors it handed out round-trips.
-    for cursor in [0, 1, 2, issued] {
+    // Every token the service can issue for cursors it handed out round-trips. The
+    // cursors handed out start at one: the counter pre-increments, so no record and no
+    // token of this service ever carries the cursor zero.
+    for cursor in [1, 2, issued] {
         let token = page_token(&key, cursor);
         assert_eq!(
             parse_page_token(&token, &key, issued),
@@ -1147,12 +1153,15 @@ fn a_page_token_the_service_never_issued_is_answered_not_panicked() {
     // Rows differ in how the token fails: the empty string, a shape never emitted, the
     // prefix alone, non-hex bytes of the right length, a multi-byte scalar across the
     // scope/cursor boundary, one byte too few and one too many, a cursor past everything
-    // issued, and a token issued for another app environment.
+    // issued, a cursor below the first one ever handed out, and a token issued for another
+    // app environment.
     let right_length_non_hex = format!("c-{}", "z".repeat(24));
     let multibyte_across_boundary = format!("c-{}{}{}", "a".repeat(6), "€", "b".repeat(15));
     let too_short = page_token(&key, 1)[..25].to_string();
     let too_long = format!("{}0", page_token(&key, 1));
     let past_issued = page_token(&key, issued + 1);
+    let largest_cursor = page_token(&key, u64::MAX);
+    let below_first_issued = page_token(&key, 0);
     let from_other_app = page_token(&other_app, 1);
     let from_other_environment = page_token(&other_environment, 1);
     let cases: Vec<(&str, String)> = vec![
@@ -1167,6 +1176,8 @@ fn a_page_token_the_service_never_issued_is_answered_not_panicked() {
         ("one hex digit too few", too_short),
         ("one hex digit too many", too_long),
         ("a cursor past everything issued", past_issued),
+        ("the largest cursor a token can spell", largest_cursor),
+        ("a cursor below the first one handed out", below_first_issued),
         ("a token issued for another app", from_other_app),
         (
             "a token issued for another environment",
@@ -1179,6 +1190,17 @@ fn a_page_token_the_service_never_issued_is_answered_not_panicked() {
             parse_page_token(&token, &key, issued),
             None,
             "case {case:?}: the token {token:?} names no page of this list"
+        );
+    }
+
+    // The span is empty while nothing has been created, so before the first create even a
+    // correctly scoped token of the lowest cursor names no page.
+    for cursor in [0, 1, 2] {
+        let token = page_token(&key, cursor);
+        assert_eq!(
+            parse_page_token(&token, &key, 0),
+            None,
+            "case cursor={cursor} with nothing handed out: the token {token:?} names no page"
         );
     }
 

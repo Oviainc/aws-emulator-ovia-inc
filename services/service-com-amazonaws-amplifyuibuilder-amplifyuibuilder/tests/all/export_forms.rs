@@ -628,8 +628,10 @@ async fn export_forms_refuses_a_token_it_never_issued() {
 
     // The rows differ in how the token fails to name a page of this export: a shape the
     // service never emits, a token issued for another app environment, and a correctly
-    // scoped token whose cursor was never handed out.
+    // scoped token whose cursor was never handed out — above the highest one handed out
+    // and below the first one alike.
     let never_issued_cursor = format!("{}{}", &issued[..issued.len() - 16], "f".repeat(16));
+    let cursor_below_the_first = format!("{}{}", &issued[..issued.len() - 16], "0".repeat(16));
     for token in [
         "not-a-token",
         "c-",
@@ -637,6 +639,7 @@ async fn export_forms_refuses_a_token_it_never_issued() {
         "0",
         &elsewhere,
         &never_issued_cursor,
+        &cursor_below_the_first,
     ] {
         let refused = export_in(&router, APP_ID, ENVIRONMENT, Some(token)).await;
         assert_eq!(

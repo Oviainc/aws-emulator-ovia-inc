@@ -44,6 +44,9 @@ mod form_update;
 #[path = "all/metadata_flags.rs"]
 mod metadata_flags;
 
+#[path = "all/page_token_cursor_bounds.rs"]
+mod page_token_cursor_bounds;
+
 #[path = "all/resource_error_messages.rs"]
 mod resource_error_messages;
 

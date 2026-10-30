@@ -202,6 +202,15 @@ const PAGE_TOKEN_HEX_WIDTH: usize = 16;
 /// (a `u32`).
 const PAGE_TOKEN_SCOPE_WIDTH: usize = 8;
 
+/// The lowest cursor this service ever hands out, and so the lowest one a page
+/// token it issued can carry.
+///
+/// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::next_cursor`] draws from
+/// a counter that starts at zero and pre-increments, so the first cursor any
+/// record holds is this one and every smaller value — zero — belongs to no
+/// record and to no token the service issued.
+pub const FIRST_CURSOR: u64 = 1;
+
 /// Which Amplify app and backend environment a component belongs to: the two
 /// `@httpLabel` members that, with the id, name a component.
 pub type EnvironmentKey = (String, String);
@@ -709,6 +718,10 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// Saturating rather than wrapping so the "never repeats" invariant above
     /// holds for every value it can actually reach: exhausting a `u64` would
     /// take 2^64 creates, which no emulator run performs.
+    ///
+    /// The counter pre-increments, so the first cursor handed out is
+    /// [`FIRST_CURSOR`]: the cursors in existence always run from there up to
+    /// `cursor_seq`, which is the span [`parse_page_token`] admits.
     pub fn next_cursor(&mut self) -> u64 {
         self.cursor_seq = self.cursor_seq.saturating_add(1);
         self.cursor_seq
@@ -1093,8 +1106,11 @@ pub fn page_token(key: &EnvironmentKey, cursor: u64) -> String {
 /// The cursor `token` resumes `key`'s list at, or `None` when it is not a token
 /// this service issued for that app environment.
 ///
-/// A cursor beyond `issued` — the highest cursor the service has handed out — is
-/// refused too, so a well-formed token nobody was ever given names no page.
+/// The cursor has to be one the service actually handed out: the cursors in
+/// existence run from [`FIRST_CURSOR`] to `issued`, the highest handed out, so a
+/// well-formed token carrying anything outside that span — above `issued`, or
+/// below the first cursor ever minted — names no page, exactly as a token of the
+/// wrong shape or the wrong app environment does.
 pub fn parse_page_token(token: &str, key: &EnvironmentKey, issued: u64) -> Option<u64> {
     let digits = token.strip_prefix(PAGE_TOKEN_PREFIX)?;
     // Both halves are hex digits, so refusing anything else here is what makes
@@ -1111,7 +1127,7 @@ pub fn parse_page_token(token: &str, key: &EnvironmentKey, issued: u64) -> Optio
         return None;
     }
     let cursor = u64::from_str_radix(cursor, 16).ok()?;
-    (cursor <= issued).then_some(cursor)
+    (FIRST_CURSOR..=issued).contains(&cursor).then_some(cursor)
 }
 
 /// The app environment half of a page token: a digest of the (appId,
