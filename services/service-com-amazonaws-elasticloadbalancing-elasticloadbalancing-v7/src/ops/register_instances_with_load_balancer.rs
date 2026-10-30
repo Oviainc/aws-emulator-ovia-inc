@@ -212,8 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // Registration is what starts an instance's health-check timeline, so the
+        // instant it happened is stored with it.
+        let registered_at = ::std::time::SystemTime::now();
         for instance_id in &requested {
-            record.register_instance(instance_id);
+            record.register_instance(instance_id, registered_at);
         }
 
         // The FULL current set, read back from state — not just what this call added.

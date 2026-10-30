@@ -21,12 +21,19 @@ pub(crate) const API_VERSION: &str = "2012-06-01";
 /// The emulator under test: ONE shared engine with this service mounted on the
 /// multi-service router, exactly as the production router assembles it.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// The same emulator, plus the shared engine it was mounted on — the handle a suite
+/// needs to read this service's stored state, or to place a stored instant in the past so
+/// a transition the clock owes is due without waiting for it.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router
         .set_request_authentication(false)
-        .register_service(EmulatedService::new(engine));
-    router
+        .register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// One wire answer: the HTTP status, the `Content-Type` it was answered with, and the XML

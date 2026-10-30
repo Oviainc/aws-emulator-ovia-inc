@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceHealth
-//! IMPLEMENTED: derives one `InstanceState` per instance from the stored registration
-//! set. This is the ONLY file to touch for this operation.
+//! IMPLEMENTED: derives one `InstanceState` per described instance from the stored
+//! registration — its id, the instant it was registered and the load balancer's
+//! health-check configuration. This is the ONLY file to touch for this operation.
 //!
-//! Registration is the only health state this emulator holds: no health-check engine
-//! probes an instance, so a registered instance reports `InService` / `N/A` and an
-//! unregistered one the documented `OutOfService` / `ELB`. A later slice that serves
-//! `ConfigureHealthCheck` and actually evaluates a target replaces that first branch —
-//! it is a placeholder for a probe, not a rule the model states.
+//! The three health members move together as one state, so they are projected together
+//! by [`crate::state::LoadBalancer::instance_health`], which states the rule; this
+//! handler decides only WHICH instances are described.
 //!
 //! ## Shape of an operation
 //!
@@ -177,6 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::region_from_request(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let guard = state.lock();
         let Some(record) = guard
             .load_balancers_in(&region)
@@ -207,20 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let instance_states = described
             .into_iter()
             .map(|instance_id| {
-                if record.has_instance(&instance_id) {
-                    InstanceState {
-                        instance_id: Some(instance_id),
-                        state: Some(STATE_IN_SERVICE.to_string()),
-                        reason_code: Some(REASON_CODE_NOT_APPLICABLE.to_string()),
-                        description: Some(REASON_CODE_NOT_APPLICABLE.to_string()),
-                    }
-                } else {
-                    InstanceState {
-                        instance_id: Some(instance_id),
-                        state: Some(STATE_OUT_OF_SERVICE.to_string()),
-                        reason_code: Some(REASON_CODE_ELB.to_string()),
-                        description: Some(DESCRIPTION_NOT_REGISTERED.to_string()),
-                    }
+                let health = record.instance_health(&instance_id, now);
+                InstanceState {
+                    instance_id: Some(instance_id),
+                    state: Some(health.state.to_string()),
+                    reason_code: Some(health.reason_code.to_string()),
+                    description: Some(health.description.to_string()),
                 }
             })
             .collect();
@@ -231,16 +223,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// `InstanceState$State`, from that member's documented valid values
-/// (`InService` | `OutOfService` | `Unknown`).
-const STATE_IN_SERVICE: &str = "InService";
-const STATE_OUT_OF_SERVICE: &str = "OutOfService";
-
-/// `InstanceState$ReasonCode`, from that member's documented valid values
-/// (`ELB` | `Instance` | `N/A`).
-const REASON_CODE_ELB: &str = "ELB";
-const REASON_CODE_NOT_APPLICABLE: &str = "N/A";
-
-/// One of the descriptions `InstanceState$Description` documents, the one that states
-/// the instance is not registered with this load balancer.
-const DESCRIPTION_NOT_REGISTERED: &str = "Instance is not currently registered with the LoadBalancer.";

@@ -117,20 +117,29 @@ pub const MAX_REGIONS: usize = 64;
 /// order, with membership answered from an index rather than by scanning.
 ///
 /// The ordered `Vec` is what `DescribeLoadBalancers` and `DescribeInstanceHealth`
-/// report; the `BTreeSet` makes each membership test O(log n), so a batched request
-/// costs O(batch x log n) instead of O(batch x n).
+/// report; the `BTreeMap` makes each membership test O(log n), so a batched request
+/// costs O(batch x log n) instead of O(batch x n), and it carries WHEN each instance was
+/// registered — the instant the health checks it owes are counted from
+/// ([`LoadBalancer::instance_health`]).
 #[derive(Debug, Clone, Default)]
 pub struct InstanceSet {
     order: Vec<String>,
-    index: BTreeSet<String>,
+    /// Instance id -> the instant it was registered.
+    registered: BTreeMap<String, SystemTime>,
 }
 
 impl InstanceSet {
-    /// Add `instance_id` unless it is already registered. Answers whether it was added.
-    pub fn insert(&mut self, instance_id: &str) -> bool {
-        if !self.index.insert(instance_id.to_string()) {
+    /// Add `instance_id`, registered at `at`, unless it is already registered. Answers
+    /// whether it was added.
+    ///
+    /// An instance the set already holds keeps the instant it was first registered: the
+    /// call restates a registration that already happened, so the health-check timeline
+    /// it started does not restart.
+    pub fn insert(&mut self, instance_id: &str, at: SystemTime) -> bool {
+        if self.registered.contains_key(instance_id) {
             return false;
         }
+        self.registered.insert(instance_id.to_string(), at);
         self.order.push(instance_id.to_string());
         true
     }
@@ -141,13 +150,33 @@ impl InstanceSet {
         let before = self.order.len();
         self.order.retain(|held| !ids.contains(held));
         for id in ids {
-            self.index.remove(id);
+            self.registered.remove(id);
         }
         before - self.order.len()
     }
 
     pub fn contains(&self, instance_id: &str) -> bool {
-        self.index.contains(instance_id)
+        self.registered.contains_key(instance_id)
+    }
+
+    /// The instant `instance_id` was registered, or `None` when it is not registered.
+    pub fn registered_at(&self, instance_id: &str) -> Option<SystemTime> {
+        self.registered.get(instance_id).copied()
+    }
+
+    /// Move an existing registration's instant to `at`, leaving the set and its order as
+    /// they are. Answers whether the instance was registered.
+    ///
+    /// The health-check timeline of a registered instance is read off that instant, so
+    /// this is how a registration is placed at a chosen point in time.
+    pub fn restamp(&mut self, instance_id: &str, at: SystemTime) -> bool {
+        match self.registered.get_mut(instance_id) {
+            Some(registered_at) => {
+                *registered_at = at;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -163,6 +192,67 @@ impl InstanceSet {
         self.order.iter()
     }
 }
+
+/// The health of one instance with respect to one load balancer, as the three members of
+/// `InstanceState` report it together.
+///
+/// Every field is one of the values that member's own documentation enumerates, so a
+/// projection cannot report a state, a reason code or a description Elastic Load
+/// Balancing does not use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceHealth {
+    pub state: &'static str,
+    pub reason_code: &'static str,
+    pub description: &'static str,
+}
+
+/// `InstanceState$State`, from that member's documented valid values
+/// (`InService` | `OutOfService` | `Unknown`).
+pub const STATE_OUT_OF_SERVICE: &str = "OutOfService";
+
+/// `InstanceState$ReasonCode`, from that member's documented valid values
+/// (`ELB` | `Instance` | `N/A`), documented as "Information about the cause of
+/// <code>OutOfService</code> instances. Specifically, whether the cause is Elastic Load
+/// Balancing or the instance."
+pub const REASON_CODE_ELB: &str = "ELB";
+pub const REASON_CODE_INSTANCE: &str = "Instance";
+
+/// One of the descriptions `InstanceState$Description` enumerates: the instance is not
+/// registered with the load balancer the health was asked about, so Elastic Load
+/// Balancing — not the instance — is why it takes no traffic.
+pub const HEALTH_NOT_REGISTERED: InstanceHealth = InstanceHealth {
+    state: STATE_OUT_OF_SERVICE,
+    reason_code: REASON_CODE_ELB,
+    description: "Instance is not currently registered with the LoadBalancer.",
+};
+
+/// The health of an instance whose registration has not yet been health-checked: again
+/// Elastic Load Balancing's own doing, with the description that member enumerates for it.
+pub const HEALTH_REGISTRATION_IN_PROGRESS: InstanceHealth = InstanceHealth {
+    state: STATE_OUT_OF_SERVICE,
+    reason_code: REASON_CODE_ELB,
+    description: "Instance registration is still in progress.",
+};
+
+/// The health of an instance that has failed the health checks it owes: the reason is the
+/// instance, with the description `InstanceState$Description` enumerates for exactly that
+/// — fixed text, naming the threshold rather than substituting its value.
+pub const HEALTH_FAILED_HEALTH_CHECKS: InstanceHealth = InstanceHealth {
+    state: STATE_OUT_OF_SERVICE,
+    reason_code: REASON_CODE_INSTANCE,
+    description: "Instance has failed at least the UnhealthyThreshold number of health \
+                  checks consecutively.",
+};
+
+/// How long one health check of a registered instance takes to fall due.
+///
+/// Nothing in this emulator serves a health-check target — no process listens on an
+/// instance's port — so a check that runs can only fail, and the transition a failing
+/// instance is owed is a transition the CLOCK makes due rather than one a probe
+/// observes. The span is this emulator's choice, not a duration AWS documents: the
+/// configured `HealthCheck$Interval` is the cadence of a real probe, and there is no real
+/// probe here.
+pub const HEALTH_CHECK_SPAN: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// One listener of a load balancer, keyed logically by its `LoadBalancerPort`.
 #[derive(Debug, Clone)]
@@ -565,10 +655,36 @@ impl LoadBalancer {
         self.subnets.retain(|candidate| candidate != subnet_id);
     }
 
-    /// Register `instance_id`, keeping the set deduplicated and in registration order.
-    /// Answers whether the id was newly added.
-    pub fn register_instance(&mut self, instance_id: &str) -> bool {
-        self.instances.insert(instance_id)
+    /// Register `instance_id` as of `at`, keeping the set deduplicated and in
+    /// registration order. Answers whether the id was newly added.
+    pub fn register_instance(&mut self, instance_id: &str, at: SystemTime) -> bool {
+        self.instances.insert(instance_id, at)
+    }
+
+    /// The health of `instance_id` with respect to this load balancer as of `now`.
+    ///
+    /// An instance takes traffic only while it passes this load balancer's health check,
+    /// and a registered instance that has failed `UnhealthyThreshold` consecutive checks
+    /// is `OutOfService` with the instance as the reason; one whose checks have not run
+    /// yet is `OutOfService` with Elastic Load Balancing as the reason. No emulated
+    /// instance serves a health-check target, so every check an instance owes fails: the
+    /// checks the clock has made due are counted off the registration instant, one per
+    /// [`HEALTH_CHECK_SPAN`], against the load balancer's configured
+    /// `UnhealthyThreshold`.
+    pub fn instance_health(&self, instance_id: &str, now: SystemTime) -> InstanceHealth {
+        let Some(registered_at) = self.instances.registered_at(instance_id) else {
+            return HEALTH_NOT_REGISTERED;
+        };
+        let checks = u32::try_from(self.health_check.unhealthy_threshold)
+            .unwrap_or(1)
+            .max(1);
+        match registered_at.checked_add(HEALTH_CHECK_SPAN.saturating_mul(checks)) {
+            Some(failed_at) if now < failed_at => HEALTH_REGISTRATION_IN_PROGRESS,
+            Some(_) => HEALTH_FAILED_HEALTH_CHECKS,
+            // An instant so far out that the owed checks cannot be dated: nothing has
+            // run yet, so the registration is still in progress.
+            None => HEALTH_REGISTRATION_IN_PROGRESS,
+        }
     }
 
     /// Deregister every id in `ids`. Answers how many had been registered.

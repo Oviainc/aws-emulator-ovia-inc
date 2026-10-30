@@ -576,16 +576,17 @@ async fn a_load_balancer_is_created_used_read_back_and_deleted() {
         );
         for state in &states {
             assert_eq!(
-                kid_text(state, "State").as_deref(),
-                Some("InService"),
-                "case {:?}: a registered instance is InService, got {}",
-                case.name,
-                health.body
-            );
-            assert_eq!(
-                kid_text(state, "ReasonCode").as_deref(),
-                Some("N/A"),
-                "case {:?}: an InService instance has ReasonCode N/A, got {}",
+                (
+                    kid_text(state, "State"),
+                    kid_text(state, "ReasonCode"),
+                    kid_text(state, "Description"),
+                ),
+                (
+                    Some("OutOfService".to_string()),
+                    Some("ELB".to_string()),
+                    Some("Instance registration is still in progress.".to_string()),
+                ),
+                "case {:?}: a just-registered instance reports its registration in progress, got {}",
                 case.name,
                 health.body
             );

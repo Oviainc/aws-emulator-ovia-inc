@@ -15,6 +15,8 @@
 mod documented_rule_refusals;
 #[path = "all/elbv2_listener_chain_on_the_shared_endpoint.rs"]
 mod elbv2_listener_chain_on_the_shared_endpoint;
+#[path = "all/instance_health_timeline.rs"]
+mod instance_health_timeline;
 #[path = "all/listeners_health_check_and_attributes.rs"]
 mod listeners_health_check_and_attributes;
 #[path = "all/load_balancer_lifecycle.rs"]
