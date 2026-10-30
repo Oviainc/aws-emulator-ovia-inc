@@ -6,7 +6,6 @@ Issue-Corpus: simparity-wire-aws-v1
 Issue-Corpus-Kind: wire
 Issue-Trace-Ids: service-quotas-catalog-list-aws-default-service-quotas-iotevents service-quotas-catalog-list-aws-default-service-quotas-kafka service-quotas-catalog-list-aws-default-service-quotas-kendra service-quotas-catalog-list-aws-default-service-quotas-kms service-quotas-catalog-list-aws-default-service-quotas-lakeformation service-quotas-catalog-list-aws-default-service-quotas-lex service-quotas-catalog-list-aws-default-service-quotas-license-manager service-quotas-catalog-list-aws-default-service-quotas-logs service-quotas-catalog-list-aws-default-service-quotas-medialive service-quotas-catalog-list-aws-default-service-quotas-mediapackage
 Issue-Shape-Id: com.amazonaws.servicequotas#ServiceQuotasV20190624
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="DetectorModelsPerAccount"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-0B548925"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-134442DD"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-17157277"]
@@ -33,8 +32,6 @@ Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCod
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-EBDD79FD"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-F7E2E007"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-FCDB3431"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="BrokersPerCluster"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="ClustersPerAccount"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-03FD6822"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-36D29E8C"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-8F940D28"]
@@ -42,7 +39,6 @@ Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCod
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-B2FDE22A"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-EDD31C36"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-FAB9E493"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="IndexesPerAccount"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-22D37218"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-25C6FEE8"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-27DC8932"]
@@ -71,9 +67,6 @@ Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCod
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-DCB3B6C6"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-E8A56FA5"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-E8BFBD04"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="AliasesPerKMSKey"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="CustomerManagedKMSKeys"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="GrantsPerKMSKey"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-0428A42E"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-08932E37"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-0E66C9C0"]
@@ -131,7 +124,6 @@ Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCod
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-FB1A2EEA"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-FB6513A2"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-FCE4492D"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="DataLakeAdministratorsPerAccount"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-1343AC0E"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-3D55E97C"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-3E3798DF"]
@@ -139,7 +131,6 @@ Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCod
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-9F3EFFAB"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-B0A837CA"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-F165AF61"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="BotsPerAccount"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-311093B9"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-36FA8BD2"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-3D56827F"]
@@ -178,8 +169,6 @@ Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCod
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-D92A2CE4"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-F6FC7130"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-FD8F1E79"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="LicenseConfigurationsPerAccount"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="DescribeLogStreamsThrottleLimitInTransactionsPerSecond"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-035ED7CA"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-0397E41F"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-07A912D5"]
@@ -249,9 +238,6 @@ Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCod
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-F738B5C5"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-FAF0999A"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-FB8CE9B0"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="MetricFiltersPerLogGroup"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="SubscriptionFiltersPerLogGroup"]
-Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="ChannelsPerRegion"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-019F695A"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-05A796F2"]
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-1F6E2FAF"]
@@ -300,44 +286,44 @@ Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCod
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-F7CB14AC"]
 Issue-Commit: 716594ad03747236be5f362ba3ba8170b7a2d152
 
-# Service Quotas defaults for iotevents, kafka, kendra, kms, lakeformation, lex and 4 more ServiceCodes omit the AWS quota catalog
+# Service Quotas: the AWS L- coded default-quota rows of iotevents, kafka, kendra, kms, lakeformation, lex, license-manager, logs, medialive and mediapackage are still absent
 
-> _Note: this issue was identified against the code base at commit `716594ad03747236be5f362ba3ba8170b7a2d152`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+> _Split out of `issues/things-that-now-work/20261030T005329Z-service-quotas-defaults-for-iotevents-kafka-kendra-kms.md`, whose other cause — the fifteen `QuotaCode`s this catalog had DERIVED FROM A QUOTA NAME for these ten services, which AWS publishes nothing under — is fixed. This report carries the 278 replay keys that do NOT pass, so no part of them is claimed closed. Everything below is what that fix established about them; a later fixer starts from here rather than from scratch._
 
 ## Operation
 ListAWSDefaultServiceQuotas
 
 ## Description
-This issue bundles 10 causes — one per ServiceCode — of the same defect: the emulator's default-quota catalog is a small hand-written table rather than the service's published catalog. Each cause is its own ServiceCode and its own fixture, and a fixer must close and re-replay all 10 before submitting.
 
-AWS (applies to every cause): ListAWSDefaultServiceQuotas(ServiceCode) answers 200 with `Quotas`, the complete published default-quota catalog for that service. Every entry is keyed by the AWS-assigned quota code of the form L-XXXXXXXX and carries ServiceCode, ServiceName, QuotaCode, QuotaArn (arn:aws:servicequotas:<region>::<serviceCode>/<quotaCode>), QuotaName, Description, Value, Unit, Adjustable and GlobalQuota, plus Period, UsageMetric and QuotaContext where AWS publishes them. Smithy: ListAWSDefaultServiceQuotasResponse.Quotas -> ServiceQuotaListDefinition. The per-ServiceCode catalog contents are recorded behavior only — each fixture's recorded 200 response is the reference.
+One cause, with one cluster per `ServiceCode`: the default-quota catalog does not carry the rows AWS publishes for these ten services, so each `L-XXXXXXXX` `QuotaCode` above resolves nothing.
 
-Emulator (applies to every cause): 200 is returned, but the list holds only a few entries keyed by invented, human-readable codes AWS does not publish, and almost every real L- coded quota (with its Period/UsageMetric/QuotaContext members) is absent.
+AWS: `ListAWSDefaultServiceQuotas(ServiceCode)` answers 200 with `Quotas`, the service's whole published default-quota catalog. Every entry is keyed on the AWS-assigned `QuotaCode` (`L-XXXXXXXX` for every row of these ten services) and carries `ServiceCode`, `ServiceName`, `QuotaCode`, `QuotaArn`, `QuotaName`, `Description`, `Value`, `Unit`, `Adjustable` and `GlobalQuota`, plus `Period`, `UsageMetric` and `QuotaContext` where AWS publishes them.
 
-Why (applies to every cause): QuotaCode is the only stable key Service Quotas exposes and is the input to GetServiceQuota, GetAWSDefaultServiceQuota and RequestServiceQuotaIncrease. A client looking up a documented L- code finds nothing and concludes the quota does not exist; a client enumerating the list is handed codes no other API accepts and values that are not the service defaults, so throttling/limit pre-flight checks and capacity planning are wrong.
+Emulator: 200 with the rows the catalog can cite — `kafka/L-FAB9E493`, `kms/L-8A08DAEA`, `kms/L-275D92F3` — and an EMPTY `Quotas` list for the other eight service codes, which is the documented state of a service code the catalog holds no citable row for (`src/state.rs::seed_default_quotas`, `tests/all/default_quota_catalog.rs::a_service_without_seeded_defaults_resolves_with_an_empty_list`). Each remaining code above is therefore `missing … got None` on replay.
 
-Fix (applies to every cause): the ListAWSDefaultServiceQuotas handler's quota-catalog state for Service Quotas — serve the published catalog keyed on AWS L- quota codes with all published members, and stop emitting codes AWS does not publish.
+Per-`ServiceCode` counts of the rows still absent: iotevents 26, kafka 6 of 7, kendra 28, kms 55 of 57, lakeformation 7, lex 13, license-manager 25, logs 69, medialive 24, mediapackage 22.
 
-Cause 1 of 10: ServiceCode=iotevents — fixture service-quotas-catalog-list-aws-default-service-quotas-iotevents, step task#1. 26 L- coded quotas absent (e.g. L-DE2C2CBE, L-0B548925, L-279A67DA, L-18935129, L-134442DD); invented code 'DetectorModelsPerAccount'.
-Cause 2 of 10: ServiceCode=kafka — fixture service-quotas-catalog-list-aws-default-service-quotas-kafka, step task#1. 7 L- coded quotas absent (L-B2FDE22A, L-36D29E8C, L-8F940D28, L-FAB9E493, L-9B45E609, L-03FD6822, L-EDD31C36); invented codes 'BrokersPerCluster', 'ClustersPerAccount'.
-Cause 3 of 10: ServiceCode=kendra — fixture service-quotas-catalog-list-aws-default-service-quotas-kendra, step task#1. 28 L- coded quotas absent (e.g. L-7107C1BC, L-4E1777B8, L-C0EA1398, L-740FA277, L-31DA7514); invented code 'IndexesPerAccount'.
-Cause 4 of 10: ServiceCode=kms — fixture service-quotas-catalog-list-aws-default-service-quotas-kms, step task#1. 57 L- coded quotas absent, including the per-API request-rate quotas with their Period and UsageMetric blocks (e.g. L-275D92F3 'UpdateCustomKeyStore request rate', L-8A08DAEA 'ListKeys request rate', L-171660E4); invented codes 'AliasesPerKMSKey', 'CustomerManagedKMSKeys', 'GrantsPerKMSKey'.
-Cause 5 of 10: ServiceCode=lakeformation — fixture service-quotas-catalog-list-aws-default-service-quotas-lakeformation, step task#1. 7 L- coded quotas absent (L-3D55E97C, L-B0A837CA, L-3E3798DF, L-F165AF61, L-47097528, L-1343AC0E, L-9F3EFFAB); invented code 'DataLakeAdministratorsPerAccount'.
-Cause 6 of 10: ServiceCode=lex — fixture service-quotas-catalog-list-aws-default-service-quotas-lex, step task#1. 13 L- coded quotas absent (e.g. L-824BBA1D, L-9030FC28, L-36FA8BD2, L-4F321B43, L-ED50DA7C); invented code 'BotsPerAccount'.
-Cause 7 of 10: ServiceCode=license-manager — fixture service-quotas-catalog-list-aws-default-service-quotas-license-manager, step task#1. 25 L- coded quotas absent (e.g. L-30F617EC, L-CDB75D7A, L-A6872F54, L-9FC671A7, L-46604BA1); invented code 'LicenseConfigurationsPerAccount'.
-Cause 8 of 10: ServiceCode=logs — fixture service-quotas-catalog-list-aws-default-service-quotas-logs, step task#1. 69 L- coded quotas absent, including the per-API throttle quotas with their Period/UsageMetric (e.g. L-FB8CE9B0, L-9D43025B, L-F738B5C5, L-4A1D48B1); invented codes 'DescribeLogStreamsThrottleLimitInTransactionsPerSecond', 'MetricFiltersPerLogGroup', 'SubscriptionFiltersPerLogGroup'.
-Cause 9 of 10: ServiceCode=medialive — fixture service-quotas-catalog-list-aws-default-service-quotas-medialive, step task#1. 24 L- coded quotas absent (e.g. L-9E4BC4C0, L-D1AFAF75, L-019F695A, L-BDF24E14, L-A825B11C); invented code 'ChannelsPerRegion'.
-Cause 10 of 10: ServiceCode=mediapackage — fixture service-quotas-catalog-list-aws-default-service-quotas-mediapackage, step task#1. 22 L- coded quotas absent (e.g. L-81A8E99B, L-258E8DBA, L-66FFDBE4, L-1E11547D, L-F7CB14AC); invented code 'ChannelsPerRegion'.
+What the parent fix ESTABLISHED, which is the useful part of this report:
 
-Related: the open issue 20261029T192055Z-service-quotas-listawsdefaultservicequotas-serves-a-hand-written-default-quota-table.md names the same root cause but carries replay keys for other ServiceCodes only; none of the 10 causes above is covered by it.
+* The BLOCKER is the catalog DATA, not the code. Every quota read of this service resolves its pair through the one table `src/state.rs::seed_quota_catalog` builds (`ListAWSDefaultServiceQuotas`, `GetAWSDefaultServiceQuota`, `ListServiceQuotas`, `GetServiceQuota`, `RequestServiceQuotaIncrease`, the template plane and the utilization report), so adding a row is a one-line table entry and nothing else has to change. Two rows now prove that path end to end for these services.
+* A row may be published only under the `QuotaCode` the service answers to, and a `QuotaCode` identifies ONE quota (`src/state.rs::descriptive_quota_code` states that rule). So each row needs the code PAIRED with the quota it names, and the parent report's evidence states exactly three such pairings, all three of which are now published:
+  * `kafka/L-FAB9E493` = "Number of brokers per cluster", `Value` 30;
+  * `kms/L-8A08DAEA` = "ListKeys request rate", `Value` 500, `Period` 1 SECOND, `AWS/Usage` `CallCount` with `Service=KMS, Resource=ListKeys, Type=API, Class=None`, `Description` "Maximum ListKeys requests per second. When you reach this quota, KMS rejects requests for this operation for the remainder of the interval.";
+  * `kms/L-275D92F3` = "UpdateCustomKeyStore request rate" (`Value` 5 from KMS's published per-operation request quotas; the recorded value is not stated in the parent report).
+* KMS's per-operation request rates are ONE class, and `src/state.rs::kms_request_rate` already builds it: `QuotaName` `<operation> request rate`, a one-second `Period`, that operation's `AWS/Usage` `CallCount` metric under the `KMS` service dimension, and the sentence above with the operation named in it. Each further KMS rate row therefore needs only its `QuotaCode`, its operation and its value — not a new shape.
+* What blocks the remaining 278 rows is which quota each code NAMES, and its value. No source available in the repo states it: the parent report says "the per-ServiceCode catalog contents are recorded behavior only — each fixture's recorded 200 response is the reference", the model carries no quota data (`ListAWSDefaultServiceQuotasResponse$Quotas -> ServiceQuotaListDefinition` is a shape, not a catalog), no crate publishes AWS's catalog, and the replay reports only WHICH paths differ while withholding every recorded value. Guessing a pairing would make `GetAWSDefaultServiceQuota`/`GetServiceQuota` answer a documented `L-` code with a quota AWS never publishes under it — the defect `issues/things-that-now-work/20261022T115709Z-servicequotas-service-quotas-returns-the-wrong-quota-record-and.md` was filed for — so nothing of the kind is in the tree.
+* Two divergences on `kafka/L-FAB9E493` remain and are NOT keyed above because they are members of a row that now exists: `.Description` (AWS publishes description text for that quota; no source here states it, so the row publishes none) and `.ServiceName` (filled from `SEED_SERVICE_CATALOG`; "Amazon Managed Streaming for Apache Kafka (Amazon MSK)", "… (MSK)" and "Amazon Managed Streaming for Apache Kafka" were each replayed and none matched, so the seeded name is left as found — it is also what `ListServices` reports, which the related open report `20261029T192055Z-service-quotas-listawsdefaultservicequotas-serves-a-hand-written-default-quota-table.md` carries a `$.Services[*]` key for).
+
+Fix: add one `seed_quota_catalog` row per code above — AWS's code, the quota it names, its value, unit, adjustability, scope and (where AWS publishes them) `Period` and `UsageMetric` — taken from AWS's published default-quota data for that `ServiceCode`. A fixer who can read the recorded `ListAWSDefaultServiceQuotas` response for these ten fixtures can close this one `ServiceCode` at a time; guessing a code-to-quota pairing is not a fix.
+
+Related: `20261029T192055Z-service-quotas-listawsdefaultservicequotas-serves-a-hand-written-default-quota-table.md` names the same gap for OTHER service codes.
 
 ## Evidence
-Example (Cause 4, fixture service-quotas-catalog-list-aws-default-service-quotas-kms step task#1) — expected entry in the recorded 200 response, absent from the emulator's: {QuotaCode: L-8A08DAEA, ServiceCode: kms, ServiceName: 'AWS Key Management Service (AWS KMS)', QuotaName: 'ListKeys request rate', Description: 'Maximum ListKeys requests per second. When you reach this quota, KMS rejects requests for this operation for the remainder of the interval.', Value: 500, Unit: None, Adjustable: true, GlobalQuota: false, Period: {PeriodUnit: SECOND, PeriodValue: 1}, UsageMetric: {MetricNamespace: AWS/Usage, MetricName: CallCount, MetricStatisticRecommendation: Sum, MetricDimensions: {Service: KMS, Resource: ListKeys, Type: API, Class: None}}} -> replay: 'missing ... got None'. Entries keyed 'CustomerManagedKMSKeys', 'AliasesPerKMSKey', 'GrantsPerKMSKey' are returned instead -> 'extra'.
-Example (Cause 2) $.Quotas[QuotaCode="L-FAB9E493"] expected ('Number of brokers per cluster', Value 30) -> got None; extra entries keyed 'BrokersPerCluster', 'ClustersPerAccount'.
-Each cause is one replay cluster, verdict=mismatch, expected_status 200, actual_status 200.
+Replay of the parent issue's ten units after its fix: 10 failed, every key above `progressed` (no unit fails on a surplus or missing-entry key for the fifteen derived codes any more), `other_causes_count: 0`. Per unit, `ListAWSDefaultServiceQuotas` answers HTTP 200 where the recording answers HTTP 200, and the recorded rows keyed above are reported `missing … got None`; for the eight services whose list is now empty the divergence is reported positionally (`$.Quotas[0] … $.Quotas[N]`, recorded values withheld).
 
 ## Steps to Reproduce
 1. Boot the emulator from this checkout and replay trace set simparity-wire-aws-v1.
-2. For each cause, call Service Quotas ListAWSDefaultServiceQuotas with that cause's ServiceCode (iotevents, kafka, kendra, kms, lakeformation, lex, license-manager, logs, medialive, mediapackage) — fixture service-quotas-catalog-list-aws-default-service-quotas-<ServiceCode>, step task#1.
-3. Diff the returned Quotas list against the fixture's recorded 200 response: the L-XXXXXXXX keyed entries (and their Period/UsageMetric/QuotaContext members) are missing and invented-key entries are present.
-4. Re-replay all 10 fixtures listed in Issue-Trace/trace_ids to confirm a fix.
+2. Call `ListAWSDefaultServiceQuotas` with each of `iotevents`, `kafka`, `kendra`, `kms`, `lakeformation`, `lex`, `license-manager`, `logs`, `medialive`, `mediapackage` — fixture `service-quotas-catalog-list-aws-default-service-quotas-<ServiceCode>`, step task#1.
+3. Diff the returned `Quotas` against the fixture's recorded 200 response: each `QuotaCode` keyed above is absent.
+4. `GetAWSDefaultServiceQuota(ServiceCode, QuotaCode)` for any code keyed above is refused `400 NoSuchResourceException`, where AWS answers 200 with that quota's record.
+5. Re-replay all ten fixtures listed in Issue-Trace-Ids to confirm a fix.

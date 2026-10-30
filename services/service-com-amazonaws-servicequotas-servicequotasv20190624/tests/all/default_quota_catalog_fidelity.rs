@@ -262,6 +262,7 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     ("dynamodb", "DynamoDB"),
     ("ec2", "EC2"),
     ("kinesis", "Kinesis Data Streams"),
+    ("kms", "KMS"),
     ("lambda", "Lambda"),
     ("monitoring", "CloudWatch"),
     ("ses", "SES"),

@@ -39,6 +39,8 @@ mod cross_region_settlement;
 mod default_quota_catalog;
 #[path = "all/default_quota_catalog_fidelity.rs"]
 mod default_quota_catalog_fidelity;
+#[path = "all/default_quota_published_codes.rs"]
+mod default_quota_published_codes;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/history_filter_chain.rs"]

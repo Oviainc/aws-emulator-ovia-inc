@@ -206,7 +206,10 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("ec2", "L-0263D0A3"),
     ("ec2", "L-1216C47A"),
     ("ec2", "L-34B43A08"),
+    ("kafka", "L-FAB9E493"),
     ("kinesis", "L-0918CF54"),
+    ("kms", "L-275D92F3"),
+    ("kms", "L-8A08DAEA"),
     ("lambda", "L-2ACBD22F"),
     ("lambda", "L-72E0D058"),
     ("lambda", "L-B2AA0F47"),
@@ -265,7 +268,10 @@ const CODES_WITHOUT_A_CITED_DISPLAY_NAME: &[&str] = &[
 /// Whether `code` has the shape of a code AWS MINTS: `L-` and eight upper-case hex
 /// characters, the form every `QuotaCode` in AWS's published catalog has.
 ///
-/// `pub(crate)` so another suite asks this question through the one copy of it.
+/// `pub(crate)` so another suite asks this question through the one copy of it:
+/// `default_quota_published_codes.rs` asserts the same namespace rule for the services
+/// whose whole published catalog sits in it, so the two suites cannot disagree about
+/// what the namespace IS.
 pub(crate) fn is_aws_minted_shape(code: &str) -> bool {
     code.strip_prefix("L-").is_some_and(|rest| {
         rest.len() == 8
@@ -695,11 +701,7 @@ async fn a_minted_code_this_catalog_does_not_cite_resolves_nothing() {
     // no AWS code — each resolves the quota whose name it was built from.
     for (service_code, quota_code, quota_name) in [
         ("amplify", "AppsPerRegion", "Apps per Region"),
-        (
-            "logs",
-            "MetricFiltersPerLogGroup",
-            "Metric filters per log group",
-        ),
+        ("iot", "RulesPerAccount", "Rules per account"),
         ("vpc", "PrefixListsPerRegion", "Prefix lists per Region"),
         // The one row whose code the SERVICE's own refusal publishes.
         ("b2bi", "ProfilesPerAccount", "Customer profiles per account"),

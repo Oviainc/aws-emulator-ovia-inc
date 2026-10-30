@@ -3064,6 +3064,24 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         // dropping them (`codecommit`, `config`, `kinesis` below), each of which AWS
         // publishes with no usage metric or window.
         //
+        // The same evidence covers these pairs, each the stand-in of a service whose
+        // recorded listing publishes every one of its quotas under an AWS `L-` code
+        // and nothing under the stand-in: `iotevents/DetectorModelsPerAccount`,
+        // `kafka/BrokersPerCluster`, `kafka/ClustersPerAccount`,
+        // `kendra/IndexesPerAccount`, `kms/CustomerManagedKMSKeys`,
+        // `kms/AliasesPerKMSKey`, `kms/GrantsPerKMSKey`,
+        // `lakeformation/DataLakeAdministratorsPerAccount`, `lex/BotsPerAccount`,
+        // `license-manager/LicenseConfigurationsPerAccount`,
+        // `logs/MetricFiltersPerLogGroup`, `logs/SubscriptionFiltersPerLogGroup`,
+        // `logs/DescribeLogStreamsThrottleLimitInTransactionsPerSecond`,
+        // `medialive/ChannelsPerRegion` and `mediapackage/ChannelsPerRegion`. Of
+        // those, the rows whose AWS code the recording states are RE-KEYED onto it
+        // rather than dropped (`kafka` and `kms` below); for the others the recording
+        // states no code for the quota the row names, and a code identifies ONE
+        // quota, so the row is dropped rather than paired with a code this catalog
+        // would be guessing at, and the rest of those services' published quotas stay
+        // in the default-quota-set gap.
+        //
         // The same evidence covers ten further services, whose recorded
         // default-quota listings report this catalog's descriptive row as a surplus
         // entry and publish their own quotas under codes in AWS's minted namespace:
@@ -3438,11 +3456,6 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             vec![quota("Rules per account", 1000.0)],
         ),
         service(
-            "iotevents",
-            "AWS IoT Events",
-            vec![quota("Detector models per account", 1000.0)],
-        ),
-        service(
             "ivs",
             "Amazon Interactive Video Service",
             vec![quota("Channels per account", 5000.0)],
@@ -3450,15 +3463,13 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "kafka",
             "Amazon Managed Streaming for Apache Kafka (MSK)",
-            vec![
-                quota("Clusters per account", 90.0),
-                quota("Brokers per cluster", 30.0),
-            ],
-        ),
-        service(
-            "kendra",
-            "Amazon Kendra",
-            vec![quota("Indexes per account", 5.0)],
+            // The recorded default-quota listing of this service states both the code
+            // AWS publishes this quota under and the name it publishes it as, so the
+            // row is published under AWS's code. The rest of the service's published
+            // catalog names no code this catalog can cite for the quota it names, so
+            // it is left to the default-quota-set gap rather than published under a
+            // stand-in the service answers to nothing under.
+            vec![quota("Number of brokers per cluster", 30.0).code("L-FAB9E493")],
         ),
         service(
             "kinesis",
@@ -3482,16 +3493,22 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "kms",
             "AWS Key Management Service (AWS KMS)",
+            // KMS publishes a REQUEST-RATE quota per API operation, all of one shape
+            // ([`kms_request_rate`]). These two are the rows whose `QuotaCode` the
+            // recorded default-quota listing of this service states; the rest of the
+            // service's published catalog names no code this catalog can cite for the
+            // quota it names.
             vec![
-                quota("Customer managed KMS keys", 100000.0),
-                quota("Aliases per KMS key", 50.0).fixed(),
-                quota("Grants per KMS key", 50000.0),
+                // `L-8A08DAEA`'s name, value and every other member are STATED by the
+                // recorded listing of this service (see the parent issue's evidence).
+                kms_request_rate("ListKeys", 500.0).code("L-8A08DAEA"),
+                // The recording states this code's name but not its value. SOURCE for
+                // the 5: the "Request quotas for each AWS KMS API operation" table of
+                // the KMS Developer Guide's "Quotas" chapter, whose row for
+                // `UpdateCustomKeyStore` — like every custom-key-store operation's —
+                // publishes 5 requests per second.
+                kms_request_rate("UpdateCustomKeyStore", 5.0).code("L-275D92F3"),
             ],
-        ),
-        service(
-            "lakeformation",
-            "AWS Lake Formation",
-            vec![quota("Data lake administrators per account", 30.0)],
         ),
         service(
             "lambda",
@@ -3699,16 +3716,6 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             ],
         ),
         service(
-            "lex",
-            "Amazon Lex",
-            vec![quota("Bots per account", 100.0)],
-        ),
-        service(
-            "license-manager",
-            "AWS License Manager",
-            vec![quota("License configurations per account", 25.0)],
-        ),
-        service(
             "lightsail",
             "Amazon Lightsail",
             vec![
@@ -3717,28 +3724,9 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             ],
         ),
         service(
-            "logs",
-            "Amazon CloudWatch Logs",
-            vec![
-                quota("Subscription filters per log group", 2.0).fixed(),
-                quota("Metric filters per log group", 100.0).fixed(),
-                quota("DescribeLogStreams throttle limit in transactions per second", 25.0),
-            ],
-        ),
-        service(
             "mediaconvert",
             "AWS Elemental MediaConvert",
             vec![quota("Queues per Region", 10.0)],
-        ),
-        service(
-            "medialive",
-            "AWS Elemental MediaLive",
-            vec![quota("Channels per Region", 5.0)],
-        ),
-        service(
-            "mediapackage",
-            "AWS Elemental MediaPackage",
-            vec![quota("Channels per Region", 200.0)],
         ),
         service("monitoring", "Amazon CloudWatch", monitoring_quotas()),
         service(
@@ -5124,6 +5112,32 @@ fn call_count_metric(usage_service_name: &str, api_name: &str) -> MetricInfo {
             ("Type", "API"),
         ],
     )
+}
+
+/// One AWS KMS API REQUEST-RATE quota: `<api> request rate`, the most requests to that
+/// one operation KMS serves per second.
+///
+/// KMS publishes a rate quota for each of its API operations, and every member of such
+/// a row but the operation's own name and the value is the same across the class: the
+/// `QuotaName` is the operation's name followed by `request rate`, the window is one
+/// second, the usage metric is that operation's `AWS/Usage` `CallCount`
+/// ([`call_count_metric`]) under the `KMS` service dimension, and the `Description` is
+/// the sentence KMS publishes for the class with the operation it throttles named in
+/// it. Those are the quota's PUBLISHED members, so one constructor fills them and two
+/// rows of the class cannot drift apart.
+///
+/// SOURCE: AWS KMS's published request quotas (the per-operation request-quota table of
+/// the KMS Developer Guide, which is what the service's default-quota listing reports),
+/// and the recorded default-quota listing of `kms` for the wording and for which
+/// `QuotaCode` names which operation's rate.
+fn kms_request_rate(api_name: &str, requests_per_second: f64) -> QuotaRow {
+    quota(format!("{api_name} request rate"), requests_per_second)
+        .period(1, "SECOND")
+        .metric(call_count_metric("KMS", api_name))
+        .describe(&format!(
+            "Maximum {api_name} requests per second. When you reach this quota, KMS \
+             rejects requests for this operation for the remainder of the interval."
+        ))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
