@@ -35,6 +35,8 @@ mod collection_group_lifecycle;
 mod collection_group_membership;
 #[path = "all/collection_lifecycle.rs"]
 mod collection_lifecycle;
+#[path = "all/effective_lifecycle_policy.rs"]
+mod effective_lifecycle_policy;
 #[path = "all/encryption_indexes_and_tagging.rs"]
 mod encryption_indexes_and_tagging;
 #[path = "all/index_name_rule.rs"]

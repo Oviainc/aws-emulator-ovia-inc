@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetEffectiveLifecyclePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetEffectiveLifecyclePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetEffectiveLifecyclePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: answers each `resourceIdentifiers` entry with the lifecycle policy in
+//! EFFECT for the index resource it names — resolved from the `LifecyclePolicyRecord`s of
+//! that type in [`crate::state`], whose retention rules are matched against the resource
+//! name with the most specific match deciding
+//! ([`crate::state::effective_retention_rule`]). A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +139,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetEffectiveLifecyclePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetEffectiveLifecyclePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetEffectiveLifecyclePolicy"))
+        use crate::state::AuditOutcome;
+
+        // This read addresses index resources rather than one policy by its `(type, name)`
+        // pair, so its audit records name no single policy resource — the terms the other
+        // many-record policy readers in this crate are recorded on.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::StoreUnreachable, None);
+            return Err(
+                BatchGetEffectiveLifecyclePolicyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(crate::state::STORE_UNREACHABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `LifecyclePolicyType` is an enum the boundary validator does not narrow; a value
+        // outside the model's list names no policy type at all, so the whole request is
+        // refused rather than answered with an effective policy for a type that cannot
+        // exist.
+        if let Some(identifier) = input
+            .resource_identifiers
+            .iter()
+            .find(|identifier| !LIFECYCLE_POLICY_TYPE_VALUES.contains(&identifier.r#type.as_str()))
+        {
+            crate::state::audit(Self::NAME, ctx, AuditOutcome::ValidationRefused, None);
+            return Err(
+                BatchGetEffectiveLifecyclePolicyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "type must be one of [{}], got {:?}",
+                            LIFECYCLE_POLICY_TYPE_VALUES.join(", "),
+                            identifier.r#type
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Taking the rule copy is the whole of this read's work under the lock: the
+        // resource-pattern matching below runs with the guard released, so one caller's
+        // identifiers cannot block another request.
+        let store = state.lock();
+        let rules: Vec<crate::state::RetentionRule> = store
+            .lifecycle_policies
+            .values()
+            .flat_map(crate::state::LifecyclePolicyRecord::retention_rules)
+            .collect();
+        drop(store);
+
+        // Each identifier is answered in request order from those rules. The effective
+        // policy of a resource no rule applies to is "no minimum retention is set", which is
+        // a DETAIL rather than a failure, so the error list stays empty: it reports a
+        // resource whose retrieval failed, and nothing here can fail one entry's retrieval
+        // while serving another's.
+        let mut budget = crate::state::MAX_RESOURCE_FILTER_WORK;
+        let mut details: Vec<EffectiveLifecyclePolicyDetail> = Vec::new();
+        for identifier in &input.resource_identifiers {
+            let chosen = crate::state::effective_retention_rule(
+                &rules,
+                &identifier.r#type,
+                &identifier.resource,
+                &mut budget,
+            );
+            match chosen {
+                Ok(rule) => details.push(crate::state::effective_lifecycle_policy_detail(
+                    &identifier.r#type,
+                    &identifier.resource,
+                    rule,
+                )),
+                Err(why) => {
+                    crate::state::audit(Self::NAME, ctx, AuditOutcome::ValidationRefused, None);
+                    return Err(
+                        BatchGetEffectiveLifecyclePolicyErrorModeled::ValidationException(
+                            ValidationException { message: Some(why) },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        crate::state::audit(Self::NAME, ctx, AuditOutcome::PolicyRead, None);
+        Ok(BatchGetEffectiveLifecyclePolicyOutput {
+            effective_lifecycle_policy_details: Some(details),
+            effective_lifecycle_policy_error_details: Some(Vec::new()),
+        })
     }
 }
+

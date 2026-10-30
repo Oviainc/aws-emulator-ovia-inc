@@ -26,7 +26,8 @@ use crate::ops::types::{
     CollectionErrorDetail, CollectionGroupCapacityLimits, CollectionGroupDetail,
     CollectionGroupErrorDetail, CollectionGroupStorageConfiguration, CollectionSummary,
     CreateCollectionDetail, CreateCollectionGroupDetail, CreateVpcEndpointDetail, CurrentCapacity,
-    DeleteCollectionDetail, DeleteVpcEndpointDetail, FipsEndpoints, IamFederationConfigOptions,
+    DeleteCollectionDetail, DeleteVpcEndpointDetail, EffectiveLifecyclePolicyDetail, FipsEndpoints,
+    IamFederationConfigOptions,
     IamIdentityCenterConfigOptions, LifecyclePolicyDetail, LifecyclePolicyErrorDetail,
     LifecyclePolicySummary, SamlConfigOptions, SecurityConfigDetail, SecurityConfigSummary, SecurityPolicyDetail,
     SecurityPolicySummary, Tag, UpdateCollectionDetail, UpdateCollectionGroupDetail,
@@ -2000,6 +2001,63 @@ impl LifecyclePolicyRecord {
         }
     }
 
+    /// The retention rules this policy's document carries, COPIED OUT of the store; see
+    /// [`RetentionRule`] for why the copy is taken under the lock and what bounds it.
+    ///
+    /// The document is read at the same three levels, through the same
+    /// [`policy_document_entries`], as [`policy_document_resources`] reads it at, so the
+    /// rules an effective-policy read resolves against are carried by exactly the resources
+    /// a listing's `resource` filter matches a policy by. A position that does not hold what
+    /// the documented rule form puts there contributes no rule rather than an error:
+    /// [`validate_retention_policy`] is what refuses such a document at the write.
+    pub fn retention_rules(&self) -> Vec<RetentionRule> {
+        use ::aws_smithy_types::Document;
+
+        let mut rules: Vec<RetentionRule> = Vec::new();
+        let mut patterns = 0usize;
+        for statement in policy_document_entries(Some(&self.policy)) {
+            let Document::Object(members) = statement else {
+                continue;
+            };
+            for rule in policy_document_entries(members.get("Rules")) {
+                let Document::Object(rule) = rule else {
+                    continue;
+                };
+                let Some(Document::String(resource_type)) = rule.get("ResourceType") else {
+                    continue;
+                };
+                let mut resource_patterns: Vec<String> = Vec::new();
+                for named in policy_document_entries(rule.get("Resource")) {
+                    if patterns >= MAX_POLICY_RESOURCES {
+                        return rules;
+                    }
+                    let Document::String(named) = named else {
+                        continue;
+                    };
+                    // A pattern past the length bound is dropped rather than matched, on the
+                    // same terms as [`policy_document_resources`] drops it.
+                    if named.len() <= MAX_RESOURCE_PATTERN_LENGTH {
+                        patterns += 1;
+                        resource_patterns.push(named.clone());
+                    }
+                }
+                rules.push(RetentionRule {
+                    policy_type: self.kind.clone(),
+                    policy_name: self.name.clone(),
+                    resource_type: resource_type.clone(),
+                    resource_patterns,
+                    retention_period: match rule.get("MinIndexRetention") {
+                        Some(Document::String(window)) => Some(window.clone()),
+                        // No window named is no minimum retention: the `NoMinIndexRetention`
+                        // spelling of the same rule.
+                        _ => None,
+                    },
+                });
+            }
+        }
+        rules
+    }
+
     /// Apply `write` to this record; see [`PolicyWrite`] for the rule it follows.
     pub fn apply(&mut self, write: PolicyWrite) {
         write.apply(
@@ -2008,6 +2066,137 @@ impl LifecyclePolicyRecord {
             &mut self.policy_version,
             &mut self.last_modified_date,
         );
+    }
+}
+
+/// One retention rule of one stored lifecycle policy, COPIED OUT of the store on the same
+/// terms as [`LifecyclePolicyRecord::listing_entry`]: taking the copy is the whole of an
+/// effective-policy read's work under the state lock, so the resource-pattern matching that
+/// read drives runs outside it.
+///
+/// Bounded by construction: the store holds at most [`MAX_LIFECYCLE_POLICIES`] records, one
+/// document contributes at most [`MAX_POLICY_RESOURCES`] patterns and each of those is at
+/// most [`MAX_RESOURCE_PATTERN_LENGTH`] bytes.
+#[derive(Debug, Clone)]
+pub struct RetentionRule {
+    /// The `LifecyclePolicyType` of the policy that carries the rule, so a read of one type
+    /// never resolves against another type's rules.
+    pub policy_type: String,
+    /// The `PolicyName` of the policy that carries the rule — what an effective read reports
+    /// as `policyName`.
+    pub policy_name: String,
+    /// The rule's own `ResourceType`, which is the kind of resource it applies to.
+    pub resource_type: String,
+    /// The rule's `Resource` entries, each a resource pattern in the form
+    /// [`resource_pattern_matches`] reads.
+    pub resource_patterns: Vec<String>,
+    /// The `MinIndexRetention` window the rule names, or `None` when it names no minimum at
+    /// all (`NoMinIndexRetention`) — the two spellings [`validate_retention_policy`]
+    /// accepts.
+    pub retention_period: Option<String>,
+}
+
+/// The `ResourceType` the resource name `resource` addresses: the segment before its first
+/// `/`, the prefix AWS's resource names and the `Resource` patterns of a policy rule are
+/// both written with (`index/<collection>/<index>`). `None` when that segment is not one of
+/// the model's own `ResourceType` values.
+pub fn resource_type_of(resource: &str) -> Option<&'static str> {
+    let addressed = resource.split('/').next().unwrap_or_default();
+    crate::ops::types::RESOURCE_TYPE_VALUES
+        .iter()
+        .copied()
+        .find(|value| *value == addressed)
+}
+
+/// How specific a resource pattern is, as an order: the literal prefix it pins before its
+/// first `*`, and then whether it pins the whole name (no wildcard at all).
+///
+/// A pattern that matches a given resource name pins a prefix of that name, so the longer
+/// the pinned prefix the narrower the set of resources the pattern denotes; a wildcard-free
+/// pattern pins the name itself, which is narrower still than a wildcarded pattern pinning
+/// the same characters (`index/sales/orders` against `index/sales/orders*`).
+fn pattern_specificity(pattern: &str) -> (usize, bool) {
+    match pattern.split_once('*') {
+        Some((pinned, _)) => (pinned.len(), false),
+        None => (pattern.len(), true),
+    }
+}
+
+/// The rule of `rules` that decides the effective lifecycle policy of the `resource` named
+/// under the policy type `kind`, or `None` when none of them applies to it.
+///
+/// AWS's "Amazon OpenSearch Serverless data lifecycle policies" documents the precedence
+/// that resolves several applicable rules: the most specific matching resource pattern
+/// decides. [`pattern_specificity`] is that order, and rules that tie in it are resolved by
+/// the order the store holds them in — policy type and name, then document order — so the
+/// answer is a property of the stored policies rather than of the walk.
+///
+/// `budget` bounds the matching work, charged per comparison by [`resource_overlap_work`]
+/// exactly as a listing's `resource` filter is: a read whose identifiers and stored patterns
+/// together exceed it is refused with the message answered here rather than running on.
+pub fn effective_retention_rule<'rules>(
+    rules: &'rules [RetentionRule],
+    kind: &str,
+    resource: &str,
+    budget: &mut usize,
+) -> Result<Option<&'rules RetentionRule>, String> {
+    let addressed = resource_type_of(resource);
+    let mut chosen: Option<(&RetentionRule, (usize, bool))> = None;
+    for rule in rules
+        .iter()
+        .filter(|rule| rule.policy_type == kind && Some(rule.resource_type.as_str()) == addressed)
+    {
+        for pattern in &rule.resource_patterns {
+            // Charged BEFORE the comparison, so the budget bounds work done rather than
+            // work already spent.
+            let Some(left) = budget.checked_sub(resource_overlap_work(pattern, resource)) else {
+                return Err(format!(
+                    "resourceIdentifiers names more, or more wildcarded, resources than this \
+                     read matches ({MAX_RESOURCE_FILTER_WORK} bytes of matching); name fewer \
+                     resources"
+                ));
+            };
+            *budget = left;
+            // The identifier names ONE resource rather than a pattern, so this is the
+            // one-directional match — a stored pattern against that name — not the
+            // symmetric overlap a listing's filter entry takes part in.
+            if !resource_pattern_matches(pattern, resource) {
+                continue;
+            }
+            let specificity = pattern_specificity(pattern);
+            if chosen.is_none_or(|(_, held)| specificity > held) {
+                chosen = Some((rule, specificity));
+            }
+        }
+    }
+    Ok(chosen.map(|(rule, _)| rule))
+}
+
+/// The `EffectiveLifecyclePolicyDetail` for the identifier `(kind, resource)`, answered from
+/// `rule` — the rule [`effective_retention_rule`] chose, or `None` when no stored policy of
+/// that type applies to the resource.
+///
+/// The one place this crate renders that shape. A rule naming a `MinIndexRetention` window
+/// reports it as `retentionPeriod` beside a `noMinRetentionPeriod` of `false`; a rule naming
+/// no minimum, and a resource no rule applies to, report `noMinRetentionPeriod` `true` and
+/// no window — the member's own documentation, "that will return as `true` if the minimum
+/// number of days or hours is not set to a index resource".
+pub fn effective_lifecycle_policy_detail(
+    kind: &str,
+    resource: &str,
+    rule: Option<&RetentionRule>,
+) -> EffectiveLifecyclePolicyDetail {
+    EffectiveLifecyclePolicyDetail {
+        r#type: Some(kind.to_string()),
+        resource: Some(resource.to_string()),
+        policy_name: rule.map(|rule| rule.policy_name.clone()),
+        // The applying rule's `ResourceType` when one applies, and otherwise the kind of
+        // resource the name itself addresses: the detail describes that resource either way.
+        resource_type: rule
+            .map(|rule| rule.resource_type.clone())
+            .or_else(|| resource_type_of(resource).map(str::to_string)),
+        retention_period: rule.and_then(|rule| rule.retention_period.clone()),
+        no_min_retention_period: Some(rule.is_none_or(|rule| rule.retention_period.is_none())),
     }
 }
 
