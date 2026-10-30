@@ -39,6 +39,8 @@ mod quick_response;
 mod quick_response_search;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/service_managed_defaults.rs"]
+mod service_managed_defaults;
 #[path = "all/session_configuration.rs"]
 mod session_configuration;
 #[path = "all/session_recommendations.rs"]

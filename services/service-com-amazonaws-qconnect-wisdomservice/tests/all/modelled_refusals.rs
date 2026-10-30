@@ -36,8 +36,9 @@ const MESSAGE_UNAUTHORIZED: &str = "Unauthorized";
 /// The region every request is signed for.
 const REGION: &str = "us-west-2";
 
-/// A UUID no create ever mints.
-const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
+/// A UUID no create ever mints. The all-zero id is NOT one: it names the system-managed
+/// session every assistant is provisioned with.
+const ABSENT_UUID: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]

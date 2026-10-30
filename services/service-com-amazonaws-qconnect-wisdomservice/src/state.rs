@@ -53,6 +53,29 @@ pub const ASSISTANT_CAPABILITY_V2: &str = "V2";
 /// `CUSTOMER` for a Session created by calling CreateSession API".
 pub const SESSION_ORIGIN_CUSTOMER: &str = "CUSTOMER";
 
+/// The `Origin` of the session the SERVICE creates for an assistant, the other half of
+/// the wording quoted on [`SESSION_ORIGIN_CUSTOMER`]: the default session Amazon Q in
+/// Connect provisions with the assistant rather than one a caller asked for.
+pub const SESSION_ORIGIN_SYSTEM: &str = "SYSTEM";
+
+/// The `sessionId` of the service-managed session every assistant owns.
+///
+/// Amazon Q in Connect provisions one default session per assistant and addresses it by
+/// this fixed all-zero id, which is why a client that was given no session of its own
+/// (the Amazon Connect integration path) can still read and notify the assistant's
+/// session. It satisfies the modelled `Uuid` form
+/// (`smithy_query(query="shape",shape="Uuid")`) without being a minted id, so no
+/// [`mint_candidate`] can collide with it.
+pub const SYSTEM_SESSION_ID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// The `name` of the service-managed session [`SYSTEM_SESSION_ID`] names. Fixed text the
+/// service gives it — the caller names nothing, since the caller did not create it.
+pub const SYSTEM_SESSION_NAME: &str = "QinConnectSystemSession";
+
+/// The `description` of the service-managed session [`SYSTEM_SESSION_ID`] names, fixed
+/// text on the same footing as [`SYSTEM_SESSION_NAME`].
+pub const SYSTEM_SESSION_DESCRIPTION: &str = "System-managed session for Amazon Q in Connect.";
+
 /// The page size `ListAssistants` serves when a call names no `maxResults`: the
 /// modelled maximum of the `maxResults` range (1..100).
 pub const DEFAULT_MAX_RESULTS: usize = 100;
@@ -189,17 +212,6 @@ pub const AI_AGENT_VISIBILITY_PUBLISHED: &str = "PUBLISHED";
 /// rather than moving it through a deleting status.
 pub const AI_RESOURCE_STATUS_ACTIVE: &str = "ACTIVE";
 
-/// The version of a default `SYSTEM` AI agent the service provisions with an assistant,
-/// and so the version the assistant's binding to it names.
-///
-/// A published AI agent is versioned, and the first published version of one is 1: the
-/// modelled `Version` shape is `range 1..`
-/// (`smithy_query(query="shape",shape="Version")`), and nothing in this emulator
-/// publishes a second version of a default agent, so the version a binding reports stays
-/// the one the provisioning assigned. See [`qualified_ai_agent_id`] for why the binding
-/// reports it at all.
-pub const AI_AGENT_FIRST_VERSION: i64 = 1;
-
 /// The one AI agent type whose binding can be turned off, which is why its binding is
 /// the one that reports `enabled`: the model's `AIAgentConfigurationData$enabled` doc
 /// says "Setting this value to false is currently supported only for the
@@ -213,24 +225,88 @@ pub const AI_AGENT_FIRST_VERSION: i64 = 1;
 /// turned off.
 pub const AI_AGENT_TYPE_ANSWER_RECOMMENDATION: &str = "ANSWER_RECOMMENDATION";
 
-/// The AI agent types an assistant gets a default `SYSTEM` AI agent for when the service
-/// creates it, which is what a fresh assistant's `aiAgentConfiguration` reports a
-/// binding for.
+/// One built-in AI agent of the service: the `AIAgentType` it serves, the id Amazon Q in
+/// Connect publishes it under and the version of it that is published.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltInAiAgent {
+    pub r#type: &'static str,
+    pub ai_agent_id: &'static str,
+    /// The published version of this agent, which the binding that names it qualifies
+    /// the id with — see [`qualified_ai_agent_id`]. Within the modelled `Version` range
+    /// (`smithy_query(query="shape",shape="Version")`: `range 1..`).
+    pub version_number: i64,
+}
+
+/// The built-in (`SYSTEM`-origin) AI agents Amazon Q in Connect provisions every
+/// assistant with, which is what a fresh assistant's and a fresh session's
+/// `aiAgentConfiguration` is bound to.
 ///
-/// Every `AIAgentType` the model declares
+/// These agents belong to the SERVICE, not to the assistant that reports them, so their
+/// ids and published versions are service constants: every assistant and every session,
+/// in every account and region, names the same eight `<id>:<version>` pairs. The ids and
+/// versions below are the ones the recorded answers of `CreateAssistant`,
+/// `CreateSession` and `GetSession` report, which agree across independently created
+/// assistants.
+///
+/// One entry per `AIAgentType` the model declares
 /// (`smithy_query(query="shape",shape="AIAgentType")`) except `ORCHESTRATION`, which has
-/// no default agent: the recorded wire answer for a fresh assistant carries a binding
-/// for each of the eight below and none for `ORCHESTRATION`. Sorted, so the list reads
-/// as the set it is.
-pub const DEFAULT_AI_AGENT_TYPES: [&str; 8] = [
-    "ANSWER_RECOMMENDATION",
-    "CASE_SUMMARIZATION",
-    "EMAIL_GENERATIVE_ANSWER",
-    "EMAIL_OVERVIEW",
-    "EMAIL_RESPONSE",
-    "MANUAL_SEARCH",
-    "NOTE_TAKING",
-    "SELF_SERVICE",
+/// no built-in agent: a recorded fresh assistant carries a binding for each of the eight
+/// below and none for `ORCHESTRATION`. Sorted by type, so the list reads as the set it
+/// is.
+pub const BUILT_IN_AI_AGENTS: [BuiltInAiAgent; 8] = [
+    BuiltInAiAgent {
+        r#type: "ANSWER_RECOMMENDATION",
+        ai_agent_id: "3025a3fa-5419-4c9c-a040-877213b93f70",
+        version_number: 12,
+    },
+    BuiltInAiAgent {
+        r#type: "CASE_SUMMARIZATION",
+        ai_agent_id: "9114812c-2a1e-4501-8817-daec4223ce57",
+        version_number: 3,
+    },
+    BuiltInAiAgent {
+        r#type: "EMAIL_GENERATIVE_ANSWER",
+        ai_agent_id: "4d7e9f2a-1b3c-5d6e-8f7a-9b0c1d2e3f4a",
+        version_number: 7,
+    },
+    BuiltInAiAgent {
+        r#type: "EMAIL_OVERVIEW",
+        ai_agent_id: "91bb967b-bd5e-4e02-a8d5-cb7c5b2bf9c7",
+        version_number: 5,
+    },
+    BuiltInAiAgent {
+        r#type: "EMAIL_RESPONSE",
+        ai_agent_id: "8f4e7d2a-9c31-4b5e-a6f8-e2d9c7b54321",
+        version_number: 7,
+    },
+    BuiltInAiAgent {
+        r#type: "MANUAL_SEARCH",
+        ai_agent_id: "652f0287-1610-4fee-bbe3-c687c13f5ec3",
+        version_number: 9,
+    },
+    BuiltInAiAgent {
+        r#type: "NOTE_TAKING",
+        ai_agent_id: "7fc84960-5b46-4e44-9dd6-5956b2acfaa4",
+        version_number: 3,
+    },
+    BuiltInAiAgent {
+        r#type: "SELF_SERVICE",
+        ai_agent_id: "529207fe-80fd-42be-bcf2-facd2141aec7",
+        version_number: 5,
+    },
+];
+
+/// The AI agent types an assistant gets a default `SYSTEM` AI agent for when the service
+/// creates it, read off [`BUILT_IN_AI_AGENTS`] so the two cannot drift apart.
+pub const DEFAULT_AI_AGENT_TYPES: [&str; BUILT_IN_AI_AGENTS.len()] = [
+    BUILT_IN_AI_AGENTS[0].r#type,
+    BUILT_IN_AI_AGENTS[1].r#type,
+    BUILT_IN_AI_AGENTS[2].r#type,
+    BUILT_IN_AI_AGENTS[3].r#type,
+    BUILT_IN_AI_AGENTS[4].r#type,
+    BUILT_IN_AI_AGENTS[5].r#type,
+    BUILT_IN_AI_AGENTS[6].r#type,
+    BUILT_IN_AI_AGENTS[7].r#type,
 ];
 
 /// The fixed text for a request addressed to an AI guardrail its named assistant does
@@ -764,6 +840,94 @@ pub fn topic_integration_arn(region: &str, assistant_id: &str) -> String {
     )
 }
 
+/// The built-in AI agents an assistant is provisioned with, and the bindings that name
+/// them: one `SYSTEM`-origin record per [`BUILT_IN_AI_AGENTS`] entry, under that entry's
+/// service-published id and version.
+///
+/// The ids are the SERVICE's, so every assistant holds the same eight agents and every
+/// binding a fresh assistant or session reports names one of them: nothing here is
+/// minted per assistant. Returned rather than stored, so the create puts them on the
+/// record it inserts.
+pub fn default_ai_agents(
+    region: &str,
+    assistant_id: &str,
+) -> (
+    HashMap<String, AiAgent>,
+    HashMap<String, AIAgentConfigurationData>,
+) {
+    let created_at = SystemTime::now();
+    let mut agents: HashMap<String, AiAgent> = HashMap::new();
+    let mut bindings: HashMap<String, AIAgentConfigurationData> = HashMap::new();
+    for agent in BUILT_IN_AI_AGENTS {
+        agents.insert(
+            agent.ai_agent_id.to_string(),
+            AiAgent {
+                ai_agent_arn: ai_agent_arn(region, assistant_id, agent.ai_agent_id),
+                ai_agent_id: agent.ai_agent_id.to_string(),
+                assistant_id: assistant_id.to_string(),
+                name: agent.r#type.to_string(),
+                r#type: agent.r#type.to_string(),
+                origin: AI_AGENT_ORIGIN_SYSTEM.to_string(),
+                visibility_status: AI_AGENT_VISIBILITY_PUBLISHED.to_string(),
+                status: AI_RESOURCE_STATUS_ACTIVE.to_string(),
+                version_number: agent.version_number,
+                created_at,
+            },
+        );
+        bindings.insert(
+            agent.r#type.to_string(),
+            AIAgentConfigurationData {
+                // The binding names the agent by its id AND the version of it that runs
+                // — the model's own wording for the member is "The ID of the AI Agent to
+                // be configured", and the map it lives in maps an AI agent type "to AI
+                // Agent version" — so what this assistant reports is the id of the
+                // service's agent for the type, qualified by that agent's published
+                // version. See [`qualified_ai_agent_id`].
+                ai_agent_id: qualified_ai_agent_id(agent.ai_agent_id, agent.version_number),
+                // The model's own wording: "Indicates whether the AI Agent
+                // configured for this AI Agent type is enabled … Setting this value
+                // to false is currently supported only for the
+                // `ANSWER_RECOMMENDATION` AI Agent type" — see
+                // [`AI_AGENT_TYPE_ANSWER_RECOMMENDATION`] for why that one default
+                // is bound disabled and why no other type reports the member.
+                enabled: (agent.r#type == AI_AGENT_TYPE_ANSWER_RECOMMENDATION).then_some(false),
+            },
+        );
+    }
+    (agents, bindings)
+}
+
+/// The service-managed session an assistant is provisioned with, as this emulator
+/// persists it: the session [`SYSTEM_SESSION_ID`] names, of `SYSTEM` origin, carrying
+/// the fixed name and description the service gives it and the assistant's own AI agent
+/// bindings.
+///
+/// Nothing on it comes from a caller — no caller created it — so it holds no tags, no tag
+/// filter, no contact, no topic integration and no orchestrator configuration, and
+/// reports only the members it holds.
+pub fn system_session(
+    region: &str,
+    assistant_id: &str,
+    ai_agent_configuration: &HashMap<String, AIAgentConfigurationData>,
+) -> Session {
+    Session {
+        session_id: SYSTEM_SESSION_ID.to_string(),
+        session_arn: session_arn(region, assistant_id, SYSTEM_SESSION_ID),
+        assistant_id: assistant_id.to_string(),
+        name: SYSTEM_SESSION_NAME.to_string(),
+        description: Some(SYSTEM_SESSION_DESCRIPTION.to_string()),
+        tags: HashMap::new(),
+        tag_filter: None,
+        ai_agent_configuration: ai_agent_configuration.clone(),
+        topic_integration_arn: None,
+        orchestrator_configuration_list: None,
+        contact_arn: None,
+        origin: SESSION_ORIGIN_SYSTEM.to_string(),
+        created_at: SystemTime::now(),
+        recommendations: RecommendationFeed::default(),
+    }
+}
+
 /// One id candidate for the mint block the store's sequence number `seq` owns.
 ///
 /// The form is the modelled `Uuid` shape
@@ -1059,10 +1223,13 @@ pub struct Session {
     pub ai_agent_configuration: HashMap<String, AIAgentConfigurationData>,
     /// The ARN of the SNS topic this session streams chat messages through: the topic the
     /// parent assistant was provisioned with (see [`topic_integration_arn`]), which is
-    /// what a session of that assistant is integrated with.
+    /// what a session of that assistant is integrated with. `None` on a session that is
+    /// integrated with no topic, which reports no integration configuration at all.
     pub topic_integration_arn: Option<String>,
-    /// This session's orchestrator configurations, as its create stored them.
-    pub orchestrator_configuration_list: Vec<OrchestratorConfigurationEntry>,
+    /// This session's orchestrator configurations, as its create stored them: `Some` of
+    /// the list a create was given — empty when it named none — and `None` on a session
+    /// no create configured, which reports no orchestrator list at all.
+    pub orchestrator_configuration_list: Option<Vec<OrchestratorConfigurationEntry>>,
     /// The contact this session was opened for, as the caller gave it. Not a member of
     /// `SessionData`, so it is persisted but not reported.
     pub contact_arn: Option<String>,
@@ -1087,27 +1254,32 @@ impl Session {
             // Every configuration member of the stored record is reported, each out of
             // what the record holds — the same rule the assistant is rendered by: the
             // topic the session streams through, the AI agent bound per `AIAgentType`,
-            // and the orchestrator configurations, the last reported empty rather than
-            // omitted the way `tags` is.
-            integration_configuration: Some(SessionIntegrationConfiguration {
-                topic_integration_arn: self.topic_integration_arn.clone(),
+            // and the orchestrator configurations. A member the session HOLDS is
+            // reported even when it is empty (a create that named no orchestrator
+            // configuration reports an empty list, not nothing); a member it holds
+            // nothing under at all is omitted.
+            integration_configuration: self.topic_integration_arn.as_ref().map(|topic| {
+                SessionIntegrationConfiguration {
+                    topic_integration_arn: Some(topic.clone()),
+                }
             }),
             tag_filter: self.tag_filter.clone(),
             ai_agent_configuration: map_out(&self.ai_agent_configuration),
             origin: Some(self.origin.clone()),
-            orchestrator_configuration_list: Some(self.orchestrator_configuration_list.clone()),
+            orchestrator_configuration_list: self.orchestrator_configuration_list.clone(),
         }
     }
 }
 
 /// One AI agent of an assistant, as this emulator persists it.
 ///
-/// The default agents the service creates with the assistant are `SYSTEM`-origin
-/// records; an agent a caller creates through `CreateAIAgent` is `CUSTOMER`-origin and
-/// carries the configuration the caller gave. Nothing reports these yet — `GetAIAgent`
-/// and `ListAIAgents` are still scaffolded — but the assistant's
-/// `aiAgentConfiguration` names them, so the ids it reports are the ids of records this
-/// store holds rather than numbers with nothing behind them.
+/// The built-in agents the service provisions with the assistant are `SYSTEM`-origin
+/// records under the service's own ids (see [`BUILT_IN_AI_AGENTS`]); an agent a caller
+/// creates through `CreateAIAgent` is `CUSTOMER`-origin and carries the configuration the
+/// caller gave. Nothing reports these yet — `GetAIAgent` and `ListAIAgents` are still
+/// scaffolded — but the assistant's `aiAgentConfiguration` names them, so the ids it
+/// reports are the ids of records this store holds rather than numbers with nothing
+/// behind them.
 #[derive(Debug, Clone)]
 pub struct AiAgent {
     pub ai_agent_id: String,
@@ -1260,8 +1432,10 @@ pub struct Assistant {
     /// This assistant's orchestrator configurations, with the same contract as
     /// [`Self::ai_agent_configuration`].
     pub orchestrator_configuration_list: Vec<OrchestratorConfigurationEntry>,
-    /// This assistant's sessions, keyed by `sessionId`. A session is reachable only
-    /// through its parent, so a session id does not resolve under another assistant.
+    /// This assistant's sessions, keyed by `sessionId`: the service-managed one the
+    /// create provisions it with (see [`system_session`]) and every session a caller
+    /// creates. A session is reachable only through its parent, so a session id does not
+    /// resolve under another assistant.
     pub sessions: HashMap<String, Session>,
 }
 
@@ -1336,6 +1510,17 @@ impl Assistant {
         (0..MINT_ATTEMPTS as u64)
             .map(|attempt| mint_candidate(seq, attempt))
             .find(|candidate| !self.sessions.contains_key(candidate))
+    }
+
+    /// How many sessions a CALLER has created under this assistant, which is what
+    /// [`MAX_SESSIONS_PER_ASSISTANT`] bounds: the session the SERVICE provisioned with
+    /// the assistant (see [`system_session`]) is not one a caller asked for, so it does
+    /// not spend the caller's allowance.
+    pub fn customer_session_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.origin != SESSION_ORIGIN_SYSTEM)
+            .count()
     }
 
     /// An `aiGuardrailId` no guardrail of this assistant holds, with the same contract as
@@ -2310,71 +2495,6 @@ impl ComAmazonawsQconnectWisdomserviceState {
                 true
             }
         }
-    }
-
-    /// The default AI agents an assistant comes with, and the bindings that name them:
-    /// one `SYSTEM`-origin agent per [`DEFAULT_AI_AGENT_TYPES`] entry, which is what the
-    /// service provisions when it creates an assistant. Returned rather than stored, so
-    /// the create puts them on the record it inserts.
-    pub fn default_ai_agents(
-        &mut self,
-        region: &str,
-        assistant_id: &str,
-    ) -> (
-        HashMap<String, AiAgent>,
-        HashMap<String, AIAgentConfigurationData>,
-    ) {
-        let created_at = SystemTime::now();
-        let mut agents: HashMap<String, AiAgent> = HashMap::new();
-        let mut bindings: HashMap<String, AIAgentConfigurationData> = HashMap::new();
-        for agent_type in DEFAULT_AI_AGENT_TYPES {
-            let seq = self.next_seq();
-            let Some(ai_agent_id) = (0..MINT_ATTEMPTS as u64)
-                .map(|attempt| mint_candidate(seq, attempt))
-                .find(|candidate| !agents.contains_key(candidate))
-            else {
-                // Every candidate of this block was taken by an agent minted a moment
-                // ago: the assistant gets no default agent of this type rather than a
-                // second record under one id.
-                continue;
-            };
-            agents.insert(
-                ai_agent_id.clone(),
-                AiAgent {
-                    ai_agent_arn: ai_agent_arn(region, assistant_id, &ai_agent_id),
-                    ai_agent_id: ai_agent_id.clone(),
-                    assistant_id: assistant_id.to_string(),
-                    name: agent_type.to_string(),
-                    r#type: agent_type.to_string(),
-                    origin: AI_AGENT_ORIGIN_SYSTEM.to_string(),
-                    visibility_status: AI_AGENT_VISIBILITY_PUBLISHED.to_string(),
-                    status: AI_RESOURCE_STATUS_ACTIVE.to_string(),
-                    version_number: AI_AGENT_FIRST_VERSION,
-                    created_at,
-                },
-            );
-            bindings.insert(
-                agent_type.to_string(),
-                AIAgentConfigurationData {
-                    // The binding names the stored agent by its id AND the version of it
-                    // that runs — the model's own wording for the member is "The ID of
-                    // the AI Agent to be configured", and the map it lives in maps an AI
-                    // agent type "to AI Agent version" — so the id this assistant reports
-                    // is the id of a record this store holds, qualified by that record's
-                    // published version. See [`qualified_ai_agent_id`].
-                    ai_agent_id: qualified_ai_agent_id(&ai_agent_id, AI_AGENT_FIRST_VERSION),
-                    // The model's own wording: "Indicates whether the AI Agent
-                    // configured for this AI Agent type is enabled … Setting this value
-                    // to false is currently supported only for the
-                    // `ANSWER_RECOMMENDATION` AI Agent type" — see
-                    // [`AI_AGENT_TYPE_ANSWER_RECOMMENDATION`] for why that one default
-                    // is bound disabled and why no other type reports the member.
-                    enabled: (agent_type == AI_AGENT_TYPE_ANSWER_RECOMMENDATION)
-                        .then_some(false),
-                },
-            );
-        }
-        (agents, bindings)
     }
 
     /// A knowledge-base id no stored knowledge base holds, or `None` when

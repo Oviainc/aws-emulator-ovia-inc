@@ -378,14 +378,14 @@ async fn an_assistants_configuration_is_reported_by_every_read() {
     }
 }
 
-/// Two assistants are provisioned independently: neither the topic nor any default AI
-/// agent is shared between them.
+/// Two assistants are provisioned independently in what belongs to the ASSISTANT — the
+/// streaming topic — and identically in what belongs to the SERVICE: the built-in AI
+/// agents every assistant is bound to are the same agents.
 #[tokio::test]
-async fn two_assistants_get_their_own_topic_and_agents() {
+async fn two_assistants_get_their_own_topic_and_the_services_agents() {
     let emulator = Emulator::new();
     let mut topics = BTreeSet::new();
-    let mut agent_ids: BTreeSet<String> = BTreeSet::new();
-    let mut created_count = 0usize;
+    let mut first_bindings: Option<Value> = None;
 
     for case in ["first assistant", "second assistant", "third assistant"] {
         let created = emulator
@@ -399,7 +399,6 @@ async fn two_assistants_get_their_own_topic_and_agents() {
             "case {case:?}: expected HTTP 200, got {} with body {}",
             created.status, created.body
         );
-        created_count += 1;
         let topic = created
             .string("/assistant/integrationConfiguration/topicIntegrationArn")
             .unwrap_or_else(|| panic!("case {case:?}: no topicIntegrationArn in {}", created.body));
@@ -407,30 +406,18 @@ async fn two_assistants_get_their_own_topic_and_agents() {
             topics.insert(topic.clone()),
             "case {case:?}: topic {topic} was already another assistant's"
         );
-        for (agent_type, binding) in created
+        let bindings = created
             .body
             .pointer("/assistant/aiAgentConfiguration")
-            .and_then(Value::as_object)
-            .unwrap_or_else(|| panic!("case {case:?}: no aiAgentConfiguration"))
-        {
-            let id = binding
-                .get("aiAgentId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            assert!(
-                agent_ids.insert(id.clone()),
-                "case {case:?}/{agent_type}: aiAgentId {id} was already another \
-                 assistant's agent"
-            );
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: no aiAgentConfiguration"));
+        match &first_bindings {
+            None => first_bindings = Some(bindings),
+            Some(expected) => assert_eq!(
+                &bindings, expected,
+                "case {case:?}: expected the same service-owned default agents every \
+                 assistant is bound to ({expected:?}), got {bindings:?}"
+            ),
         }
     }
-
-    assert_eq!(
-        agent_ids.len(),
-        created_count * DEFAULT_AI_AGENT_TYPES.len(),
-        "case {:?}: expected one default agent per type per assistant, got {}",
-        "distinct agents over all assistants",
-        agent_ids.len()
-    );
 }

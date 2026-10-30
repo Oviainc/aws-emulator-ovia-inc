@@ -249,11 +249,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The service provisions the assistant's streaming topic and its default SYSTEM
-        // AI agents with the assistant itself, so the create's own answer already
-        // reports them.
+        // The service provisions the assistant's streaming topic, its built-in SYSTEM AI
+        // agents and its own system-managed session with the assistant itself, so the
+        // create's own answer already reports them.
         let (ai_agents, ai_agent_configuration) =
-            store.default_ai_agents(&region, &assistant_id);
+            crate::state::default_ai_agents(&region, &assistant_id);
+        let system_session = crate::state::system_session(
+            &region,
+            &assistant_id,
+            &ai_agent_configuration,
+        );
         let assistant = crate::state::Assistant {
             assistant_arn: crate::state::assistant_arn(&region, &assistant_id),
             assistant_id: assistant_id.clone(),
@@ -279,7 +284,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `CreateAIGuardrail`, under the assistant the route names.
             ai_guardrails: ::std::collections::HashMap::new(),
             orchestrator_configuration_list: Vec::new(),
-            sessions: ::std::collections::HashMap::new(),
+            // The assistant owns the service-managed session from the moment it exists:
+            // a `GetSession` on it right after this create reports it, with no
+            // `CreateSession` in between.
+            sessions: ::std::collections::HashMap::from([(
+                crate::state::SYSTEM_SESSION_ID.to_string(),
+                system_session,
+            )]),
         };
         store.insert_assistant(assistant);
         store.remember_create(

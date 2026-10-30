@@ -467,9 +467,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // The assistant's session bound, which is what keeps the store finite. The
-        // operation models no quota error, so the refusal is its `ValidationException`.
-        if assistant.sessions.len() >= crate::state::MAX_SESSIONS_PER_ASSISTANT {
+        // The assistant's session bound, which is what keeps the store finite. It bounds
+        // the sessions a CALLER created, not the service-managed one the assistant came
+        // with. The operation models no quota error, so the refusal is its
+        // `ValidationException`.
+        if assistant.customer_session_count() >= crate::state::MAX_SESSIONS_PER_ASSISTANT {
             return Err(CreateSessionErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(format!(
@@ -512,10 +514,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tag_filter: input.tag_filter.clone(),
             ai_agent_configuration,
             topic_integration_arn,
-            orchestrator_configuration_list: input
-                .orchestrator_configuration_list
-                .clone()
-                .unwrap_or_default(),
+            orchestrator_configuration_list: Some(
+                input.orchestrator_configuration_list.clone().unwrap_or_default(),
+            ),
             contact_arn: input.contact_arn.clone(),
             origin: crate::state::SESSION_ORIGIN_CUSTOMER.to_string(),
             created_at: now,

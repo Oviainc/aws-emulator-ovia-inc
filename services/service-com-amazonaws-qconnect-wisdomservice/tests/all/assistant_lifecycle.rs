@@ -38,8 +38,9 @@ const MAX_RESULTS_MAX: i64 = 100;
 /// only ever stored and reported.
 const AI_AGENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 
-/// A UUID no create ever mints, for the not-found assertions.
-const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
+/// A UUID no create ever mints, for the not-found assertions. The all-zero id is NOT
+/// one: it names the system-managed session every assistant is provisioned with.
+const ABSENT_UUID: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
 
 /// The service's fixed sentence for each refusal condition these tests reach, written
 /// out here rather than imported from `state.rs` so the assertion states the text

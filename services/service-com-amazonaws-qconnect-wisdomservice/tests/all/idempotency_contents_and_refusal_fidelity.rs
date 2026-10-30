@@ -54,8 +54,9 @@ const REGION: &str = "eu-central-1";
 /// follows are minted on.
 const ENDPOINT_HOST: &str = "wisdom.eu-central-1.amazonaws.com";
 
-/// A UUID no create ever mints, for the not-found assertions.
-const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
+/// A UUID no create ever mints, for the not-found assertions. The all-zero id is NOT
+/// one: it names the system-managed session every assistant is provisioned with.
+const ABSENT_UUID: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
 
 /// One media type `StartContentUpload`'s modelled `ContentType` pattern admits
 /// (`smithy_query(query="operation",operation="StartContentUpload")`).
