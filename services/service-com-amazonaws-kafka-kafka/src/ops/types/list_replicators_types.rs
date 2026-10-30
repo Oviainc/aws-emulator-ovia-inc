@@ -26,7 +26,10 @@ pub struct ListReplicatorsOutput {
     pub replicators: Option<Vec<ReplicatorSummary>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#ReplicatorSummary")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#ReplicatorSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct ReplicatorSummary {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
@@ -39,6 +42,54 @@ pub struct ReplicatorSummary {
     pub replicator_resource_arn: Option<String>,
     pub replicator_state: Option<String>,
 }
+
+// `ReplicatorState` is an enum shape, which the generator writes as `ShapeType::String`.
+kafka_schema_and_codec!(
+    ReplicatorSummary,
+    REPLICATOR_SUMMARY_SCHEMA,
+    "ReplicatorSummary",
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 0, opt, date_time),
+    (M_CURRENT_VERSION, current_version, "CurrentVersion", "currentVersion", 1, opt, string),
+    (
+        M_IS_REPLICATOR_REFERENCE,
+        is_replicator_reference,
+        "IsReplicatorReference",
+        "isReplicatorReference",
+        2,
+        opt,
+        boolean
+    ),
+    (
+        M_KAFKA_CLUSTERS_SUMMARY,
+        kafka_clusters_summary,
+        "KafkaClustersSummary",
+        "kafkaClustersSummary",
+        3,
+        opt,
+        list_of_struct(KafkaClusterSummary)
+    ),
+    (
+        M_REPLICATION_INFO_SUMMARY_LIST,
+        replication_info_summary_list,
+        "ReplicationInfoSummaryList",
+        "replicationInfoSummaryList",
+        4,
+        opt,
+        list_of_struct(ReplicationInfoSummary)
+    ),
+    (M_REPLICATOR_ARN, replicator_arn, "ReplicatorArn", "replicatorArn", 5, opt, string),
+    (M_REPLICATOR_NAME, replicator_name, "ReplicatorName", "replicatorName", 6, opt, string),
+    (
+        M_REPLICATOR_RESOURCE_ARN,
+        replicator_resource_arn,
+        "ReplicatorResourceArn",
+        "replicatorResourceArn",
+        7,
+        opt,
+        string
+    ),
+    (M_REPLICATOR_STATE, replicator_state, "ReplicatorState", "replicatorState", 8, opt, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kafka#KafkaClusterSummary")]
 #[derive(Debug, Clone, Default)]

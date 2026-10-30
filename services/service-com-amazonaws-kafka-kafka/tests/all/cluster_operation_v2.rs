@@ -27,7 +27,8 @@
 use serde_json::{json, Value};
 
 use crate::kafka_harness::{
-    pct, sleep_past_activation, sleep_past_update, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+    pct, reported_instant_secs, sleep_past_activation, sleep_past_update, ClusterRequest, Emulator,
+    Reply, ACCOUNT, REGION,
 };
 
 /// The wire values this suite expects, written out rather than imported from
@@ -248,9 +249,7 @@ async fn describes_the_operation_each_update_files() {
             member(&info, "/operationState")
         );
         assert!(
-            member(&info, "/startTime")
-                .as_f64()
-                .is_some_and(|epoch| epoch > 0.0),
+            reported_instant_secs(&member(&info, "/startTime"), case.name) > 0.0,
             "case {}: expected the operation to report a startTime, got {:?}",
             case.name,
             member(&info, "/startTime")
@@ -349,9 +348,7 @@ async fn describes_the_operation_each_update_files() {
             member(&info, "/operationState")
         );
         assert!(
-            member(&info, "/endTime")
-                .as_f64()
-                .is_some_and(|epoch| epoch > 0.0),
+            reported_instant_secs(&member(&info, "/endTime"), case.name) > 0.0,
             "case {}: expected a finished operation to report an endTime, got {:?}",
             case.name,
             member(&info, "/endTime")

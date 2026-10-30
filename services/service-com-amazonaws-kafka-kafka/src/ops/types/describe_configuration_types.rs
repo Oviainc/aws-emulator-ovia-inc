@@ -17,7 +17,10 @@ pub struct DescribeConfigurationInput {
     pub arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#DescribeConfigurationResponse")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#DescribeConfigurationResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeConfigurationOutput {
     pub arn: Option<String>,
@@ -28,4 +31,27 @@ pub struct DescribeConfigurationOutput {
     pub name: Option<String>,
     pub state: Option<String>,
 }
+
+kafka_schema_and_codec!(
+    DescribeConfigurationOutput,
+    DESCRIBE_CONFIGURATION_OUTPUT_SCHEMA,
+    "DescribeConfigurationResponse",
+    (M_ARN, arn, "Arn", "arn", 0, opt, string),
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 1, opt, date_time),
+    (M_DESCRIPTION, description, "Description", "description", 2, opt, string),
+    (M_KAFKA_VERSIONS, kafka_versions, "KafkaVersions", "kafkaVersions", 3, opt, list_of_string),
+    (
+        M_LATEST_REVISION,
+        latest_revision,
+        "LatestRevision",
+        "latestRevision",
+        4,
+        opt,
+        struct_of(ConfigurationRevision)
+    ),
+    (M_NAME, name, "Name", "name", 5, opt, string),
+    // `ConfigurationState` is an enum shape, which the generator writes as
+    // `ShapeType::String`.
+    (M_STATE, state, "State", "state", 6, opt, string),
+);
 

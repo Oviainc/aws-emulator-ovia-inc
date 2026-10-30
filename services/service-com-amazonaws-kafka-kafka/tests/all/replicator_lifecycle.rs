@@ -23,7 +23,7 @@ use service_com_amazonaws_kafka_kafka::state::{
     REPLICATOR_ACTIVATION_DELAY, REPLICATOR_STATE_DELETING,
 };
 
-use crate::kafka_harness::{pct, Emulator, Reply, ACCOUNT, REGION};
+use crate::kafka_harness::{assert_name_already_exists, pct, Emulator, Reply, ACCOUNT, REGION};
 
 /// The IAM role every row below hands the replicator. `ServiceExecutionRoleArn` is
 /// a plain `__string` in the model, so the service stores and reports it verbatim.
@@ -713,13 +713,9 @@ async fn a_repeated_replicator_name_conflicts() {
             ..ReplicatorRequest::named(name)
         };
         let conflict = create(&emulator, &second).await;
-        assert_eq!(
-            (conflict.status, conflict.error_code()),
-            (409, "ConflictException"),
-            "case {name}: expected a 409 ConflictException for a repeated name, got {} {}",
-            conflict.status,
-            conflict.body
-        );
+        // The conflict is the service's one fixed sentence for a taken name,
+        // blaming the replicator-name parameter by its wire name.
+        assert_name_already_exists(&conflict, name, "replicatorName", name, &arn);
 
         // The refused create registered nothing: the first replicator is still the
         // one the name resolves to, with its own configuration intact.

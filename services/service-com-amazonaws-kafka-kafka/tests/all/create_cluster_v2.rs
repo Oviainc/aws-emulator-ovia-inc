@@ -19,7 +19,8 @@
 use serde_json::{json, Map, Value};
 
 use crate::kafka_harness::{
-    pct, sleep_past_activation, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+    assert_name_already_exists, pct, sleep_past_activation, ClusterRequest, Emulator, Reply,
+    ACCOUNT, REGION,
 };
 
 /// `CreateClusterV2`'s URI, per the model's `http` binding on the operation.
@@ -752,16 +753,14 @@ async fn a_cluster_name_is_unique_per_region_across_kinds_and_apis() {
         let arn = created.at("/clusterArn").as_str().unwrap_or_default().to_string();
 
         let repeated = create_v2(&emulator, second.clone()).await;
-        assert_eq!(
-            repeated.status, 409,
-            "case {case}: expected HTTP 409 for a name already taken, got {} {}",
-            repeated.status, repeated.body
-        );
-        assert!(
-            repeated.error_code().ends_with("ConflictException"),
-            "case {case}: expected ConflictException, got {:?}",
-            repeated.error_code()
-        );
+        // The conflict is the service's one fixed sentence for a taken name,
+        // blaming the cluster-name parameter by its wire name, whichever kind of
+        // cluster took the name.
+        let name = second
+            .get("clusterName")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_name_already_exists(&repeated, case, "clusterName", name, &arn);
 
         // The same name in another region is another cluster.
         let elsewhere = emulator

@@ -24,7 +24,8 @@
 use serde_json::{json, Value};
 
 use crate::kafka_harness::{
-    pct, sleep_past_activation, sleep_past_update, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+    pct, reported_instant_secs, sleep_past_activation, sleep_past_update, ClusterRequest, Emulator,
+    Reply, ACCOUNT, REGION,
 };
 
 /// The wire values this suite expects, written out rather than imported from
@@ -351,9 +352,7 @@ async fn pages_the_operations_a_cluster_recorded_latest_first() {
                 member(entry, "/operationState")
             );
             assert!(
-                member(entry, "/endTime")
-                    .as_f64()
-                    .is_some_and(|epoch| epoch > 0.0),
+                reported_instant_secs(&member(entry, "/endTime"), case) > 0.0,
                 "case {case}: expected a finished operation to report an endTime at position \
                  {position}, got {:?}",
                 member(entry, "/endTime")

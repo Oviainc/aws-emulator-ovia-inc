@@ -27,7 +27,10 @@ pub struct ListChannelsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#ChannelInfo")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#ChannelInfo")`.
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
     pub channel_arn: String,
@@ -37,4 +40,26 @@ pub struct ChannelInfo {
     pub destination_type: String,
     pub cluster_operation_arn: Option<String>,
 }
+
+// `ChannelStatus` and `ChannelDestinationType` are enum shapes, which the generator writes
+// as `ShapeType::String`.
+kafka_schema_and_codec!(
+    ChannelInfo,
+    CHANNEL_INFO_SCHEMA,
+    "ChannelInfo",
+    (M_CHANNEL_ARN, channel_arn, "ChannelArn", "channelArn", 0, req, string),
+    (M_CHANNEL_NAME, channel_name, "ChannelName", "channelName", 1, req, string),
+    (M_STATUS, status, "Status", "status", 2, req, string),
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 3, req, date_time),
+    (M_DESTINATION_TYPE, destination_type, "DestinationType", "destinationType", 4, req, string),
+    (
+        M_CLUSTER_OPERATION_ARN,
+        cluster_operation_arn,
+        "ClusterOperationArn",
+        "clusterOperationArn",
+        5,
+        opt,
+        string
+    ),
+);
 

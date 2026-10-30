@@ -276,18 +276,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another region is a different configuration. A configuration whose
         // asynchronous delete has not completed yet still holds its name — it is
         // still a configuration of this region — while one the clock has taken
-        // out holds it no longer.
-        if let Some(existing) = state.configuration_arn_for_name(&region, &input.name, now) {
-            return Err(
-                CreateConfigurationErrorModeled::ConflictException(ConflictException {
-                    invalid_parameter: Some("name".to_string()),
-                    message: Some(format!(
-                        "A configuration with the name '{}' already exists: {existing}",
-                        input.name
-                    )),
-                })
-                .into(),
-            );
+        // out holds it no longer. The refusal is the service's one fixed sentence
+        // for a taken name, which discloses neither the name nor the
+        // configuration already holding it.
+        if state
+            .configuration_arn_for_name(&region, &input.name, now)
+            .is_some()
+        {
+            return Err(CreateConfigurationErrorModeled::ConflictException(
+                crate::state::name_already_exists("name"),
+            )
+            .into());
         }
 
         // The monotonic counter is what makes each configuration's ARN

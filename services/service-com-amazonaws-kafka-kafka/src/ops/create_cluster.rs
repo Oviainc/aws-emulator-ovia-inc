@@ -270,18 +270,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A cluster name identifies a cluster within an account and region, so a
         // name already in use IN THIS REGION is a conflict; the same name in
-        // another region is a different cluster.
-        if let Some(existing) = state.arn_for_name(&region, &input.cluster_name) {
-            return Err(
-                CreateClusterErrorModeled::ConflictException(ConflictException {
-                    invalid_parameter: Some("ClusterName".to_string()),
-                    message: Some(format!(
-                        "A cluster with the name '{}' already exists: {existing}",
-                        input.cluster_name
-                    )),
-                })
-                .into(),
-            );
+        // another region is a different cluster. The refusal is the service's one
+        // fixed sentence for a taken name, which discloses neither the name nor
+        // the cluster already holding it.
+        if state.arn_for_name(&region, &input.cluster_name).is_some() {
+            return Err(CreateClusterErrorModeled::ConflictException(
+                crate::state::name_already_exists("clusterName"),
+            )
+            .into());
         }
 
         // The monotonic counter is what makes each cluster's ARN and endpoints

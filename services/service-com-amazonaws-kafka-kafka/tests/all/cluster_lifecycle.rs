@@ -18,7 +18,10 @@
 use serde_json::Value;
 use service_com_amazonaws_kafka_kafka::state::MAX_CLUSTERS_PER_REGION;
 
-use crate::kafka_harness::{pct, sleep_past_activation, ClusterRequest, Emulator, ACCOUNT, REGION};
+use crate::kafka_harness::{
+    assert_name_already_exists, pct, sleep_past_activation, ClusterRequest, Emulator, ACCOUNT,
+    REGION,
+};
 
 /// Every bootstrap-broker member the model declares, so a suite can assert that a
 /// member it did not expect is ABSENT rather than merely unchecked.
@@ -556,16 +559,14 @@ async fn a_repeated_cluster_name_conflicts() {
     for (first, second) in &rows {
         let arn = emulator.create_ok(first).await;
         let reply = emulator.create(second).await;
-        assert_eq!(
-            reply.status, 409,
-            "case {second:?}: expected a 409 for a name already in use, got {} {}",
-            reply.status, reply.body
-        );
-        assert_eq!(
-            reply.error_code(),
-            "ConflictException",
-            "case {second:?}: expected ConflictException, got {}",
-            reply.body
+        // The conflict is the service's one fixed sentence for a taken name,
+        // blaming the cluster-name parameter by its wire name.
+        assert_name_already_exists(
+            &reply,
+            &format!("{second:?}"),
+            "clusterName",
+            second.name.as_str(),
+            &arn,
         );
 
         // The conflict changed nothing: the stored cluster is still the first one.

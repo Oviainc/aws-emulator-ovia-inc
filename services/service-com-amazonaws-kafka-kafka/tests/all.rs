@@ -59,6 +59,8 @@ mod connectivity_update;
 mod create_cluster_v2;
 #[path = "all/describe_cluster_v2.rs"]
 mod describe_cluster_v2;
+#[path = "all/iso8601_timestamps.rs"]
+mod iso8601_timestamps;
 #[path = "all/kafka_harness.rs"]
 mod kafka_harness;
 #[path = "all/kafka_version_update.rs"]

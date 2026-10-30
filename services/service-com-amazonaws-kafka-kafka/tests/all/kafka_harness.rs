@@ -486,11 +486,84 @@ pub fn reported_server_properties(reply: &Reply, case: &str) -> Vec<u8> {
         .unwrap_or_else(|error| panic!("case {case}: serverProperties is not base64: {error}"))
 }
 
+/// The instant a modelled timestamp member reports, in seconds since the epoch.
+///
+/// Every timestamp member of this service's model targets
+/// `com.amazonaws.kafka#__timestampIso8601`, which carries
+/// `@timestampFormat("date-time")`, so on this restJson1 wire the member is an RFC 3339
+/// date-time STRING — never a JSON number. This reads that string and fails the case when
+/// the member is absent, carries any other JSON type, or is not a date-time, so every
+/// suite asserting an instant asserts the modelled TYPE along with it.
+pub fn reported_instant_secs(value: &Value, case: &str) -> f64 {
+    let text = value.as_str().unwrap_or_else(|| {
+        panic!("case {case}: expected an ISO-8601 date-time string, got {value}")
+    });
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("case {case}: {text:?} is not an ISO-8601 date-time: {error}")
+        })
+        .as_secs_f64()
+}
+
+/// What Amazon MSK answers a create whose name another resource of its kind
+/// already holds. Written out here rather than imported from the implementation,
+/// so an assertion cannot agree with a constant that is wrong: it is the
+/// service's one fixed sentence, naming neither the resource type, nor the name
+/// submitted, nor the resource already holding it.
+pub const NAME_ALREADY_EXISTS: &str = "A resource with this name already exists.";
+
+/// Assert `reply` is the refusal every create of this service answers a name
+/// already taken with: HTTP 409 `ConflictException` carrying
+/// [`NAME_ALREADY_EXISTS`] and naming, in `invalidParameter`, the request member
+/// that carried the name — `parameter`, by the wire name the request itself uses.
+///
+/// The message is asserted EQUAL to that fixed sentence, which is what proves the
+/// submitted name reached none of it; `existing`, the ARN of the resource already
+/// holding the name, is additionally asserted absent, since disclosing a resource
+/// the caller cannot otherwise see is the worse half of composing the sentence.
+///
+/// Shared by every create suite, so the conflict cannot be worded per resource
+/// type.
+pub fn assert_name_already_exists(
+    reply: &Reply,
+    case: &str,
+    parameter: &str,
+    name: &str,
+    existing: &str,
+) {
+    assert_eq!(
+        (reply.status, reply.error_code()),
+        (409, "ConflictException"),
+        "case {case}: expected 409 ConflictException for a name already in use ({name:?}), got \
+         {} {}",
+        reply.status,
+        reply.body
+    );
+    assert_eq!(
+        reply.error_message(),
+        NAME_ALREADY_EXISTS,
+        "case {case}: expected the fixed taken-name sentence, got {:?}",
+        reply.error_message()
+    );
+    assert!(
+        !reply.error_message().contains(existing),
+        "case {case}: the message must not disclose the existing ARN ({existing:?}), got {:?}",
+        reply.error_message()
+    );
+    assert_eq!(
+        reply.at("/invalidParameter").as_str(),
+        Some(parameter),
+        "case {case}: the conflict must name {parameter} as the parameter at fault, got {}",
+        reply.body
+    );
+}
+
 /// Assert `reply` is the refusal every operation of the MSK configuration family
 /// answers an `Arn` it resolves to no configuration of `region` with: HTTP 400
-/// `BadRequestException`, naming `Arn` as the parameter at fault, carrying the
-/// service's one fixed sentence for that condition — a sentence with no variable
-/// parts, so neither `arn` nor `region` nor the account id may appear in it.
+/// `BadRequestException`, naming the `arn` parameter at fault by its WIRE name,
+/// carrying the service's one fixed sentence for that condition — a sentence with
+/// no variable parts, so neither `arn` nor `region` nor the account id may appear
+/// in it.
 ///
 /// Shared by every configuration suite, so none of them can drift from another
 /// about what that refusal is.
@@ -515,8 +588,9 @@ pub fn assert_configuration_arn_resolves_to_nothing(
     );
     assert_eq!(
         reply.at("/invalidParameter").as_str(),
-        Some("Arn"),
-        "case {case}: the refusal must name Arn as the parameter at fault, got {}",
+        Some("arn"),
+        "case {case}: the refusal must name the arn parameter at fault, by the wire name the \
+         request carries, got {}",
         reply.body
     );
     for (what, value) in [("the ARN", arn), ("the region", region), ("the account", ACCOUNT)] {

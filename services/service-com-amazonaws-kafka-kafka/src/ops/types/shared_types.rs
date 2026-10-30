@@ -437,13 +437,25 @@ pub struct ServerlessSasl {
     pub iam: Option<Iam>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#ConfigurationRevision")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#ConfigurationRevision")`.
 #[derive(Debug, Clone)]
 pub struct ConfigurationRevision {
     pub creation_time: ::aws_smithy_types::DateTime,
     pub description: Option<String>,
     pub revision: i64,
 }
+
+kafka_schema_and_codec!(
+    ConfigurationRevision,
+    CONFIGURATION_REVISION_SCHEMA,
+    "ConfigurationRevision",
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 0, req, date_time),
+    (M_DESCRIPTION, description, "Description", "description", 1, opt, string),
+    (M_REVISION, revision, "Revision", "revision", 2, req, long),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kafka#AmazonMskCluster")]
 #[derive(Debug, Clone, Default)]
@@ -653,7 +665,10 @@ pub struct UnknownTopicOrPartitionException {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#ClusterInfo")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#ClusterInfo")`.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterInfo {
     pub active_operation_arn: Option<String>,
@@ -678,6 +693,123 @@ pub struct ClusterInfo {
     pub storage_mode: Option<String>,
     pub customer_action_status: Option<String>,
 }
+
+// `EnhancedMonitoring`, `ClusterState`, `StorageMode` and `CustomerActionStatus` are enum
+// shapes, which the generator writes as `ShapeType::String`.
+kafka_schema_and_codec!(
+    ClusterInfo,
+    CLUSTER_INFO_SCHEMA,
+    "ClusterInfo",
+    (
+        M_ACTIVE_OPERATION_ARN,
+        active_operation_arn,
+        "ActiveOperationArn",
+        "activeOperationArn",
+        0,
+        opt,
+        string
+    ),
+    (
+        M_BROKER_NODE_GROUP_INFO,
+        broker_node_group_info,
+        "BrokerNodeGroupInfo",
+        "brokerNodeGroupInfo",
+        1,
+        opt,
+        struct_of(BrokerNodeGroupInfo)
+    ),
+    (M_REBALANCING, rebalancing, "Rebalancing", "rebalancing", 2, opt, struct_of(Rebalancing)),
+    (
+        M_CLIENT_AUTHENTICATION,
+        client_authentication,
+        "ClientAuthentication",
+        "clientAuthentication",
+        3,
+        opt,
+        struct_of(ClientAuthentication)
+    ),
+    (M_CLUSTER_ARN, cluster_arn, "ClusterArn", "clusterArn", 4, opt, string),
+    (M_CLUSTER_NAME, cluster_name, "ClusterName", "clusterName", 5, opt, string),
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 6, opt, date_time),
+    (
+        M_CURRENT_BROKER_SOFTWARE_INFO,
+        current_broker_software_info,
+        "CurrentBrokerSoftwareInfo",
+        "currentBrokerSoftwareInfo",
+        7,
+        opt,
+        struct_of(BrokerSoftwareInfo)
+    ),
+    (M_CURRENT_VERSION, current_version, "CurrentVersion", "currentVersion", 8, opt, string),
+    (
+        M_ENCRYPTION_INFO,
+        encryption_info,
+        "EncryptionInfo",
+        "encryptionInfo",
+        9,
+        opt,
+        struct_of(EncryptionInfo)
+    ),
+    (
+        M_ENHANCED_MONITORING,
+        enhanced_monitoring,
+        "EnhancedMonitoring",
+        "enhancedMonitoring",
+        10,
+        opt,
+        string
+    ),
+    (
+        M_OPEN_MONITORING,
+        open_monitoring,
+        "OpenMonitoring",
+        "openMonitoring",
+        11,
+        opt,
+        struct_of(OpenMonitoring)
+    ),
+    (M_LOGGING_INFO, logging_info, "LoggingInfo", "loggingInfo", 12, opt, struct_of(LoggingInfo)),
+    (
+        M_NUMBER_OF_BROKER_NODES,
+        number_of_broker_nodes,
+        "NumberOfBrokerNodes",
+        "numberOfBrokerNodes",
+        13,
+        opt,
+        integer
+    ),
+    (M_STATE, state, "State", "state", 14, opt, string),
+    (M_STATE_INFO, state_info, "StateInfo", "stateInfo", 15, opt, struct_of(StateInfo)),
+    (M_TAGS, tags, "Tags", "tags", 16, opt, map_of_string),
+    (
+        M_ZOOKEEPER_CONNECT_STRING,
+        zookeeper_connect_string,
+        "ZookeeperConnectString",
+        "zookeeperConnectString",
+        17,
+        opt,
+        string
+    ),
+    (
+        M_ZOOKEEPER_CONNECT_STRING_TLS,
+        zookeeper_connect_string_tls,
+        "ZookeeperConnectStringTls",
+        "zookeeperConnectStringTls",
+        18,
+        opt,
+        string
+    ),
+    (M_STORAGE_MODE, storage_mode, "StorageMode", "storageMode", 19, opt, string),
+    (
+        M_CUSTOMER_ACTION_STATUS,
+        customer_action_status,
+        "CustomerActionStatus",
+        "customerActionStatus",
+        20,
+        opt,
+        string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kafka#BrokerSoftwareInfo")]
 #[derive(Debug, Clone, Default)]
@@ -719,7 +851,11 @@ pub struct StateInfo {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#ClusterOperationInfo")]
+/// `CreationTime` and `EndTime` target `__timestampIso8601`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `kafka_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order, wire
+/// names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#ClusterOperationInfo")`.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterOperationInfo {
     pub client_request_id: Option<String>,
@@ -735,6 +871,56 @@ pub struct ClusterOperationInfo {
     pub target_cluster_info: Option<MutableClusterInfo>,
     pub vpc_connection_info: Option<VpcConnectionInfo>,
 }
+
+kafka_schema_and_codec!(
+    ClusterOperationInfo,
+    CLUSTER_OPERATION_INFO_SCHEMA,
+    "ClusterOperationInfo",
+    (M_CLIENT_REQUEST_ID, client_request_id, "ClientRequestId", "clientRequestId", 0, opt, string),
+    (M_CLUSTER_ARN, cluster_arn, "ClusterArn", "clusterArn", 1, opt, string),
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 2, opt, date_time),
+    (M_END_TIME, end_time, "EndTime", "endTime", 3, opt, date_time),
+    (M_ERROR_INFO, error_info, "ErrorInfo", "errorInfo", 4, opt, struct_of(ErrorInfo)),
+    (M_OPERATION_ARN, operation_arn, "OperationArn", "operationArn", 5, opt, string),
+    (M_OPERATION_STATE, operation_state, "OperationState", "operationState", 6, opt, string),
+    (
+        M_OPERATION_STEPS,
+        operation_steps,
+        "OperationSteps",
+        "operationSteps",
+        7,
+        opt,
+        list_of_struct(ClusterOperationStep)
+    ),
+    (M_OPERATION_TYPE, operation_type, "OperationType", "operationType", 8, opt, string),
+    (
+        M_SOURCE_CLUSTER_INFO,
+        source_cluster_info,
+        "SourceClusterInfo",
+        "sourceClusterInfo",
+        9,
+        opt,
+        struct_of(MutableClusterInfo)
+    ),
+    (
+        M_TARGET_CLUSTER_INFO,
+        target_cluster_info,
+        "TargetClusterInfo",
+        "targetClusterInfo",
+        10,
+        opt,
+        struct_of(MutableClusterInfo)
+    ),
+    (
+        M_VPC_CONNECTION_INFO,
+        vpc_connection_info,
+        "VpcConnectionInfo",
+        "vpcConnectionInfo",
+        11,
+        opt,
+        struct_of(VpcConnectionInfo)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kafka#ErrorInfo")]
 #[derive(Debug, Clone, Default)]
@@ -797,7 +983,10 @@ pub struct BrokerCountUpdateInfo {
     pub deleted_broker_ids: Option<Vec<f64>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#VpcConnectionInfo")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#VpcConnectionInfo")`.
 #[derive(Debug, Clone, Default)]
 pub struct VpcConnectionInfo {
     pub vpc_connection_arn: Option<String>,
@@ -805,6 +994,32 @@ pub struct VpcConnectionInfo {
     pub user_identity: Option<UserIdentity>,
     pub creation_time: Option<::aws_smithy_types::DateTime>,
 }
+
+kafka_schema_and_codec!(
+    VpcConnectionInfo,
+    VPC_CONNECTION_INFO_SCHEMA,
+    "VpcConnectionInfo",
+    (
+        M_VPC_CONNECTION_ARN,
+        vpc_connection_arn,
+        "VpcConnectionArn",
+        "vpcConnectionArn",
+        0,
+        opt,
+        string
+    ),
+    (M_OWNER, owner, "Owner", "owner", 1, opt, string),
+    (
+        M_USER_IDENTITY,
+        user_identity,
+        "UserIdentity",
+        "userIdentity",
+        2,
+        opt,
+        struct_of(UserIdentity)
+    ),
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 3, opt, date_time),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kafka#UserIdentity")]
 #[derive(Debug, Clone, Default)]
@@ -819,7 +1034,10 @@ pub struct ServerlessConnectivityInfo {
     pub network_type: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#Cluster")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#Cluster")`.
 #[derive(Debug, Clone, Default)]
 pub struct Cluster {
     pub active_operation_arn: Option<String>,
@@ -834,6 +1052,33 @@ pub struct Cluster {
     pub provisioned: Option<Provisioned>,
     pub serverless: Option<Serverless>,
 }
+
+// `ClusterType` and `ClusterState` are enum shapes, which the generator writes as
+// `ShapeType::String`.
+kafka_schema_and_codec!(
+    Cluster,
+    CLUSTER_SCHEMA,
+    "Cluster",
+    (
+        M_ACTIVE_OPERATION_ARN,
+        active_operation_arn,
+        "ActiveOperationArn",
+        "activeOperationArn",
+        0,
+        opt,
+        string
+    ),
+    (M_CLUSTER_TYPE, cluster_type, "ClusterType", "clusterType", 1, opt, string),
+    (M_CLUSTER_ARN, cluster_arn, "ClusterArn", "clusterArn", 2, opt, string),
+    (M_CLUSTER_NAME, cluster_name, "ClusterName", "clusterName", 3, opt, string),
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 4, opt, date_time),
+    (M_CURRENT_VERSION, current_version, "CurrentVersion", "currentVersion", 5, opt, string),
+    (M_STATE, state, "State", "state", 6, opt, string),
+    (M_STATE_INFO, state_info, "StateInfo", "stateInfo", 7, opt, struct_of(StateInfo)),
+    (M_TAGS, tags, "Tags", "tags", 8, opt, map_of_string),
+    (M_PROVISIONED, provisioned, "Provisioned", "provisioned", 9, opt, struct_of(Provisioned)),
+    (M_SERVERLESS, serverless, "Serverless", "serverless", 10, opt, struct_of(Serverless)),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kafka#Provisioned")]
 #[derive(Debug, Clone, Default)]

@@ -18,7 +18,10 @@ pub struct DescribeChannelInput {
     pub cluster_arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#DescribeChannelResponse")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#DescribeChannelResponse")`.
 #[derive(Debug, Clone)]
 pub struct DescribeChannelOutput {
     pub channel_arn: String,
@@ -35,6 +38,75 @@ pub struct DescribeChannelOutput {
     pub cluster_operation_arn: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+// `ChannelStatus` and `ChannelDestinationType` are enum shapes, which the generator writes
+// as `ShapeType::String`.
+kafka_schema_and_codec!(
+    DescribeChannelOutput,
+    DESCRIBE_CHANNEL_OUTPUT_SCHEMA,
+    "DescribeChannelResponse",
+    (M_CHANNEL_ARN, channel_arn, "ChannelArn", "channelArn", 0, req, string),
+    (M_CHANNEL_NAME, channel_name, "ChannelName", "channelName", 1, req, string),
+    (
+        M_ENCRYPTION_CONFIGURATION,
+        encryption_configuration,
+        "EncryptionConfiguration",
+        "encryptionConfiguration",
+        2,
+        opt,
+        struct_of(EncryptionConfiguration)
+    ),
+    (
+        M_ICEBERG_DESTINATION_CONFIGURATION,
+        iceberg_destination_configuration,
+        "IcebergDestinationConfiguration",
+        "icebergDestinationConfiguration",
+        3,
+        opt,
+        struct_of(IcebergDestinationConfiguration)
+    ),
+    (
+        M_S3_DESTINATION_CONFIGURATION,
+        s3_destination_configuration,
+        "S3DestinationConfiguration",
+        "s3DestinationConfiguration",
+        4,
+        opt,
+        struct_of(S3DestinationConfiguration)
+    ),
+    (M_STATUS, status, "Status", "status", 5, req, string),
+    (M_DESTINATION_TYPE, destination_type, "DestinationType", "destinationType", 6, req, string),
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 7, req, date_time),
+    (
+        M_TOPIC_CONFIGURATION_LIST,
+        topic_configuration_list,
+        "TopicConfigurationList",
+        "topicConfigurationList",
+        8,
+        req,
+        list_of_struct(TopicConfiguration)
+    ),
+    (
+        M_LOGGING_INFO,
+        logging_info,
+        "LoggingInfo",
+        "loggingInfo",
+        9,
+        opt,
+        struct_of(ChannelLoggingInfo)
+    ),
+    (M_STATE_INFO, state_info, "StateInfo", "stateInfo", 10, opt, struct_of(ChannelStateInfo)),
+    (
+        M_CLUSTER_OPERATION_ARN,
+        cluster_operation_arn,
+        "ClusterOperationArn",
+        "clusterOperationArn",
+        11,
+        opt,
+        string
+    ),
+    (M_TAGS, tags, "Tags", "tags", 12, opt, map_of_string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.kafka#ChannelStateInfo")]
 #[derive(Debug, Clone, Default)]

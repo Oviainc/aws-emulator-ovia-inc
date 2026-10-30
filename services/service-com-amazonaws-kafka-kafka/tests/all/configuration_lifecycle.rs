@@ -23,7 +23,7 @@ use service_com_amazonaws_kafka_kafka::state::KAFKA_VERSION_CATALOG;
 // The router harness, the signing region, the account id and the URI encoder
 // every suite of this crate shares, so this one adds only its own rule and its
 // configuration-shaped requests.
-use super::kafka_harness::{pct, Emulator, Reply, ACCOUNT, REGION};
+use super::kafka_harness::{assert_name_already_exists, pct, Emulator, Reply, ACCOUNT, REGION};
 
 /// The page size `ListConfigurations` may be asked for, from the `range` on the
 /// model's `MaxResults` shape (1..100). Both bounds are exercised, as is the
@@ -819,9 +819,9 @@ async fn a_next_token_this_list_did_not_mint_is_refused() {
 }
 
 /// RULE: a configuration name identifies a configuration within an account and
-/// region — a repeat in the same region is a conflict (HTTP 409), the same name
-/// in another region is a different configuration, and each region's list
-/// reports only its own.
+/// region — a repeat in the same region is a conflict (HTTP 409) carrying the
+/// service's one fixed sentence for a taken name, the same name in another region
+/// is a different configuration, and each region's list reports only its own.
 #[tokio::test]
 async fn a_configuration_name_is_unique_per_region() {
     let emulator = Emulator::new();
@@ -841,17 +841,10 @@ async fn a_configuration_name_is_unique_per_region() {
     ];
     for repeat in &repeats {
         let reply = create(&emulator, repeat).await;
-        assert_eq!(
-            reply.status, 409,
-            "case {repeat:?}: a repeated name must conflict, got {} {}",
-            reply.status, reply.body
-        );
-        assert_eq!(
-            reply.error_code(),
-            "ConflictException",
-            "case {repeat:?}: expected ConflictException, got {}",
-            reply.body
-        );
+        // The conflict is the service's, not this resource type's: one fixed
+        // sentence, the name parameter blamed by its wire name, and nothing of
+        // the submitted name or the existing configuration in the text.
+        assert_name_already_exists(&reply, &format!("{repeat:?}"), "name", &repeat.name, &arn);
     }
 
     // The same name in another region is a different configuration, minted in

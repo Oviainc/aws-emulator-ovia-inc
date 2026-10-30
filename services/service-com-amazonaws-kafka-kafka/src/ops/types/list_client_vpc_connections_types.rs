@@ -26,7 +26,10 @@ pub struct ListClientVpcConnectionsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#ClientVpcConnection")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#ClientVpcConnection")`.
 #[derive(Debug, Clone, Default)]
 pub struct ClientVpcConnection {
     pub authentication: Option<String>,
@@ -35,4 +38,24 @@ pub struct ClientVpcConnection {
     pub vpc_connection_arn: String,
     pub owner: Option<String>,
 }
+
+// `VpcConnectionState` is an enum shape, which the generator writes as `ShapeType::String`.
+kafka_schema_and_codec!(
+    ClientVpcConnection,
+    CLIENT_VPC_CONNECTION_SCHEMA,
+    "ClientVpcConnection",
+    (M_AUTHENTICATION, authentication, "Authentication", "authentication", 0, opt, string),
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 1, opt, date_time),
+    (M_STATE, state, "State", "state", 2, opt, string),
+    (
+        M_VPC_CONNECTION_ARN,
+        vpc_connection_arn,
+        "VpcConnectionArn",
+        "vpcConnectionArn",
+        3,
+        req,
+        string
+    ),
+    (M_OWNER, owner, "Owner", "owner", 4, opt, string),
+);
 

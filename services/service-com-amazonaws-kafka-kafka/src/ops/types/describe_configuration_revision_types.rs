@@ -18,7 +18,10 @@ pub struct DescribeConfigurationRevisionInput {
     pub revision: i64,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#DescribeConfigurationRevisionResponse")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from `smithy_query(query="shape",
+/// shape="com.amazonaws.kafka#DescribeConfigurationRevisionResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeConfigurationRevisionOutput {
     pub arn: Option<String>,
@@ -27,4 +30,23 @@ pub struct DescribeConfigurationRevisionOutput {
     pub revision: Option<i64>,
     pub server_properties: Option<Vec<u8>>,
 }
+
+kafka_schema_and_codec!(
+    DescribeConfigurationRevisionOutput,
+    DESCRIBE_CONFIGURATION_REVISION_OUTPUT_SCHEMA,
+    "DescribeConfigurationRevisionResponse",
+    (M_ARN, arn, "Arn", "arn", 0, opt, string),
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 1, opt, date_time),
+    (M_DESCRIPTION, description, "Description", "description", 2, opt, string),
+    (M_REVISION, revision, "Revision", "revision", 3, opt, long),
+    (
+        M_SERVER_PROPERTIES,
+        server_properties,
+        "ServerProperties",
+        "serverProperties",
+        4,
+        opt,
+        blob
+    ),
+);
 

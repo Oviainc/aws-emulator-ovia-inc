@@ -32,6 +32,12 @@ use service_com_amazonaws_kafka_kafka::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+// The one reader of a modelled timestamp this crate's suites share: every
+// timestamp member of this service targets `__timestampIso8601`, so the wire form
+// is an RFC 3339 date-time STRING and a number is the defect, not the other
+// encoding the protocol would allow.
+use crate::kafka_harness::reported_instant_secs;
+
 /// The signing region every request below is scoped to unless a row names
 /// another; it is the region whose replicators the endpoint must report.
 const REGION: &str = "us-west-2";
@@ -310,30 +316,6 @@ fn replication(source: Endpoint, target: Endpoint) -> ReplicationInfo {
     }
 }
 
-/// The reported timestamp as seconds since the epoch, however the wire carried
-/// it.
-///
-/// This emulator's serializer renders a timestamp member as an epoch-seconds
-/// number; an ISO-8601 string is the other form the protocol allows for a
-/// `@timestampFormat("date-time")` member. Which encoding the core picks is not
-/// this operation's business, so the suite pins the INSTANT reported rather than
-/// its spelling.
-fn reported_epoch_seconds(value: &Value, case: &str) -> f64 {
-    match value {
-        Value::Number(seconds) => seconds
-            .as_f64()
-            .unwrap_or_else(|| panic!("case {case}: timestamp {value} is not a number")),
-        Value::String(text) => {
-            ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
-                .unwrap_or_else(|error| {
-                    panic!("case {case}: timestamp {text:?} is not ISO-8601: {error}")
-                })
-                .as_secs_f64()
-        }
-        other => panic!("case {case}: expected a timestamp, got {other}"),
-    }
-}
-
 /// The `replicatorName` of each entry of a page, in the order reported.
 fn names(page: &[Value]) -> Vec<String> {
     page.iter()
@@ -602,7 +584,7 @@ async fn each_summary_is_derived_from_the_stored_replication_setup() {
     );
     // `CreationTime` reports the instant the stored record was created.
     let expected_creation = ::aws_smithy_types::DateTime::from(created_at).as_secs_f64();
-    let reported_creation = reported_epoch_seconds(&local_summary["creationTime"], "both-kinds");
+    let reported_creation = reported_instant_secs(&local_summary["creationTime"], "both-kinds");
     assert!(
         (reported_creation - expected_creation).abs() < 0.001,
         "case both-kinds: expected creationTime {expected_creation}, got {reported_creation} in {local_summary}"

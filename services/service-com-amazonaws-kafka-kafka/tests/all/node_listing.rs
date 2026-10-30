@@ -179,13 +179,20 @@ async fn the_node_listing_reports_every_stored_broker() {
             reply.at("/nextToken")
         );
 
-        let creation_time = emulator
-            .describe(&arn)
-            .await
+        // `ClusterInfo.creationTime` targets `__timestampIso8601`, so the member
+        // is an RFC 3339 date-time string on the wire.
+        let described = emulator.describe(&arn).await;
+        let reported_creation = described
             .at("/clusterInfo/creationTime")
-            .as_f64()
-            .unwrap_or_else(|| panic!("case {case}: DescribeCluster reported no creationTime"))
-            as i64;
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case}: DescribeCluster reported no creationTime date-time, got {}",
+                    described.at("/clusterInfo/creationTime")
+                )
+            })
+            .to_string();
+        let creation_time = instant_secs(&case, &reported_creation);
 
         let mut arns = BTreeSet::new();
         let mut endpoints = BTreeSet::new();

@@ -17,7 +17,10 @@ pub struct DescribeVpcConnectionInput {
     pub arn: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#DescribeVpcConnectionResponse")]
+/// `CreationTime` targets `__timestampIso8601` (`@timestampFormat("date-time")`), so this
+/// shape's schema comes from `kafka_schema_and_codec!` — see `types/date_time_wire.rs`.
+/// Member set, order, wire names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#DescribeVpcConnectionResponse")`.
 #[derive(Debug, Clone, Default)]
 pub struct DescribeVpcConnectionOutput {
     pub vpc_connection_arn: Option<String>,
@@ -30,4 +33,44 @@ pub struct DescribeVpcConnectionOutput {
     pub creation_time: Option<::aws_smithy_types::DateTime>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+// `VpcConnectionState` is an enum shape, which the generator writes as `ShapeType::String`.
+kafka_schema_and_codec!(
+    DescribeVpcConnectionOutput,
+    DESCRIBE_VPC_CONNECTION_OUTPUT_SCHEMA,
+    "DescribeVpcConnectionResponse",
+    (
+        M_VPC_CONNECTION_ARN,
+        vpc_connection_arn,
+        "VpcConnectionArn",
+        "vpcConnectionArn",
+        0,
+        opt,
+        string
+    ),
+    (
+        M_TARGET_CLUSTER_ARN,
+        target_cluster_arn,
+        "TargetClusterArn",
+        "targetClusterArn",
+        1,
+        opt,
+        string
+    ),
+    (M_STATE, state, "State", "state", 2, opt, string),
+    (M_AUTHENTICATION, authentication, "Authentication", "authentication", 3, opt, string),
+    (M_VPC_ID, vpc_id, "VpcId", "vpcId", 4, opt, string),
+    (M_SUBNETS, subnets, "Subnets", "subnets", 5, opt, list_of_string),
+    (
+        M_SECURITY_GROUPS,
+        security_groups,
+        "SecurityGroups",
+        "securityGroups",
+        6,
+        opt,
+        list_of_string
+    ),
+    (M_CREATION_TIME, creation_time, "CreationTime", "creationTime", 7, opt, date_time),
+    (M_TAGS, tags, "Tags", "tags", 8, opt, map_of_string),
+);
 

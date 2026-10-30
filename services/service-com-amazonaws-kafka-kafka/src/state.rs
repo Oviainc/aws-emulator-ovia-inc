@@ -151,7 +151,7 @@ use crate::ops::types::{
     BrokerSoftwareInfo,
     ChannelLoggingInfo, ClientAuthentication, ClientVpcConnection, ClusterInfo, ClusterOperationInfo,
     ClusterOperationV2,
-    ClusterOperationV2Provisioned, Configuration,
+    ClusterOperationV2Provisioned, ConflictException, Configuration,
     ConfigurationInfo, ConfigurationRevision, ConnectivityInfo, ConsumerGroupReplicationUpdate,
     CreateChannelInput,
     CreateClusterInput, CreateConfigurationInput, CreateReplicatorInput, CreateVpcConnectionInput,
@@ -1469,7 +1469,7 @@ pub const CONFIGURATION_ARN_NOT_FOUND_MESSAGE: &str = "Configuration ARN does no
 /// The refusal every configuration operation answers a configuration reference
 /// that resolves to nothing this endpoint's region holds with: a
 /// `BadRequestException` (HTTP 400) carrying
-/// [`CONFIGURATION_ARN_NOT_FOUND_MESSAGE`] and naming `Arn` as the parameter at
+/// [`CONFIGURATION_ARN_NOT_FOUND_MESSAGE`] and naming `arn` as the parameter at
 /// fault. The reference is the `Arn` alone where the operation names only a
 /// configuration, and the `Arn` plus the `Revision` where it names one revision
 /// of one, since a revision number the configuration never issued resolves to a
@@ -1482,8 +1482,38 @@ pub const CONFIGURATION_ARN_NOT_FOUND_MESSAGE: &str = "Configuration ARN does no
 /// envelope, whichever operation met it.
 pub fn configuration_arn_not_found() -> BadRequestException {
     BadRequestException {
-        invalid_parameter: Some("Arn".to_string()),
+        // `InvalidParameter` reports the parameter as the API names it on the
+        // wire — the configuration operations bind their `Arn` label as `arn` —
+        // not as the Smithy structure member is spelled.
+        invalid_parameter: Some("arn".to_string()),
         message: Some(CONFIGURATION_ARN_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// What Amazon MSK answers a create whose name is already taken: ONE fixed
+/// sentence for every resource the service names by name, disclosing neither the
+/// name submitted nor the resource already holding it.
+///
+/// A CONSTANT of the service, not built from the request: the conflict is about
+/// the name being taken, and the caller already knows which name it sent, so
+/// nothing of the request or of the stored resource reaches the text. The
+/// request member at fault is named by `ConflictException$InvalidParameter`
+/// instead.
+pub const NAME_ALREADY_EXISTS_MESSAGE: &str = "A resource with this name already exists.";
+
+/// The refusal a create answers a name another resource of its kind already
+/// holds with: a `ConflictException` (HTTP 409) carrying
+/// [`NAME_ALREADY_EXISTS_MESSAGE`] and naming, in `invalidParameter`, the
+/// request member that carried the name — by its wire name, which is what the
+/// API documents and what the caller's own request holds.
+///
+/// Built HERE rather than in each create handler because the sentence is the
+/// service's, not the resource type's: two creates refusing a taken name must
+/// not answer differently.
+pub fn name_already_exists(parameter: &str) -> ConflictException {
+    ConflictException {
+        invalid_parameter: Some(parameter.to_string()),
+        message: Some(NAME_ALREADY_EXISTS_MESSAGE.to_string()),
     }
 }
 

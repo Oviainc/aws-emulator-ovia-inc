@@ -17,7 +17,8 @@ use service_com_amazonaws_kafka_kafka::state::{
 };
 
 use crate::kafka_harness::{
-    pct, sleep_past_activation, ClusterRequest, Emulator, Reply, ACCOUNT, REGION,
+    assert_name_already_exists, pct, reported_instant_secs, sleep_past_activation, ClusterRequest,
+    Emulator, Reply, ACCOUNT, REGION,
 };
 
 /// A role ARN a channel assumes to write to its destination. Any role ARN does:
@@ -567,9 +568,11 @@ async fn describe_reports_exactly_what_was_created() {
             row.destination.expected_type(),
             reply.at("/destinationType")
         );
+        // `CreationTime` targets `__timestampIso8601`, so the member is an RFC
+        // 3339 date-time string on the wire and a number is the defect.
         assert!(
-            reply.at("/creationTime").is_string() || reply.at("/creationTime").is_number(),
-            "case {row:?}: expected a creationTime, got {}",
+            reported_instant_secs(reply.at("/creationTime"), &format!("{row:?}")) > 0.0,
+            "case {row:?}: expected a creationTime date-time, got {}",
             reply.at("/creationTime")
         );
         // The whole submitted configuration comes back, member for member.
@@ -663,12 +666,14 @@ async fn a_repeated_channel_name_conflicts_within_its_cluster() {
     for (first, second) in &rows {
         let arn = create_channel_ok(&emulator, &first_cluster, first).await;
         let reply = create_channel(&emulator, &first_cluster, second).await;
-        assert_eq!(
-            (reply.status, reply.error_code()),
-            (409, "ConflictException"),
-            "case {second:?}: expected a 409 ConflictException for a name already in use, got {} {}",
-            reply.status,
-            reply.body
+        // The conflict is the service's one fixed sentence for a taken name,
+        // blaming the channel-name parameter by its wire name.
+        assert_name_already_exists(
+            &reply,
+            &format!("{second:?}"),
+            "channelName",
+            &second.name,
+            &arn,
         );
 
         // The conflict changed nothing: the stored channel is still the first one.

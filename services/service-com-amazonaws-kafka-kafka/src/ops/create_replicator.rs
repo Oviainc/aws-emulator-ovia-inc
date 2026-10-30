@@ -369,18 +369,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A replicator name identifies a replicator within an account and region,
         // so a name already in use IN THIS REGION is a conflict; the same name in
-        // another region is a different replicator.
-        if let Some(existing) = state.replicator_arn_for_name(&region, &input.replicator_name) {
-            return Err(
-                CreateReplicatorErrorModeled::ConflictException(ConflictException {
-                    invalid_parameter: Some("ReplicatorName".to_string()),
-                    message: Some(format!(
-                        "A replicator with the name '{}' already exists: {existing}",
-                        input.replicator_name
-                    )),
-                })
-                .into(),
-            );
+        // another region is a different replicator. The refusal is the service's
+        // one fixed sentence for a taken name, which discloses neither the name
+        // nor the replicator already holding it.
+        if state
+            .replicator_arn_for_name(&region, &input.replicator_name)
+            .is_some()
+        {
+            return Err(CreateReplicatorErrorModeled::ConflictException(
+                crate::state::name_already_exists("replicatorName"),
+            )
+            .into());
         }
 
         // The monotonic counter is what makes each replicator's ARN distinct; it

@@ -283,19 +283,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A channel name identifies a channel WITHIN a cluster, so a name already
         // in use under THIS cluster is a conflict; the same name under another
         // cluster is a different channel.
-        if let Some(existing) =
-            state.channel_arn_for_name(&input.cluster_arn, &input.channel_name, now)
+        if state
+            .channel_arn_for_name(&input.cluster_arn, &input.channel_name, now)
+            .is_some()
         {
-            return Err(
-                CreateChannelErrorModeled::ConflictException(ConflictException {
-                    invalid_parameter: Some("ChannelName".to_string()),
-                    message: Some(format!(
-                        "A channel with the name '{}' already exists: {existing}",
-                        input.channel_name
-                    )),
-                })
-                .into(),
-            );
+            return Err(CreateChannelErrorModeled::ConflictException(
+                crate::state::name_already_exists("channelName"),
+            )
+            .into());
         }
 
         // The monotonic counter is what makes each channel's ARN and its create

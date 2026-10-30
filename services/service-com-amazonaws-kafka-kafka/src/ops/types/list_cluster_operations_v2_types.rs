@@ -26,7 +26,11 @@ pub struct ListClusterOperationsV2Output {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.kafka#ClusterOperationV2Summary")]
+/// `StartTime` and `EndTime` target `__timestampIso8601`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `kafka_schema_and_codec!` — see `types/date_time_wire.rs`. Member set, order, wire
+/// names and requiredness from
+/// `smithy_query(query="shape", shape="com.amazonaws.kafka#ClusterOperationV2Summary")`.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterOperationV2Summary {
     pub cluster_arn: Option<String>,
@@ -37,4 +41,18 @@ pub struct ClusterOperationV2Summary {
     pub operation_state: Option<String>,
     pub operation_type: Option<String>,
 }
+
+// `ClusterType` is an enum shape, which the generator writes as `ShapeType::String`.
+kafka_schema_and_codec!(
+    ClusterOperationV2Summary,
+    CLUSTER_OPERATION_V2_SUMMARY_SCHEMA,
+    "ClusterOperationV2Summary",
+    (M_CLUSTER_ARN, cluster_arn, "ClusterArn", "clusterArn", 0, opt, string),
+    (M_CLUSTER_TYPE, cluster_type, "ClusterType", "clusterType", 1, opt, string),
+    (M_START_TIME, start_time, "StartTime", "startTime", 2, opt, date_time),
+    (M_END_TIME, end_time, "EndTime", "endTime", 3, opt, date_time),
+    (M_OPERATION_ARN, operation_arn, "OperationArn", "operationArn", 4, opt, string),
+    (M_OPERATION_STATE, operation_state, "OperationState", "operationState", 5, opt, string),
+    (M_OPERATION_TYPE, operation_type, "OperationType", "operationType", 6, opt, string),
+);
 
