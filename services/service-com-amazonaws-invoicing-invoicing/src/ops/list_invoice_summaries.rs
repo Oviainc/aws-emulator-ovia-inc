@@ -87,8 +87,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use smithy_server_runtime::{Violation, ViolationKind};
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -152,35 +150,6 @@ fn decode_next_token(
     })
 }
 
-/// A member that targets an ENUM shape admits only the values that shape declares, and
-/// nothing else; a request carrying any other value is refused.
-///
-/// The check belongs here rather than at the boundary: the generated input type carries
-/// such a member as a plain `String`, and the boundary validator enforces the legacy
-/// `@enum` string trait only, so an unmodelled value reaches this handler. The refusal
-/// is worded through the one formatter every refusal of this service is worded by
-/// (`crate::service::validation`), so an enum violation found here reads exactly like a
-/// constraint violation found at the boundary — the member path and the requirement,
-/// never the rejected value.
-fn modelled_enum_value(
-    path: &str,
-    value: &str,
-    allowed: &'static [&'static str],
-) -> Result<(), ListInvoiceSummariesErrorModeled> {
-    if allowed.contains(&value) {
-        return Ok(());
-    }
-    Err(ListInvoiceSummariesErrorModeled::ValidationException(
-        crate::service::validation::field_validation_failed(&[Violation {
-            path: path.to_string(),
-            kind: ViolationKind::EnumValue(allowed.iter().map(|value| (*value).to_string()).collect()),
-            // The wording never renders the rejected value, so it is not carried here
-            // either.
-            value: None,
-        }]),
-    ))
-}
-
 /// What the request's `Selector` selects: ONE invoice by its id, or every invoice linked
 /// to one account (`smithy_query(query="doc", shape="ListInvoiceSummariesRequest",
 /// member="Selector")`: "details for a specific invoice by providing its unique ID …
@@ -194,24 +163,20 @@ enum Selected<'s> {
 }
 
 impl<'s> Selected<'s> {
-    /// The selector a request carries, or the refusal of a `ResourceType` the model's
-    /// `ListInvoiceSummariesResourceType` does not declare.
-    fn new(
-        selector: &'s InvoiceSummariesSelector,
-    ) -> Result<Self, ListInvoiceSummariesErrorModeled> {
-        modelled_enum_value(
-            "selector.resourceType",
-            &selector.resource_type,
-            LIST_INVOICE_SUMMARIES_RESOURCE_TYPE_VALUES,
-        )?;
-        // The two values `LIST_INVOICE_SUMMARIES_RESOURCE_TYPE_VALUES` declares, which
-        // the check above has already narrowed the member to.
+    /// The selector a request carries.
+    ///
+    /// A member that targets an enum shape admits only the values that shape declares,
+    /// and the boundary walk this service runs over every modelled input constraint
+    /// before a handler runs ([`crate::service`]) holds the member to exactly that value
+    /// set, down to a member nested in a structure. So the two values
+    /// `ListInvoiceSummariesResourceType` declares are the only ones that reach here, and
+    /// this reads the selector rather than re-checking it.
+    fn new(selector: &'s InvoiceSummariesSelector) -> Self {
         match selector.resource_type.as_str() {
-            "INVOICE_ID" => Ok(Self::Invoice(&selector.value)),
-            _ => Ok(Self::Account(&selector.value)),
+            "INVOICE_ID" => Self::Invoice(&selector.value),
+            _ => Self::Account(&selector.value),
         }
     }
-
 }
 
 /// Whether `invoice` is LINKED to `account_id`: the invoice that account was issued
@@ -248,18 +213,14 @@ struct SummaryFilter<'f> {
 }
 
 impl<'f> SummaryFilter<'f> {
-    /// The filter a request carries, or the refusal of a `ReceiverRole` the model's
-    /// `ReceiverRole` enum does not declare.
-    fn new(
-        filter: Option<&'f InvoiceSummariesFilter>,
-    ) -> Result<Self, ListInvoiceSummariesErrorModeled> {
+    /// The filter a request carries. `ReceiverRole` targets an enum shape, so the
+    /// boundary walk has already held it to that shape's value set (see
+    /// [`Selected::new`]) by the time this reads it.
+    fn new(filter: Option<&'f InvoiceSummariesFilter>) -> Self {
         let Some(filter) = filter else {
-            return Ok(Self::default());
+            return Self::default();
         };
-        if let Some(role) = filter.receiver_role.as_deref() {
-            modelled_enum_value("filter.receiverRole", role, RECEIVER_ROLE_VALUES)?;
-        }
-        Ok(Self {
+        Self {
             time_interval: filter.time_interval.as_ref().map(|interval| {
                 (
                     crate::state::instant_key(&interval.start_date),
@@ -272,7 +233,7 @@ impl<'f> SummaryFilter<'f> {
                 .map(|period| (period.month, period.year)),
             invoicing_entity: filter.invoicing_entity.as_deref(),
             receiver_role: filter.receiver_role.as_deref(),
-        })
+        }
     }
 
     /// Whether `invoice` satisfies every filter member the caller supplied. Members of
@@ -348,8 +309,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        let selected = Selected::new(&input.selector)?;
-        let filter = SummaryFilter::new(input.filter.as_ref())?;
+        let selected = Selected::new(&input.selector);
+        let filter = SummaryFilter::new(input.filter.as_ref());
         let resume_at = decode_next_token(input.next_token.as_deref())?;
         // The walk's maximum, and the page size this request resolves to inside it: the
         // rule every paginated listing of this service shares
