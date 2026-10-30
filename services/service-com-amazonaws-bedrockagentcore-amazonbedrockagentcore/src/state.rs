@@ -7,6 +7,11 @@
 //! were created. Every one of `CreateEvent` / `ListSessions` / `ListEvents` /
 //! `GetEvent` / `DeleteEvent` computes its answer from these maps; nothing is canned.
 //!
+//! A session also holds the content `IngestData` submitted for long-term extraction,
+//! in the same (memory, actor, session) tree: that content is not a short-term event,
+//! so it is kept beside a session's events rather than among them, and a session that
+//! only ever received ingested content exists with no events of its own.
+//!
 //! The AgentCore *tools* data plane keeps its own map: a code interpreter holds the
 //! sessions `StartCodeInterpreterSession` started on it, and
 //! `GetCodeInterpreterSession` reports one of them back — its status read off the
@@ -14,7 +19,8 @@
 //!
 //! # The store has an explicit ceiling
 //!
-//! `CreateEvent` is the only growth site, and a caller chooses every key it inserts
+//! `CreateEvent` and `IngestData` are the memory plane's growth sites, and a caller
+//! chooses every key they insert
 //! under (`memoryId`, `actorId`, `sessionId`, `clientToken`), so request volume alone
 //! must not be able to grow the process heap without limit. Each level therefore
 //! carries a maximum and evicts its least recently written record once that maximum is
@@ -26,7 +32,9 @@
 //! caller influences, each itself bounded by the modelled `payload` <= 100 items and
 //! `metadata` <= 15 entries) and at most
 //! `MAX_MEMORIES * MAX_ACTORS_PER_MEMORY * MAX_SESSIONS_PER_ACTOR` session records,
-//! whatever a caller sends. AWS publishes no retention for any of this, so these are
+//! whatever a caller sends. Ingested content is bounded the same way, by
+//! [`MAX_INGESTIONS_PER_SESSION`] per session and [`MAX_STORED_INGESTIONS`] across the
+//! store. AWS publishes no retention for any of this, so these are
 //! the EMULATOR's own bounds, set far above any test or client working set.
 //!
 //! `StartCodeInterpreterSession` is the tools plane's only growth site, and a caller
@@ -39,8 +47,8 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Branch, Certificate, Event, MetadataValue, PayloadType, SessionSummary,
-    ToolsFileSystemConfiguration,
+    Branch, Certificate, Event, ExtractionConfig, IngestPayloadType, MetadataValue, PayloadType,
+    SessionSummary, ToolsFileSystemConfiguration,
 };
 
 /// The most memory containers this emulator retains; the least recently written one
@@ -61,6 +69,14 @@ pub const MAX_EVENTS_PER_SESSION: usize = 1_000;
 /// insertion order: the oldest event (and the now-empty session, actor and memory it
 /// was the last of) is dropped once the store passes it.
 pub const MAX_STORED_EVENTS: usize = 10_000;
+
+/// The most ingested-content records this emulator retains in one session.
+pub const MAX_INGESTIONS_PER_SESSION: usize = 1_000;
+
+/// The most ingested-content records this emulator retains across EVERY session, as a
+/// ring in insertion order: the oldest record (and the now-empty session, actor and
+/// memory it was the last of) is dropped once the store passes it.
+pub const MAX_STORED_INGESTIONS: usize = 10_000;
 
 /// The most `clientToken` records this emulator retains for one memory container.
 pub const MAX_IDEMPOTENCY_RECORDS_PER_MEMORY: usize = 1_000;
@@ -94,6 +110,9 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// [`MAX_STORED_EVENTS`]. An entry whose event is already gone (deleted, or
     /// evicted by a per-level bound) is simply skipped when it reaches the front.
     pub order: VecDeque<EventKey>,
+    /// Every stored ingestion, in insertion order, as a ring bounded by
+    /// [`MAX_STORED_INGESTIONS`], read the same way as [`Self::order`].
+    pub ingest_order: VecDeque<IngestKey>,
     /// Monotonic counter feeding the hex suffix of every generated `eventId` and
     /// `sessionId`, so two records minted inside the same millisecond still get
     /// distinct ids, and ordering the records each bound evicts by.
@@ -196,6 +215,7 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
                 created_at: event.event_timestamp,
                 last_seq: seq,
                 events: VecDeque::new(),
+                ingestions: VecDeque::new(),
             });
         session.last_seq = seq;
         session.events.push_back(event);
@@ -246,7 +266,9 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
         if let Some(actor) = memory.actors.get_mut(&key.actor_id) {
             if let Some(session) = actor.sessions.get_mut(&key.session_id) {
                 session.events.retain(|event| event.event_id != key.event_id);
-                if session.events.is_empty() {
+                // A session that still holds ingested content is still a session this
+                // memory has, so only an empty one is dropped.
+                if session.events.is_empty() && session.ingestions.is_empty() {
                     actor.sessions.remove(&key.session_id);
                 }
             }
@@ -257,6 +279,136 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
         memory
             .idempotency
             .retain(|_, locator| locator.event_id != key.event_id);
+        if memory.actors.is_empty() {
+            self.memories.remove(&key.memory_id);
+        }
+    }
+
+    /// The content a `clientToken` already ingested into this memory container, or
+    /// `None` when that token ingested none (or the record it wrote is no longer held).
+    pub fn ingestion_for_token(
+        &self,
+        memory_id: &str,
+        client_token: &str,
+    ) -> Option<&IngestedContent> {
+        let memory = self.memories.get(memory_id)?;
+        let locator = memory.ingest_idempotency.get(client_token)?;
+        self.session(memory_id, &locator.actor_id, &locator.session_id)?
+            .ingestions
+            .iter()
+            .find(|ingestion| ingestion.seq == locator.seq)
+    }
+
+    /// Persist one ingested-content record — registering its memory, actor and session
+    /// on the way — and hold every bound in
+    /// [the module's ceiling](self#the-store-has-an-explicit-ceiling).
+    ///
+    /// The session is registered here exactly as an event registers one: the content
+    /// belongs to a session of an actor in the memory container, and a session that
+    /// received only ingested content holds no events.
+    pub fn insert_ingestion(&mut self, ingestion: IngestedContent, client_token: Option<String>) {
+        let key = IngestKey {
+            memory_id: ingestion.memory_id.clone(),
+            actor_id: ingestion.actor_id.clone(),
+            session_id: ingestion.session_id.clone(),
+            seq: ingestion.seq,
+        };
+        let seq = ingestion.seq;
+
+        let memory = self.memories.entry(key.memory_id.clone()).or_default();
+        memory.last_seq = seq;
+        if let Some(token) = client_token {
+            memory.ingest_idempotency.insert(
+                token,
+                IngestLocator {
+                    actor_id: key.actor_id.clone(),
+                    session_id: key.session_id.clone(),
+                    seq,
+                },
+            );
+            while memory.ingest_idempotency.len() > MAX_IDEMPOTENCY_RECORDS_PER_MEMORY {
+                let Some(oldest) =
+                    least_recently_written(&memory.ingest_idempotency, |locator| locator.seq)
+                else {
+                    break;
+                };
+                memory.ingest_idempotency.remove(&oldest);
+            }
+        }
+
+        let actor = memory.actors.entry(key.actor_id.clone()).or_default();
+        actor.last_seq = seq;
+        let session = actor
+            .sessions
+            .entry(key.session_id.clone())
+            .or_insert_with(|| SessionStore {
+                session_id: key.session_id.clone(),
+                actor_id: key.actor_id.clone(),
+                // The session came into being with this content, so the content's
+                // `contentTimestamp` is the session's `createdAt`.
+                created_at: ingestion.content_timestamp,
+                last_seq: seq,
+                events: VecDeque::new(),
+                ingestions: VecDeque::new(),
+            });
+        session.last_seq = seq;
+        session.ingestions.push_back(ingestion);
+        while session.ingestions.len() > MAX_INGESTIONS_PER_SESSION {
+            session.ingestions.pop_front();
+        }
+
+        while actor.sessions.len() > MAX_SESSIONS_PER_ACTOR {
+            let Some(oldest) = least_recently_written(&actor.sessions, |session| session.last_seq)
+            else {
+                break;
+            };
+            actor.sessions.remove(&oldest);
+        }
+        while memory.actors.len() > MAX_ACTORS_PER_MEMORY {
+            let Some(oldest) = least_recently_written(&memory.actors, |actor| actor.last_seq) else {
+                break;
+            };
+            memory.actors.remove(&oldest);
+        }
+        while self.memories.len() > MAX_MEMORIES {
+            let Some(oldest) = least_recently_written(&self.memories, |memory| memory.last_seq)
+            else {
+                break;
+            };
+            self.memories.remove(&oldest);
+        }
+
+        self.ingest_order.push_back(key);
+        while self.ingest_order.len() > MAX_STORED_INGESTIONS {
+            let Some(oldest) = self.ingest_order.pop_front() else {
+                break;
+            };
+            self.evict_ingestion(&oldest);
+        }
+    }
+
+    /// Drop an evicted ingestion and every container it was the last record of, so a
+    /// container cannot outlive the records that created it.
+    fn evict_ingestion(&mut self, key: &IngestKey) {
+        let Some(memory) = self.memories.get_mut(&key.memory_id) else {
+            return;
+        };
+        if let Some(actor) = memory.actors.get_mut(&key.actor_id) {
+            if let Some(session) = actor.sessions.get_mut(&key.session_id) {
+                session
+                    .ingestions
+                    .retain(|ingestion| ingestion.seq != key.seq);
+                if session.events.is_empty() && session.ingestions.is_empty() {
+                    actor.sessions.remove(&key.session_id);
+                }
+            }
+            if actor.sessions.is_empty() {
+                memory.actors.remove(&key.actor_id);
+            }
+        }
+        memory
+            .ingest_idempotency
+            .retain(|_, locator| locator.seq != key.seq);
         if memory.actors.is_empty() {
             self.memories.remove(&key.memory_id);
         }
@@ -360,6 +512,17 @@ pub struct EventKey {
     pub event_id: String,
 }
 
+/// Where one stored ingestion lives, as the whole-store ring records it. The
+/// sequence identifies the record inside its session: ingested content carries no
+/// modelled id of its own (`IngestData` answers with the `sessionId` only).
+#[derive(Debug, Clone)]
+pub struct IngestKey {
+    pub memory_id: String,
+    pub actor_id: String,
+    pub session_id: String,
+    pub seq: u64,
+}
+
 /// One AgentCore Memory container's data-plane contents.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
@@ -371,6 +534,14 @@ pub struct MemoryStore {
     /// creating a second one. Bounded by [`MAX_IDEMPOTENCY_RECORDS_PER_MEMORY`], and
     /// a record is dropped with the event it points at.
     pub idempotency: HashMap<String, EventLocator>,
+    /// `clientToken` -> the content that token already ingested. `IngestData` is
+    /// `@idempotent` and its `clientToken` is an `@idempotencyToken`, so a replayed
+    /// token answers with the session the first call used rather than ingesting the
+    /// content twice. Kept apart from [`Self::idempotency`] because an ingestion and
+    /// an event are different records. Bounded by
+    /// [`MAX_IDEMPOTENCY_RECORDS_PER_MEMORY`], and a record is dropped with the
+    /// ingestion it points at.
+    pub ingest_idempotency: HashMap<String, IngestLocator>,
     /// The sequence of the last event written into this container, which is what its
     /// eviction order is read from.
     pub last_seq: u64,
@@ -383,6 +554,16 @@ pub struct EventLocator {
     pub session_id: String,
     pub event_id: String,
     /// The sequence of the event this record points at: its eviction order.
+    pub seq: u64,
+}
+
+/// Where an already-ingested record lives, so a replayed `clientToken` can find it.
+#[derive(Debug, Clone)]
+pub struct IngestLocator {
+    pub actor_id: String,
+    pub session_id: String,
+    /// The sequence of the ingestion this record points at: its identity inside the
+    /// session, and its eviction order.
     pub seq: u64,
 }
 
@@ -410,6 +591,11 @@ pub struct SessionStore {
     /// Creation-ordered, and bounded by [`MAX_EVENTS_PER_SESSION`]: the oldest event
     /// leaves the front once the session passes that bound.
     pub events: VecDeque<StoredEvent>,
+    /// The content `IngestData` submitted into this session for long-term extraction,
+    /// in ingestion order and bounded by [`MAX_INGESTIONS_PER_SESSION`]. Ingested
+    /// content is not a short-term event, so it is never reported by `ListEvents` or
+    /// `GetEvent`.
+    pub ingestions: VecDeque<IngestedContent>,
 }
 
 impl SessionStore {
@@ -421,6 +607,25 @@ impl SessionStore {
             created_at: self.created_at,
         }
     }
+}
+
+/// A stored ingestion: exactly what `IngestData` persisted for one call, the content
+/// long-term extraction reads.
+#[derive(Debug, Clone)]
+pub struct IngestedContent {
+    pub memory_id: String,
+    pub actor_id: String,
+    pub session_id: String,
+    /// The instant the content occurred, as the request stated it.
+    pub content_timestamp: ::aws_smithy_types::DateTime,
+    /// The inline payload items the request submitted, in the order it sent them.
+    pub payload: Vec<IngestPayloadType>,
+    /// The namespace substitution the request asked extraction to use, kept as sent.
+    pub extraction_config: Option<ExtractionConfig>,
+    pub metadata: Option<HashMap<String, MetadataValue>>,
+    /// The value [`ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState::next_seq`]
+    /// handed this ingestion: its identity inside the session, and its eviction order.
+    pub seq: u64,
 }
 
 /// A stored event: exactly what `CreateEvent` persisted, which is what `GetEvent`

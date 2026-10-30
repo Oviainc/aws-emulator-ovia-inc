@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op IngestData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `IngestData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records content submitted for long-term extraction against a session of an actor
+//! in an AgentCore Memory container, in [`crate::state`], and answers with the
+//! session it went into: the one the request named, or one minted here when it named
+//! none. A replayed `clientToken` answers with the session that token already used
+//! and stores nothing further.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`IngestData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Ingested content is NOT a short-term event, so it is kept beside a session's
+//! events rather than among them: `ListEvents` and `GetEvent` report only what
+//! `CreateEvent` stored, while `ListSessions` reports the session this call created
+//! (its `HAS_EVENTS` filter is what narrows a listing to the sessions holding events).
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +181,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `IngestData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(IngestDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("IngestData"))
+        // Request metadata is not read by this operation: every member it needs is
+        // bound into `input` by the centralized request walk.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            IngestDataErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry this service's state".to_string(),
+            })
+        })?;
+
+        let memory_id = crate::state::normalize_memory_id(&input.memory_id);
+        let mut store = state.lock();
+
+        // `IngestData` is `@idempotent`, and the model documents that a `clientToken`
+        // matching an earlier request is ignored rather than refused: answer with the
+        // session that token already ingested into, so the content is stored once.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(ingested) = store.ingestion_for_token(&memory_id, token) {
+                return Ok(IngestDataOutput {
+                    session_id: ingested.session_id.clone(),
+                });
+            }
+        }
+
+        // `ContentSource` models inline content only ("Only inline content is
+        // supported"), so the union has one member to take the payload from.
+        let ContentSource::Inline(inline) = input.source;
+
+        let seq = store.next_seq();
+        // A session the caller did not name is created for it and reported back, so the
+        // caller can address that session afterwards.
+        let session_id = input
+            .session_id
+            .clone()
+            .unwrap_or_else(|| crate::state::mint_session_id(seq));
+        // The content is persisted as submitted: it is what long-term extraction reads,
+        // and the `*MemoryRecord*` operations that report extracted records are still
+        // 501 in this crate. Synthesising records nothing extracted would be worse than
+        // not reporting them, so this operation stores the content and leaves those
+        // records to the issues that implement them.
+        let ingestion = crate::state::IngestedContent {
+            memory_id: memory_id.clone(),
+            actor_id: input.actor_id.clone(),
+            session_id: session_id.clone(),
+            content_timestamp: input.content_timestamp,
+            payload: inline.payload,
+            extraction_config: input.extraction_config,
+            metadata: input.metadata,
+            seq,
+        };
+        // `insert_ingestion` registers the memory container, the actor and the session,
+        // and holds every bound the store declares, so no caller can grow it without
+        // limit.
+        store.insert_ingestion(ingestion, input.client_token);
+
+        Ok(IngestDataOutput { session_id })
     }
 }
