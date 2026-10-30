@@ -171,6 +171,8 @@ mod processing_job_stop;
 mod rejection_fidelity;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/search_resources.rs"]
+mod search_resources;
 #[path = "all/search_suggestions.rs"]
 mod search_suggestions;
 #[path = "all/servicecatalog_portfolio_status.rs"]

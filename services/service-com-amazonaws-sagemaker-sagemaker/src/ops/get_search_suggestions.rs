@@ -196,7 +196,10 @@ impl<'hint> Suggestions<'hint> {
 ///
 /// The names themselves come from the generated schemas rather than a hand-written
 /// catalogue, so this surface follows the model the service is built from.
-fn search_entity(resource: &str) -> Option<&'static ::aws_smithy_schema::Schema> {
+///
+/// `Search` resolves a filter's `Name` against the SAME mapping, so the properties a
+/// query may name and the ones suggested for it cannot drift apart.
+pub(crate) fn search_entity(resource: &str) -> Option<&'static ::aws_smithy_schema::Schema> {
     Some(match resource {
         "TrainingJob" => &TrainingJob::SCHEMA,
         "Experiment" => &Experiment::SCHEMA,
@@ -230,7 +233,10 @@ fn search_entity(resource: &str) -> Option<&'static ::aws_smithy_schema::Schema>
 /// `CreateTrialComponent` — the member's name lowercased, then the key verbatim as the
 /// request spelled it. The same rule covers every facet, so a member needs no entry
 /// anywhere: ONE lowercasing is what the index does to all of them.
-fn published_facet(member: &str) -> String {
+///
+/// `Search` reads the same mapping, so a path this operation suggests is a path a filter
+/// accepts.
+pub(crate) fn published_facet(member: &str) -> String {
     member.to_ascii_lowercase()
 }
 

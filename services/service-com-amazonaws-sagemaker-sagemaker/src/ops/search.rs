@@ -1,22 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Search
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Search`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: selects the resources of one `ResourceType` out of `crate::state`, keeps
+//! the ones the request's `SearchExpression` holds for, orders them by the property
+//! `SortBy` names and pages the result. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Search::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## How a resource is judged
 //!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `Search::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! A filter names a PROPERTY of the resource, not a field of this emulator's store, so
+//! every candidate is first projected into the shape `SearchRecord` carries it in (a
+//! `TrainingJob`, an `Experiment`, a `ModelDashboardModel`, …) and then rendered by this
+//! service's own JSON codec into one document per resource
+//! ([`rendered`]). The filters and the sort read that document, so the property names a
+//! caller may write are exactly the members the MODEL declares for the record — which is
+//! also what makes a name the model does not declare refusable
+//! ([`property_declared`]).
 //!
 //! ## Reaching this service's state
 //!
@@ -146,6 +145,1348 @@ impl<Eng> Search<Eng> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// This operation's own vocabulary: the defaults the model documents, the operator
+// spellings the evaluation branches on, and the one bound `SearchExpression`'s doc
+// states. Each is named once so no branch below carries a bare literal.
+// ---------------------------------------------------------------------------
+
+/// `SortBy`'s documented default ("The name of the resource property used to sort the
+/// SearchResults. The default is LastModifiedTime.").
+///
+/// A record shape that declares no such property — `ModelDashboardModel`, which nests
+/// the model under `Model` — has nothing to order by under the default, so the default
+/// is never REFUSED the way an explicit unknown `SortBy` is; every such record then
+/// sorts under the tie-break alone.
+const DOCUMENTED_DEFAULT_SORT_BY: &str = "LastModifiedTime";
+
+/// `SortOrder`'s documented default ("The default is Descending").
+const DOCUMENTED_DEFAULT_SORT_ORDER: &str = crate::state::ORDER_DESCENDING;
+
+/// The `SearchSortOrder` member that orders a result set from the lowest sort key up.
+const ORDER_ASCENDING: &str = "Ascending";
+
+/// `BooleanOperator`'s documented default ("The default value is And").
+const DEFAULT_BOOLEAN_OPERATOR: &str = "And";
+
+/// The `BooleanOperator` member that needs only one conditional statement to hold.
+const BOOLEAN_OPERATOR_OR: &str = "Or";
+
+/// `Filter$Operator`'s documented default ("If you specify a Value, but not an Operator,
+/// SageMaker uses the equals operator").
+const DEFAULT_FILTER_OPERATOR: &str = "Equals";
+
+/// The two `Operator` members that ask only whether the property is there, and so are
+/// the only two that need no `Value`.
+const OPERATOR_EXISTS: &str = "Exists";
+const OPERATOR_NOT_EXISTS: &str = "NotExists";
+
+/// `CrossAccountFilterOption`'s two members.
+const CROSS_ACCOUNT: &str = "CrossAccount";
+const SAME_ACCOUNT: &str = "SameAccount";
+
+/// How many `Filters`, `NestedFilters` and `SubExpressions` one `SearchExpression` may
+/// carry in total, from the member's own doc: "The maximum number of recursive
+/// SubExpressions, NestedFilters, and Filters that can be included in a SearchExpression
+/// object is 50." It is also what bounds the recursion of [`validate_expression`] and
+/// [`expression_holds`].
+const MAX_EXPRESSION_ELEMENTS: usize = 50;
+
+/// The `Relation` member that says `TotalHits$Value` "is the exact count of matching
+/// results" — which it is here: every matching resource is counted, never sampled.
+const TOTAL_HITS_EXACT: &str = "EqualTo";
+
+/// The two members of a key/value pair in a modelled list (a `Tag`, a
+/// `FeatureParameter`): a path segment that names such a list is followed by the KEY of
+/// the entry it addresses, which is the form `Tags.<key>` the `Filter$Name` doc gives
+/// for a tag filter.
+const PAIR_KEY_MEMBER: &str = "Key";
+const PAIR_VALUE_MEMBER: &str = "Value";
+
+/// The form `VisibilityConditions$Key` documents ("It must be in the following format:
+/// `Tags.<key>`").
+const VISIBILITY_CONDITION_PREFIX: &str = "Tags.";
+
+/// What a refusal says about a property name the record's modelled shape does not
+/// declare. `Filter$Name`'s doc states the rule it breaks: "You must specify a valid
+/// property for the resource."
+fn unknown_property(name: &str) -> SearchError {
+    crate::scaffolded::Scaffolded::validation(format!("Unknown property name: {name}"))
+}
+
+// ---------------------------------------------------------------------------
+// One resource, as `Search` judges and reports it.
+// ---------------------------------------------------------------------------
+
+/// One stored resource of the searched `ResourceType`.
+struct Candidate {
+    /// The resource's stable identity: the tie-break that keeps the sort total and the
+    /// page boundary a `NextToken` names.
+    key: String,
+    /// The record as it goes into `Results`.
+    record: SearchRecord,
+    /// The same resource as this service's own JSON codec renders it: one document whose
+    /// members are the property names a filter and a sort may name.
+    document: ::serde_json::Value,
+}
+
+/// One modelled shape as the JSON value this service's own codec renders for it.
+///
+/// Rendering through the codec is what makes the filters read the RESOURCE's modelled
+/// properties rather than this emulator's storage fields: the document's member names,
+/// nesting and value types are the model's, so `Tags.<key>`, a nested
+/// `InputDataConfig.ChannelName` and a timestamp compare exactly as they do in the
+/// response the same record is serialised into.
+fn rendered(
+    schema: &::aws_smithy_schema::Schema,
+    value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+) -> Result<::serde_json::Value, SearchError> {
+    use ::aws_smithy_schema::serde::ShapeSerializer;
+
+    let mut serializer = ::aws_smithy_schema_server::json::JsonShapeSerializer::new();
+    serializer.write_struct(schema, value).map_err(|error| {
+        crate::scaffolded::Scaffolded::validation(format!(
+            "a stored SageMaker resource could not be rendered for searching: {error}"
+        ))
+    })?;
+    ::serde_json::from_str(&serializer.into_string()).map_err(|error| {
+        crate::scaffolded::Scaffolded::validation(format!(
+            "a stored SageMaker resource did not render as JSON for searching: {error}"
+        ))
+    })
+}
+
+/// The modelled member a property path's first segment names: the member of `entity`
+/// whose own name, or the facet name the service publishes for it, is that segment.
+///
+/// A caller may spell a facet the way the search index publishes it —
+/// `hyperparameters.<key>` for a training job's hyperparameters, the form
+/// `GetSearchSuggestions` answers — so the segment is matched against both spellings and
+/// answered as the MODELLED name, which is the name the rendered document carries.
+fn declared_member(
+    entity: Option<&'static ::aws_smithy_schema::Schema>,
+    segment: &str,
+) -> Option<&'static str> {
+    entity?.members().iter().find_map(|member| {
+        let name = member.member_name()?;
+        let published = crate::ops::get_search_suggestions::published_facet(name);
+        (name == segment || published == segment).then_some(name)
+    })
+}
+
+/// `path` as the segments it addresses in a rendered resource, or `None` when its first
+/// segment names no property of the resource at all.
+///
+/// Only the first segment is checked against the model: a member schema carries its own
+/// name and shape type but not the members of the shape it targets, so a nested path
+/// (`InputDataConfig.ChannelName`, `Tags.<key>`, `hyperparameters.<name>`) is known
+/// exactly as far as the shape in hand declares it — and resolved the rest of the way
+/// against the resource's own document, where a segment that names nothing simply
+/// matches nothing.
+fn property_path<'path>(
+    entity: Option<&'static ::aws_smithy_schema::Schema>,
+    path: &'path str,
+) -> Option<Vec<&'path str>> {
+    let mut segments = path_segments(path);
+    let head = *segments.first()?;
+    segments[0] = declared_member(entity, head)?;
+    Some(segments)
+}
+
+/// The values `path` addresses in `document`, in document order.
+///
+/// A list is TRANSPARENT: a path reaching one addresses its elements, so a filter on
+/// `InputDataConfig.ChannelName` holds when any channel carries that name — which is how
+/// a plain `Filter` differs from a `NestedFilters`, where every filter must hold for ONE
+/// element. A list of key/value pairs is addressed BY KEY instead, which is the
+/// `Tags.<key>` form `Filter$Name` documents.
+fn resolve<'doc>(
+    document: &'doc ::serde_json::Value,
+    segments: &[&str],
+    found: &mut Vec<&'doc ::serde_json::Value>,
+) {
+    let Some((head, rest)) = segments.split_first() else {
+        if !document.is_null() {
+            found.push(document);
+        }
+        return;
+    };
+    match document {
+        ::serde_json::Value::Object(members) => {
+            if let Some(child) = members.get(*head) {
+                resolve(child, rest, found);
+            }
+        }
+        ::serde_json::Value::Array(elements) => {
+            for element in elements {
+                match pair_value(element, head) {
+                    Some(value) => resolve(value, rest, found),
+                    None => resolve(element, segments, found),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `Value` of `element` when it is a key/value pair whose `Key` is `key`.
+fn pair_value<'doc>(
+    element: &'doc ::serde_json::Value,
+    key: &str,
+) -> Option<&'doc ::serde_json::Value> {
+    let members = element.as_object()?;
+    let holds_key = members.get(PAIR_KEY_MEMBER)?.as_str()? == key;
+    holds_key.then(|| members.get(PAIR_VALUE_MEMBER)).flatten()
+}
+
+/// One comparable value: what a filter's `Value` is compared against and what a sort
+/// orders by. The four value types `Search` documents querying against — numeric, text,
+/// Boolean and timestamp — land here as text, a number (a timestamp is a number of
+/// seconds on the wire) or a Boolean.
+#[derive(Debug, Clone, PartialEq)]
+enum Scalar {
+    Text(String),
+    Number(f64),
+    Boolean(bool),
+}
+
+impl Scalar {
+    /// One document value as a comparable scalar, or `None` for a structure or a list,
+    /// which no operator compares.
+    fn of(value: &::serde_json::Value) -> Option<Self> {
+        match value {
+            ::serde_json::Value::String(text) => Some(Self::Text(text.clone())),
+            ::serde_json::Value::Number(number) => number.as_f64().map(Self::Number),
+            ::serde_json::Value::Bool(flag) => Some(Self::Boolean(*flag)),
+            _ => None,
+        }
+    }
+
+    /// Where this value sorts relative to another, with a stable order across types so a
+    /// result set whose sort property is a number for one record and text for another
+    /// still has ONE order.
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Boolean(_) => 0,
+            Self::Number(_) => 1,
+            Self::Text(_) => 2,
+        }
+    }
+
+    /// Whether this value equals the text a filter carries, compared as the value's own
+    /// type: a number against a number, a Boolean against `true`/`false`, text as text.
+    fn equals(&self, wanted: &str) -> bool {
+        match self {
+            Self::Text(text) => text == wanted,
+            Self::Number(number) => as_number(wanted).is_some_and(|value| *number == value),
+            Self::Boolean(flag) => as_boolean(wanted).is_some_and(|value| *flag == value),
+        }
+    }
+
+    /// How this value orders against the text a filter carries, or `None` when the
+    /// comparison has no answer — a text property, which the `Operator` doc excludes
+    /// from the ordering operators ("Not supported for text properties"), or a filter
+    /// value that is not of the property's type.
+    fn ordering(&self, wanted: &str) -> Option<::std::cmp::Ordering> {
+        match self {
+            Self::Number(number) => as_number(wanted).and_then(|value| number.partial_cmp(&value)),
+            Self::Text(_) | Self::Boolean(_) => None,
+        }
+    }
+
+    /// Whether this value contains the text a filter carries. The `Operator` doc limits
+    /// `Contains` to text properties, so a number or a Boolean contains nothing.
+    fn contains(&self, wanted: &str) -> bool {
+        match self {
+            Self::Text(text) => text.contains(wanted),
+            Self::Number(_) | Self::Boolean(_) => false,
+        }
+    }
+}
+
+/// `wanted` as a number: a numeric property's filter value, or a timestamp one. A
+/// timestamp is a number of seconds in the rendered document, and `Filter$Value`'s doc
+/// gives the two spellings a caller may write it in — "an integer or floating-point
+/// decimal" for a numeric property, and for a timestamp property "an ISO 8601 date-time
+/// string of the following format: YYYY-mm-dd'T'HH:MM:SS" — so both resolve to the same
+/// comparable number here.
+fn as_number(wanted: &str) -> Option<f64> {
+    if let Ok(number) = wanted.parse::<f64>() {
+        return Some(number);
+    }
+    as_instant(wanted)
+}
+
+/// `wanted` as a number of seconds since the epoch, when it is an ISO 8601 date-time.
+///
+/// The documented form carries no zone, which RFC 3339 requires, so a value written
+/// without one is read as UTC — the zone every instant this service renders is in.
+fn as_instant(wanted: &str) -> Option<f64> {
+    let parse = |text: &str| {
+        ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+            .ok()
+    };
+    let parsed = parse(wanted).or_else(|| parse(&format!("{wanted}Z")))?;
+    Some(parsed.as_secs_f64())
+}
+
+/// `wanted` as a Boolean, in the two spellings the JSON document renders.
+fn as_boolean(wanted: &str) -> Option<bool> {
+    match wanted {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The search expression: validated once per request, then evaluated per resource.
+// ---------------------------------------------------------------------------
+
+/// Refuse a `SearchExpression` this operation cannot evaluate, BEFORE any resource is
+/// read, so a request naming a property the resource does not declare is refused whether
+/// or not it would have matched anything.
+fn validate_expression(
+    expression: &SearchExpression,
+    entity: Option<&'static ::aws_smithy_schema::Schema>,
+    budget: &mut usize,
+) -> Result<(), SearchError> {
+    let filters = expression.filters.as_deref().unwrap_or_default();
+    let nested = expression.nested_filters.as_deref().unwrap_or_default();
+    let sub_expressions = expression.sub_expressions.as_deref().unwrap_or_default();
+    if filters.is_empty() && nested.is_empty() && sub_expressions.is_empty() {
+        // "You must specify at least one subexpression, filter, or nested filter."
+        return Err(crate::scaffolded::Scaffolded::validation(
+            "SearchExpression must specify at least one of Filters, NestedFilters or \
+             SubExpressions.",
+        ));
+    }
+    if let Some(operator) = expression.operator.as_deref() {
+        if !BOOLEAN_OPERATOR_VALUES.contains(&operator) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SearchExpression Operator must be one of {}; got \"{operator}\".",
+                BOOLEAN_OPERATOR_VALUES.join(", ")
+            )));
+        }
+    }
+
+    let elements = filters.len() + nested.len() + sub_expressions.len();
+    *budget = budget.checked_sub(elements).ok_or_else(|| {
+        crate::scaffolded::Scaffolded::validation(format!(
+            "SearchExpression may include at most {MAX_EXPRESSION_ELEMENTS} recursive \
+             SubExpressions, NestedFilters and Filters."
+        ))
+    })?;
+
+    for filter in filters {
+        validate_filter(filter, entity)?;
+    }
+    for nested in nested {
+        if property_path(entity, &nested.nested_property_name).is_none() {
+            return Err(unknown_property(&nested.nested_property_name));
+        }
+        for filter in &nested.filters {
+            validate_filter(filter, entity)?;
+        }
+    }
+    for sub_expression in sub_expressions {
+        validate_expression(sub_expression, entity, budget)?;
+    }
+    Ok(())
+}
+
+/// Refuse a filter whose property the record's shape does not declare, whose operator is
+/// not a modelled `Operator`, or which carries no value for an operator that compares
+/// one.
+fn validate_filter(
+    filter: &Filter,
+    entity: Option<&'static ::aws_smithy_schema::Schema>,
+) -> Result<(), SearchError> {
+    if property_path(entity, &filter.name).is_none() {
+        return Err(unknown_property(&filter.name));
+    }
+    let operator = filter.operator.as_deref().unwrap_or(DEFAULT_FILTER_OPERATOR);
+    if !OPERATOR_VALUES.contains(&operator) {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "Filter Operator must be one of {}; got \"{operator}\".",
+            OPERATOR_VALUES.join(", ")
+        )));
+    }
+    let compares_a_value = operator != OPERATOR_EXISTS && operator != OPERATOR_NOT_EXISTS;
+    if compares_a_value && filter.value.is_none() {
+        return Err(crate::scaffolded::Scaffolded::validation(format!(
+            "Filter {} with operator {operator} must carry a Value.",
+            filter.name
+        )));
+    }
+    Ok(())
+}
+
+/// Whether one resource's document satisfies an expression.
+///
+/// `And` — the documented default — needs every conditional statement in all three lists
+/// to hold; `Or` needs one of them to.
+fn expression_holds(
+    expression: &SearchExpression,
+    entity: Option<&'static ::aws_smithy_schema::Schema>,
+    document: &::serde_json::Value,
+) -> bool {
+    let operator = expression
+        .operator
+        .as_deref()
+        .unwrap_or(DEFAULT_BOOLEAN_OPERATOR);
+    let filters = expression.filters.as_deref().unwrap_or_default();
+    let nested = expression.nested_filters.as_deref().unwrap_or_default();
+    let sub_expressions = expression.sub_expressions.as_deref().unwrap_or_default();
+
+    let mut statements = filters
+        .iter()
+        .map(|filter| filter_holds(filter, entity, document, &[]))
+        .chain(
+            nested
+                .iter()
+                .map(|nested| nested_filters_hold(nested, entity, document)),
+        )
+        .chain(
+            sub_expressions
+                .iter()
+                .map(|sub_expression| expression_holds(sub_expression, entity, document)),
+        );
+
+    if operator == BOOLEAN_OPERATOR_OR {
+        statements.any(|holds| holds)
+    } else {
+        statements.all(|holds| holds)
+    }
+}
+
+/// Whether a nested filter holds: "A nested filter is satisfied if a single object in the
+/// list satisfies all Boolean expressions."
+///
+/// The inner filters name FULL property paths (`InputDataConfig.ChannelName` beside a
+/// nested property of `InputDataConfig`), so the nested property's own prefix is dropped
+/// and what remains is resolved against ONE element of the nested list at a time.
+fn nested_filters_hold(
+    nested: &NestedFilters,
+    entity: Option<&'static ::aws_smithy_schema::Schema>,
+    document: &::serde_json::Value,
+) -> bool {
+    let Some(prefix) = property_path(entity, &nested.nested_property_name) else {
+        return false;
+    };
+    let mut elements = Vec::new();
+    resolve(document, &prefix, &mut elements);
+    elements.iter().any(|element| {
+        nested
+            .filters
+            .iter()
+            .all(|filter| filter_holds(filter, entity, element, &prefix))
+    })
+}
+
+/// One property path as its segments.
+fn path_segments(path: &str) -> Vec<&str> {
+    path.split('.').collect()
+}
+
+/// Whether one filter holds for `document`, which is the whole resource for a plain
+/// filter and one element of a nested list for a nested one — `prefix` being the nested
+/// property's path, which the inner filter's name repeats.
+fn filter_holds(
+    filter: &Filter,
+    entity: Option<&'static ::aws_smithy_schema::Schema>,
+    document: &::serde_json::Value,
+    prefix: &[&str],
+) -> bool {
+    // Validated before any resource was read, so the property is one the resource
+    // declares by the time a resource is judged by it.
+    let Some(segments) = property_path(entity, &filter.name) else {
+        return false;
+    };
+    let relative = segments.strip_prefix(prefix).unwrap_or(&segments);
+    let mut values = Vec::new();
+    resolve(document, relative, &mut values);
+
+    let operator = filter.operator.as_deref().unwrap_or(DEFAULT_FILTER_OPERATOR);
+    if operator == OPERATOR_EXISTS {
+        return !values.is_empty();
+    }
+    if operator == OPERATOR_NOT_EXISTS {
+        return values.is_empty();
+    }
+    // Validated before any resource was read, so an operator that compares a value has
+    // one here.
+    let Some(wanted) = filter.value.as_deref() else {
+        return false;
+    };
+    let scalars: Vec<Scalar> = values.iter().filter_map(|value| Scalar::of(value)).collect();
+    match operator {
+        "Equals" => scalars.iter().any(|scalar| scalar.equals(wanted)),
+        // "The value of Name doesn't equal Value": a property the resource does not
+        // carry has no value to differ from, so it does not satisfy the comparison.
+        "NotEquals" => !scalars.is_empty() && !scalars.iter().any(|scalar| scalar.equals(wanted)),
+        "GreaterThan" => scalars
+            .iter()
+            .any(|scalar| scalar.ordering(wanted) == Some(::std::cmp::Ordering::Greater)),
+        "GreaterThanOrEqualTo" => scalars.iter().any(|scalar| {
+            matches!(
+                scalar.ordering(wanted),
+                Some(::std::cmp::Ordering::Greater | ::std::cmp::Ordering::Equal)
+            )
+        }),
+        "LessThan" => scalars
+            .iter()
+            .any(|scalar| scalar.ordering(wanted) == Some(::std::cmp::Ordering::Less)),
+        "LessThanOrEqualTo" => scalars.iter().any(|scalar| {
+            matches!(
+                scalar.ordering(wanted),
+                Some(::std::cmp::Ordering::Less | ::std::cmp::Ordering::Equal)
+            )
+        }),
+        "Contains" => scalars.iter().any(|scalar| scalar.contains(wanted)),
+        // "The value of Name is one of the comma delimited strings in Value."
+        "In" => wanted
+            .split(',')
+            .map(str::trim)
+            .any(|item| scalars.iter().any(|scalar| scalar.equals(item))),
+        _ => false,
+    }
+}
+
+/// Whether every visibility condition holds for `document`.
+///
+/// "If a search result contains a key from your list, it is included in the final search
+/// response if the value associated with the key in the result matches the value you
+/// specified. If the value doesn't match, the result is excluded" — so a resource that
+/// carries none of the keys is not excluded by any of them.
+fn visibility_holds(
+    conditions: &[VisibilityConditions],
+    entity: Option<&'static ::aws_smithy_schema::Schema>,
+    document: &::serde_json::Value,
+) -> bool {
+    conditions.iter().all(|condition| {
+        let Some(key) = condition.key.as_deref() else {
+            return true;
+        };
+        let Some(segments) = property_path(entity, key) else {
+            // A resource whose record declares no such property carries none of the
+            // keys, so no condition on one excludes it.
+            return true;
+        };
+        let mut values = Vec::new();
+        resolve(document, &segments, &mut values);
+        if values.is_empty() {
+            return true;
+        }
+        let wanted = condition.value.as_deref().unwrap_or_default();
+        values
+            .iter()
+            .filter_map(|value| Scalar::of(value))
+            .any(|scalar| scalar.equals(wanted))
+    })
+}
+
+/// The value a record is ordered by, or `None` when it carries no such property.
+fn sort_value(
+    document: &::serde_json::Value,
+    entity: Option<&'static ::aws_smithy_schema::Schema>,
+    sort_by: &str,
+) -> Option<Scalar> {
+    let segments = property_path(entity, sort_by)?;
+    let mut values = Vec::new();
+    resolve(document, &segments, &mut values);
+    values.iter().find_map(|value| Scalar::of(value))
+}
+
+/// How two records order under one sort property. A record carrying no value for it
+/// sorts below every record that carries one, so the order is total in both directions.
+fn compare_sort_values(left: Option<&Scalar>, right: Option<&Scalar>) -> ::std::cmp::Ordering {
+    match (left, right) {
+        (None, None) => ::std::cmp::Ordering::Equal,
+        (None, Some(_)) => ::std::cmp::Ordering::Less,
+        (Some(_), None) => ::std::cmp::Ordering::Greater,
+        (Some(left), Some(right)) => match (left, right) {
+            (Scalar::Text(left), Scalar::Text(right)) => left.cmp(right),
+            (Scalar::Number(left), Scalar::Number(right)) => left.total_cmp(right),
+            (Scalar::Boolean(left), Scalar::Boolean(right)) => left.cmp(right),
+            _ => left.rank().cmp(&right.rank()),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The resource catalogue: one stored resource kind per `ResourceType` member.
+// ---------------------------------------------------------------------------
+
+/// The training job as `SearchRecord$TrainingJob` carries it: the stored record, plus the
+/// accepted request `DescribeTrainingJob` replays from.
+fn training_job_entity(job: &crate::state::TrainingJob) -> TrainingJob {
+    let request = job.request.clone();
+    TrainingJob {
+        training_job_name: Some(job.name.clone()),
+        training_job_arn: Some(job.arn.clone()),
+        tuning_job_arn: job.tuning_job_arn.clone(),
+        model_artifacts: Some(ModelArtifacts {
+            s3_model_artifacts: job.model_artifacts_path(),
+        }),
+        training_job_status: Some(job.status.clone()),
+        secondary_status: job.secondary_status.clone(),
+        failure_reason: job.failure_reason.clone(),
+        creation_time: Some(crate::state::timestamp(job.creation_time)),
+        last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
+        training_end_time: job.training_end_time.map(crate::state::timestamp),
+        warm_pool_status: job.warm_pool_status.clone(),
+        hyper_parameters: request.hyper_parameters,
+        algorithm_specification: request.algorithm_specification,
+        role_arn: Some(request.role_arn),
+        input_data_config: request.input_data_config,
+        output_data_config: Some(request.output_data_config),
+        resource_config: request.resource_config,
+        vpc_config: request.vpc_config,
+        stopping_condition: request.stopping_condition,
+        enable_network_isolation: request.enable_network_isolation,
+        enable_inter_container_traffic_encryption: request
+            .enable_inter_container_traffic_encryption,
+        enable_managed_spot_training: request.enable_managed_spot_training,
+        checkpoint_config: request.checkpoint_config,
+        debug_hook_config: request.debug_hook_config,
+        experiment_config: request.experiment_config,
+        debug_rule_configurations: request.debug_rule_configurations,
+        tensor_board_output_config: request.tensor_board_output_config,
+        profiler_config: request.profiler_config,
+        environment: request.environment,
+        retry_strategy: request.retry_strategy,
+        model_package_config: request.model_package_config,
+        tags: tag_list(&job.tags),
+        // Every member left here is one nothing in this emulator holds a value for, for
+        // the reasons `DescribeTrainingJob` gives: no run started, so there is no start
+        // instant, no metric, no secondary-status transition and no debugger evaluation.
+        ..Default::default()
+    }
+}
+
+/// The experiment as `SearchRecord$Experiment` carries it.
+fn experiment_entity(experiment: &crate::state::Experiment) -> Experiment {
+    Experiment {
+        experiment_name: Some(experiment.name.clone()),
+        experiment_arn: Some(experiment.arn.clone()),
+        display_name: Some(experiment.display_name.clone()),
+        description: experiment.description.clone(),
+        creation_time: Some(crate::state::timestamp(experiment.creation_time)),
+        created_by: Some(experiment.created_by.clone()),
+        last_modified_time: Some(crate::state::timestamp(experiment.last_modified_time)),
+        last_modified_by: Some(experiment.created_by.clone()),
+        tags: tag_list(&experiment.tags),
+        // `Source` names the SageMaker resource that created the experiment on the
+        // caller's behalf; one created through `CreateExperiment` has none.
+        source: None,
+    }
+}
+
+/// The trial as `SearchRecord$Trial` carries it, with the components
+/// `AssociateTrialComponent` attached to it.
+fn trial_entity(
+    trial: &crate::state::Trial,
+    store: &crate::state::ComAmazonawsSagemakerSagemakerState,
+) -> Trial {
+    let trial_key = crate::state::entity_key(&trial.name);
+    let summaries: Vec<TrialComponentSimpleSummary> = store
+        .trial_component_trials
+        .iter()
+        .filter(|(held_trial, _)| *held_trial == trial_key)
+        .filter_map(|(_, component_key)| store.trial_components.get(component_key))
+        .map(|component| TrialComponentSimpleSummary {
+            trial_component_name: Some(component.name.clone()),
+            trial_component_arn: Some(component.arn.clone()),
+            creation_time: Some(crate::state::timestamp(component.creation_time)),
+            created_by: Some(component.created_by.clone()),
+            // The source is the JOB that produced the component; one created through
+            // `CreateTrialComponent` has none.
+            trial_component_source: None,
+        })
+        .collect();
+    Trial {
+        trial_name: Some(trial.name.clone()),
+        trial_arn: Some(trial.arn.clone()),
+        // "If DisplayName isn't specified, TrialName is displayed."
+        display_name: Some(
+            trial
+                .display_name
+                .clone()
+                .unwrap_or_else(|| trial.name.clone()),
+        ),
+        experiment_name: Some(trial.experiment_name.clone()),
+        creation_time: Some(crate::state::timestamp(trial.creation_time)),
+        created_by: Some(trial.created_by.clone()),
+        last_modified_time: Some(crate::state::timestamp(trial.last_modified_time)),
+        last_modified_by: Some(trial.created_by.clone()),
+        metadata_properties: trial.metadata_properties.clone(),
+        tags: tag_list(&trial.tags),
+        trial_component_summaries: (!summaries.is_empty()).then_some(summaries),
+        // The source is the job that created the trial; one created through `CreateTrial`
+        // has none.
+        source: None,
+    }
+}
+
+/// The trial component as `SearchRecord$TrialComponent` carries it, exactly as
+/// `DescribeTrialComponent` reports the same record.
+fn trial_component_entity(component: &crate::state::TrialComponent) -> TrialComponent {
+    TrialComponent {
+        trial_component_name: Some(component.name.clone()),
+        trial_component_arn: Some(component.arn.clone()),
+        display_name: Some(component.display_name.clone()),
+        status: component.status.clone(),
+        start_time: component.start_time,
+        end_time: component.end_time,
+        creation_time: Some(crate::state::timestamp(component.creation_time)),
+        created_by: Some(component.created_by.clone()),
+        last_modified_time: Some(crate::state::timestamp(component.last_modified_time)),
+        last_modified_by: Some(component.created_by.clone()),
+        parameters: component.parameters.clone(),
+        input_artifacts: component.input_artifacts.clone(),
+        output_artifacts: component.output_artifacts.clone(),
+        metadata_properties: component.metadata_properties.clone(),
+        lineage_group_arn: Some(crate::state::lineage_group_arn(&component.region)),
+        tags: tag_list(&component.tags),
+        // A source, a metric and a parent trial run of a job; a component created through
+        // `CreateTrialComponent` has no source job and no metric, and its trial
+        // memberships are reported by `ListTrialComponents`.
+        ..Default::default()
+    }
+}
+
+/// The endpoint as `SearchRecord$Endpoint` carries it, summarised the way
+/// `DescribeEndpoint` reports the same record.
+fn endpoint_entity(endpoint: &crate::state::Endpoint) -> Endpoint {
+    let data_capture_config = endpoint.data_capture_config.as_ref().map(|capture| {
+        let enabled = capture.enable_capture.unwrap_or(true);
+        DataCaptureConfigSummary {
+            enable_capture: enabled,
+            capture_status: if enabled { "Started" } else { "Stopped" }.to_string(),
+            current_sampling_percentage: capture.initial_sampling_percentage,
+            destination_s3_uri: capture.destination_s3_uri.clone(),
+            kms_key_id: capture.kms_key_id.clone().unwrap_or_default(),
+        }
+    });
+    Endpoint {
+        endpoint_name: endpoint.name.clone(),
+        endpoint_arn: endpoint.arn.clone(),
+        endpoint_config_name: endpoint.config_name.clone(),
+        production_variants: (!endpoint.production_variants.is_empty())
+            .then(|| endpoint.production_variants.clone()),
+        data_capture_config,
+        endpoint_status: endpoint.status.clone(),
+        failure_reason: endpoint.failure_reason.clone(),
+        creation_time: crate::state::timestamp(endpoint.creation_time),
+        last_modified_time: crate::state::timestamp(endpoint.last_modified_time),
+        // A monitoring schedule is created against an endpoint by
+        // `CreateMonitoringSchedule`, which stores none here yet.
+        monitoring_schedules: None,
+        tags: tag_list(&endpoint.tags),
+        shadow_production_variants: (!endpoint.shadow_production_variants.is_empty())
+            .then(|| endpoint.shadow_production_variants.clone()),
+    }
+}
+
+/// The model as `SearchRecord$Model` carries it: the stored model, plus the endpoints
+/// that host it, read off the endpoints themselves.
+fn model_entity(
+    model: &crate::state::Model,
+    store: &crate::state::ComAmazonawsSagemakerSagemakerState,
+) -> ModelDashboardModel {
+    let endpoints: Vec<ModelDashboardEndpoint> = store
+        .endpoints
+        .values()
+        .filter(|endpoint| hosts_model(endpoint, &model.name, store))
+        .map(|endpoint| ModelDashboardEndpoint {
+            endpoint_name: endpoint.name.clone(),
+            endpoint_arn: endpoint.arn.clone(),
+            creation_time: crate::state::timestamp(endpoint.creation_time),
+            last_modified_time: crate::state::timestamp(endpoint.last_modified_time),
+            endpoint_status: endpoint.status.clone(),
+        })
+        .collect();
+    ModelDashboardModel {
+        model: Some(Model {
+            model_name: Some(model.name.clone()),
+            model_arn: Some(model.arn.clone()),
+            primary_container: model.primary_container.clone(),
+            containers: model.containers.clone(),
+            inference_execution_config: model.inference_execution_config.clone(),
+            execution_role_arn: model.execution_role_arn.clone(),
+            vpc_config: model.vpc_config.clone(),
+            enable_network_isolation: model.enable_network_isolation,
+            creation_time: Some(crate::state::timestamp(model.creation_time)),
+            tags: tag_list(&model.tags),
+            // An inference recommendation for the model, which only a recommendation job
+            // produces; none runs against a model here.
+            deployment_recommendation: None,
+        }),
+        endpoints: (!endpoints.is_empty()).then_some(endpoints),
+        // A batch transform job, a monitoring schedule and a model card are resources of
+        // their own; none of them is attached to a model by name in this store.
+        ..Default::default()
+    }
+}
+
+/// Whether `endpoint` hosts `model_name`, i.e. a variant of the configuration it was
+/// created from names that model.
+fn hosts_model(
+    endpoint: &crate::state::Endpoint,
+    model_name: &str,
+    store: &crate::state::ComAmazonawsSagemakerSagemakerState,
+) -> bool {
+    store
+        .endpoint_configs
+        .get(&endpoint.config_name)
+        .is_some_and(|config| {
+            config
+                .production_variants
+                .iter()
+                .chain(config.shadow_production_variants.iter().flatten())
+                .any(|variant| variant.model_name.as_deref() == Some(model_name))
+        })
+}
+
+/// The model package as `SearchRecord$ModelPackage` carries it.
+fn model_package_entity(package: &crate::state::ModelPackage) -> ModelPackage {
+    ModelPackage {
+        model_package_name: Some(package.name.clone()),
+        model_package_group_name: package.group_name.clone(),
+        model_package_version: package.version,
+        model_package_registration_type: package.registration_type.clone(),
+        model_package_arn: Some(package.arn.clone()),
+        model_package_description: package.description.clone(),
+        creation_time: Some(crate::state::timestamp(package.creation_time)),
+        inference_specification: package.inference_specification.clone(),
+        source_algorithm_specification: package.source_algorithm_specification.clone(),
+        validation_specification: package.validation_specification.clone(),
+        model_package_status: Some(package.status.clone()),
+        model_package_status_details: Some(package.status_details()),
+        certify_for_marketplace: package.certify_for_marketplace,
+        model_approval_status: package.model_approval_status.clone(),
+        created_by: Some(package.created_by.clone()),
+        metadata_properties: package.metadata_properties.clone(),
+        model_metrics: package.model_metrics.clone(),
+        last_modified_time: Some(crate::state::timestamp(package.last_modified_time)),
+        last_modified_by: package.last_modified_by.clone(),
+        approval_description: package.approval_description.clone(),
+        domain: package.domain.clone(),
+        task: package.task.clone(),
+        sample_payload_url: package.sample_payload_url.clone(),
+        additional_inference_specifications: package.additional_inference_specifications.clone(),
+        source_uri: package.source_uri.clone(),
+        security_config: package.security_config.clone(),
+        model_card: package.model_card.clone(),
+        model_life_cycle: package.model_life_cycle.clone(),
+        tags: tag_list(&package.tags),
+        customer_metadata_properties: package.customer_metadata_properties.clone(),
+        drift_check_baselines: package.drift_check_baselines.clone(),
+        skip_model_validation: package.skip_model_validation.clone(),
+    }
+}
+
+/// The model package group as `SearchRecord$ModelPackageGroup` carries it.
+fn model_package_group_entity(group: &crate::state::ModelPackageGroup) -> ModelPackageGroup {
+    ModelPackageGroup {
+        model_package_group_name: Some(group.name.clone()),
+        model_package_group_arn: Some(group.arn.clone()),
+        model_package_group_description: group.description.clone(),
+        creation_time: Some(crate::state::timestamp(group.creation_time)),
+        created_by: Some(group.created_by.clone()),
+        model_package_group_status: Some(group.status.clone()),
+        tags: tag_list(&group.tags),
+    }
+}
+
+/// The pipeline as `SearchRecord$Pipeline` carries it.
+fn pipeline_entity(pipeline: &crate::state::Pipeline) -> Pipeline {
+    Pipeline {
+        pipeline_arn: Some(pipeline.arn.clone()),
+        pipeline_name: Some(pipeline.name.clone()),
+        pipeline_display_name: pipeline.display_name.clone(),
+        pipeline_description: pipeline.description.clone(),
+        role_arn: Some(pipeline.role_arn.clone()),
+        pipeline_status: Some(pipeline.status.clone()),
+        creation_time: Some(crate::state::timestamp(pipeline.creation_time)),
+        last_modified_time: Some(crate::state::timestamp(pipeline.last_modified_time)),
+        last_run_time: pipeline.last_run_time.map(crate::state::timestamp),
+        parallelism_configuration: pipeline.parallelism_configuration.clone(),
+        tags: tag_list(&pipeline.tags),
+        // The identities behind the create and the last update, which this store keeps on
+        // the execution rather than on the pipeline.
+        ..Default::default()
+    }
+}
+
+/// The pipeline execution as `SearchRecord$PipelineExecution` carries it.
+fn pipeline_execution_entity(execution: &crate::state::PipelineExecution) -> PipelineExecution {
+    PipelineExecution {
+        pipeline_arn: Some(execution.pipeline_arn.clone()),
+        pipeline_execution_arn: Some(execution.arn.clone()),
+        pipeline_execution_display_name: execution.display_name.clone(),
+        pipeline_execution_status: Some(execution.status.clone()),
+        pipeline_execution_description: execution.description.clone(),
+        failure_reason: execution.failure_reason.clone(),
+        creation_time: Some(crate::state::timestamp(execution.creation_time)),
+        last_modified_time: Some(crate::state::timestamp(execution.last_modified_time)),
+        created_by: Some(execution.created_by.clone()),
+        last_modified_by: Some(execution.created_by.clone()),
+        parallelism_configuration: execution.parallelism_configuration.clone(),
+        selective_execution_config: execution.selective_execution_config.clone(),
+        pipeline_parameters: (!execution.parameters.is_empty())
+            .then(|| execution.parameters.clone()),
+        pipeline_version_id: Some(execution.pipeline_version_id),
+        // The experiment an execution creates on the caller's behalf, which nothing here
+        // creates, and the display name of a named pipeline version.
+        ..Default::default()
+    }
+}
+
+/// The feature group as `SearchRecord$FeatureGroup` carries it, exactly as
+/// `DescribeFeatureGroup` reports the same record.
+fn feature_group_entity(group: &crate::state::FeatureGroup) -> FeatureGroup {
+    FeatureGroup {
+        feature_group_arn: Some(group.arn.clone()),
+        feature_group_name: Some(group.name.clone()),
+        record_identifier_feature_name: Some(group.record_identifier_feature_name.clone()),
+        event_time_feature_name: Some(group.event_time_feature_name.clone()),
+        feature_definitions: Some(group.feature_definitions.clone()),
+        creation_time: Some(crate::state::timestamp(group.creation_time)),
+        last_modified_time: Some(crate::state::timestamp(group.last_modified_time)),
+        online_store_config: group.online_store_config.clone(),
+        offline_store_config: group.offline_store_config.clone(),
+        role_arn: group.role_arn.clone(),
+        feature_group_status: Some(group.status.clone()),
+        offline_store_status: group
+            .offline_store_config
+            .as_ref()
+            .map(|_| OfflineStoreStatus {
+                status: crate::state::OFFLINE_STORE_STATUS_ACTIVE.to_string(),
+                blocked_reason: None,
+            }),
+        description: group.description.clone(),
+        tags: tag_list(&group.tags),
+        // An update status, which only an update produces, and a failure reason, which
+        // only a failed create or delete produces.
+        ..Default::default()
+    }
+}
+
+/// The tuning job as `SearchRecord$HyperParameterTuningJob` carries it, with the counters
+/// `DescribeHyperParameterTuningJob` reports for the same record.
+fn tuning_job_entity(
+    job: &crate::state::HyperParameterTuningJob,
+) -> HyperParameterTuningJobSearchEntity {
+    HyperParameterTuningJobSearchEntity {
+        hyper_parameter_tuning_job_name: Some(job.name.clone()),
+        hyper_parameter_tuning_job_arn: Some(job.arn.clone()),
+        hyper_parameter_tuning_job_config: Some(job.config.clone()),
+        training_job_definition: job.training_job_definition.clone(),
+        training_job_definitions: job.training_job_definitions.clone(),
+        hyper_parameter_tuning_job_status: Some(job.status.clone()),
+        creation_time: Some(crate::state::timestamp(job.creation_time)),
+        hyper_parameter_tuning_end_time: job.end_time.map(crate::state::timestamp),
+        last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
+        // Every counter is zero and there is no best training job: no training job was
+        // launched, so none is in progress, completed, stopped or failed and no objective
+        // metric was evaluated — the same values the describe reports.
+        training_job_status_counters: Some(TrainingJobStatusCounters {
+            completed: Some(0),
+            in_progress: Some(0),
+            retryable_error: Some(0),
+            non_retryable_error: Some(0),
+            stopped: Some(0),
+        }),
+        objective_status_counters: Some(ObjectiveStatusCounters {
+            succeeded: Some(0),
+            pending: Some(0),
+            failed: Some(0),
+        }),
+        warm_start_config: job.warm_start_config.clone(),
+        failure_reason: job.failure_reason.clone(),
+        tags: tag_list(&job.tags),
+        // A best training job, completion details and consumed resources all report on a
+        // run; nothing ran.
+        ..Default::default()
+    }
+}
+
+/// The model card as `SearchRecord$ModelCard` carries it: the card and its latest
+/// version, which is the version a reader naming none describes.
+fn model_card_entity(card: &crate::state::ModelCard) -> ModelCard {
+    let latest = card.latest_version();
+    ModelCard {
+        model_card_arn: Some(card.arn.clone()),
+        model_card_name: Some(card.name.clone()),
+        model_card_version: latest.map(|version| version.version),
+        content: latest.map(|version| version.content.clone()),
+        model_card_status: latest.map(|version| version.status.clone()),
+        security_config: latest.and_then(|version| version.security_config.clone()),
+        creation_time: latest.map(|version| crate::state::timestamp(version.creation_time)),
+        created_by: latest.map(|version| version.created_by.clone()),
+        last_modified_time: latest.map(|version| crate::state::timestamp(version.last_modified_time)),
+        last_modified_by: latest.and_then(|version| version.last_modified_by.clone()),
+        tags: tag_list(&card.tags),
+        // The model and the model package group a card documents, which the card carries
+        // only inside its `Content` document here.
+        ..Default::default()
+    }
+}
+
+/// The model-customization job as `SearchRecord$Job` carries it.
+fn job_entity(job: &crate::state::Job) -> Job {
+    Job {
+        job_name: Some(job.name.clone()),
+        job_arn: Some(job.arn.clone()),
+        role_arn: Some(job.role_arn.clone()),
+        job_category: Some(job.category.clone()),
+        job_config_schema_version: Some(job.config_schema_version.clone()),
+        job_config_document: Some(job.config_document.clone()),
+        creation_time: Some(crate::state::timestamp(job.creation_time)),
+        last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
+        job_status: Some(job.status.clone()),
+        secondary_status: Some(job.secondary_status.clone()),
+        tags: tag_list(&job.tags),
+        // An end time, a status history and a failure reason all belong to a run that
+        // ended; a job accepted here is still `InProgress`.
+        ..Default::default()
+    }
+}
+
+/// The hub content version as `SearchRecord$HubContent` carries it. `HubArn` is a
+/// required member, so a content whose hub is no longer stored cannot be reported.
+fn hub_content_entity(
+    key: &crate::state::HubContentKey,
+    content: &crate::state::HubContent,
+    store: &crate::state::ComAmazonawsSagemakerSagemakerState,
+) -> Option<HubContent> {
+    let hub = store.hubs.get(&key.hub_name)?;
+    Some(HubContent {
+        hub_content_name: content.name.clone(),
+        hub_content_arn: content.arn.clone(),
+        hub_content_version: content.version.clone(),
+        hub_content_type: content.content_type.clone(),
+        document_schema_version: content.document_schema_version.clone(),
+        hub_name: hub.name.clone(),
+        hub_arn: hub.arn.clone(),
+        hub_content_display_name: content.display_name.clone(),
+        hub_content_description: content.description.clone(),
+        support_status: content.support_status.clone(),
+        hub_content_search_keywords: content.search_keywords.clone(),
+        sage_maker_public_hub_content_arn: content.sage_maker_public_hub_content_arn.clone(),
+        hub_content_status: content.status.clone(),
+        creation_time: crate::state::timestamp(content.creation_time),
+        last_modified_time: content.original_creation_time.map(|_| {
+            // A revised content's last modification is the creation of THIS version.
+            crate::state::timestamp(content.creation_time)
+        }),
+        // The document, the markdown, the dependencies and the minimum referenced version
+        // are stored by the import operations, each its own open issue; a failure reason
+        // belongs to an import that failed.
+        hub_content_markdown: None,
+        hub_content_document: None,
+        reference_min_version: None,
+        hub_content_dependencies: None,
+        failure_reason: None,
+        tags: None,
+    })
+}
+
+/// A record's tags, or `None` when it carries none: `Tags` is a list, so a resource with
+/// no tag omits the member rather than reporting an empty one.
+fn tag_list(tags: &[Tag]) -> Option<Vec<Tag>> {
+    (!tags.is_empty()).then(|| tags.to_vec())
+}
+
+/// Every resource of `resource` this emulator holds, as `Search` judges and reports it.
+///
+/// The record each is carried in is the `SearchRecord` member the model binds that
+/// resource type to, which is also where its property names come from
+/// (`crate::ops::get_search_suggestions::search_entity`).
+///
+/// A `ResourceType` member with no resource here answers an empty result set rather than
+/// a refusal, because the type is one the model admits: `Image` and `ImageVersion` are
+/// members `SearchRecord` declares NO member for, so no image can be carried in a search
+/// result however many the store holds, and `FeatureMetadata`, `Project` and
+/// `PipelineVersion` have a record member but no writer in this emulator yet, so the
+/// account holds none.
+fn candidates(
+    resource: &str,
+    store: &crate::state::ComAmazonawsSagemakerSagemakerState,
+) -> Result<Vec<Candidate>, SearchError> {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    match resource {
+        "TrainingJob" => {
+            for job in store.training_jobs.values() {
+                let entity = training_job_entity(job);
+                candidates.push(Candidate {
+                    key: job.arn.clone(),
+                    document: rendered(TRAINING_JOB_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        training_job: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "Experiment" => {
+            for experiment in store.experiments.values() {
+                let entity = experiment_entity(experiment);
+                candidates.push(Candidate {
+                    key: experiment.arn.clone(),
+                    document: rendered(EXPERIMENT_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        experiment: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "ExperimentTrial" => {
+            for trial in store.trials.values() {
+                let entity = trial_entity(trial, store);
+                candidates.push(Candidate {
+                    key: trial.arn.clone(),
+                    document: rendered(TRIAL_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        trial: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "ExperimentTrialComponent" => {
+            for component in store.trial_components.values() {
+                let entity = trial_component_entity(component);
+                candidates.push(Candidate {
+                    key: component.arn.clone(),
+                    document: rendered(TRIAL_COMPONENT_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        trial_component: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "Endpoint" => {
+            for endpoint in store.endpoints.values() {
+                let entity = endpoint_entity(endpoint);
+                candidates.push(Candidate {
+                    key: endpoint.arn.clone(),
+                    document: rendered(ENDPOINT_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        endpoint: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "Model" => {
+            for model in store.models.values() {
+                let entity = model_entity(model, store);
+                candidates.push(Candidate {
+                    key: model.arn.clone(),
+                    document: rendered(MODEL_DASHBOARD_MODEL_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        model: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "ModelPackage" => {
+            for package in store.model_packages.values() {
+                let entity = model_package_entity(package);
+                candidates.push(Candidate {
+                    key: package.arn.clone(),
+                    document: rendered(MODEL_PACKAGE_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        model_package: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "ModelPackageGroup" => {
+            for group in store.model_package_groups.values() {
+                let entity = model_package_group_entity(group);
+                candidates.push(Candidate {
+                    key: group.arn.clone(),
+                    document: rendered(MODEL_PACKAGE_GROUP_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        model_package_group: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "Pipeline" => {
+            for pipeline in store.pipelines.values() {
+                let entity = pipeline_entity(pipeline);
+                candidates.push(Candidate {
+                    key: pipeline.arn.clone(),
+                    document: rendered(PIPELINE_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        pipeline: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "PipelineExecution" => {
+            for execution in store.pipeline_executions.values() {
+                let entity = pipeline_execution_entity(execution);
+                candidates.push(Candidate {
+                    key: execution.arn.clone(),
+                    document: rendered(PIPELINE_EXECUTION_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        pipeline_execution: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "FeatureGroup" => {
+            for group in store.feature_groups.values() {
+                let entity = feature_group_entity(group);
+                candidates.push(Candidate {
+                    key: group.arn.clone(),
+                    document: rendered(FEATURE_GROUP_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        feature_group: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "HyperParameterTuningJob" => {
+            for job in store.tuning_jobs.values() {
+                let entity = tuning_job_entity(job);
+                candidates.push(Candidate {
+                    key: job.arn.clone(),
+                    document: rendered(HYPER_PARAMETER_TUNING_JOB_SEARCH_ENTITY_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        hyper_parameter_tuning_job: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "ModelCard" => {
+            for card in store.model_cards.values() {
+                let entity = model_card_entity(card);
+                candidates.push(Candidate {
+                    key: card.arn.clone(),
+                    document: rendered(MODEL_CARD_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        model_card: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "Job" => {
+            for job in store.jobs.values() {
+                let entity = job_entity(job);
+                candidates.push(Candidate {
+                    key: job.arn.clone(),
+                    document: rendered(JOB_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        job: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        "HubContent" => {
+            for (key, content) in &store.hub_contents {
+                let Some(entity) = hub_content_entity(key, content, store) else {
+                    continue;
+                };
+                candidates.push(Candidate {
+                    key: content.arn.clone(),
+                    document: rendered(HUB_CONTENT_SCHEMA, &entity)?,
+                    record: SearchRecord {
+                        hub_content: Some(entity),
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        // The resource types this emulator holds nothing of: see this function's own
+        // doc for which, and why each answers an empty result set.
+        _ => {}
+    }
+    Ok(candidates)
+}
+
+/// Materialise, for the kind of resource this search reports, every status transition the
+/// clock already owed.
+///
+/// The one write a reporting call makes, and the same one `ListEndpoints` and
+/// `ListModelPackages` make: each transition was due at its stored instant whether or not
+/// anybody searched, so a filter or a sort on a status reads the status a `Describe*` at
+/// this same instant reports. Answers the ARNs that moved, so the caller records them.
+fn settle_due(
+    resource: &str,
+    store: &mut crate::state::ComAmazonawsSagemakerSagemakerState,
+    now: ::std::time::SystemTime,
+) -> Vec<String> {
+    let mut settled = Vec::new();
+    match resource {
+        "TrainingJob" => {
+            for job in store.training_jobs.values_mut() {
+                if job.settle_status(now) {
+                    settled.push(job.arn.clone());
+                }
+            }
+        }
+        "Endpoint" | "Model" => {
+            // A model's record carries the endpoints that host it, so both searches read
+            // the endpoint statuses.
+            for endpoint in store.endpoints.values_mut() {
+                if endpoint.settle_status(now) {
+                    settled.push(endpoint.arn.clone());
+                }
+            }
+        }
+        "ModelPackage" => {
+            for package in store.model_packages.values_mut() {
+                if package.settle_status(now) {
+                    settled.push(package.arn.clone());
+                }
+            }
+        }
+        "PipelineExecution" => {
+            for execution in store.pipeline_executions.values_mut() {
+                if execution.settle_status(now) {
+                    settled.push(execution.arn.clone());
+                }
+            }
+        }
+        "FeatureGroup" => {
+            for group in store.feature_groups.values_mut() {
+                if group.settle_status(now) {
+                    settled.push(group.arn.clone());
+                }
+            }
+        }
+        "HyperParameterTuningJob" => {
+            for job in store.tuning_jobs.values_mut() {
+                if job.settle_status(now) {
+                    settled.push(job.arn.clone());
+                }
+            }
+        }
+        // Every other resource kind this search reports is born in a terminal status, so
+        // the clock owes it nothing.
+        _ => {}
+    }
+    settled
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for Search<Eng>
 {
@@ -163,18 +1504,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Search` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Search"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `Resource`, `SortOrder` and `CrossAccountFilterOption` each select on one
+        // member of their modelled enum, so a value that is not a member is REFUSED
+        // rather than silently searched, ordered or filtered another way. The messages
+        // list the members the model generates, so they cannot drift from the enums.
+        if !RESOURCE_TYPE_VALUES.contains(&input.resource.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Resource must be one of {}; got \"{}\".",
+                RESOURCE_TYPE_VALUES.join(", "),
+                input.resource
+            )));
+        }
+        let descending = match input
+            .sort_order
+            .as_deref()
+            .unwrap_or(DOCUMENTED_DEFAULT_SORT_ORDER)
+        {
+            crate::state::ORDER_DESCENDING => true,
+            ORDER_ASCENDING => false,
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "SortOrder must be one of {}; got \"{other}\".",
+                    SEARCH_SORT_ORDER_VALUES.join(", ")
+                )))
+            }
+        };
+        // "When the value is CrossAccount the search results will only include resources
+        // made discoverable to you from other accounts." Nothing makes a resource of
+        // another account discoverable to this one — every resource this emulator holds
+        // belongs to the one account — so that option selects none of them, where
+        // `SameAccount` and the null default select them all.
+        let cross_account = match input.cross_account_filter_option.as_deref() {
+            None | Some(SAME_ACCOUNT) => false,
+            Some(CROSS_ACCOUNT) => true,
+            Some(other) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "CrossAccountFilterOption must be one of {}; got \"{other}\".",
+                    CROSS_ACCOUNT_FILTER_OPTION_VALUES.join(", ")
+                )))
+            }
+        };
+
+        let visibility_conditions = input.visibility_conditions.clone().unwrap_or_default();
+        for condition in &visibility_conditions {
+            if let Some(key) = condition.key.as_deref() {
+                if !key.starts_with(VISIBILITY_CONDITION_PREFIX) || key == VISIBILITY_CONDITION_PREFIX
+                {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "VisibilityConditions Key must be in the format \
+                         {VISIBILITY_CONDITION_PREFIX}<key>; got \"{key}\"."
+                    )));
+                }
+            }
+        }
+
+        // The shape the record is carried in, whose members are this resource's property
+        // names — the same mapping `GetSearchSuggestions` answers from.
+        let entity = crate::ops::get_search_suggestions::search_entity(&input.resource);
+
+        // The expression and the sort property are validated against that shape, before
+        // any resource is judged by them.
+        if let Some(expression) = input.search_expression.as_ref() {
+            let mut budget = MAX_EXPRESSION_ELEMENTS;
+            validate_expression(expression, entity, &mut budget)?;
+        }
+        let sort_by = match input.sort_by.as_deref() {
+            Some(sort_by) if property_path(entity, sort_by).is_none() => {
+                return Err(unknown_property(sort_by))
+            }
+            Some(sort_by) => sort_by,
+            None => DOCUMENTED_DEFAULT_SORT_BY,
+        };
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let settled = settle_due(&input.resource, &mut store, now);
+        let candidates = candidates(&input.resource, &store)?;
+
+        let mut matching: Vec<(Option<Scalar>, &Candidate)> = candidates
+            .iter()
+            .filter(|_| !cross_account)
+            .filter(|candidate| {
+                input
+                    .search_expression
+                    .as_ref()
+                    .is_none_or(|expression| {
+                        expression_holds(expression, entity, &candidate.document)
+                    })
+            })
+            .filter(|candidate| {
+                visibility_holds(&visibility_conditions, entity, &candidate.document)
+            })
+            .map(|candidate| (sort_value(&candidate.document, entity, sort_by), candidate))
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays the resource's own
+        // identity ascending in both directions, so two resources sharing a sort value
+        // keep one order whichever way the result is sorted — and a `NextToken` resolved
+        // against a freshly computed result set lands on the same boundary.
+        matching.sort_by(|(left_key, left), (right_key, right)| {
+            let by_key = compare_sort_values(left_key.as_ref(), right_key.as_ref());
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.key.cmp(&right.key))
+        });
+        let matching: Vec<&Candidate> = matching.into_iter().map(|(_, candidate)| candidate).collect();
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|key| matching.iter().position(|candidate| candidate.key == key))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page, and so does the service's own ceiling: an absent or
+        // larger `MaxResults` still cannot make one call serialise the whole store. The
+        // token below is emitted whenever anything is left, so a paginating client walks
+        // the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(crate::state::encode_page_token(&last.key)),
+            _ => None,
+        };
+
+        let output = SearchOutput {
+            results: Some(page.iter().map(|candidate| candidate.record.clone()).collect()),
+            next_token,
+            // Every matching resource was counted, not sampled, so the count is exact.
+            total_hits: Some(TotalHits {
+                value: Some(matching.len() as i64),
+                relation: Some(TOTAL_HITS_EXACT.to_string()),
+            }),
+        };
+        drop(store);
+
+        for arn in &settled {
+            // A transition is a state change, so it leaves the same record a create does
+            // rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+        Ok(output)
     }
 }
