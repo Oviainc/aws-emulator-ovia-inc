@@ -8,7 +8,10 @@
 //!
 //! A Connect peer is created "for a specified core network connect attachment between a
 //! core network and an appliance" (`smithy_query query="doc" shape="CreateConnectPeer"`),
-//! so `ConnectAttachmentId` has to name a stored attachment of the CONNECT kind, and the
+//! so `ConnectAttachmentId` has to name a stored attachment of the CONNECT kind that
+//! EXISTS — one still held for the acceptance its core network policy asked for, and one
+//! whose attachment request was turned down, have no tunnel for a peer to run in and are
+//! refused — and the
 //! peer takes that attachment's core network, edge location and tunnel protocol rather
 //! than any of its own. The two ends of the BGP session it peers over — the appliance's
 //! address and the core network's — are addresses of ONE IP address family, so a request
@@ -210,6 +213,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // A peer runs inside the TUNNEL of that attachment, so the attachment has to
+            // exist: one still waiting for the acceptance its core network policy asked for
+            // has no tunnel yet, and one whose request was turned down never will have. The
+            // rule is [`crate::state::check_attachment_is_created`], the one every create
+            // that builds on a stored attachment goes through.
+            crate::state::check_attachment_is_created(
+                crate::state::FIELD_CONNECT_ATTACHMENT_ID,
+                attachment,
+                "a Connect peer",
+                now,
+            )
+            .map_err(CreateConnectPeerErrorModeled::ValidationException)?;
             // The protocol is the attachment's, not the request's: `CreateConnectPeer`
             // carries no protocol member at all, and the peering runs inside that
             // attachment's tunnel.

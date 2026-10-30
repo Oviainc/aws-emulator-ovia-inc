@@ -2876,6 +2876,18 @@ impl AttachmentRecord {
         self.available_at.is_none() && self.rejected_at.is_none()
     }
 
+    /// Whether anything was ever CREATED for this attachment — whether it is the attachment
+    /// it describes rather than a request for one.
+    ///
+    /// An attachment still waiting for the acceptance its core network policy asked for has
+    /// nothing created yet ([`Self::available_at`]), and one whose request was turned down
+    /// never will have ([`Self::rejected_at`]); every other stored attachment is either
+    /// coming into existence on the transition the clock owes it or already there, so it is
+    /// something another resource can be built on ([`check_attachment_is_created`]).
+    pub fn is_created(&self) -> bool {
+        self.available_at.is_some() && self.rejected_at.is_none()
+    }
+
     /// Grant the acceptance this attachment is waiting for, at `now`: the attachment starts
     /// being created, so the `CREATING` -> `AVAILABLE` transition the clock owes becomes due
     /// a [`SETTLE_DELAY`] later. Answers `false`, writing nothing, when the attachment was
@@ -3189,6 +3201,42 @@ impl AttachmentRecord {
             associated_routing_policies: None,
         })
     }
+}
+
+/// Check the attachment a request wants to build a resource ON — the transport a Connect
+/// attachment is carried over, the Connect attachment a Connect peer runs inside — against
+/// what it is: a resource is built on an attachment that EXISTS, and an attachment whose
+/// request nothing has granted yet, or that was turned down, is not one
+/// ([`AttachmentRecord::is_created`]).
+///
+/// The refusal is the modelled `ValidationException` (HTTP 400) naming the member that
+/// carried the reference, exactly as the other refusals of that reference do: the request
+/// names an attachment that cannot carry anything, which is a fault of that member's value
+/// against stored state ([`VALIDATION_REASON_OTHER`]), and the state the attachment is in
+/// is reported so the caller knows whether an acceptance is owed on it or the decision was
+/// already taken against it.
+///
+/// ONE function owns the rule, so no two creates can disagree about which attachments can
+/// be built on. `member` is the request member carrying the reference and `built` names the
+/// resource the request asked for, as the message reads it.
+pub fn check_attachment_is_created(
+    member: &str,
+    attachment: &AttachmentRecord,
+    built: &str,
+    now: SystemTime,
+) -> Result<(), ValidationException> {
+    if attachment.is_created() {
+        return Ok(());
+    }
+    Err(field_rejection(
+        member,
+        VALIDATION_REASON_OTHER,
+        format!(
+            "attachment {} is {}; {built} is built on an attachment that exists",
+            attachment.id,
+            attachment.state_at(now)
+        ),
+    ))
 }
 
 /// A stored core network Connect peer: the BGP peering one CONNECT attachment carries to

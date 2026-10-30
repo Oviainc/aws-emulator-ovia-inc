@@ -24,7 +24,7 @@
 
 use serde_json::{json, Value};
 
-use crate::attachment_acceptance::core_network_with;
+use crate::attachment_acceptance::{accept, core_network_with};
 use crate::attachment_lifecycle::{
     attachment_id, core_network_at, create_connect_attachment, create_vpc_attachment, subnet_arn,
     vpc_arn,
@@ -327,7 +327,19 @@ pub(crate) async fn create_attachment_of_kind(
                 status, 200,
                 "case {name:?}: the transport create expected 200, got {status} with {transport}"
             );
+            let transport_state = transport["VpcAttachment"]["Attachment"]["State"].clone();
             let transport = attachment_id(name, &transport["VpcAttachment"]);
+            // A Connect attachment is built on an attachment that EXISTS, and a transport
+            // the core network policy held for an acceptance is not one until that
+            // acceptance is granted, so a policy that claimed the transport too is answered
+            // here: the transport is accepted first, which is what starts it.
+            if transport_state == json!(PENDING_ACCEPTANCE) {
+                let (status, accepted) = accept(emulator, &transport).await;
+                assert_eq!(
+                    status, 200,
+                    "case {name:?}: AcceptAttachment on the transport expected 200, got {status} with {accepted}"
+                );
+            }
             let body = with_tags(
                 json!({
                     "CoreNetworkId": core_network,

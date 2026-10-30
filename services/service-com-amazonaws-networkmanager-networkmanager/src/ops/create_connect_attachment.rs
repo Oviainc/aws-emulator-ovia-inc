@@ -8,8 +8,10 @@
 //!
 //! "A core network Connect attachment uses an existing VPC attachment as the underlying
 //! transport mechanism" (`smithy_query query="doc" shape="CreateConnectAttachment"`), so
-//! `TransportAttachmentId` has to name a stored VPC attachment of the same core network,
-//! and the new attachment sits at that transport's edge location. A created attachment
+//! `TransportAttachmentId` has to name a stored VPC attachment of the same core network that
+//! EXISTS — one the core network policy is still holding for an acceptance, and one whose
+//! attachment request was turned down, are refused — and the new attachment sits at that
+//! transport's edge location. A created attachment
 //! waits in `CREATING` until the transition the clock owes falls due and is `AVAILABLE`
 //! after it.
 //!
@@ -228,6 +230,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // "An EXISTING VPC attachment" is also what the transport has to BE: an attachment
+        // still waiting for the acceptance its core network policy asked for has nothing
+        // created yet, and one whose request was turned down never will have, so neither is
+        // an attachment this Connect attachment's tunnel could run over. The rule is
+        // [`crate::state::check_attachment_is_created`], the one every create that builds on
+        // a stored attachment goes through.
+        crate::state::check_attachment_is_created(
+            crate::state::FIELD_TRANSPORT_ATTACHMENT_ID,
+            transport,
+            "a Connect attachment",
+            now,
+        )
+        .map_err(CreateConnectAttachmentErrorModeled::ValidationException)?;
 
         // A Connect attachment is carried BY its transport, so it sits at the same edge of
         // the core network: a request naming any other edge location describes a tunnel

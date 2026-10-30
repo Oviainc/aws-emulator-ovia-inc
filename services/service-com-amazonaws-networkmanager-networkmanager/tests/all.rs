@@ -29,6 +29,8 @@ mod attachment_routing_policy_associations;
 mod attachment_routing_policy_label;
 #[path = "all/attachment_routing_policy_label_removal.rs"]
 mod attachment_routing_policy_label_removal;
+#[path = "all/build_on_created_attachment.rs"]
+mod build_on_created_attachment;
 #[path = "all/client_token_idempotency.rs"]
 mod client_token_idempotency;
 #[path = "all/connect_peer_association_lifecycle.rs"]

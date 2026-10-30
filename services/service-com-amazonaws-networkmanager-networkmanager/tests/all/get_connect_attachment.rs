@@ -388,6 +388,18 @@ async fn get_connect_attachment_reports_the_stored_record_of_every_kind_of_conne
             "case {name:?}: CreateVpcAttachment expected 200, got {status} with {created_transport}"
         );
         let transport = attachment_id(name, &created_transport["VpcAttachment"]);
+        // A Connect attachment is built on an attachment that EXISTS, and a row whose rule
+        // claims the TRANSPORT too (the `region` condition below) leaves it waiting for an
+        // acceptance, which is not one: that acceptance is granted here, before anything is
+        // built on it, so the row's Connect attachment is the only record whose own claim
+        // this suite is about.
+        if created_transport["VpcAttachment"]["Attachment"]["State"] == json!(PENDING_ACCEPTANCE) {
+            let (status, accepted) = accept(&emulator, &transport).await;
+            assert_eq!(
+                status, 200,
+                "case {name:?}: AcceptAttachment on the transport expected 200, got {status} with {accepted}"
+            );
+        }
 
         let request = json!({
             "CoreNetworkId": core_network,
