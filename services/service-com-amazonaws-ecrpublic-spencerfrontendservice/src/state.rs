@@ -11,7 +11,8 @@
 //! * the ARN / URI forms every repository carries ([`StoredRepository`] is built once,
 //!   by `CreateRepository`, and read back verbatim by every reporting operation);
 //! * the repository policy document ([`StoredRepository::policy_text`]) that
-//!   `SetRepositoryPolicy` writes and `GetRepositoryPolicy` / `DeleteRepositoryPolicy`
+//!   `SetRepositoryPolicy` writes in the one rendering this service reports a policy in
+//!   ([`canonical_policy_document`]) and `GetRepositoryPolicy` / `DeleteRepositoryPolicy`
 //!   read back;
 //! * the `sha256:` manifest digest ([`manifest_digest`]) that `PutImage` keys an image
 //!   by and `DescribeImages` / `BatchDeleteImage` resolve against, and the JSON-document
@@ -328,7 +329,7 @@ pub struct StoredImage {
     /// The manifest document exactly as it was pushed.
     pub manifest: String,
     /// What [`Self::manifest`] references, read ONCE when the image was stored (see
-    /// [`manifest_content`]): the layer sizes of an image manifest, or the digests a
+    /// [`manifest_content`]): the blob sizes an image manifest declares, or the digests a
     /// manifest list names. Sizing an image never re-parses a manifest document.
     pub references: ManifestContent,
     /// `imageSizeInBytes`: the size this image reports, derived from [`Self::references`]
@@ -379,12 +380,13 @@ pub struct StoredRepository {
     pub catalog_data: RepositoryCatalogData,
     /// Resource tags, keyed by tag key.
     pub tags: BTreeMap<String, String>,
-    /// The repository policy document, exactly as `SetRepositoryPolicy` supplied it, or
-    /// `None` while this repository carries no policy.
+    /// The repository policy document in the form this service REPORTS it
+    /// ([`canonical_policy_document`]), or `None` while this repository carries no policy.
     ///
-    /// `RepositoryPolicyText` is modelled as an opaque string, so the document is stored
-    /// and reported byte for byte: `GetRepositoryPolicy` documents that "the policy text
-    /// will be in JSON format", not that the service reformats it.
+    /// The document a caller submits is parsed and re-serialized before it is stored, so
+    /// `SetRepositoryPolicy`, `GetRepositoryPolicy` and `DeleteRepositoryPolicy` all report
+    /// the one canonical rendering of the policy rather than the bytes of whichever request
+    /// happened to write it.
     pub policy_text: Option<String>,
     /// Images keyed by `imageDigest`, so `DescribeImages` pages in digest order.
     pub images: BTreeMap<String, StoredImage>,
@@ -447,12 +449,23 @@ impl StoredRepository {
     }
 
     /// This image as the modelled `ImageDetail` shape.
+    ///
+    /// `imageTags` is "the list of tags associated with this image": an UNTAGGED manifest
+    /// has none, so the member is omitted rather than reported as an empty list — it is
+    /// neither `@required` nor `@default`, and an empty list would claim the service had
+    /// looked and found a tag set, which is a different statement from "this image carries
+    /// no tag". A manifest loses its last tag when another push moves that tag onto a
+    /// different manifest, so this is a state an ordinary push reaches.
     pub fn image_detail(&self, image: &StoredImage) -> ImageDetail {
         ImageDetail {
             registry_id: Some(self.registry_id.clone()),
             repository_name: Some(self.name.clone()),
             image_digest: Some(image.digest.clone()),
-            image_tags: Some(image.tags.iter().cloned().collect()),
+            image_tags: if image.tags.is_empty() {
+                None
+            } else {
+                Some(image.tags.iter().cloned().collect())
+            },
             image_size_in_bytes: image.size_in_bytes,
             image_pushed_at: Some(as_timestamp(image.pushed_at)),
             image_manifest_media_type: image.manifest_media_type.clone(),
@@ -509,12 +522,12 @@ impl StoredRepository {
     /// Recompute the `imageSizeInBytes` every image in this repository reports.
     ///
     /// `ImageDetail$imageSizeInBytes` is "the size, in bytes, of the image in the
-    /// repository", which the same doc's note pins to the layer content the client
-    /// pushed ("the Docker client compresses image layers before pushing them"): it is
-    /// the total size of the layer blobs the manifest references, never the size of the
-    /// manifest document or of the config blob. "If the image is a manifest list, this
-    /// is the max size of all manifests in the list", so a list reports the largest of
-    /// the images it references, each child's size being its own layer total.
+    /// repository": the size of the CONTENT the manifest references, which is the total of
+    /// the sizes its content descriptors declare for the blobs that make the image up — its
+    /// config blob and its layer blobs — never the size of the manifest document itself.
+    /// "If the image is a manifest list, this is the max size of all manifests in the
+    /// list", so a list reports the largest of the images it references, each child's size
+    /// being its own blob total.
     ///
     /// A list's size is a statement about other images in the repository, so it is
     /// recomputed here whenever the image set changes — a push or a delete — rather than
@@ -528,22 +541,32 @@ impl StoredRepository {
     ///
     /// A size is `None` for an image nothing stored states one for: the member is
     /// neither required nor defaulted, so an unknown size is absent rather than zero.
-    /// That covers a document that references no layer or manifest array at all, a layer
-    /// descriptor that states no usable size (none at all, or one no byte count can be),
+    /// That covers a document that references no blob or manifest array at all, a blob
+    /// whose size neither its descriptor nor this repository's record of it states,
     /// a total no `long` can represent — the addends are caller-supplied, so they are
     /// added with checked arithmetic and never wrapped — and a list none of whose
     /// children the repository holds. An image manifest with an EMPTY `layers` array is
-    /// a statement, not a gap: it references no layer content, so its total is `0`.
+    /// a statement, not a gap: it references no layer content, so its total is the size of
+    /// the config blob alone, and `0` for a document that declares neither.
+    ///
+    /// What a blob's size is read from: the size its descriptor declares, else the byte
+    /// count this repository recorded when the layer upload was completed
+    /// ([`StoredRepository::layers`]) — a descriptor that states no size still references
+    /// content the registry has counted.
     pub fn refresh_image_sizes(&mut self) {
-        // An image manifest's total rests on nothing but its own descriptors.
+        // An image manifest's total rests on its own descriptors and on the blobs this
+        // repository holds for them.
         let mut sizes: BTreeMap<String, Option<i64>> = self
             .images
             .iter()
             .map(|(digest, image)| {
                 let own = match &image.references {
-                    ManifestContent::Layers(layer_sizes) => layer_sizes
-                        .iter()
-                        .try_fold(0i64, |total, size| total.checked_add((*size)?)),
+                    ManifestContent::Blobs(blobs) => blobs.iter().try_fold(0i64, |total, blob| {
+                        let size = blob
+                            .size
+                            .or_else(|| self.layers.get(&blob.digest).copied())?;
+                        total.checked_add(size)
+                    }),
                     ManifestContent::List(_) | ManifestContent::Opaque => None,
                 };
                 (digest.clone(), own)
@@ -685,14 +708,24 @@ impl IdentifierProblem {
     pub fn failure_reason(self) -> &'static str {
         match self {
             Self::MissingDigestAndTag => {
-                "Invalid request parameters: at least one of imageTag or imageDigest must be \
-                 specified"
+                "Invalid request parameters: both tag and digest cannot be null"
             }
             Self::ImageNotFound => "Requested image not found",
             Self::ImageTagDoesNotMatchDigest => {
                 "Requested image tag does not match the specified image digest"
             }
         }
+    }
+
+    /// Whether this problem is one the REQUEST states, rather than one the repository's
+    /// contents decide.
+    ///
+    /// An identifier carrying neither member names no image whatever the registry holds, so
+    /// it is refused while the request's identifiers are being read; the other two are the
+    /// verdict of a lookup against a repository. A batch reports the first kind before the
+    /// second (see `BatchDeleteImage`), so this is what splits the two passes.
+    pub fn states_an_unusable_identifier(self) -> bool {
+        matches!(self, Self::MissingDigestAndTag)
     }
 }
 
@@ -1203,20 +1236,38 @@ pub fn manifest_layer_count_message(member: &str) -> String {
     )
 }
 
+/// One blob an image manifest references: the digest the descriptor names it by, and the
+/// size that descriptor declares for it, if any.
+///
+/// The digest is kept beside the size because what a manifest does not state about a blob
+/// the repository's own record of that blob does: a completed layer upload counted the
+/// bytes, so [`StoredRepository::refresh_image_sizes`] can read a size the document left
+/// out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestBlob {
+    /// The digest the descriptor names, under the spelling layer digests are stored and
+    /// compared by ([`canonical_layer_digest`]) so a read of the repository's layer record
+    /// costs one lookup and no allocation; empty for a descriptor that names no blob at
+    /// all.
+    pub digest: String,
+    /// The byte count the descriptor declares, or `None` when it declares none usable.
+    pub size: Option<i64>,
+}
+
 /// What content a stored manifest document references.
 ///
-/// A registry manifest is one of two things: an image manifest, which lists the layer
-/// blobs of one image, or a manifest list / OCI index, which lists other manifests by
-/// digest. Anything else states the size of nothing.
+/// A registry manifest is one of two things: an image manifest, which names the blobs of
+/// one image — its config blob and its layer blobs — or a manifest list / OCI index, which
+/// lists other manifests by digest. Anything else states the size of nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestContent {
-    /// An image manifest: what each of its layer descriptors states the size of its blob
-    /// to be, in manifest order — `None` for a descriptor that states no usable size.
-    Layers(Vec<Option<i64>>),
+    /// An image manifest: the DISTINCT blobs it references — its `config` descriptor, then
+    /// each entry of `layers`, in document order.
+    Blobs(Vec<ManifestBlob>),
     /// A manifest list or OCI index: the distinct digests of the manifests it
     /// references, in digest order.
     List(BTreeSet<String>),
-    /// A document that references neither layers nor manifests.
+    /// A document that references neither blobs nor manifests.
     Opaque,
 }
 
@@ -1226,19 +1277,27 @@ pub enum ManifestContent {
 /// this takes the `Value` rather than the text: one request parses one manifest once.
 ///
 /// Both forms carry OCI content descriptors — a `mediaType`, a `digest` and a `size` —
-/// under `layers` for an image manifest and under `manifests` for a list, so this reads
-/// those two arrays and nothing else. A document that carries neither array is
+/// under `config` and `layers` for an image manifest and under `manifests` for a list, so
+/// this reads those members and nothing else. A document that carries none of them is
 /// [`ManifestContent::Opaque`], and so is one that could not be parsed at all (the
 /// caller has no `Value` to pass for it).
+///
+/// An image manifest's descriptors are read in document order, the `config` one first:
+/// the config blob is content of the image exactly as a layer blob is
+/// ([`StoredRepository::refresh_image_sizes`] totals them). They are DEDUPLICATED by
+/// digest, under the spelling digests are compared by ([`canonical_layer_digest`]), because
+/// one blob a manifest names twice — as its configuration and as its only layer, which is
+/// what a minimal probe image does — is one blob in the repository and is counted once. A
+/// descriptor that names no digest references nothing to deduplicate, so each one is kept.
 ///
 /// A descriptor's `size` is the byte count of the blob it points at, so a value that is
 /// absent, not an integer, or below zero states no size at all — the document is
 /// caller-supplied, and nothing it says may be read as a byte count it did not give.
 ///
 /// A list's digests are collected as a SET, so naming one child a thousand times costs
-/// what naming it once costs, and a document naming more than
-/// [`MAX_MANIFEST_LIST_ENTRIES`] children is [`ManifestContent::Opaque`] rather than
-/// read in part.
+/// what naming it once costs; a document naming more than [`MAX_MANIFEST_LIST_ENTRIES`]
+/// children, or more layer descriptors than [`MAX_MANIFEST_LAYER_ENTRIES`], is
+/// [`ManifestContent::Opaque`] rather than read in part.
 pub fn manifest_content_of(document: &serde_json::Value) -> ManifestContent {
     if let Some(manifests) = document.get("manifests").and_then(|m| m.as_array()) {
         if manifests.len() > MAX_MANIFEST_LIST_ENTRIES {
@@ -1253,20 +1312,40 @@ pub fn manifest_content_of(document: &serde_json::Value) -> ManifestContent {
                 .collect(),
         );
     }
-    if let Some(layers) = document.get("layers").and_then(|l| l.as_array()) {
-        return ManifestContent::Layers(
-            layers
-                .iter()
-                .map(|descriptor| {
-                    descriptor
-                        .get("size")
-                        .and_then(serde_json::Value::as_i64)
-                        .filter(|size| *size >= 0)
-                })
-                .collect(),
-        );
+    let config = document.get("config");
+    let layers = document.get("layers").and_then(|l| l.as_array());
+    if config.is_none() && layers.is_none() {
+        return ManifestContent::Opaque;
     }
-    ManifestContent::Opaque
+    // The descriptor count is the caller's and `imageManifest` is modelled
+    // `@length(1..4194304)`, so the walk is bounded before any per-descriptor work — the
+    // same ceiling [`manifest_blob_digests`] refuses a push over, applied here too so
+    // nothing past it is read or stored even when a document reaches this reader by
+    // another path. A document naming more descriptors than this registry reads states no
+    // size it reports, rather than being read in part.
+    if layers.is_some_and(|layers| layers.len() > MAX_MANIFEST_LAYER_ENTRIES) {
+        return ManifestContent::Opaque;
+    }
+    let descriptor_blob = |descriptor: &serde_json::Value| ManifestBlob {
+        digest: descriptor
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .map(canonical_layer_digest)
+            .unwrap_or_default(),
+        size: descriptor
+            .get("size")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|size| *size >= 0),
+    };
+    let layer_descriptors: &[serde_json::Value] = layers.map(Vec::as_slice).unwrap_or_default();
+    let mut blobs: Vec<ManifestBlob> = config
+        .map(descriptor_blob)
+        .into_iter()
+        .chain(layer_descriptors.iter().map(descriptor_blob))
+        .collect();
+    let mut named: BTreeSet<String> = BTreeSet::new();
+    blobs.retain(|blob| blob.digest.is_empty() || named.insert(blob.digest.clone()));
+    ManifestContent::Blobs(blobs)
 }
 
 /// A `SystemTime` as a modelled timestamp.
@@ -1504,4 +1583,67 @@ pub fn invalid_token_message() -> String {
         "Invalid parameter at '{NEXT_TOKEN_PARAMETER}' failed to satisfy constraint: \
          'Invalid next token provided'"
     )
+}
+
+/// The parameter name ECR Public states for the page size when it refuses one, spelled the
+/// way [`NEXT_TOKEN_PARAMETER`] is: the shape name `MaxResults` behind the lower-camel wire
+/// member `maxResults`.
+pub const MAX_RESULTS_PARAMETER: &str = "MaxResults";
+
+/// Why a paginated reader cannot serve a request that pages AND names the resources it
+/// wants, or `None` when the request asks for only one of the two.
+///
+/// Every paginated reader of this service whose input also takes an explicit identifier
+/// list documents the two as mutually exclusive — `DescribeRepositories$maxResults` and
+/// `$nextToken` each end "If you specify repositories with `repositoryNames`, you can't use
+/// this option", and `DescribeImages`' pair says the same of `imageIds`
+/// (`smithy_query(query="doc", shape="DescribeRepositoriesRequest",
+/// member="maxResults")`). A request naming the resources it wants is not a scan to page
+/// through, so the combination is refused rather than served: the service's
+/// `Invalid parameter at '<member>' failed to satisfy constraint: '<rule>'` template over
+/// the pagination parameter and the rule that it cannot be given beside the list, with
+/// nothing from the request interpolated.
+///
+/// `list_parameter` is the identifier list as the service names it in that message
+/// (`RepositoryNames`, `ImageIds`). The page size is judged before the token, so a request
+/// carrying both is told about the one the clause names first.
+pub fn pagination_beside_list_message(
+    list_parameter: &str,
+    names_resources: bool,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+) -> Option<String> {
+    if !names_resources {
+        return None;
+    }
+    let offending = if max_results.is_some() {
+        MAX_RESULTS_PARAMETER
+    } else if next_token.is_some() {
+        NEXT_TOKEN_PARAMETER
+    } else {
+        return None;
+    };
+    Some(format!(
+        "Invalid parameter at '{offending}' failed to satisfy constraint: 'Cannot provide \
+         {offending} if providing {list_parameter}'"
+    ))
+}
+
+/// The `RepositoryNameList` parameter as this service names it in a refusal clause.
+pub const REPOSITORY_NAMES_PARAMETER: &str = "RepositoryNames";
+
+/// The `ImageIdentifierList` parameter as this service names it in a refusal clause.
+pub const IMAGE_IDS_PARAMETER: &str = "ImageIds";
+
+/// A repository policy document in the form this service REPORTS it: the canonical
+/// IAM-policy rendering ([`::service_common::iam_policy::canonical_document`]), which is
+/// the tree's ONE rendering of an attached policy.
+///
+/// ECR's policy engine parses the submitted document and re-serializes it, so the text
+/// `SetRepositoryPolicy` answers with — and `GetRepositoryPolicy` and
+/// `DeleteRepositoryPolicy` report afterwards — is that rendering and not the caller's
+/// bytes. The rendering is a fixed point, so canonicalising once on the write is what makes
+/// every later read report it.
+pub fn canonical_policy_document(text: &str) -> String {
+    ::service_common::iam_policy::canonical_document(text)
 }

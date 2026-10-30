@@ -386,6 +386,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(server_error());
         };
         repository.layers.insert(layer_digest.clone(), layer_size);
+        // A blob the registry has just counted is content a stored manifest may reference
+        // without stating its size, so the sizes this repository reports are recomputed
+        // now that its layer set has changed
+        // (`crate::state::StoredRepository::refresh_image_sizes`).
+        repository.refresh_image_sizes();
         store.uploads.remove(&input.upload_id);
         drop(store);
 

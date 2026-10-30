@@ -3,23 +3,25 @@
 //! Three response-fidelity rules of the ECR Public surface, driven end to end over the
 //! wire through the harness in [`crate::repository_image_lifecycle`].
 //!
-//! 1. `ImageDetail$imageSizeInBytes` is the size of the layer content a manifest
-//!    REFERENCES — the sum of its layer descriptors' sizes, and for a manifest list the
-//!    max over the images it references — never the size of the manifest document or of
-//!    the config blob. Source: the member's own doc, via
+//! 1. `ImageDetail$imageSizeInBytes` is the size of the content a manifest REFERENCES —
+//!    the total over the DISTINCT blobs the image is made of, its config blob and its
+//!    layer blobs, and for a manifest list the max over the images it references — never
+//!    the size of the manifest document itself. A blob's size is the one its descriptor
+//!    declares, else the byte count the registry recorded for the blob it stored. Source:
+//!    the member's own doc, via
 //!    `smithy_query(query="doc", shape="ImageDetail", member="imageSizeInBytes")`:
 //!    "The size, in bytes, of the image in the repository. If the image is a manifest
-//!    list, this is the max size of all manifests in the list", with the note that the
-//!    value is the COMPRESSED layer content the client pushed. A list's size is a
+//!    list, this is the max size of all manifests in the list". A list's size is a
 //!    statement about other images in the repository, so it follows them as they are
 //!    pushed and deleted.
 //! 2. `BatchDeleteImage` reports what it removed FULLY identified: one `ImageIdentifier`
 //!    per digest-and-tag pair the delete detached, and a digest-only identifier when the
 //!    image it removed carried no tag.
 //! 3. A response omits a structure member that is neither `@required` nor `@default` and
-//!    that the service has not set — `RepositoryCatalogData$marketplaceCertified` is the
-//!    one such member this service can report — rather than writing a zero value, so
-//!    "no statement" stays distinguishable from "false".
+//!    that the service has not set — `ImageDetail$imageTags` for a manifest that carries
+//!    no tag, and `RepositoryCatalogData$marketplaceCertified`, which nothing a caller can
+//!    do makes the service state — rather than writing a zero value, so "no statement"
+//!    stays distinguishable from "an empty list" and from "false".
 //!
 //! Each case names itself and the actual value in its assertion, and every table row
 //! differs along what its rule generalises over: the number and size of layers, the
@@ -51,7 +53,8 @@ fn descriptor(media_type: &str, body: &str, size: i64) -> Value {
 }
 
 /// An image manifest referencing `layer_sizes` layer blobs, plus a config blob of
-/// `config_size` bytes (which is not layer content and so is not part of the image size).
+/// `config_size` bytes (which is content of the image too, so it is part of the image
+/// size).
 fn image_manifest(name: &str, config_size: i64, layer_sizes: &[i64]) -> String {
     json!({
         "schemaVersion": 2,
@@ -145,7 +148,8 @@ async fn detail_of(
     described["imageDetails"][0].clone()
 }
 
-/// One image manifest, and the `imageSizeInBytes` its layer descriptors add up to.
+/// One image manifest, and the `imageSizeInBytes` the blobs its descriptors name add up
+/// to.
 struct SizeCase {
     case: &'static str,
     manifest: String,
@@ -153,7 +157,7 @@ struct SizeCase {
 }
 
 #[tokio::test]
-async fn image_size_in_bytes_totals_the_layer_blobs_the_manifest_references() {
+async fn image_size_in_bytes_totals_the_blobs_the_manifest_references() {
     let router = service();
     repository(&router, "sizes/images").await;
 
@@ -161,27 +165,28 @@ async fn image_size_in_bytes_totals_the_layer_blobs_the_manifest_references() {
         SizeCase {
             case: "one layer",
             manifest: image_manifest("one-layer", 7, &[209]),
-            expected: Some(209),
+            expected: Some(216),
         },
         SizeCase {
             case: "three layers of different sizes",
             manifest: image_manifest("three-layers", 7, &[1, 1024, 65_536]),
-            expected: Some(66_561),
+            expected: Some(66_568),
         },
         SizeCase {
             case: "a config blob far larger than the layers",
             manifest: image_manifest("fat-config", 10_000_000, &[12, 30]),
-            expected: Some(42),
+            expected: Some(10_000_042),
         },
         SizeCase {
+            // No layer content at all: the image is its config blob, so that is its size.
             case: "no layers at all",
             manifest: image_manifest("no-layers", 7, &[]),
-            expected: Some(0),
+            expected: Some(7),
         },
         SizeCase {
             case: "a layer past the 32-bit range, since the member is a long",
             manifest: image_manifest("big-layer", 7, &[4_294_967_296, 1]),
-            expected: Some(4_294_967_297),
+            expected: Some(4_294_967_304),
         },
         SizeCase {
             case: "a docker v2 manifest, not an oci one",
@@ -202,7 +207,7 @@ async fn image_size_in_bytes_totals_the_layer_blobs_the_manifest_references() {
                 ],
             })
             .to_string(),
-            expected: Some(777),
+            expected: Some(5_777),
         },
         SizeCase {
             // A document that references no sized content says nothing about an image
@@ -217,11 +222,20 @@ async fn image_size_in_bytes_totals_the_layer_blobs_the_manifest_references() {
             expected: None,
         },
         SizeCase {
-            // A descriptor's size is the byte count of its blob, so a value below zero
-            // is no byte count: the total it belongs to is unknown, not understated.
-            case: "a negative layer size beside a real one",
+            // A descriptor's size is the byte count of its blob, so a value below zero is
+            // no byte count at all: what the document does not state about a blob, the
+            // registry's own count of the blob it stored does — here the 22 bytes of the
+            // layer body `negative-layer-layer-0` the push uploaded.
+            case: "a layer size that is not a byte count, counted by the registry instead",
             manifest: image_manifest("negative-layer", 7, &[-1_000, 50]),
-            expected: None,
+            expected: Some(7 + "negative-layer-layer-0".len() as i64 + 50),
+        },
+        SizeCase {
+            // The config descriptor is one of the blobs the total is over, so the same
+            // reading holds for it: the registry counted `negative-config-config`.
+            case: "a config size that is not a byte count, counted by the registry instead",
+            manifest: image_manifest("negative-config", -1, &[50]),
+            expected: Some("negative-config-config".len() as i64 + 50),
         },
         SizeCase {
             // The addends come from the request, so the total is computed with checked
@@ -232,7 +246,9 @@ async fn image_size_in_bytes_totals_the_layer_blobs_the_manifest_references() {
             expected: None,
         },
         SizeCase {
-            case: "a layer descriptor that declares no size at all",
+            // A descriptor naming no blob at all names nothing the registry could have
+            // counted, so the total it belongs to is unknown rather than understated.
+            case: "a layer descriptor that declares neither a size nor a digest",
             manifest: json!({
                 "schemaVersion": 2,
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -279,8 +295,8 @@ async fn image_size_in_bytes_totals_the_layer_blobs_the_manifest_references() {
         if let Some(expected) = size_case.expected {
             assert_ne!(
                 expected, size_case.manifest.len() as i64,
-                "case {case:?}: the row must distinguish the layer total from the \
-                 manifest's own byte length"
+                "case {case:?}: the row must distinguish the referenced blob total from \
+                 the manifest's own byte length"
             );
         }
     }
@@ -292,7 +308,8 @@ async fn a_manifest_list_reports_the_max_size_of_the_images_it_references() {
     repository(&router, "sizes/lists").await;
 
     // Three single-platform images, pushed first, as a client pushes a manifest list's
-    // children before the list itself.
+    // children before the list itself. Each child's own size is its config blob plus its
+    // layers: 17, 507 and 78 bytes.
     let small = image_manifest("small", 7, &[10]);
     let large = image_manifest("large", 7, &[500]);
     let middle = image_manifest("middle", 7, &[70, 1]);
@@ -312,7 +329,7 @@ async fn a_manifest_list_reports_the_max_size_of_the_images_it_references() {
                 middle_digest.as_str(),
                 large_digest.as_str(),
             ],
-            Some(500),
+            Some(507),
         ),
         (
             "largest child first",
@@ -321,14 +338,14 @@ async fn a_manifest_list_reports_the_max_size_of_the_images_it_references() {
                 middle_digest.as_str(),
                 small_digest.as_str(),
             ],
-            Some(500),
+            Some(507),
         ),
         (
             "a subset that excludes the largest child",
             vec![small_digest.as_str(), middle_digest.as_str()],
-            Some(71),
+            Some(78),
         ),
-        ("a single child", vec![small_digest.as_str()], Some(10)),
+        ("a single child", vec![small_digest.as_str()], Some(17)),
         (
             "no child this registry holds",
             vec![absent_digest.as_str()],
@@ -363,7 +380,7 @@ async fn a_manifest_list_reports_the_max_size_of_the_images_it_references() {
         .map(|entry| format!("sha256:{entry:064x}"))
         .collect();
     for (case, entry_count, expected) in [
-        ("entries exactly at the bound", MAX_MANIFEST_LIST_ENTRIES, Some(500)),
+        ("entries exactly at the bound", MAX_MANIFEST_LIST_ENTRIES, Some(507)),
         ("one entry past the bound", MAX_MANIFEST_LIST_ENTRIES + 1, None),
     ] {
         // The held child is the last entry, so an implementation reading only a prefix
@@ -413,7 +430,7 @@ async fn a_manifest_list_reports_the_max_size_of_the_images_it_references() {
     .await;
     assert_eq!(
         detail["imageSizeInBytes"].as_i64(),
-        Some(10),
+        Some(17),
         "case {:?}: expected the child's own size, got {detail}",
         "the same child named three times"
     );
@@ -442,8 +459,8 @@ async fn a_manifest_list_follows_the_children_it_references() {
 
     // Each child that arrives is accounted for as it arrives.
     for (case, manifest, tag, expected) in [
-        ("the smaller child arrives", &small, "small", Some(10)),
-        ("the larger child arrives", &large, "large", Some(640)),
+        ("the smaller child arrives", &small, "small", Some(17)),
+        ("the larger child arrives", &large, "large", Some(647)),
     ] {
         push(&router, "sizes/order", manifest, Some(tag), case).await;
         let detail = detail_of(&router, "sizes/order", &list_digest, case).await;
@@ -469,7 +486,7 @@ async fn a_manifest_list_follows_the_children_it_references() {
     let after = detail_of(&router, "sizes/order", &list_digest, "the larger child leaves").await;
     assert_eq!(
         after["imageSizeInBytes"].as_i64(),
-        Some(10),
+        Some(17),
         "case {:?}: expected the remaining child's size, got {after}",
         "the larger child leaves"
     );
@@ -670,6 +687,70 @@ async fn batch_delete_image_reports_every_digest_and_tag_pair_it_removed() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn an_image_detail_omits_the_tag_list_of_a_manifest_that_carries_no_tag() {
+    let router = service();
+    repository(&router, "tags/omitted").await;
+
+    // One row per tag set a stored manifest can have: pushed with no tag at all, pushed
+    // with one, pushed with several, and left untagged again because another push moved
+    // its last tag away.
+    let untagged = image_manifest("untagged", 7, &[3]);
+    let untagged_digest = push(&router, "tags/omitted", &untagged, None, "no tag at all").await;
+    let detail = detail_of(&router, "tags/omitted", &untagged_digest, "no tag at all").await;
+    assert!(
+        detail.get("imageTags").is_none(),
+        "case {:?}: expected no imageTags member at all, got {detail}",
+        "no tag at all"
+    );
+
+    // The same manifest, now pushed with a tag: the member appears, so the omission is
+    // about an image with no tags and not about dropping the member.
+    push(
+        &router,
+        "tags/omitted",
+        &untagged,
+        Some("first"),
+        "one tag",
+    )
+    .await;
+    let detail = detail_of(&router, "tags/omitted", &untagged_digest, "one tag").await;
+    assert_eq!(
+        detail["imageTags"],
+        json!(["first"]),
+        "case {:?}: expected the one tag to be reported, got {detail}",
+        "one tag"
+    );
+    push(
+        &router,
+        "tags/omitted",
+        &untagged,
+        Some("second"),
+        "two tags",
+    )
+    .await;
+    let detail = detail_of(&router, "tags/omitted", &untagged_digest, "two tags").await;
+    assert_eq!(
+        detail["imageTags"],
+        json!(["first", "second"]),
+        "case {:?}: expected both tags to be reported, got {detail}",
+        "two tags"
+    );
+
+    // A tag is mutable, so pushing both of them onto another manifest leaves the first
+    // one with no tag: the member goes away again.
+    let other = image_manifest("other", 7, &[4]);
+    for tag in ["first", "second"] {
+        push(&router, "tags/omitted", &other, Some(tag), "the tags move").await;
+    }
+    let detail = detail_of(&router, "tags/omitted", &untagged_digest, "the tags move").await;
+    assert!(
+        detail.get("imageTags").is_none(),
+        "case {:?}: expected the member to go away with the last tag, got {detail}",
+        "the tags move"
+    );
 }
 
 #[tokio::test]

@@ -185,6 +185,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A request that names the repositories it wants is not a scan to page through, so
+        // a page size or a cursor beside `repositoryNames` is refused before anything is
+        // read (`crate::state::pagination_beside_list_message`).
+        if let Some(message) = crate::state::pagination_beside_list_message(
+            crate::state::REPOSITORY_NAMES_PARAMETER,
+            input.repository_names.is_some(),
+            input.max_results,
+            input.next_token.as_deref(),
+        ) {
+            return Err(invalid_parameter(message));
+        }
+
         let resume_after = match crate::state::decode_page_token(input.next_token.as_deref()) {
             Ok(resume_after) => resume_after,
             Err(message) => return Err(invalid_parameter(message)),

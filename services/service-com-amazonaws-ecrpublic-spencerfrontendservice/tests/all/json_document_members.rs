@@ -7,7 +7,9 @@
 //! `InvalidParameterException`, whose message names the member and the rule it failed
 //! (`Invalid parameter at '<Member>' failed to satisfy constraint: 'Invalid JSON
 //! syntax'`) and does NOT quote the rejected body back, and the refused request stores
-//! nothing. A body that IS parseable JSON is stored verbatim, whatever JSON value it is.
+//! nothing. A body that IS parseable JSON is stored: a manifest verbatim, whatever JSON
+//! value it is, and a policy document in the one rendering this service reports a policy in
+//! (`tests/all/repository_policy_canonical_form.rs` pins that rendering).
 //!
 //! Both members this service declares as JSON text are rows of the same table:
 //! `PutImage.imageManifest` ("The image manifest that corresponds to the image to be
@@ -263,10 +265,15 @@ async fn set_repository_policy_stores_every_well_formed_json_document() {
             case,
         )
         .await;
+        let expected =
+            service_com_amazonaws_ecrpublic_spencerfrontendservice::state::canonical_policy_document(
+                &policy,
+            );
         assert_eq!(
             read["policyText"].as_str(),
-            Some(policy.as_str()),
-            "case {case:?}: expected the stored document, got {read}"
+            Some(expected.as_str()),
+            "case {case:?}: expected the stored document in the service's rendering, \
+             got {read}"
         );
     }
 }

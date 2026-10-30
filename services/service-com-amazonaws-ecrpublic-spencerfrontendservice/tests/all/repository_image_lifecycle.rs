@@ -521,8 +521,8 @@ struct ManifestCase {
     manifest_media_type: Option<&'static str>,
     /// The `artifactMediaType` the manifest's `config` states, if any.
     artifact_media_type: Option<&'static str>,
-    /// The `imageSizeInBytes` the manifest's layer descriptors add up to, or `None`
-    /// when the document references no sized content. Covered exhaustively by
+    /// The `imageSizeInBytes` the blobs the manifest's descriptors name add up to, or
+    /// `None` when the document references no sized content. Covered exhaustively by
     /// `tests/all/response_field_fidelity.rs`.
     image_size: Option<i64>,
 }
@@ -548,7 +548,8 @@ fn manifest_cases() -> Vec<ManifestCase> {
             .to_string(),
             manifest_media_type: Some("application/vnd.oci.image.manifest.v1+json"),
             artifact_media_type: Some("application/vnd.oci.image.config.v1+json"),
-            image_size: Some(46),
+            // The config blob (7) plus the two layers (12 and 34).
+            image_size: Some(53),
         },
         ManifestCase {
             case: "docker manifest list, no config",
@@ -1290,12 +1291,13 @@ async fn batch_delete_image_removes_what_it_reports_and_reports_what_it_cannot()
     assert_eq!(
         codes,
         vec![
-            "ImageNotFound",
-            "ImageNotFound",
             "MissingDigestAndTag",
+            "ImageNotFound",
+            "ImageNotFound",
             "ImageTagDoesNotMatchDigest",
         ],
-        "expected one failure per unmatched identifier, in request order, got {batch}"
+        "expected one failure per unmatched identifier, the entry naming neither a tag \
+         nor a digest first and the lookups after it in request order, got {batch}"
     );
     for failure in batch["failures"].as_array().expect("failures") {
         assert!(

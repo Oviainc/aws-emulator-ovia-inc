@@ -14,6 +14,11 @@
 //! versions, the published size bound and one byte past it), every way the policy grammar
 //! can be broken, and every action/principal form by which a `Deny` can lock the
 //! repository's policy — rather than one recorded request.
+//!
+//! A document is reported in the one rendering this service reports a policy in rather
+//! than as the caller's bytes, so every expectation here is [`reported`] of the submitted
+//! document; the rendering itself is pinned byte for byte, over its own table, by
+//! `tests/all/repository_policy_canonical_form.rs`.
 
 use std::sync::Arc;
 
@@ -117,6 +122,16 @@ fn text(body: &Value, member: &str, case: &str) -> String {
         .to_string()
 }
 
+/// The text this service reports for a submitted policy document: the canonical rendering
+/// its policy engine re-serializes the parsed document into
+/// (`state::canonical_policy_document`), which is what every read of the stored policy
+/// answers with.
+fn reported(document: &str) -> String {
+    service_com_amazonaws_ecrpublic_spencerfrontendservice::state::canonical_policy_document(
+        document,
+    )
+}
+
 /// Create `name` so a policy can be attached to it.
 async fn repository(router: &MultiServiceRouter, name: &str) {
     ok(
@@ -129,7 +144,8 @@ async fn repository(router: &MultiServiceRouter, name: &str) {
 }
 
 /// Assert that `SetRepositoryPolicy` stored `document` and that every reader hands back
-/// the same bytes, keeping the registry and repository the request named.
+/// the same text — the rendering this service reports a policy in — keeping the registry
+/// and repository the request named.
 async fn assert_round_trip(router: &MultiServiceRouter, name: &str, document: &str, case: &str) {
     let set = ok(
         router,
@@ -138,11 +154,12 @@ async fn assert_round_trip(router: &MultiServiceRouter, name: &str, document: &s
         case,
     )
     .await;
+    let expected = reported(document);
     assert_eq!(
         text(&set, "policyText", case),
-        document,
-        "case {case:?}: expected SetRepositoryPolicy to report the document it stored, \
-         got {set}"
+        expected,
+        "case {case:?}: expected SetRepositoryPolicy to report the document it stored in \
+         the service's rendering, got {set}"
     );
     assert_eq!(
         text(&set, "repositoryName", case),
@@ -226,7 +243,7 @@ fn valid_documents() -> Vec<(String, String)> {
                 .to_string(),
         ),
         (
-            "escape sequences, which a re-serialized document would lose".to_string(),
+            "escape sequences, which the rendering copies verbatim".to_string(),
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"ecr-public:BatchGetImage","Condition":{"StringEquals":{"aws:PrincipalTag\/team":"caf\u00e9 \"quoted\" back\\slash"}}}]}"#
                 .to_string(),
         ),
@@ -238,7 +255,7 @@ fn valid_documents() -> Vec<(String, String)> {
 }
 
 #[tokio::test]
-async fn every_valid_document_form_round_trips_byte_for_byte() {
+async fn every_valid_document_form_round_trips_through_the_service_rendering() {
     let router = service();
 
     for (index, (case, document)) in valid_documents().into_iter().enumerate() {
@@ -258,7 +275,7 @@ async fn every_valid_document_form_round_trips_byte_for_byte() {
         .await;
         assert_eq!(
             text(&deleted, "policyText", &case),
-            document,
+            reported(&document),
             "case {case:?}: expected DeleteRepositoryPolicy to report the document it \
              removed, got {deleted}"
         );
@@ -301,7 +318,7 @@ async fn a_document_one_byte_past_the_published_maximum_is_refused_and_stores_no
     .await;
     assert_eq!(
         text(&got, "policyText", "after the refusal"),
-        PULL_POLICY,
+        reported(PULL_POLICY),
         "expected the refused call to store nothing, got {got}"
     );
 }
@@ -441,7 +458,7 @@ async fn a_document_that_is_not_a_policy_is_refused_and_stores_nothing() {
         .await;
         assert_eq!(
             text(&got, "policyText", case),
-            PULL_POLICY,
+            reported(PULL_POLICY),
             "case {case:?}: expected the refused call to leave the stored policy alone, \
              got {got}"
         );
@@ -492,7 +509,7 @@ async fn the_policy_lifecycle_is_set_read_replace_delete() {
     .await;
     assert_eq!(
         text(&deleted, "policyText", "delete"),
-        replacement,
+        reported(replacement),
         "expected the delete to report the replacement document, got {deleted}"
     );
     for operation in ["GetRepositoryPolicy", "DeleteRepositoryPolicy"] {
@@ -556,7 +573,7 @@ async fn a_registry_id_naming_another_account_is_an_invalid_parameter() {
     .await;
     assert_eq!(
         text(&set, "policyText", "this registry"),
-        PULL_POLICY,
+        reported(PULL_POLICY),
         "expected the document to be stored for this registry, got {set}"
     );
 
@@ -596,7 +613,7 @@ async fn a_registry_id_naming_another_account_is_an_invalid_parameter() {
     .await;
     assert_eq!(
         text(&got, "policyText", "after the refusals"),
-        PULL_POLICY,
+        reported(PULL_POLICY),
         "expected the stored document to survive, got {got}"
     );
 }
@@ -723,7 +740,7 @@ async fn a_document_that_would_lock_the_policy_needs_force_and_then_really_locks
         .await;
         assert_eq!(
             text(&got, "policyText", case),
-            PULL_POLICY,
+            reported(PULL_POLICY),
             "case {case:?}: expected the unforced call to store nothing, got {got}"
         );
 
@@ -754,7 +771,7 @@ async fn a_document_that_would_lock_the_policy_needs_force_and_then_really_locks
         .await;
         assert_eq!(
             text(&still, "policyText", case),
-            document,
+            reported(document),
             "case {case:?}: expected the locking document to still be the stored one, \
              got {still}"
         );
@@ -787,7 +804,7 @@ async fn assert_round_trip_forced(
     .await;
     assert_eq!(
         text(&set, "policyText", case),
-        document,
+        reported(document),
         "case {case:?}: expected the forced call to store the document, got {set}"
     );
     let got = ok(

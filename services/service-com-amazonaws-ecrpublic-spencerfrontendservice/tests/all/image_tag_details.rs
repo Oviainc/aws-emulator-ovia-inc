@@ -150,7 +150,9 @@ fn descriptor(media_type: &str, body: &str, size: i64) -> Value {
     json!({"mediaType": media_type, "digest": blob_digest(body), "size": size})
 }
 
-/// An image manifest referencing `layer_sizes` layer blobs.
+/// An image manifest referencing `layer_sizes` layer blobs, over a config blob of 9999
+/// bytes: an image's reported size is the total of the blobs its descriptors name, so every
+/// row's expectation carries that config blob too.
 fn image_manifest(name: &str, layer_sizes: &[i64]) -> String {
     json!({
         "schemaVersion": 2,
@@ -394,19 +396,19 @@ async fn a_tag_entry_reports_the_stored_manifest_and_two_reads_report_the_same_s
             case: "one layer",
             tag: "one",
             manifest: one_layer.clone(),
-            expected: Some(7),
+            expected: Some(10_006),
         },
         SizeCase {
             case: "three layers add up",
             tag: "three",
             manifest: three_layers.clone(),
-            expected: Some(6),
+            expected: Some(10_005),
         },
         SizeCase {
-            case: "an empty layers array references no content",
+            case: "an empty layers array references no layer content",
             tag: "empty",
             manifest: no_layers,
-            expected: Some(0),
+            expected: Some(9_999),
         },
         SizeCase {
             case: "a manifest stating no referenced content states no size",
@@ -418,7 +420,7 @@ async fn a_tag_entry_reports_the_stored_manifest_and_two_reads_report_the_same_s
             case: "a manifest list is the max over its children",
             tag: "list",
             manifest: list,
-            expected: Some(7),
+            expected: Some(10_006),
         },
     ];
 

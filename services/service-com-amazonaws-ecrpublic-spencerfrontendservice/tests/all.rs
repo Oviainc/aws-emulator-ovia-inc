@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/batch_delete_image_failure_order.rs"]
+mod batch_delete_image_failure_order;
 #[path = "all/client_error_message_templates.rs"]
 mod client_error_message_templates;
 #[path = "all/harness.rs"]
@@ -35,6 +37,8 @@ mod layer_upload_convergence;
 mod layer_upload_refusal_messages;
 #[path = "all/layer_upload_sessions.rs"]
 mod layer_upload_sessions;
+#[path = "all/pagination_filter_exclusion.rs"]
+mod pagination_filter_exclusion;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
 #[path = "all/put_image_layer_resolution.rs"]
@@ -59,6 +63,8 @@ mod repository_image_lifecycle;
 mod repository_policy;
 #[path = "all/repository_policy_and_catalog_data.rs"]
 mod repository_policy_and_catalog_data;
+#[path = "all/repository_policy_canonical_form.rs"]
+mod repository_policy_canonical_form;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_field_fidelity.rs"]

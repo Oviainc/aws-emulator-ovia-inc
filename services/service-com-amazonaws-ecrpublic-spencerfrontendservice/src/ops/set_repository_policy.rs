@@ -273,10 +273,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Stored verbatim: `policyText` is an opaque document, so the bytes a later read
-        // reports are the bytes this call supplied. The response is then read back out of
-        // the store, so it reports what was persisted and not what was asked for.
-        let stored = repository.policy_text.insert(input.policy_text).clone();
+        // Stored in the one rendering this service reports a policy in
+        // (`crate::state::canonical_policy_document`): ECR's policy engine re-serializes
+        // the document it parsed, so what every later read reports is that rendering and
+        // not the bytes of whichever request wrote it. The response is then read back out
+        // of the store, so it reports what was persisted and not what was asked for.
+        let stored = repository
+            .policy_text
+            .insert(crate::state::canonical_policy_document(&input.policy_text))
+            .clone();
         let repository_name = repository.name.clone();
         drop(store);
 
@@ -318,8 +323,9 @@ fn invalid_policy() -> SetRepositoryPolicyError {
 }
 
 /// A parsed repository policy: the statements that matter for deciding what the document
-/// denies. Everything else about the document is validated and then dropped, because the
-/// document itself is stored verbatim.
+/// denies. Everything else about the document is validated and then dropped, because what
+/// is stored is the document's own canonical rendering
+/// (`crate::state::canonical_policy_document`) rather than anything rebuilt from here.
 #[derive(Debug, Clone)]
 pub struct PolicyDocument {
     statements: Vec<PolicyStatement>,
@@ -464,8 +470,8 @@ fn parse_policy(text: &str) -> Option<PolicyDocument> {
         id.as_str()?;
     }
 
-    // Borrowed, not cloned: the document itself is stored verbatim by the caller, so the
-    // grammar check only reads it.
+    // Borrowed, not cloned: the grammar check only reads the document, which is stored in
+    // its own canonical rendering by the caller.
     let statements: Vec<&serde_json::Value> = match document.get("Statement")? {
         serde_json::Value::Array(statements) if !statements.is_empty() => {
             statements.iter().collect()

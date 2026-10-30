@@ -201,6 +201,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut deleted: Vec<ImageIdentifier> = Vec::new();
         let mut failures: Vec<ImageFailure> = Vec::new();
 
+        // The request's identifiers are READ first, and only then resolved against the
+        // repository: an entry that names neither a tag nor a digest addresses no image
+        // whatever this repository holds, so it is reported as the request is read — before
+        // every failure a lookup decides. That is the order a batch reports its failures
+        // in, so a caller sees the entries it got wrong ahead of the entries the registry
+        // could not match.
+        for id in &input.image_ids {
+            let unusable = repository
+                .resolve_identifier(id)
+                .err()
+                .filter(|problem| problem.states_an_unusable_identifier());
+            if let Some(problem) = unusable {
+                failures.push(ImageFailure {
+                    image_id: Some(id.clone()),
+                    failure_code: Some(problem.failure_code().to_string()),
+                    failure_reason: Some(problem.failure_reason().to_string()),
+                });
+            }
+        }
+
         for id in &input.image_ids {
             // Resolve to an owned digest first: the lookup borrows the repository, and
             // the removal below mutates it.
@@ -210,11 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let digest = match resolved {
                 Ok(digest) => digest,
                 Err(problem) => {
-                    failures.push(ImageFailure {
-                        image_id: Some(id.clone()),
-                        failure_code: Some(problem.failure_code().to_string()),
-                        failure_reason: Some(problem.failure_reason().to_string()),
-                    });
+                    // The identifiers the request itself got wrong were reported above.
+                    if !problem.states_an_unusable_identifier() {
+                        failures.push(ImageFailure {
+                            image_id: Some(id.clone()),
+                            failure_code: Some(problem.failure_code().to_string()),
+                            failure_reason: Some(problem.failure_reason().to_string()),
+                        });
+                    }
                     continue;
                 }
             };

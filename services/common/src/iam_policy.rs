@@ -37,6 +37,11 @@
 //! to be and nothing about any one service's error shape, so a service that reports a
 //! single opaque "invalid policy" phrase can ignore it and one that names the member can
 //! render it.
+//!
+//! Beside the grammar, [`canonical_document`] is the one LAYOUT an attached policy document
+//! is reported in: a service that stores a policy does not echo the caller's bytes but
+//! re-serializes the parsed document, so the rendering lives here too rather than once per
+//! service.
 
 /// The policy-language versions an IAM JSON policy document may declare. The IAM JSON
 /// policy reference documents exactly two `Version` values: `2012-10-17`, the current one,
@@ -219,6 +224,276 @@ fn names_values(element: &::serde_json::Value) -> bool {
             !members.is_empty() && members.values().all(names_values)
         }
         _ => false,
+    }
+}
+
+/// The indentation one nesting level of a canonically rendered policy document is written
+/// with: see [`canonical_document`].
+const CANONICAL_INDENT: usize = 2;
+
+/// What separates a canonically rendered document's key from its value: a colon with a
+/// space on BOTH sides (`"Version" : "2012-10-17"`). See [`canonical_document`].
+const CANONICAL_KEY_SEPARATOR: &str = " : ";
+
+/// How many levels of nesting [`canonical_document`] renders.
+///
+/// The walk descends once per enclosing object or array of the submitted text, and that
+/// nesting is the caller's, so it is bounded here rather than in whatever parsed the
+/// document first: 128 levels, the depth a maintained JSON parser (`serde_json`) accepts
+/// before it refuses a document for its nesting, which is far past any policy the IAM
+/// grammar describes (a document, its statement list, a statement, a condition operator
+/// and its key is five). Text nested past it is returned unrendered.
+const MAX_CANONICAL_NESTING: usize = 128;
+
+/// An IAM policy document in the layout the services that attach one REPORT it in: the
+/// canonical rendering their policy engine re-serializes a stored document into, whatever
+/// layout the caller submitted.
+///
+/// A service whose API takes a policy as a string does not echo the caller's bytes back: it
+/// parses the document and renders it again on every read and write, so two clients that
+/// submit the same policy written differently read the same text back. The layout, as the
+/// recorded responses of those operations show it:
+///
+/// * each member of a JSON object on its own line, indented [`CANONICAL_INDENT`] spaces per
+///   enclosing OBJECT (an enclosing array adds no indentation), with the closing brace on
+///   its own line at the enclosing level;
+/// * [`CANONICAL_KEY_SEPARATOR`] between a key and its value;
+/// * arrays laid out inline — `[ ` before the first element, `, ` between elements and
+///   ` ]` after the last — so a statement list reads `"Statement" : [ {` … `} ]`;
+/// * an empty object and an empty array written `{ }` and `[ ]`;
+/// * a VALUE LIST holding exactly one value written as that value alone, without the
+///   brackets: the IAM policy language documents `Action`, `NotAction`, `Resource`,
+///   `NotResource`, the per-type lists of `Principal`/`NotPrincipal` and a condition key's
+///   values as "a string or an array of strings", and a one-value list of those is reported
+///   in its string form. A list of STATEMENTS is not a value list, so a `Statement` carrying
+///   one statement keeps its brackets — which is the difference a one-element array of
+///   strings makes against one of objects.
+///
+/// Only the whitespace BETWEEN tokens, and the brackets of a one-value list, are this
+/// function's: every token is copied out of the submitted text byte for byte, so nothing
+/// else about the document's content changes. That is what keeps the caller's document the
+/// caller's — member order survives, a number keeps the digits it was written with, and
+/// every string literal keeps the escapes it was written with (`\u00e9` is not decoded, and
+/// a literal non-ASCII character is not escaped). The rendering is therefore a fixed point:
+/// re-rendering a rendered document returns it unchanged, so a client that puts back what it
+/// read sees no drift.
+///
+/// `text` that is not well-formed JSON is returned as it came, and so is text nested past
+/// [`MAX_CANONICAL_NESTING`]: this is a rendering, not a validation, and the policy grammar
+/// ([`resource_policy_defect`]) is what refuses an unusable document.
+pub fn canonical_document(text: &str) -> String {
+    let mut renderer = PolicyRenderer {
+        source: text,
+        at: 0,
+        nesting: 0,
+        rendered: String::with_capacity(text.len() + text.len() / 2),
+    };
+    if renderer.render() {
+        renderer.rendered
+    } else {
+        text.to_string()
+    }
+}
+
+/// The re-indenter behind [`canonical_document`]: walks the submitted document a token at a
+/// time, copying every token verbatim into `rendered` and writing the canonical whitespace
+/// between them.
+struct PolicyRenderer<'a> {
+    /// The document being rendered.
+    source: &'a str,
+    /// How far into `source` the walk has read. Only ever advanced over ASCII bytes or over
+    /// a whole token, so it is always a character boundary.
+    at: usize,
+    /// How many enclosing objects and arrays the walk is inside, which is what
+    /// [`MAX_CANONICAL_NESTING`] bounds. Counted separately from the INDENTATION depth,
+    /// because an array adds a level of recursion while adding no indentation.
+    nesting: usize,
+    /// What has been rendered so far.
+    rendered: String,
+}
+
+impl PolicyRenderer<'_> {
+    /// Render the whole document, reporting whether it was one JSON value and nothing else.
+    /// `false` leaves `rendered` half-written, which [`canonical_document`] discards.
+    fn render(&mut self) -> bool {
+        if self.value(0).is_none() {
+            return false;
+        }
+        self.skip_space();
+        self.at == self.source.len()
+    }
+
+    /// The next byte of `source`, or `None` at its end.
+    fn peek(&self) -> Option<u8> {
+        self.source.as_bytes().get(self.at).copied()
+    }
+
+    /// Step over the whitespace between two tokens: insignificant, and the whitespace this
+    /// renderer replaces.
+    fn skip_space(&mut self) {
+        while self.peek().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            self.at += 1;
+        }
+    }
+
+    /// Step over `expected`, or report that the document does not carry it here.
+    fn expect(&mut self, expected: u8) -> Option<()> {
+        if self.peek()? != expected {
+            return None;
+        }
+        self.at += 1;
+        Some(())
+    }
+
+    /// Write a line break and the indentation `depth` enclosing objects are written with.
+    fn newline(&mut self, depth: usize) {
+        self.rendered.push('\n');
+        for _ in 0..depth * CANONICAL_INDENT {
+            self.rendered.push(' ');
+        }
+    }
+
+    /// Render one JSON value, whose own members sit `depth` objects deep.
+    ///
+    /// The one place the walk recurses, so the one place the nesting a document may carry
+    /// is bounded ([`MAX_CANONICAL_NESTING`]): past it the render fails and
+    /// [`canonical_document`] hands the text back unrendered, which is what keeps a
+    /// caller-supplied run of opening brackets off the stack.
+    fn value(&mut self, depth: usize) -> Option<()> {
+        self.skip_space();
+        if self.nesting == MAX_CANONICAL_NESTING {
+            return None;
+        }
+        self.nesting += 1;
+        let rendered = match self.peek()? {
+            // An object's members are one level deeper than the object itself.
+            b'{' => self.object(depth + 1),
+            // An array is inline, so it adds no level of its own.
+            b'[' => self.array(depth),
+            b'"' => self.string(),
+            _ => self.scalar(),
+        };
+        self.nesting -= 1;
+        rendered
+    }
+
+    /// Render a JSON object whose members are written at `depth`.
+    fn object(&mut self, depth: usize) -> Option<()> {
+        self.expect(b'{')?;
+        self.rendered.push('{');
+        self.skip_space();
+        if self.peek()? == b'}' {
+            self.at += 1;
+            self.rendered.push_str(" }");
+            return Some(());
+        }
+        loop {
+            self.skip_space();
+            self.newline(depth);
+            self.string()?;
+            self.skip_space();
+            self.expect(b':')?;
+            self.rendered.push_str(CANONICAL_KEY_SEPARATOR);
+            self.value(depth)?;
+            self.skip_space();
+            match self.peek()? {
+                b',' => {
+                    self.at += 1;
+                    self.rendered.push(',');
+                }
+                b'}' => {
+                    self.at += 1;
+                    self.newline(depth - 1);
+                    self.rendered.push('}');
+                    return Some(());
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Render a JSON array inline, its elements' own members staying at `depth` — or, when
+    /// it is a value list holding exactly one value, as that value alone (see
+    /// [`canonical_document`]).
+    fn array(&mut self, depth: usize) -> Option<()> {
+        self.expect(b'[')?;
+        self.skip_space();
+        if self.peek()? == b']' {
+            self.at += 1;
+            self.rendered.push_str("[ ]");
+            return Some(());
+        }
+        // Where this array's rendering begins: its brackets are written only once it is
+        // known not to be a one-value list, which is rendered without them.
+        let opens_at = self.rendered.len();
+        let holds_values = self.peek()? == b'"';
+        self.value(depth)?;
+        self.skip_space();
+        if holds_values && self.peek()? == b']' {
+            self.at += 1;
+            return Some(());
+        }
+        self.rendered.insert_str(opens_at, "[ ");
+        loop {
+            match self.peek()? {
+                b',' => {
+                    self.at += 1;
+                    self.rendered.push_str(", ");
+                }
+                b']' => {
+                    self.at += 1;
+                    self.rendered.push_str(" ]");
+                    return Some(());
+                }
+                _ => return None,
+            }
+            self.value(depth)?;
+            self.skip_space();
+        }
+    }
+
+    /// Copy a string literal — a key's or a value's — out verbatim, escapes and all. A
+    /// UTF-8 continuation byte is never one of the ASCII bytes scanned for, so reading the
+    /// literal byte by byte cannot split a character.
+    fn string(&mut self) -> Option<()> {
+        let source = self.source;
+        if self.peek()? != b'"' {
+            return None;
+        }
+        let start = self.at;
+        self.at += 1;
+        let mut escaped = false;
+        loop {
+            let byte = self.peek()?;
+            self.at += 1;
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                break;
+            }
+        }
+        self.rendered.push_str(&source[start..self.at]);
+        Some(())
+    }
+
+    /// Copy a number, `true`, `false` or `null` out verbatim: a token that runs up to the
+    /// next structural character.
+    fn scalar(&mut self) -> Option<()> {
+        let source = self.source;
+        let start = self.at;
+        while self
+            .peek()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'+' | b'.'))
+        {
+            self.at += 1;
+        }
+        if self.at == start {
+            return None;
+        }
+        self.rendered.push_str(&source[start..self.at]);
+        Some(())
     }
 }
 
@@ -494,6 +769,107 @@ mod tests {
                 Some(PolicyDefect::NotJson),
                 "case {case:?}: text that is not JSON is not a policy, got {defect:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_document_is_rendered_in_the_canonical_layout_whatever_layout_it_arrived_in() {
+        // The rows differ along what the rendering generalises over: the submitted
+        // whitespace, the arity of a value list (none, one, two), the element type of a
+        // list (strings against statement objects), the nesting depth, the member order and
+        // the value types a condition carries.
+        let compact = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"One\",\
+                       \"Effect\":\"Allow\",\"Principal\":\"*\",\
+                       \"Action\":[\"svc:A\",\"svc:B\"]}]}";
+        let rendered = "{\n  \"Version\" : \"2012-10-17\",\n  \"Statement\" : [ {\n    \
+                        \"Sid\" : \"One\",\n    \"Effect\" : \"Allow\",\n    \
+                        \"Principal\" : \"*\",\n    \"Action\" : [ \"svc:A\", \"svc:B\" ]\n  \
+                        } ]\n}";
+        let rows: [(&str, &str, &str); 6] = [
+            ("a compact document", compact, rendered),
+            ("a document already rendered", rendered, rendered),
+            (
+                "a one-value list, which is written as the value alone",
+                "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":\"*\",\
+                 \"Action\":[\"svc:A\"]}}",
+                "{\n  \"Statement\" : {\n    \"Effect\" : \"Allow\",\n    \
+                 \"Principal\" : \"*\",\n    \"Action\" : \"svc:A\"\n  }\n}",
+            ),
+            (
+                "a nested principal map and an empty list",
+                "{\"Statement\":[{\"Effect\":\"Allow\",\
+                 \"Principal\":{\"AWS\":[\"a\",\"b\"]},\"Action\":\"svc:A\",\
+                 \"Resource\":[]}]}",
+                "{\n  \"Statement\" : [ {\n    \"Effect\" : \"Allow\",\n    \
+                 \"Principal\" : {\n      \"AWS\" : [ \"a\", \"b\" ]\n    },\n    \
+                 \"Action\" : \"svc:A\",\n    \"Resource\" : [ ]\n  } ]\n}",
+            ),
+            (
+                "a condition carrying a number and a boolean",
+                "{\"Statement\":{\"Effect\":\"Allow\",\"Principal\":\"*\",\
+                 \"Action\":\"svc:A\",\"Condition\":{\"NumericLessThan\":{\"k\":3600},\
+                 \"Bool\":{\"b\":true},\"Null\":{}}}}",
+                "{\n  \"Statement\" : {\n    \"Effect\" : \"Allow\",\n    \
+                 \"Principal\" : \"*\",\n    \"Action\" : \"svc:A\",\n    \
+                 \"Condition\" : {\n      \"NumericLessThan\" : {\n        \
+                 \"k\" : 3600\n      },\n      \"Bool\" : {\n        \"b\" : true\n      \
+                 },\n      \"Null\" : { }\n    }\n  }\n}",
+            ),
+            // Not JSON at all: a rendering is not a validation, so the text comes back as
+            // it came.
+            ("text that is not JSON", "not a policy", "not a policy"),
+        ];
+
+        for (case, submitted, expected) in rows {
+            let actual = canonical_document(submitted);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+            // The rendering is a fixed point, so a client that puts back what it read sees
+            // no drift.
+            let again = canonical_document(&actual);
+            assert_eq!(
+                again, actual,
+                "case {case:?}: expected re-rendering to change nothing, got {again:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_document_nested_past_the_rendered_limit_comes_back_unrendered() {
+        // Rows: exactly the nesting the renderer accepts, and one level past it. The
+        // nesting of a submitted document is the caller's, so the bound is the renderer's
+        // own rather than something it inherits from whoever parsed the text first.
+        for (case, objects, renders) in [
+            ("at the nesting bound", MAX_CANONICAL_NESTING - 1, true),
+            ("one level past the bound", MAX_CANONICAL_NESTING, false),
+        ] {
+            let mut document = String::new();
+            for _ in 0..objects {
+                document.push_str("{\"a\":");
+            }
+            document.push_str("\"x\"");
+            for _ in 0..objects {
+                document.push('}');
+            }
+
+            let actual = canonical_document(&document);
+            assert_eq!(
+                actual != document,
+                renders,
+                "case {case:?}: expected a {objects}-deep document to be \
+                 {}, got {} bytes",
+                if renders { "rendered" } else { "returned as it came" },
+                actual.len()
+            );
+            if renders {
+                assert!(
+                    actual.starts_with("{\n  \"a\" : "),
+                    "case {case:?}: expected the canonical layout, got {:?}",
+                    &actual[..actual.len().min(32)]
+                );
+            }
         }
     }
 
