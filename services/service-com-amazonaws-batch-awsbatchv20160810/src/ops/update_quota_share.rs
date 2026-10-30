@@ -14,8 +14,9 @@
 //! The refusals are `DescribeQuotaShare`'s, because the identifier is the same one: a
 //! `quotaShareArn` carrying no `job-queue/<queue>/quota-share/<share>` path is not a quota
 //! share ARN at all, and an ARN of that shape naming nothing stored is well-formed but
-//! unknown. Both are the modelled `ClientException` (HTTP 400), in the frontend envelope
-//! AWS is recorded to word the quota-share refusals in.
+//! unknown. Both are the modelled `ClientException` (HTTP 400): the first is the frontend's
+//! own refusal and carries its envelope, the second is this service's lookup missing and
+//! states its sentence bare, exactly as the reader words them.
 //!
 //! An accepted update leaves the share in the transient `UPDATING` status — the way
 //! `UpdateJobQueue` leaves a queue — and the move back to `VALID` is owed by the CLOCK
@@ -182,10 +183,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         if !state.quota_shares.contains_key(&input.quota_share_arn) {
+            // The same lookup the reader performs, and the same bare sentence when it
+            // misses: the frontend wraps only the refusals it raises itself, such as the
+            // ARN-pattern one above.
             return Err(UpdateQuotaShareErrorModeled::ClientException(
-                batch::client_exception_enveloped(batch::does_not_exist_sentence(
-                    &input.quota_share_arn,
-                )),
+                batch::client_exception(batch::does_not_exist_sentence(&input.quota_share_arn)),
             )
             .into());
         }

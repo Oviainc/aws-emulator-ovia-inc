@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteQuotaShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteQuotaShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteQuotaShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a quota share this service holds, identified by the ARN it is stored under —
+//! the only identifier this operation takes, as it is `DescribeQuotaShare`'s
+//! ([`crate::state::quota_share_arn`]).
+//!
+//! A value carrying no `job-queue/<queue>/quota-share/<share>` path is no quota-share ARN
+//! at all and names nothing to look up, which the frontend refuses before any lookup with
+//! the modelled `ClientException` (HTTP 400), inside the envelope it wraps its own refusals
+//! in ([`crate::state::client_exception_enveloped`]). An ARN of the right shape that names
+//! nothing stored is not refused: the removal it asks for has already happened, so it
+//! answers the empty success body and changes nothing, as every `Delete*` of this service
+//! does — unlike `DescribeQuotaShare` and `UpdateQuotaShare`, which have an answer to
+//! compute from the record and report it nonexistent.
+//!
+//! A share that still accepts work cannot be deleted — "You must first disable submissions
+//! for the share by updating the state to DISABLED using the UpdateQuotaShare operation" —
+//! and that precondition is stated in the sentence the quota-share API words it with
+//! ([`crate::state::QUOTA_SHARE_MUST_BE_DISABLED`]).
+//!
+//! An accepted delete answers its empty body and leaves the share in the non-terminal
+//! `DELETING` status: the removal itself is owed by the CLOCK
+//! ([`crate::state::JOB_PHASE_MILLIS`] later), materialised by whoever calls next, and with
+//! it the service jobs the share was carrying end — "All jobs in the share are eventually
+//! terminated when you delete a quota share." Repeating a delete already accepted asks for
+//! a removal the clock already owes, so it is the same success and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +154,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteQuotaShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteQuotaShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteQuotaShare"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(
+                DeleteQuotaShareErrorModeled::ServerException(batch::unreachable_state()).into(),
+            );
+        };
+        let now = batch::now_millis();
+        // The store's lock lives in THIS block and no longer, so nothing holds it while
+        // what `materialize_due` moved is published (that call reaches another service
+        // in-process).
+        {
+            let mut state = state.lock();
+            state.materialize_due(now);
+
+            // A value that is not a quota-share ARN at all is its OWN refusal: it names no
+            // job queue and no share, so there is nothing to look up.
+            if batch::parse_quota_share_arn(&input.quota_share_arn).is_none() {
+                return Err(DeleteQuotaShareErrorModeled::ClientException(
+                    batch::client_exception_enveloped(batch::QUOTA_SHARE_ARN_NOT_VALID),
+                )
+                .into());
+            }
+            let Some(share) = state.quota_shares.get(&input.quota_share_arn) else {
+                // A removal of something that is not there is ALREADY DONE: the post-state
+                // this call asks for already holds, so it answers its empty success body
+                // and changes nothing — the same rule every `Delete*` of this service
+                // follows (`DeleteJobQueue`, `DeleteComputeEnvironment`). Only the reading
+                // and updating operations, which have an answer to compute from the record,
+                // report an absent share as nonexistent.
+                return Ok(DeleteQuotaShareOutput {});
+            };
+            // A delete already accepted is in flight: repeating it asks for a removal the
+            // clock already owes, so it is the same success and changes nothing.
+            if share.status == batch::STATUS_DELETING {
+                return Ok(DeleteQuotaShareOutput {});
+            }
+            if share.state != batch::STATE_DISABLED {
+                // The precondition this operation documents ("You must first disable
+                // submissions for the share by updating the state to DISABLED"), in the
+                // sentence the quota-share API states it with
+                // ([`batch::QUOTA_SHARE_MUST_BE_DISABLED`]) — the service's own
+                // precondition, so it is stated bare.
+                return Err(DeleteQuotaShareErrorModeled::ClientException(
+                    batch::client_exception(batch::QUOTA_SHARE_MUST_BE_DISABLED),
+                )
+                .into());
+            }
+
+            // Accepted: the share enters `DELETING` now and stops existing when that move
+            // falls due (`state::materialize_due`), which is also when the jobs it carried
+            // end.
+            if let Some(share) = state.quota_shares.get_mut(&input.quota_share_arn) {
+                share.status = batch::STATUS_DELETING.to_string();
+                share.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+            }
+        }
+        batch::publish_job_state_changes(ctx, &*self.engine, &batch::request_region(ctx)).await;
+
+        Ok(DeleteQuotaShareOutput {})
     }
 }

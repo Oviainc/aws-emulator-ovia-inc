@@ -11,8 +11,10 @@
 //!
 //! A request naming a `jobQueue` this service does not hold is refused with the modelled
 //! `ClientException` (HTTP 400), and so is a name the queue already carries a share for.
-//! AWS is recorded to word the quota-share refusals in Batch's frontend envelope
-//! ([`crate::state::client_exception_enveloped`]).
+//! AWS is recorded to word THIS operation's refusals in Batch's frontend envelope
+//! ([`crate::state::client_exception_enveloped`]) — unlike the share lookups of
+//! `DescribeQuotaShare`, `UpdateQuotaShare` and `DeleteQuotaShare`, where a miss the service
+//! itself finds states its sentence bare.
 //!
 //! AWS Batch hands a fresh quota share back in the non-terminal `CREATING` status, so the
 //! move to `VALID` is owed by the CLOCK ([`crate::state::JOB_PHASE_MILLIS`] later) and is

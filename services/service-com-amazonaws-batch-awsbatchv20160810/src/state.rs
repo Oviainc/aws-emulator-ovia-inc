@@ -386,6 +386,15 @@ pub fn delete_enabled_message(kind: &str) -> String {
     format!("Cannot delete an enabled {kind}, set the state to {STATE_DISABLED} first.")
 }
 
+/// What `DeleteQuotaShare` answers for a share whose state still accepts submissions.
+///
+/// The same RULE as [`delete_enabled_message`] — a resource that still accepts work must be
+/// disabled before it can be deleted — in the sentence the quota-share API states it with,
+/// which is the one AWS is recorded to answer here. It carries nothing from the request:
+/// a share that is not [`STATE_DISABLED`] is by the model's own `QuotaShareState` enum
+/// exactly an enabled one.
+pub const QUOTA_SHARE_MUST_BE_DISABLED: &str = "Quota Share must be DISABLED before deleting.";
+
 /// What `UpdateComputeEnvironment` answers for a request carrying `computeResources` for
 /// an environment Batch does not manage: the fixed sentence for the rule, naming the
 /// environment by the ARN it is stored under.
@@ -415,6 +424,14 @@ pub const SERVICE_JOB_COMPLETED_NOT_UPDATABLE: &str =
 /// `DeleteJobQueue`'s own doc: "All jobs in the queue are eventually terminated when you
 /// delete a job queue."
 pub const JOB_QUEUE_DELETED_REASON: &str = "The job queue this job was submitted to was deleted";
+
+/// `statusReason` of a service job the deletion of its quota share ended.
+///
+/// `DeleteQuotaShare`'s own doc: "All jobs in the share are eventually terminated when you
+/// delete a quota share." Worded as [`JOB_QUEUE_DELETED_REASON`] is, naming the resource
+/// whose removal ended the job.
+pub const QUOTA_SHARE_DELETED_REASON: &str =
+    "The quota share this job was submitted to was deleted";
 
 /// `statusReason` of a service job whose work nothing here dispatched.
 ///
@@ -1440,7 +1457,9 @@ pub struct QuotaShare {
     pub state: String,
     /// `QuotaShareStatus`.
     pub status: String,
-    /// Set while the `CREATING` -> `VALID` move is still owed by the clock.
+    /// Set while a status move is still owed by the clock: the `CREATING` -> `VALID` move
+    /// a create left, the `UPDATING` -> `VALID` one an update left, or the `DELETING` span
+    /// a delete wrote, at the end of which the record stops existing.
     pub status_due_at: Option<i64>,
     pub tags: Option<HashMap<String, String>>,
 }
@@ -2314,8 +2333,8 @@ pub struct ComAmazonawsBatchAwsbatchv20160810State {
     /// [`limits::MAX_CONSUMABLE_RESOURCE_UPDATE_TOKENS`].
     consumable_resource_updates: HashMap<String, ConsumableResourceUpdate>,
     /// Quota shares by ARN — the only identifier `DescribeQuotaShare` takes. Bounded by
-    /// [`limits::MAX_QUOTA_SHARES`], and a share goes when the job queue it hangs off
-    /// does.
+    /// [`limits::MAX_QUOTA_SHARES`], and a share goes when its own `DeleteQuotaShare`
+    /// falls due, or when the job queue it hangs off does.
     pub quota_shares: BTreeMap<String, QuotaShare>,
     /// Job ids per queue ARN, in submission order, backing `ListJobs`.
     pub jobs_by_queue: HashMap<String, Vec<String>>,
@@ -2802,10 +2821,39 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 }
             }
         }
+        // A share leaves its transient status (`CREATING` after a create, `UPDATING` after
+        // an update) for `VALID` once the span the clock owes has elapsed, and stops
+        // existing when the removal a `DeleteQuotaShare` started falls due — the way a
+        // queue's and an environment's do above.
+        let mut deleted_shares: Vec<String> = Vec::new();
         for share in self.quota_shares.values_mut() {
             if share.status_due_at.is_some_and(|due| due <= now) {
-                share.status = STATUS_VALID.to_string();
                 share.status_due_at = None;
+                if share.status == STATUS_DELETING {
+                    deleted_shares.push(share.arn.clone());
+                } else {
+                    share.status = STATUS_VALID.to_string();
+                }
+            }
+        }
+        for key in deleted_shares {
+            if let Some(removed) = self.quota_shares.remove(&key) {
+                // "All jobs in the share are eventually terminated when you delete a quota
+                // share" (`DeleteQuotaShare`): the share's removal is when that falls due.
+                // A job names its share by name, so the share it belongs to is the one of
+                // that name on the queue the job was submitted to.
+                let carried: Vec<String> = self
+                    .service_jobs
+                    .values()
+                    .filter(|job| {
+                        job.job_queue_arn == removed.job_queue_arn
+                            && job.quota_share_name.as_deref() == Some(removed.name.as_str())
+                    })
+                    .map(|job| job.job_id.clone())
+                    .collect();
+                for id in carried {
+                    self.terminate_service_job(&id, QUOTA_SHARE_DELETED_REASON, now);
+                }
             }
         }
         self.advance_jobs(now);

@@ -135,10 +135,10 @@ async fn answers(batch: &Batch) -> Vec<Answer> {
         },
         Answer {
             // The scaffold's 501: an answer a still-stubbed operation produced.
-            label: "DeleteQuotaShare, a scaffolded operation".to_string(),
+            label: "TerminateServiceJobs, a scaffolded operation".to_string(),
             method: "POST",
-            uri: "/v1/deletequotashare".to_string(),
-            payload: Some(json!({"quotaShareArn": "arn:aws:batch:us-east-1:1:quota-share/qs"})),
+            uri: "/v1/terminateservicejobs".to_string(),
+            payload: Some(json!({"jobs": ["sj-reported"], "reason": "because"})),
             status: 501,
             stated: Stated::Nothing,
         },

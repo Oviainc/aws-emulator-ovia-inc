@@ -7,8 +7,10 @@
 //! Two refusals, and they are DIFFERENT: a `quotaShareArn` that carries no
 //! `job-queue/<queue>/quota-share/<share>` path is not a quota share ARN at all, while an
 //! ARN of that shape naming nothing stored is well-formed but unknown. Both are the
-//! modelled `ClientException` (HTTP 400), each saying which it is, in the frontend
-//! envelope AWS is recorded to word the quota-share refusals in.
+//! modelled `ClientException` (HTTP 400), each saying which it is. The pattern refusal is
+//! the FRONTEND's, raised before any lookup, so it carries the envelope that layer wraps
+//! its own refusals in; the unknown-share one is this service's own lookup missing, so it
+//! states its sentence bare ([`crate::state::does_not_exist_sentence`]).
 //!
 //! A REPORTING operation: it materialises what the clock already owed (the share's
 //! `CREATING` -> `VALID` move) and writes nothing else, so two reads at one instant answer
@@ -177,13 +179,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let Some(share) = state.quota_shares.get(&input.quota_share_arn) else {
-            // The resolver's refusal, in the envelope the quota-share refusals carry and
-            // terminated the way the resolvers that close the sentence do
-            // ([`batch::does_not_exist_sentence`]).
+            // The resolver's refusal, terminated the way the resolvers that close the
+            // sentence do ([`batch::does_not_exist_sentence`]). A lookup the SERVICE
+            // performs and misses states its sentence BARE, unlike the pattern refusal
+            // above, which the frontend raises and therefore wraps.
             return Err(DescribeQuotaShareErrorModeled::ClientException(
-                batch::client_exception_enveloped(batch::does_not_exist_sentence(
-                    &input.quota_share_arn,
-                )),
+                batch::client_exception(batch::does_not_exist_sentence(&input.quota_share_arn)),
             )
             .into());
         };
