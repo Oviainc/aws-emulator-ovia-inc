@@ -3623,6 +3623,66 @@ pub fn decode_scoped_page_token(scope: &str, token: &str) -> Option<String> {
     (!key.is_empty()).then_some(key)
 }
 
+/// The collection `ListAppsLists` pages: the applications lists this service
+/// stores ([`ComAmazonawsFmsAwsfms20180101State::apps_lists`]).
+pub const APPS_LISTS_PAGE: &str = "ListAppsLists";
+
+/// The collection `ListProtocolsLists` pages: the protocols lists this service
+/// stores ([`ComAmazonawsFmsAwsfms20180101State::protocols_lists`]), a different
+/// collection from the applications lists and keyed independently of them.
+pub const PROTOCOLS_LISTS_PAGE: &str = "ListProtocolsLists";
+
+/// The page one of the `DefaultLists`-selected listings serves: the namespace
+/// that member selects INSIDE the collection `collection` names.
+///
+/// Both halves are needed, and neither alone identifies the page: the two
+/// namespaces of one collection share its id space (so a namespace must be
+/// named), and the two collections are enumerated by different listings whose
+/// `ListId`s are minted independently of each other (so the collection must be
+/// named too). Neither a collection name nor a boolean contains the separator
+/// [`scoped_page_key`] joins with, so the stamp is unambiguous.
+fn namespaced_list_page_scope(collection: &str, default_lists: bool) -> String {
+    scoped_page_key(collection, &default_lists.to_string())
+}
+
+/// Encode a page boundary (the `ListId` the next page starts at) of the
+/// namespace `default_lists` selects in the list collection `collection` names,
+/// as an opaque `PaginationToken`.
+///
+/// The stamp is what lets [`decode_namespaced_list_page_token`] tell a boundary
+/// of THIS page from one minted for the other namespace or for the other
+/// collection; the encoding is [`encode_scoped_page_token`]'s, so these tokens
+/// stay inside the modelled `PaginationToken` pattern and length and stay opaque
+/// to a caller.
+pub fn encode_namespaced_list_page_token(
+    collection: &str,
+    default_lists: bool,
+    list_id: &str,
+) -> String {
+    encode_scoped_page_token(&namespaced_list_page_scope(collection, default_lists), list_id)
+}
+
+/// Decode a `PaginationToken` produced by [`encode_namespaced_list_page_token`]
+/// for the namespace `default_lists` of the collection `collection` names,
+/// yielding the `ListId` the next page starts at.
+///
+/// `None` when the token was not produced by this service, or was produced for
+/// the other namespace or for the other list collection: a `ListId` of another
+/// page is either absent from this one or sorts past lists this one does hold,
+/// so resuming from it would silently drop them.
+///
+/// The decoded boundary must still be a `ListId` ([`is_minted_identifier`]), the
+/// shape check this page class adds on top of the shared token-to-key step.
+pub fn decode_namespaced_list_page_token(
+    collection: &str,
+    default_lists: bool,
+    token: &str,
+) -> Option<String> {
+    let decoded =
+        decode_scoped_page_token(&namespaced_list_page_scope(collection, default_lists), token)?;
+    is_minted_identifier(&decoded).then_some(decoded)
+}
+
 /// Mint a fresh service-owned identifier: 36 lowercase hex characters, which
 /// satisfies the model's `PolicyId` pattern (`^[a-z0-9A-Z-]{36}$`, length 36)
 /// and also `PolicyUpdateToken`'s (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`, length

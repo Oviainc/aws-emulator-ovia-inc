@@ -150,6 +150,12 @@ mod resource_set_item_service_field;
 // Declared beside them, for the same reason: this suite's name sorts right into
 // the contended region of the list below. The suite itself is an ordinary
 // `tests/all/<name>.rs` file.
+#[path = "all/list_namespace_page_token_scoping.rs"]
+mod list_namespace_page_token_scoping;
+
+// Declared beside them, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
 #[path = "all/organization_roster_clock_reading.rs"]
 mod organization_roster_clock_reading;
 
