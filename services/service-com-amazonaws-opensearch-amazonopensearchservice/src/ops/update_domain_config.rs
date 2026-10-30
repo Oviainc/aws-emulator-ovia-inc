@@ -4,7 +4,8 @@
 //! IMPLEMENTED: merges the supplied option containers into the stored
 //! [`crate::state::Domain`] record, bumping the revision of each option it changed,
 //! and answers with the `DomainConfig` projection of the merged record. A `DryRun`
-//! computes the same answer without storing anything.
+//! computes the same answer without applying it, and a `Verbose` one records the
+//! analysis `DescribeDryRunProgress` then reports on.
 //!
 //! ## Shape of an operation
 //!
@@ -411,6 +412,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let name = input.domain_name.clone();
         let dry_run = input.dry_run.unwrap_or(false);
+        // The two members that decide what a dry run LEAVES BEHIND, captured before
+        // the merge below consumes the request: which analysis was asked for, and the
+        // advisory warning codes the caller accepted for the change.
+        let dry_run_mode = input.dry_run_mode.clone();
+        let accepted_warnings = input.accepted_warnings.clone().unwrap_or_default();
 
         let mut store = state.lock();
 
@@ -512,18 +518,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if dry_run {
             // "This flag, when set to True, specifies whether the UpdateDomain request
             // should return the results of a dry run analysis without actually
-            // applying the change." Nothing is written: the store still holds the
-            // record the settle above left, so a later read sees the old values.
+            // applying the change." The configuration is NOT applied: the store still
+            // holds the record the settle above left, so a later read sees the old
+            // values.
+            //
+            // What the mode asked for decides whether there is anything to report on
+            // afterwards. `Verbose` "runs an additional check to validate the changes
+            // you're making", which is the analysis `DescribeDryRunProgress` reports
+            // the progress of, so the run is RECORDED on the domain and this call
+            // answers the record it minted; `Basic` "only returns the type of
+            // deployment", which this answer already carries, so it starts no run and
+            // reports no progress status.
+            let dry_run_progress_status = if dry_run_mode.as_deref()
+                == Some(crate::state::DRY_RUN_MODE_VERBOSE)
+            {
+                store.settled_mut(&name, now).map(|domain| {
+                    domain
+                        .begin_dry_run(
+                            merged.to_status(),
+                            deployment,
+                            accepted_warnings,
+                            now,
+                        )
+                        .to_progress_status()
+                })
+            } else {
+                None
+            };
             return Ok(UpdateDomainConfigOutput {
                 domain_config: merged.to_config(),
                 dry_run_results: Some(DryRunResults {
                     deployment_type: Some(deployment.to_string()),
                     message: None,
                 }),
-                // A `DryRunProgressStatus` belongs to the asynchronous, verbose dry
-                // run `DescribeDryRunProgress` reports on; that operation is still a
-                // stub, so no dry run is tracked and none is reported.
-                dry_run_progress_status: None,
+                dry_run_progress_status,
             });
         }
 

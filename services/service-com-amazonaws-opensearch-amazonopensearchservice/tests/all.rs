@@ -69,6 +69,8 @@ mod domain_maintenance;
 mod domain_nodes;
 #[path = "all/domain_package_listing_cursor.rs"]
 mod domain_package_listing_cursor;
+#[path = "all/dry_run_progress.rs"]
+mod dry_run_progress;
 #[path = "all/ebs_volume_size_limit.rs"]
 mod ebs_volume_size_limit;
 #[path = "all/engine_version_resolution.rs"]

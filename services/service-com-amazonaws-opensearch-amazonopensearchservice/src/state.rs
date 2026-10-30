@@ -56,6 +56,7 @@ use crate::ops::types::{
     DomainPackageDetails,
     DomainStatus, EBSOptions,
     EBSOptionsStatus,
+    DryRunProgressStatus, DryRunResults,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus, ErrorDetails,
     ExportOptions,
     IAMFederationOptionsOutput, IPAddressTypeStatus, IamIdentityCenterOptions,
@@ -3250,8 +3251,9 @@ impl ConfigChange {
             config_change_status: Some(self.config_change_status().to_string()),
             initiated_by: Some(self.initiated_by.clone()),
             // Validation failures come from the pre-update validation check a verbose
-            // dry run runs (`DescribeDryRunProgress`), which is still a stub, so
-            // there are none to report.
+            // dry run runs, which reports them on the dry run's OWN record
+            // ([`DryRun::to_progress_status`], read by `DescribeDryRunProgress`)
+            // rather than on the change a later call applied.
             validation_failures: None,
             // Advisory warnings are accepted through the same verbose dry run.
             accepted_warnings: None,
@@ -3273,6 +3275,133 @@ impl ConfigChange {
             initiated_by: Some(self.initiated_by.clone()),
             start_time: Some(datetime(self.started_at)),
             last_updated_time: Some(datetime(self.last_updated_at)),
+        }
+    }
+}
+
+/// How many verbose dry runs one domain keeps, the same bound and for the same
+/// reason as [`CHANGE_HISTORY`]: a caller may ask for one before every update it is
+/// considering, so the record set a domain holds has to be bounded.
+pub const DRY_RUN_HISTORY: usize = 50;
+
+/// `DryRunMode`'s `Verbose` value (one of [`DRY_RUN_MODE_VALUES`]): the mode that
+/// "runs an additional check to validate the changes you're making", which is the
+/// analysis `DescribeDryRunProgress` reports the progress of. `Basic` "only returns
+/// the type of deployment (blue/green or dynamic) that the update will cause", which
+/// the update call answers from its own analysis, so it starts no run and leaves
+/// nothing to report on.
+pub const DRY_RUN_MODE_VERBOSE: &str = "Verbose";
+
+/// `DryRunProgressStatus$DryRunStatus` while the validation check the dry run runs
+/// has not finished — the status the call that started it answers with, so a caller
+/// polling straight after it still observes the analysis in flight.
+pub const DRY_RUN_STATUS_PENDING: &str = "PENDING";
+
+/// `DryRunProgressStatus$DryRunStatus` once that check has finished.
+pub const DRY_RUN_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// One verbose dry run on a domain: the analysis an `UpdateDomainConfig` carrying
+/// `DryRun` with `DryRunMode` [`DRY_RUN_MODE_VERBOSE`] started, which
+/// `DescribeDryRunProgress` reports the progress, the configuration and the results
+/// of.
+///
+/// A dry run applies NOTHING: it is "a pre-update dry run analysis", so the record
+/// holds the configuration the change WOULD have left the domain in — computed by
+/// the same merge the real update performs, on a copy of the domain — beside the
+/// deployment kind that change would need. It is [`DRY_RUN_STATUS_PENDING`] from the
+/// call that started it until the span the clock owes the analysis has passed
+/// ([`PROVISIONING`], the same span a configuration change takes), and
+/// [`DRY_RUN_STATUS_COMPLETED`] after — materialised by whichever later call reads
+/// the record ([`Self::settle`]), so nothing sleeps.
+#[derive(Debug, Clone)]
+pub struct DryRun {
+    /// `DryRunProgressStatus$DryRunId`: the GUID this run is addressed by.
+    pub dry_run_id: String,
+    /// `CreationDate`: the instant of the call that started the run.
+    pub started_at: SystemTime,
+    /// `UpdateDate`: the instant this run's status last moved.
+    pub last_updated_at: SystemTime,
+    /// When the clock owes this run its conclusion; `None` once it has concluded.
+    pub completes_at: Option<SystemTime>,
+    /// The `DomainStatus` of the configuration the change would leave the domain in
+    /// — "details about the changes you're planning to make on the domain", which
+    /// `DescribeDryRunProgress` answers as `DryRunConfig`.
+    ///
+    /// A projection rather than a domain record, because it describes a
+    /// configuration that was never applied and never will be by this run: there is
+    /// no live domain for it to be re-derived from, so it is held exactly as the
+    /// analysis computed it.
+    pub config: DomainStatus,
+    /// `DryRunResults$DeploymentType`: which of the four documented deployment kinds
+    /// applying the change would be, as the update path's own analysis decided.
+    pub deployment_type: String,
+    /// `AcceptedWarnings`: "the list of advisory warning codes that were accepted
+    /// for the configuration change", as the request that started the run carried
+    /// them.
+    pub accepted_warnings: Vec<String>,
+}
+
+impl DryRun {
+    /// Materialise the conclusion the clock owes this run, if `now` is past its due
+    /// instant.
+    ///
+    /// Dated at the DUE instant rather than at `now`, for the same reason a
+    /// configuration change's completion is ([`ConfigChange::settle`]): the
+    /// `UpdateDate` a caller reads does not move with the moment it happened to look.
+    fn settle(&mut self, now: SystemTime) {
+        let Some(due) = self.completes_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.completes_at = None;
+        self.last_updated_at = due;
+    }
+
+    /// Whether the analysis is still running.
+    pub fn in_progress(&self) -> bool {
+        self.completes_at.is_some()
+    }
+
+    /// `DryRunProgressStatus$DryRunStatus` for this run.
+    pub fn status(&self) -> &'static str {
+        if self.in_progress() {
+            DRY_RUN_STATUS_PENDING
+        } else {
+            DRY_RUN_STATUS_COMPLETED
+        }
+    }
+
+    /// This run as `DryRunProgressStatus` — what the call that starts it and
+    /// `DescribeDryRunProgress` both answer with, so the two can never report one run
+    /// differently.
+    pub fn to_progress_status(&self) -> DryRunProgressStatus {
+        DryRunProgressStatus {
+            dry_run_id: self.dry_run_id.clone(),
+            dry_run_status: self.status().to_string(),
+            creation_date: datetime_text(self.started_at),
+            update_date: datetime_text(self.last_updated_at),
+            // "The validation failures that occurred as a result of the dry run": a
+            // configuration this service cannot apply is refused by the update path
+            // itself, under the modelled error class for the rule it broke, and only
+            // a configuration that passed every one of those checks reaches a dry
+            // run — so a run that concluded found no failure, and one still running
+            // has found none yet.
+            validation_failures: Some(Vec::new()),
+            accepted_warnings: Some(self.accepted_warnings.clone()),
+        }
+    }
+
+    /// This run as `DryRunResults` — the same answer the call that started it gave,
+    /// from the same stored analysis.
+    pub fn to_results(&self) -> DryRunResults {
+        DryRunResults {
+            deployment_type: Some(self.deployment_type.clone()),
+            // "A message corresponding to the deployment type": this service's own
+            // wording for one is not published, and the deployment kind is already
+            // reported in `DeploymentType`, so none is invented.
+            message: None,
         }
     }
 }
@@ -4522,6 +4651,12 @@ pub struct Domain {
     /// newest is the one `DescribeDomainChangeProgress` reports when the request
     /// names no `ChangeId`.
     pub changes: VecDeque<ConfigChange>,
+    /// The verbose dry runs started against this domain, oldest first, bounded by
+    /// [`DRY_RUN_HISTORY`]: an `UpdateDomainConfig` asking for one mints the record
+    /// and `DescribeDryRunProgress` reports it, from THIS one record. A FIFO, because
+    /// the cap drops the oldest run and the newest is the one that operation reports
+    /// when the request names no `DryRunId`.
+    pub dry_runs: VecDeque<DryRun>,
     /// The node maintenance actions started on this domain, oldest first, bounded by
     /// [`MAINTENANCE_HISTORY`]: `StartDomainMaintenance` mints one and
     /// `GetDomainMaintenanceStatus` reports it, from THIS one record. A FIFO, because
@@ -4712,6 +4847,54 @@ impl Domain {
             .find(|change| change.change_id == change_id)
     }
 
+    /// Record the verbose dry run a call at `now` asked for, and answer it.
+    ///
+    /// `config` is the `DomainStatus` of the configuration the change would leave the
+    /// domain in and `deployment_type` the deployment kind it would need, both
+    /// computed by the update path's own analysis of a COPY of this record — nothing
+    /// about the domain itself moves, because a dry run applies nothing. The run is
+    /// [`DRY_RUN_STATUS_PENDING`] and the clock owes it its conclusion
+    /// ([`DryRun::settle`]), so a caller reading straight after the call still
+    /// observes the analysis in flight.
+    pub fn begin_dry_run(
+        &mut self,
+        config: DomainStatus,
+        deployment_type: &str,
+        accepted_warnings: Vec<String>,
+        now: SystemTime,
+    ) -> DryRun {
+        let run = DryRun {
+            dry_run_id: new_dry_run_id(),
+            started_at: now,
+            last_updated_at: now,
+            completes_at: Some(now + PROVISIONING),
+            config,
+            deployment_type: deployment_type.to_string(),
+            accepted_warnings,
+        };
+        self.dry_runs.push_back(run.clone());
+        // The history is bounded the same way the configuration changes are: past
+        // its cap the oldest run is dropped.
+        while self.dry_runs.len() > DRY_RUN_HISTORY {
+            self.dry_runs.pop_front();
+        }
+        run
+    }
+
+    /// The most recent dry run, which `DescribeDryRunProgress` reports when the
+    /// request names no `DryRunId`.
+    pub fn latest_dry_run(&self) -> Option<&DryRun> {
+        self.dry_runs.back()
+    }
+
+    /// The dry run `dry_run_id` names, or `None` when this domain's history holds no
+    /// such run.
+    pub fn dry_run(&self, dry_run_id: &str) -> Option<&DryRun> {
+        self.dry_runs
+            .iter()
+            .find(|run| run.dry_run_id == dry_run_id)
+    }
+
     /// Start the engine version upgrade — or the upgrade eligibility check — a call at
     /// `now` asked for, and answer the record it created.
     ///
@@ -4814,6 +4997,12 @@ impl Domain {
     pub fn settle(&mut self, now: SystemTime) {
         for change in &mut self.changes {
             change.settle(now);
+        }
+        // A verbose dry run is owed its conclusion by the same clock, and on the same
+        // span: it analyses a change rather than applying one, so it is not one of the
+        // domain's configuration changes.
+        for run in &mut self.dry_runs {
+            run.settle(now);
         }
         // A node maintenance action is owed its run by the same clock, on its own
         // spans: it is not one of the domain's configuration changes.
@@ -8945,6 +9134,13 @@ pub fn new_upgrade_id() -> String {
     new_guid()
 }
 
+/// `DryRunProgressStatus$DryRunId`: "the unique identifier of the dry run", a `GUID`
+/// like every other id this service hands out ([`new_guid`]), so no two runs share
+/// one.
+fn new_dry_run_id() -> String {
+    new_guid()
+}
+
 /// `DomainStatus$DomainId`: the account the domain belongs to and its name.
 pub fn domain_id(domain_name: &str) -> String {
     format!("{}/{domain_name}", ::engine::emulator_account_id())
@@ -9008,6 +9204,15 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// A `SystemTime` as the modelled `UpdateTimestamp` type.
 pub fn datetime(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
+}
+
+/// A `SystemTime` as the TEXT a member modelled a string carries an instant as:
+/// date-time, which is how this service's string-typed timestamps
+/// (`DryRunProgressStatus$CreationDate`, `$UpdateDate`) are written.
+pub fn datetime_text(at: SystemTime) -> String {
+    datetime(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
 }
 
 /// What this service says of a name that names no stored domain, in whichever
@@ -9181,6 +9386,23 @@ pub fn change_not_found(domain_name: &str, change_id: Option<&str>) -> ResourceN
                 format!("Change not found for domain {domain_name}: {change_id}")
             }
             None => format!("No configuration change found for domain {domain_name}"),
+        }),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a `DryRunId` a domain's history holds
+/// no dry run for, and for a domain on which no dry run was ever started.
+///
+/// Worded as this service words every other miss of a record held ON a domain (a
+/// configuration change, a maintenance action): the domain the request named and,
+/// where it named one, the id it asked for.
+pub fn dry_run_not_found(domain_name: &str, dry_run_id: Option<&str>) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(match dry_run_id {
+            Some(dry_run_id) => {
+                format!("Dry run not found for domain {domain_name}: {dry_run_id}")
+            }
+            None => format!("No dry run found for domain {domain_name}"),
         }),
     }
 }

@@ -433,6 +433,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The change this create starts is recorded by `begin_change` below,
             // once every option it set has a revision.
             changes: VecDeque::new(),
+            // No dry run has been asked for on a domain this create has just minted;
+            // an `UpdateDomainConfig` asking for a verbose one is what records the
+            // first.
+            dry_runs: VecDeque::new(),
             // No maintenance action has been started on a domain this create has
             // just minted; `StartDomainMaintenance` is what records one.
             maintenances: VecDeque::new(),

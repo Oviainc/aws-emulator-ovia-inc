@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDryRunProgress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDryRunProgress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDryRunProgress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the verbose dry run an `UpdateDomainConfig` started on the
+//! domain — the run the request names, or the domain's most recent one — from the
+//! [`crate::state::DryRun`] record that call minted, and refuses a domain or a
+//! `DryRunId` that has none with the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDryRunProgress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDryRunProgressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDryRunProgress"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `GUID`'s own pattern is 8-4-4-4-12 hexadecimal groups. The request boundary
+        // enforces the length bound but not the pattern, so an id of the right length
+        // that is not a GUID is refused here as the modelled `ValidationException` — it
+        // is a malformed request, not a dry run that happens not to exist.
+        if let Some(dry_run_id) = input.dry_run_id.as_deref() {
+            if !crate::state::is_guid(dry_run_id) {
+                return Err(DescribeDryRunProgressErrorModeled::ValidationException(
+                    crate::state::malformed_guid("DryRunId", dry_run_id),
+                )
+                .into());
+            }
+        }
+
+        // Reporting progress materialises only what the clock already owed at `now`: a
+        // dry run whose analysis span has passed has concluded whether or not anybody
+        // asked. Nothing else about the record changes on a read.
+        let domain = store
+            .settled_mut(&input.domain_name, now)
+            .ok_or_else(|| {
+                DescribeDryRunProgressErrorModeled::ResourceNotFoundException(
+                    crate::state::domain_not_found(&input.domain_name),
+                )
+            })?;
+
+        // "The unique identifier of the dry run" addresses one run of this domain's
+        // history; a request naming none asks about the latest, which is the run the
+        // call that started it handed the caller. A domain on which no dry run was ever
+        // started, and an id whose history holds no run, name no resource — so each is
+        // the modelled not-found refusal rather than a progress record for an analysis
+        // nothing performed.
+        let run = match input.dry_run_id.as_deref() {
+            Some(dry_run_id) => domain.dry_run(dry_run_id),
+            None => domain.latest_dry_run(),
+        }
+        .ok_or_else(|| {
+            DescribeDryRunProgressErrorModeled::ResourceNotFoundException(
+                crate::state::dry_run_not_found(&input.domain_name, input.dry_run_id.as_deref()),
+            )
+        })?;
+
+        Ok(DescribeDryRunProgressOutput {
+            dry_run_progress_status: Some(run.to_progress_status()),
+            // "Whether to include the configuration of the dry run in the response. The
+            // configuration specifies the updates that you're planning to make on the
+            // domain" — so the planned configuration is carried exactly for the caller
+            // that asked for it.
+            dry_run_config: input
+                .load_dry_run_config
+                .unwrap_or(false)
+                .then(|| run.config.clone()),
+            // "The results of the dry run": the analysis the run performed, which is the
+            // same answer the call that started it gave.
+            dry_run_results: Some(run.to_results()),
+        })
     }
 }
