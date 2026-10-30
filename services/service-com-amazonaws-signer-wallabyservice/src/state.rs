@@ -1077,7 +1077,12 @@ impl TaggingArnProblem {
     }
 
     /// The prose beside the code, built from the request's own ARN.
+    ///
+    /// `resourceArn` is a bare string in the model, so the value is quoted
+    /// through the one ceiling this crate states for a request value a clause
+    /// carries ([`stated_value`]).
     pub fn message(self, resource_arn: &str) -> String {
+        let resource_arn = stated_value(resource_arn);
         match self {
             Self::Malformed => {
                 format!("{resource_arn} is not a valid signing profile resource ARN")
@@ -1495,8 +1500,14 @@ pub fn signing_platform(platform_id: &str) -> Option<&'static SigningPlatformEnt
 /// Says the id was WELL FORMED and unknown — a platform another endpoint may
 /// publish, or one that was withdrawn. An id that is not a platform id at all is
 /// a different answer ([`platform_id_pattern_refusal`]).
+///
+/// `PlatformId` is a bare string in the model, so a value the published
+/// character class admits reaches here at any length: the id is quoted through
+/// the one ceiling this crate states for a request value a clause carries
+/// ([`stated_value`]), the same ceiling the syntax refusal of this very member
+/// applies.
 pub fn platform_not_found_message(platform_id: &str) -> String {
-    format!("Platform with id {platform_id} does not exist")
+    format!("Platform with id {} does not exist", stated_value(platform_id))
 }
 
 /// The refusal prose for a `profileVersion` the named profile has never had.
@@ -1557,7 +1568,15 @@ const MAX_STATED_VALUE: usize = 16 * 1024;
 /// Rendering only: the value is checked against the published class UNELIDED
 /// ([`satisfies_platform_id_pattern`]), because a decision taken on a prefix
 /// would refuse a long value the class admits.
-fn stated_value(value: &str) -> String {
+///
+/// The ONE place this crate quotes a request value whose member the model puts
+/// no length on — a `platformId`, a tagging `resourceArn`, a `jobId`, a
+/// permission's `statementId`, `revisionId` or `action` — so every clause of
+/// every operation carries the same ceiling and no refusal is sized by the
+/// request. A member the model DOES bound (an `Arn`, a `ProfileName`, a
+/// `ProfileVersion`, an `AccountId`, a `TagKey`, an enumerated value) is already
+/// bounded when the boundary validator admits it, and is quoted as it arrived.
+pub fn stated_value(value: &str) -> String {
     if value.len() <= MAX_STATED_VALUE {
         return value.to_string();
     }

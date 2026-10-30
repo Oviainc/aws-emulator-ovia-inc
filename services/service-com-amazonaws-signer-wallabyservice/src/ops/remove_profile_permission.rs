@@ -125,11 +125,15 @@ fn profile_not_found(profile_name: &str) -> RemoveProfilePermissionError {
 /// The modelled 404 for a statement id the profile's permission policy does not
 /// hold — including the case where the profile holds no policy at all, which is a
 /// policy holding no statement of that id.
+///
+/// `statementId` is a bare string in the model, so it is quoted through the one
+/// ceiling this crate states for a request value a clause carries.
 fn statement_not_found(profile_name: &str, statement_id: &str) -> RemoveProfilePermissionError {
     RemoveProfilePermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(format!(
-            "statement id {statement_id} does not exist in the permissions of profile \
-             {profile_name}"
+            "statement id {} does not exist in the permissions of profile \
+             {profile_name}",
+            crate::state::stated_value(statement_id)
         )),
         code: Some(crate::state::ERROR_CODE_NOT_FOUND.to_string()),
     })
@@ -206,10 +210,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if policy.revision_id != input.revision_id {
             return Err(
                 RemoveProfilePermissionErrorModeled::ConflictException(ConflictException {
+                    // `revisionId` is a bare string in the model, so it is
+                    // quoted through the one ceiling this crate states for a
+                    // request value a clause carries.
                     message: Some(format!(
                         "revision id {} is not the current revision of the permissions of \
                          profile {}",
-                        input.revision_id, input.profile_name
+                        crate::state::stated_value(&input.revision_id),
+                        input.profile_name
                     )),
                     code: Some(crate::state::permissions::ERROR_CODE_CONFLICT.to_string()),
                 })

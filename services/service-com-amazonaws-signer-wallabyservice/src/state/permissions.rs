@@ -47,10 +47,15 @@ pub fn is_grantable_action(action: &str) -> bool {
 /// The refusal prose for an `action` outside the documented catalog: the member,
 /// the value and the values the member admits, so the caller can fix the request
 /// from the text alone.
+///
+/// `action` is a bare string in the model, so it is quoted through the one
+/// ceiling this crate states for a request value a clause carries
+/// ([`super::stated_value`]).
 pub fn ungrantable_action_message(action: &str) -> String {
     format!(
-        "action {action} is not an AWS Signer action that can be granted to another account; \
+        "action {} is not an AWS Signer action that can be granted to another account; \
          expected one of {}",
+        super::stated_value(action),
         GRANTABLE_ACTIONS.join(", ")
     )
 }

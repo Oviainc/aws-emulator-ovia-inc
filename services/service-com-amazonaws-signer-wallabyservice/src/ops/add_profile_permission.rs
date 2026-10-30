@@ -270,9 +270,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|policy| policy.revision_id.clone());
         if let Some(named) = input.revision_id.as_deref() {
             if current_revision.as_deref() != Some(named) {
+                // `revisionId` is a bare string in the model, so it is quoted
+                // through the one ceiling this crate states for a request value
+                // a clause carries.
                 return Err(conflict(format!(
-                    "revision id {named} is not the current revision of the permissions of \
+                    "revision id {} is not the current revision of the permissions of \
                      profile {}",
+                    crate::state::stated_value(named),
                     input.profile_name
                 )));
             }
@@ -286,7 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(conflict(format!(
                 "statement id {} already exists in the permissions of profile {}",
-                input.statement_id, input.profile_name
+                crate::state::stated_value(&input.statement_id),
+                input.profile_name
             )));
         }
 

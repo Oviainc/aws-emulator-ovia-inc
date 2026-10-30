@@ -194,7 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // answers, so it is not the profile one.
                 DescribeSigningJobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!("Signing job not found for id {}", input.job_id)),
+                        // `jobId` is a bare string in the model, so the id is
+                        // quoted through the one ceiling this crate states for a
+                        // request value a clause carries.
+                        message: Some(format!(
+                            "Signing job not found for id {}",
+                            crate::state::stated_value(&input.job_id)
+                        )),
                         code: Some(crate::state::ERROR_CODE_JOB_NOT_FOUND.to_string()),
                     },
                 )
