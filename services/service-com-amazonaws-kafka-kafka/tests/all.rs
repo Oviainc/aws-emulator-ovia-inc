@@ -83,6 +83,8 @@ mod refusal_wording;
 mod replication_end_naming;
 #[path = "all/replication_info_update.rs"]
 mod replication_info_update;
+#[path = "all/replicator_input_cardinality.rs"]
+mod replicator_input_cardinality;
 #[path = "all/replicator_lifecycle.rs"]
 mod replicator_lifecycle;
 #[path = "all/replicator_listing.rs"]

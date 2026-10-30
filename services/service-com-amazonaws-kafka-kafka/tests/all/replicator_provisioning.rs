@@ -115,7 +115,9 @@ fn create_body(name: &str, clusters: &[&str], extra: Value) -> Value {
             .iter()
             .map(|arn| json!({
                 "amazonMskCluster": { "mskClusterArn": arn },
-                "vpcConfig": { "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa"] },
+                "vpcConfig": {
+                    "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"],
+                },
             }))
             .collect::<Vec<_>>(),
         "replicationInfoList": [{
@@ -446,13 +448,15 @@ async fn an_omitted_member_is_reported_with_the_value_the_service_applied() {
                     {
                         "amazonMskCluster": { "mskClusterArn": source.as_str() },
                         "vpcConfig": {
-                            "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa"],
+                            "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"],
                             "securityGroupIds": ["sg-aaaaaaaaaaaaaaaaa"],
                         },
                     },
                     {
                         "amazonMskCluster": { "mskClusterArn": target.as_str() },
-                        "vpcConfig": { "subnetIds": ["subnet-bbbbbbbbbbbbbbbbb"] },
+                        "vpcConfig": {
+                            "subnetIds": ["subnet-bbbbbbbbbbbbbbbbb", "subnet-ccccccccccccccccc"],
+                        },
                     },
                 ],
                 "replicationInfoList": [{

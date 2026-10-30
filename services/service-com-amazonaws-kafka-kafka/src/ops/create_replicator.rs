@@ -18,12 +18,18 @@
 //!
 //! The SUBNETS each `KafkaClusters` entry names
 //! (`KafkaClusterClientVpcConfig$SubnetIds`) are a different matter: the
-//! replicator's own client interfaces are created in them, and they are EC2's
-//! resources rather than this service's, so they are resolved against the account's
-//! EC2 inventory ([`crate::state::network::placement_subnet_refusal`]) before any
-//! ARN is minted — a subnet the account does not have is a `BadRequestException`
-//! and no replicator record is written. Those interfaces are only ever created for
-//! a setup whose clusters resolve, so that gate runs only when the clusters did.
+//! replicator's own client interfaces are created in them, one per Availability
+//! Zone, so a list that does not span the two or three Availability Zones a client
+//! VPC configuration spans ([`crate::state::MIN_CLIENT_VPC_SUBNETS`]) is refused
+//! from the request alone, before anything is resolved — as is a `KafkaClusters`
+//! list that does not name the one source and the one target a replicator
+//! replicates between ([`crate::state::KAFKA_CLUSTERS_PER_REPLICATOR`]). The
+//! subnets themselves are EC2's resources rather than this service's, so what the
+//! admitted list names is resolved against the account's EC2 inventory
+//! ([`crate::state::network::placement_subnet_refusal`]) before any ARN is minted —
+//! a subnet the account does not have is a `BadRequestException` and no replicator
+//! record is written. Those interfaces are only ever created for a setup whose
+//! clusters resolve, so that gate runs only when the clusters did.
 //!
 //! Authentication is NOT this handler's business: the emulator verifies every
 //! request signature centrally (see `AGENTS.md`), so the modelled
@@ -225,35 +231,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Checked BEFORE the state lock is taken: these depend on the request
         // alone, so the registry mutex is held only for the state-dependent work.
         //
-        // The two list ceilings come first, so the loops below — and every later
-        // read of the record they produce — walk a bounded request. A replicator
-        // stores both its cluster list and its replication list, and every reader
-        // resolves each replication against the cluster list, so a create with
-        // caller-sized lists would otherwise size the work of each later
-        // Describe/List call.
-        for (member, submitted, ceiling) in [
-            (
-                "KafkaClusters",
-                input.kafka_clusters.len(),
-                crate::state::MAX_CLUSTERS_PER_REPLICATOR,
-            ),
-            (
-                "ReplicationInfoList",
-                input.replication_info_list.len(),
-                crate::state::MAX_FLOWS_PER_REPLICATOR,
-            ),
-        ] {
-            if submitted > ceiling {
-                return Err(CreateReplicatorErrorModeled::BadRequestException(
-                    BadRequestException {
-                        invalid_parameter: Some(member.to_string()),
-                        message: Some(format!(
-                            "{member} may hold at most {ceiling} entries, not {submitted}."
-                        )),
-                    },
-                )
-                .into());
-            }
+        // The CARDINALITY of each caller-sized list comes first, so the loops
+        // below — and every later read of the record they produce — walk a
+        // bounded request. A replicator stores both its cluster list and its
+        // replication list, and every reader resolves each replication against
+        // the cluster list, so a create with caller-sized lists would otherwise
+        // size the work of each later Describe/List call.
+        //
+        // `KafkaClusters` names the replicator's source and its target, so the
+        // count is EXACT rather than a ceiling, and a list of any other length is
+        // refused with the service's own fixed sentence for it — before the
+        // entries are read, so the answer rests on the count alone.
+        if input.kafka_clusters.len() != crate::state::KAFKA_CLUSTERS_PER_REPLICATOR {
+            return Err(
+                CreateReplicatorErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("kafkaClusters".to_string()),
+                    message: Some(crate::state::KAFKA_CLUSTER_COUNT_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+        if input.replication_info_list.len() > crate::state::MAX_FLOWS_PER_REPLICATOR {
+            return Err(
+                CreateReplicatorErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ReplicationInfoList".to_string()),
+                    message: Some(format!(
+                        "ReplicationInfoList may hold at most {} entries, not {}.",
+                        crate::state::MAX_FLOWS_PER_REPLICATOR,
+                        input.replication_info_list.len()
+                    )),
+                })
+                .into(),
+            );
         }
 
         // `Tags` goes through the ONE admission check every tag write uses, so a
@@ -297,6 +306,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // Each entry also names the subnets the replicator's own client network
+        // interfaces to that cluster are created in
+        // (`KafkaClusterClientVpcConfig$SubnetIds`), and MSK places those
+        // interfaces one per Availability Zone across the two or three a client
+        // VPC configuration spans — so a list outside that range names a
+        // placement the service does not admit, whatever the ids in it are. The
+        // refusal is the service's fixed sentence for it, naming the member as
+        // the wire spells it, and it is answered for EVERY entry — an entry
+        // carrying no client VPC configuration at all names no subnet, which is
+        // the same count and the same answer — before any ARN is minted, so a
+        // create MSK would refuse leaves no replicator behind.
+        if input.kafka_clusters.iter().any(|cluster| {
+            let named = cluster
+                .vpc_config
+                .as_ref()
+                .map_or(0, |config| config.subnet_ids.len());
+            !(crate::state::MIN_CLIENT_VPC_SUBNETS..=crate::state::MAX_CLIENT_VPC_SUBNETS)
+                .contains(&named)
+        }) {
+            return Err(
+                CreateReplicatorErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("subnetIds".to_string()),
+                    message: Some(crate::state::SUBNET_COUNT_MESSAGE.to_string()),
+                })
+                .into(),
+            );
         }
 
         for (index, info) in input.replication_info_list.iter().enumerate() {

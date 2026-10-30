@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_kafka_kafka::state::{
-    MAX_CLUSTERS_PER_REPLICATOR, MAX_FLOWS_PER_REPLICATOR, MAX_TAGS_PER_REPLICATOR,
-    REPLICATOR_ACTIVATION_DELAY, REPLICATOR_STATE_DELETING,
+    MAX_FLOWS_PER_REPLICATOR, MAX_TAGS_PER_REPLICATOR, REPLICATOR_ACTIVATION_DELAY,
+    REPLICATOR_STATE_DELETING,
 };
 
 use crate::kafka_harness::{assert_name_already_exists, pct, Emulator, Reply, ACCOUNT, REGION};
@@ -159,7 +159,9 @@ impl ClusterRef {
                     "apacheKafkaClusterId": id,
                     "bootstrapBrokerString": format!("b-1.{id}.example.internal:9092"),
                 },
-                "vpcConfig": { "subnetIds": ["subnet-ccccccccccccccccc"] },
+                "vpcConfig": {
+                    "subnetIds": ["subnet-ccccccccccccccccc", "subnet-ddddddddddddddddd"],
+                },
                 "encryptionInTransit": { "encryptionType": "TLS" },
             }),
         };
@@ -594,18 +596,17 @@ async fn describe_reports_exactly_what_was_created() {
         },
         ReplicatorRequest {
             clusters: vec![
-                ClusterRef::msk("fan-out-source"),
-                ClusterRef::msk("fan-out-first"),
-                ClusterRef::msk("fan-out-second"),
+                ClusterRef::msk("two-flow-source"),
+                ClusterRef::msk("two-flow-target"),
             ],
-            flows: vec![Flow::new(0, 1, "SNAPPY"), Flow::new(0, 2, "LZ4")],
+            flows: vec![Flow::new(0, 1, "SNAPPY"), Flow::new(1, 0, "LZ4")],
             tags: tags(&[("env", "test"), ("owner", "msk"), ("team", "data")]),
             log_delivery: Some(json!({
                 "replicatorLogDelivery": {
                     "s3": { "enabled": true, "bucket": "msk-replicator-logs", "prefix": "repl/" },
                 },
             })),
-            ..ReplicatorRequest::named("fan-out")
+            ..ReplicatorRequest::named("two-flows")
         },
         ReplicatorRequest {
             description: Some("z".repeat(1024)),
@@ -886,15 +887,20 @@ async fn a_flow_between_one_cluster_is_refused() {
     // Rows span how the two ends can collide: the same MSK cluster named by ARN,
     // the same Apache Kafka cluster named by id, an MSK cluster and an Apache
     // cluster that resolve to one alias, and a collision in the SECOND flow of a
-    // multi-flow request (so the check is per flow, not only on the first).
+    // multi-flow request (so the check is per flow, not only on the first). Each
+    // row names the two Kafka clusters a replicator spans and has a flow point
+    // BOTH of its ends at one of them.
     let refused = vec![
         ReplicatorRequest {
-            clusters: vec![ClusterRef::msk("loop-msk")],
+            clusters: vec![ClusterRef::msk("loop-msk"), ClusterRef::msk("loop-other")],
             flows: vec![Flow::new(0, 0, "NONE")],
             ..ReplicatorRequest::named("same-msk-arn")
         },
         ReplicatorRequest {
-            clusters: vec![ClusterRef::apache("loop-apache")],
+            clusters: vec![
+                ClusterRef::apache("loop-apache"),
+                ClusterRef::apache("loop-apache-other"),
+            ],
             flows: vec![Flow::new(0, 0, "GZIP")],
             ..ReplicatorRequest::named("same-apache-id")
         },
@@ -1104,17 +1110,14 @@ async fn a_request_past_a_per_replicator_ceiling_is_refused() {
     let emulator = Emulator::new();
 
     // One row per published ceiling, each tested AT the bound and one past it —
-    // `(member, accepted row, refused row)`.
+    // `(member, accepted row, refused row)`. `KafkaClusters` carries no ceiling: a
+    // replicator spans exactly its source and its target, which
+    // `crate::replicator_input_cardinality` tests on both sides of that count.
     let rows = vec![
         (
-            "KafkaClusters",
-            sized("clusters-at", MAX_CLUSTERS_PER_REPLICATOR, 1, 0),
-            sized("clusters-past", MAX_CLUSTERS_PER_REPLICATOR + 1, 1, 0),
-        ),
-        (
             "ReplicationInfoList",
-            sized("flows-at", 3, MAX_FLOWS_PER_REPLICATOR, 0),
-            sized("flows-past", 3, MAX_FLOWS_PER_REPLICATOR + 1, 0),
+            sized("flows-at", 2, MAX_FLOWS_PER_REPLICATOR, 0),
+            sized("flows-past", 2, MAX_FLOWS_PER_REPLICATOR + 1, 0),
         ),
         (
             "Tags",
@@ -1178,31 +1181,45 @@ async fn a_kafka_cluster_that_identifies_nothing_is_refused() {
     });
 
     // Rows differ in where the unidentified entry sits and what else it carries:
-    // the only entry carrying nothing, the SECOND of two (so the check is per
-    // entry, not only on the first), and one carrying every member a
-    // `KafkaCluster` models EXCEPT a cluster identity.
+    // the FIRST of two, the SECOND of two (so the check is per entry, not only on
+    // the first), and one carrying every member a `KafkaCluster` models EXCEPT a
+    // cluster identity. Each row names the two entries a replicator spans, so the
+    // answer is about the entry that identifies nothing.
     let rows: Vec<(&str, Vec<Value>, &str)> = vec![
-        ("only-entry", vec![json!({})], "KafkaClusters[0]"),
+        (
+            "first-entry",
+            vec![json!({}), ClusterRef::msk("identified-target").to_json()],
+            "KafkaClusters[0]",
+        ),
         (
             "second-entry",
             vec![
                 ClusterRef::msk("identified").to_json(),
-                json!({ "vpcConfig": { "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa"] } }),
+                json!({
+                    "vpcConfig": {
+                        "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"],
+                    },
+                }),
             ],
             "KafkaClusters[1]",
         ),
         (
             "everything-but-identity",
-            vec![json!({
-                "vpcConfig": { "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa"] },
-                "encryptionInTransit": { "encryptionType": "TLS" },
-                "clientAuthentication": {
-                    "mTLS": {
-                        "secretArn":
-                            "arn:aws:secretsmanager:us-west-2:000000000000:secret:AmazonMSK_mtls",
+            vec![
+                json!({
+                    "vpcConfig": {
+                        "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"],
                     },
-                },
-            })],
+                    "encryptionInTransit": { "encryptionType": "TLS" },
+                    "clientAuthentication": {
+                        "mTLS": {
+                            "secretArn":
+                                "arn:aws:secretsmanager:us-west-2:000000000000:secret:AmazonMSK_mtls",
+                        },
+                    },
+                }),
+                ClusterRef::msk("identified-target").to_json(),
+            ],
             "KafkaClusters[0]",
         ),
     ];

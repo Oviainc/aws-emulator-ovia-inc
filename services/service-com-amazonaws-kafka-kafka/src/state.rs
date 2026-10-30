@@ -472,15 +472,16 @@ pub const REPLICATOR_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 /// can only be reached by a caller trying to exhaust the emulator.
 pub const MAX_REPLICATORS_IN_REGISTRY: usize = 1024;
 
-/// The most `KafkaClusters` entries one replicator may hold.
+/// The most `KafkaClusters` entries one replicator RECORD may hold.
 ///
 /// CHOSEN, not an AWS quota (the model declares `__listOfKafkaCluster` with no
 /// `length` trait): a replicator's cluster list and its replication list are both
 /// caller-sized, and every reader resolves each replication against the cluster
 /// list, so without ceilings on BOTH one create would size the work of every
-/// later read. Sized far above any real setup — AWS Replicator documents
-/// replication between a source and a target — so a realistic client never meets
-/// it, while the product with [`MAX_FLOWS_PER_REPLICATOR`] stays small.
+/// later read. `CreateReplicator` admits exactly
+/// [`KAFKA_CLUSTERS_PER_REPLICATOR`] entries, so this is the backstop the
+/// record-building path keeps rather than a bound a caller meets, and the product
+/// with [`MAX_FLOWS_PER_REPLICATOR`] stays small.
 pub const MAX_CLUSTERS_PER_REPLICATOR: usize = 16;
 
 /// The most `ReplicationInfoList` entries one replicator may hold. CHOSEN for the
@@ -488,6 +489,43 @@ pub const MAX_CLUSTERS_PER_REPLICATOR: usize = 16;
 /// [`MAX_CLUSTERS_PER_REPLICATOR`]: a replicator cannot hold more distinct
 /// ordered cluster pairs than this anyway.
 pub const MAX_FLOWS_PER_REPLICATOR: usize = 32;
+
+/// How many Kafka clusters ONE replicator replicates between.
+///
+/// A replicator carries one source and one target — `KafkaClusters` is documented
+/// as the "Kafka Clusters to use in setting up sources / targets for replication"
+/// and every `ReplicationInfo` names one of each — so the list names exactly that
+/// many, and a create naming any other number is refused with
+/// [`KAFKA_CLUSTER_COUNT_MESSAGE`] before anything is minted. The model declares no
+/// `length` on `__listOfKafkaCluster`, so the service is what states the count; the
+/// behavioural record for a list of one is that refusal rather than a replicator.
+pub const KAFKA_CLUSTERS_PER_REPLICATOR: usize = 2;
+
+/// What MSK answers a `KafkaClusters` list that does not name
+/// [`KAFKA_CLUSTERS_PER_REPLICATOR`] clusters: fixed text end to end, carrying
+/// neither the submitted count nor the required one.
+pub const KAFKA_CLUSTER_COUNT_MESSAGE: &str = "Too many or too few kafka clusters specified.";
+
+/// The fewest subnets ONE Kafka cluster's client VPC configuration may name
+/// (`KafkaClusterClientVpcConfig$SubnetIds`, "The list of subnets in the client VPC
+/// to connect to").
+///
+/// Amazon MSK creates the elastic network interfaces a replicator reaches a Kafka
+/// cluster through one per Availability Zone, and a client VPC configuration spans
+/// two or three of them — the same two-or-three-Availability-Zone placement MSK
+/// requires of a cluster's own client subnets. The model declares no `length` on the
+/// list, so the count is the service's rule: a list outside this range describes a
+/// placement MSK does not admit and is refused with [`SUBNET_COUNT_MESSAGE`], which
+/// is what the behavioural record shows for a list of one.
+pub const MIN_CLIENT_VPC_SUBNETS: usize = 2;
+
+/// The most that configuration may name, the other end of the same range.
+pub const MAX_CLIENT_VPC_SUBNETS: usize = 3;
+
+/// What MSK answers a client VPC configuration naming a number of subnets outside
+/// [`MIN_CLIENT_VPC_SUBNETS`]`..=`[`MAX_CLIENT_VPC_SUBNETS`]: fixed text end to end,
+/// carrying neither the submitted count, nor the subnet ids, nor the bounds.
+pub const SUBNET_COUNT_MESSAGE: &str = "Too many or too few subnet ids specified.";
 
 /// How long after a replication flow and a source topic it covers are both in
 /// place the clock owes that topic's appearance on the flow's target cluster.

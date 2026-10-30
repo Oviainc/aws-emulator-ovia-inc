@@ -529,11 +529,15 @@ fn replicator_body(name: &str, role_arn: &str) -> Value {
         "kafkaClusters": [
             {
                 "amazonMskCluster": { "mskClusterArn": source },
-                "vpcConfig": { "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa"] },
+                "vpcConfig": {
+                    "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"],
+                },
             },
             {
                 "amazonMskCluster": { "mskClusterArn": target },
-                "vpcConfig": { "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa"] },
+                "vpcConfig": {
+                    "subnetIds": ["subnet-aaaaaaaaaaaaaaaaa", "subnet-bbbbbbbbbbbbbbbbb"],
+                },
             },
         ],
         "replicationInfoList": [{

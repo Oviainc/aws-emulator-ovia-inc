@@ -117,7 +117,9 @@ impl End {
                     "apacheKafkaClusterId": id,
                     "bootstrapBrokerString": format!("b-1.{id}.example.internal:9092"),
                 },
-                "vpcConfig": { "subnetIds": ["subnet-ccccccccccccccccc"] },
+                "vpcConfig": {
+                    "subnetIds": ["subnet-ccccccccccccccccc", "subnet-ddddddddddddddddd"],
+                },
                 "encryptionInTransit": { "encryptionType": "TLS" },
             }),
         }
@@ -463,12 +465,11 @@ async fn an_addressed_replication_is_updated_and_read_back() {
         UpdateCase {
             setup: Setup {
                 clusters: vec![
-                    End::msk("fan-out-source"),
-                    End::msk("fan-out-first"),
-                    End::apache("fan-out-second"),
+                    End::msk("two-flows-msk"),
+                    End::apache("two-flows-apache"),
                 ],
-                flows: vec![(0, 1, "GZIP"), (0, 2, "LZ4")],
-                ..Setup::named("fan-out")
+                flows: vec![(1, 0, "GZIP"), (0, 1, "LZ4")],
+                ..Setup::named("two-flows")
             },
             // The SECOND replication, so the lookup is by pair and not "the first
             // one" — and its target is named by an Apache Kafka cluster id.
@@ -654,11 +655,7 @@ async fn an_addressed_replication_is_updated_and_read_back() {
 async fn a_pair_that_addresses_no_replication_is_refused() {
     let emulator = Emulator::new();
     let setup = Setup {
-        clusters: vec![
-            End::msk("mismatch-source"),
-            End::msk("mismatch-target"),
-            End::apache("mismatch-bystander"),
-        ],
+        clusters: vec![End::msk("mismatch-source"), End::msk("mismatch-target")],
         flows: vec![(0, 1, "NONE")],
         ..Setup::named("mismatch")
     };
@@ -681,10 +678,10 @@ async fn a_pair_that_addresses_no_replication_is_refused() {
 
     // Rows span every way a pair of NAMED ends can address no configured
     // replication: the configured pair REVERSED, a source the replicator does not
-    // span, a target it does not span, a cluster it spans that no replication runs
-    // between, and an end named as an Apache Kafka cluster id where the configured
-    // one is an MSK ARN. A request that leaves an end unnamed never reaches this
-    // rule — see `crate::replication_end_naming`.
+    // span, a target it does not span, a target named as an Apache Kafka cluster id
+    // the replicator does not span, and both ends named as Apache Kafka cluster ids
+    // where the configured ones are MSK ARNs. A request that leaves an end unnamed
+    // never reaches this rule — see `crate::replication_end_naming`.
     let rows: Vec<(&str, Value)> = vec![
         (
             "reversed",
@@ -707,7 +704,7 @@ async fn a_pair_that_addresses_no_replication_is_refused() {
             }),
         ),
         (
-            "spanned-but-unreplicated",
+            "apache-id-target",
             json!({
                 "sourceKafkaClusterArn": source_arn,
                 "targetKafkaClusterId": "mismatch-bystander",
