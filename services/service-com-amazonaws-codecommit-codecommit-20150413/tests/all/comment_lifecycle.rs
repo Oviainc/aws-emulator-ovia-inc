@@ -296,9 +296,10 @@ async fn a_posted_comment_is_read_back_from_state() {
             comment.pointer("/inReplyTo").is_none(),
             "case {label:?}: expected no inReplyTo on a top-level comment, got {comment}"
         );
-        assert!(
-            comment.pointer("/reactionCounts").is_none(),
-            "case {label:?}: expected no reactions on a fresh comment, got {comment}"
+        assert_eq!(
+            comment.pointer("/reactionCounts"),
+            Some(&json!({})),
+            "case {label:?}: expected an empty reaction count map on a fresh comment, got {comment}"
         );
 
         // The round trip: the reader answers with the stored record, member for
@@ -763,31 +764,18 @@ async fn a_comment_is_edited_and_deleted_only_by_its_author() {
     }
 }
 
-/// Every form of every reaction the service's table holds, with the form it is
-/// reported under. The catalog is the emoji reaction table in the CodeCommit User
-/// Guide, which the model's `reactionValue` documentation links to
-/// (`smithy_query(query="doc",shape="PutCommentReactionInput",member="reactionValue")`).
-const REACTION_FORMS: &[(&str, &str)] = &[
-    (":thumbsup:", ":thumbsup:"),
-    (":+1:", ":thumbsup:"),
-    ("👍", ":thumbsup:"),
-    (":thumbsdown:", ":thumbsdown:"),
-    (":-1:", ":thumbsdown:"),
-    ("👎", ":thumbsdown:"),
-    (":smile:", ":smile:"),
-    ("😄", ":smile:"),
-    (":confused:", ":confused:"),
-    ("😕", ":confused:"),
-    (":eyes:", ":eyes:"),
-    ("👀", ":eyes:"),
-    (":heart:", ":heart:"),
-    ("❤️", ":heart:"),
-    (":hooray:", ":hooray:"),
-    (":tada:", ":hooray:"),
-    ("🎉", ":hooray:"),
-    (":rocket:", ":rocket:"),
-    ("🚀", ":rocket:"),
-];
+/// Every form of every reaction, with the reaction VALUE it is reported as on a
+/// comment (`callerReactions` and the keys of `reactionCounts`, both
+/// `ReactionValue` —
+/// `smithy_query(query="shape",shape="ReactionCountsMap,CallerReactions")`). The
+/// rows are projected out of the crate's one test-side reaction catalog
+/// ([`crate::comment_reaction_surfacing::CATALOG`]), which names its source.
+fn reaction_forms() -> Vec<(String, &'static str)> {
+    crate::comment_reaction_surfacing::sent_forms()
+        .into_iter()
+        .map(|(sent, row)| (sent, row.name))
+        .collect()
+}
 
 #[tokio::test]
 async fn a_reaction_is_one_per_caller_and_counted_from_state() {
@@ -820,8 +808,8 @@ async fn a_reaction_is_one_per_caller_and_counted_from_state() {
     }
 
     // Every accepted form of every reaction: the caller holds exactly that one
-    // reaction afterwards, reported under the table's own form.
-    for (sent, reported) in REACTION_FORMS {
+    // reaction afterwards, reported under the reaction's own name.
+    for (sent, reported) in reaction_forms() {
         ok(
             &fixture.router,
             "PutCommentReaction",
@@ -861,18 +849,18 @@ async fn a_reaction_is_one_per_caller_and_counted_from_state() {
     let as_author = read(&fixture.router, DEFAULT_ACCESS_KEY_ID, &comment_id).await;
     assert_eq!(
         as_author.pointer("/comment/reactionCounts"),
-        Some(&json!({ ":rocket:": 1, ":hooray:": 1 })),
+        Some(&json!({ "ROCKET": 1, "HOORAY": 1 })),
         "case \"two callers\": expected one count per reaction held, got {as_author}"
     );
     assert_eq!(
         as_author.pointer("/comment/callerReactions"),
-        Some(&json!([":rocket:"])),
+        Some(&json!(["ROCKET"])),
         "case \"two callers\": expected the author's own reaction, got {as_author}"
     );
     let as_other = read(&fixture.router, OTHER_ACCESS_KEY_ID, &comment_id).await;
     assert_eq!(
         as_other.pointer("/comment/callerReactions"),
-        Some(&json!([":hooray:"])),
+        Some(&json!(["HOORAY"])),
         "case \"two callers\": expected the other caller's own reaction, got {as_other}"
     );
 
@@ -897,13 +885,14 @@ async fn a_reaction_is_one_per_caller_and_counted_from_state() {
         );
         assert_eq!(
             comment.pointer("/comment/reactionCounts"),
-            Some(&json!({ ":hooray:": 1 })),
+            Some(&json!({ "HOORAY": 1 })),
             "case {removal:?}: expected the other caller's reaction to stand, got {comment}"
         );
     }
 
-    // A value the reaction table does not hold is refused.
-    for invalid in [":shrug:", "LIKE", "😀", ":+2:", "thumbsup"] {
+    // A value no row of the reaction table names — in any of the four forms — is
+    // refused.
+    for invalid in [":shrug:", "SHRUG", "LIKE", "😀", ":+2:", "U+1F600", "thumbs up"] {
         let code = error(
             &fixture.router,
             "PutCommentReaction",
@@ -985,12 +974,12 @@ async fn a_comment_holds_a_bounded_number_of_principals_reactions() {
     .await;
     assert_eq!(
         comment.pointer("/comment/callerReactions"),
-        Some(&json!([":rocket:"])),
+        Some(&json!(["ROCKET"])),
         "case \"a change at the bound\": expected the changed reaction, got {comment}"
     );
     assert_eq!(
         comment.pointer("/comment/reactionCounts"),
-        Some(&json!({ ":eyes:": MAX_REACTIONS_PER_COMMENT - 1, ":rocket:": 1 })),
+        Some(&json!({ "EYES": MAX_REACTIONS_PER_COMMENT - 1, "ROCKET": 1 })),
         "case \"a change at the bound\": expected the counts to stay at the bound, got {comment}"
     );
 }

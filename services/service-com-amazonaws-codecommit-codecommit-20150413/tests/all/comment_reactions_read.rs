@@ -19,48 +19,27 @@ use crate::comment_lifecycle::{fixture, Fixture, OTHER_ACCESS_KEY_ID};
 use crate::repository_lifecycle::{error, ok, string_at};
 use crate::wire::{caller_arn, error_as, ok_as, DEFAULT_ACCESS_KEY_ID};
 
-/// Every form of every reaction the service's catalog holds, with the three forms
-/// a read reports it in: the short code, the Emoji Version 1.0 graphic and the
-/// Unicode codepoint. The catalog is the emoji reaction table in the CodeCommit
-/// User Guide, which the model's `reactionValue` documentation links to
-/// (`smithy_query(query="doc",shape="PutCommentReactionInput",member="reactionValue")`),
-/// and the codepoint spelling is the one CodeCommit reports for the `unicode`
-/// member ("The Unicode codepoint for the reaction",
-/// `smithy_query(query="doc",shape="ReactionValueFormats",member="unicode")`).
+/// One case of the read table: a reaction named by one of its published forms,
+/// with the three forms a read reports it in — the short code, the Emoji Version
+/// 1.0 graphic and the Unicode codepoint. The rows are projected out of the
+/// crate's one test-side reaction catalog
+/// ([`crate::comment_reaction_surfacing::CATALOG`]), which names its source.
 struct ReactionCase {
     /// The value as the request sends it.
-    sent: &'static str,
+    sent: String,
     short_code: &'static str,
     emoji: &'static str,
     unicode: &'static str,
 }
 
 fn reaction_cases() -> Vec<ReactionCase> {
-    let catalog: &[(&str, &str, &str, &[&str])] = &[
-        (":thumbsup:", "\u{1f44d}", "U+1F44D", &[":+1:"]),
-        (":thumbsdown:", "\u{1f44e}", "U+1F44E", &[":-1:"]),
-        (":smile:", "\u{1f604}", "U+1F604", &[]),
-        (":confused:", "\u{1f615}", "U+1F615", &[]),
-        (":eyes:", "\u{1f440}", "U+1F440", &[]),
-        (":heart:", "\u{2764}", "U+2764", &["\u{2764}\u{fe0f}"]),
-        (":hooray:", "\u{1f389}", "U+1F389", &[":tada:"]),
-        (":rocket:", "\u{1f680}", "U+1F680", &[]),
-    ];
-    catalog
-        .iter()
-        .flat_map(|(short_code, emoji, unicode, aliases)| {
-            // Each row is reachable by its short code, by its graphic and by every
-            // further spelling the catalog lists for it.
-            [*short_code, *emoji]
-                .into_iter()
-                .chain(aliases.iter().copied())
-                .map(move |sent| ReactionCase {
-                    sent,
-                    short_code,
-                    emoji,
-                    unicode,
-                })
-                .collect::<Vec<ReactionCase>>()
+    crate::comment_reaction_surfacing::sent_forms()
+        .into_iter()
+        .map(|(sent, row)| ReactionCase {
+            sent,
+            short_code: row.short_code,
+            emoji: row.emoji,
+            unicode: row.unicode,
         })
         .collect()
 }

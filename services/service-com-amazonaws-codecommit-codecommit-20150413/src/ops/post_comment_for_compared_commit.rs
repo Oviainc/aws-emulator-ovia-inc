@@ -206,10 +206,13 @@ fn checked_commit_id(commit_id: &str) -> Result<(), PostCommentForComparedCommit
 }
 
 /// The comment this call posted (or, on a repeated idempotency token, the comment
-/// the first call posted), with the comparison it was filed under.
+/// the first call posted), with the comparison it was filed under, as the POSTING
+/// caller sees it: `callerReactions` is that principal's own reaction, so a
+/// replay of a token reports the reactions it has left on the comment since.
 fn posted(
     repository_name: &str,
     record: &crate::state::CommentRecord,
+    caller_arn: &str,
 ) -> PostCommentForComparedCommitOutput {
     PostCommentForComparedCommitOutput {
         repository_name: Some(repository_name.to_string()),
@@ -218,7 +221,7 @@ fn posted(
         before_blob_id: record.comparison.before_blob_id.clone(),
         after_blob_id: record.comparison.after_blob_id.clone(),
         location: record.location.clone(),
-        comment: Some(record.comment()),
+        comment: Some(record.comment_as(caller_arn)),
     }
 }
 
@@ -451,7 +454,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     && crate::state::location_key(existing.location.as_ref())
                         == crate::state::location_key(location.as_ref());
                 return if unchanged {
-                    Ok(posted(&input.repository_name, existing))
+                    Ok(posted(&input.repository_name, existing, &author_arn))
                 } else {
                     Err(
                         PostCommentForComparedCommitErrorModeled::IdempotencyParameterMismatchException(
@@ -500,7 +503,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .comment_tokens
                 .insert(token.to_string(), record.comment_id.clone());
         }
-        let response = posted(&input.repository_name, &record);
+        let response = posted(&input.repository_name, &record, &record.author_arn);
         repository.comments.insert(record.comment_id.clone(), record);
         Ok(response)
     }

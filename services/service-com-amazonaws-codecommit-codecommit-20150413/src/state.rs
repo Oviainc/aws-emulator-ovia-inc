@@ -996,14 +996,21 @@ pub const MAX_REACTIONS_PER_COMMENT: usize = 100;
 
 /// One reaction CodeCommit accepts on a comment, in every form the API names it.
 ///
-/// A reaction is REPORTED in three forms — the model's `ReactionValueFormats`
-/// carries the graphic, the short code and the Unicode codepoint — and ACCEPTED in
-/// any of them, so a row holds the two reported spellings once and lists beside
-/// them the further short codes a caller may send the same reaction as.
+/// A reaction is REPORTED in two places, in a different form in each: as a
+/// reaction VALUE, where it is the reaction's name (the keys of a comment's
+/// `reactionCounts` and the entries of its `callerReactions`, both typed
+/// `ReactionValue` by the model —
+/// `smithy_query(query="shape",shape="ReactionCountsMap,CallerReactions")`), and
+/// as the three spellings of `ReactionValueFormats`, which carries the graphic,
+/// the short code and the Unicode codepoint. It is ACCEPTED in ANY of those
+/// forms, so a row holds each reported spelling once and lists beside them the
+/// further short codes a caller may send the same reaction as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reaction {
-    /// The emoji short code this service reports the reaction under, and the form
-    /// a stored reaction is held as.
+    /// The reaction's name, which is the form a stored reaction is held as and
+    /// reported under wherever a comment carries one as a reaction value.
+    pub name: &'static str,
+    /// The emoji short code this service reports the reaction under.
     pub short_code: &'static str,
     /// The Emoji Version 1.0 graphic of the reaction.
     pub emoji: &'static str,
@@ -1034,11 +1041,17 @@ impl Reaction {
     }
 
     /// Does `normalized` — a reaction value already reduced to the comparable
-    /// form [`canonical_reaction`] reduces to — name this reaction?
+    /// form [`canonical_reaction`] reduces to — name this reaction? Every form
+    /// the API publishes for a reaction names it: its name, its short code and
+    /// the further short codes that spell the same reaction, its graphic, and
+    /// its Unicode codepoint.
     fn named_by(&self, normalized: &str) -> bool {
-        self.short_code == normalized
+        self.name.eq_ignore_ascii_case(normalized)
+            || self.short_code == normalized
             || self.emoji == normalized
             || self.aliases.contains(&normalized)
+            // Only a value spelled as a codepoint is rendered as one to compare.
+            || (normalized.starts_with("u+") && self.unicode().eq_ignore_ascii_case(normalized))
     }
 }
 
@@ -1051,41 +1064,49 @@ impl Reaction {
 /// (`smithy_query(query="doc",shape="PutCommentReactionInput",member="reactionValue")`).
 pub const REACTION_TABLE: &[Reaction] = &[
     Reaction {
+        name: "THUMBSUP",
         short_code: ":thumbsup:",
         emoji: "\u{1f44d}",
         aliases: &[":+1:"],
     },
     Reaction {
+        name: "THUMBSDOWN",
         short_code: ":thumbsdown:",
         emoji: "\u{1f44e}",
         aliases: &[":-1:"],
     },
     Reaction {
+        name: "SMILE",
         short_code: ":smile:",
         emoji: "\u{1f604}",
         aliases: &[],
     },
     Reaction {
+        name: "CONFUSED",
         short_code: ":confused:",
         emoji: "\u{1f615}",
         aliases: &[],
     },
     Reaction {
+        name: "EYES",
         short_code: ":eyes:",
         emoji: "\u{1f440}",
         aliases: &[],
     },
     Reaction {
+        name: "HEART",
         short_code: ":heart:",
         emoji: "\u{2764}",
         aliases: &[],
     },
     Reaction {
+        name: "HOORAY",
         short_code: ":hooray:",
         emoji: "\u{1f389}",
         aliases: &[":tada:"],
     },
     Reaction {
+        name: "ROCKET",
         short_code: ":rocket:",
         emoji: "\u{1f680}",
         aliases: &[],
@@ -1101,10 +1122,11 @@ pub const REACTION_NONE: &str = "none";
 /// The reaction a reaction value names, or `None` when the reaction table holds
 /// no such reaction.
 ///
-/// A caller may send a reaction as any of the forms the table lists, so the value
-/// is first reduced to one comparable form: trimmed, lowercased, and with the
-/// Unicode variation selector an emoji may carry (U+FE0F) removed, so `"❤️"` and
-/// `"❤"` are the one reaction the table lists.
+/// A caller may send a reaction as any of the forms the table lists — its name,
+/// a short code, the graphic or the Unicode codepoint — so the value is first
+/// reduced to one comparable form: trimmed, lowercased, and with the Unicode
+/// variation selector an emoji may carry (U+FE0F) removed, so `"❤️"` and `"❤"`
+/// are the one reaction the table lists.
 pub fn canonical_reaction(value: &str) -> Option<&'static Reaction> {
     let normalized: String = value
         .trim()
@@ -1483,8 +1505,9 @@ pub struct CommentRecord {
     pub pull_request_id: Option<u64>,
     pub comparison: ComparedCommit,
     pub location: Option<Location>,
-    /// The emoji reactions left on this comment, keyed by the ARN of the
-    /// principal that left each one, so a principal holds at most one reaction
+    /// The emoji reactions left on this comment — each the NAME of a reaction
+    /// the service's catalog holds ([`Reaction::name`]) — keyed by the ARN of the
+    /// principal that left it, so a principal holds at most one reaction
     /// per comment ("Reactions are limited to one reaction per user for each
     /// individual comment ID") and `callerReactions` is that principal's own
     /// entry. Bounded by [`MAX_REACTIONS_PER_COMMENT`] principals.
@@ -1495,23 +1518,18 @@ pub struct CommentRecord {
 }
 
 impl CommentRecord {
-    /// This comment as the modeled `Comment` shape — the one place that
-    /// projection is written, so `PostCommentForComparedCommit` and
-    /// `GetCommentsForComparedCommit` cannot disagree about a stored comment.
-    pub fn comment(&self) -> Comment {
-        self.comment_for(None)
-    }
-
-    /// The same projection for a NAMED caller: `callerReactions` is that
-    /// principal's own reaction, which is the one member of a comment that
-    /// depends on who is asking.
+    /// This comment as the modeled `Comment` shape, for the caller that is
+    /// asking — the one place that projection is written, so no two readers of a
+    /// stored comment can disagree about it. `callerReactions` is that
+    /// principal's own reaction, the one member of a comment that depends on who
+    /// is asking.
     pub fn comment_as(&self, caller_arn: &str) -> Comment {
-        self.comment_for(Some(caller_arn))
-    }
-
-    fn comment_for(&self, caller_arn: Option<&str>) -> Comment {
         // `reactionCounts` is how many principals hold each reaction, counted
-        // from the stored map rather than tallied anywhere else.
+        // from the stored map rather than tallied anywhere else. It is "a string
+        // to integer map that represents the number of individual users who have
+        // responded to a comment with the specified reactions": a comment nobody
+        // has reacted to has responded-to-with nothing, which is the EMPTY map
+        // rather than no map at all.
         let mut reaction_counts: HashMap<String, i32> = HashMap::new();
         for reaction in self.reactions.values() {
             *reaction_counts.entry(reaction.clone()).or_insert(0) += 1;
@@ -1527,10 +1545,11 @@ impl CommentRecord {
             author_arn: Some(self.author_arn.clone()),
             deleted: self.deleted,
             client_request_token: self.client_request_token.clone(),
-            caller_reactions: caller_arn
-                .and_then(|caller_arn| self.reactions.get(caller_arn))
+            caller_reactions: self
+                .reactions
+                .get(caller_arn)
                 .map(|reaction| vec![reaction.clone()]),
-            reaction_counts: (!reaction_counts.is_empty()).then_some(reaction_counts),
+            reaction_counts: Some(reaction_counts),
         }
     }
 }

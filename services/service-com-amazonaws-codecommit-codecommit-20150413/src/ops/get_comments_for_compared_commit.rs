@@ -197,7 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Reporting only: the comments are read exactly as the operations that
+        // post them left them, and nothing here writes. `callerReactions` is the
+        // one member of a comment that depends on who is asking, so the asking
+        // identity is read the way the other readers of a stored comment read it.
+        let caller_arn = crate::state::caller_identity_arn(&*self.engine, ctx);
+
         // "A non-zero, non-negative integer used to limit the number of returned
         // results. The default is 100 comments, but you can configure up to 500."
         let page_size = match input.max_results {
@@ -325,7 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 comments: Some(
                     crate::state::comment_thread(&replies, root)
                         .into_iter()
-                        .map(crate::state::CommentRecord::comment)
+                        .map(|comment| comment.comment_as(&caller_arn))
                         .collect(),
                 ),
             })

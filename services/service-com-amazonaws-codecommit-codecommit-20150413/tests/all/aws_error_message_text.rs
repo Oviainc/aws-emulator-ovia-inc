@@ -843,14 +843,17 @@ async fn unrecognized_reaction_value_message_names_the_value() {
     let comment_id = string_at(&posted, "/comment/commentId");
 
     // Values no row of the service's reaction table holds: a shortcode that is not
-    // one, a shortcode missing a delimiter, a bare word, emoji outside the table,
-    // and a repeated emoji. `""` and `"none"` are NOT here: those are the documented
+    // one, a shortcode missing a delimiter, a bare word, a name the table does not
+    // hold, a codepoint outside it, emoji outside the table, and a repeated emoji.
+    // `""` and `"none"` are NOT here: those are the documented
     // removal values, not unrecognized ones.
     let values = [
         "not-a-real-emoji-shortcode",
         ":shipit:",
         ":THUMBSUP",
-        "thumbsup",
+        "thumbs-up",
+        "SHRUG",
+        "U+1F44F",
         "\u{1f44f}",
         "\u{1f680}\u{1f680}",
     ];
@@ -874,12 +877,12 @@ async fn unrecognized_reaction_value_message_names_the_value() {
     }
 
     // The refusals left the comment without reactions: nothing was recorded for a
-    // value the service does not hold. An absent `reactionCounts` member and an
-    // empty map both say that.
+    // value the service does not hold, so the count map a comment always carries is
+    // empty.
     let read_back = ok(&f.router, "GetComment", &json!({"commentId": comment_id})).await;
     let counts = &read_back["comment"]["reactionCounts"];
     assert!(
-        counts.is_null() || counts.as_object().is_some_and(serde_json::Map::is_empty),
+        counts.as_object().is_some_and(serde_json::Map::is_empty),
         "a refused reaction must leave the comment's reactions empty, got {read_back}"
     );
 }

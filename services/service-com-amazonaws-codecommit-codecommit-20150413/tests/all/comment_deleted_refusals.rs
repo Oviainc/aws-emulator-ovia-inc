@@ -262,7 +262,11 @@ async fn a_deleted_comment_is_refused_with_the_exceptions_recorded_sentence() {
             }
             assert_eq!(
                 after.get("reactionCounts").cloned(),
-                case.reacted.then(|| json!({ ":eyes:": 1 })),
+                Some(if case.reacted {
+                    json!({ "EYES": 1 })
+                } else {
+                    json!({})
+                }),
                 "case {label:?}: expected the stored reactions to stand, got {after}"
             );
         }

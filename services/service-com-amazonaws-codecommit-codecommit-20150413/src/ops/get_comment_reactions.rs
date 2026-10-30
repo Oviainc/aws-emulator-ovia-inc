@@ -287,8 +287,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let users: Vec<String> = comment
                         .reactions
                         .iter()
-                        .filter(|(arn, short_code)| {
-                            short_code.as_str() == reaction.short_code
+                        .filter(|(arn, held)| {
+                            held.as_str() == reaction.name
                                 && reaction_user_arn.is_none_or(|wanted| arn.as_str() == wanted)
                         })
                         .map(|(arn, _)| arn.clone())

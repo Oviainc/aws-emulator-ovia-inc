@@ -272,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 comment
                     .reactions
-                    .insert(caller_arn, reaction.short_code.to_string());
+                    .insert(caller_arn, reaction.name.to_string());
             }
             None => {
                 comment.reactions.remove(&caller_arn);

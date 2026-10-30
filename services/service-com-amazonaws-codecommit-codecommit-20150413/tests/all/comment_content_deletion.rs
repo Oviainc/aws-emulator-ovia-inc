@@ -188,9 +188,12 @@ async fn deleting_a_comments_content_keeps_the_comment_and_refuses_a_second_dele
         );
         let reaction_counts = before.pointer("/comment/reactionCounts").cloned();
         assert_eq!(
-            reaction_counts.is_some(),
+            reaction_counts
+                .as_ref()
+                .and_then(Value::as_object)
+                .is_some_and(|counts| !counts.is_empty()),
             case.reacted,
-            "case {label:?}: expected reactions only where one was left, got {before}"
+            "case {label:?}: expected counted reactions only where one was left, got {before}"
         );
 
         // The deletion answers with the stored comment as it now stands.

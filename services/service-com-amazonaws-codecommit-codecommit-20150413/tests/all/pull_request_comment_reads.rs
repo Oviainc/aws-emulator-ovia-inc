@@ -569,9 +569,11 @@ async fn a_read_reports_each_callers_own_reactions_on_the_thread() {
     .await;
     let comment_id = string_at(&posted, "/comment/commentId");
 
+    // Each caller sends the reaction in a different form, so what is reported is
+    // the stored reaction rather than the spelling of the request.
     for (access_key_id, reaction) in [
         (DEFAULT_ACCESS_KEY_ID, ":rocket:"),
-        (OTHER_ACCESS_KEY_ID, ":hooray:"),
+        (OTHER_ACCESS_KEY_ID, "HOORAY"),
     ] {
         ok_as(
             &router,
@@ -585,8 +587,8 @@ async fn a_read_reports_each_callers_own_reactions_on_the_thread() {
     // Every principal holding a reaction is counted, while `callerReactions` is the
     // asking principal's own.
     for (access_key_id, own) in [
-        (DEFAULT_ACCESS_KEY_ID, ":rocket:"),
-        (OTHER_ACCESS_KEY_ID, ":hooray:"),
+        (DEFAULT_ACCESS_KEY_ID, "ROCKET"),
+        (OTHER_ACCESS_KEY_ID, "HOORAY"),
     ] {
         let read = ok_as(
             &router,
@@ -608,7 +610,7 @@ async fn a_read_reports_each_callers_own_reactions_on_the_thread() {
         );
         assert_eq!(
             comment.get("reactionCounts"),
-            Some(&json!({ ":rocket:": 1, ":hooray:": 1 })),
+            Some(&json!({ "ROCKET": 1, "HOORAY": 1 })),
             "case {access_key_id:?}: expected one count per reaction held, got {comment}"
         );
     }

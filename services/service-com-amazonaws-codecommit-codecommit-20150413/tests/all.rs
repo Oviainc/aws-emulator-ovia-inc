@@ -67,6 +67,8 @@ mod comment_deleted_refusals;
 mod comment_id_form;
 #[path = "all/comment_lifecycle.rs"]
 mod comment_lifecycle;
+#[path = "all/comment_reaction_surfacing.rs"]
+mod comment_reaction_surfacing;
 #[path = "all/comment_reactions_read.rs"]
 mod comment_reactions_read;
 #[path = "all/comment_replies.rs"]
