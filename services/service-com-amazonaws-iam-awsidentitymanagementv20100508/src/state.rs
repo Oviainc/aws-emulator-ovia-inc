@@ -1550,7 +1550,8 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// The account-level properties the account has persisted, keyed by the
     /// property key itself — "keys are in the format `Namespace/PropertyName`"
     /// (`GetAccountPropertiesResponse$Properties`). `PutAccountProperties` is what
-    /// fills this map and `GetAccountProperties` is what reports it.
+    /// fills this map and `GetAccountProperties` is what reports it; it starts at the
+    /// values an untouched account holds ([`default_account_properties`]).
     ///
     /// A `BTreeMap` so the store's own enumeration order is total and stable; the
     /// modelled response member is a map, so what a read reports is the SET of
@@ -1687,12 +1688,19 @@ impl Default for ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// [`Self::access_keys`] — so seeding one there would start evaluating that caller
     /// against an empty policy set instead of leaving it in the position this emulator's
     /// published credential is in.
+    ///
+    /// The account-level properties start at the values an account holds before anything
+    /// has been written to them ([`default_account_properties`]), because that is the
+    /// configuration an account IS in: each account-wide feature these properties gate is
+    /// in its default state from the moment the account exists, so a read of one before a
+    /// write reports that state rather than nothing.
     fn default() -> Self {
         let mut account = Self::empty();
         let caller = ambient_user();
         account
             .users
             .insert(name_key(&caller.user_name), caller);
+        account.account_properties = default_account_properties();
         account
     }
 }
@@ -5665,6 +5673,81 @@ pub fn account_property_namespace(key: &str) -> Option<&str> {
     let names_one_property =
         !namespace.is_empty() && !property_name.is_empty() && !property_name.contains('/');
     names_one_property.then_some(namespace)
+}
+
+/// One account-property NAMESPACE this service serves, with the properties it carries and
+/// the value an account holds for each before anything has been written.
+///
+/// Account properties "are configuration settings that control account-wide IAM features
+/// such as Role Manager" and "each namespace groups related configuration settings"
+/// (`PutAccountProperties`, `GetAccountProperties`), so a namespace names a FEATURE the
+/// service itself offers rather than a name a caller invents: the set of namespaces is
+/// published, and so is the value each of their properties has until an account sets it.
+#[derive(Debug, Clone, Copy)]
+pub struct ServedAccountPropertyNamespace {
+    /// The namespace segment of a key, in its published spelling.
+    pub namespace: &'static str,
+    /// The namespace's properties, as `(the property name after the separator, the value
+    /// an account holds for it before any write)`.
+    pub defaults: &'static [(&'static str, &'static str)],
+}
+
+/// The account-property namespaces this service serves, each with its properties and
+/// their default values.
+///
+/// SOURCE, for adding a namespace: the account-wide feature IAM publishes properties for,
+/// with the value a fresh account reports for each of them. Role Manager is the feature
+/// both of these operations name, its `Enabled` property is what gates it, and an account
+/// that has never set it reports it off — a feature is not on until an account turns it
+/// on. A namespace nobody has that for is NOT listed: an unlisted namespace is refused
+/// ([`unsupported_account_property_namespace`]) rather than stored under a default nobody
+/// can state.
+pub const SERVED_ACCOUNT_PROPERTY_NAMESPACES: &[ServedAccountPropertyNamespace] =
+    &[ServedAccountPropertyNamespace {
+        namespace: "RoleManager",
+        defaults: &[("Enabled", "false")],
+    }];
+
+/// Whether `namespace` is one this service serves — see
+/// [`SERVED_ACCOUNT_PROPERTY_NAMESPACES`].
+///
+/// The comparison is EXACT. A namespace is published in one spelling, and
+/// `accountPropertyKeyType`'s alphabet admits both cases while keys are stored verbatim,
+/// so another spelling of a served name is a different namespace and not one this service
+/// serves.
+pub fn is_served_account_property_namespace(namespace: &str) -> bool {
+    SERVED_ACCOUNT_PROPERTY_NAMESPACES
+        .iter()
+        .any(|served| served.namespace == namespace)
+}
+
+/// How a write under a namespace this service does not serve is refused: the
+/// `InvalidInputException` message, whose fixed text is `Unsupported namespace: ` followed
+/// by the namespace segment of the submitted key.
+pub fn unsupported_account_property_namespace(namespace: &str) -> String {
+    format!("Unsupported namespace: {namespace}")
+}
+
+/// The properties an account holds before any `PutAccountProperties`: every property of
+/// every served namespace at its default, keyed as `Namespace/PropertyName` — the form
+/// "keys are in the format `Namespace/PropertyName`"
+/// (`GetAccountPropertiesResponse$Properties`) states.
+///
+/// A read of an account that has written nothing therefore reports the configuration the
+/// account is actually in, which is what a caller checking a feature gate before setting
+/// it reads.
+pub fn default_account_properties() -> BTreeMap<String, String> {
+    SERVED_ACCOUNT_PROPERTY_NAMESPACES
+        .iter()
+        .flat_map(|served| {
+            served.defaults.iter().map(|(property, value)| {
+                (
+                    format!("{}/{property}", served.namespace),
+                    (*value).to_string(),
+                )
+            })
+        })
+        .collect()
 }
 
 /// The reserved tag key among `keys`, if any — the lowest one, so the refusal names

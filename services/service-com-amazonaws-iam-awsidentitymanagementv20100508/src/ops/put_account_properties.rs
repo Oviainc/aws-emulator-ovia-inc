@@ -228,6 +228,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A namespace names an account-wide FEATURE this service configures — "each
+        // namespace groups related configuration settings" — so the set of them is the
+        // service's own ([`crate::state::SERVED_ACCOUNT_PROPERTY_NAMESPACES`]) and a key
+        // under any other namespace configures nothing: it is "an invalid … value …
+        // supplied for an input parameter", refused before the store is reached, so a
+        // property the service does not serve is never persisted and never reported by a
+        // later read.
+        if let Some(namespace) = namespaces
+            .iter()
+            .find(|namespace| !crate::state::is_served_account_property_namespace(namespace))
+        {
+            return Err(PutAccountPropertiesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::unsupported_account_property_namespace(
+                        namespace,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // The write: each supplied key SETS that property, so a key the account
         // already holds takes the new value and a key it does not hold is added.
         // Properties the request does not name are left alone — this call sets the

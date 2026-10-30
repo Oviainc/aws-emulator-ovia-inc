@@ -138,12 +138,13 @@ async fn list_account_aliases_reports_the_alias_the_account_persisted() {
 #[tokio::test]
 async fn creating_an_alias_replaces_the_one_the_account_holds() {
     // Rows differ in the number of creates in turn and in the alias each one
-    // names, including a repeat of the alias already held (which is the same end
-    // state, so it is a success, not a conflict).
+    // names. No row names the alias just created, which is a create of a resource
+    // that already exists rather than a replacement — see
+    // `recreating_the_alias_the_account_already_holds_is_refused`.
     let sequences: &[&[&str]] = &[
         &["first-alias"],
         &["first-alias", "second-alias"],
-        &["abc", "abc"],
+        &["abc", "abd"],
         &["one", "two", "three", "two"],
         &["0123456789", "a-1", "my-account-alias"],
     ];
@@ -174,6 +175,96 @@ async fn creating_an_alias_replaces_the_one_the_account_holds() {
                 "case {replaced:?}: a replaced alias is no longer held, got {status}: {body}"
             );
         }
+    }
+}
+
+/// RULE: a create whose resource already exists is refused — the modelled
+/// `EntityAlreadyExistsException` (HTTP 409, awsQuery code `EntityAlreadyExists`)
+/// — rather than answered as a success, so a client that branches on that refusal
+/// learns the resource was not minted again; the account keeps exactly what it
+/// held.
+#[tokio::test]
+async fn recreating_the_alias_the_account_already_holds_is_refused() {
+    // Rows span the whole alias catalog (alphabet and both published length
+    // bounds), and each row repeats the create twice over, so the refusal is not
+    // one-shot.
+    for alias in alias_catalog() {
+        let case = format!("{} chars: {alias}", alias.len());
+        let router = router();
+        create_alias(&router, &alias).await;
+
+        for attempt in 0..2 {
+            let (status, body) =
+                call(&router, "CreateAccountAlias", &[("AccountAlias", alias.as_str())]).await;
+            assert_eq!(
+                status, 409,
+                "case {case:?} attempt {attempt}: expected 409, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "EntityAlreadyExists",
+                "case {case:?} attempt {attempt}: expected EntityAlreadyExists, got {:?}",
+                error_code(&body)
+            );
+            assert_eq!(
+                element(&body, "Message"),
+                format!("The account alias {alias} already exists."),
+                "case {case:?} attempt {attempt}: unexpected message, got {:?}",
+                element(&body, "Message")
+            );
+            assert_eq!(
+                current_aliases(&router, &case).await,
+                vec![alias.clone()],
+                "case {case:?} attempt {attempt}: the refusal must leave the held alias alone"
+            );
+        }
+    }
+}
+
+/// RULE: the refusal is about what the account HOLDS NOW, so an alias the account
+/// no longer holds — because a later create replaced it, or a delete cleared it —
+/// is a resource that no longer exists and can be created again.
+#[tokio::test]
+async fn an_alias_the_account_no_longer_holds_can_be_created_again() {
+    // Rows differ in how the account stopped holding the first alias: a create of
+    // another alias replaced it, and a delete cleared it.
+    for cleared_by_delete in [false, true] {
+        let case = format!("cleared by delete: {cleared_by_delete}");
+        let router = router();
+        create_alias(&router, "released-alias").await;
+        if cleared_by_delete {
+            let (status, body) = call(
+                &router,
+                "DeleteAccountAlias",
+                &[("AccountAlias", "released-alias")],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the fixture delete must succeed, got {status}: {body}"
+            );
+        } else {
+            create_alias(&router, "holder-alias").await;
+        }
+
+        // The released alias is creatable again, and once held it is refused again.
+        create_alias(&router, "released-alias").await;
+        assert_eq!(
+            current_aliases(&router, &case).await,
+            vec!["released-alias".to_string()],
+            "case {case:?}: expected the re-created alias to be held"
+        );
+        let (status, body) = call(
+            &router,
+            "CreateAccountAlias",
+            &[("AccountAlias", "released-alias")],
+        )
+        .await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected the re-created alias to be refused once held, got \
+             {status}: {body}"
+        );
     }
 }
 

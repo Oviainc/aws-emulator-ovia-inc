@@ -159,10 +159,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         // A REPORT: this "retrieves the account-level properties for the caller's
-        // Amazon Web Services account", so it hands back exactly what
-        // `PutAccountProperties` persisted and writes nothing. An account that has
-        // set no property reports an empty map — the whole set of its properties,
-        // not a missing answer.
+        // Amazon Web Services account", so it hands back exactly what the account
+        // holds and writes nothing. An account that has set no property is not an
+        // account with no configuration: each account-wide feature these properties
+        // gate is in its default state from the moment the account exists, so what a
+        // read before any write reports is those defaults
+        // ([`crate::state::default_account_properties`], which is where the store
+        // starts).
         //
         // The modelled member is a map, so what is reported is the SET of pairs the
         // account holds: every read reports the same pairs for the same account.

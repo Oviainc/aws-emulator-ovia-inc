@@ -193,17 +193,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         // An account holds AT MOST ONE alias ("Note: you can have only one",
-        // `ListAccountAliases`), and creating one when the account already has an
-        // alias REPLACES it: "your AWS account can have only one alias. If you
-        // create a new alias for your AWS account, the new alias replaces the
+        // `ListAccountAliases`), and creating one when the account already has a
+        // DIFFERENT alias REPLACES it: "your AWS account can have only one alias. If
+        // you create a new alias for your AWS account, the new alias replaces the
         // previous alias" (the Sign-In User Guide page "Creating, deleting, and
-        // listing an AWS account alias" this operation's documentation links to).
-        // So the store holds one slot and this writes it, which also makes a repeat
-        // of the same alias idempotent rather than a conflict.
+        // listing an AWS account alias" this operation's documentation links to). So
+        // the store holds one slot and a create of a fresh alias writes it.
         //
-        // `EntityAlreadyExistsException` is the refusal for an alias ANOTHER
-        // account already holds — aliases are unique across all accounts — which a
-        // single-account emulator holds no record of and so never reaches.
+        // Re-creating the alias the account ALREADY holds is not a replacement: it
+        // "attempted to create a resource that already exists", which
+        // `EntityAlreadyExistsException` is this operation's modelled refusal for —
+        // the same answer every create in this service gives for the resource it was
+        // asked to mint already being there. The refusal is what an idempotency-aware
+        // client branches on, so it is answered rather than reported as a success, and
+        // the account is left holding exactly the alias it held.
+        //
+        // Aliases are unique across all accounts, so AWS refuses an alias ANOTHER
+        // account holds the same way; a single-account emulator keeps no record of
+        // other accounts' aliases, so the alias this account holds is the only one it
+        // can know exists.
+        if store.account_alias.as_deref() == Some(input.account_alias.as_str()) {
+            return Err(
+                CreateAccountAliasErrorModeled::EntityAlreadyExistsException(
+                    EntityAlreadyExistsException {
+                        message: Some(format!(
+                            "The account alias {} already exists.",
+                            input.account_alias
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
         store.account_alias = Some(input.account_alias);
         Ok(CreateAccountAliasOutput)
     }
