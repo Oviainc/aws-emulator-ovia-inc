@@ -27,7 +27,10 @@
 //! narrowed by (none, a key the
 //! pass carries and holds, the same key with another account's value, a key the pass carries
 //! no value for), where the role lives (the default path and a path), which account the ARN
-//! names, and whether the role was ever created.
+//! names, whether the role was ever created, and — because the decision is taken over the
+//! request as submitted — every form `baseModelIdentifier` takes (a bare `vendor.model` id, a
+//! `:foundation-model/` ARN, a `:custom-model/` ARN) whether or not it resolves to anything
+//! this service publishes.
 
 use std::sync::Arc;
 
@@ -472,6 +475,41 @@ async fn fine_tuning_base_model(router: &MultiServiceRouter) -> String {
         .expect("the catalog must publish an ACTIVE base model supporting FINE_TUNING")
 }
 
+/// Every `modelId` the catalog this emulator serves publishes, read through
+/// `ListFoundationModels` exactly as a caller would.
+async fn published_model_ids(router: &MultiServiceRouter) -> Vec<String> {
+    let (status, _, listed) = bedrock(router, "GET", "/foundation-models", None).await;
+    assert_eq!(
+        status, 200,
+        "setup: ListFoundationModels must answer 200, got {status} ({listed})"
+    );
+    listed["modelSummaries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|model| text(model, "modelId"))
+        .collect()
+}
+
+/// Base model ids AWS publishes as past their END OF LIFE ("Model lifecycle" in the Amazon
+/// Bedrock User Guide), so a service that offers only its live models publishes no catalog
+/// row for any of them — which the control plane's own
+/// `tests/all/get_foundation_model.rs` pins, and which the rows below re-read off
+/// `ListFoundationModels` rather than assume. TWO of them, so the rule is not asserted on
+/// the single id a check happens to read.
+const END_OF_LIFE_MODEL_IDS: &[&str] = &["amazon.titan-text-express-v1", "anthropic.claude-v2"];
+
+/// The modelled client errors of this operation that report an identifier the service does
+/// not offer a base model under, with the `@httpError` each carries
+/// (`smithy_query(query="operation",operation="CreateModelCustomizationJob")`): the request
+/// named something, so the answer is about the thing it named — not the authorization, not a
+/// conflict, not a quota and not a throttle.
+const UNOFFERED_MODEL_ERRORS: &[(u16, &str)] = &[
+    (400, "ValidationException"),
+    (404, "ResourceNotFoundException"),
+];
+
 /// A `CreateModelCustomizationJob` body carrying the six `@required` members.
 fn create_body(stem: &str, base_model: &str, role_arn: &str) -> Value {
     json!({
@@ -587,59 +625,186 @@ async fn a_customization_job_is_minted_only_for_a_role_iam_lets_bedrock_assume()
     }
 }
 
+/// What a create answers once the pass-role decision has ADMITTED the pass: the row's own
+/// resolution, which is what the ordering rule is about.
+enum AdmittedAnswer {
+    /// The identifier resolves to a base model the catalog publishes, so the job is minted.
+    MintsJob,
+    /// The identifier names no base model at all, which this service settles as the modelled
+    /// `ResourceNotFoundException` (`@httpError(404)`).
+    ReportsItAbsent,
+    /// The identifier names a model AWS publishes as past its end of life, so the service
+    /// offers no row for it. WHICH of this operation's modelled errors for an identifier it
+    /// does not offer a model under reports a model that is known but no longer offered is
+    /// the subject of its own open report, so this row holds the answer to
+    /// [`UNOFFERED_MODEL_ERRORS`] and pins what the ordering rule settles: the answer is the
+    /// identifier's own and not the authorization's.
+    ReportsAClientError,
+}
+
+/// The roles a pass is refused on, spanning both halves of a pass IAM withholds: a role of
+/// the caller's OWN account that this account's IAM holds and that trusts this service, whose
+/// grant is narrowed to the ARN of the very job the call would create — a key the pass
+/// carries no value for, which is the shape the corpus records a refusal for — and a role
+/// that trusts another service only.
+const REFUSING_ROLES: &[(&str, &str)] = &[
+    (
+        "a grant narrowed to the ARN of the job this call would create",
+        "customization-role-source-arn",
+    ),
+    ("a role that trusts another service only", "lambda-only-role"),
+];
+
 /// RULE (the ordering half): the pass is authorized BEFORE anything the request names is
-/// resolved, so the same body that a later step of the create refuses draws the 403 when the
-/// role cannot be passed, and that later step's own refusal when it can.
+/// resolved, so the same body draws the 403 wherever the grant does not cover the pass —
+/// whatever `baseModelIdentifier` would have resolved to, in every form the member's
+/// published pattern admits (a bare `vendor.model` id, a `:foundation-model/` ARN, a
+/// `:custom-model/` ARN), and such a refusal writes nothing whichever form it carried — and
+/// draws that identifier's OWN answer wherever the grant does cover the pass, so an admitting
+/// decision does not swallow what follows it either.
 #[tokio::test]
 async fn the_pass_is_authorized_before_the_request_is_resolved() {
     let router = emulator();
     create_roles(&router).await;
+    let published = fine_tuning_base_model(&router).await;
+    let catalogued = published_model_ids(&router).await;
+    for id in END_OF_LIFE_MODEL_IDS {
+        assert!(
+            !catalogued.iter().any(|model_id| model_id == id),
+            "setup: {id:?} is past its end of life, so the catalog must publish no row for \
+             it, got {catalogued:?}"
+        );
+    }
 
-    // The rows differ along which later step would answer: a `baseModelIdentifier` the
-    // catalog does not publish (404 `ResourceNotFoundException`) and one that is not an
-    // identifier at all for this account.
-    let rows = [
-        ("a base model the catalog does not publish", "acme.not-a-model-v1"),
+    // The rows differ along the FORM the identifier takes and along whether it resolves at
+    // all, which is what the rule generalises over.
+    let rows: Vec<(&str, String, AdmittedAnswer)> = vec![
+        (
+            "the published base model, by its bare id",
+            published.clone(),
+            AdmittedAnswer::MintsJob,
+        ),
+        (
+            "the published base model, by its foundation-model ARN",
+            format!("arn:aws:bedrock:{REGION}::foundation-model/{published}"),
+            AdmittedAnswer::MintsJob,
+        ),
+        (
+            "a model past its end of life, by its bare id",
+            END_OF_LIFE_MODEL_IDS[0].to_string(),
+            AdmittedAnswer::ReportsAClientError,
+        ),
+        (
+            "a model past its end of life, by its foundation-model ARN",
+            format!(
+                "arn:aws:bedrock:{REGION}::foundation-model/{}",
+                END_OF_LIFE_MODEL_IDS[0]
+            ),
+            AdmittedAnswer::ReportsAClientError,
+        ),
+        (
+            "another model past its end of life, by its foundation-model ARN",
+            format!(
+                "arn:aws:bedrock:{REGION}::foundation-model/{}",
+                END_OF_LIFE_MODEL_IDS[1]
+            ),
+            AdmittedAnswer::ReportsAClientError,
+        ),
+        (
+            "an id that names no model at all",
+            "acme.not-a-model-v1".to_string(),
+            AdmittedAnswer::ReportsItAbsent,
+        ),
         (
             "a custom-model ARN this account does not hold",
-            "arn:aws:bedrock:us-east-1:000000000000:custom-model/amazon.titan-text-lite-v1/abcdef012345",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/{published}/abcdef012345"),
+            AdmittedAnswer::ReportsItAbsent,
         ),
     ];
 
-    for (index, (case, base_model)) in rows.iter().enumerate() {
-        let (status, error, refused) = bedrock(
-            &router,
-            "POST",
-            "/model-customization-jobs",
-            Some(create_body(
-                "ordering-denied",
-                base_model,
-                &role_arn("lambda-only-role"),
-            )),
-        )
-        .await;
-        assert_eq!(
-            (status, error.as_str(), text(&refused, "message").as_str()),
-            (403, "AccessDeniedException", PASS_ROLE_REFUSAL),
-            "case {case:?}: the pass decision comes first, got {status} {error} ({refused})"
-        );
+    for (row_index, (case, base_model, admitted)) in rows.iter().enumerate() {
+        for (role_index, (role_case, role)) in REFUSING_ROLES.iter().enumerate() {
+            let stem = format!("spelling-{row_index}-{role_index}");
+            let (status, error, refused) = bedrock(
+                &router,
+                "POST",
+                "/model-customization-jobs",
+                Some(create_body(&stem, base_model, &role_arn(role))),
+            )
+            .await;
+            assert_eq!(
+                (status, error.as_str(), text(&refused, "message").as_str()),
+                (403, "AccessDeniedException", PASS_ROLE_REFUSAL),
+                "case {case:?} ({base_model}) with {role_case:?}: the pass decision comes \
+                 first, whatever the identifier resolves to, got {status} {error} ({refused})"
+            );
 
+            // The refusal wrote nothing: no job under the name it carried, and no custom
+            // model reserved under the one it asked for.
+            let (status, error, jobs) = bedrock(
+                &router,
+                "GET",
+                &format!("/model-customization-jobs?nameContains=job-{stem}"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, listed_count(&jobs, "modelCustomizationJobSummaries")),
+                (200, 0),
+                "case {case:?} with {role_case:?}: a refused pass leaves no job to list, got \
+                 {status} {error} ({jobs})"
+            );
+            let (status, error, models) = bedrock(
+                &router,
+                "GET",
+                &format!("/custom-models?nameContains=model-{stem}"),
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, listed_count(&models, "modelSummaries")),
+                (200, 0),
+                "case {case:?} with {role_case:?}: a refused pass reserves no custom model, \
+                 got {status} {error} ({models})"
+            );
+        }
+
+        // The same identifier, passed a role whose grant DOES cover the pass: now the
+        // request's own resolution is what answers.
         let (status, error, resolved) = bedrock(
             &router,
             "POST",
             "/model-customization-jobs",
             Some(create_body(
-                &format!("ordering-admitted-{index}"),
+                &format!("spelling-admitted-{row_index}"),
                 base_model,
                 &role_arn("customization-role"),
             )),
         )
         .await;
-        assert_eq!(
-            (status, error.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: with a passable role the request's own resolution answers, \
-             got {status} {error} ({resolved})"
-        );
+        match admitted {
+            AdmittedAnswer::MintsJob => assert_eq!(
+                (status, text(&resolved, "jobArn").is_empty()),
+                (201, false),
+                "case {case:?} ({base_model}): an admitted pass over an identifier the \
+                 catalog publishes mints a job, got {status} {error} ({resolved})"
+            ),
+            AdmittedAnswer::ReportsItAbsent => assert_eq!(
+                (status, error.as_str()),
+                (404, "ResourceNotFoundException"),
+                "case {case:?} ({base_model}): with a passable role the identifier's own \
+                 resolution answers, got {status} {error} ({resolved})"
+            ),
+            AdmittedAnswer::ReportsAClientError => assert!(
+                UNOFFERED_MODEL_ERRORS
+                    .iter()
+                    .any(|(modelled, code)| (*modelled, *code) == (status, error.as_str())),
+                "case {case:?} ({base_model}): with a passable role a model this service \
+                 does not offer is reported by one of this operation's own modelled errors \
+                 for the identifier it named ({UNOFFERED_MODEL_ERRORS:?}) rather than by the \
+                 authorization, got {status} {error} ({resolved})"
+            ),
+        }
     }
 }
+
