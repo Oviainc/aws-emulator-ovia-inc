@@ -19,6 +19,9 @@
 //!   — so a new run of it may be started again;
 //! * a run the experiment has already finished with takes no second stop: that is HTTP 409
 //!   `ConflictException` and it writes nothing;
+//! * a stop ends the ONE run its path addresses: the runs the definition already finished
+//!   with keep the documents they finished with, and a run of another definition keeps
+//!   running;
 //! * an application, a definition or a run number that addresses nothing is HTTP 404
 //!   `ResourceNotFoundException`, and writes nothing.
 //!
@@ -428,6 +431,172 @@ async fn a_second_stop_of_a_finished_run_conflicts_and_changes_nothing() {
             events.json()
         );
     }
+}
+
+/// A stop ends the ONE run its path addresses and nothing else: the runs the definition
+/// has already finished with keep the documents they finished with, a run of another
+/// definition keeps running and leaves that definition reporting an experiment in flight,
+/// and a stop aimed at a finished run never reaches the run that IS in flight.
+///
+/// The rows span the run number the stop addresses — the first run of a definition and the
+/// ones after it, over a definition that keeps accumulating finished runs — which is what a
+/// handler that ended "the running run" rather than the addressed one would confuse.
+#[tokio::test]
+async fn a_stop_ends_only_the_run_it_addresses() {
+    const LABEL: &str = "addressed";
+    let router = router();
+    let scope = scope(&router, LABEL).await;
+
+    // A second definition under the same application, with a run in flight for the whole
+    // test: no stop aimed at the definition under test may touch either of them.
+    let bystander_name = format!("{LABEL}-bystander");
+    let (bystander_id, bystander_run) = running(
+        &router,
+        "the other definition's run",
+        &scope,
+        &bystander_name,
+        &json!({ "ExposurePercentage": 25.0 }),
+    )
+    .await;
+
+    let name = format!("{LABEL}-definition");
+    let definition = create_test_definition(&router, &scope, &name).await;
+    let definition_id = id_of(&name, &definition);
+
+    // The runs this definition has finished with, and the document each of them ended as.
+    let mut finished: Vec<(i64, Value)> = Vec::new();
+    for run in [1_i64, 2, 3] {
+        let case = format!(
+            "run {run}, stopped with {} finished run(s) behind it",
+            finished.len()
+        );
+        let started = start_run(
+            &router,
+            &scope.application,
+            &definition_id,
+            &json!({ "ExposurePercentage": 10.0 }),
+        )
+        .await;
+        assert_eq!(
+            started.status,
+            201,
+            "case {case:?}: the run under test must start, got {} / {}",
+            started.status,
+            String::from_utf8_lossy(&started.body)
+        );
+        assert_eq!(
+            started.json().get("Run").and_then(Value::as_i64),
+            Some(run),
+            "case {case:?}: expected run {run}, got {}",
+            started.json()
+        );
+
+        // A stop aimed at a run this definition has already finished with conflicts, and
+        // the run that IS in flight is not the one it ends.
+        for (earlier, _) in &finished {
+            let refused =
+                stop_run(&router, &scope.application, &definition_id, *earlier, &json!({})).await;
+            assert_refused(&case, &refused, 409, "ConflictException");
+            let in_flight = get_run(&router, &scope.application, &definition_id, run).await;
+            assert_eq!(
+                in_flight.json().get("Status").and_then(Value::as_str),
+                Some(state::EXPERIMENT_RUN_RUNNING),
+                "case {case:?}: a refused stop of run {earlier} must leave run {run} running, \
+                 got {}",
+                in_flight.json()
+            );
+        }
+
+        let summary = format!("run {run} concluded");
+        let stopped = stop_run(
+            &router,
+            &scope.application,
+            &definition_id,
+            run,
+            &json!({ "Result": { "ExecutiveSummary": summary } }),
+        )
+        .await;
+        assert_eq!(
+            stopped.status,
+            200,
+            "case {case:?}: expected 200, got {} / {}",
+            stopped.status,
+            String::from_utf8_lossy(&stopped.body)
+        );
+        let ended = stopped.json();
+        assert_eq!(
+            ended.get("Run").and_then(Value::as_i64),
+            Some(run),
+            "case {case:?}: the stop reports the run it addressed, got {ended}"
+        );
+        assert_eq!(
+            ended.get("Status").and_then(Value::as_str),
+            Some(state::EXPERIMENT_RUN_DONE),
+            "case {case:?}: expected the finished status, got {ended}"
+        );
+        assert_eq!(
+            ended.get("Result"),
+            Some(&json!({ "ExecutiveSummary": summary })),
+            "case {case:?}: expected the conclusion this stop stated, got {ended}"
+        );
+
+        // Every run finished EARLIER still reports the document it finished with: this
+        // stop wrote none of them.
+        for (earlier, document) in &finished {
+            let read = get_run(&router, &scope.application, &definition_id, *earlier).await;
+            assert_eq!(
+                read.status,
+                200,
+                "case {case:?}: run {earlier} must still read back, got {} / {}",
+                read.status,
+                String::from_utf8_lossy(&read.body)
+            );
+            assert_eq!(
+                &read.json(),
+                document,
+                "case {case:?}: expected run {earlier} to still report {document}, got {}",
+                read.json()
+            );
+        }
+        finished.push((run, ended));
+
+        // The other definition's run is in flight exactly as it was, and that definition
+        // still reports the status it holds while an experiment runs.
+        let other_run = get_run(&router, &scope.application, &bystander_id, 1).await;
+        assert_eq!(
+            other_run.status,
+            200,
+            "case {case:?}: the other definition's run must still read back, got {} / {}",
+            other_run.status,
+            String::from_utf8_lossy(&other_run.body)
+        );
+        let other = other_run.json();
+        assert_eq!(
+            other.get("Status").and_then(Value::as_str),
+            Some(state::EXPERIMENT_RUN_RUNNING),
+            "case {case:?}: expected the other definition's run to still be running, got {other}"
+        );
+        assert_eq!(
+            other, bystander_run,
+            "case {case:?}: expected the other definition's run to report {bystander_run}, got \
+             {other}"
+        );
+        let other_definition = get_definition(&router, &scope.application, &bystander_id).await;
+        assert_eq!(
+            other_definition.string("Status").as_deref(),
+            Some(state::EXPERIMENT_DEFINITION_ACTIVE),
+            "case {case:?}: expected the other definition to still hold a run in flight, got {}",
+            other_definition.json()
+        );
+    }
+
+    // Three runs were issued, stopped and kept, each under its own number.
+    assert_eq!(
+        finished.iter().map(|(run, _)| *run).collect::<Vec<_>>(),
+        vec![1_i64, 2, 3],
+        "expected one finished record per run number, got {:?}",
+        finished.iter().map(|(run, _)| *run).collect::<Vec<_>>()
+    );
 }
 
 /// An identifier or a run number that addresses nothing is HTTP 404
