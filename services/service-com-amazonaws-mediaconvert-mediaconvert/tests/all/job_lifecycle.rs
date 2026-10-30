@@ -90,6 +90,23 @@ impl Emulator {
         Self::with_settle_span(HELD_IN_SUBMITTED)
     }
 
+    /// As [`Self::new`], with one more service mounted beside this one on the same router
+    /// and built over the SAME engine — for a suite that has to watch what this service's
+    /// handlers send to another service over the in-process callback, which is routed by
+    /// this very router.
+    pub(crate) fn beside<S, F>(build: F) -> Self
+    where
+        S: smithy_server_runtime::Service,
+        F: FnOnce(Arc<engine::InMemoryEngine>) -> S,
+    {
+        let mut emulator = Self::new();
+        let extra = build(Arc::clone(&emulator.engine));
+        // The router has not been cloned or served yet, so the service set is still
+        // uniquely held and one more may join it.
+        emulator.router.register_service(extra);
+        emulator
+    }
+
     /// An emulator whose jobs are due to leave `SUBMITTED` after `span`.
     pub(crate) fn with_settle_span(span: Duration) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());

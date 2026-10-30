@@ -161,7 +161,10 @@ async fn create_job_with_inputs(emulator: &Emulator, uris: &[&str]) -> Reply {
 
 /// How many jobs the store holds, read back through `ListJobs` — through the API, never by
 /// reaching into the state struct. Every case keeps its job count under one page.
-async fn stored_jobs(emulator: &Emulator) -> usize {
+///
+/// Shared with the suites that also have to show a refused submission stored nothing, so
+/// "how many jobs does the account hold" is read one way.
+pub(crate) async fn stored_jobs(emulator: &Emulator) -> usize {
     let listed = emulator.send("GET", "/2017-08-29/jobs", None).await;
     assert_eq!(
         listed.status, 200,

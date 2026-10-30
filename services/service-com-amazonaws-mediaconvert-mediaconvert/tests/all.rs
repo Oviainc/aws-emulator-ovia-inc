@@ -73,6 +73,8 @@ mod job_templates;
 mod jobs_query;
 #[path = "all/list_jobs_queue_filter.rs"]
 mod list_jobs_queue_filter;
+#[path = "all/local_refusals_cost_no_input_read.rs"]
+mod local_refusals_cost_no_input_read;
 #[path = "all/optional_free_text.rs"]
 mod optional_free_text;
 #[path = "all/output_preset_reference.rs"]

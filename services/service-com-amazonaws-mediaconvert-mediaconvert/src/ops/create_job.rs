@@ -308,10 +308,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The job template this request inherits from, and the queue the job is sent to,
         // both read under the store's guard — which is then RELEASED, because the input
         // probe below calls another emulated service in-process and this service's state
-        // is never locked across that call. Every purely-local refusal is answered here,
+        // is never locked across that call. Every purely-local refusal is answered
         // before any outbound work: a request naming a template or a queue this account
-        // does not hold costs no probe.
-        let (template, queue, policy, job_engine_version_used) = {
+        // does not hold costs no probe, and so does one no part of this store admits —
+        // see the guarded [`locally_refused`] call below, which answers the rest of them
+        // once the graph the job will run from is known.
+        let (template, queue, job_engine_version_used) = {
             let mut store = state.lock();
             store.settle(now);
             if let Some(token) = token.as_deref() {
@@ -354,6 +356,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(crate::state::queue_name_from_reference)
                 .map(str::to_string)
                 .unwrap_or_else(|| crate::state::DEFAULT_QUEUE_NAME.to_string());
+            // The queue reference is RESOLVED here, where the name the job stores is
+            // worked out, so it is answered before the engine-version refusal below: a
+            // request naming a queue this account does not hold is the 404, whatever else
+            // it carries. [`locally_refused`] owns this decision from here on and takes it
+            // again under each guard it needs — do not drop this one as a duplicate, or an
+            // invalid `JobEngineVersion` would answer 400 where the service answers 404.
             if !store.queues.contains_key(&queue) {
                 return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
                     // The refusal names the request member the reference came from,
@@ -392,10 +400,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 None => None,
             };
-            // The account's input policy is read here too — it is local state, so the
-            // decision it carries costs no probe — and applied below, once the settings
-            // the job will actually run from are known.
-            (template, queue, store.policy.clone(), job_engine_version_used)
+            (template, queue, job_engine_version_used)
         };
 
         // "When you create a job, you can either specify a job template or specify the
@@ -460,16 +465,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        // Every input the job will read, which both the policy decision below and the
-        // probe after it are taken against: the request's own
-        // `Settings.Inputs[].FileInput` merged with whatever the referenced template
-        // supplies.
+        // Every input the job will read, which both the refusals below and the probe
+        // after them are taken against: the request's own `Settings.Inputs[].FileInput`
+        // merged with whatever the referenced template supplies.
         let input_uris = crate::state::job_input_uris(&settings);
-        // "An input policy allows or disallows a job you submit to run based on the
-        // conditions that you specify": the account's policy gates the SUBMISSION, so a
-        // job stating an input at a location the policy disallows is refused here —
-        // before any outbound work and before anything is stored.
-        if let Some(refusal) = policy_refusal(policy.as_ref(), &input_uris) {
+
+        // Every refusal this submission can be decided from the request and this
+        // service's own store is answered HERE — before the probe below calls another
+        // emulated service, so a submission that is already refused by local state costs
+        // no outbound read of anybody's objects. The guard is taken and RELEASED around
+        // the decision, because this service's state is never locked across that call.
+        let locally = {
+            let store = state.lock();
+            locally_refused(
+                &store,
+                &queue,
+                job_template.as_deref(),
+                &hop_destinations,
+                &settings,
+                &input_uris,
+            )
+        };
+        if let Some(refusal) = locally {
             return Err(refusal.into());
         }
 
@@ -495,65 +512,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Both reference members are re-read under the guard the job is stored through,
-        // for the same reason the token is: the probe ran without it, so either resource
-        // may have been deleted in the meantime, and a job is never created against a
-        // queue or a template this account no longer holds.
-        if !state.queues.contains_key(&queue) {
-            return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
-                // The refusal names the request member the reference came from, `Queue`.
-                message: Some(crate::state::not_found_message("queue")),
-            })
-            .into());
-        }
-        if job_template
-            .as_deref()
-            .is_some_and(|name| !state.job_templates.contains_key(name))
-        {
-            return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message("jobTemplate")),
-            })
-            .into());
-        }
-
-        // Every other reference this request makes to a stored resource is resolved the
-        // same way, against the same guarded store: a reference that resolves to nothing
-        // is the modelled 404 naming the member it came from, never a job pointing at a
-        // resource no reader can see.
-        if crate::state::hop_destination_queues(&hop_destinations)
-            .any(|reference| !state.holds_queue(reference))
-        {
-            return Err(CreateJobErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::not_found_message("hopDestinations")),
-            })
-            .into());
-        }
-
-        // The account's policy is re-read under the guard the job is stored through, for
-        // the same reason the references are: it was read before the probe, so a
-        // `PutPolicy` may have replaced it in the meantime, and the policy a job is
-        // admitted under is the one in force when the job is stored.
-        if let Some(refusal) = policy_refusal(state.policy.as_ref(), &input_uris) {
+        // Every local refusal is decided AGAIN, under the guard the job is stored
+        // through, for the same reason the token is re-read: the probe ran without that
+        // guard, so a queue, a job template, a hop destination's queue or an output's
+        // preset may have been deleted and `PutPolicy` may have replaced the policy while
+        // it ran. The job is admitted on the state in force when it is stored, never on a
+        // reading taken before the probe.
+        if let Some(refusal) = locally_refused(
+            &state,
+            &queue,
+            job_template.as_deref(),
+            &hop_destinations,
+            &settings,
+            &input_uris,
+        ) {
             return Err(refusal.into());
-        }
-
-        // The settings graph is validated at SUBMIT time, against what the job will
-        // actually be run from: `settings` above is the request's own `Settings` with the
-        // referenced template's laid under it, member by member. A job that describes no
-        // source, or no complete output, describes no transcode at all, which is the
-        // modelled 400 — and nothing is stored, because this returns before `accept_job`.
-        // The template reference itself was resolved against this same guarded store above,
-        // so a template that vanished is already the 404 naming the member it came from.
-        // The graph's OWN references are resolved here, against the same guarded store: an
-        // output names its encoder settings either by naming a preset the account holds or
-        // by carrying container settings of its own, so a preset that was never created, or
-        // was deleted after the template naming it was written, refuses the submission
-        // instead of being stored on a job no reader can resolve.
-        if let Some(problem) = state.job_settings_problem(&settings) {
-            return Err(CreateJobErrorModeled::BadRequestException(BadRequestException {
-                message: Some(problem.message()),
-            })
-            .into());
         }
 
         // The id, the clock-owed exit from SUBMITTED and the idempotency entry are all
@@ -658,6 +631,78 @@ impl TagRefusalError for CreateJobErrorModeled {
             message: Some(message),
         })
     }
+}
+
+/// How this submission is refused by the request together with this service's OWN store,
+/// or `None` when nothing local refuses it.
+///
+/// Every test here needs nothing but the guarded store and values already derived from the
+/// request, so the decision costs no call to another service — which is why it is taken
+/// BEFORE the input probe: a submission naming a queue, a job template, a hop destination's
+/// queue or an output's preset this account does not hold, a graph that describes no
+/// transcode, or an input the account's own policy disallows, is refused without a single
+/// object read being sent anywhere.
+///
+/// One function because that decision is taken TWICE on the same request: once before the
+/// probe, so a locally refusable submission does no outbound work, and once under the guard
+/// the job is stored through, because the probe runs with no lock held and any of these
+/// resources may have been deleted — or the policy replaced — while it ran. Two copies of
+/// the walk could disagree about which refusal a request gets; one cannot.
+///
+/// The order is the order the operation answers them in: the references the job stores
+/// first, then the permission the account itself withheld, then the graph the job would run
+/// from.
+fn locally_refused(
+    store: &crate::state::ComAmazonawsMediaconvertMediaconvertState,
+    queue: &str,
+    job_template: Option<&str>,
+    hop_destinations: &[HopDestination],
+    settings: &JobSettings,
+    input_uris: &[String],
+) -> Option<CreateJobErrorModeled> {
+    // A reference that resolves to nothing is the modelled 404 naming the member it came
+    // from, never a job pointing at a resource no reader can see. `queue` is already the
+    // NAME the job will store; the hop destinations are references in either form.
+    if !store.queues.contains_key(queue) {
+        return Some(CreateJobErrorModeled::NotFoundException(NotFoundException {
+            // The refusal names the request member the reference came from, `Queue`.
+            message: Some(crate::state::not_found_message("queue")),
+        }));
+    }
+    if job_template.is_some_and(|name| !store.job_templates.contains_key(name)) {
+        return Some(CreateJobErrorModeled::NotFoundException(NotFoundException {
+            message: Some(crate::state::not_found_message("jobTemplate")),
+        }));
+    }
+    if crate::state::hop_destination_queues(hop_destinations)
+        .any(|reference| !store.holds_queue(reference))
+    {
+        return Some(CreateJobErrorModeled::NotFoundException(NotFoundException {
+            message: Some(crate::state::not_found_message("hopDestinations")),
+        }));
+    }
+    // "An input policy allows or disallows a job you submit to run based on the conditions
+    // that you specify": the account's policy gates the SUBMISSION, so a job stating an
+    // input at a location the policy disallows never runs and is never stored.
+    if let Some(refusal) = policy_refusal(store.policy.as_ref(), input_uris) {
+        return Some(refusal);
+    }
+    // The settings graph is validated at SUBMIT time, against what the job will actually be
+    // run from: `settings` is the request's own `Settings` with the referenced template's
+    // laid under it, member by member. A job that describes no source, or no complete
+    // output, describes no transcode at all, which is the modelled 400. The graph's OWN
+    // references are resolved here, against this store: an output names its encoder
+    // settings either by naming a preset the account holds or by carrying container
+    // settings of its own, so a preset that was never created, or was deleted after the
+    // template naming it was written, refuses the submission instead of being stored on a
+    // job no reader can resolve.
+    store
+        .job_settings_problem(settings)
+        .map(|problem| {
+            CreateJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(problem.message()),
+            })
+        })
 }
 
 /// How a submission is refused when the account's input policy disallows an input the job
