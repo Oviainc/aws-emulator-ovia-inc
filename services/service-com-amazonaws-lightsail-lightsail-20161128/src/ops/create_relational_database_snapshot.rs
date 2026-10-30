@@ -186,14 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account holds, the snapshot name must not already be taken, and the
         // caller-sized tag list must be within the store's bounds. Each is checked
         // BEFORE the first write, so a refused request creates nothing.
-        let tags = input.tags.unwrap_or_default();
-        if tags.len() > crate::state::MAX_TAGS {
-            return Err(invalid(format!(
-                "tags carries {} entries, more than the {} this service accepts",
-                tags.len(),
-                crate::state::MAX_TAGS
-            )));
-        }
+        //
+        // The request's list BECOMES the tags this resource carries, so it is
+        // bounded AND collapsed by key here: the tags of a resource obey one
+        // rule whether a create or a later tag change put them there.
+        let tags = crate::state::tags_created_from(input.tags.as_deref()).map_err(invalid)?;
 
         let name = input.relational_database_snapshot_name;
         let source_name = input.relational_database_name;

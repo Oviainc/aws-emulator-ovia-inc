@@ -201,8 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before the store is reached and before a single key is compared, so no
         // caller-sized walk runs for a request this service refuses anyway. The
         // same check, at the same bound, as every operation of this crate that
-        // accepts `tags` (see `create_disk.rs`). `UntagResource` bounds nothing,
-        // and correctly: a key list only ever REMOVES.
+        // accepts `tags` makes through `crate::state::tags_created_from`.
+        // `UntagResource` bounds nothing, and correctly: a key list only ever
+        // REMOVES.
         //
         // Bounding the LIST is deliberately stricter than bounding the merged
         // set: a list of more than this many entries is refused even where its

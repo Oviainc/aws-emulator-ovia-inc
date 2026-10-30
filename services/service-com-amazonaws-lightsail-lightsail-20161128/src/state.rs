@@ -16483,14 +16483,50 @@ pub fn tags_without(record: &dyn TaggedRecord, keys: &BTreeSet<String>) -> Vec<T
 /// Answers the set rather than applying it, so a caller can refuse a request that
 /// would take the resource past [`MAX_TAGS`] before anything is written.
 pub fn tags_merged_with(record: &dyn TaggedRecord, added: &[Tag]) -> Vec<Tag> {
-    let mut merged = record.tags().to_vec();
+    tags_merged_into(record.tags().to_vec(), added)
+}
+
+/// The tags a resource CREATED with `requested` carries, or a refusal naming the
+/// bound that list broke.
+///
+/// A create starts the resource from no tags at all, so the set it ends up
+/// carrying is the one [`tags_merged_with`] would answer for an untagged
+/// resource: merging is BY KEY, because "tag keys must be unique per resource"
+/// (the modelled `TagResource` documentation) is a rule about the RESOURCE and so
+/// holds however the resource came to carry its tags. A key the request names
+/// twice is therefore held once, carrying the last value that request gave it,
+/// leaving a created resource in exactly the states a tag change can also reach —
+/// and never one where a later `TagResource` for that key could not reach every
+/// entry holding it.
+///
+/// The LIST is bounded first, at [`MAX_TAGS`] and in the wording every operation
+/// of this crate that accepts `tags` answers with, so a caller-sized list is
+/// refused before a single key is compared; the bound is deliberately on the
+/// list rather than on the collapsed set, exactly as the tag-change path bounds
+/// the list it is given.
+pub fn tags_created_from(requested: Option<&[Tag]>) -> Result<Vec<Tag>, String> {
+    let requested = requested.unwrap_or_default();
+    if requested.len() > MAX_TAGS {
+        return Err(format!(
+            "tags carries {} entries, more than the {MAX_TAGS} this service accepts",
+            requested.len()
+        ));
+    }
+    Ok(tags_merged_into(Vec::new(), requested))
+}
+
+/// `added` merged into the tags `held`, the one place this crate applies the
+/// per-resource key-uniqueness rule — reached from [`tags_merged_with`] for a
+/// resource that already exists and from [`tags_created_from`] for one being
+/// created, so both answer the same set for the same list.
+fn tags_merged_into(mut held: Vec<Tag>, added: &[Tag]) -> Vec<Tag> {
     for tag in added {
-        match merged.iter_mut().find(|held| held.key == tag.key) {
-            Some(held) => held.value = tag.value.clone(),
-            None => merged.push(tag.clone()),
+        match held.iter_mut().find(|entry| entry.key == tag.key) {
+            Some(entry) => entry.value = tag.value.clone(),
+            None => held.push(tag.clone()),
         }
     }
-    merged
+    held
 }
 
 // ---------------------------------------------------------------------------

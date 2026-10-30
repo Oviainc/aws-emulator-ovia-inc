@@ -212,14 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.subject_alternative_names.unwrap_or_default(),
         )
         .map_err(invalid)?;
-        let tags = input.tags.unwrap_or_default();
-        if tags.len() > crate::state::MAX_TAGS {
-            return Err(invalid(format!(
-                "tags carries {} entries, more than the {} this service accepts",
-                tags.len(),
-                crate::state::MAX_TAGS
-            )));
-        }
+        // The request's list BECOMES the tags this resource carries, so it is
+        // bounded AND collapsed by key here: the tags of a resource obey one
+        // rule whether a create or a later tag change put them there.
+        let tags = crate::state::tags_created_from(input.tags.as_deref()).map_err(invalid)?;
 
         let location =
             crate::state::StoredLocation::regional(crate::state::DISTRIBUTION_REGION_NAME);

@@ -220,14 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.power
             ))
         })?;
-        let tags = input.tags.clone().unwrap_or_default();
-        if tags.len() > crate::state::MAX_TAGS {
-            return Err(invalid(format!(
-                "tags carries {} entries, more than the {} this service accepts",
-                tags.len(),
-                crate::state::MAX_TAGS
-            )));
-        }
+        // The request's list BECOMES the tags this resource carries, so it is
+        // bounded AND collapsed by key here: the tags of a resource obey one
+        // rule whether a create or a later tag change put them there.
+        let tags = crate::state::tags_created_from(input.tags.as_deref()).map_err(invalid)?;
         // How many public domain names the request may carry is decided by the
         // request alone; WHICH certificate each group of them may be keyed by is
         // decided by the certificates this account holds, so that half of the

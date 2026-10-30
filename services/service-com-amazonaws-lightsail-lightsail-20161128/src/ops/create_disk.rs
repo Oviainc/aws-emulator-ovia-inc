@@ -201,14 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.size_in_gb
             )));
         }
-        let tags = input.tags.clone().unwrap_or_default();
-        if tags.len() > crate::state::MAX_TAGS {
-            return Err(invalid(format!(
-                "tags carries {} entries, more than the {} this service accepts",
-                tags.len(),
-                crate::state::MAX_TAGS
-            )));
-        }
+        // The request's list BECOMES the tags this resource carries, so it is
+        // bounded AND collapsed by key here: the tags of a resource obey one
+        // rule whether a create or a later tag change put them there.
+        let tags = crate::state::tags_created_from(input.tags.as_deref()).map_err(invalid)?;
 
         // Of the modelled `AddOnType` members, only `AutoSnapshot` describes a
         // disk, which is what `disk_add_ons_from_requests` accepts — the one

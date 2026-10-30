@@ -201,14 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // be held by no snapshot of this account, and the caller-sized tag list
         // must be within the store's bounds. Every one of those is checked
         // BEFORE the first write, so a refused request creates nothing.
-        let tags = input.tags.unwrap_or_default();
-        if tags.len() > crate::state::MAX_TAGS {
-            return Err(invalid(format!(
-                "tags carries {} entries, more than the {} this service accepts",
-                tags.len(),
-                crate::state::MAX_TAGS
-            )));
-        }
+        //
+        // The request's list BECOMES the tags this resource carries, so it is
+        // bounded AND collapsed by key here: the tags of a resource obey one
+        // rule whether a create or a later tag change put them there.
+        let tags = crate::state::tags_created_from(input.tags.as_deref()).map_err(invalid)?;
         let source = match (input.disk_name, input.instance_name) {
             (Some(disk_name), None) => RequestedSource::Disk(disk_name),
             (None, Some(instance_name)) => RequestedSource::Instance(instance_name),

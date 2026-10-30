@@ -284,14 +284,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 notification_triggers.join(", ")
             )));
         }
-        let tags = input.tags.clone().unwrap_or_default();
-        if tags.len() > crate::state::MAX_TAGS {
-            return Err(invalid(format!(
-                "tags carries {} entries, more than the {} this service accepts",
-                tags.len(),
-                crate::state::MAX_TAGS
-            )));
-        }
+        // The request's list BECOMES the tags this alarm carries, so it is
+        // bounded AND collapsed by key here: the tags of a resource obey one
+        // rule whether a put or a later tag change put them there.
+        let tags = crate::state::tags_created_from(input.tags.as_deref()).map_err(invalid)?;
 
         let contact_protocols = input.contact_protocols.clone().unwrap_or_default();
         let treat_missing_data = input
