@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // half-applied update.
         let id = state
             .update_alarm_template_group(&region, &input.identifier, input.description, now)
-            .ok_or_else(|| not_found(&input.identifier))?;
+            .map_err(|refusal| refused(refusal, &input.identifier))?;
 
         // The response is read back out of the stored record, never built from
         // `input`, so what this update answers is what the next
@@ -188,6 +188,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             UpdateCloudWatchAlarmTemplateGroupOutput,
             group
         ))
+    }
+}
+
+/// Turn a store refusal into this operation's own modelled error: an identifier
+/// no group in this region answers to — by either of the two forms `Identifier`
+/// documents (its id or its current name) — is its 404, and a group the service
+/// publishes is its 400, since what the caller must change is the request rather
+/// than any state of its own.
+fn refused(
+    refusal: crate::state::PublishedWriteRefusal,
+    identifier: &str,
+) -> UpdateCloudWatchAlarmTemplateGroupError {
+    match refusal {
+        crate::state::PublishedWriteRefusal::NotFound => not_found(identifier),
+        crate::state::PublishedWriteRefusal::Published => {
+            UpdateCloudWatchAlarmTemplateGroupErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::published_resource_message(
+                        "cloudwatch alarm template group",
+                        identifier,
+                    )),
+                },
+            )
+            .into()
+        }
     }
 }
 

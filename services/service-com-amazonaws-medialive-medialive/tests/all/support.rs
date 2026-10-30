@@ -78,6 +78,46 @@ pub fn percent_encoded(label: &str) -> String {
     percent_encoding::utf8_percent_encode(label, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
+/// The prefix the id of an AWS-PROVIDED monitor template resource carries, as
+/// `CloudWatchAlarmTemplateGroupSummary$Id` and
+/// `CloudWatchAlarmTemplateSummary$Id` document it ("AWS provided template
+/// groups have ids that start with `aws-`").
+pub const AWS_PROVIDED_ID_PREFIX: &str = "aws-";
+
+/// Whether the monitor template resource `summary` reports is one the SERVICE
+/// publishes rather than one the account created, which its id's prefix is what
+/// tells apart.
+pub fn is_aws_provided(summary: &Value) -> bool {
+    summary["id"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with(AWS_PROVIDED_ID_PREFIX)
+}
+
+/// The entries of `summaries` the ACCOUNT created: a listing of a monitor
+/// template resource reports the service's published catalog beside the
+/// account's own, and a suite whose subject is what the CALLER created reads its
+/// own entries out of the response this way rather than by assuming the listing
+/// reports nothing else.
+pub fn account_owned(summaries: &[Value]) -> Vec<Value> {
+    summaries
+        .iter()
+        .filter(|summary| !is_aws_provided(summary))
+        .cloned()
+        .collect()
+}
+
+/// The `name`s of [`account_owned`] entries, sorted — what a suite that asserts
+/// WHICH of the caller's resources a listing admits compares.
+pub fn account_owned_names(summaries: &[Value]) -> Vec<String> {
+    let mut names: Vec<String> = account_owned(summaries)
+        .iter()
+        .map(|summary| summary["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
 /// A timestamp member, read as the instant its RFC 3339 / ISO-8601 string names.
 ///
 /// The model targets every timestamp member of this service at

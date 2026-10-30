@@ -18,11 +18,11 @@
 //! and whether two versions share a release instant.
 //!
 //! NOTHING in this emulator releases an encoder engine, and nothing here invents
-//! one: the catalogue is seeded when the account's store comes up (the service
-//! publishes these versions, no caller creates one), which is what the seeded-set
-//! suite below reads, and the suites that span the class install the catalogue
-//! they are about through the store's own type instead of asking an operation to
-//! create a version it models no way to create.
+//! one: an engine version is published by the SERVICE and no operation of it
+//! creates, changes or deletes one, so an account the service has published none
+//! to reports none (the fresh-account suite below), and the suites that span the
+//! class install the catalogue they are about through the store's own type instead
+//! of asking an operation to create a version it models no way to create.
 
 use std::time::{Duration, SystemTime};
 
@@ -240,23 +240,70 @@ async fn list_versions_reports_the_unexpired_catalogue_newest_first() {
     }
 }
 
-/// Rule, on the catalogue no test installed: an account's store comes up carrying
-/// the service's own engine versions, so `ListVersions` on an account that has made
-/// no other call reports that seeded set — newest release first, each inside its
-/// lifetime and none dated in the future.
+/// Rule, on the catalogue no test installed: an engine version is published by
+/// the SERVICE and created by no operation of it, so an account the service has
+/// published none to reports none — `ListVersions` answers 200 with an empty set
+/// rather than with versions and expiry dates derived from the emulator's own
+/// clock, which would differ on every run.
 #[tokio::test]
-async fn a_fresh_account_reports_its_seeded_catalogue() {
-    let case = "the seeded catalogue";
+async fn a_fresh_account_publishes_no_versions() {
+    let case = "a fresh account";
     let router = medialive();
-    let before = SystemTime::now();
     let (status, body) = list_versions(&router).await;
-    let after = SystemTime::now();
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ListVersions to answer 200, got {status}: {body}"
+    );
+    let reported = reported_versions(case, &body);
+    assert!(
+        reported.is_empty(),
+        "case {case:?}: expected a fresh account to publish no versions, got {reported:?}"
+    );
+
+    // Reading again reports the same thing: the read published nothing into the
+    // catalogue it answers from.
+    let (status, again) = list_versions(&router).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the second ListVersions to answer 200, got {status}: {again}"
+    );
+    assert!(
+        reported_versions(case, &again).is_empty(),
+        "case {case:?}: expected the second read to publish no versions either, got {again}"
+    );
+}
+
+/// Rule: a published series of engine versions reports, newest release first,
+/// every entry still inside its lifetime — the labels the series is named by
+/// ([`channel_engine_version_label`]), one [`CHANNEL_ENGINE_VERSION_INTERVAL`]
+/// apart, each expiring a [`CHANNEL_ENGINE_VERSION_LIFETIME`] after its release.
+///
+/// The series is INSTALLED through the store's own type, because the service is
+/// what publishes an account's versions and this emulator invents none.
+#[tokio::test]
+async fn an_installed_series_reports_newest_first_with_its_stored_expiries() {
+    let case = "an installed release series";
+    let (router, engine) = medialive_with_engine();
+    let released_at = SystemTime::now();
+    let series: Vec<ChannelEngineVersionRecord> = (0..CHANNEL_ENGINE_VERSION_COUNT)
+        .map(|release| {
+            let generations = u32::try_from(CHANNEL_ENGINE_VERSION_COUNT - 1 - release)
+                .expect("the series is short");
+            ChannelEngineVersionRecord::released(
+                channel_engine_version_label(release),
+                released_at - CHANNEL_ENGINE_VERSION_INTERVAL * generations,
+            )
+        })
+        .collect();
+    install(&engine, ChannelEngineVersionCatalog::of(series));
+
+    let (status, body) = list_versions(&router).await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected ListVersions to answer 200, got {status}: {body}"
     );
 
-    // The seeded labels, newest release first: the catalogue is counted from its
+    // The installed labels, newest release first: the series is counted from its
     // oldest release, so the newest is the last label.
     let expected: Vec<String> = (0..CHANNEL_ENGINE_VERSION_COUNT)
         .rev()
@@ -268,33 +315,28 @@ async fn a_fresh_account_reports_its_seeded_catalogue() {
         "case {case:?}: expected the versions {expected:?}, got {reported:?}"
     );
 
-    // The newest version expires a lifetime after the account's store came up,
-    // which is somewhere inside the span this test took.
+    // Each entry expires a lifetime after the instant it was released at, and
+    // consecutive releases are one interval apart.
     let expiries: Vec<f64> = entries(case, &body)
         .iter()
         .map(|entry| epoch_seconds(timestamp(case, "expirationDate", entry)))
         .collect();
     let lifetime = CHANNEL_ENGINE_VERSION_LIFETIME.as_secs_f64();
+    let interval = CHANNEL_ENGINE_VERSION_INTERVAL.as_secs_f64();
     let newest = expiries
         .first()
         .copied()
-        .expect("a seeded catalogue reports at least one version");
+        .expect("the installed series reports at least one version");
     assert!(
-        newest >= unix_seconds(before) + lifetime - TOLERANCE_SECONDS
-            && newest <= unix_seconds(after) + lifetime + TOLERANCE_SECONDS,
-        "case {case:?}: expected the newest version to expire a lifetime from now \
-         ({}..{}), got {newest}",
-        unix_seconds(before) + lifetime,
-        unix_seconds(after) + lifetime
+        (newest - (unix_seconds(released_at) + lifetime)).abs() < TOLERANCE_SECONDS,
+        "case {case:?}: expected the newest version to expire a lifetime after its release \
+         ({}), got {newest}",
+        unix_seconds(released_at) + lifetime
     );
-
-    // Consecutive releases are one interval apart, and every entry is still ahead
-    // of its expiry — nothing in the seeded set is already expired.
-    let interval = CHANNEL_ENGINE_VERSION_INTERVAL.as_secs_f64();
     for (index, expiry) in expiries.iter().enumerate() {
         assert!(
-            *expiry > unix_seconds(after),
-            "case {case:?}/{}: every seeded version must still be available, \
+            *expiry > unix_seconds(released_at),
+            "case {case:?}/{}: every entry of the series must still be available, \
              but it expires at {expiry}",
             reported[index]
         );

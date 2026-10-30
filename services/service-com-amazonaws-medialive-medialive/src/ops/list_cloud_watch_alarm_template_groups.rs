@@ -193,10 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // `NextToken` is the id the next page starts at, and ids sort in mint
-        // order in the store, so resuming is a range scan from that id. Every
-        // filter the request named must hold, so naming both narrows the listing
-        // to the groups both admit.
+        // `NextToken` is the id the next page starts at, in the order a listing
+        // reports this kind — the groups the SERVICE publishes, then the
+        // account's own in mint order — so resuming is a scan from that id in
+        // that order. Every filter the request named must hold, so naming both
+        // narrows the listing to the groups both admit.
         let mut remaining = state
             .alarm_template_groups_in(&region, input.next_token.as_deref())
             .filter(|group| {

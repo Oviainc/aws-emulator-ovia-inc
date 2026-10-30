@@ -253,7 +253,8 @@ pub use alarm_template_groups::{
 pub mod account_configuration;
 
 pub use account_configuration::{
-    is_kms_key_arn, AccountConfigurationRecord, MAX_ACCOUNT_CONFIGURATION_REGIONS,
+    is_kms_key_arn, medialive_managed_kms_key_arn, AccountConfigurationRecord,
+    MAX_ACCOUNT_CONFIGURATION_REGIONS,
 };
 
 pub use schedules::{
@@ -297,6 +298,21 @@ pub use alarm_templates::{
 };
 
 pub(crate) use alarm_templates::alarm_template_output;
+
+/// The AWS-PROVIDED monitor template catalog slice: the cloudwatch alarm
+/// template groups the service publishes, the templates inside them and the
+/// records a region's partition is seeded with, in one module of its own for the
+/// same reason as the two slices above. What stays in this file is the part the
+/// rest of the state needs: the seeding of a partition
+/// ([`ComAmazonawsMedialiveMedialiveState::with_mints`]) and the predicate every
+/// writer checks before it modifies a monitor template resource
+/// ([`is_published_id`]).
+pub mod managed_monitor_templates;
+
+pub use managed_monitor_templates::{
+    is_published_id, listing_position, published_groups, published_resource_message,
+    published_templates, service_owned_arn, PublishedWriteRefusal, CATALOG_PUBLISHED_AT,
+};
 
 /// The multiplex slice: its record, its bounds, its refusals, the store's
 /// methods and its output projection, in one module of its own for the same
@@ -2243,6 +2259,10 @@ pub enum TemplateGroupDeleteRefusal {
         signal_map_ids: Vec<String>,
         template_ids: Vec<String>,
     },
+    /// The identifier names a group the SERVICE publishes
+    /// ([`managed_monitor_templates`]) rather than one the account created, so
+    /// the account cannot delete it however its own state stands.
+    Published,
 }
 
 /// The message a group delete refused because the group still holds templates
@@ -2390,9 +2410,12 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// PRIVATE: every id comes out of a `mint_*` method of this store, which is
     /// where the kind of id and its first value live.
     mints: ::std::sync::Arc<IdMints>,
-    /// Every cloudwatch alarm template group that exists, keyed by its minted
-    /// `Id`. A `BTreeMap` so a later `ListCloudWatchAlarmTemplateGroups` walks it
-    /// in id order on every call.
+    /// Every cloudwatch alarm template group that exists — the ones this account
+    /// created, keyed by their minted `Id`, and the ones the SERVICE publishes,
+    /// keyed by the `aws-` prefixed id the [`managed_monitor_templates`] catalog
+    /// publishes them under and seeded when the partition came up. A `BTreeMap`
+    /// so a later `ListCloudWatchAlarmTemplateGroups` walks it in id order on
+    /// every call.
     ///
     /// PRIVATE, so the name-uniqueness rule, the cap and the mint stay invariants
     /// of [`Self::insert_alarm_template_group`] rather than of each handler.
@@ -2401,9 +2424,11 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// keyed per region by [`template_group_token_key`] -> the group it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     alarm_template_group_tokens: IdempotencyTokens,
-    /// Every cloudwatch alarm template that exists, keyed by its minted `Id`. A
-    /// `BTreeMap` so a later `ListCloudWatchAlarmTemplates` walks it in id order
-    /// on every call.
+    /// Every cloudwatch alarm template that exists — this account's own, keyed by
+    /// their minted `Id`, and the ones the SERVICE publishes inside its own
+    /// groups, seeded when the partition came up, exactly as
+    /// [`Self::alarm_template_groups`] holds both provenances. A `BTreeMap` so a
+    /// later `ListCloudWatchAlarmTemplates` walks it in id order on every call.
     ///
     /// PRIVATE, so the group resolution, the name-uniqueness rule, the cap and
     /// the mint stay invariants of [`Self::insert_alarm_template`] rather than of
@@ -2524,9 +2549,11 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// the available ones out of it.
     ///
     /// There is no mint counter and no token map beside it: an engine version is
-    /// not a resource a caller creates, it is one the service publishes, so the
-    /// catalogue is SEEDED when this store comes up (the [`engine_versions`]
-    /// slice's own `Default`) and no request path writes it.
+    /// not a resource a caller creates, it is one the service publishes, so
+    /// nothing on a request path writes this catalogue — and an account the
+    /// service has published no version to carries the EMPTY one the
+    /// [`engine_versions`] slice's `Default` gives, never a set derived from the
+    /// local clock.
     pub channel_engine_versions: ChannelEngineVersionCatalog,
 }
 
@@ -2535,11 +2562,27 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// `mints` — the store's own set, which every partition shares, so no two
     /// regions hand out the same id. The [`regions`] slice is what calls this;
     /// `Default` (which gives a set of its own) is for a standalone store.
-    fn with_mints(mints: ::std::sync::Arc<IdMints>) -> Self {
-        Self {
+    ///
+    /// Empty of the ACCOUNT's resources, that is. The monitor template resources
+    /// the SERVICE publishes exist in every account and every region without
+    /// anybody creating them, so the partition comes up carrying them (the
+    /// [`managed_monitor_templates`] catalog), which is what makes a listing
+    /// report them on an account that has created nothing. They are seeded here,
+    /// once per partition, rather than merged in by each reader, so every reader
+    /// — the listings, the single gets, the `Scope` filter and a group's derived
+    /// `TemplateCount` — answers from the one store.
+    fn with_mints(region: &str, mints: ::std::sync::Arc<IdMints>) -> Self {
+        let mut state = Self {
             mints,
             ..Self::default()
+        };
+        for group in published_groups(region) {
+            state.alarm_template_groups.insert(group.id.clone(), group);
         }
+        for template in published_templates(region) {
+            state.alarm_templates.insert(template.id.clone(), template);
+        }
+        state
     }
 
     /// Materialise every transition the clock had already made due as of `now`,
@@ -4636,9 +4679,14 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .input_devices
                 .get_mut(&id)
                 .map(|record| &mut record.tags),
+            // The monitor template resources the SERVICE publishes are read-only
+            // for the account, tags included: they are not its resources, so a
+            // tag write is not handed their stored map and the tag writers answer
+            // the ARN with their modelled not-found error.
             TaggedResource::AlarmTemplateGroup(id) => self
                 .alarm_template_groups
                 .get_mut(&id)
+                .filter(|record| !is_published_id(&record.id))
                 .map(|record| &mut record.tags),
             TaggedResource::EventBridgeRuleTemplateGroup(id) => self
                 .event_bridge_rule_template_groups
@@ -4650,6 +4698,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             TaggedResource::AlarmTemplate(id) => self
                 .alarm_templates
                 .get_mut(&id)
+                .filter(|record| !is_published_id(&record.id))
                 .map(|record| &mut record.tags),
             TaggedResource::EventBridgeRuleTemplate(id) => self
                 .event_bridge_rule_templates

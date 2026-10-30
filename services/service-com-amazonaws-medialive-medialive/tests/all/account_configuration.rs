@@ -6,9 +6,10 @@
 //!
 //! Rules asserted here:
 //!
-//! * The account always HAS a configuration: a describe before any update
-//!   answers 200 with the UNSET configuration (no `kmsKeyId`), never a 404, and
-//!   a describe changes nothing a later caller would have seen.
+//! * The account always HAS a configuration, and always has a key: a describe
+//!   before any update answers 200 reporting the key MediaLive creates and
+//!   manages for the account, never a 404 and never an absent `kmsKeyId`, and a
+//!   describe changes nothing a later caller would have seen.
 //! * An update applies the parameters the request carries and leaves the ones it
 //!   omits as they stood ("List of account configuration parameters to update",
 //!   `smithy_query(query="shape", shape="UpdateAccountConfigurationRequest")`),
@@ -33,7 +34,17 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call_in_region, error_code, error_message, medialive, DEFAULT_REGION};
+use crate::wire::{call_in_region, error_code, error_message, medialive, ACCOUNT, DEFAULT_REGION};
+
+/// The configuration a region with no CUSTOMER-managed key reports: the key
+/// MediaLive creates and manages for the account, which `KmsKeyId` documents as
+/// what a blank value asks for ("leave blank to use the key that MediaLive
+/// creates and manages for you"). An AWS-managed key is addressed by its
+/// `alias/aws/<service>` alias in the account and region that holds it, so the
+/// ARN is built from the region the request was signed for.
+fn managed_key(region: &str) -> Value {
+    json!({ "kmsKeyId": format!("arn:aws:kms:{region}:{ACCOUNT}:alias/aws/medialive") })
+}
 
 /// The URI both operations are bound to: `smithy_query(query="operation",
 /// operation="UpdateAccountConfiguration")` is PUT /prod/accountConfiguration
@@ -123,20 +134,20 @@ async fn reported(router: &MultiServiceRouter, case: &str, region: &str) -> Valu
 }
 
 /// Rule: the account's configuration exists whether or not anything has been
-/// configured, so a describe on a fresh emulator answers 200 with a
-/// configuration carrying no `kmsKeyId` — the member is OPTIONAL and the account
-/// holds no customer-managed key, so it is absent rather than an empty value —
-/// and repeating the read answers exactly the same thing (a read changes
-/// nothing).
+/// configured, so a describe on a fresh emulator answers 200 with the key
+/// MediaLive creates and manages for the account rather than with an absent
+/// member — an account that configured no key of its own still encrypts with a
+/// key, and which key that is is what the member reports — and repeating the
+/// read answers exactly the same thing (a read changes nothing).
 #[tokio::test]
-async fn a_describe_before_any_update_reports_the_unset_configuration() {
+async fn a_describe_before_any_update_reports_the_service_managed_key() {
     let router = medialive();
 
     let first = reported(&router, "fresh account", DEFAULT_REGION).await;
     assert_eq!(
         first,
-        json!({}),
-        "case {case:?}: expected the unset configuration, got {first}",
+        managed_key(DEFAULT_REGION),
+        "case {case:?}: expected the MediaLive-managed key, got {first}",
         case = "fresh account"
     );
 
@@ -183,7 +194,7 @@ async fn every_kms_key_arn_form_round_trips_through_the_store() {
 
 /// Rule: a BLANK `KmsKeyId` is the documented way to ask for "the key that
 /// MediaLive creates and manages for you", so it CLEARS a stored
-/// customer-managed key: the account then reports no `kmsKeyId` at all, and it
+/// customer-managed key: the account then reports that managed key again, and it
 /// stays cleared on the next read.
 ///
 /// The rows are the key forms the clear is applied to.
@@ -209,14 +220,14 @@ async fn a_blank_kms_key_clears_the_stored_key() {
         .await;
         assert_eq!(
             cleared,
-            json!({}),
-            "case {case:?}: expected a blank kmsKeyId to clear the key, got {cleared}"
+            managed_key(DEFAULT_REGION),
+            "case {case:?}: expected a blank kmsKeyId to clear the customer key, got {cleared}"
         );
 
         let described = reported(&router, case, DEFAULT_REGION).await;
         assert_eq!(
             described,
-            json!({}),
+            managed_key(DEFAULT_REGION),
             "case {case:?}: expected the cleared configuration to be what is stored, got {described}"
         );
     }
@@ -392,8 +403,8 @@ async fn the_per_region_store_is_bounded() {
     let described = reported(&router, case, "emulator-region-overflow").await;
     assert_eq!(
         described,
-        json!({}),
-        "case {case:?}: expected the refused region to hold nothing, got {described}"
+        managed_key("emulator-region-overflow"),
+        "case {case:?}: expected the refused region to hold no customer key, got {described}"
     );
 
     // An update that sets nothing needs no room at all, so even a new region is
@@ -416,8 +427,8 @@ async fn the_per_region_store_is_bounded() {
         let quiet = configuration(case, "UpdateAccountConfiguration", status, &response);
         assert_eq!(
             quiet,
-            json!({}),
-            "case {case:?}: expected the unset configuration, got {quiet}"
+            managed_key(region),
+            "case {case:?}: expected the MediaLive-managed key, got {quiet}"
         );
     }
 }
@@ -425,7 +436,7 @@ async fn the_per_region_store_is_bounded() {
 /// Rule: MediaLive is a regional service, so the account configuration a
 /// regional endpoint reports is the one configured through THAT endpoint: a key
 /// set in one region is not reported by another, and a region nothing has
-/// configured still reports the unset configuration.
+/// configured reports the key MediaLive manages for it.
 ///
 /// The rows are the regions, each carrying a different key form, so no row can
 /// pass by reporting another's value.
@@ -460,9 +471,9 @@ async fn the_configuration_belongs_to_the_region_it_was_set_in() {
     let unconfigured = reported(&router, "sa-east-1", "sa-east-1").await;
     assert_eq!(
         unconfigured,
-        json!({}),
-        "case {case:?}: expected a region nothing configured to report the unset \
-         configuration, got {unconfigured}",
+        managed_key("sa-east-1"),
+        "case {case:?}: expected a region nothing configured to report its own \
+         MediaLive-managed key, got {unconfigured}",
         case = "sa-east-1"
     );
 }

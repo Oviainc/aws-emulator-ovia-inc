@@ -15,6 +15,10 @@
 //! the clock-owed settling the channel readers do, because no member an engine
 //! version reports depends on a channel's transitions.
 //!
+//! The catalogue is the SERVICE's to publish and this emulator never invents an
+//! entry for it, so an account the service has published no engine version to
+//! reports none.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -156,9 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
         let now = ::std::time::SystemTime::now();
-        // Reporting only, and not even the one write the channel readers make: the
-        // catalogue is seeded when the store comes up and no request path writes
-        // it, so this guard is only ever read through.
+        // Reporting only, and not even the one write the channel readers make:
+        // the catalogue holds what the service published to this account and no
+        // request path writes it, so this guard is only ever read through. An
+        // account with no published version reports none.
         let state = state.lock();
         Ok(ListVersionsOutput {
             versions: Some(state.channel_engine_versions.available_at(now)),

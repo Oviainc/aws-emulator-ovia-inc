@@ -213,10 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        // `NextToken` is the id the next page starts at, and ids sort in mint
-        // order in the store, so resuming is a range scan from that id. Every
-        // filter the request named must hold, so naming several narrows the
-        // listing to the templates all of them admit.
+        // `NextToken` is the id the next page starts at, in the order a listing
+        // reports this kind — the templates the SERVICE publishes, then the
+        // account's own in mint order — so resuming is a scan from that id in
+        // that order. Every filter the request named must hold, so naming several
+        // narrows the listing to the templates all of them admit.
         let mut remaining = state
             .alarm_templates_in(&region, input.next_token.as_deref())
             .filter(|template| {

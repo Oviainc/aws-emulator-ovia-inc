@@ -97,7 +97,7 @@ impl ComAmazonawsMedialiveMedialiveStore {
         Some(
             self.regions
                 .entry(region.to_string())
-                .or_insert_with(|| RegionState::new(mints))
+                .or_insert_with(|| RegionState::new(region, mints))
                 .clone(),
         )
     }
@@ -126,11 +126,17 @@ impl RegionState {
     /// An empty partition, minting its resources out of `mints` — the store's
     /// own set, which every partition shares.
     ///
+    /// `region` is what the partition is for: a resource belongs to the region
+    /// whose endpoint created it, and the monitor template resources the SERVICE
+    /// publishes ([`super::managed_monitor_templates`]) are read through every
+    /// regional endpoint, so the partition comes up carrying them with that
+    /// region's ARNs.
+    ///
     /// There is no `Default`: a partition that minted out of counters of its own
     /// could hand out an id another region had already handed out.
-    fn new(mints: Arc<IdMints>) -> Self {
+    fn new(region: &str, mints: Arc<IdMints>) -> Self {
         Self(Arc::new(Mutex::new(
-            ComAmazonawsMedialiveMedialiveState::with_mints(mints),
+            ComAmazonawsMedialiveMedialiveState::with_mints(region, mints),
         )))
     }
 

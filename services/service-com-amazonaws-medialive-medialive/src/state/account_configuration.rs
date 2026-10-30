@@ -10,11 +10,18 @@
 //!
 //! There is no resource to mint here and none to delete: an account always HAS a
 //! configuration, so `DescribeAccountConfiguration` answers for an account that
-//! has configured nothing yet with the unset configuration rather than a 404, and
-//! `UpdateAccountConfiguration` — whose request is "List of account configuration
-//! parameters to update" (`smithy_query(query="shape",
+//! has configured nothing yet with the configuration it has rather than a 404,
+//! and `UpdateAccountConfiguration` — whose request is "List of account
+//! configuration parameters to update" (`smithy_query(query="shape",
 //! shape="UpdateAccountConfigurationRequest")`) — changes the parameters the
 //! request carries and leaves the ones it omits exactly as they stood.
+//!
+//! What an account that has configured nothing HAS is the key MediaLive creates
+//! and manages for it ([`medialive_managed_kms_key_arn`]): `KmsKeyId` names the
+//! key the account's features encrypt with, and leaving it blank is documented as
+//! asking for that managed key rather than for no key at all. So the store keeps
+//! a record only for a region where a CUSTOMER-managed key was configured, and
+//! the projection fills in the managed key everywhere else.
 //!
 //! The configuration is held PER REGION, keyed by the region the request was
 //! signed for ([`super::request_region`]): MediaLive is a regional service, so
@@ -44,31 +51,56 @@ pub const MAX_ACCOUNT_CONFIGURATION_REGIONS: usize = 64;
 ///
 /// A record exists only once an update has set something in that region; a
 /// region without one reads as [`AccountConfigurationRecord::default`], which is
-/// the unset configuration.
+/// the configuration of an account that has configured nothing of its own.
 #[derive(Debug, Clone, Default)]
 pub struct AccountConfigurationRecord {
     /// The customer-managed KMS key this account's MediaLive features encrypt
     /// with, as `AccountConfiguration$KmsKeyId` carries it.
     ///
-    /// `None` is "no customer-managed key", which is what the member documents
-    /// as the meaning of a BLANK value: "Specify the ARN of a KMS key that you
-    /// have created. Or leave blank to use the key that MediaLive creates and
-    /// manages for you". So a blank update is stored as `None` rather than as an
-    /// empty string, and a read of it reports the OPTIONAL member as absent
-    /// rather than reporting an empty value for a key the account does not have.
+    /// `None` is "no CUSTOMER-managed key", which is what the member documents as
+    /// the meaning of a BLANK value: "Specify the ARN of a KMS key that you have
+    /// created. Or leave blank to use the key that MediaLive creates and manages
+    /// for you". So a blank update is stored as `None` rather than as an empty
+    /// string, and a read of a region with no customer key reports the key
+    /// MediaLive manages ([`ComAmazonawsMedialiveMedialiveStore::account_configuration`])
+    /// rather than an empty value.
     pub kms_key_id: Option<String>,
 }
 
 impl AccountConfigurationRecord {
     /// Whether this record holds no setting at all, which is indistinguishable
-    /// from the account holding no record for the region: both read as the unset
-    /// configuration, so a record in this state is dropped rather than kept (and
-    /// so it holds none of the store's bounded room). `KmsKeyId` is the whole of
-    /// the configuration the model declares today; a member added to
-    /// `AccountConfiguration` later joins this check.
+    /// from the account holding no record for the region: both read as the
+    /// configuration of an account with no customer-managed key, so a record in
+    /// this state is dropped rather than kept (and so it holds none of the
+    /// store's bounded room). `KmsKeyId` is the whole of the configuration the
+    /// model declares today; a member added to `AccountConfiguration` later joins
+    /// this check.
     fn is_unset(&self) -> bool {
         self.kms_key_id.is_none()
     }
+}
+
+/// The alias every AWS-managed KMS key is addressed by: `alias/aws/<service
+/// namespace>`, this service's namespace being the one its own ARNs carry.
+///
+/// `AccountConfiguration$KmsKeyId` is "Specifies the KMS key to use for all
+/// features that use key encryption. Specify the ARN of a KMS key that you have
+/// created. Or leave blank to use the key that MediaLive creates and manages for
+/// you" — so an account that has configured no key of its own still HAS a key,
+/// the one the service creates and manages for it, and that key is what a read
+/// reports ([`medialive_managed_kms_key_arn`]).
+const MEDIALIVE_MANAGED_KEY_ALIAS: &str = "alias/aws/medialive";
+
+/// The ARN of the KMS key MediaLive creates and manages for this account in
+/// `region`.
+///
+/// Derived from the account and the region a request addressed, never from the
+/// clock or from the request's body, so two reads of one region report the same
+/// key and a read after a restart reports the one the read before it did. It is a
+/// KMS key ARN in the alias form [`is_kms_key_arn`] accepts, which is what lets a
+/// caller configure it back explicitly after configuring a key of its own.
+pub fn medialive_managed_kms_key_arn(region: &str) -> String {
+    ::engine::emulator_arn(KMS_SERVICE, region, MEDIALIVE_MANAGED_KEY_ALIAS)
 }
 
 impl ComAmazonawsMedialiveMedialiveStore {
@@ -77,12 +109,23 @@ impl ComAmazonawsMedialiveMedialiveStore {
     ///
     /// The ONE projection, so `DescribeAccountConfiguration` and the
     /// `UpdateAccountConfiguration` that preceded it cannot report the same
-    /// stored configuration differently. A region nothing has configured yet
-    /// answers with the unset configuration — the account exists either way.
+    /// stored configuration differently.
+    ///
+    /// `KmsKeyId` is always reported, because the account always has a key: the
+    /// customer-managed one it configured, and otherwise the key MediaLive
+    /// creates and manages for it ([`medialive_managed_kms_key_arn`]), which is
+    /// what the member documents a blank value as asking for. So a region nothing
+    /// has configured yet answers with the service-managed key rather than with
+    /// an absent member, which would say nothing at all about what this account's
+    /// features encrypt with.
     pub fn account_configuration(&self, region: &str) -> AccountConfiguration {
         let stored = self.account_configurations.get(region);
         AccountConfiguration {
-            kms_key_id: stored.and_then(|record| record.kms_key_id.clone()),
+            kms_key_id: Some(
+                stored
+                    .and_then(|record| record.kms_key_id.clone())
+                    .unwrap_or_else(|| medialive_managed_kms_key_arn(region)),
+            ),
         }
     }
 
@@ -105,7 +148,8 @@ impl ComAmazonawsMedialiveMedialiveStore {
     /// parameter it omits — and a request that carries no `AccountConfiguration`
     /// at all — leaves the stored value alone. A supplied BLANK `KmsKeyId` is a
     /// value and not an omission: it clears the customer-managed key, which is
-    /// the member's documented way of asking for the key MediaLive manages.
+    /// the member's documented way of asking for the key MediaLive manages, and
+    /// is then what a read reports.
     ///
     /// The write and the read-back are one step in the store, so what the update
     /// answers is what the next read answers.
@@ -126,9 +170,10 @@ impl ComAmazonawsMedialiveMedialiveStore {
                 Some(kms_key_id.to_string())
             };
             // A record with nothing set reads exactly as no record, so it is
-            // dropped instead of kept: clearing the last setting gives the
-            // region's slot in the bounded store back rather than holding it for
-            // a configuration that says nothing.
+            // dropped instead of kept: clearing the customer-managed key gives
+            // the region's slot in the bounded store back rather than holding it
+            // for a configuration that says nothing beyond the managed key every
+            // region has anyway.
             if record.is_unset() {
                 self.account_configurations.remove(region);
             }

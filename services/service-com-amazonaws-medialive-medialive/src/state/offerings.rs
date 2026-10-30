@@ -240,13 +240,17 @@ impl OfferingSpec {
     pub fn offering(&self, index: usize, region: &str) -> Offering {
         let id = offering_id(index);
         Offering {
-            // The ARN form the `Arn` member documents by example
-            // ("arn:aws:medialive:us-west-2:123456789012:offering:87654321").
-            arn: Some(::engine::emulator_arn(
-                "medialive",
-                region,
-                &format!("offering:{id}"),
-            )),
+            // An offering is a resource the SERVICE publishes per region and not
+            // one an account owns, so its ARN carries the region it is offered in
+            // and an EMPTY account-id field, the form
+            // [`super::service_owned_arn`] builds for every service-owned
+            // resource of this service. (The member's own example sketches an
+            // account-bearing form; what a published catalog entry's ARN looks
+            // like is settled by the recorded `ListOfferings` bodies this
+            // emulator is replayed against, which carry no account id.) The
+            // RESERVATION a purchase of this offering mints is the account's, and
+            // keeps the account-bearing form.
+            arn: Some(super::service_owned_arn(region, &format!("offering:{id}"))),
             currency_code: Some(OFFERING_CURRENCY_CODE.to_string()),
             duration: Some(OFFERING_DURATION),
             duration_units: Some(OFFERING_DURATION_UNITS.to_string()),

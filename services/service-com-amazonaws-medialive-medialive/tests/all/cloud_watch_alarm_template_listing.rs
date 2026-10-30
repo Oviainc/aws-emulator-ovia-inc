@@ -16,8 +16,17 @@ use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::MAX_LIST_PAGE_SIZE;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::support::{create_in as create_group_in, entry_point, timestamp};
+use crate::support::{
+    account_owned_names, create_in as create_group_in, entry_point, timestamp,
+    AWS_PROVIDED_ID_PREFIX,
+};
 use crate::wire::{call_in_region, error_code, medialive, DEFAULT_REGION};
+
+/// The `Scope` that narrows a listing to the templates LOCAL to this account,
+/// which the suites whose subject is what the CALLER created list with: the
+/// service publishes a catalog of its own templates in every region, and those
+/// are the subject of `managed_monitor_catalog.rs` instead.
+const LOCAL_ONLY: &str = "?scope=LOCAL";
 
 /// The collection URI `ListCloudWatchAlarmTemplates` and
 /// `CreateCloudWatchAlarmTemplate` are bound to
@@ -326,7 +335,7 @@ async fn listing_pages_through_every_stored_template_in_mint_order() {
             created.push(template["id"].as_str().unwrap_or_default().to_string());
         }
 
-        let (listed, pages) = every_page(&router, case, "", page_size).await;
+        let (listed, pages) = every_page(&router, case, LOCAL_ONLY, page_size).await;
         assert_eq!(
             listed, created,
             "case {case:?}: expected the listing to report every stored template once, \
@@ -434,7 +443,7 @@ async fn a_listed_summary_reads_the_stored_template() {
         let created = create_template(&router, case, DEFAULT_REGION, body).await;
         let id = created["id"].as_str().unwrap_or_default().to_string();
 
-        let (status, listed) = list(&router, "").await;
+        let (status, listed) = list(&router, LOCAL_ONLY).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected 200, got {status}: {listed}"
@@ -607,9 +616,10 @@ async fn a_filter_lists_only_the_templates_it_admits() {
             format!("?groupIdentifier={spare}&signalMapIdentifier={both}"),
             &[],
         ),
-        // `Scope` is the provenance filter: every template this emulator mints
+        // `Scope` is the provenance filter: every template this emulator MINTS
         // is created by the caller, so the local scope admits them all and the
-        // AWS-provided scope admits none.
+        // AWS-provided scope admits none of them (it admits the service's own
+        // published templates, which `managed_monitor_catalog.rs` asserts).
         ("every scope", "?scope=ALL".to_string(), &every),
         ("the local scope", "?scope=LOCAL".to_string(), &every),
         ("the AWS-provided scope", "?scope=AWS".to_string(), &[]),
@@ -639,11 +649,11 @@ async fn a_filter_lists_only_the_templates_it_admits() {
             status, 200,
             "case {case:?}: expected 200, got {status}: {body}"
         );
-        let mut names: Vec<String> = summaries(case, &body)
-            .iter()
-            .map(|summary| summary["name"].as_str().unwrap_or_default().to_string())
-            .collect();
-        names.sort();
+        // The ACCOUNT's templates among what the listing reports: the service's
+        // own published templates are admitted by every row that does not narrow
+        // the provenance or name one of the caller's groups, and which of the
+        // CALLER's templates a filter admits is this suite's subject.
+        let names = account_owned_names(&summaries(case, &body));
         assert_eq!(
             names, expected,
             "case {case:?}: expected the filter to admit {expected:?}, got {names:?}"
@@ -652,10 +662,15 @@ async fn a_filter_lists_only_the_templates_it_admits() {
         // The same filter, paged one template at a time, admits the same set:
         // the page cut narrows nothing of its own.
         let (ids, pages) = every_page(&router, case, &query, Some(1)).await;
+        let account = ids
+            .iter()
+            .filter(|id| !id.starts_with(AWS_PROVIDED_ID_PREFIX))
+            .count();
         assert_eq!(
-            ids.len(),
+            account,
             expected.len(),
-            "case {case:?}: expected {} templates across the pages {pages:?}, got {ids:?}",
+            "case {case:?}: expected {} of the account's templates across the pages \
+             {pages:?}, got {ids:?}",
             expected.len()
         );
     }
@@ -689,11 +704,7 @@ async fn a_listing_reports_only_the_templates_of_its_own_region() {
             status, 200,
             "case {region:?}: expected 200, got {status}: {body}"
         );
-        let mut listed: Vec<String> = summaries(region, &body)
-            .iter()
-            .map(|summary| summary["name"].as_str().unwrap_or_default().to_string())
-            .collect();
-        listed.sort();
+        let listed = account_owned_names(&summaries(region, &body));
         assert_eq!(
             listed, names,
             "case {region:?}: expected only the templates created in {region}, got {listed:?}"
@@ -810,7 +821,7 @@ async fn a_bad_page_size_scope_or_unresolvable_filter_is_refused() {
 
     // A refused listing wrote nothing: the store still holds the templates the
     // setup created, which is none of them.
-    let (status, body) = list(&router, "").await;
+    let (status, body) = list(&router, LOCAL_ONLY).await;
     assert_eq!(status, 200, "the unfiltered listing got {status}: {body}");
     assert!(
         summaries("after refusals", &body).is_empty(),

@@ -109,7 +109,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 name,
             });
         }
-        if self.alarm_template_groups.len() >= MAX_ALARM_TEMPLATE_GROUPS {
+        if self.account_alarm_template_groups() >= MAX_ALARM_TEMPLATE_GROUPS {
             return Err(AlarmTemplateGroupRefusal::StoreFull);
         }
 
@@ -138,6 +138,20 @@ impl ComAmazonawsMedialiveMedialiveState {
         Ok(id)
     }
 
+    /// How many of the stored groups this ACCOUNT created — what
+    /// [`MAX_ALARM_TEMPLATE_GROUPS`] bounds.
+    ///
+    /// The groups the SERVICE publishes are seeded into the same store (see
+    /// [`super::managed_monitor_templates`]) and no create brought them there,
+    /// so they hold none of the room a create loop could otherwise grow without
+    /// bound.
+    fn account_alarm_template_groups(&self) -> usize {
+        self.alarm_template_groups
+            .keys()
+            .filter(|id| !super::is_published_id(id))
+            .count()
+    }
+
     /// The group `identifier` names in `region`, resolving it as the group's id
     /// or its current name — the two forms
     /// `GetCloudWatchAlarmTemplateGroupRequest$Identifier` documents ("Can be
@@ -154,30 +168,33 @@ impl ComAmazonawsMedialiveMedialiveState {
             .or_else(|| self.alarm_template_group_named(region, identifier))
     }
 
-    /// The cloudwatch alarm template groups stored in `region`, in the order
-    /// their ids were minted, beginning at the group `start` names when a
-    /// `NextToken` carried a resume point.
+    /// The cloudwatch alarm template groups stored in `region`, in the order a
+    /// listing reports them ([`super::listing_position`]: the groups the SERVICE
+    /// published first, then the account's own in mint order), beginning at the
+    /// group `start` names when a `NextToken` carried a resume point.
     ///
     /// The store itself is private, so this is how a listing reads it — the same
     /// reading the listing of the TEMPLATES inside them already uses
-    /// ([`ComAmazonawsMedialiveMedialiveState::alarm_templates_in`]): a
-    /// `BTreeMap` range scan from the resume point, which is why a token naming a
-    /// group deleted since the previous page resumes at the next surviving id
-    /// instead of failing. Groups of other regions are invisible, for the reason
+    /// ([`ComAmazonawsMedialiveMedialiveState::alarm_templates_in`]): a scan from
+    /// the resume point in that order, which is why a token naming a group
+    /// deleted since the previous page resumes at the next surviving id instead
+    /// of failing. Groups of other regions are invisible, for the reason
     /// [`Self::alarm_template_group`] states.
     pub fn alarm_template_groups_in<'a>(
         &'a self,
         region: &'a str,
         start: Option<&'a str>,
     ) -> impl Iterator<Item = &'a CloudWatchAlarmTemplateGroupRecord> + 'a {
-        let first = match start {
-            Some(token) => ::std::ops::Bound::Included(token),
-            None => ::std::ops::Bound::Unbounded,
-        };
-        self.alarm_template_groups
-            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
-            .map(|(_, group)| group)
-            .filter(move |group| group.region == region)
+        let mut ordered: Vec<&'a CloudWatchAlarmTemplateGroupRecord> = self
+            .alarm_template_groups
+            .values()
+            .filter(|group| group.region == region)
+            .collect();
+        ordered.sort_by_key(|group| super::listing_position(&group.id));
+        let from = start.map(super::listing_position);
+        ordered
+            .into_iter()
+            .filter(move |group| from.is_none_or(|first| super::listing_position(&group.id) >= first))
     }
 
     /// Project a stored group onto the `CloudWatchAlarmTemplateGroupSummary` a
@@ -220,6 +237,10 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// removed the group is GONE from the store, so every later read of either of
     /// its identifiers misses and its name is free again.
     ///
+    /// A group the SERVICE publishes ([`super::managed_monitor_templates`]) is
+    /// refused before either precondition is read: it is not the account's
+    /// resource, so no state the account could change would make it deletable.
+    ///
     /// The resolution, the precondition and the removal live together here, so a
     /// handler cannot check one of them and write past another; the handler's job
     /// is only to turn a [`TemplateGroupDeleteRefusal`] into the operation's own
@@ -234,6 +255,9 @@ impl ComAmazonawsMedialiveMedialiveState {
             .ok_or(TemplateGroupDeleteRefusal::NotFound)?
             .id
             .clone();
+        if super::is_published_id(&id) {
+            return Err(TemplateGroupDeleteRefusal::Published);
+        }
 
         let signal_map_ids = self.signal_maps_using_alarm_template_group(&id);
         let template_ids = self.alarm_template_ids_in_group(&id);
@@ -269,28 +293,40 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// Apply the members an `UpdateCloudWatchAlarmTemplateGroup` request
     /// supplied onto the group `identifier` names in `region`, and answer that
-    /// group's id — or `None` when this region holds no such group.
+    /// group's id — or refuse, changing nothing.
     ///
     /// "Updates the specified cloudwatch alarm template group": a member the
     /// request carries replaces the stored one, a member it omits leaves that
     /// value as it was, and `ModifiedAt` becomes the instant of the call, which
     /// is when the record was last written. The identifier resolves through
     /// [`Self::alarm_template_group`], so an update reaches its group by either
-    /// form `Identifier` documents ("Can be either be its id or current name").
+    /// form `Identifier` documents ("Can be either be its id or current name") —
+    /// and a group the SERVICE publishes is refused, for the reason
+    /// [`Self::delete_alarm_template_group`] states.
     pub fn update_alarm_template_group(
         &mut self,
         region: &str,
         identifier: &str,
         description: Option<String>,
         now: SystemTime,
-    ) -> Option<String> {
-        let id = self.alarm_template_group(region, identifier)?.id.clone();
-        let group = self.alarm_template_groups.get_mut(&id)?;
+    ) -> Result<String, super::PublishedWriteRefusal> {
+        let id = self
+            .alarm_template_group(region, identifier)
+            .ok_or(super::PublishedWriteRefusal::NotFound)?
+            .id
+            .clone();
+        if super::is_published_id(&id) {
+            return Err(super::PublishedWriteRefusal::Published);
+        }
+        let group = self
+            .alarm_template_groups
+            .get_mut(&id)
+            .ok_or(super::PublishedWriteRefusal::NotFound)?;
         if let Some(description) = description {
             group.description = Some(description);
         }
         group.modified_at = now;
-        Some(id)
+        Ok(id)
     }
 
     /// Record `token`, as presented in `region`, as having created the group

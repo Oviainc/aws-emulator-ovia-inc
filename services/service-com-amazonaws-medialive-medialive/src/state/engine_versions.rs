@@ -12,9 +12,18 @@
 //! An engine version is NOT a resource a caller creates: `ListVersions`
 //! "retrieves an array of all the encoder engine versions that are available in
 //! this AWS account", and no operation of this service creates, deletes or
-//! changes one. So the catalogue is SEEDED when the account's store comes up and
-//! no request path writes it, which is what makes the versions a caller reads
-//! back the ones that were persisted rather than ones a handler assembled.
+//! changes one. So the catalogue holds what the SERVICE publishes for the
+//! account, and no request path writes it — which is what makes the versions a
+//! caller reads back the ones that were persisted rather than ones a handler
+//! assembled.
+//!
+//! A new account's catalogue is EMPTY: an engine version is published by the
+//! service, so an emulator that has had none published to it has none to report,
+//! and nothing here manufactures one. In particular the catalogue is not seeded
+//! off the local clock — a version whose `ExpirationDate` were derived from the
+//! instant the store came up would report a different expiry on every run, so
+//! nothing a caller cached about it could stay true. A caller that knows the
+//! versions an account is offered installs them through [`Self::of`].
 //!
 //! What a read does take from the clock is which of those versions are still
 //! AVAILABLE. `ChannelEngineVersionResponse$ExpirationDate` is "The UTC time when
@@ -22,43 +31,36 @@
 //! the versions available to the account and is not reported — while its record
 //! stays in the catalogue, because a read never writes.
 //!
-//! The three facts AWS publishes nowhere machine-readable — how many versions an
-//! account is offered, how far apart they are released and how long one lasts —
-//! are this EMULATOR's own ([`CHANNEL_ENGINE_VERSION_COUNT`],
-//! [`CHANNEL_ENGINE_VERSION_INTERVAL`], [`CHANNEL_ENGINE_VERSION_LIFETIME`]), and
-//! so is the FORM of a version's build identifier
-//! ([`channel_engine_version_label`]), since the model documents `Version` only as
-//! "The build identifier for this version of the channel version". Nothing should
-//! read them as AWS's own release calendar.
+//! The FORM of a version's build identifier ([`channel_engine_version_label`])
+//! is this EMULATOR's own, since the model documents `Version` only as "The build
+//! identifier for this version of the channel version"; nothing should read it as
+//! AWS's own release naming.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::ChannelEngineVersionResponse;
 
-/// How many encoder engine versions the account's catalogue carries.
+/// How many encoder engine versions a release series of this emulator's own
+/// labelling spans, where a caller installs one ([`ChannelEngineVersionCatalog::of`]).
 ///
-/// A CHOSEN count: `ListVersions` documents that an account has a set of
-/// available engine versions and the model carries no list of its entries, so the
-/// SIZE of the seeded catalogue is the emulator's own, as the [`super::offerings`]
-/// catalog's shape is. Several of them, so a caller can tell the newest from the
-/// rest.
+/// A CHOSEN count, and NOT the size of a new account's catalogue, which is empty:
+/// `ListVersions` documents that an account has a set of available engine
+/// versions and the model carries no list of its entries, so the service
+/// publishes that set and this emulator never invents it.
 pub const CHANNEL_ENGINE_VERSION_COUNT: usize = 4;
 
-/// How far apart two consecutive engine versions of that catalogue are released.
+/// How far apart two consecutive engine versions of such a series are released.
 ///
 /// A CHOSEN span, not a documented one: nothing in the model says how often the
-/// encoder engine is released. It is non-zero, which is what gives the catalogue a
+/// encoder engine is released. It is non-zero, which is what gives a series a
 /// strict newest-to-oldest order and so one newest version.
 pub const CHANNEL_ENGINE_VERSION_INTERVAL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
-/// How long after its release an engine version expires.
+/// How long after its release an engine version of such a series expires.
 ///
 /// A CHOSEN span, not a documented one: `ExpirationDate` ("The UTC time when the
-/// version expires") documents THAT a version expires, never how long it lasts. A
-/// year, which is longer than the whole seeded catalogue spans
-/// (`CHANNEL_ENGINE_VERSION_COUNT - 1` intervals), so every entry of a freshly
-/// constructed account's catalogue is still available.
+/// version expires") documents THAT a version expires, never how long it lasts.
 pub const CHANNEL_ENGINE_VERSION_LIFETIME: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// The release series every seeded version belongs to — the leading component of
@@ -143,49 +145,19 @@ impl ChannelEngineVersionRecord {
 
 /// The account's engine version catalogue, keyed by build identifier.
 ///
-/// A type of its own rather than a bare map, so the SEEDING is part of
-/// constructing the store: the state struct derives `Default`, and this
-/// [`Default`] is what puts the account's versions there without any request path
-/// — reporting ones included — having to write them.
-#[derive(Debug)]
+/// A type of its own rather than a bare map, so what an account's catalogue
+/// holds is a fact of the store: the state struct derives `Default`, and this
+/// [`Default`] is the catalogue of an account the service has published no engine
+/// version to — which is EMPTY, because no request path and no clock may put one
+/// there.
+#[derive(Debug, Default)]
 pub struct ChannelEngineVersionCatalog {
     /// Every version the catalogue holds, expired ones included, keyed by its
-    /// build identifier, which is unique because consecutive releases are a
-    /// [`CHANNEL_ENGINE_VERSION_INTERVAL`] apart and labelled in release order.
+    /// build identifier.
     pub versions: BTreeMap<String, ChannelEngineVersionRecord>,
 }
 
-impl Default for ChannelEngineVersionCatalog {
-    /// The catalogue of an account whose store has just come up, seeded as of now.
-    fn default() -> Self {
-        Self::seeded_at(SystemTime::now())
-    }
-}
-
 impl ChannelEngineVersionCatalog {
-    /// The seeded catalogue as of `now`: [`CHANNEL_ENGINE_VERSION_COUNT`] versions,
-    /// the newest released at `now` and each earlier one a
-    /// [`CHANNEL_ENGINE_VERSION_INTERVAL`] further back, so every entry is inside
-    /// its lifetime and none is dated in the future.
-    ///
-    /// `checked_sub` rather than `-`, so an instant near the start of the
-    /// representable range cannot panic — it simply yields a shorter catalogue.
-    pub fn seeded_at(now: SystemTime) -> Self {
-        let versions = (0..CHANNEL_ENGINE_VERSION_COUNT)
-            .filter_map(|release| {
-                let generations = CHANNEL_ENGINE_VERSION_COUNT - 1 - release;
-                let age =
-                    CHANNEL_ENGINE_VERSION_INTERVAL.checked_mul(u32::try_from(generations).ok()?)?;
-                let record = ChannelEngineVersionRecord::released(
-                    channel_engine_version_label(release),
-                    now.checked_sub(age)?,
-                );
-                Some((record.version.clone(), record))
-            })
-            .collect();
-        Self { versions }
-    }
-
     /// A catalogue holding exactly `records` — the constructor a caller that knows
     /// the versions an account is offered uses instead of the seeded set.
     pub fn of(records: impl IntoIterator<Item = ChannelEngineVersionRecord>) -> Self {

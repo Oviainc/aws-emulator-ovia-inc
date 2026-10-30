@@ -209,6 +209,20 @@ fn refused(
             )),
         })
         .into(),
+        // A group the service publishes is nothing the account can detach or
+        // empty, so this is a bad request rather than a conflict with state the
+        // caller could clear.
+        crate::state::TemplateGroupDeleteRefusal::Published => {
+            DeleteCloudWatchAlarmTemplateGroupErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::published_resource_message(
+                        "cloudwatch alarm template group",
+                        identifier,
+                    )),
+                },
+            )
+            .into()
+        }
     }
 }
 

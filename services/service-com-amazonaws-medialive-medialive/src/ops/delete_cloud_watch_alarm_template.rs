@@ -179,9 +179,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal.
         state
             .delete_alarm_template(&region, &input.identifier)
-            .ok_or_else(|| not_found(&input.identifier))?;
+            .map_err(|refusal| refused(refusal, &input.identifier))?;
 
         Ok(DeleteCloudWatchAlarmTemplateOutput)
+    }
+}
+
+/// Turn a store refusal into this operation's own modelled error: an identifier
+/// no template in this region answers to is its 404, and a template the service
+/// publishes is its 400 — what the caller must change is the request, not any
+/// state of its own.
+fn refused(
+    refusal: crate::state::PublishedWriteRefusal,
+    identifier: &str,
+) -> DeleteCloudWatchAlarmTemplateError {
+    match refusal {
+        crate::state::PublishedWriteRefusal::NotFound => not_found(identifier),
+        crate::state::PublishedWriteRefusal::Published => {
+            DeleteCloudWatchAlarmTemplateErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::published_resource_message(
+                    "cloudwatch alarm template",
+                    identifier,
+                )),
+            })
+            .into()
+        }
     }
 }
 

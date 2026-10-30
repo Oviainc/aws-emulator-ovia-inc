@@ -28,7 +28,7 @@ use service_com_amazonaws_medialive_medialive::ops::types::{
 use service_com_amazonaws_medialive_medialive::state::MAX_LIST_PAGE_SIZE;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, call_in_region, error_code, medialive, ACCOUNT, DEFAULT_REGION};
+use crate::wire::{call, call_in_region, error_code, medialive, DEFAULT_REGION};
 
 /// The collection URI `ListOfferings` is bound to
 /// (`smithy_query(query="operation", operation="ListOfferings")`: GET
@@ -334,10 +334,10 @@ async fn every_offering_reports_the_configuration_it_reserves() {
         assert_eq!(
             offering["arn"],
             json!(format!(
-                "arn:aws:medialive:{DEFAULT_REGION}:{ACCOUNT}:offering:{id}"
+                "arn:aws:medialive:{DEFAULT_REGION}::offering:{id}"
             )),
-            "case {case:?}: expected the ARN built from the signed region and the offering id, \
-             got {:?}",
+            "case {case:?}: expected the service-owned ARN built from the signed region and \
+             the offering id, got {:?}",
             offering["arn"]
         );
         assert_eq!(
@@ -846,8 +846,8 @@ async fn a_listing_is_a_report_and_an_id_names_one_configuration() {
         );
         assert_eq!(
             there["arn"],
-            json!(format!("arn:aws:medialive:eu-west-1:{ACCOUNT}:offering:{id}")),
-            "expected the ARN built from the signed region, got {:?}",
+            json!(format!("arn:aws:medialive:eu-west-1::offering:{id}")),
+            "expected the service-owned ARN built from the signed region, got {:?}",
             there["arn"]
         );
     }

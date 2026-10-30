@@ -216,6 +216,11 @@ pub enum AlarmTemplateUpdateRefusal {
     /// which `Name` is documented to make unique there. Carries the name and the
     /// id of the template that holds it.
     NameTaken { id: String, name: String },
+    /// The identifier names a template the SERVICE publishes
+    /// ([`super::managed_monitor_templates`]) rather than one the account
+    /// created, so none of its settings are the account's to change. Carries the
+    /// identifier the request named.
+    Published { identifier: String },
 }
 
 /// What one update asks the store to change: a member the request carried is
@@ -338,7 +343,7 @@ impl ComAmazonawsMedialiveMedialiveState {
                 name: template.name,
             });
         }
-        if self.alarm_templates.len() >= MAX_ALARM_TEMPLATES {
+        if self.account_alarm_templates() >= MAX_ALARM_TEMPLATES {
             return Err(AlarmTemplateRefusal::StoreFull);
         }
 
@@ -422,6 +427,14 @@ impl ComAmazonawsMedialiveMedialiveState {
             });
         };
         let id = template.id.clone();
+        // A template the SERVICE publishes ([`super::managed_monitor_templates`])
+        // is not the account's resource, so no member of it is the account's to
+        // change; refused before anything is resolved or written.
+        if super::is_published_id(&id) {
+            return Err(AlarmTemplateUpdateRefusal::Published {
+                identifier: identifier.to_string(),
+            });
+        }
 
         // A `GroupIdentifier` is resolved against the groups of the request's
         // region, exactly as the create resolves it, so the stored `GroupId` is
@@ -498,6 +511,17 @@ impl ComAmazonawsMedialiveMedialiveState {
         Ok(id)
     }
 
+    /// How many of the stored templates this ACCOUNT created — what
+    /// [`MAX_ALARM_TEMPLATES`] bounds, for the reason the group store's own
+    /// count states: the templates the SERVICE publishes are seeded into the
+    /// same store and no create brought them there.
+    fn account_alarm_templates(&self) -> usize {
+        self.alarm_templates
+            .keys()
+            .filter(|id| !super::is_published_id(id))
+            .count()
+    }
+
     /// The template `identifier` names in `region`, resolving it as the
     /// template's id or its current name — the two forms
     /// `GetCloudWatchAlarmTemplateRequest$Identifier` documents ("Can be either
@@ -529,12 +553,13 @@ impl ComAmazonawsMedialiveMedialiveState {
             .find(|template| template.region == region && template.name == name)
     }
 
-    /// The cloudwatch alarm templates stored in `region`, in the order their ids
-    /// were minted, beginning at the template `start` names when a `NextToken`
-    /// carried a resume point.
+    /// The cloudwatch alarm templates stored in `region`, in the order a listing
+    /// reports them ([`super::listing_position`]: the templates the SERVICE
+    /// published first, then the account's own in mint order), beginning at the
+    /// template `start` names when a `NextToken` carried a resume point.
     ///
-    /// The store itself is private, so this is how a listing reads it: a
-    /// `BTreeMap` range scan from the resume point, which is why a token naming a
+    /// The store itself is private, so this is how a listing reads it: a scan
+    /// from the resume point in that order, which is why a token naming a
     /// template deleted since the previous page resumes at the next surviving id
     /// instead of failing. Templates of other regions are invisible, for the
     /// reason [`Self::alarm_template`] states.
@@ -543,14 +568,16 @@ impl ComAmazonawsMedialiveMedialiveState {
         region: &'a str,
         start: Option<&'a str>,
     ) -> impl Iterator<Item = &'a CloudWatchAlarmTemplateRecord> + 'a {
-        let first = match start {
-            Some(token) => ::std::ops::Bound::Included(token),
-            None => ::std::ops::Bound::Unbounded,
-        };
-        self.alarm_templates
-            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
-            .map(|(_, template)| template)
-            .filter(move |template| template.region == region)
+        let mut ordered: Vec<&'a CloudWatchAlarmTemplateRecord> = self
+            .alarm_templates
+            .values()
+            .filter(|template| template.region == region)
+            .collect();
+        ordered.sort_by_key(|template| super::listing_position(&template.id));
+        let from = start.map(super::listing_position);
+        ordered.into_iter().filter(move |template| {
+            from.is_none_or(|first| super::listing_position(&template.id) >= first)
+        })
     }
 
     /// The ids of the templates stored in the cloudwatch alarm template group
@@ -587,13 +614,25 @@ impl ComAmazonawsMedialiveMedialiveState {
         &mut self,
         region: &str,
         identifier: &str,
-    ) -> Option<CloudWatchAlarmTemplateRecord> {
-        let id = self.alarm_template(region, identifier)?.id.clone();
-        let removed = self.alarm_templates.remove(&id)?;
+    ) -> Result<CloudWatchAlarmTemplateRecord, super::PublishedWriteRefusal> {
+        let id = self
+            .alarm_template(region, identifier)
+            .ok_or(super::PublishedWriteRefusal::NotFound)?
+            .id
+            .clone();
+        // Published templates are the service's, for the reason
+        // [`Self::update_alarm_template`] states.
+        if super::is_published_id(&id) {
+            return Err(super::PublishedWriteRefusal::Published);
+        }
+        let removed = self
+            .alarm_templates
+            .remove(&id)
+            .ok_or(super::PublishedWriteRefusal::NotFound)?;
         // A token never outlives the resource it minted, so a retried create
         // cannot resurrect a deleted template.
         self.alarm_template_tokens.forget(&id);
-        Some(removed)
+        Ok(removed)
     }
 
     /// Record `token`, as presented in `region`, as having created the template

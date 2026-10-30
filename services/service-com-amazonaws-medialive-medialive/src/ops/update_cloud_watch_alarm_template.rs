@@ -307,6 +307,18 @@ fn refused(
             })
             .into()
         }
+        // A template the service publishes is not the account's to change, so
+        // this is a bad request rather than a conflict with state the caller
+        // could clear.
+        crate::state::AlarmTemplateUpdateRefusal::Published { identifier } => {
+            UpdateCloudWatchAlarmTemplateErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::published_resource_message(
+                    "cloudwatch alarm template",
+                    &identifier,
+                )),
+            })
+            .into()
+        }
     }
 }
 

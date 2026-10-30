@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store, beside the removal, so a refused delete removes nothing.
         state
             .delete_event_bridge_rule_template_group(&region, &input.identifier)
-            .map_err(refused)?;
+            .map_err(|refusal| refused(refusal, &input.identifier))?;
 
         Ok(DeleteEventBridgeRuleTemplateGroupOutput)
     }
@@ -194,6 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// 409 keeps the fixed sentence of its own class.
 fn refused(
     refusal: crate::state::TemplateGroupDeleteRefusal,
+    identifier: &str,
 ) -> DeleteEventBridgeRuleTemplateGroupError {
     match refusal {
         crate::state::TemplateGroupDeleteRefusal::NotFound => {
@@ -212,6 +213,22 @@ fn refused(
             )),
         })
         .into(),
+        // Shared with the cloudwatch alarm template group's delete, which is
+        // where this refusal comes from: the service publishes no eventbridge
+        // rule template group, so every group of this family is the account's
+        // own and this arm is never reached. It answers as the other delete of
+        // the shared type does rather than claiming the group was not found.
+        crate::state::TemplateGroupDeleteRefusal::Published => {
+            DeleteEventBridgeRuleTemplateGroupErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::published_resource_message(
+                        "eventbridge rule template group",
+                        identifier,
+                    )),
+                },
+            )
+            .into()
+        }
     }
 }
 

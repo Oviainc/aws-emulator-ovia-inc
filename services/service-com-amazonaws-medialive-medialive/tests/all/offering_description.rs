@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::offering_catalog::every_page;
-use crate::wire::{call_in_region, error_code, medialive, ACCOUNT, DEFAULT_REGION};
+use crate::wire::{call_in_region, error_code, medialive, DEFAULT_REGION};
 
 /// The instance URI `DescribeOffering` is bound to
 /// (`smithy_query(query="operation", operation="DescribeOffering")`: GET
@@ -167,10 +167,10 @@ async fn describe_offering_reports_the_offering_its_id_names() {
         assert_eq!(
             described["arn"],
             json!(format!(
-                "arn:aws:medialive:{DEFAULT_REGION}:{ACCOUNT}:offering:{id}"
+                "arn:aws:medialive:{DEFAULT_REGION}::offering:{id}"
             )),
-            "case {case:?}: expected the ARN built from the signed region and the offering id, \
-             got {:?}",
+            "case {case:?}: expected the service-owned ARN built from the signed region and \
+             the offering id, got {:?}",
             described["arn"]
         );
     }
@@ -304,8 +304,8 @@ async fn a_describe_is_a_report_and_an_id_names_one_configuration() {
         );
         assert_eq!(
             away["arn"],
-            json!(format!("arn:aws:medialive:{region}:{ACCOUNT}:offering:{id}")),
-            "case {case:?}: expected the ARN built from the signed region, got {:?}",
+            json!(format!("arn:aws:medialive:{region}::offering:{id}")),
+            "case {case:?}: expected the service-owned ARN built from the signed region, got {:?}",
             away["arn"]
         );
         for member in OFFERING_MEMBERS {

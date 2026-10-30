@@ -18,8 +18,18 @@ use service_com_amazonaws_medialive_medialive::state::MAX_LIST_PAGE_SIZE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloud_watch_alarm_template_listing::required_members;
-use crate::support::{create_in, entry_point, get_in, timestamp, GROUPS};
+use crate::support::{
+    account_owned, account_owned_names, create_in, entry_point, get_in, timestamp, GROUPS,
+};
 use crate::wire::{call_in_region, error_code, medialive, ACCOUNT, DEFAULT_REGION};
+
+/// The `Scope` that narrows a listing to the groups LOCAL to this account
+/// ("Represents the scope of a resource, with options for all scopes, AWS
+/// provided resources, or local resources"), which is what the suites whose
+/// subject is what the CALLER created list with: the service publishes a catalog
+/// of its own groups in every region, and those are the subject of
+/// `managed_monitor_catalog.rs` instead.
+const LOCAL_ONLY: &str = "?scope=LOCAL";
 
 /// The template collection, whose members are what a group's `templateCount`
 /// counts (`smithy_query(query="operation",
@@ -262,7 +272,7 @@ async fn listing_pages_through_every_stored_group_in_mint_order() {
             created.push(named_group(&router, DEFAULT_REGION, &format!("grp-{index}")).await);
         }
 
-        let (listed, pages) = every_page(&router, case, "", page_size).await;
+        let (listed, pages) = every_page(&router, case, LOCAL_ONLY, page_size).await;
         assert_eq!(
             listed, created,
             "case {case:?}: expected the listing to report every stored group once, \
@@ -375,7 +385,7 @@ async fn a_listed_summary_reads_the_stored_group() {
             );
         }
 
-        let (status, listed) = list(&router, "").await;
+        let (status, listed) = list(&router, LOCAL_ONLY).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected 200, got {status}: {listed}"
@@ -430,7 +440,7 @@ async fn a_listed_summary_reads_the_stored_group() {
         // lowers it on the very next read.
         if let Some(gone) = template_ids.first() {
             delete_template(&router, DEFAULT_REGION, gone).await;
-            let (status, listed) = list(&router, "").await;
+            let (status, listed) = list(&router, LOCAL_ONLY).await;
             assert_eq!(
                 status, 200,
                 "case {case:?}: expected 200 after a template delete, got {status}: {listed}"
@@ -503,9 +513,10 @@ async fn a_signal_map_or_scope_filter_lists_only_the_groups_it_admits() {
             format!("?signalMapIdentifier={unassociated}"),
             &[],
         ),
-        // `Scope` is the provenance filter: every group this emulator mints is
+        // `Scope` is the provenance filter: every group this emulator MINTS is
         // created by the caller, so the local scope admits them all and the
-        // AWS-provided scope admits none.
+        // AWS-provided scope admits none of them (it admits the service's own
+        // published groups, which `managed_monitor_catalog.rs` asserts).
         ("every scope", "?scope=ALL".to_string(), &every),
         ("the local scope", "?scope=LOCAL".to_string(), &every),
         ("the AWS-provided scope", "?scope=AWS".to_string(), &[]),
@@ -530,11 +541,11 @@ async fn a_signal_map_or_scope_filter_lists_only_the_groups_it_admits() {
             status, 200,
             "case {case:?}: expected 200, got {status}: {body}"
         );
-        let mut names: Vec<String> = summaries(case, &body)
-            .iter()
-            .map(|summary| summary["name"].as_str().unwrap_or_default().to_string())
-            .collect();
-        names.sort();
+        // The ACCOUNT's groups among what the listing reports: the service's own
+        // published groups are admitted by every row that does not narrow the
+        // provenance, and which of the CALLER's groups a filter admits is this
+        // suite's subject.
+        let names = account_owned_names(&summaries(case, &body));
         assert_eq!(
             names, expected,
             "case {case:?}: expected the filter to admit {expected:?}, got {names:?}"
@@ -543,10 +554,15 @@ async fn a_signal_map_or_scope_filter_lists_only_the_groups_it_admits() {
         // The same filter, paged one group at a time, admits the same set: the
         // page cut narrows nothing of its own.
         let (ids, pages) = every_page(&router, case, &query, Some(1)).await;
+        let account = ids
+            .iter()
+            .filter(|id| !id.starts_with(crate::support::AWS_PROVIDED_ID_PREFIX))
+            .count();
         assert_eq!(
-            ids.len(),
+            account,
             expected.len(),
-            "case {case:?}: expected {} groups across the pages {pages:?}, got {ids:?}",
+            "case {case:?}: expected {} of the account's groups across the pages {pages:?}, \
+             got {ids:?}",
             expected.len()
         );
     }
@@ -562,8 +578,10 @@ async fn a_signal_map_or_scope_filter_lists_only_the_groups_it_admits() {
         listed.contains(&first) && listed.contains(&second),
         "case \"no filter\": expected the created ids among {listed:?}"
     );
-    // Every reported ARN names this service, this region and this account.
-    for summary in summaries("no filter", &body) {
+    // Every ARN the account's own groups report names this service, this region
+    // and this account. (A published group's ARN names no account at all, which
+    // is `managed_monitor_catalog.rs`'s subject.)
+    for summary in account_owned(&summaries("no filter", &body)) {
         let arn = summary["arn"].as_str().unwrap_or_default().to_string();
         assert!(
             arn.starts_with(&format!("arn:aws:medialive:{DEFAULT_REGION}:{ACCOUNT}:")),
@@ -599,11 +617,7 @@ async fn a_listing_reports_only_the_groups_of_its_own_region() {
             status, 200,
             "case {region:?}: expected 200, got {status}: {body}"
         );
-        let mut listed: Vec<String> = summaries(region, &body)
-            .iter()
-            .map(|summary| summary["name"].as_str().unwrap_or_default().to_string())
-            .collect();
-        listed.sort();
+        let listed = account_owned_names(&summaries(region, &body));
         assert_eq!(
             listed, names,
             "case {region:?}: expected only the groups created in {region}, got {listed:?}"

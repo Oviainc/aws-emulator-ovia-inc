@@ -239,6 +239,9 @@ mod input_update;
 #[path = "all/list_page_size.rs"]
 mod list_page_size;
 
+#[path = "all/managed_monitor_catalog.rs"]
+mod managed_monitor_catalog;
+
 #[path = "all/monitor_deployment.rs"]
 mod monitor_deployment;
 

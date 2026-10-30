@@ -20,9 +20,8 @@
 //!
 //! Nothing here invents an engine version: the catalogue the table installs is
 //! built through the store's own type, because no operation of this service models
-//! a way to create one, and the agreement suite at the end installs nothing at all
-//! and pins the versions the account's seeded catalogue publishes through
-//! `ListVersions`.
+//! a way to create one — and the service is what publishes the set an account is
+//! offered, so an account nothing published to has none.
 
 use std::time::SystemTime;
 
@@ -34,7 +33,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::engine_version_catalog::{install, shifted};
 use crate::support::{epoch_seconds, member, timestamp};
-use crate::wire::{call, medialive, medialive_with_engine};
+use crate::wire::{call, medialive_with_engine};
 
 /// How far two reported instants may be apart and still name the same instant: the
 /// wire form carries sub-second precision, so the comparison is a tolerance rather
@@ -218,16 +217,32 @@ async fn a_channel_reports_the_catalogue_expiry_of_the_version_it_is_pinned_to()
     }
 }
 
-/// Rule, on the catalogue no test installed: the two readers of one stored instant
-/// agree — a caller who takes a version out of `ListVersions` and pins it on a
-/// channel reads that version back, with that expiry, from the channel.
+/// Rule: the two readers of one stored instant agree — a caller who takes a
+/// version out of `ListVersions` and pins it on a channel reads that version
+/// back, with that expiry, from the channel.
 ///
-/// Every version the account's seeded catalogue publishes is a row, so the
-/// agreement is asserted across the whole published set rather than on one entry.
+/// Every version the installed catalogue publishes is a row, so the agreement is
+/// asserted across the whole published set rather than on one entry. The
+/// catalogue is installed through the store's own type for the reason the module
+/// docs state: the service publishes engine versions and no operation of this
+/// one creates them, so nothing here invents one.
 #[tokio::test]
 async fn a_channel_reports_the_same_version_entry_list_versions_published() {
-    let case = "the seeded catalogue";
-    let router = medialive();
+    let case = "a published catalogue";
+    let (router, engine) = medialive_with_engine();
+    let base = SystemTime::now();
+    install(
+        &engine,
+        ChannelEngineVersionCatalog::of(CATALOGUE.iter().map(
+            |(version, released, expires)| {
+                ChannelEngineVersionRecord::expiring(
+                    (*version).to_string(),
+                    shifted(base, *released),
+                    shifted(base, *expires),
+                )
+            },
+        )),
+    );
     let (status, body) = call(&router, "GET", "/prod/versions", None).await;
     assert_eq!(
         status, 200,
@@ -237,9 +252,12 @@ async fn a_channel_reports_the_same_version_entry_list_versions_published() {
         .as_array()
         .cloned()
         .unwrap_or_else(|| panic!("case {case:?}: expected a versions array, got {body}"));
-    assert!(
-        !published.is_empty(),
-        "case {case:?}: expected ListVersions to publish the account's seeded versions, got {body}"
+    // The catalogue holds one expired entry, which is not available and so not
+    // published; every other entry is.
+    assert_eq!(
+        published.len(),
+        CATALOGUE.len() - 1,
+        "case {case:?}: expected the unexpired entries of the installed catalogue, got {body}"
     );
 
     for entry in published {
