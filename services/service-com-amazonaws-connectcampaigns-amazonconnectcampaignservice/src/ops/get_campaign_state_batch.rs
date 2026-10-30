@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCampaignStateBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCampaignStateBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCampaignStateBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored run state of several campaigns in one call: every requested id the
+//! store holds is answered in `successfulRequests` with the state the last
+//! start/pause/stop left it in, and every id it does not hold is answered in
+//! `failedRequests` with the `ResourceNotFound` failure code — a per-id outcome, so one
+//! absent id does not refuse the whole batch.
 //!
 //! ## Shape of an operation
 //!
@@ -53,7 +49,9 @@
 //!
 //! ## Input
 //!
-//! * `campaignIds` (CampaignIdList) **required** — List of CampaignId
+//! * `campaignIds` (CampaignIdList, len 1..25) **required** — List of CampaignId. Each
+//!   entry is a `CampaignId` (len 0..256, pattern ^[\S]*$); the list's own bound is what
+//!   refuses a batch, and the boundary validator applies both before `handle` runs.
 //!
 //! ## Output
 //!
@@ -74,6 +72,13 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The `GetCampaignStateBatchFailureCode` a requested campaign id that resolves to no
+/// stored campaign is reported with. The model's enum carries two values
+/// (`ResourceNotFound | UnknownError`, see `GET_CAMPAIGN_STATE_BATCH_FAILURE_CODE_VALUES`);
+/// this one says the id named nothing, which is the only per-id failure a lookup against
+/// this store can have — `UnknownError` is for a fault the store cannot produce.
+const RESOURCE_NOT_FOUND_FAILURE_CODE: &str = "ResourceNotFound";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +151,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCampaignStateBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCampaignStateBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCampaignStateBatch"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCampaignStateBatchError::from(
+                GetCampaignStateBatchErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the campaign store is unavailable".to_string(),
+                        x_amz_error_type: None,
+                    },
+                ),
+            )
+        })?;
+
+        // A batch read is per-id: `campaignIds` is the only thing that can refuse the
+        // whole call, through the `@length(min: 1, max: 25)` its `CampaignIdList` carries
+        // in this service's model (and each entry's own `CampaignId` constraints), which
+        // the boundary validator applies before this runs — so reaching here means the
+        // request carries between one and twenty-five well-formed ids. Each is then
+        // answered on its own — resolved or not — in the order it was asked for, so a
+        // caller can line the answers up with what it sent.
+        let guard = state.lock();
+        let mut successful_requests = Vec::new();
+        let mut failed_requests = Vec::new();
+        for campaign_id in &input.campaign_ids {
+            match guard.campaigns.get(campaign_id) {
+                Some(stored) => successful_requests.push(SuccessfulCampaignStateResponse {
+                    campaign_id: Some(stored.id.clone()),
+                    state: Some(stored.state.as_wire().to_string()),
+                }),
+                None => failed_requests.push(FailedCampaignStateResponse {
+                    campaign_id: Some(campaign_id.clone()),
+                    failure_code: Some(RESOURCE_NOT_FOUND_FAILURE_CODE.to_string()),
+                }),
+            }
+        }
+
+        // Both lists are present even when one of them is empty: the answer says how
+        // every requested id came out, so "nothing failed" is an empty list rather than
+        // an absent member.
+        Ok(GetCampaignStateBatchOutput {
+            successful_requests: Some(successful_requests),
+            failed_requests: Some(failed_requests),
+        })
     }
 }

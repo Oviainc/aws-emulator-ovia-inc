@@ -24,8 +24,12 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. It delegates to the shared AWS renderer
+//!   ([`service_common::validation_message::aws_validation_refusal`]), so a constraint
+//!   refusal of any operation of this service reads as AWS words it: the framework's
+//!   envelope, member paths and requirements, with a `@pattern` quoted without its
+//!   whole-value anchors and a list or map that broke its `@length` stated with no
+//!   value at all. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -60,9 +64,63 @@
 
 use service_common::response_media_type::{ResponseMediaType, ResponseMediaTypeOperation};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// How this service renders the value of a LIST member whose `@length` a request broke:
+/// the elements it submitted, bracketed, which is a value and not a count — so it is the
+/// framework's `Value '<value>'` half rather than the valueless clause a collection with
+/// no rendering takes. The EMPTY list is the one such value a structural refusal
+/// determines on its own, because a refusal carries a collection's element COUNT and no
+/// elements, and zero elements render as this and nothing else.
+const EMPTY_LIST_VALUE: &str = "[]";
+
+/// `refusal` with the value of every EMPTY list member restated as the list it is
+/// ([`EMPTY_LIST_VALUE`]), or `None` when it carries no such member — in which case the
+/// refusal is stated exactly as the shared renderer states it.
+///
+/// Only the VALUE half of a clause is touched, and only where the refusal determines
+/// that value: the element count is read back out of the framework's own rendering
+/// through [`service_common::validation_message::list_item_count`], so this service and
+/// any other that words a list's length refusal read one rendering the same way. Every
+/// other clause, the requirement, the member path, the envelope and the error code stay
+/// with the shared renderer.
+///
+/// A LIST only: a map's own rendering counts ENTRIES, not items, so `list_item_count`
+/// does not read it and an empty map keeps the shared valueless clause. That is
+/// deliberate — `[]` is the rendering of a list, and nothing here invents the rendering
+/// of another collection kind.
+fn with_empty_lists_stated(refusal: &Refusal) -> Option<Refusal> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    let empty_list = |violation: &Violation| {
+        matches!(
+            violation.kind,
+            ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+        ) && violation.value.as_deref().is_some_and(|stored| {
+            service_common::validation_message::list_item_count(stored) == Some(0)
+        })
+    };
+    if !violations.iter().any(empty_list) {
+        return None;
+    }
+    let restated = violations
+        .iter()
+        .map(|violation| {
+            if empty_list(violation) {
+                Violation {
+                    value: Some(EMPTY_LIST_VALUE.to_string()),
+                    ..violation.clone()
+                }
+            } else {
+                violation.clone()
+            }
+        })
+        .collect();
+    Some(Refusal::Invalid(restated))
+}
 
 /// The media type the `restJson1` protocol trait this service's model declares implies,
 /// which the framework's renderers stamp on every response — the one value
@@ -174,16 +232,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) so this service can
+        // state it the way the service it emulates states it, which no model records.
+        //
+        // The whole wording is delegated to the shared AWS renderer rather than written
+        // here: the envelope, the member paths and every requirement stay the
+        // framework's, and the two renderings AWS does differently are applied to every
+        // constrained member of every operation of this service alike — a `@pattern`
+        // requirement quoted without the anchors a whole-value pattern wraps it in, and
+        // a LIST or MAP that broke its `@length` stated with no value at all where the
+        // refusal carries only a count, because a count is not a value a caller sent. A
+        // scalar's own value is still stated, and a refusal that is not a constraint
+        // violation — an unauthenticated caller — keeps the framework's code and wording.
+        //
+        // This service states a list member's rejected value as the LIST it is, so the
+        // one such value a structural refusal determines — the empty list — is restated
+        // as that list first (see [`with_empty_lists_stated`]).
+        let stated = with_empty_lists_stated(refusal);
+        service_common::validation_message::aws_validation_refusal(
+            stated.as_ref().unwrap_or(refusal),
+        )
     }
 
     fn override_routing_error(

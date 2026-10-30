@@ -925,13 +925,10 @@ async fn operations_outside_this_slice_still_answer_501() {
     let router = service_router();
     let id = created_id(&router, &simple_request("not-yet", "inst-1")).await;
 
+    // `GetCampaignStateBatch` used to sit here; it is implemented now, and the batch
+    // state read has its own suite (`campaign_state_batch.rs`).
     let rows: &[(&str, String, Option<Value>)] = &[
         ("ResumeCampaign", format!("/campaigns/{id}/resume"), None),
-        (
-            "GetCampaignStateBatch",
-            "/campaigns-state".to_string(),
-            Some(json!({"campaignIds": [id]})),
-        ),
     ];
 
     for (case, path, body) in rows {

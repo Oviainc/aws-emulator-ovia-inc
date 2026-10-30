@@ -168,12 +168,18 @@ async fn dispatch(
     (status, error_code, payload)
 }
 
-/// What a row expects of the version that claimed it: either an error code only that
-/// version's own answer carries, or a member only its output has.
+/// What a row expects of the version that claimed it: an error code only that version's
+/// own answer carries, a member only its output has, or — for a batch read, whose two
+/// output members both versions name alike — the per-id report the claiming version's
+/// own store produces for one requested id.
 #[derive(Debug)]
 enum Expect {
     Error(&'static str),
     Member(&'static str),
+    /// The requested campaign id comes back as the ONLY entry of `failedRequests`,
+    /// carrying the not-found failure code, with `successfulRequests` empty: the answer
+    /// of a store that does not hold that id.
+    BatchMissing(&'static str),
 }
 
 /// Neither routing refusal may ever be the answer to a legitimately signed request.
@@ -221,9 +227,9 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
             Expect::Error("ResourceNotFoundException"),
         ),
         (
-            // V2 implements this one, so its answer is its own per-id state report:
-            // the id row 1 minted resolves in V2's store, which neither a router
-            // refusal nor v1's own stub for `/campaigns-state` can produce.
+            // V2 implements this one, so its answer is its own per-id state report
+            // over ITS store, which no router refusal can produce — and the path it
+            // sits at is one only the V2 version claims.
             "V2 GetCampaignStateBatch",
             "POST",
             "/v2/campaigns-state",
@@ -285,12 +291,17 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
             Expect::Error("ResourceNotFoundException"),
         ),
         (
-            "v1 GetCampaignStateBatch (still a stub)",
+            // v1 implements this one, so its answer is its own per-id state report over
+            // ITS store: the id named here is one no v1 campaign carries (the v1 create
+            // row above mints its own), so it comes back as the single failed request —
+            // which neither a router refusal nor the V2 version, whose every route is
+            // `/v2/`-prefixed, can produce for this path.
+            "v1 GetCampaignStateBatch",
             "POST",
             "/campaigns-state",
             r#"{"campaignIds":["000000000000"]}"#,
-            501,
-            Expect::Error("NotImplemented"),
+            200,
+            Expect::BatchMissing("000000000000"),
         ),
         (
             "v1 StartInstanceOnboardingJob (still a stub)",
@@ -346,6 +357,42 @@ async fn each_connect_campaigns_api_version_serves_its_own_route_space() {
                     payload.get(member).is_some(),
                     "case {case:?}: expected the claiming version's {member} in the \
                      response, got {payload}"
+                );
+            }
+            Expect::BatchMissing(id) => {
+                assert_eq!(
+                    status, expected_status,
+                    "case {case:?}: expected HTTP {expected_status} from the one version \
+                     that owns {uri}, got {status} {payload}"
+                );
+                let failed = payload
+                    .get("failedRequests")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let reported: Vec<(&str, &str)> = failed
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry["campaignId"].as_str().unwrap_or_default(),
+                            entry["failureCode"].as_str().unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    reported,
+                    vec![(id, "ResourceNotFound")],
+                    "case {case:?}: expected the claiming version's store to report the \
+                     requested id as its one failed request, got {payload}"
+                );
+                assert_eq!(
+                    payload
+                        .get("successfulRequests")
+                        .and_then(Value::as_array)
+                        .map_or(usize::MAX, Vec::len),
+                    0,
+                    "case {case:?}: expected no state to be reported for an id that \
+                     version's store does not hold, got {payload}"
                 );
             }
         }
