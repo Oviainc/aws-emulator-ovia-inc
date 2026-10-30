@@ -2,7 +2,8 @@
 
 //! Engine state for the com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig service.
 //!
-//! Holds the cluster -> control panel -> routing control hierarchy: every resource a
+//! Holds the cluster -> control panel -> routing control hierarchy, and the safety rules
+//! a control panel scopes: every resource a
 //! create call minted, keyed by the ARN that call handed the client. A handler reaches
 //! it through [`service_state`] and answers from what is stored here — a describe or a
 //! list never recomputes a body from its own request.
@@ -27,7 +28,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AccessDeniedException, Cluster, ClusterEndpoint, ControlPanel, RoutingControl,
+    AccessDeniedException, AssertionRule, Cluster, ClusterEndpoint, ControlPanel, GatingRule,
+    RoutingControl, Rule, RuleConfig,
 };
 
 /// The ARN service segment Route 53 Application Recovery Controller's recovery-control
@@ -80,6 +82,10 @@ pub const MAX_CONTROL_PANELS: usize = 1_000;
 /// The most routing controls this store holds at once — CHOSEN, for the same reason as
 /// [`MAX_CLUSTERS`].
 pub const MAX_ROUTING_CONTROLS: usize = 10_000;
+
+/// The most safety rules this store holds at once — CHOSEN, for the same reason as
+/// [`MAX_CLUSTERS`].
+pub const MAX_SAFETY_RULES: usize = 10_000;
 
 /// The most `ClientToken` records the idempotency ledger remembers at once — CHOSEN,
 /// for the same reason: a caller must not be able to grow the ledger without limit.
@@ -273,6 +279,174 @@ impl RoutingControlRecord {
     }
 }
 
+/// The two kinds of safety rule, with the routing controls each kind evaluates.
+///
+/// A safety rule is one of them and never both: an assertion rule asserts its
+/// `RuleConfig` over the controls a transaction changes, a gating rule evaluates its
+/// `RuleConfig` over gating controls to decide whether its target controls may change at
+/// all. Storing the controls inside the kind is what keeps a rule from holding the
+/// members of the other kind.
+#[derive(Debug, Clone)]
+pub enum SafetyRuleControls {
+    /// An assertion rule's `AssertedControls`.
+    Assertion { asserted_controls: Vec<String> },
+    /// A gating rule's `GatingControls` and the `TargetControls` they gate.
+    Gating {
+        gating_controls: Vec<String>,
+        target_controls: Vec<String>,
+    },
+}
+
+impl SafetyRuleControls {
+    /// Every routing control the rule references, in the order its members declare them.
+    pub fn referenced(&self) -> impl Iterator<Item = &str> {
+        let (first, second) = match self {
+            Self::Assertion { asserted_controls } => (asserted_controls, None),
+            Self::Gating {
+                gating_controls,
+                target_controls,
+            } => (gating_controls, Some(target_controls)),
+        };
+        first
+            .iter()
+            .chain(second.into_iter().flatten())
+            .map(String::as_str)
+    }
+
+    /// Whether the rule references `routing_control_arn` — as a control it evaluates or as
+    /// one it gates.
+    pub fn references(&self, routing_control_arn: &str) -> bool {
+        self.referenced()
+            .any(|referenced| referenced == routing_control_arn)
+    }
+
+    /// This rule's kind and controls as a deterministic string, for an idempotency
+    /// fingerprint.
+    ///
+    /// Each member is labelled and joined on its own, so two requests that differ only in
+    /// how the same controls are split between a gating rule's two lists fingerprint
+    /// differently.
+    pub fn fingerprint(&self) -> String {
+        match self {
+            Self::Assertion { asserted_controls } => {
+                format!("{ASSERTION_RULE_KIND}|asserted={}", asserted_controls.join(","))
+            }
+            Self::Gating {
+                gating_controls,
+                target_controls,
+            } => format!(
+                "{GATING_RULE_KIND}|gating={}|target={}",
+                gating_controls.join(","),
+                target_controls.join(",")
+            ),
+        }
+    }
+
+    /// The kind of rule this is, as the `Rule` projection and an update's refusal name
+    /// it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Assertion { .. } => ASSERTION_RULE_KIND,
+            Self::Gating { .. } => GATING_RULE_KIND,
+        }
+    }
+}
+
+/// The name the assertion kind of safety rule is known by, which is also the member
+/// `Rule` reports one under (`smithy_query(query="shape",shape="Rule")`).
+pub const ASSERTION_RULE_KIND: &str = "ASSERTION";
+
+/// The name the gating kind of safety rule is known by, and the member `Rule` reports one
+/// under.
+pub const GATING_RULE_KIND: &str = "GATING";
+
+/// One stored safety rule, of either kind.
+#[derive(Debug, Clone)]
+pub struct SafetyRuleRecord {
+    /// Creation order within the service, which is the order `ListSafetyRules` pages
+    /// through.
+    pub seq: u64,
+    pub arn: String,
+    /// The control panel the rule is scoped to: a safety rule guards the routing controls
+    /// of one panel.
+    pub control_panel_arn: String,
+    pub name: String,
+    pub owner: String,
+    /// The evaluation period, in milliseconds, the rule holds changes off for.
+    pub wait_period_ms: i32,
+    pub rule_config: RuleConfig,
+    /// Which kind of rule this is, and the controls that kind evaluates.
+    pub controls: SafetyRuleControls,
+    pub tags: BTreeMap<String, String>,
+    pub deploy_due: Instant,
+}
+
+impl SafetyRuleRecord {
+    /// Move the rule onto `name` and `wait_period_ms` — the only two things an update
+    /// changes — making the deployment of the changed configuration due again.
+    ///
+    /// A request naming the name and wait period the rule already carries writes NOTHING,
+    /// so it does not restart a deployment either.
+    pub fn set_name_and_wait_period(&mut self, name: String, wait_period_ms: i32) {
+        if self.name == name && self.wait_period_ms == wait_period_ms {
+            return;
+        }
+        self.name = name;
+        self.wait_period_ms = wait_period_ms;
+        self.deploy_due = deploy_due();
+    }
+
+    /// This record as the modelled `AssertionRule` shape, or `None` when it is a gating
+    /// rule.
+    pub fn to_assertion_rule(&self) -> Option<AssertionRule> {
+        let SafetyRuleControls::Assertion { asserted_controls } = &self.controls else {
+            return None;
+        };
+        Some(AssertionRule {
+            asserted_controls: asserted_controls.clone(),
+            control_panel_arn: self.control_panel_arn.clone(),
+            name: self.name.clone(),
+            rule_config: self.rule_config.clone(),
+            safety_rule_arn: self.arn.clone(),
+            status: status_at(self.deploy_due).to_string(),
+            wait_period_ms: self.wait_period_ms,
+            owner: Some(self.owner.clone()),
+        })
+    }
+
+    /// This record as the modelled `GatingRule` shape, or `None` when it is an assertion
+    /// rule.
+    pub fn to_gating_rule(&self) -> Option<GatingRule> {
+        let SafetyRuleControls::Gating {
+            gating_controls,
+            target_controls,
+        } = &self.controls
+        else {
+            return None;
+        };
+        Some(GatingRule {
+            control_panel_arn: self.control_panel_arn.clone(),
+            gating_controls: gating_controls.clone(),
+            name: self.name.clone(),
+            rule_config: self.rule_config.clone(),
+            safety_rule_arn: self.arn.clone(),
+            status: status_at(self.deploy_due).to_string(),
+            target_controls: target_controls.clone(),
+            wait_period_ms: self.wait_period_ms,
+            owner: Some(self.owner.clone()),
+        })
+    }
+
+    /// This record as the modelled `Rule` shape a list page carries: the one member its
+    /// kind fills, and nothing under the other.
+    pub fn to_rule(&self) -> Rule {
+        Rule {
+            assertion: self.to_assertion_rule(),
+            gating: self.to_gating_rule(),
+        }
+    }
+}
+
 /// What a `ClientToken` the store has already seen means for the call replaying it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenOutcome {
@@ -303,6 +477,8 @@ pub struct ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigS
     pub control_panels: BTreeMap<String, ControlPanelRecord>,
     /// Every created routing control, keyed by its ARN.
     pub routing_controls: BTreeMap<String, RoutingControlRecord>,
+    /// Every created safety rule, of either kind, keyed by its ARN.
+    pub safety_rules: BTreeMap<String, SafetyRuleRecord>,
     /// `"<Operation>#<ClientToken>"` -> the resource that token created. Held to
     /// [`MAX_IDEMPOTENCY_TOKENS`] by [`Self::remember_token`].
     idempotency: BTreeMap<String, IdempotencyRecord>,
@@ -361,6 +537,61 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
     /// Whether the store already holds [`MAX_ROUTING_CONTROLS`] routing controls.
     pub fn routing_controls_full(&self) -> bool {
         self.routing_controls.len() >= MAX_ROUTING_CONTROLS
+    }
+
+    /// Whether the store already holds [`MAX_SAFETY_RULES`] safety rules.
+    pub fn safety_rules_full(&self) -> bool {
+        self.safety_rules.len() >= MAX_SAFETY_RULES
+    }
+
+    /// How many safety rules are stored under `control_panel_arn`.
+    pub fn safety_rule_count(&self, control_panel_arn: &str) -> usize {
+        self.safety_rules
+            .values()
+            .filter(|rule| rule.control_panel_arn == control_panel_arn)
+            .count()
+    }
+
+    /// Whether any stored safety rule references `routing_control_arn` — as a control it
+    /// evaluates or as one it gates.
+    ///
+    /// A routing control a rule names is a dependent of that rule, so this is what the
+    /// delete of a routing control asks before removing it.
+    pub fn safety_rules_reference(&self, routing_control_arn: &str) -> bool {
+        self.safety_rules
+            .values()
+            .any(|rule| rule.controls.references(routing_control_arn))
+    }
+
+    /// Whether `control_panel_arn` already holds a safety rule called `name`, other than
+    /// the rule `except_arn` names.
+    ///
+    /// A rule's name identifies it within its control panel, so this is what the create
+    /// and the update both ask before taking a name. Scanned in place: no ordering is
+    /// needed to answer it.
+    pub fn safety_rule_name_taken(
+        &self,
+        control_panel_arn: &str,
+        name: &str,
+        except_arn: Option<&str>,
+    ) -> bool {
+        self.safety_rules.values().any(|rule| {
+            rule.control_panel_arn == control_panel_arn
+                && rule.name == name
+                && except_arn.is_none_or(|arn| rule.arn != arn)
+        })
+    }
+
+    /// `control_panel_arn`'s safety rules in creation order — the order a list page walks,
+    /// with both kinds interleaved as they were created.
+    pub fn ordered_safety_rules(&self, control_panel_arn: &str) -> Vec<&SafetyRuleRecord> {
+        let mut found: Vec<&SafetyRuleRecord> = self
+            .safety_rules
+            .values()
+            .filter(|rule| rule.control_panel_arn == control_panel_arn)
+            .collect();
+        found.sort_by_key(|rule| rule.seq);
+        found
     }
 
     /// How many routing controls are stored under `control_panel_arn`.
@@ -544,6 +775,9 @@ pub const CONTROL_PANEL_NOUN: &str = "control panel";
 /// The noun a routing control is named by in a not-found diagnosis.
 pub const ROUTING_CONTROL_NOUN: &str = "routing control";
 
+/// The noun a safety rule is named by in a not-found diagnosis.
+pub const SAFETY_RULE_NOUN: &str = "safety rule";
+
 /// The `ResourceNotFoundException$Message` for a request whose ARN resolves to no
 /// resource of this service.
 ///
@@ -569,6 +803,9 @@ pub const CONTROL_PANEL_RESOURCE: &str = "Control Panel";
 
 /// The name a routing control is named by in those same refusals.
 pub const ROUTING_CONTROL_RESOURCE: &str = "Routing Control";
+
+/// The name a safety rule is named by in those same refusals.
+pub const SAFETY_RULE_RESOURCE: &str = "Safety Rule";
 
 /// The namespace this service's IAM actions are published under: the model's
 /// `arnNamespace`, which is also its endpoint prefix
@@ -635,6 +872,9 @@ pub const NON_DEFAULT_CONTROL_PANEL_DEPENDENTS: &str = "non-default Control Pane
 /// The dependents a cluster or a control panel cannot be deleted while it still owns.
 pub const ROUTING_CONTROL_DEPENDENTS: &str = "Routing Controls";
 
+/// The dependents a control panel cannot be deleted while it still owns.
+pub const SAFETY_RULE_DEPENDENTS: &str = "Safety Rules";
+
 /// The `ValidationException$Message` for a create request whose name is already taken
 /// inside the parent that scopes it.
 ///
@@ -654,6 +894,23 @@ pub fn already_exists_message(resource: &str, name: &str, parent: &str, parent_a
 /// refusal whose reason is what the resource IS rather than what it still owns.
 pub fn cannot_delete_default_message(resource: &str) -> String {
     format!("Cannot delete a default {resource}.")
+}
+
+/// The `ValidationException$Message` for a request that must carry exactly ONE rule and
+/// carries both kinds of rule, or neither.
+///
+/// Route 53 ARC words this refusal as one fixed sentence, with no part taken from the
+/// request: not the member names, not the rule's name, not the control panel it would
+/// have been created in.
+pub const INVALID_RULE_MESSAGE: &str = "Invalid Rule provided.";
+
+/// The `ValidationException$Message` for an update that addresses a safety rule of the
+/// OTHER kind than the update it carries.
+///
+/// `Safety Rule <arn> is a <stored> rule, not a <requested> rule.` — the rule the request
+/// addressed, the kind it really is and the kind the update would have changed.
+pub fn wrong_rule_kind_message(arn: &str, stored: &str, requested: &str) -> String {
+    format!("{SAFETY_RULE_RESOURCE} {arn} is a {stored} rule, not a {requested} rule.")
 }
 
 /// A request's `Tags` map as a deterministic string, for an idempotency fingerprint.

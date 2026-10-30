@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSafetyRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSafetyRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: validates the control panel the rule is scoped to and every routing
+//! control it references are stored — an ARN holding neither is `ValidationException`
+//! (400), since the request only REFERENCES them — mints a safety-rule ARN under that
+//! control panel and persists the rule in [`crate::state`]; `DescribeSafetyRule` and
+//! `ListSafetyRules` project the same stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSafetyRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request carries EXACTLY ONE of `AssertionRule` and `GatingRule`, and the stored rule
+//! is of that kind: the response fills the member of the kind created and leaves the other
+//! empty.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +120,33 @@ impl From<CreateSafetyRuleErrorModeled> for CreateSafetyRuleError {
     }
 }
 
+/// This operation's refusal of its own input: every rule it enforces over the request and
+/// the stored tree is `ValidationException` (400), the only client error this operation
+/// models.
+fn invalid(message: String) -> CreateSafetyRuleError {
+    CreateSafetyRuleErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
+/// The `ClientToken` fingerprint of one create request: every value that decides what is
+/// created, so a token replayed with a different rule is told from a true retry.
+fn fingerprint(
+    panel_arn: &str,
+    name: &str,
+    wait_period_ms: i32,
+    rule_config: &RuleConfig,
+    controls: &crate::state::SafetyRuleControls,
+    tags: Option<&std::collections::HashMap<String, String>>,
+) -> String {
+    format!(
+        "{}|{panel_arn}|{name}|{wait_period_ms}|{}|{}|{}|{}",
+        controls.fingerprint(),
+        rule_config.inverted,
+        rule_config.threshold,
+        rule_config.r#type,
+        crate::state::tags_fingerprint(tags)
+    )
+}
+
 /// The `CreateSafetyRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +183,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSafetyRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSafetyRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSafetyRule"))
+        let _ = ctx;
+        // A safety rule is an assertion rule or a gating rule, never both and never
+        // neither: the two members are the alternatives of one choice, so a request
+        // carrying both or neither is refused on its input before anything is looked up.
+        let (panel_arn, name, wait_period_ms, rule_config, controls) =
+            match (input.assertion_rule, input.gating_rule) {
+                (Some(rule), None) => (
+                    rule.control_panel_arn,
+                    rule.name,
+                    rule.wait_period_ms,
+                    rule.rule_config,
+                    crate::state::SafetyRuleControls::Assertion {
+                        asserted_controls: rule.asserted_controls,
+                    },
+                ),
+                (None, Some(rule)) => (
+                    rule.control_panel_arn,
+                    rule.name,
+                    rule.wait_period_ms,
+                    rule.rule_config,
+                    crate::state::SafetyRuleControls::Gating {
+                        gating_controls: rule.gating_controls,
+                        target_controls: rule.target_controls,
+                    },
+                ),
+                _ => return Err(invalid(crate::state::INVALID_RULE_MESSAGE.to_string())),
+            };
+
+        // The rule configuration is stored as the request sends it: the threshold is how
+        // many of the rule's controls must be set, which the DATA plane evaluates, so the
+        // control plane does not couple it to how many controls the rule names.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSafetyRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let fingerprint = fingerprint(
+            &panel_arn,
+            &name,
+            wait_period_ms,
+            &rule_config,
+            &controls,
+            input.tags.as_ref(),
+        );
+        let mut guard = state.lock();
+
+        match guard.token_outcome(Self::NAME, input.client_token.as_deref(), &fingerprint) {
+            crate::state::TokenOutcome::Replay(arn) => {
+                if let Some(record) = guard.safety_rules.get(&arn) {
+                    return Ok(CreateSafetyRuleOutput {
+                        assertion_rule: record.to_assertion_rule(),
+                        gating_rule: record.to_gating_rule(),
+                    });
+                }
+            }
+            crate::state::TokenOutcome::Mismatch => {
+                return Err(invalid(
+                    "ClientToken was already used for a CreateSafetyRule request with different \
+                     parameters"
+                        .to_string(),
+                ));
+            }
+            crate::state::TokenOutcome::Fresh => {}
+        }
+
+        // The control panel and the routing controls are resources this request
+        // REFERENCES rather than addresses, so an ARN holding none makes the request's
+        // input wrong — a 400 — where a read addressing the same ARN answers the 404 of
+        // the read path.
+        if !guard.control_panels.contains_key(&panel_arn) {
+            return Err(invalid(crate::state::does_not_exist_message(
+                crate::state::CONTROL_PANEL_RESOURCE,
+                &panel_arn,
+            )));
+        }
+        // A safety rule guards the routing controls of the ONE control panel it is scoped
+        // to, so a control of another panel is no more referenceable than one that is not
+        // stored at all.
+        for referenced in controls.referenced() {
+            if guard
+                .routing_controls
+                .get(referenced)
+                .is_none_or(|control| control.control_panel_arn != panel_arn)
+            {
+                return Err(invalid(crate::state::does_not_exist_message(
+                    crate::state::ROUTING_CONTROL_RESOURCE,
+                    referenced,
+                )));
+            }
+        }
+
+        // A safety rule name identifies the rule within its control panel, so the loser of
+        // a race for one name is refused on its INPUT: the name is taken, and no retry of
+        // the same request can win it.
+        if guard.safety_rule_name_taken(&panel_arn, &name, None) {
+            return Err(invalid(crate::state::already_exists_message(
+                crate::state::SAFETY_RULE_RESOURCE,
+                &name,
+                crate::state::CONTROL_PANEL_RESOURCE,
+                &panel_arn,
+            )));
+        }
+
+        // The store is bounded, so a repeated create cannot grow it without limit.
+        if guard.safety_rules_full() {
+            return Err(invalid(format!(
+                "this account may hold at most {} safety rules",
+                crate::state::MAX_SAFETY_RULES
+            )));
+        }
+
+        // AWS nests a safety rule's ARN inside its control panel's, so the panel ARN is
+        // the prefix of the safety-rule ARN.
+        let rule_id = guard.mint_id();
+        let safety_rule_arn = format!("{panel_arn}/safetyrule/{rule_id}");
+        let seq = guard.next_seq();
+
+        guard.safety_rules.insert(
+            safety_rule_arn.clone(),
+            crate::state::SafetyRuleRecord {
+                seq,
+                arn: safety_rule_arn.clone(),
+                control_panel_arn: panel_arn,
+                name,
+                owner: ::engine::emulator_account_id().to_string(),
+                wait_period_ms,
+                rule_config,
+                controls,
+                tags: crate::state::tags_map(input.tags),
+                deploy_due: crate::state::deploy_due(),
+            },
+        );
+
+        guard.remember_token(
+            Self::NAME,
+            input.client_token.as_deref(),
+            &fingerprint,
+            &safety_rule_arn,
+        );
+
+        // Answer from the STORED record, so this body is what `DescribeSafetyRule` answers
+        // with afterwards.
+        let Some(record) = guard.safety_rules.get(&safety_rule_arn) else {
+            return Err(CreateSafetyRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the safety rule just created is not in the store".to_string(),
+                },
+            )
+            .into());
+        };
+        Ok(CreateSafetyRuleOutput {
+            assertion_rule: record.to_assertion_rule(),
+            gating_rule: record.to_gating_rule(),
+        })
     }
 }

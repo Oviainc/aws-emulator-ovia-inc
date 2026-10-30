@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSafetyRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSafetyRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSafetyRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: moves the stored safety rule the update addresses onto the name and wait
+//! period it carries — the only two things this operation changes — and makes the changed
+//! configuration's deployment due again, so a read straight after it sees `PENDING`. An
+//! ARN holding no rule is `ResourceNotFoundException` (404); an update for the other kind
+//! of rule than the one stored is `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +106,16 @@ impl From<UpdateSafetyRuleErrorModeled> for UpdateSafetyRuleError {
     }
 }
 
+/// This operation's refusal of an ARN that addresses no stored safety rule:
+/// `ResourceNotFoundException` (404) with the one sentence every lookup in this crate
+/// states.
+fn rule_not_found(arn: &str) -> UpdateSafetyRuleError {
+    UpdateSafetyRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: crate::state::not_found_message(crate::state::SAFETY_RULE_NOUN, arn),
+    })
+    .into()
+}
+
 /// The `UpdateSafetyRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -146,18 +152,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSafetyRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSafetyRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSafetyRule"))
+        let _ = ctx;
+        // An update carries EXACTLY ONE of the two updates, each naming the rule it
+        // addresses: they are the alternatives of one choice, so both or neither is
+        // refused on the request's input.
+        let (safety_rule_arn, name, wait_period_ms, requested_kind) =
+            match (input.assertion_rule_update, input.gating_rule_update) {
+                (Some(update), None) => (
+                    update.safety_rule_arn,
+                    update.name,
+                    update.wait_period_ms,
+                    crate::state::ASSERTION_RULE_KIND,
+                ),
+                (None, Some(update)) => (
+                    update.safety_rule_arn,
+                    update.name,
+                    update.wait_period_ms,
+                    crate::state::GATING_RULE_KIND,
+                ),
+                _ => {
+                    return Err(UpdateSafetyRuleErrorModeled::ValidationException(
+                        ValidationException {
+                            message: crate::state::INVALID_RULE_MESSAGE.to_string(),
+                        },
+                    )
+                    .into())
+                }
+            };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSafetyRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        // One read of the addressed rule, for the two things the checks below need: the
+        // control panel its name is scoped to, and which kind of rule it is. Read before
+        // the record is borrowed mutably.
+        let Some((panel_arn, stored_kind)) = guard
+            .safety_rules
+            .get(&safety_rule_arn)
+            .map(|record| (record.control_panel_arn.clone(), record.controls.kind()))
+        else {
+            return Err(rule_not_found(&safety_rule_arn));
+        };
+
+        // An assertion rule is not updatable by a gating-rule update, or the other way
+        // round: the update names which kind it is for, and the stored rule is of one
+        // kind.
+        if stored_kind != requested_kind {
+            return Err(UpdateSafetyRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::wrong_rule_kind_message(
+                        &safety_rule_arn,
+                        stored_kind,
+                        requested_kind,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The name is scoped to the rule's control panel, so a rename onto a name another
+        // rule of that panel already holds is refused the way the create states it.
+        if guard.safety_rule_name_taken(&panel_arn, &name, Some(&safety_rule_arn)) {
+            return Err(UpdateSafetyRuleErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::already_exists_message(
+                        crate::state::SAFETY_RULE_RESOURCE,
+                        &name,
+                        crate::state::CONTROL_PANEL_RESOURCE,
+                        &panel_arn,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let Some(record) = guard.safety_rules.get_mut(&safety_rule_arn) else {
+            return Err(rule_not_found(&safety_rule_arn));
+        };
+
+        // The name and the wait period are the only two things an update changes; a
+        // request naming the ones the rule already carries changes nothing, so it does not
+        // restart a deployment either.
+        record.set_name_and_wait_period(name, wait_period_ms);
+
+        // Answer from the STORED record, so this body is what `DescribeSafetyRule` answers
+        // with afterwards.
+        Ok(UpdateSafetyRuleOutput {
+            assertion_rule: record.to_assertion_rule(),
+            gating_rule: record.to_gating_rule(),
+        })
     }
 }

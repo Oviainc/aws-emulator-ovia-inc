@@ -9,9 +9,10 @@
 //! ARN is echoed back exactly as it was sent.
 //!
 //! The tables span what that rule generalises over: every implemented operation that
-//! ADDRESSES a resource by ARN (read, delete, update, list), all three resource levels
-//! (cluster, control panel, routing control) and several fillings of the ARN's own
-//! variable parts — a lowercase UUID, an upper-case-hex UUID and a non-UUID tail.
+//! ADDRESSES a resource by ARN (read, delete, update, list), every resource level
+//! (cluster, control panel, routing control, safety rule) and several fillings of the
+//! ARN's own variable parts — a lowercase UUID, an upper-case-hex UUID and a non-UUID
+//! tail.
 //!
 //! Every ARN here names the CALLER's account, because that is the only kind of ARN this
 //! sentence answers: one naming another account is refused by the authorization check
@@ -134,6 +135,50 @@ fn control_panel_cases(panel_arn: &str) -> Vec<Case> {
             noun: "control panel",
             requested_arn: panel_arn.to_string(),
         },
+        Case {
+            label: format!("ListSafetyRules({panel_arn})"),
+            method: "GET",
+            path: format!("/controlpanel/{}/safetyrules", enc(panel_arn)),
+            body: None,
+            noun: "control panel",
+            requested_arn: panel_arn.to_string(),
+        },
+    ]
+}
+
+/// Every safety-rule-resolving request for one safety rule ARN.
+fn safety_rule_cases(rule_arn: &str) -> Vec<Case> {
+    vec![
+        Case {
+            label: format!("DescribeSafetyRule({rule_arn})"),
+            method: "GET",
+            path: format!("/safetyrule/{}", enc(rule_arn)),
+            body: None,
+            noun: "safety rule",
+            requested_arn: rule_arn.to_string(),
+        },
+        Case {
+            label: format!("DeleteSafetyRule({rule_arn})"),
+            method: "DELETE",
+            path: format!("/safetyrule/{}", enc(rule_arn)),
+            body: None,
+            noun: "safety rule",
+            requested_arn: rule_arn.to_string(),
+        },
+        Case {
+            label: format!("UpdateSafetyRule({rule_arn})"),
+            method: "PUT",
+            path: "/safetyrule".to_string(),
+            body: Some(json!({
+                "AssertionRuleUpdate": {
+                    "Name": "renamed",
+                    "SafetyRuleArn": rule_arn,
+                    "WaitPeriodMs": 5000
+                }
+            })),
+            noun: "safety rule",
+            requested_arn: rule_arn.to_string(),
+        },
     ]
 }
 
@@ -174,9 +219,11 @@ async fn an_unresolvable_arn_is_refused_with_the_no_record_sentence() {
         let cluster_arn = arn(ACCOUNT, &format!("cluster/{id}"));
         let panel_arn = arn(ACCOUNT, &format!("controlpanel/{id}"));
         let control_arn = format!("{panel_arn}/routingcontrol/{id}");
+        let rule_arn = format!("{panel_arn}/safetyrule/{id}");
         cases.extend(cluster_cases(&cluster_arn));
         cases.extend(control_panel_cases(&panel_arn));
         cases.extend(routing_control_cases(&control_arn));
+        cases.extend(safety_rule_cases(&rule_arn));
     }
 
     for case in cases {

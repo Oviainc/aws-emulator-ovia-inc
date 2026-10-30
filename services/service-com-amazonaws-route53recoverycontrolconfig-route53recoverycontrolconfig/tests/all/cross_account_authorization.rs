@@ -165,6 +165,14 @@ fn cases_for(cluster_arn: &str, own_cluster_arn: &str) -> Vec<Case> {
             resource: panel_arn.clone(),
         },
         Case {
+            label: format!("ListSafetyRules({panel_arn})"),
+            method: "GET",
+            path: format!("/controlpanel/{}/safetyrules", enc(&panel_arn)),
+            body: None,
+            action: "ListSafetyRules",
+            resource: panel_arn.clone(),
+        },
+        Case {
             label: format!("DescribeRoutingControl({control_arn})"),
             method: "GET",
             path: format!("/routingcontrol/{}", enc(&control_arn)),

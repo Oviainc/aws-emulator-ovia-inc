@@ -4,8 +4,8 @@
 //! Implemented: removes the control panel from [`crate::state`] once nothing is left
 //! under it, so a following `DescribeControlPanel` answers 404; an ARN no control panel
 //! is stored under is `ResourceNotFoundException` (404), a panel that still holds routing
-//! controls is `ValidationException` (400), and so is the cluster's default control
-//! panel, which exists for as long as its cluster does.
+//! controls or safety rules is `ValidationException` (400), and so is the cluster's default
+//! control panel, which exists for as long as its cluster does.
 //!
 //! ## Shape of an operation
 //!
@@ -198,6 +198,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: crate::state::cannot_delete_message(
                         crate::state::CONTROL_PANEL_RESOURCE,
                         crate::state::ROUTING_CONTROL_DEPENDENTS,
+                    ),
+                },
+            )
+            .into());
+        }
+        // The safety rules scoped to the panel are dependents of it too, so the same rule
+        // holds for them.
+        if guard.safety_rule_count(&input.control_panel_arn) > 0 {
+            return Err(DeleteControlPanelErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::cannot_delete_message(
+                        crate::state::CONTROL_PANEL_RESOURCE,
+                        crate::state::SAFETY_RULE_DEPENDENTS,
                     ),
                 },
             )

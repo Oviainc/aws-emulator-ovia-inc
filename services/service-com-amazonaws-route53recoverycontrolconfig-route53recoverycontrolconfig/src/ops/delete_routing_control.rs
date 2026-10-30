@@ -161,11 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut guard = state.lock();
-        if guard
-            .routing_controls
-            .remove(&input.routing_control_arn)
-            .is_none()
-        {
+        if !guard.routing_controls.contains_key(&input.routing_control_arn) {
             return Err(DeleteRoutingControlErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::not_found_message(
@@ -176,6 +172,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // A routing control a safety rule names — as a control that rule evaluates or as
+        // one it gates — is a dependent of that rule, so it is only removable once the
+        // rule is: stated the way the cluster and the control panel state the same
+        // refusal, as a refusal of the request's input rather than a transient class.
+        if guard.safety_rules_reference(&input.routing_control_arn) {
+            return Err(DeleteRoutingControlErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::cannot_delete_message(
+                        crate::state::ROUTING_CONTROL_RESOURCE,
+                        crate::state::SAFETY_RULE_DEPENDENTS,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        guard.routing_controls.remove(&input.routing_control_arn);
 
         // The resource is gone, so the tokens that created it are released too.
         guard.forget_tokens_for(&input.routing_control_arn);
