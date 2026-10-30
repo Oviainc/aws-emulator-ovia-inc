@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListS3TableIntegrations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListS3TableIntegrations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports a summary of every S3 Table integration [`crate::state`] holds
+//! in the region the request was signed for, one `@paginated` page at a time. A pure
+//! read: it writes nothing, so a listing leaves every record exactly as the caller
+//! before it saw it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListS3TableIntegrations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each summary comes from the one record the create stored — its ARN, which is the
+//! only handle a caller ever has on an integration, and that record's own status — so
+//! a listing and a `GetS3TableIntegration` of the same integration cannot disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +115,66 @@ impl From<ListS3TableIntegrationsErrorModeled> for ListS3TableIntegrationsError 
     }
 }
 
+/// The largest page this operation will ever build, and the page size applied when
+/// the request omits `MaxResults`.
+///
+/// It is the maximum of the modelled `ListS3TableIntegrationsMaxResults` range
+/// (1..100), which the centralized walk already refuses values outside of — but this
+/// handler does not depend on that: the size is clamped to this constant here, so the
+/// page it allocates is decided by the server, never by the request.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// A page token naming the integration id the NEXT page starts at.
+///
+/// `NextToken` is modelled opaque, so the id is hex-encoded rather than handed back in
+/// the clear — this makes the token opaque to a caller, not secret: hex is trivially
+/// reversible and the token carries nothing beyond an integration id.
+fn encode_page_token(id: &str) -> String {
+    hex::encode(id)
+}
+
+/// The integration id a page token names, or a 400 refusal when the token carries
+/// nothing this operation could have issued.
+///
+/// What it can decide is the FORM: every token this operation hands out carries an id
+/// this service minted (`crate::state::new_s3_table_integration_id` — a hyphenated,
+/// lowercase-hex UUID, 8-4-4-4-12), so a token decoding to anything else is one this
+/// operation never issued and is refused rather than read as a position. A
+/// well-formed id the store no longer holds is NOT refused: it is a position, and a
+/// page resumes strictly after it, which is what lets a walk survive the integration
+/// its last page ended on being deleted between the two calls.
+fn decode_page_token(token: &str) -> Result<String, ListS3TableIntegrationsError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|id| is_minted_id_form(id))
+        .ok_or_else(|| {
+            ListS3TableIntegrationsErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "NextToken is not a pagination token issued by ListS3TableIntegrations"
+                        .to_string(),
+                ),
+                ..Default::default()
+            })
+            .into()
+        })
+}
+
+/// Whether `id` has the form this service mints an integration id in: five
+/// hyphen-separated groups of 8, 4, 4, 4 and 12 lowercase hex digits
+/// (`crate::state::new_s3_table_integration_id`).
+fn is_minted_id_form(id: &str) -> bool {
+    let mut groups = id.split('-');
+    [8usize, 4, 4, 4, 12].iter().all(|width| {
+        groups.next().is_some_and(|group| {
+            group.len() == *width
+                && group
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+    }) && groups.next().is_none()
+}
+
 /// The `ListS3TableIntegrations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -152,18 +211,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListS3TableIntegrations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListS3TableIntegrationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListS3TableIntegrations"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListS3TableIntegrationsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the S3 Table integration store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
+        // whatever the request asked for, so no allocation below is sized by input.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
+            requested.clamp(1, MAX_PAGE_SIZE as i32) as usize
+        });
+        let start = input
+            .next_token
+            .as_deref()
+            .map(decode_page_token)
+            .transpose()?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        let store = state.lock();
+        // The store is keyed by (region, id), so one region's integrations are one
+        // contiguous, id-ordered run: the page starts at the id the token named and
+        // stops at the first key of another region. That order is the store's own, so
+        // the pages of one sequence neither repeat nor skip an integration.
+        let page_start = start.unwrap_or_default();
+        let remaining = store
+            .s3_table_integrations
+            .range((region.clone(), page_start)..)
+            .take_while(|((integration_region, _), _)| *integration_region == region);
+
+        // Reserve no more than the store can actually yield.
+        let mut integration_summaries =
+            Vec::with_capacity(page_size.min(store.s3_table_integrations.len()));
+        let mut next_token = None;
+        for ((_, id), record) in remaining {
+            // The first integration that does not fit becomes the next page's start,
+            // and only then is a `NextToken` emitted — the last page carries none.
+            if integration_summaries.len() == page_size {
+                next_token = Some(encode_page_token(id));
+                break;
+            }
+            integration_summaries.push(record.summary());
+        }
+
+        Ok(ListS3TableIntegrationsOutput {
+            integration_summaries: Some(integration_summaries),
+            next_token,
+        })
     }
 }

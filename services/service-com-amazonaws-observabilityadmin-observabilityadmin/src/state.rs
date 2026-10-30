@@ -45,8 +45,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    CentralizationRule, CentralizationRuleSummary, Encryption, RegionStatus, TelemetryPipeline,
-    TelemetryPipelineConfiguration, TelemetryPipelineStatusReason, TelemetryRule,
+    CentralizationRule, CentralizationRuleSummary, Encryption, IntegrationSummary, RegionStatus,
+    TelemetryPipeline, TelemetryPipelineConfiguration, TelemetryPipelineStatusReason, TelemetryRule,
     TelemetryRuleSummary, ACTION_VALUES, DELETION_PROTECTION_VALUES, DESTINATION_TYPE_VALUES,
     ENCRYPTED_LOG_GROUP_STRATEGY_VALUES, ENCRYPTION_CONFLICT_RESOLUTION_STRATEGY_VALUES,
     ENCRYPTION_SCOPE_VALUES, ENCRYPTION_STRATEGY_VALUES, FILTER_BEHAVIOR_VALUES,
@@ -531,6 +531,15 @@ impl StoredS3TableIntegration {
         Encryption {
             sse_algorithm: self.sse_algorithm.clone(),
             kms_key_arn: self.kms_key_arn.clone(),
+        }
+    }
+
+    /// This record as an `IntegrationSummary` — the shape a listing reports one
+    /// integration as: the ARN that is the only handle on it, and its status.
+    pub fn summary(&self) -> IntegrationSummary {
+        IntegrationSummary {
+            arn: Some(self.arn.clone()),
+            status: Some(self.status().to_string()),
         }
     }
 }
@@ -1186,6 +1195,26 @@ impl ComAmazonawsObservabilityadminObservabilityadminState {
         self.s3_table_integration_arn_index
             .insert(record.arn.clone(), record.key());
         self.s3_table_integrations.insert(record.key(), record);
+    }
+
+    /// Retire the S3 Table integration `arn` names in `region`, answering the record
+    /// that was removed, or `None` when the ARN names none.
+    ///
+    /// Both the record and its ARN index entry go, so the handle a caller holds stops
+    /// resolving at the same instant the record stops existing — the way a retired
+    /// telemetry rule leaves no index entry behind either
+    /// ([`Self::remove_rule_tree`]). A freed id is never minted again
+    /// ([`new_s3_table_integration_id`]), so the key cannot come back under a
+    /// different record.
+    pub fn remove_s3_table_integration(
+        &mut self,
+        region: &str,
+        arn: &str,
+    ) -> Option<StoredS3TableIntegration> {
+        let key = self.resolve_s3_table_integration_key(region, arn)?;
+        let record = self.s3_table_integrations.remove(&key)?;
+        self.s3_table_integration_arn_index.remove(&record.arn);
+        Some(record)
     }
 
     /// The telemetry-config feature records of `scope`.

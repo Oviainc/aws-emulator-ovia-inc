@@ -329,11 +329,20 @@ fn invalid_parameter(message: impl Into<String>) -> UpdateSecretVersionStageErro
     .into()
 }
 
-/// `InvalidRequestException` for a `RemoveFromVersionId` that does not name the
-/// version the label is on — "a parameter value is not valid for the current
-/// state of the resource" (this service's Smithy model), which is exactly what a
-/// caller holding a stale view of the labels sends. The message names where the
-/// label actually is, so the caller can retry against the current state.
+/// `InvalidParameterException` for a `RemoveFromVersionId` that does not name the
+/// version the label is on.
+///
+/// The refusal is about the VALUE of a parameter — "the parameter name or value is
+/// invalid" — and not about the secret's state: the same request with the version the
+/// label is really on is served, so what the caller has to correct is the value it
+/// sent. That is the same class the sibling case of this one rule carries, a
+/// `RemoveFromVersionId` the request left out entirely.
+///
+/// The sentence states the rule and names where the label actually is, so the caller
+/// can retry against the current state: the staging label comes from the request's
+/// `VersionStage` and the version id from this store, and nothing else in it varies.
+/// A label that is on no version at all has no holder to name, so that case states
+/// what the request asserted and the store contradicts.
 fn stale_remove_from(
     stage: &str,
     holder: Option<&str>,
@@ -341,15 +350,12 @@ fn stale_remove_from(
 ) -> UpdateSecretVersionStageError {
     let message = match holder {
         Some(holder) => format!(
-            "Staging label {stage} is currently attached to version {holder}, so you can't remove \
-             it from version {named}."
+            "When you move staging label {stage}, if you specify RemoveFromVersionId, it must \
+             be set to the version that currently has the staging label {holder}."
         ),
         None => format!("Staging label {stage} is not attached to version {named}."),
     };
-    UpdateSecretVersionStageErrorModeled::InvalidRequestException(InvalidRequestException {
-        message: Some(message),
-    })
-    .into()
+    invalid_parameter(message)
 }
 
 /// `InvalidRequestException` for a secret that is inside its recovery window: it

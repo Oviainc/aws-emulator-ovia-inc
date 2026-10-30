@@ -99,6 +99,8 @@ mod imported_certificate_issuer_and_key_purposes;
 mod imported_certificate_serves_an_https_listener;
 #[path = "all/imported_certificate_serves_custom_domain.rs"]
 mod imported_certificate_serves_custom_domain;
+#[path = "all/list_certificates_next_token_message.rs"]
+mod list_certificates_next_token_message;
 #[path = "all/pending_validation_and_tag_envelopes.rs"]
 mod pending_validation_and_tag_envelopes;
 #[path = "all/refusal_codes_and_search_projection.rs"]

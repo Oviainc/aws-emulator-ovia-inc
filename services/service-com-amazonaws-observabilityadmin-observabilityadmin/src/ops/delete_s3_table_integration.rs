@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteS3TableIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteS3TableIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: retires the one S3 Table integration the request's `Arn` names in the
+//! region the request was signed for, then answers the modelled empty 204.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteS3TableIntegration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules this handler enforces:
+//!
+//! * the ARN is the only handle a caller has on an integration, and it resolves only
+//!   within the region the caller signed for (`crate::state::s3_table_integration`,
+//!   the one lookup every integration-scoped operation goes through), so an ARN of
+//!   another partition, region, account or resource type names nothing here;
+//! * an `Arn` that names no stored integration is refused with the modelled
+//!   `ValidationException` (HTTP 400) — this operation models no not-found error, and
+//!   an ARN that resolves to no resource is a value the request cannot be served with;
+//! * the delete removes the record and the ARN index entry together, so the handle
+//!   stops resolving at the instant the record stops existing and a later listing or
+//!   read reports neither.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +181,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteS3TableIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteS3TableIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteS3TableIntegration"))
+        // `Arn`'s presence, its 1..1011 length and its `^arn:aws…` pattern are
+        // modelled, so the centralized walk has already refused anything outside them
+        // before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteS3TableIntegrationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the S3 Table integration store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The presented access-key id is an identifier, never a secret: it is what the
+        // audit record below attributes this state-changing call to.
+        let principal = ::emulator_server::extract_akid(&ctx.parts().headers);
+
+        let mut store = state.lock();
+        let removed = store.remove_s3_table_integration(&region, &input.arn);
+        drop(store);
+
+        if removed.is_none() {
+            ::tracing::info!(
+                target: "audit",
+                operation = Self::NAME,
+                outcome = "rejected-unknown-resource",
+                principal = %principal,
+                region = %region,
+                "refused an S3 Table integration delete"
+            );
+            return Err(DeleteS3TableIntegrationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Arn names no S3 Table integration in {region}: {}",
+                        input.arn
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // Audit record for a state-changing call: who asked, what changed, and how it
+        // ended. The retired integration's role and KMS key are deliberately not in it.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "deleted",
+            principal = %principal,
+            region = %region,
+            resource_arn = %input.arn,
+            "deleted an S3 Table integration"
+        );
+
+        Ok(DeleteS3TableIntegrationOutput)
     }
 }

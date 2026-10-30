@@ -459,6 +459,20 @@ fn encode_next_token(cert: &crate::state::Certificate) -> String {
     ))
 }
 
+/// The sentence `ListCertificates` refuses a `NextToken` it did not issue with.
+///
+/// The fixed text is `Invalid Next Token received `, followed by the token the request
+/// carried, exactly as it carried it: this operation's refusal names the value it
+/// could not read, so a caller paging with a stale or hand-built token sees WHICH
+/// token was rejected. Only the caller's own input is interpolated — nothing is read
+/// out of the store — and the token is opaque, so the message leaks no state. The
+/// newer reads of this service word the same class differently
+/// (`crate::state::INVALID_NEXT_TOKEN_MESSAGE`), so the sentence lives with the
+/// operation it belongs to rather than beside theirs.
+fn invalid_next_token_message(token: &str) -> String {
+    format!("Invalid Next Token received {token}")
+}
+
 /// The [`Cursor`] inside a `NextToken`, or `InvalidArgsException` when the token did
 /// not come from [`encode_next_token`].
 ///
@@ -469,7 +483,7 @@ fn encode_next_token(cert: &crate::state::Certificate) -> String {
 fn decode_next_token(token: &str) -> Result<Cursor, ListCertificatesError> {
     let invalid = || {
         ListCertificatesErrorModeled::InvalidArgsException(InvalidArgsException {
-            message: Some("NextToken is not a token this service issued".into()),
+            message: Some(invalid_next_token_message(token)),
         })
     };
     let bytes = hex::decode(token).map_err(|_| invalid())?;

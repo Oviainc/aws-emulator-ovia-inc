@@ -10,10 +10,10 @@
 //!   takes the label off the version that held it, and a move of `AWSCURRENT`
 //!   leaves `AWSPREVIOUS` on the version it came from;
 //! * a label that is already attached can only be moved by a call that names its
-//!   current holder in `RemoveFromVersionId`: a call that names none is
-//!   `InvalidParameterException` and one that names the wrong version is
-//!   `InvalidRequestException`, and neither changes anything — which is what
-//!   makes two concurrent moves of one label resolve with a single winner;
+//!   current holder in `RemoveFromVersionId`: a call that names none and one that
+//!   names the wrong version are both `InvalidParameterException` — the value the
+//!   caller sent is what it has to correct — and neither changes anything, which is
+//!   what makes two concurrent moves of one label resolve with a single winner;
 //! * `AWSCURRENT` names the version a secret's current value lives on, so it is
 //!   only ever MOVED between versions: a call that asks to take it off the
 //!   version holding it, naming no version to move it to, is refused and leaves
@@ -397,11 +397,17 @@ async fn an_attached_label_moves_only_for_the_version_that_holds_it() {
         let target = if holder == v0 { v1.clone() } else { v0.clone() };
         let before = stages(&router, name, &case).await;
 
-        // (what RemoveFromVersionId carries, the code the refusal must use)
+        // (what RemoveFromVersionId carries, the code the refusal must use) — one
+        // class for the whole rule: whether the parameter is missing or names a
+        // version the label is not on, what the caller has to correct is the value it
+        // sent, so every row is the parameter-value refusal.
         let rows: [(Option<String>, &str); 3] = [
             (None, "InvalidParameterException"),
-            (Some(v2.clone()), "InvalidRequestException"),
-            (Some(version_id("never-stored")), "InvalidRequestException"),
+            (Some(v2.clone()), "InvalidParameterException"),
+            (
+                Some(version_id("never-stored")),
+                "InvalidParameterException",
+            ),
         ];
         for (remove_from, expected_code) in rows {
             // A row that happens to name the holder is not a refusal at all.
@@ -739,8 +745,8 @@ async fn removing_the_last_label_deprecates_a_version_without_deleting_it() {
         )
         .await;
         assert_eq!(
-            code, "InvalidRequestException",
-            "case {case:?}: expected InvalidRequestException for a label that is not attached, \
+            code, "InvalidParameterException",
+            "case {case:?}: expected InvalidParameterException for a label that is not attached, \
              got {code:?} with message {message:?}"
         );
         let expected = format!("Staging label blue is not attached to version {v1}.");
@@ -1410,6 +1416,150 @@ async fn a_staging_label_other_than_awscurrent_comes_off_the_version_holding_it(
             text(&read, "VersionId", &case),
             held_by,
             "case {case:?}: expected the version to stay readable by id, got {read}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_remove_from_version_id_that_is_not_where_the_label_is_is_a_parameter_refusal() {
+    // "If the label is attached and you either do not specify this parameter, or
+    // the version ID does not match, then the operation fails."
+    // (`UpdateSecretVersionStageRequest$RemoveFromVersionId`, this service's
+    // Smithy model.) What fails is the VALUE the request carried — the same call
+    // naming the version the label is really on is served — so the whole class is
+    // the parameter refusal, `InvalidParameterException`, whether the parameter is
+    // missing or names the wrong version.
+    //
+    // The rows span what the rule generalises over: the label (both reserved ones
+    // and a caller's own), what `RemoveFromVersionId` names (a version the secret
+    // holds but the label is not on, a version id the secret never held, and the
+    // version the label is being moved TO), and whether the call also names a
+    // `MoveToVersionId` at all.
+    for label in ["AWSCURRENT", "AWSPENDING", "blue"] {
+        let router = emulator();
+        let name = "stale-remove-from";
+        let case = format!("label {label:?}");
+        let (_, v0) = create(&router, name, &case).await;
+        let v1 = put(&router, name, &version_id("v1"), json!(["AWSPENDING"]), &case).await;
+        let v2 = put(&router, name, &version_id("v2"), json!(["blue"]), &case).await;
+        // Where each label starts: AWSCURRENT on v0, AWSPENDING on v1, blue on v2.
+        let holder = match label {
+            "AWSCURRENT" => v0.clone(),
+            "AWSPENDING" => v1.clone(),
+            _ => v2.clone(),
+        };
+        // The version the label is moved to: never the one that holds it.
+        let target = if holder == v0 { v1.clone() } else { v0.clone() };
+        let before = stages(&router, name, &case).await;
+
+        let stale: Vec<(&str, String)> = vec![
+            (
+                "a version the secret holds but the label is not on",
+                if holder == v2 { v1.clone() } else { v2.clone() },
+            ),
+            (
+                "a version id the secret has never held",
+                version_id("never-stored"),
+            ),
+            ("the version the label is being moved to", target.clone()),
+        ];
+        for (row, named) in stale {
+            // A row that happens to name the holder is not a refusal at all.
+            if named == holder {
+                continue;
+            }
+            let case = format!("{case}, RemoveFromVersionId naming {row}");
+            let (code, message) = err(
+                &router,
+                "UpdateSecretVersionStage",
+                json!({
+                    "SecretId": name,
+                    "VersionStage": label,
+                    "MoveToVersionId": target.clone(),
+                    "RemoveFromVersionId": named.clone(),
+                }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                code, "InvalidParameterException",
+                "case {case:?}: expected InvalidParameterException, got {code:?} with message \
+                 {message:?}"
+            );
+            let expected = format!(
+                "When you move staging label {label}, if you specify RemoveFromVersionId, it \
+                 must be set to the version that currently has the staging label {holder}."
+            );
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+            assert_eq!(
+                stages(&router, name, &case).await,
+                before,
+                "case {case:?}: expected the refused call to leave the staging map untouched"
+            );
+        }
+
+        // The same class with no `MoveToVersionId` at all: a removal that names a
+        // version the label is not on. `AWSCURRENT` is refused before this rule —
+        // it is only ever moved — so the removal rows are the other labels'.
+        if label != "AWSCURRENT" {
+            let named = if holder == v2 { v1.clone() } else { v2.clone() };
+            let case = format!("{case}, a removal naming a version the label is not on");
+            let (code, message) = err(
+                &router,
+                "UpdateSecretVersionStage",
+                json!({
+                    "SecretId": name,
+                    "VersionStage": label,
+                    "RemoveFromVersionId": named.clone(),
+                }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                code, "InvalidParameterException",
+                "case {case:?}: expected InvalidParameterException, got {code:?} with message \
+                 {message:?}"
+            );
+            assert!(
+                message.contains(label) && message.contains(&holder),
+                "case {case:?}: expected the refusal to name the label and where it is, got \
+                 {message:?}"
+            );
+            assert_eq!(
+                stages(&router, name, &case).await,
+                before,
+                "case {case:?}: expected the refused call to leave the staging map untouched"
+            );
+        }
+
+        // Naming the holder is what makes the same move succeed, so the refusals
+        // above are about the value, not about the move.
+        let case = format!("{case}, RemoveFromVersionId naming the holder");
+        ok(
+            &router,
+            "UpdateSecretVersionStage",
+            json!({
+                "SecretId": name,
+                "VersionStage": label,
+                "MoveToVersionId": target.clone(),
+                "RemoveFromVersionId": holder.clone(),
+            }),
+            &case,
+        )
+        .await;
+        let after = stages(&router, name, &case).await;
+        let holders: Vec<&String> = after
+            .iter()
+            .filter(|(_, labels)| labels.iter().any(|held| held == label))
+            .map(|(version, _)| version)
+            .collect();
+        assert_eq!(
+            holders,
+            vec![&target],
+            "case {case:?}: expected {label:?} to end up on {target}, got {after:?}"
         );
     }
 }
