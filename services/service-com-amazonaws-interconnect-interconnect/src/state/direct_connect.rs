@@ -16,8 +16,12 @@
 //! not by the account alone.
 //!
 //! Nothing is assumed from silence and nothing is invented: an account that holds no
-//! gateway — and an emulator with no Direct Connect mounted, which knows of none — has no
-//! attach point, which is an EMPTY listing rather than a fabricated descriptor.
+//! gateway has no attach point, which is an EMPTY listing rather than a fabricated
+//! descriptor. Silence from the service that owns the gateways is a different thing
+//! again: then nothing at all is known about what the account holds, so no reader here
+//! turns it into an answer — neither a fabricated descriptor nor the empty listing that
+//! would assert there are none ([`AttachPointResolution::Unresolvable`],
+//! [`AttachPointListing::Unresolvable`]).
 
 use crate::ops::types::{AttachPoint, AttachPointDescriptor, Environment};
 
@@ -146,6 +150,25 @@ pub async fn resolve_attach_point(
     }
 }
 
+/// What reading the attach points valid for an Environment found.
+///
+/// A listing is an ASSERTION about what the account holds — `ListAttachPointsResponse`'s
+/// `attachPoints` is `@required`, so an empty or short list is a positive claim that
+/// those are all of them — which is why the two answers are kept apart here exactly as
+/// [`AttachPointResolution`] keeps "none of them is that identifier" apart from "they
+/// could not be read": either the descriptors are the COMPLETE account of what is valid,
+/// or there is no answer to publish at all.
+#[derive(Debug)]
+pub enum AttachPointListing {
+    /// The account's gateways were read to the end, so these descriptors — of which there
+    /// may be none — are every attach point valid for that Environment.
+    Resolved(Vec<AttachPointDescriptor>),
+    /// The account's gateways could not be read to the end, so WHICH of them are valid
+    /// attach points is unknown: the descriptors gathered so far are not a complete
+    /// account of what the account holds and are never published as one.
+    Unresolvable,
+}
+
 /// How a request whose attach point could not be judged AT ALL is worded.
 ///
 /// This is the emulator failing to resolve the account's own gateways rather than the
@@ -154,6 +177,16 @@ pub async fn resolve_attach_point(
 const ATTACH_POINTS_UNRESOLVABLE_MESSAGE: &str =
     "the attach points of this account could not be resolved, so the requested attach point \
      could not be validated";
+
+/// How a LISTING that could not resolve the account's attach points is worded.
+///
+/// The same failure as above — this emulator cannot read the account's own gateways — so
+/// the sentence opens the same way; what could not be done with them differs, because a
+/// listing judges no identifier of the caller's. It names nothing of the request either:
+/// nothing is known about what the account holds, whichever Environment was asked about.
+pub const ATTACH_POINTS_UNLISTABLE_MESSAGE: &str =
+    "the attach points of this account could not be resolved, so the attach points valid for \
+     the requested environment could not be listed";
 
 /// The refusals an attach-point judgement can call for, in the error channel of the
 /// operation that asked for it.
@@ -243,20 +276,26 @@ pub async fn judge_attach_point<E: AttachPointRefusal>(
 /// nothing can be placed upon has nothing valid to offer. The account's gateways are
 /// not read at all in that case: no answer about them could change it.
 ///
-/// Empty, too, when the account holds no gateway, and when Direct Connect cannot be
-/// asked at all — in both cases nothing is known to attach to, and a descriptor is
-/// never synthesised to fill the gap. The last case is not silent: it is logged at
-/// `warn`, so an empty listing is not read as a positive answer when the peer simply
-/// did not answer.
+/// [`AttachPointListing::Resolved`] and EMPTY, too, when the account holds no gateway:
+/// there is nothing to attach to and a descriptor is never synthesised to fill the gap.
+///
+/// An account whose gateways cannot be read to the end — Direct Connect could not be
+/// asked at all, or the walk's page bound was reached with a cursor still outstanding —
+/// is [`AttachPointListing::Unresolvable`] instead, never that empty listing: the two
+/// would be indistinguishable on the wire, and one of them asserts that the account owns
+/// no attach point while nothing whatever is known about what it owns.
 pub async fn attach_points(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     environment: Option<&Environment>,
-) -> Vec<AttachPointDescriptor> {
+) -> AttachPointListing {
     if !crate::state::environment_offers_attach_points(environment) {
-        return Vec::new();
+        return AttachPointListing::Resolved(Vec::new());
     }
-    walk_attach_points(ctx, region).await.0
+    match walk_attach_points(ctx, region).await {
+        (descriptors, true) => AttachPointListing::Resolved(descriptors),
+        (_, false) => AttachPointListing::Unresolvable,
+    }
 }
 
 /// The walk both readers above share: the descriptors it gathered, and whether it

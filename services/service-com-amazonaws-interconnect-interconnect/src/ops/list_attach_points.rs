@@ -203,8 +203,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot disagree. An account that owns no gateway has no attach point either,
         // which is an empty page: a descriptor is never synthesised for a gateway that
         // does not exist.
-        let descriptors =
-            crate::state::direct_connect::attach_points(ctx, &region, Some(&environment)).await;
+        //
+        // An account whose gateways this emulator could not read to the end is a
+        // DIFFERENT answer from one that holds none: `attachPoints` is `@required`, so
+        // an empty — or silently short — page asserts that those are all the attach
+        // points the account has, which is a claim nothing is known to support. That is
+        // this emulator failing to resolve the account's own state, so it is the
+        // modelled `InterconnectServerException` (500), the same class the two writers
+        // of a connection's attach point answer the same condition with, rather than a
+        // 200 a caller could not tell from "this environment offers none".
+        let descriptors = match crate::state::direct_connect::attach_points(
+            ctx,
+            &region,
+            Some(&environment),
+        )
+        .await
+        {
+            crate::state::direct_connect::AttachPointListing::Resolved(descriptors) => descriptors,
+            crate::state::direct_connect::AttachPointListing::Unresolvable => {
+                return Err(ListAttachPointsErrorModeled::InterconnectServerException(
+                    InterconnectServerException {
+                        message: crate::state::direct_connect::ATTACH_POINTS_UNLISTABLE_MESSAGE
+                            .to_string(),
+                    },
+                )
+                .into());
+            }
+        };
 
         // Keyed by `identifier`, which is what identifies an attach point within an
         // environment, and ordered by it so paging walks one stable sequence: a page
