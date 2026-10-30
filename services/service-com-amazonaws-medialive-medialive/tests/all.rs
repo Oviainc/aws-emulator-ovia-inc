@@ -362,6 +362,9 @@ mod schedule_channel_references;
 #[path = "all/sdi_source_lifecycle.rs"]
 mod sdi_source_lifecycle;
 
+#[path = "all/sdi_source_name_uniqueness.rs"]
+mod sdi_source_name_uniqueness;
+
 #[path = "all/sdi_source_tags_and_statuses.rs"]
 mod sdi_source_tags_and_statuses;
 

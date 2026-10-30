@@ -198,6 +198,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // `Name` is documented "Specify a name that is unique in the AWS
+        // account… Names are case-sensitive", so a second source under a name
+        // the account already holds is the modelled conflict rather than
+        // another source no caller could tell apart by the name the model says
+        // identifies it. A request that names nothing takes no name, and so
+        // conflicts with nothing.
+        if let Some(name) = input.name.as_deref() {
+            if state.sdi_source_named(name).is_some() {
+                return Err(CreateSdiSourceErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
+                })
+                .into());
+            }
+        }
+
         // The store is bounded, so a create loop cannot grow the emulator's heap
         // without limit: once it is full the operation's own modelled throttle is
         // the answer, not another source.

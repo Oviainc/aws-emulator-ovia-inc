@@ -171,8 +171,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deleted is reported as already deleted, naming the id the request asked
         // for, while an id no source ever had is simply not found. Both are
         // `NotFoundException`, because neither leaves a source to change.
-        let source = match state.sdi_sources.get_mut(&input.sdi_source_id) {
-            Some(source) if !source.is_deleted() => source,
+        match state.sdi_sources.get(&input.sdi_source_id) {
+            Some(source) if !source.is_deleted() => {}
             found => {
                 let message = if found.is_some() {
                     crate::state::already_deleted_message(&format!(
@@ -187,7 +187,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .into());
             }
-        };
+        }
+
+        // `Name` repeats the create's own rule ("Specify a name that is unique
+        // in the AWS account… Names are case-sensitive"), resolved through the
+        // same account-wide lookup so a rename can no more leave two sources
+        // under one name than a create can: a name ANOTHER source of the
+        // account holds is the modelled conflict, while re-sending this
+        // source's own name is not a collision with itself. Checked BEFORE the
+        // first write, so a refused update leaves the stored source exactly as
+        // it was.
+        if let Some(name) = input.name.as_deref() {
+            if state
+                .sdi_source_named(name)
+                .is_some_and(|holder| holder != input.sdi_source_id)
+            {
+                return Err(UpdateSdiSourceErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
+                })
+                .into());
+            }
+        }
+
+        let source = state
+            .sdi_sources
+            .get_mut(&input.sdi_source_id)
+            .ok_or_else(unavailable)?;
 
         // "Change some of the settings in an SdiSource": a member the request
         // carries replaces the stored one, and a member it omits leaves that

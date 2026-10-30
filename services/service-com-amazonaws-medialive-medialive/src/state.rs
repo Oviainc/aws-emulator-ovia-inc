@@ -2844,6 +2844,29 @@ impl ComAmazonawsMedialiveMedialiveState {
         self.sdi_sources.get(id).map(|source| source.id.as_str())
     }
 
+    /// The id of the SdiSource whose `Name` is `name`, if the store holds one.
+    ///
+    /// `CreateSdiSource`'s and `UpdateSdiSource`'s `Name` carry the same
+    /// documented rule as the cluster's and the network's own ("Specify a name
+    /// that is unique in the AWS account… Names are case-sensitive"), so the
+    /// match is EXACT (never case-folded) and spans every source this store
+    /// holds, and it is what makes a create — or a rename — under a name the
+    /// account already holds the modelled `ConflictException` rather than a
+    /// second source nothing can tell apart by the name the model says
+    /// identifies it. This is the ONE lookup both of them resolve against, so
+    /// the two cannot disagree about what a stored source may be called
+    /// ([`Self::network_named`] plays the same part on the network side).
+    ///
+    /// A deleted source is skipped: `DELETED` is terminal, so the record stays
+    /// readable but the source is out of the account and the name it was created
+    /// under is free for the next create.
+    pub fn sdi_source_named(&self, name: &str) -> Option<&str> {
+        self.sdi_sources
+            .values()
+            .find(|source| source.name.as_deref() == Some(name) && !source.is_deleted())
+            .map(|source| source.id.as_str())
+    }
+
     /// The inputs that are currently using the SdiSource `id` - the model's
     /// `Inputs` member ("The list of inputs that are currently using this SDI
     /// source. This list will be empty if the SdiSource has just been deleted").
@@ -5655,17 +5678,19 @@ pub fn not_idle_message(resource_type: &str, identifier: &str, state: &str) -> S
     )
 }
 
-/// The message a create refused because the region already holds a monitor
+/// The message a create or a rename refused because the account already holds a
 /// resource of that type under the requested `Name` carries.
 ///
 /// Every monitor resource — the cloudwatch alarm template and its group, the
 /// eventbridge rule template and its group, and the signal map — documents the
 /// same uniqueness rule for `Name` ("Names must be unique within the scope of a
-/// resource type in a specific region"), so the name collision is ONE rejection
-/// class across all of them and this is the fixed sentence it carries. Nothing
-/// is interpolated: the colliding resource's internal id and the region are
-/// state the caller did not supply, and a caller matching on the message would
-/// be matching on this emulator's environment.
+/// resource type in a specific region"), and the anywhere resources — the
+/// cluster, the node, the channel placement group and the SdiSource — document
+/// theirs ("Specify a name that is unique in the AWS account"), so the name
+/// collision is ONE rejection class across all of them and this is the fixed
+/// sentence it carries. Nothing is interpolated: the colliding resource's
+/// internal id and the region are state the caller did not supply, and a caller
+/// matching on the message would be matching on this emulator's environment.
 pub const NAME_ALREADY_IN_USE_MESSAGE: &str = "Name already in use";
 
 /// One created input, as `CreateInput` stored it plus its lifecycle state.
