@@ -50,6 +50,11 @@ const MAX_TAGS: usize = 50;
 const MAX_TAG_KEY_LEN: usize = 128;
 const MAX_TAG_VALUE_LEN: usize = 256;
 
+/// The status a successful tag mutation answers with: 204 No Content, as AWS answers an
+/// empty-output tag mutation — written out here rather than read from the service, so a
+/// regression to the protocol default fails these cases.
+const TAG_MUTATION_STATUS: u16 = 204;
+
 /// The two resource kinds an IoT Device Advisor `resourceArn` can name: every tagging
 /// operation documents the same thing about it — "This can be SuiteDefinition ARN or
 /// SuiteRun ARN".
@@ -374,9 +379,18 @@ async fn untagging_removes_exactly_the_named_keys_for_either_resource_kind() {
 
             let answer = emulator.untag(&arn, &removed).await;
             assert_eq!(
-                answer.status, 200,
-                "case {case:?}: expected HTTP 200 from UntagResource, got {} {} ({:?})",
+                answer.status, TAG_MUTATION_STATUS,
+                "case {case:?}: expected HTTP {TAG_MUTATION_STATUS} from UntagResource, got \
+                 {} {} ({:?})",
                 answer.status, answer.body, answer.error_code
+            );
+            assert!(
+                answer
+                    .body
+                    .as_object()
+                    .is_none_or(serde_json::Map::is_empty),
+                "case {case:?}: a no-content answer reports nothing, got {}",
+                answer.body
             );
             assert!(
                 answer.error_code.is_none(),
@@ -436,8 +450,9 @@ async fn untagging_the_same_keys_again_is_idempotent() {
             for attempt in 1..=3 {
                 let answer = emulator.untag(&arn, &removed).await;
                 assert_eq!(
-                    answer.status, 200,
-                    "case {case:?} attempt {attempt}: expected HTTP 200, got {} {}",
+                    answer.status, TAG_MUTATION_STATUS,
+                    "case {case:?} attempt {attempt}: expected HTTP {TAG_MUTATION_STATUS}, got \
+                     {} {}",
                     answer.status, answer.body
                 );
                 let reported = emulator.reported_tags(&case, &arn).await;
@@ -478,8 +493,8 @@ async fn untagging_one_resource_leaves_every_other_resource_alone() {
         let (case, arn) = &resources[target];
         let answer = emulator.untag(arn, &removed).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected HTTP 200, got {} {}",
+            answer.status, TAG_MUTATION_STATUS,
+            "case {case:?}: expected HTTP {TAG_MUTATION_STATUS}, got {} {}",
             answer.status, answer.body
         );
 

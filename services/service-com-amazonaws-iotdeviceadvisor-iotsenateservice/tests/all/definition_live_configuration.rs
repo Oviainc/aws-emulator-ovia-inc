@@ -23,7 +23,7 @@
 
 use serde_json::{json, Value};
 
-use crate::suite_lifecycle::{definition_rows, Answer, Emulator, ROLE_ARN};
+use crate::suite_lifecycle::{definition_rows, resolved, Answer, Emulator, ROLE_ARN};
 
 const REGION: &str = "us-east-1";
 
@@ -91,7 +91,7 @@ async fn a_version_qualified_read_serves_the_current_configuration() {
         let first_version = before.string("suiteDefinitionVersion");
         assert_eq!(
             before.member("suiteDefinitionConfiguration"),
-            initial,
+            &resolved(initial),
             "case {case:?}: the created configuration must read back, got {}",
             before.body
         );
@@ -119,7 +119,7 @@ async fn a_version_qualified_read_serves_the_current_configuration() {
         );
         assert_eq!(
             historical.member("suiteDefinitionConfiguration"),
-            replacement,
+            &resolved(replacement),
             "case {case:?}: version {first_version} must serve the current configuration, got {}",
             historical.body
         );
@@ -148,7 +148,7 @@ async fn a_version_qualified_read_serves_the_current_configuration() {
         );
         assert_eq!(
             unqualified.member("suiteDefinitionConfiguration"),
-            replacement,
+            &resolved(replacement),
             "case {case:?}: the unqualified read must serve the configuration just stored, got {}",
             unqualified.body
         );
@@ -333,7 +333,7 @@ async fn an_update_moves_only_the_named_definitions_stamps() {
     );
     assert_eq!(
         after.member("suiteDefinitionConfiguration"),
-        &configuration("bystander"),
+        &resolved(&configuration("bystander")),
         "case {:?}: an update must not touch another definition's configuration, got {}",
         "bystander",
         after.body

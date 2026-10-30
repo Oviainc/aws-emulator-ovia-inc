@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
 
-use super::suite_lifecycle::{thing_arn, Emulator, ROLE_ARN};
+use super::suite_lifecycle::{resolved, thing_arn, Emulator, ROLE_ARN};
 
 /// The region every case below signs for, so the ARNs and the endpoint are the published
 /// shape for one region throughout.
@@ -665,10 +665,12 @@ async fn an_update_records_a_new_version_a_following_read_observes() {
             id,
             "case {case:?}: an update must not move the definition's id"
         );
-        assert_eq!(
-            updated.string("suiteDefinitionArn"),
-            arn,
-            "case {case:?}: an update must not move the definition's ARN"
+        // The ARN is a member this operation does not serialize: the create that minted it
+        // and the reads report it, the update reply does not.
+        assert!(
+            updated.member("suiteDefinitionArn").is_null(),
+            "case {case:?}: an update reply must carry no suiteDefinitionArn, got {}",
+            updated.body
         );
         assert_eq!(
             updated.string("suiteDefinitionVersion"),
@@ -708,6 +710,12 @@ async fn an_update_records_a_new_version_a_following_read_observes() {
             read.status, read.body
         );
         assert_eq!(
+            read.string("suiteDefinitionArn"),
+            arn,
+            "case {case:?}: a read must report the definition's ARN unchanged, got {}",
+            read.body
+        );
+        assert_eq!(
             read.string("latestVersion"),
             "v2",
             "case {case:?}: the version the update minted is the latest, got {}",
@@ -715,7 +723,7 @@ async fn an_update_records_a_new_version_a_following_read_observes() {
         );
         assert_eq!(
             read.member("suiteDefinitionConfiguration"),
-            &replacement,
+            &resolved(&replacement),
             "case {case:?}: an unqualified read answers the configuration just stored"
         );
 
@@ -731,7 +739,7 @@ async fn an_update_records_a_new_version_a_following_read_observes() {
             .await;
         assert_eq!(
             old.member("suiteDefinitionConfiguration"),
-            &replacement,
+            &resolved(&replacement),
             "case {case:?}: version v1 must answer the CURRENT configuration (a definition \
              keeps one live configuration), got {}",
             old.body

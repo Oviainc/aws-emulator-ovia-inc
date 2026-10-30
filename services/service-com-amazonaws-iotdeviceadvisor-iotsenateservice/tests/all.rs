@@ -47,6 +47,9 @@ mod shared_paging_rule;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/stored_configuration_and_tag_responses.rs"]
+mod stored_configuration_and_tag_responses;
+
 #[path = "all/suite_lifecycle.rs"]
 mod suite_lifecycle;
 

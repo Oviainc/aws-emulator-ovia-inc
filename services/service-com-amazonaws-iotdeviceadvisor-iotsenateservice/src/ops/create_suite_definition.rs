@@ -183,6 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // What the store keeps is the RESOLVED configuration: the optional members a caller
+        // left out are stored with the values the suite will run with, so every later read
+        // answers them. See `crate::state::resolved_configuration`.
+        let config = crate::state::resolved_configuration(config);
         let tags: ::std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
         let fingerprint = crate::state::create_request_fingerprint(&region, &config, &tags);

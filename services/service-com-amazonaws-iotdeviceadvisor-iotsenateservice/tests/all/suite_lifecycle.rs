@@ -353,6 +353,47 @@ pub(crate) fn definition_rows() -> Vec<(String, Value)> {
     rows
 }
 
+/// `configuration` as the service STORES it, which is what a definition read answers.
+///
+/// A suite definition is stored RESOLVED: the optional members a caller left out come back
+/// with the values the suite will actually run with (`devices` as an empty list,
+/// `intendedForQualification` and `isLongDurationTest` as false, `protocol` as the service's
+/// default), and a qualification suite that named an EMPTY `rootGroup` comes back with the
+/// default qualification root group. The mirror of `state::resolved_configuration`, so a
+/// round-trip assertion states the rule rather than repeating its values row by row.
+pub(crate) fn resolved(configuration: &Value) -> Value {
+    // The resolved protocol, written out rather than read from the service: plain MQTT 3.1.1
+    // is the `Protocol` value a read of a definition stored without one answers with.
+    const RESOLVED_PROTOCOL: &str = "MqttV3_1_1";
+
+    let mut expected = configuration.clone();
+    let object = expected
+        .as_object_mut()
+        .expect("a suite definition configuration is a JSON object");
+    object.entry("devices").or_insert_with(|| json!([]));
+    object
+        .entry("intendedForQualification")
+        .or_insert_with(|| json!(false));
+    object
+        .entry("isLongDurationTest")
+        .or_insert_with(|| json!(false));
+    object
+        .entry("protocol")
+        .or_insert_with(|| json!(RESOLVED_PROTOCOL));
+    if object.get("rootGroup").and_then(Value::as_str) == Some("") {
+        // The materialized default root group is taken from the service here because its
+        // document SHAPE is the emulator's own choice and may be replaced; what the contract
+        // fixes — that a qualification suite reads back a non-empty root group, stable across
+        // reads and accepted back on an update — is pinned independently in
+        // `tests/all/stored_configuration_and_tag_responses.rs`.
+        object.insert(
+            "rootGroup".to_string(),
+            json!(iotdeviceadvisor::state::DEFAULT_QUALIFICATION_ROOT_GROUP),
+        );
+    }
+    expected
+}
+
 /// A suite run configuration for `thing`, with the optional members the table varies.
 pub(crate) fn run_configuration(
     thing: &str,
@@ -370,7 +411,7 @@ pub(crate) fn run_configuration(
 }
 
 /// What a create mints is what every later read answers with, for every row of the table:
-/// the id, the ARN, the first version label and the configuration VERBATIM.
+/// the id, the ARN, the first version label and the configuration as the service stored it.
 #[tokio::test]
 async fn a_created_definition_is_read_back_verbatim() {
     let emulator = Emulator::new();
@@ -432,7 +473,7 @@ async fn a_created_definition_is_read_back_verbatim() {
         );
         assert_eq!(
             fetched.member("suiteDefinitionConfiguration"),
-            &configuration,
+            &resolved(&configuration),
             "case {case:?}: GetSuiteDefinition must answer with the stored configuration"
         );
         assert_eq!(
@@ -472,7 +513,7 @@ async fn a_created_definition_is_read_back_verbatim() {
             .await;
         assert_eq!(
             by_version.member("suiteDefinitionConfiguration"),
-            &configuration,
+            &resolved(&configuration),
             "case {case:?}: reading version v1 must answer the stored configuration"
         );
         let missing_version = emulator
@@ -1460,12 +1501,9 @@ async fn tags_round_trip_through_the_reads() {
         let fetched = emulator
             .call("GET", &format!("/suiteDefinitions/{id}"), "us-east-1", None)
             .await;
-        let expected = if tags.as_object().is_some_and(serde_json::Map::is_empty) {
-            // No tags recorded means an ABSENT member, not an empty map.
-            Value::Null
-        } else {
-            tags.clone()
-        };
+        // `TagMap` is `len 0..50`, so an untagged resource reads as an EMPTY map, never as
+        // an absent member.
+        let expected = tags.clone();
         assert_eq!(
             fetched.member("tags"),
             &expected,

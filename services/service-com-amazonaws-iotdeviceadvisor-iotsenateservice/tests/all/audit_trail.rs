@@ -37,6 +37,11 @@ const UNKNOWN_ID: &str = "11111111-2222-3333-4444-555555555555";
 /// on.
 const MAX_TAGS: usize = 50;
 
+/// The status a successful tag mutation answers with: 204 No Content, as AWS answers an
+/// empty-output tag mutation — written out here rather than read from the service, so a
+/// regression to the protocol default fails these rows.
+const TAG_MUTATION_STATUS: u16 = 204;
+
 /// One row of the table below: a call, the answer it must get, and the record it must
 /// leave — `(case, method, path, body, status, error code, operation, the resource the
 /// record names, the outcome it carries)`.
@@ -425,7 +430,7 @@ async fn every_mutating_call_leaves_one_audit_record() {
             "POST",
             tags_uri(&definition),
             Some(json!({ "tags": { "owner": "audit" } })),
-            200,
+            TAG_MUTATION_STATUS,
             None,
             "TagResource",
             definition.clone(),
@@ -436,7 +441,7 @@ async fn every_mutating_call_leaves_one_audit_record() {
             "DELETE",
             format!("{}?tagKeys=owner&tagKeys=absent", tags_uri(&definition)),
             None,
-            200,
+            TAG_MUTATION_STATUS,
             None,
             "UntagResource",
             definition.clone(),
@@ -565,8 +570,9 @@ async fn every_mutating_call_leaves_one_audit_record() {
     )
     .await;
     assert_eq!(
-        answer.status, 200,
-        "case \"a merge up to the per-resource tag limit\": expected HTTP 200, got {} {}",
+        answer.status, TAG_MUTATION_STATUS,
+        "case \"a merge up to the per-resource tag limit\": expected HTTP \
+         {TAG_MUTATION_STATUS}, got {} {}",
         answer.status, answer.body
     );
     assert_record(

@@ -128,6 +128,58 @@ pub const MAX_PARALLEL_RUNS_PER_DEFINITION: usize = 10;
 /// tagging call past the per-resource tag limit.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The HTTP status a successful TAG MUTATION answers with.
+///
+/// Both tag mutations leave their success code defaulted in the model (`@http` on
+/// `TagResource` and on `UntagResource` carries no `code:`), so Smithy's 200 default is
+/// not a statement about this service: the success status is a behavioural fact, and the
+/// recorded AWS responses are what state it. A tag mutation writes only the tag set of the
+/// resource its `resourceArn` names and reports nothing back about it — `TagResourceResponse`
+/// and `UntagResourceResponse` declare no members — so there is no entity for a caller to
+/// parse and the answer is 204 No Content. A 200 there promises a body the response does not
+/// carry, and every client path gated on the no-content status (conditional body parsing,
+/// caches and proxies that key on it) takes the wrong branch. The two operations share the
+/// `/tags/{resourceArn}` route and this one status, so the rule lives here rather than twice
+/// in the handlers.
+///
+/// This does NOT extend to every operation whose output declares no members: `DeleteSuiteDefinition`
+/// reports nothing either and keeps the defaulted 200 the recordings answer it with.
+pub const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
+
+/// The `protocol` a stored suite definition configuration carries when the caller named none.
+///
+/// `SuiteDefinitionConfiguration$protocol` is an optional `Protocol`
+/// (`smithy_query(query="shape",shape="Protocol")`: `MqttV3_1_1`, `MqttV5`,
+/// `MqttV3_1_1_OverWebSocket`, `MqttV5_OverWebSocket`), documented as "the MQTT protocol
+/// that is configured in the suite definition" — a suite always runs over ONE of them, so
+/// the service resolves the member when it stores the configuration rather than leaving the
+/// suite with no protocol. The resolved value is plain MQTT 3.1.1, which is what the recorded
+/// reads of a definition stored without a protocol answer with.
+pub const DEFAULT_PROTOCOL: &str = "MqttV3_1_1";
+
+/// The `rootGroup` a QUALIFICATION suite that named none is stored with.
+///
+/// The model's prose for `SuiteDefinitionConfiguration$rootGroup`: "If `rootGroup` is empty,
+/// and `intendedForQualification` is set to true, all the qualification tests are included,
+/// and the configuration is default." The empty string is therefore an INSTRUCTION to the
+/// service and not the value it keeps: it stores the default qualification root group, so
+/// every later read answers a non-empty one.
+///
+/// A Device Advisor root group is a document naming the test groups a run executes. This
+/// emulator attaches no device test runner ([`NO_TEST_RUNNER_REASON`]) and so holds no
+/// test-case catalog to enumerate; what it materialises is the single default qualification
+/// group with the default configuration the prose names, in that document shape — non-empty,
+/// and well inside `RootGroup`'s `len 0..2048`.
+///
+/// Its internal structure is EMULATOR-CHOSEN: what the service contract fixes is that a
+/// qualification suite stores a non-empty root group and reads it back unchanged, not the
+/// document's shape, so a later change that gains a real test-group catalog can replace this
+/// value without breaking anything a caller may rely on.
+pub const DEFAULT_QUALIFICATION_ROOT_GROUP: &str = concat!(
+    r#"{"configuration":{},"tests":[{"name":"Device Advisor qualification tests","#,
+    r#""configuration":{},"test":{"id":"qualification"}}]}"#
+);
+
 /// One of this service's two taggable resources, as a `resourceArn` names it.
 ///
 /// `ListTagsForResource`/`TagResource`/`UntagResource` all document the same thing about
@@ -257,11 +309,14 @@ impl SuiteDefinition {
     /// surviving label once retention has dropped an older one. BOTH timestamps move to the
     /// write instant: for the one live record `createdAt` behaves as a last-write stamp,
     /// just as `lastModifiedAt` does.
+    /// The configuration is stored RESOLVED ([`resolved_configuration`]), exactly as a
+    /// create stores the one it was given.
     pub fn record_version(
         &mut self,
         configuration: SuiteDefinitionConfiguration,
         now: SystemTime,
     ) -> String {
+        let configuration = resolved_configuration(configuration);
         let highest = self
             .versions
             .iter()
@@ -561,15 +616,20 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
         removed
     }
 
-    /// The tags recorded for `arn`, or `None` when it carries none — an absent `tags`
-    /// member rather than an empty map.
-    pub fn tags_of(&self, arn: &str) -> Option<std::collections::HashMap<String, String>> {
-        let tags = self.tags.get(arn)?;
-        (!tags.is_empty()).then(|| {
-            tags.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<std::collections::HashMap<_, _>>()
-        })
+    /// The tags recorded for `arn` — an EMPTY MAP when it carries none.
+    ///
+    /// `TagMap` is `len 0..50`, so "no tags" is a value the member can hold: every read
+    /// that reports a resource's tags serves that empty map rather than dropping the
+    /// member, so a caller never has to tell `null` from `{}` to learn a resource is
+    /// untagged. Whether a row exists at all is an artefact of how this store prunes empty
+    /// rows ([`remove_tags`](Self::remove_tags)), and is not observable.
+    pub fn tags_of(&self, arn: &str) -> std::collections::HashMap<String, String> {
+        self.tags
+            .get(arn)
+            .into_iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// True when this store holds the resource `resource` names, UNDER THE ARN it was
@@ -810,6 +870,47 @@ pub fn page_request(
 pub fn root_group_violation(configuration: &SuiteDefinitionConfiguration) -> Option<String> {
     (configuration.root_group.is_empty() && configuration.intended_for_qualification != Some(true))
         .then(|| EMPTY_ROOT_GROUP_MESSAGE.to_string())
+}
+
+/// `configuration` as the service STORES it: every optional member resolved to the value
+/// the suite will actually run with.
+///
+/// A suite definition read answers the stored configuration, and the store holds a
+/// RESOLVED one: a caller that named no device list, no long-duration flag, no
+/// qualification flag and no protocol has not left those undecided — the suite runs against
+/// no devices, as a short-duration, non-qualification suite, over the default MQTT protocol
+/// ([`DEFAULT_PROTOCOL`]) — and a qualification suite that named an empty `rootGroup` has
+/// asked for the default qualification root group ([`DEFAULT_QUALIFICATION_ROOT_GROUP`]),
+/// which is what gets stored. So a read echoes resolved values rather than the caller's
+/// omissions.
+///
+/// Idempotent, and it never overrides a value the caller did send. The required members
+/// (`suiteDefinitionName`, `devicePermissionRoleArn`, and a non-empty `rootGroup`) are the
+/// caller's and are left alone; the prose rules on the shape are checked BEFORE this
+/// ([`definition_configuration_violation`]), so an empty `rootGroup` that reaches here
+/// belongs to a qualification suite.
+///
+/// The two optional booleans are resolved alike because they are the same kind of member on
+/// the same shape — an absent one has always behaved as `false` everywhere in this crate
+/// (`intendedForQualification` decides whether a run has a qualification report and whether
+/// an empty `rootGroup` is legal, and both read `Some(true)` only), so resolving it changes
+/// no decision, only what a read reports.
+pub fn resolved_configuration(
+    mut configuration: SuiteDefinitionConfiguration,
+) -> SuiteDefinitionConfiguration {
+    configuration.devices = Some(configuration.devices.unwrap_or_default());
+    configuration.intended_for_qualification =
+        Some(configuration.intended_for_qualification.unwrap_or(false));
+    configuration.is_long_duration_test = Some(configuration.is_long_duration_test.unwrap_or(false));
+    configuration.protocol = Some(
+        configuration
+            .protocol
+            .unwrap_or_else(|| DEFAULT_PROTOCOL.to_string()),
+    );
+    if configuration.root_group.is_empty() {
+        configuration.root_group = DEFAULT_QUALIFICATION_ROOT_GROUP.to_string();
+    }
+    configuration
 }
 
 /// The version string for the `n`-th configuration a definition holds (1-based).

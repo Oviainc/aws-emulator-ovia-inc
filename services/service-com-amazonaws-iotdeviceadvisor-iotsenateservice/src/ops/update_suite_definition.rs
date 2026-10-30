@@ -3,12 +3,14 @@
 //! @op UpdateSuiteDefinition
 //!
 //! Makes the given configuration the suite definition's live one under its NEXT version
-//! label in [`crate::state`] and advances `latestVersion` to it. A definition holds exactly
+//! label in [`crate::state`] and advances `latestVersion` to it. The configuration is stored
+//! RESOLVED, as a create stores it. A definition holds exactly
 //! one live configuration, so an earlier version stays READABLE (it is still a label the
 //! definition handed out) but answers that live configuration, not the content it was
 //! recorded with. For this one live record both timestamps are last-write stamps: this call
 //! moves `createdAt` and `lastUpdatedAt` to the update instant. An id the store does not
-//! hold is refused as not found.
+//! hold is refused as not found. The reply carries the id, the name, the new version label
+//! and both stamps — and no `suiteDefinitionArn`, which this operation does not serialize.
 //!
 //! ## Shape of an operation
 //!
@@ -232,7 +234,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         trail.ended("updated");
         Ok(UpdateSuiteDefinitionOutput {
             suite_definition_id: Some(stored.id.clone()),
-            suite_definition_arn: Some(stored.arn.clone()),
+            // Every output member of this operation is optional, and Device Advisor
+            // serialises this reply WITHOUT the ARN: an update identifies the definition it
+            // wrote by id, name and the version label it just handed out, and leaves the ARN
+            // to the operations that report it — `GetSuiteDefinition` and the create that
+            // minted it. A client diffing an update reply against AWS's must not find a
+            // member AWS never sends.
+            suite_definition_arn: None,
             suite_definition_name: Some(stored.name().to_string()),
             suite_definition_version: Some(stored.latest_version.clone()),
             created_at: Some(stored.created_at.into()),

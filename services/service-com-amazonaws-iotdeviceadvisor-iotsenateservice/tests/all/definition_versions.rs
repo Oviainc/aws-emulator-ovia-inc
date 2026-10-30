@@ -17,7 +17,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
 
-use crate::suite_lifecycle::{definition_rows, thing_arn, Answer, Emulator, ROLE_ARN};
+use crate::suite_lifecycle::{definition_rows, resolved, thing_arn, Answer, Emulator, ROLE_ARN};
 
 /// `UpdateSuiteDefinition` is `PATCH /suiteDefinitions/{suiteDefinitionId}`.
 async fn update_definition(emulator: &Emulator, id: &str, configuration: &Value) -> Answer {
@@ -88,10 +88,11 @@ async fn updating_advances_the_version_and_every_label_serves_the_live_configura
             "case {case:?}: an update must keep the definition's id, got {}",
             updated.body
         );
-        assert_eq!(
-            updated.string("suiteDefinitionArn"),
-            arn,
-            "case {case:?}: an update must keep the definition's ARN, got {}",
+        // The update reply identifies the definition by id, name, version and stamps; the
+        // ARN is a member this operation does not serialize.
+        assert!(
+            updated.member("suiteDefinitionArn").is_null(),
+            "case {case:?}: an update reply must carry no suiteDefinitionArn, got {}",
             updated.body
         );
         assert_eq!(
@@ -137,9 +138,16 @@ async fn updating_advances_the_version_and_every_label_serves_the_live_configura
             "case {case:?}: latestVersion must be the version just recorded, got {}",
             latest.body
         );
+        // The ARN the create minted is what the READ reports, update after update.
+        assert_eq!(
+            latest.string("suiteDefinitionArn"),
+            arn,
+            "case {case:?}: a read must report the definition's ARN unchanged, got {}",
+            latest.body
+        );
         assert_eq!(
             latest.member("suiteDefinitionConfiguration"),
-            configuration,
+            &resolved(configuration),
             "case {case:?}: an unqualified read must answer the configuration just recorded, \
              got {}",
             latest.body
@@ -168,7 +176,7 @@ async fn updating_advances_the_version_and_every_label_serves_the_live_configura
             );
             assert_eq!(
                 historic.member("suiteDefinitionConfiguration"),
-                configuration,
+                &resolved(configuration),
                 "case {case:?}: version {version} must answer the CURRENT configuration, got {}",
                 historic.body
             );
@@ -241,7 +249,7 @@ async fn an_update_touches_only_the_named_definition() {
     );
     assert_eq!(
         untouched.member("suiteDefinitionConfiguration"),
-        &configuration("second"),
+        &resolved(&configuration("second")),
         "case {:?}: a definition nobody updated must keep its configuration, got {}",
         "two definitions",
         untouched.body
@@ -403,7 +411,7 @@ async fn version_history_is_bounded_and_counts_by_ordinal() {
     );
     assert_eq!(
         latest.member("suiteDefinitionConfiguration"),
-        &configuration(keep + 1),
+        &resolved(&configuration(keep + 1)),
         "case {:?}: the latest read must answer the last configuration recorded, got {}",
         "bounded history",
         latest.body
@@ -431,7 +439,7 @@ async fn version_history_is_bounded_and_counts_by_ordinal() {
         );
         assert_eq!(
             historic.member("suiteDefinitionConfiguration"),
-            &configuration(keep + 1),
+            &resolved(&configuration(keep + 1)),
             "case {:?}: version v{n} must answer the CURRENT configuration, got {}",
             "bounded history",
             historic.body

@@ -170,12 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // This operation's whole answer IS the tag set, so a resource carrying no tags
-        // answers an EMPTY map rather than omitting the member — unlike a resource read
-        // (`GetSuiteDefinition`, `GetSuiteRun`), where `tags` is one attribute among many
-        // and is left out when the resource has none.
+        // A resource carrying no tags answers an EMPTY map rather than omitting the member,
+        // exactly as the resource reads (`GetSuiteDefinition`, `GetSuiteRun`) report the
+        // same tag set: one projection of one tag row, so the two cannot disagree.
         Ok(ListTagsForResourceOutput {
-            tags: Some(store.tags_of(&input.resource_arn).unwrap_or_default()),
+            tags: Some(store.tags_of(&input.resource_arn)),
         })
     }
 }

@@ -199,7 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             suite_definition_configuration: Some(configuration),
             created_at: Some(definition.created_at.into()),
             last_modified_at: Some(definition.last_modified_at.into()),
-            tags: store.tags_of(&definition.arn),
+            // `TagMap` is `len 0..50`: an untagged definition reports an EMPTY MAP rather
+            // than omitting the member, so a caller never has to tell `null` from `{}`.
+            tags: Some(store.tags_of(&definition.arn)),
         })
     }
 }

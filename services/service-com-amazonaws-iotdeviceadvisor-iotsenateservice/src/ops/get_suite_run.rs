@@ -186,7 +186,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             end_time: run.end_at.map(Into::into),
             status: Some(run.status.clone()),
             error_reason: run.error_reason.clone(),
-            tags: store.tags_of(&run.arn),
+            // `TagMap` is `len 0..50`: an untagged run reports an EMPTY MAP rather than
+            // omitting the member, so a caller never has to tell `null` from `{}`.
+            tags: Some(store.tags_of(&run.arn)),
         })
     }
 }

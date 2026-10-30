@@ -127,7 +127,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// A successful tagging carries no entity: see `crate::state::TAG_MUTATION_SUCCESS_STATUS`.
+    const SUCCESS_STATUS: u16 = crate::state::TAG_MUTATION_SUCCESS_STATUS;
 
     async fn handle(
         &self,

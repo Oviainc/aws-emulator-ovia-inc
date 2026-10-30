@@ -19,7 +19,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
 
-use super::suite_lifecycle::{thing_arn, Emulator, ROLE_ARN};
+use super::suite_lifecycle::{resolved, thing_arn, Emulator, ROLE_ARN};
 
 /// The region every case below signs for.
 const REGION: &str = "us-east-1";
@@ -376,7 +376,7 @@ async fn a_definition_configuration_with_a_bad_device_or_role_arn_is_refused() {
             .await;
         assert_eq!(
             read.member("suiteDefinitionConfiguration"),
-            &live,
+            &resolved(&live),
             "case {case:?}: a refused update must leave the live configuration alone, got {}",
             read.body
         );
@@ -433,7 +433,7 @@ async fn a_definition_device_may_be_named_by_any_of_its_arns() {
             .await;
         assert_eq!(
             read.member("suiteDefinitionConfiguration"),
-            &configuration,
+            &resolved(&configuration),
             "case {case:?}: GetSuiteDefinition must answer with the stored configuration, got {}",
             read.body
         );

@@ -48,6 +48,11 @@ const MAX_TAGS: usize = 50;
 const MAX_TAG_KEY_LEN: usize = 128;
 const MAX_TAG_VALUE_LEN: usize = 256;
 
+/// The status a successful tag mutation answers with: 204 No Content, as AWS answers an
+/// empty-output tag mutation — written out here rather than read from the service, so a
+/// regression to the protocol default fails these cases.
+const TAG_MUTATION_STATUS: u16 = 204;
+
 /// Percent-encode one value for a single URI path segment: `/` and `:` would otherwise
 /// split the segment or the authority, exactly as an SDK encodes an `@httpLabel`.
 fn percent_encode(value: &str) -> String {
@@ -336,18 +341,13 @@ async fn listing_answers_the_tags_the_store_holds_for_either_resource_kind() {
         );
 
         // The resource reads and the tag read project ONE tag row, so they cannot
-        // disagree: `GetSuiteDefinition` omits `tags` only where there are none.
+        // disagree — and an untagged resource reads as an EMPTY map on both.
         let read = emulator
             .call("GET", &format!("/suiteDefinitions/{definition_id}"), None)
             .await;
-        let expected_on_read = if tags.as_object().is_some_and(serde_json::Map::is_empty) {
-            Value::Null
-        } else {
-            tags.clone()
-        };
         assert_eq!(
             read.member("tags"),
-            &expected_on_read,
+            &tags,
             "case {case:?}: GetSuiteDefinition and ListTagsForResource must agree, got {}",
             read.body
         );
@@ -413,9 +413,17 @@ async fn tagging_merges_into_the_stored_tags_and_round_trips_through_the_read() 
 
         let tagged = emulator.tag_resource(&definition_arn, &added).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {case:?}: expected HTTP 200 from TagResource, got {} {}",
+            tagged.status, TAG_MUTATION_STATUS,
+            "case {case:?}: expected HTTP {TAG_MUTATION_STATUS} from TagResource, got {} {}",
             tagged.status, tagged.body
+        );
+        assert!(
+            tagged
+                .body
+                .as_object()
+                .is_none_or(serde_json::Map::is_empty),
+            "case {case:?}: a no-content answer reports nothing, got {}",
+            tagged.body
         );
 
         let listed = emulator.list_tags(&definition_arn).await;
@@ -431,8 +439,8 @@ async fn tagging_merges_into_the_stored_tags_and_round_trips_through_the_read() 
         let run_arn = emulator.start_run(case, &definition_id, &initial).await;
         let tagged_run = emulator.tag_resource(&run_arn, &added).await;
         assert_eq!(
-            tagged_run.status, 200,
-            "case {case:?}: expected HTTP 200 tagging a suite run, got {} {}",
+            tagged_run.status, TAG_MUTATION_STATUS,
+            "case {case:?}: expected HTTP {TAG_MUTATION_STATUS} tagging a suite run, got {} {}",
             tagged_run.status, tagged_run.body
         );
         let listed_run = emulator.list_tags(&run_arn).await;
@@ -464,7 +472,7 @@ async fn tagging_past_the_tag_limit_is_refused_and_changes_nothing() {
         (
             "overwriting a key at the limit does not grow the resource",
             json!({ "key-0": "overwritten" }),
-            200,
+            TAG_MUTATION_STATUS,
         ),
     ];
 
