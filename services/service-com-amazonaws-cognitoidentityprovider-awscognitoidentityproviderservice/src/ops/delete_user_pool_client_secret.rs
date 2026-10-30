@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // credential that authenticates it: the delete is refused while the named
         // secret is the only one the client holds, whatever its id is.
         if client.client_secrets.len() == 1 {
-            return Err(last_remaining_secret(&input.client_id));
+            return Err(last_remaining_secret());
         }
 
         // Every other secret stays stored, in the order it was created, so the
@@ -215,12 +215,12 @@ fn client_secret_not_found() -> DeleteUserPoolClientSecretError {
     .into()
 }
 
-/// This operation's refusal to take an app client's only secret away.
-fn last_remaining_secret(client_id: &str) -> DeleteUserPoolClientSecretError {
+/// This operation's refusal to take an app client's only secret away, worded as
+/// [`crate::state::LAST_CLIENT_SECRET_MESSAGE`] — the one sentence the
+/// precondition answers, quoting neither the app client nor the secret id.
+fn last_remaining_secret() -> DeleteUserPoolClientSecretError {
     DeleteUserPoolClientSecretErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(format!(
-            "Cannot delete the last remaining client secret of user pool client {client_id}."
-        )),
+        message: Some(crate::state::LAST_CLIENT_SECRET_MESSAGE.to_string()),
         reason_code: None,
     })
     .into()

@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let client = pool
             .clients
             .get(&input.client_id)
-            .ok_or_else(|| client_not_found(&input.client_id))?;
+            .ok_or_else(client_not_found)?;
         Ok(DescribeUserPoolClientOutput {
             user_pool_client: Some(client.to_user_pool_client_type()),
         })
@@ -184,10 +184,13 @@ fn user_pool_not_found(user_pool_id: &str) -> DescribeUserPoolClientError {
     .into()
 }
 
-/// This operation's `ResourceNotFoundException` for an absent app client.
-fn client_not_found(client_id: &str) -> DescribeUserPoolClientError {
+/// This operation's `ResourceNotFoundException` for a `ClientId` the named pool
+/// holds no app client for, worded as
+/// [`crate::state::APP_CLIENT_NOT_FOUND_MESSAGE`] — the one sentence the
+/// app-client lookup answers whatever id was asked for, quoting none of it.
+fn client_not_found() -> DescribeUserPoolClientError {
     DescribeUserPoolClientErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("User pool client {client_id} does not exist.")),
+        message: Some(crate::state::APP_CLIENT_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

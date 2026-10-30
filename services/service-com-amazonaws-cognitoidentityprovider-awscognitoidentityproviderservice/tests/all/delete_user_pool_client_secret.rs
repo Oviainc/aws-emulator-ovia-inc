@@ -86,6 +86,11 @@ const UNKNOWN_SECRET_ID: &str = "nosuchappclient0000--1700000000000";
 /// period.
 const SECRET_NOT_FOUND_MESSAGE: &str = "Client secret does not exist";
 
+/// The one sentence the refusal to take an app client's only secret away carries:
+/// fixed text, quoting neither the app client, the pool nor the `ClientSecretId`
+/// the request named.
+const LAST_SECRET_MESSAGE: &str = "Cannot delete the only client secret.";
+
 /// One emulator with just this service mounted.
 fn router() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -558,14 +563,16 @@ async fn a_deleted_client_secret_is_dropped_and_every_other_one_stays_active() {
             "InvalidParameterException",
         )
         .await;
-        let expected = format!(
-            "Cannot delete the last remaining client secret of user pool client {}.",
-            fixture.client_id
-        );
         assert_eq!(
             error_message(&last),
-            expected,
-            "case {case:?}: expected {expected:?}, got {:?}",
+            LAST_SECRET_MESSAGE,
+            "case {case:?}: expected {LAST_SECRET_MESSAGE:?}, got {:?}",
+            error_message(&last)
+        );
+        assert!(
+            !error_message(&last).contains(fixture.client_id.as_str()),
+            "case {case:?}: the refusal must not quote the app client the request named, \
+             got {:?}",
             error_message(&last)
         );
         assert_eq!(
@@ -650,14 +657,17 @@ async fn the_last_remaining_client_secret_of_an_app_client_is_never_deleted() {
             "InvalidParameterException",
         )
         .await;
-        let expected = format!(
-            "Cannot delete the last remaining client secret of user pool client {}.",
-            fixture.client_id
-        );
         assert_eq!(
             error_message(&payload),
-            expected,
-            "case {case:?}: expected {expected:?}, got {:?}",
+            LAST_SECRET_MESSAGE,
+            "case {case:?}: expected {LAST_SECRET_MESSAGE:?}, got {:?}",
+            error_message(&payload)
+        );
+        assert!(
+            !error_message(&payload).contains(&ids[0]) &&
+                !error_message(&payload).contains(fixture.client_id.as_str()),
+            "case {case:?}: the refusal must quote neither the secret id nor the app client, \
+             got {:?}",
             error_message(&payload)
         );
 

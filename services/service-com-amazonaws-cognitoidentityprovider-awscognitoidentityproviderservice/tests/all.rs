@@ -41,6 +41,8 @@ mod admin_user_global_sign_out;
 mod admin_user_pool_lifecycle;
 #[path = "all/app_client_and_pool_configuration.rs"]
 mod app_client_and_pool_configuration;
+#[path = "all/app_client_refusal_wording.rs"]
+mod app_client_refusal_wording;
 #[path = "all/auth_flow_not_enabled.rs"]
 mod auth_flow_not_enabled;
 #[path = "all/authentication_success_shape.rs"]

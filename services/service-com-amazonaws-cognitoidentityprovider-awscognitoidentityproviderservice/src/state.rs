@@ -3685,6 +3685,19 @@ pub const MAX_CLIENT_SECRETS_PER_CLIENT: usize = 2;
 /// identifier back to it.
 pub const CLIENT_SECRET_NOT_FOUND_MESSAGE: &str = "Client secret does not exist";
 
+/// The message `DeleteUserPoolClientSecret`'s `InvalidParameterException`
+/// carries when the secret the request names is the only one the app client
+/// still holds: "you cannot delete the last remaining secret for an app client"
+/// (that operation in this service's model), so an app client never loses the
+/// credential that authenticates it.
+///
+/// Like [`CLIENT_SECRET_NOT_FOUND_MESSAGE`] it is one fixed sentence: it reports
+/// the precondition that failed and quotes neither the `ClientSecretId` asked
+/// for, the app client nor the pool, so rotation code that branches on this
+/// refusal sees the same text for every client, and no `@sensitive` `ClientId`
+/// reaches the error string.
+pub const LAST_CLIENT_SECRET_MESSAGE: &str = "Cannot delete the only client secret.";
+
 /// One active client secret of an app client: the credential a confidential app
 /// client authenticates itself with, beside the id and creation time a listing
 /// reports it by.
@@ -3736,6 +3749,25 @@ impl ClientSecret {
         }
     }
 }
+
+/// The message a `ResourceNotFoundException` carries when the app client
+/// `DescribeUserPoolClient` reads or `UpdateUserPoolClient` writes is not one
+/// the named pool holds — a `ClientId` no create minted, one an earlier
+/// `DeleteUserPoolClient` took away, or one that belongs to another pool.
+///
+/// Amazon Cognito answers the same sentence for every `ClientId`: the lookup
+/// reports that it resolved no app client and quotes neither the id nor the
+/// pool, exactly as [`USER_NOT_FOUND_MESSAGE`] and [`GROUP_NOT_FOUND_MESSAGE`]
+/// report their own unresolved lookups. A message built from the request would
+/// word the refusal differently per app client, so nothing could group these
+/// refusals into one not-found class by text — and it would put a `@sensitive`
+/// `ClientId` (`ClientIdType` in this service's model) into an error string.
+///
+/// Every other operation words its own app-client lookup: the ones that resolve
+/// a client on the way to ANOTHER resource — its terms documents, its branding,
+/// its UI customization, its secrets — and `DeleteUserPoolClient`, which still
+/// names the `ClientId` it was asked to remove.
+pub const APP_CLIENT_NOT_FOUND_MESSAGE: &str = "User pool client does not exist.";
 
 /// One stored app client of a user pool.
 #[derive(Debug, Clone)]
