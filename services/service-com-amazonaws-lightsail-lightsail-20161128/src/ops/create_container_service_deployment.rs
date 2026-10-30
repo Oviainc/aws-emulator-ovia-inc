@@ -228,8 +228,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state: crate::state::CONTAINER_SERVICE_RUNNING,
                 activates_next_deployment: true,
             });
+            let location = service.location.clone();
+            let view = service.view(endpoint.as_deref());
+            // Creating a deployment is a mutating call, so it appends an entry
+            // to the account's operation log like every other one — which is
+            // what `GetOperations` and `GetOperationsForResource` report it by.
+            // The deployment is still being launched as this call returns, so
+            // the entry is NOT terminal: the clock settles it when the
+            // deployment becomes active.
+            store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_CONTAINER_SERVICE_DEPLOYMENT,
+                crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+                &service_name,
+                &location,
+                Some(now.saturating_add(crate::state::STATE_TRANSITION_MILLIS)),
+            );
             Ok(CreateContainerServiceDeploymentOutput {
-                container_service: Some(service.view(endpoint.as_deref())),
+                container_service: Some(view),
             })
         })
         .ok_or_else(unavailable)?

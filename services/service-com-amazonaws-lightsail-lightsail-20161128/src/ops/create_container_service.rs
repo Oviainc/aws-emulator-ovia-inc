@@ -345,8 +345,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 images: Vec::new(),
                 owed,
             };
+            // The instant the clock owes this service its terminal status: the
+            // last phase of the walk queued above, which is what the log entry
+            // this call writes stays `Started` until.
+            let settles_at_ms = service.owed.back().map(|phase| phase.at_ms);
             let view = service.view(endpoint.as_deref());
             store.insert_container_service(service);
+            // Creating a container service is a mutating call, so it appends an
+            // entry to the account's operation log like every other one — which
+            // is what `GetOperations` and `GetOperationsForResource` report it
+            // by. The service is still being created as this call returns, so
+            // the entry is NOT terminal: the clock settles it when the service
+            // reaches the status it is heading for.
+            store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_CONTAINER_SERVICE,
+                crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+                &input.service_name,
+                &location,
+                settles_at_ms,
+            );
             Ok(CreateContainerServiceOutput {
                 container_service: Some(view),
             })

@@ -155,6 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what that name is resolved in — the same way `CreateContainerService`
         // stores it and `GetContainerServices` reports it.
         let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
 
         // `serviceName` is a modelled `@required` member carrying the modelled
         // length and pattern, so the centralized walk refused anything outside
@@ -198,9 +199,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // for a service that inherits nothing from this one. The removal IS
             // the lookup once more, so two deletes of one service racing each
             // other cannot both report having removed it.
-            store
+            let removed = store
                 .remove_container_service(&region, &input.service_name)
                 .ok_or_else(|| not_found(&input.service_name))?;
+            // Deleting a container service is a mutating call, so it appends an
+            // entry to the account's operation log like every other one. The log
+            // is append-only, so the entry outlives the record it names and
+            // `GetOperationsForResource` still reports it under the deleted
+            // service's name. The record is gone as this call returns, which is
+            // why the entry is answered terminal.
+            store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_CONTAINER_SERVICE,
+                crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+                &input.service_name,
+                &removed.location,
+                None,
+            );
             // The record is gone as this call returns, so the modelled result
             // carries nothing to report: `DeleteContainerServiceResult` declares
             // no member at all, which is what this operation's 204 answers.

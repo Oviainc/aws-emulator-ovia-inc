@@ -8561,6 +8561,29 @@ pub const CONTAINER_SERVICE_UPDATING: &str = "UPDATING";
 /// See [`CONTAINER_SERVICE_PENDING`].
 pub const CONTAINER_SERVICE_DISABLED: &str = "DISABLED";
 
+/// The `operationType` the log entry of a `CreateContainerService` call carries,
+/// the modelled `OperationType` enum's own `CreateContainerService` member.
+///
+/// Every mutating container-service call writes the account's operation log the
+/// same way the rest of this service's mutating calls do (see
+/// [`ComAmazonawsLightsailLightsail20161128State::start_operation`]), so `GetOperations` and
+/// `GetOperationsForResource` report it. The entry names the modelled
+/// `ResourceType` enum's [`RESOURCE_TYPE_CONTAINER_SERVICE`] member and the
+/// service's own name — including for the image-scoped calls, whose resource the
+/// enum has no member for.
+pub const OPERATION_TYPE_CREATE_CONTAINER_SERVICE: &str = "CreateContainerService";
+/// See [`OPERATION_TYPE_CREATE_CONTAINER_SERVICE`].
+pub const OPERATION_TYPE_UPDATE_CONTAINER_SERVICE: &str = "UpdateContainerService";
+/// See [`OPERATION_TYPE_CREATE_CONTAINER_SERVICE`].
+pub const OPERATION_TYPE_DELETE_CONTAINER_SERVICE: &str = "DeleteContainerService";
+/// See [`OPERATION_TYPE_CREATE_CONTAINER_SERVICE`].
+pub const OPERATION_TYPE_CREATE_CONTAINER_SERVICE_DEPLOYMENT: &str =
+    "CreateContainerServiceDeployment";
+/// See [`OPERATION_TYPE_CREATE_CONTAINER_SERVICE`].
+pub const OPERATION_TYPE_REGISTER_CONTAINER_IMAGE: &str = "RegisterContainerImage";
+/// See [`OPERATION_TYPE_CREATE_CONTAINER_SERVICE`].
+pub const OPERATION_TYPE_DELETE_CONTAINER_IMAGE: &str = "DeleteContainerImage";
+
 /// `ContainerServiceDeploymentState` values this slice uses, from the modelled
 /// enum and the `ContainerServiceDeployment$state` documentation: `ACTIVATING`
 /// while the deployment is being created, `ACTIVE` once it is running (at most

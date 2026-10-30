@@ -156,6 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one region of the account, so the region the request is signed for is
         // what names the service the image is deleted from.
         let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
 
         // `serviceName` and `image` are modelled `@required` and the name carries
         // the modelled length and pattern, so the centralized walk refused
@@ -180,6 +181,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 service.images.remove(held);
             }
+            let location = service.location.clone();
+            // Deleting an image is a mutating call, so it appends an entry to
+            // the account's operation log like every other one — which is what
+            // `GetOperations` and `GetOperationsForResource` report it by. The
+            // resource that entry names is the container SERVICE:
+            // `Operation$resourceType` targets the modelled `ResourceType` enum,
+            // which has a `ContainerService` member and none for a container
+            // image. The registry no longer holds the name as this call returns,
+            // so the entry is terminal.
+            store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_CONTAINER_IMAGE,
+                crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+                &input.service_name,
+                &location,
+                None,
+            );
             Ok(DeleteContainerImageOutput {})
         })
         .ok_or_else(unavailable)?

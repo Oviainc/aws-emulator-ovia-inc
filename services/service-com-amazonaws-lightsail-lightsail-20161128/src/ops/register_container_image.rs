@@ -211,8 +211,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The service assigns the name: the label the request carried, at
             // the next version that label is at for this service.
             let registered = service.register_image(&input.label, &input.digest, now);
+            let view = registered.view(&input.service_name);
+            let location = service.location.clone();
+            // Registering an image is a mutating call, so it appends an entry to
+            // the account's operation log like every other one — which is what
+            // `GetOperations` and `GetOperationsForResource` report it by. The
+            // resource that entry names is the container SERVICE:
+            // `Operation$resourceType` targets the modelled `ResourceType` enum,
+            // which has a `ContainerService` member and none for a container
+            // image, the same way an access key's entry names its bucket. The
+            // image is registered as this call returns, so the entry is
+            // terminal.
+            store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_REGISTER_CONTAINER_IMAGE,
+                crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+                &input.service_name,
+                &location,
+                None,
+            );
             Ok(RegisterContainerImageOutput {
-                container_image: Some(registered.view(&input.service_name)),
+                container_image: Some(view),
             })
         })
         .ok_or_else(unavailable)?

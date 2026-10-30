@@ -297,7 +297,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 service.is_disabled = disabled;
             }
 
-            if capacity_or_domains_changed || disabled_changed {
+            let changed = capacity_or_domains_changed || disabled_changed;
+            if changed {
                 // Where the service settles once the change is applied: a
                 // disabled one is `DISABLED` ("the container service is
                 // disabled, and its active deployment and containers, if any,
@@ -336,8 +337,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
             }
 
+            // The instant the clock owes THIS call's work its terminal status: a
+            // request that asked for nothing the service was not already
+            // configured with changed nothing, so its work is finished as the
+            // call returns and the entry below is terminal; one that changed
+            // something is settled when the phase it queued above comes due.
+            let settles_at_ms =
+                changed.then(|| now.saturating_add(crate::state::STATE_TRANSITION_MILLIS));
+            let location = service.location.clone();
+            let view = service.view(endpoint.as_deref());
+            // Updating a container service is a mutating call, so it appends an
+            // entry to the account's operation log like every other one — which
+            // is what `GetOperations` and `GetOperationsForResource` report it
+            // by.
+            store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_UPDATE_CONTAINER_SERVICE,
+                crate::state::RESOURCE_TYPE_CONTAINER_SERVICE,
+                &input.service_name,
+                &location,
+                settles_at_ms,
+            );
+
             Ok(UpdateContainerServiceOutput {
-                container_service: Some(service.view(endpoint.as_deref())),
+                container_service: Some(view),
             })
         })
         .ok_or_else(unavailable)?
