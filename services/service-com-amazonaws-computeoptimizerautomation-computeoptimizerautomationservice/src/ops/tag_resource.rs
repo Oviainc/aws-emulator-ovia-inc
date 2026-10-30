@@ -6,9 +6,10 @@
 //! a key the rule does not carry is appended, and a key it already carries
 //! keeps its position and takes the new value, so the stored list holds at most
 //! one entry per key. A `ruleRevision` other than the rule's current one is
-//! refused with `InvalidParameterValueException` (400), as is a tag list
-//! `state::tag_list_violation` refuses — one naming the same key twice, or a key
-//! in the reserved tag namespace — and an addition that
+//! refused with `InvalidParameterValueException` (400), as is a request whose
+//! `tags` names no tag at all (`state::empty_value_list_violation`), as is a tag
+//! list `state::tag_list_violation` refuses — one naming the same key twice, or
+//! a key in the reserved tag namespace — and an addition that
 //! would leave the rule holding more than `state::MAX_TAGS_PER_RESOURCE` tags;
 //! an ARN no rule has is `ResourceNotFoundException` (404). Tagging is not a
 //! rule revision, so the same request may be repeated — the operation is
@@ -177,6 +178,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // `tags` names the whole subject of the addition, so a request carrying
+        // none states nothing to add and is refused rather than answered as
+        // though it had added something. `TagList` carries a `@length(max: 200)`
+        // but no minimum, and `@required` is satisfied by an empty array, so the
+        // boundary admits it and the floor every caller-supplied value list of
+        // this service is held to is applied here
+        // (`crate::state::empty_value_list_violation`). It belongs to THIS
+        // operation's member rather than to the shared list judgement below,
+        // because the create path's `tags` is optional: sending it empty there
+        // states what omitting it states, a rule created with no tags.
+        if let Some(report) = crate::state::empty_value_list_violation("tags", input.tags.len()) {
+            return Err(invalid_parameter(report));
+        }
 
         // The whole judgement of the `tags` list this request carries, made in
         // ONE place for every path that takes tags

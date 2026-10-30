@@ -456,11 +456,8 @@ where
 /// ([`MAX_ACCOUNT_IDS_PER_REQUEST`]), so a request naming none, and one naming
 /// more, is refused rather than acted on for a prefix of the list.
 pub fn account_ids_violation(account_ids: &[String]) -> Option<String> {
-    if account_ids.is_empty() {
-        return Some(constraint_report(
-            "accountIds",
-            "Member must have length greater than or equal to 1",
-        ));
+    if let Some(report) = empty_value_list_violation("accountIds", account_ids.len()) {
+        return Some(report);
     }
     if account_ids.len() > MAX_ACCOUNT_IDS_PER_REQUEST {
         return Some(constraint_report(
@@ -2790,11 +2787,10 @@ fn condition_violation(
             &format!("Member must be a {family} comparison operator for this criterion"),
         ));
     }
-    if value_count == 0 {
-        return Some(constraint_report(
-            &format!("{path}.member.values"),
-            "Member must have length greater than or equal to 1",
-        ));
+    if let Some(report) =
+        empty_value_list_violation(&format!("{path}.member.values"), value_count)
+    {
+        return Some(report);
     }
     if value_count > MAX_VALUES_PER_CONDITION {
         return Some(constraint_report(
@@ -2850,16 +2846,34 @@ pub fn tag_list_violation(tags: &[Tag]) -> Option<String> {
 ///
 /// The list names the action types the rule may execute, so an empty one selects
 /// no action at all and leaves a rule that automates nothing; the model carries
-/// no `@length` on `RecommendedActionTypeList`, so the check lives here. The
-/// preview operations refuse their own (required) list the same way.
+/// no `@length` on `RecommendedActionTypeList`, so the check lives here, as the
+/// service-wide floor every caller-supplied value list is held to
+/// ([`empty_value_list_violation`]). The preview operations refuse their own
+/// (required) list the same way.
 pub fn recommended_action_types_violation(action_types: &[String]) -> Option<String> {
-    if action_types.is_empty() {
-        return Some(constraint_report(
-            "recommendedActionTypes",
-            "Member must have length greater than or equal to 1",
-        ));
-    }
-    None
+    empty_value_list_violation("recommendedActionTypes", action_types.len())
+}
+
+/// Why a value list a request supplies to act THROUGH cannot be acted on, if it
+/// cannot: it carries no value, so it selects nothing.
+///
+/// A list a caller sends to say WHAT a call applies to — the accounts an
+/// association names, the action types a rule executes, the values a criteria
+/// condition compares against, the tags an addition carries, the keys a removal
+/// names — states the call's whole subject, so one carrying nothing states a
+/// call with nothing to do; such a request is refused rather than answered as
+/// though it had acted on something, or acted on a prefix of the list. The ONE
+/// place this service judges that floor, under the member's own name, so every
+/// such list is refused at the same bound and with the same report. None of the
+/// list shapes carries a `@length` minimum
+/// (`smithy_query(query="shape",shape="AccountIdList,RecommendedActionTypeList,TagKeyList,TagList,StringList")`),
+/// so the protocol boundary admits the empty list — `@required` is satisfied by
+/// one — and the check lives here. A list member the model leaves OPTIONAL is
+/// not judged here when it is absent: omitting it leaves the stored value
+/// alone, and sending it empty is judged exactly as sending it is.
+pub fn empty_value_list_violation(member: &str, count: usize) -> Option<String> {
+    (count == 0)
+        .then(|| constraint_report(member, "Member must have length greater than or equal to 1"))
 }
 
 /// Why this rule's `ruleType` and `organizationConfiguration` do not go

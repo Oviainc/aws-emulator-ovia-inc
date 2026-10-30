@@ -3,8 +3,10 @@
 //! @op UntagResource
 //!
 //! IMPLEMENTED. Removes the named tag keys from the automation rule the ARN
-//! names. A key outside the modelled `TagKey` form, or one in the reserved tag
-//! namespace, is refused with `InvalidParameterValueException` (400) before
+//! names. A request whose `tagKeys` names no key states nothing to remove and is
+//! refused with `InvalidParameterValueException` (400)
+//! (`state::empty_value_list_violation`); a key outside the modelled `TagKey`
+//! form, or one in the reserved tag namespace, is refused the same way before
 //! anything is removed (`state::tag_keys_violation`), a `ruleRevision` other
 //! than the rule's current one is refused the same way, and an ARN no rule has
 //! is `ResourceNotFoundException` (404). A removal that changes the rule's tag
@@ -173,6 +175,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // `tagKeys` names the whole subject of the removal, so a request
+        // carrying none states nothing to remove and is refused rather than
+        // answered as though it had removed something. `TagKeyList` carries no
+        // `@length` minimum, and `@required` is satisfied by an empty array, so
+        // the boundary admits it and the floor every caller-supplied value list
+        // of this service is held to is applied here
+        // (`crate::state::empty_value_list_violation`).
+        if let Some(report) =
+            crate::state::empty_value_list_violation("tagKeys", input.tag_keys.len())
+        {
+            return Err(invalid_parameter(report));
+        }
 
         // `TagKeyList`'s member targets a plain `String`, so the boundary
         // validator admitted keys the service's own `TagKey` shape would refuse,
