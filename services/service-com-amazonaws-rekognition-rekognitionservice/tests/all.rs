@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/face_collections.rs"]
 mod face_collections;
+#[path = "all/face_detection.rs"]
+mod face_detection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

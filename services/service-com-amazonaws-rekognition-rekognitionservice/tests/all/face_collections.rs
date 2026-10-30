@@ -79,14 +79,14 @@ fn harness() -> MultiServiceRouter {
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The wire error code (`__type`), without its namespace.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -97,15 +97,15 @@ impl Reply {
             .to_string()
     }
 
-    fn field(&self, name: &str) -> Option<&Value> {
+    pub(crate) fn field(&self, name: &str) -> Option<&Value> {
         self.body.get(name).filter(|value| !value.is_null())
     }
 
-    fn string(&self, name: &str) -> Option<String> {
+    pub(crate) fn string(&self, name: &str) -> Option<String> {
         self.field(name).and_then(Value::as_str).map(str::to_string)
     }
 
-    fn list(&self, name: &str) -> Vec<Value> {
+    pub(crate) fn list(&self, name: &str) -> Vec<Value> {
         self.field(name)
             .and_then(Value::as_array)
             .cloned()
@@ -130,7 +130,12 @@ struct DeleteCase {
     unsuccessful: Vec<String>,
 }
 
-async fn call_in(router: &MultiServiceRouter, region: &str, operation: &str, body: Value) -> Reply {
+pub(crate) async fn call_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> Reply {
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/rekognition/aws4_request, \
          SignedHeaders=host, Signature=deadbeef"
@@ -150,13 +155,13 @@ async fn call_in(router: &MultiServiceRouter, region: &str, operation: &str, bod
     Reply { status, body }
 }
 
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> Reply {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> Reply {
     call_in(router, REGION, operation, body).await
 }
 
 /// An image passed inline, the way an SDK passes `Image.Bytes` on a JSON protocol:
 /// base64 of the bytes.
-fn bytes_image(content: &[u8]) -> Value {
+pub(crate) fn bytes_image(content: &[u8]) -> Value {
     json!({ "Bytes": aws_smithy_types::base64::encode(content) })
 }
 

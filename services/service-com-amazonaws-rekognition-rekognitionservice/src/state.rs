@@ -11,23 +11,29 @@
 //! ## What this emulator does and does not compute
 //!
 //! Rekognition's face operations are backed by a face detector and a face
-//! recogniser, neither of which exists in this process: no model runs here and no
-//! image is decoded. What IS real is the collection store — a collection, the faces
-//! indexed into it, their minted ids, and the counts, filters, pages and lookups
-//! computed from them.
+//! recogniser. The RECOGNISER does not exist in this process: nothing here maps a face
+//! to an identity, so no image is matched against another image's face. What IS real is
+//! the collection store — a collection, the faces indexed into it, their minted ids, and
+//! the counts, filters, pages and lookups computed from them — and, for the operations
+//! that analyse one submitted image, the geometric face DETECTOR in
+//! [`face_detection`]: it decodes the image and measures the faces it finds in the
+//! pixels, reporting a box, a confidence, landmarks, a roll and a quality it measured
+//! and leaving every classifier's judgement (an age, a gender, an emotion) absent.
 //!
-//! Nothing here reports a value a detector or a recogniser would have had to measure.
-//! A stored face therefore carries its identity and nothing else: no bounding box, no
-//! confidence, no landmarks, pose or quality, no demographic attribute and no
-//! orientation correction — every one of those members is left absent rather than
-//! filled with an unmeasured value, and the analysis-only operations (`DetectFaces`,
-//! `CompareFaces`, `SearchFacesByImage`, `RecognizeCelebrities`, …) stay unimplemented
-//! 501s.
+//! Nothing here reports a value nothing measured. A STORED face therefore carries its
+//! identity and nothing else: no bounding box, no confidence, no landmarks, pose or
+//! quality, no demographic attribute and no orientation correction — `IndexFaces` records
+//! what the collection holds, and the recogniser that would tie a stored face to an image
+//! is what is missing, so the recogniser-backed operations (`CompareFaces`,
+//! `SearchFacesByImage`, `RecognizeCelebrities`, …) stay unimplemented 501s.
 //!
-//! The one comparison this emulator can make honestly is IDENTITY: [`image_signature`]
-//! digests what an image is, so two indexed faces can be told to have come from the
-//! same image content or not. `SearchFaces` reports exactly that and no graded score —
-//! see its own module docs.
+//! The one comparison this emulator can make about stored faces is IDENTITY:
+//! [`image_signature`] digests what an image is, so two indexed faces can be told to have
+//! come from the same image content or not. `SearchFaces` reports exactly that and no
+//! graded score — see its own module docs.
+
+pub mod face_detection;
+pub mod image_source;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -202,10 +208,32 @@ pub struct ComAmazonawsRekognitionRekognitionserviceState {
 /// The region of the request being served: the third field of its SigV4
 /// credential scope, falling back to [`DEFAULT_REGION`] for a request that is
 /// not signed.
+///
+/// The scope is caller-supplied and this value reaches both the ARNs this service reports
+/// and the address an in-process read of Amazon S3 is sent to, so a value that is not
+/// shaped like a Region identifier is not reflected: the real service would not have
+/// served the request under a Region it does not have.
 pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
+        .filter(|region| is_region_like(region))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// Whether `region` is shaped like an AWS Region identifier: two or more
+/// hyphen-separated lowercase-letter parts followed by a digit group (`us-east-1`,
+/// `ap-southeast-3`, `us-gov-west-1`, `cn-north-1`).
+fn is_region_like(region: &str) -> bool {
+    let Some((parts, index)) = region.rsplit_once('-') else {
+        return false;
+    };
+    region.len() <= 32
+        && !index.is_empty()
+        && index.bytes().all(|byte| byte.is_ascii_digit())
+        && parts.split('-').count() >= 2
+        && parts
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_lowercase()))
 }
 
 /// The ARN of a collection in `region`:

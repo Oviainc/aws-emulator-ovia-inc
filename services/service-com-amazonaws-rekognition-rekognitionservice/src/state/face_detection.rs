@@ -1,0 +1,961 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Finding the FACES in a submitted image: the pixel side of `DetectFaces`.
+//!
+//! `DetectFaces` "detects faces within an image that is provided as input" and, for each
+//! face, returns "a bounding box of the face, a confidence value (that the bounding box
+//! contains a face)" and facial landmarks, pose and quality. So an answer here is a
+//! MEASUREMENT of the submitted pixels or it is nothing: nothing in this module is echoed
+//! from the request, keyed to a digest, randomised or taken from a recorded answer, and a
+//! member no step below measured is left ABSENT rather than filled in.
+//!
+//! ## The pipeline
+//!
+//! 1. **Decode** — the `image` crate decodes the submitted bytes for the format their own
+//!    magic numbers name. `DetectFaces` documents that "the image must be either a PNG or
+//!    JPEG formatted file", so anything else is refused as an invalid image format, and the
+//!    decode is bounded by [`MAX_IMAGE_SIDE`], [`MAX_IMAGE_PIXELS`] and [`MAX_IMAGE_ALLOC`]
+//!    so one request cannot turn a small compressed file into unbounded work.
+//! 2. **Smooth** — the grey image is averaged over a 3x3 window (through an integral
+//!    image, so every window and every region mean below costs four lookups: F. Crow, 1984,
+//!    summed-area tables), which is what keeps a single noisy pixel from reading as a
+//!    facial feature.
+//! 3. **Features** — a pixel darker than the mean of the window around it by
+//!    [`MIN_FEATURE_CONTRAST`] grey levels is a FEATURE pixel (adaptive thresholding
+//!    against a local mean: D. Bradley and G. Roth, 2007). Eyes, nostrils, a mouth and
+//!    eyebrows are dark against the skin around them whatever the skin's own tone or the
+//!    image's exposure, which is why the threshold is local and the measure is intensity
+//!    rather than colour: a grey-scale image and a colour one are read alike, and no skin
+//!    tone is privileged by a chrominance range. The window is taken at each of
+//!    [`FEATURE_SCALES`], because how large a face's features are in an image is exactly
+//!    what is not known yet: a window wider than the feature finds it, one narrower finds
+//!    only its edge, so the search is run at three widths and every reading is offered to
+//!    the steps below.
+//! 4. **Blobs** — the feature pixels are grouped into 8-connected components, each with its
+//!    extent, its centroid, its area and its mean intensity. Components too small to be a
+//!    feature or large enough to be the background are dropped, and the largest
+//!    [`MAX_FEATURE_BLOBS`] of the rest are what the search considers.
+//! 5. **Pairs** — every pair of blobs is a candidate EYE PAIR. A pair is kept when the two
+//!    are alike in size and height, level with each other to within
+//!    [`MAX_EYE_LEVEL_RATIO`] of their separation, and each narrower than the gap between
+//!    them. The face the pair stands for is derived from standard facial proportions: a
+//!    face about two interocular distances wide, about 2.9 tall, with the eye line just
+//!    above the middle ([`FACE_WIDTH_IN_EYE_SPANS`], [`FACE_HEIGHT_IN_EYE_SPANS`],
+//!    [`EYE_LINE_FROM_TOP`]). A face at the frame's edge, or one closer to the lens than
+//!    the frame is wide, carries part of that box outside the image, which is allowed as
+//!    long as [`MIN_INSIDE_FRACTION`] of it is inside: the box reported is the part that
+//!    is.
+//! 6. **Verify** — a pair is only a face when the rest of the structure is there too: the
+//!    bridge between the eyes and the cheek band below them are brighter than the eyes
+//!    themselves by [`MIN_FEATURE_CONTRAST`], both of those regions are SMOOTH compared
+//!    with that contrast ([`MAX_SKIN_TEXTURE_RATIO`]) — skin is a smooth region, while a
+//!    region whose intensity swings as much as the features do is texture or noise — the
+//!    box stands out from the ring around it by [`MIN_REGION_CONTRAST`] (figure against
+//!    ground, where there is a ring to measure), and there is a wide dark feature where a
+//!    mouth belongs. A pair with no mouth, no smooth skin between the eyes or no
+//!    separation from its surroundings is reported as nothing at all.
+//! 7. **Score** — the `Confidence` reported is the detector's own measured agreement: how
+//!    alike the two eyes are, how level, how far the bridge stands above them in intensity
+//!    and how near the mouth sits to where the proportions put it, averaged. It is the only
+//!    confidence anything here measured, and a face below [`MIN_CONFIDENCE`] is not
+//!    reported. Boxes overlapping an already accepted one by more than [`MAX_OVERLAP`] are
+//!    suppressed, so one face is reported once, and what is left is sorted largest first
+//!    and cut to [`MAX_FACES`] — "DetectFaces detects the 100 largest faces in the image".
+//! 8. **Measure** — each reported face carries only members this pipeline measured:
+//!    `BoundingBox` (the derived box, as the fractions of the image a `BoundingBox` is
+//!    expressed in), `Confidence` (step 7), `Landmarks` (the eye centroids and the mouth's
+//!    own extent), `Pose.Roll` (the angle of the eye line) and `Quality` (the mean
+//!    intensity and the mean gradient magnitude of the face's own pixels).
+//!
+//! ## What it does not report
+//!
+//! `Pose.Yaw`, `Pose.Pitch` and every classified attribute — `AgeRange`, `Gender`,
+//! `Emotions`, `Smile`, `Beard`, `Mustache`, `Eyeglasses`, `Sunglasses`, `EyesOpen`,
+//! `MouthOpen`, `FaceOccluded`, `EyeDirection` — are what a trained classifier reports, and
+//! no classifier runs in this process: no maintained Rust crate classifies a face offline
+//! (the ones that detect or recognise faces load neural-network weights or a trained
+//! cascade from a file this emulator may not fetch), so those members are absent whatever
+//! `Attributes` asks for, rather than carrying a value nothing measured.
+//!
+//! The detector is therefore a geometric one: it finds frontal faces whose eyes and mouth
+//! are visible and distinguishable from the skin around them, and it finds nothing in an
+//! image that carries no such structure — which is the honest answer for an image with no
+//! face in it.
+//!
+//! ## Where it runs
+//!
+//! Every step is bounded, but all of it is CPU-bound over an image whose size the caller
+//! chose, so a request path reaches it through [`faces_in_submitted_image`], which runs it
+//! on tokio's BLOCKING pool: it occupies no async worker, and the `spawn_blocking(..).await`
+//! that drives it is a real await point a timeout, a cancellation or a shutdown can land on.
+
+use std::io::Cursor;
+
+use ::image::{ImageFormat, Limits};
+
+use super::image_source::{self, UnreadableImage};
+use crate::ops::types::{BoundingBox, FaceDetail, Image, ImageQuality, Landmark, Pose};
+
+/// The most faces one answer reports: `DetectFaces` "detects the 100 largest faces in the
+/// image".
+pub const MAX_FACES: usize = 100;
+
+/// The largest side, in pixels, of an image this service analyses. NOT an AWS limit: an
+/// emulator-side bound so one request cannot allocate without end.
+pub const MAX_IMAGE_SIDE: u32 = 8_192;
+
+/// The most pixels one image may hold. NOT an AWS limit: see [`MAX_IMAGE_SIDE`]. Every scan
+/// below is linear in the pixel count, so this bounds the per-request CPU too.
+pub const MAX_IMAGE_PIXELS: u64 = 4_000_000;
+
+/// The most bytes the decoder may allocate for one image. NOT an AWS limit: it is what stops
+/// a small compressed file from expanding into a large allocation.
+pub const MAX_IMAGE_ALLOC: u64 = 64 * 1024 * 1024;
+
+/// The most feature components ONE window width contributes to the eye-pair search,
+/// largest by area first. NOT an AWS limit: the search costs one verification per pair, so
+/// this bounds the work a single request can cause.
+pub const MAX_FEATURE_BLOBS: usize = 210;
+
+/// The window widths the feature search is run at, as divisors of the image's shorter side:
+/// one narrower than a small face's features, one about a large face's, and one between.
+pub const FEATURE_SCALES: [f32; 3] = [32.0, 16.0, 8.0];
+
+/// How far below the mean of the window around it, in grey levels, a pixel must sit to be a
+/// facial feature — and how far above the eyes the skin between and below them must sit for
+/// the pair to be a face.
+pub const MIN_FEATURE_CONTRAST: f32 = 18.0;
+
+/// How far the mean intensity of a face box must differ from the ring around it, in grey
+/// levels, for the box to be a figure against its ground.
+pub const MIN_REGION_CONTRAST: f32 = 4.0;
+
+/// How much the skin a face shows may VARY, as a fraction of how far that skin stands above
+/// the face's own dark features: a cheek or a nose bridge is a smooth region, so its
+/// root-mean-square gradient is a fraction of the contrast between it and the eyes, while a
+/// patch of noise or texture swings by as much as that contrast or more and is not skin.
+pub const MAX_SKIN_TEXTURE_RATIO: f32 = 0.5;
+
+/// How far out of level, as a fraction of their separation, two blobs may be and still be a
+/// pair of eyes. It is also what bounds the `Roll` this detector can measure.
+pub const MAX_EYE_LEVEL_RATIO: f32 = 0.3;
+
+/// The face a pair of eyes stands for, in multiples of their separation, and where the eye
+/// line sits in it as a fraction of its height: the standard proportions of a face, in which
+/// the interocular distance is about half the face's width and the eyes sit just above the
+/// middle.
+pub const FACE_WIDTH_IN_EYE_SPANS: f32 = 2.0;
+pub const FACE_HEIGHT_IN_EYE_SPANS: f32 = 2.9;
+pub const EYE_LINE_FROM_TOP: f32 = 0.45;
+
+/// The agreement score a candidate must reach to be reported as a face, on the same 0..100
+/// scale as the `Confidence` it carries.
+pub const MIN_CONFIDENCE: f32 = 50.0;
+
+/// How much of an already accepted face's box a later candidate may share, as the
+/// intersection over the union of the two, before it is taken for the same face.
+pub const MAX_OVERLAP: f32 = 0.3;
+
+/// The radius of the averaging window the feature mask and every region mean read through.
+const SMOOTH_RADIUS: usize = 1;
+
+/// How small a face this detector looks for: the eyes must be at least this many pixels
+/// apart, and at least this fraction of the image's shorter side apart, so a request cannot
+/// make a face out of two specks.
+const MIN_EYE_SPAN_PIXELS: f32 = 6.0;
+const MIN_EYE_SPAN_FRACTION: f32 = 0.02;
+
+/// How much of its derived box must lie inside the frame for a face to be reported: below
+/// this, too little of the face was in the image to measure.
+pub const MIN_INSIDE_FRACTION: f32 = 0.5;
+
+/// How alike in area and in height the two blobs of a pair of eyes must be.
+const MAX_EYE_AREA_RATIO: f32 = 4.0;
+const MAX_EYE_HEIGHT_RATIO: f32 = 3.0;
+
+/// How wide one eye may be, and must be, in multiples of the gap between the two: eyes are
+/// separated by more than their own width.
+const MAX_EYE_WIDTH_IN_SPANS: f32 = 0.6;
+const MIN_EYE_WIDTH_IN_SPANS: f32 = 0.04;
+
+/// Where a mouth sits below the eye line, and how wide it is, in multiples of the eye span:
+/// the band searched, the offset from the face's axis allowed, and the width accepted.
+const MOUTH_BELOW_EYES: f32 = 1.0;
+const MIN_MOUTH_BELOW_EYES: f32 = 0.45;
+const MAX_MOUTH_BELOW_EYES: f32 = 1.7;
+const MAX_MOUTH_OFFSET_IN_SPANS: f32 = 0.6;
+const MIN_MOUTH_WIDTH_IN_SPANS: f32 = 0.22;
+const MAX_MOUTH_WIDTH_IN_SPANS: f32 = 1.6;
+
+/// How far from where the proportions put it a mouth may sit before it contributes nothing
+/// to the score, in multiples of the eye span.
+const MOUTH_FIT_IN_SPANS: f32 = 0.5;
+
+/// The intensity difference between the bridge of the nose and the eyes at which the
+/// contrast term of the score is full, in grey levels.
+const FULL_FEATURE_CONTRAST: f32 = 96.0;
+
+/// The largest blob the feature search keeps, as a fraction of the image's shorter side:
+/// anything that wide or tall is a region of the image rather than a facial feature.
+const MAX_BLOB_SIDE_FRACTION: f32 = 0.45;
+
+/// The smallest blob the feature search keeps, in pixels and as a fraction of the image's
+/// area, so speckle is not a feature at any image size.
+const MIN_BLOB_PIXELS: u32 = 4;
+const MIN_BLOB_AREA_FRACTION: f32 = 1.0 / 40_000.0;
+
+/// How much wider than its own height an eye or a mouth blob may be, either way round.
+const MAX_BLOB_ASPECT: f32 = 8.0;
+
+/// How many points, on a side, a region's gradient measurement samples. NOT an AWS limit:
+/// it bounds the measurement's cost by a constant whatever the region's size. The quality a
+/// face reports is measured over its whole box; the skin-texture check over the small
+/// regions it verifies.
+const SHARPNESS_SAMPLES: usize = 48;
+const TEXTURE_SAMPLES: usize = 16;
+
+/// The landmark types this detector measures, as the model's `LandmarkType` names them
+/// (`smithy_query(query="shape",shape="LandmarkType")`). The eye landmarks are named for
+/// the side of the IMAGE they were found on, which is also the order the pair is read in.
+const LANDMARK_EYE_LEFT: &str = "eyeLeft";
+const LANDMARK_EYE_RIGHT: &str = "eyeRight";
+const LANDMARK_MOUTH_LEFT: &str = "mouthLeft";
+const LANDMARK_MOUTH_RIGHT: &str = "mouthRight";
+
+/// `Some(format)` when these bytes are an image in a format `DetectFaces` accepts: "the
+/// image must be either a PNG or JPEG formatted file". The format comes from the bytes' own
+/// magic numbers, never from a declared name.
+pub fn image_format(bytes: &[u8]) -> Option<ImageFormat> {
+    match ::image::guess_format(bytes) {
+        Ok(format @ (ImageFormat::Png | ImageFormat::Jpeg)) => Some(format),
+        _ => None,
+    }
+}
+
+/// The faces in the image a request submitted — its own inline `Bytes`, or the object this
+/// emulator's Amazon S3 holds at the location it named — detected OFF the async worker.
+pub async fn faces_in_submitted_image(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    image: &Image,
+) -> Result<Vec<FaceDetail>, UnreadableImage> {
+    let bytes = image_source::image_bytes(ctx, image).await?;
+    match ::tokio::task::spawn_blocking(move || faces_in_image(&bytes)).await {
+        Ok(detected) => detected,
+        Err(error) => {
+            ::tracing::error!(error = %error, "detecting the faces in an image did not complete");
+            Err(UnreadableImage::NotAnalysed(
+                "Detecting the faces in the image did not complete".to_string(),
+            ))
+        }
+    }
+}
+
+/// The faces in one image's bytes.
+///
+/// CPU-bound: a request path reaches it through [`faces_in_submitted_image`], which runs it
+/// on the blocking pool.
+pub fn faces_in_image(bytes: &[u8]) -> Result<Vec<FaceDetail>, UnreadableImage> {
+    let Some(format) = image_format(bytes) else {
+        return Err(UnreadableImage::invalid_format());
+    };
+    // The header is read with the decoder's own size limits OFF, so an image over this
+    // emulator's ceiling is refused as too large (what it is) rather than as unreadable.
+    let (width, height) = reader(bytes, format, false)
+        .into_dimensions()
+        .map_err(|_| UnreadableImage::invalid_format())?;
+    if over_ceiling(width, height) {
+        return Err(oversized(width, height));
+    }
+    let decoded = reader(bytes, format, true)
+        .decode()
+        .map_err(|_| UnreadableImage::invalid_format())?;
+    let gray = decoded.into_luma8();
+    // The ceiling again, on the frame that was actually decoded: every scan below is sized
+    // from THIS image, so the budget must not depend on the header having agreed with it.
+    if over_ceiling(gray.width(), gray.height()) {
+        return Err(oversized(gray.width(), gray.height()));
+    }
+    if gray.width() == 0 || gray.height() == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(faces(&Pixels::of(gray)))
+}
+
+/// Whether an image of these dimensions is past what this emulator analyses.
+fn over_ceiling(width: u32, height: u32) -> bool {
+    width > MAX_IMAGE_SIDE
+        || height > MAX_IMAGE_SIDE
+        || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
+}
+
+/// The refusal for an image past that ceiling, stating what was measured and the limit.
+fn oversized(width: u32, height: u32) -> UnreadableImage {
+    UnreadableImage::TooLarge(format!(
+        "Image size is too large: the image is {width}x{height} pixels; this emulator \
+         analyses at most {MAX_IMAGE_SIDE} pixels on a side and {MAX_IMAGE_PIXELS} pixels \
+         in all"
+    ))
+}
+
+/// A decoder for `bytes`, bounded so a small file cannot decode into a large one.
+///
+/// `bound_dimensions` turns the decoder's own width/height ceilings on, for the decode
+/// itself; the header read leaves them off so this module can tell an image that is too
+/// large from one that cannot be read at all.
+fn reader(
+    bytes: &[u8],
+    format: ImageFormat,
+    bound_dimensions: bool,
+) -> ::image::ImageReader<Cursor<&[u8]>> {
+    let mut reader = ::image::ImageReader::with_format(Cursor::new(bytes), format);
+    // `Limits::no_limits()` rather than `default()`: the bounds here are this emulator's,
+    // and starting from the crate's defaults would silently inherit them.
+    let mut limits = Limits::no_limits();
+    if bound_dimensions {
+        limits.max_image_width = Some(MAX_IMAGE_SIDE);
+        limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    }
+    limits.max_alloc = Some(MAX_IMAGE_ALLOC);
+    reader.limits(limits);
+    reader
+}
+
+// ---------------------------------------------------------------------------
+// Pixels, and the measurements taken off them
+// ---------------------------------------------------------------------------
+
+/// A rectangle of pixels. `x1` and `y1` are EXCLUSIVE, and every instance is already
+/// clamped to its image, so a rectangle can be empty but never out of bounds.
+#[derive(Debug, Clone, Copy)]
+struct PixelRect {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+}
+
+impl PixelRect {
+    fn area(&self) -> usize {
+        self.x1.saturating_sub(self.x0) * self.y1.saturating_sub(self.y0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.x1 <= self.x0 || self.y1 <= self.y0
+    }
+}
+
+/// The pixels of `left..right` x `top..bottom`, clamped to an image of `width` x `height`.
+fn pixel_rect(
+    bounds: (f32, f32, f32, f32),
+    width: usize,
+    height: usize,
+) -> PixelRect {
+    let (left, top, right, bottom) = bounds;
+    // A cast from a float to an integer saturates, and a negative coordinate is outside the
+    // image on the low side, so both ends land inside the image.
+    let index = |value: f32, bound: usize| -> usize {
+        if value <= 0.0 {
+            0
+        } else {
+            (value as usize).min(bound)
+        }
+    };
+    PixelRect {
+        x0: index(left.floor(), width),
+        y0: index(top.floor(), height),
+        x1: index(right.ceil(), width),
+        y1: index(bottom.ceil(), height),
+    }
+}
+
+/// The summed-area table of one grey plane: the sum over any rectangle in four lookups.
+struct Integral {
+    width: usize,
+    height: usize,
+    sums: Vec<u32>,
+}
+
+impl Integral {
+    /// The table of `pixels`, which is `width` x `height` in row-major order.
+    ///
+    /// `u32` holds it: the largest sum is 255 times the pixel count, and the pixel count is
+    /// bounded by [`MAX_IMAGE_PIXELS`].
+    fn of(pixels: &[u8], width: usize, height: usize) -> Self {
+        let stride = width + 1;
+        let mut sums = vec![0_u32; stride * (height + 1)];
+        for y in 0..height {
+            let (above, current) = sums.split_at_mut((y + 1) * stride);
+            let above = &above[y * stride..];
+            let mut row = 0_u32;
+            for (x, value) in pixels[y * width..(y + 1) * width].iter().enumerate() {
+                row += u32::from(*value);
+                current[x + 1] = above[x + 1] + row;
+            }
+        }
+        Self {
+            width,
+            height,
+            sums,
+        }
+    }
+
+    fn sum(&self, rect: PixelRect) -> u32 {
+        let stride = self.width + 1;
+        self.sums[rect.y1 * stride + rect.x1] + self.sums[rect.y0 * stride + rect.x0]
+            - self.sums[rect.y0 * stride + rect.x1]
+            - self.sums[rect.y1 * stride + rect.x0]
+    }
+
+    /// The mean intensity over `rect`, or `None` when it holds no pixel to measure.
+    fn mean(&self, rect: PixelRect) -> Option<f32> {
+        if rect.is_empty() {
+            return None;
+        }
+        Some(self.sum(rect) as f32 / rect.area() as f32)
+    }
+
+    /// The mean intensity of the window of `radius` around `(x, y)`, clipped at the edges.
+    fn window_mean(&self, x: usize, y: usize, radius: usize) -> f32 {
+        let rect = PixelRect {
+            x0: x.saturating_sub(radius),
+            y0: y.saturating_sub(radius),
+            x1: (x + radius + 1).min(self.width),
+            y1: (y + radius + 1).min(self.height),
+        };
+        self.mean(rect).unwrap_or_default()
+    }
+}
+
+/// A decoded image, with the two planes every measurement reads: the pixels as decoded, and
+/// an averaged copy with its summed-area table.
+struct Pixels {
+    width: usize,
+    height: usize,
+    /// As decoded: what the sharpness measurement reads, because averaging the pixels is
+    /// exactly what would hide the gradients it measures.
+    decoded: Vec<u8>,
+    /// Averaged over a 3x3 window: what the feature mask and every region mean read, so one
+    /// noisy pixel is neither a feature nor a measurement.
+    smoothed: Vec<u8>,
+    integral: Integral,
+}
+
+impl Pixels {
+    fn of(gray: ::image::GrayImage) -> Self {
+        let width = gray.width() as usize;
+        let height = gray.height() as usize;
+        let decoded = gray.into_raw();
+        let decoded_integral = Integral::of(&decoded, width, height);
+        let smoothed: Vec<u8> = (0..decoded.len())
+            .map(|index| {
+                let mean =
+                    decoded_integral.window_mean(index % width, index / width, SMOOTH_RADIUS);
+                mean.round().clamp(0.0, 255.0) as u8
+            })
+            .collect();
+        let integral = Integral::of(&smoothed, width, height);
+        Self {
+            width,
+            height,
+            decoded,
+            smoothed,
+            integral,
+        }
+    }
+
+    fn width_f32(&self) -> f32 {
+        self.width as f32
+    }
+
+    fn height_f32(&self) -> f32 {
+        self.height as f32
+    }
+
+    /// The shorter side of the image, which is what the size bounds scale with.
+    fn shorter_side(&self) -> f32 {
+        self.width_f32().min(self.height_f32())
+    }
+
+    fn rect(&self, bounds: (f32, f32, f32, f32)) -> PixelRect {
+        pixel_rect(bounds, self.width, self.height)
+    }
+
+    /// The rectangle of half-width `half_width` and half-height `half_height` around
+    /// `(x, y)`.
+    fn around(&self, x: f32, y: f32, half_width: f32, half_height: f32) -> PixelRect {
+        self.rect((x - half_width, y - half_height, x + half_width, y + half_height))
+    }
+
+    fn decoded_at(&self, x: usize, y: usize) -> f32 {
+        f32::from(self.decoded[y * self.width + x])
+    }
+}
+
+/// One connected run of feature pixels: a candidate eye, nostril, brow or mouth.
+#[derive(Debug, Clone, Copy)]
+struct Blob {
+    area: u32,
+    rect: PixelRect,
+    cx: f32,
+    cy: f32,
+    /// The mean intensity of the blob's own pixels.
+    mean: f32,
+}
+
+impl Blob {
+    fn width(&self) -> f32 {
+        (self.rect.x1 - self.rect.x0) as f32
+    }
+
+    fn height(&self) -> f32 {
+        (self.rect.y1 - self.rect.y0) as f32
+    }
+}
+
+/// A face box in pixel coordinates.
+#[derive(Debug, Clone, Copy)]
+struct FaceRect {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+impl FaceRect {
+    fn right(&self) -> f32 {
+        self.left + self.width
+    }
+
+    fn bottom(&self) -> f32 {
+        self.top + self.height
+    }
+
+    fn area(&self) -> f32 {
+        self.width * self.height
+    }
+
+    fn bounds(&self) -> (f32, f32, f32, f32) {
+        (self.left, self.top, self.right(), self.bottom())
+    }
+}
+
+/// The mouth of a detected face: the extent of the feature blob it was read from.
+#[derive(Debug, Clone, Copy)]
+struct Mouth {
+    x0: f32,
+    x1: f32,
+    cy: f32,
+}
+
+/// One face the detector found, with the measurements its `FaceDetail` is built from.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    rect: FaceRect,
+    confidence: f32,
+    left_eye: (f32, f32),
+    right_eye: (f32, f32),
+    mouth: Mouth,
+    roll: f32,
+}
+
+/// Every face in one decoded image, largest first and cut to [`MAX_FACES`].
+fn faces(pixels: &Pixels) -> Vec<FaceDetail> {
+    let blobs = feature_blobs(pixels);
+    let mut found: Vec<Candidate> = Vec::new();
+    for first in 0..blobs.len() {
+        for second in (first + 1)..blobs.len() {
+            if let Some(candidate) = candidate(pixels, &blobs, first, second) {
+                found.push(candidate);
+            }
+        }
+    }
+    // Strongest first, so the box kept for a face is the best-scoring reading of it and a
+    // weaker reading of the same pixels is suppressed rather than reported beside it.
+    found.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+    let mut kept: Vec<Candidate> = Vec::new();
+    for candidate in found {
+        if kept
+            .iter()
+            .all(|other| overlap(&candidate.rect, &other.rect) <= MAX_OVERLAP)
+        {
+            kept.push(candidate);
+        }
+    }
+    kept.sort_by(|left, right| right.rect.area().total_cmp(&left.rect.area()));
+    kept.truncate(MAX_FACES);
+    kept.iter().map(|face| detail(pixels, face)).collect()
+}
+
+/// The feature components of an image: the pixels darker than their surroundings, grouped,
+/// filtered to what can be a facial feature, and cut to the largest [`MAX_FEATURE_BLOBS`]
+/// per window width.
+///
+/// A component found at two window widths is offered twice, and the two readings of it stand
+/// for the same face, which the overlap suppression in [`faces`] then keeps once.
+fn feature_blobs(pixels: &Pixels) -> Vec<Blob> {
+    let min_area = MIN_BLOB_PIXELS.max(
+        (MIN_BLOB_AREA_FRACTION * pixels.width_f32() * pixels.height_f32()).round() as u32,
+    );
+    let max_side = MAX_BLOB_SIDE_FRACTION * pixels.shorter_side();
+    let per_scale = MAX_FEATURE_BLOBS / FEATURE_SCALES.len();
+    let mut blobs: Vec<Blob> = Vec::new();
+    for divisor in FEATURE_SCALES {
+        let radius = ((pixels.shorter_side() / divisor).round() as usize).clamp(2, 60);
+        let mut found = components(pixels, &feature_mask(pixels, radius));
+        found.retain(|blob| {
+            blob.area >= min_area
+                && blob.width() <= max_side
+                && blob.height() <= max_side
+                && blob.width() <= MAX_BLOB_ASPECT * blob.height()
+                && blob.height() <= MAX_BLOB_ASPECT * blob.width()
+        });
+        found.sort_by_key(|blob| ::std::cmp::Reverse(blob.area));
+        found.truncate(per_scale);
+        blobs.append(&mut found);
+    }
+    blobs
+}
+
+/// One bit per pixel, true where the pixel is darker than the mean of the window of
+/// `radius` around it by [`MIN_FEATURE_CONTRAST`].
+fn feature_mask(pixels: &Pixels, radius: usize) -> Vec<bool> {
+    pixels
+        .smoothed
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let local = pixels
+                .integral
+                .window_mean(index % pixels.width, index / pixels.width, radius);
+            f32::from(*value) + MIN_FEATURE_CONTRAST <= local
+        })
+        .collect()
+}
+
+/// The 8-connected components of a feature mask, each with its extent, centroid, area and
+/// mean intensity. Each pixel is visited once, so this is linear in the image.
+fn components(pixels: &Pixels, mask: &[bool]) -> Vec<Blob> {
+    let (width, height) = (pixels.width, pixels.height);
+    let mut seen = vec![false; mask.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut blobs: Vec<Blob> = Vec::new();
+    for (start, is_feature) in mask.iter().enumerate() {
+        if !is_feature || seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        stack.push(start);
+        let mut area = 0_u32;
+        let mut sum_x = 0_u64;
+        let mut sum_y = 0_u64;
+        let mut sum_intensity = 0_u64;
+        let mut rect = PixelRect {
+            x0: width,
+            y0: height,
+            x1: 0,
+            y1: 0,
+        };
+        while let Some(index) = stack.pop() {
+            let (x, y) = (index % width, index / width);
+            area += 1;
+            sum_x += x as u64;
+            sum_y += y as u64;
+            sum_intensity += u64::from(pixels.smoothed[index]);
+            rect.x0 = rect.x0.min(x);
+            rect.y0 = rect.y0.min(y);
+            rect.x1 = rect.x1.max(x + 1);
+            rect.y1 = rect.y1.max(y + 1);
+            let x_to = (x + 1).min(width - 1);
+            let y_to = (y + 1).min(height - 1);
+            for neighbour_y in y.saturating_sub(1)..=y_to {
+                for neighbour_x in x.saturating_sub(1)..=x_to {
+                    let neighbour = neighbour_y * width + neighbour_x;
+                    if mask[neighbour] && !seen[neighbour] {
+                        seen[neighbour] = true;
+                        stack.push(neighbour);
+                    }
+                }
+            }
+        }
+        let area_f32 = area as f32;
+        blobs.push(Blob {
+            area,
+            rect,
+            cx: sum_x as f32 / area_f32,
+            cy: sum_y as f32 / area_f32,
+            mean: sum_intensity as f32 / area_f32,
+        });
+    }
+    blobs
+}
+
+/// The face a pair of feature blobs stands for, when the pixels around them carry the rest
+/// of a face's structure; `None` when they do not, which is most pairs.
+fn candidate(pixels: &Pixels, blobs: &[Blob], first: usize, second: usize) -> Option<Candidate> {
+    let (left, right) = if blobs[first].cx <= blobs[second].cx {
+        (blobs[first], blobs[second])
+    } else {
+        (blobs[second], blobs[first])
+    };
+    let dx = right.cx - left.cx;
+    let dy = right.cy - left.cy;
+    let span = dx.hypot(dy);
+    if span < MIN_EYE_SPAN_PIXELS.max(MIN_EYE_SPAN_FRACTION * pixels.shorter_side())
+        || dy.abs() > MAX_EYE_LEVEL_RATIO * span
+    {
+        return None;
+    }
+    // Two eyes of one face are alike in size and in height, and each is narrower than the
+    // gap between them.
+    let smaller = f32::min(left.area as f32, right.area as f32);
+    let larger = f32::max(left.area as f32, right.area as f32);
+    if larger > MAX_EYE_AREA_RATIO * smaller
+        || left.height().max(right.height()) > MAX_EYE_HEIGHT_RATIO * left.height().min(right.height())
+        || left.width().max(right.width()) > MAX_EYE_WIDTH_IN_SPANS * span
+        || left.width().min(right.width()) < MIN_EYE_WIDTH_IN_SPANS * span
+    {
+        return None;
+    }
+
+    let mid_x = (left.cx + right.cx) / 2.0;
+    let mid_y = (left.cy + right.cy) / 2.0;
+    let width = FACE_WIDTH_IN_EYE_SPANS * span;
+    let height = FACE_HEIGHT_IN_EYE_SPANS * span;
+    let rect = FaceRect {
+        left: mid_x - width / 2.0,
+        top: mid_y - EYE_LINE_FROM_TOP * height,
+        width,
+        height,
+    };
+    // A face box mostly outside the frame was not measured: most of the pixels that would
+    // show it are not here.
+    if (pixels.rect(rect.bounds()).area() as f32) < MIN_INSIDE_FRACTION * rect.area() {
+        return None;
+    }
+
+    // The skin a face shows between and below its dark features: the bridge between the
+    // eyes and the band across the nose and cheeks. Both stand above the eyes in intensity,
+    // whatever the tone of the skin or the exposure of the image.
+    let eyes = (left.mean * left.area as f32 + right.mean * right.area as f32)
+        / (left.area + right.area) as f32;
+    let bridge_rect = pixels.around(mid_x, mid_y, 0.2 * span, 0.2 * span);
+    let cheeks_rect = pixels.around(mid_x, mid_y + 0.55 * span, 0.35 * span, 0.2 * span);
+    let bridge = pixels.integral.mean(bridge_rect)?;
+    let cheeks = pixels.integral.mean(cheeks_rect)?;
+    if bridge < eyes + MIN_FEATURE_CONTRAST || cheeks < eyes + MIN_FEATURE_CONTRAST {
+        return None;
+    }
+    // Skin is SMOOTH: it varies by a fraction of how far it stands above the features it
+    // surrounds. A region that swings by as much as that contrast is texture or noise, and
+    // two dark specks in a field of noise are not a face.
+    let contrast = bridge.min(cheeks) - eyes;
+    for region in [bridge_rect, cheeks_rect] {
+        if rms_gradient(pixels, region, TEXTURE_SAMPLES) > MAX_SKIN_TEXTURE_RATIO * contrast {
+            return None;
+        }
+    }
+    if !stands_out(pixels, &rect, span) {
+        return None;
+    }
+    let mouth = mouth_of(blobs, mid_x, mid_y, span)?;
+
+    // The score is what was measured about this reading of the pixels: how alike the two
+    // eyes are in size, how level they sit, how far the bridge between them stands above
+    // them in intensity, and how near the mouth is to where the proportions put it.
+    let balance = 1.0 - (larger - smaller) / (larger + smaller);
+    let level = 1.0 - (dy.abs() / (MAX_EYE_LEVEL_RATIO * span)).clamp(0.0, 1.0);
+    let standing = ((bridge - eyes) / FULL_FEATURE_CONTRAST).clamp(0.0, 1.0);
+    let expected_mouth = mid_y + MOUTH_BELOW_EYES * span;
+    let mouth_fit =
+        1.0 - ((mouth.cy - expected_mouth).abs() / (MOUTH_FIT_IN_SPANS * span)).clamp(0.0, 1.0);
+    let confidence = (100.0 * (balance + level + standing + mouth_fit) / 4.0).clamp(0.0, 100.0);
+    if confidence < MIN_CONFIDENCE {
+        return None;
+    }
+
+    Some(Candidate {
+        rect,
+        confidence,
+        left_eye: (left.cx, left.cy),
+        right_eye: (right.cx, right.cy),
+        mouth,
+        roll: dy.atan2(dx).to_degrees().clamp(-180.0, 180.0),
+    })
+}
+
+/// Whether a face box differs in mean intensity from the ring around it — figure against
+/// ground. A box at the frame's edge has no ring to measure, and nothing unmeasured is held
+/// against it.
+fn stands_out(pixels: &Pixels, rect: &FaceRect, span: f32) -> bool {
+    let margin = 0.25 * span;
+    let inner = pixels.around(
+        rect.left + rect.width / 2.0,
+        rect.top + rect.height / 2.0,
+        0.35 * rect.width,
+        0.35 * rect.height,
+    );
+    let around = pixels.rect((
+        rect.left - margin,
+        rect.top - margin,
+        rect.right() + margin,
+        rect.bottom() + margin,
+    ));
+    let box_rect = pixels.rect(rect.bounds());
+    let Some(interior) = pixels.integral.mean(inner) else {
+        return false;
+    };
+    let ring_area = around.area().saturating_sub(box_rect.area());
+    // Too little of the ring is inside the frame to measure a mean from.
+    if ring_area * 10 < box_rect.area() {
+        return true;
+    }
+    let ring = (pixels.integral.sum(around) - pixels.integral.sum(box_rect)) as f32
+        / ring_area as f32;
+    (interior - ring).abs() >= MIN_REGION_CONTRAST
+}
+
+/// The mouth of the face a pair of eyes stands for: the feature blob nearest to where the
+/// proportions put one, out of those wide enough and placed to be a mouth at all.
+fn mouth_of(blobs: &[Blob], mid_x: f32, mid_y: f32, span: f32) -> Option<Mouth> {
+    let expected = mid_y + MOUTH_BELOW_EYES * span;
+    blobs
+        .iter()
+        .filter(|blob| {
+            (blob.cx - mid_x).abs() <= MAX_MOUTH_OFFSET_IN_SPANS * span
+                && blob.cy >= mid_y + MIN_MOUTH_BELOW_EYES * span
+                && blob.cy <= mid_y + MAX_MOUTH_BELOW_EYES * span
+                && blob.width() >= MIN_MOUTH_WIDTH_IN_SPANS * span
+                && blob.width() <= MAX_MOUTH_WIDTH_IN_SPANS * span
+        })
+        .min_by(|left, right| {
+            (left.cy - expected)
+                .abs()
+                .total_cmp(&(right.cy - expected).abs())
+        })
+        .map(|blob| Mouth {
+            x0: blob.rect.x0 as f32,
+            x1: (blob.rect.x1.saturating_sub(1)) as f32,
+            cy: blob.cy,
+        })
+}
+
+/// How much two face boxes share, as the intersection over their union.
+fn overlap(left: &FaceRect, right: &FaceRect) -> f32 {
+    let shared_width = (left.right().min(right.right()) - left.left.max(right.left)).max(0.0);
+    let shared_height = (left.bottom().min(right.bottom()) - left.top.max(right.top)).max(0.0);
+    let intersection = shared_width * shared_height;
+    let union = left.area() + right.area() - intersection;
+    if union <= 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+/// The `FaceDetail` of one detected face: the members this detector measured, and no other.
+fn detail(pixels: &Pixels, face: &Candidate) -> FaceDetail {
+    let (width, height) = (pixels.width_f32(), pixels.height_f32());
+    // A `BoundingBox` is expressed in fractions of the image, and only the part of the box
+    // inside the image was measured, so the fractions are clamped to it.
+    let left = (face.rect.left / width).clamp(0.0, 1.0);
+    let top = (face.rect.top / height).clamp(0.0, 1.0);
+    let right = (face.rect.right() / width).clamp(0.0, 1.0);
+    let bottom = (face.rect.bottom() / height).clamp(0.0, 1.0);
+    let box_rect = pixels.rect(face.rect.bounds());
+    FaceDetail {
+        bounding_box: Some(BoundingBox {
+            left: Some(left),
+            top: Some(top),
+            width: Some(right - left),
+            height: Some(bottom - top),
+        }),
+        confidence: Some(face.confidence),
+        landmarks: Some(vec![
+            landmark(LANDMARK_EYE_LEFT, face.left_eye, pixels),
+            landmark(LANDMARK_EYE_RIGHT, face.right_eye, pixels),
+            landmark(LANDMARK_MOUTH_LEFT, (face.mouth.x0, face.mouth.cy), pixels),
+            landmark(LANDMARK_MOUTH_RIGHT, (face.mouth.x1, face.mouth.cy), pixels),
+        ]),
+        pose: Some(Pose {
+            roll: Some(face.roll),
+            // The angle of the eye line is what two eye positions establish; a yaw or a
+            // pitch would need a third dimension nothing here measured.
+            yaw: None,
+            pitch: None,
+        }),
+        quality: Some(ImageQuality {
+            brightness: Some(brightness(pixels, box_rect)),
+            sharpness: Some(sharpness(pixels, box_rect)),
+        }),
+        // Every other member of a `FaceDetail` is a classifier's judgement, and no
+        // classifier runs here: see this module's docs.
+        ..FaceDetail::default()
+    }
+}
+
+/// One measured landmark, as the fractions of the image a `Landmark` is expressed in.
+fn landmark(kind: &str, at: (f32, f32), pixels: &Pixels) -> Landmark {
+    Landmark {
+        r#type: Some(kind.to_string()),
+        x: Some((at.0 / pixels.width_f32()).clamp(0.0, 1.0)),
+        y: Some((at.1 / pixels.height_f32()).clamp(0.0, 1.0)),
+    }
+}
+
+/// The mean intensity of a face's own pixels, as a percentage of the brightest a pixel can
+/// be: what `Quality.Brightness` reports, measured rather than assumed.
+fn brightness(pixels: &Pixels, rect: PixelRect) -> f32 {
+    pixels
+        .integral
+        .mean(rect)
+        .map_or(0.0, |mean| (mean / 255.0 * 100.0).clamp(0.0, 100.0))
+}
+
+/// The ROOT-MEAN-SQUARE gradient magnitude across a face's own pixels, as a percentage of
+/// the steepest a gradient can be: what `Quality.Sharpness` reports. Blur spreads an edge
+/// over more pixels without adding any contrast to it, which leaves the mean gradient of a
+/// region almost unchanged but its gradient ENERGY lower, so the root mean square is what
+/// separates a crisp picture of a face from a soft one. The scale is this one, not a scale
+/// AWS publishes, because none is published.
+fn sharpness(pixels: &Pixels, rect: PixelRect) -> f32 {
+    (rms_gradient(pixels, rect, SHARPNESS_SAMPLES) / 255.0 * 100.0).clamp(0.0, 100.0)
+}
+
+/// The root-mean-square gradient magnitude over `rect`, in grey levels: how much the pixels
+/// there change from one to the next, which is what tells a smooth region from a textured
+/// one and a crisp edge from a blurred one.
+///
+/// Sampled on a bounded grid — at most `samples` points on a side — so the cost is a
+/// constant whatever the size of the region.
+fn rms_gradient(pixels: &Pixels, rect: PixelRect, samples: usize) -> f32 {
+    // Central differences need a pixel on either side, so the sampled area is the region
+    // without its outermost row and column, inside the image's own border.
+    let x0 = rect.x0.max(1);
+    let y0 = rect.y0.max(1);
+    let x1 = rect.x1.min(pixels.width.saturating_sub(1));
+    let y1 = rect.y1.min(pixels.height.saturating_sub(1));
+    if x1 <= x0 || y1 <= y0 {
+        return 0.0;
+    }
+    let step_x = ((x1 - x0) / samples.max(1)).max(1);
+    let step_y = ((y1 - y0) / samples.max(1)).max(1);
+    let mut total = 0.0_f32;
+    let mut count = 0_u32;
+    let mut y = y0;
+    while y < y1 {
+        let mut x = x0;
+        while x < x1 {
+            // Halved, because a central difference spans two pixels.
+            let horizontal = (pixels.decoded_at(x + 1, y) - pixels.decoded_at(x - 1, y)) / 2.0;
+            let vertical = (pixels.decoded_at(x, y + 1) - pixels.decoded_at(x, y - 1)) / 2.0;
+            total += horizontal * horizontal + vertical * vertical;
+            count += 1;
+            x += step_x;
+        }
+        y += step_y;
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    (total / count as f32).sqrt()
+}

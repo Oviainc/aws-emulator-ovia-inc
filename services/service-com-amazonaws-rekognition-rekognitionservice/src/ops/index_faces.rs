@@ -295,8 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(_) => IndexFacesErrorModeled::InvalidS3ObjectException(
                     InvalidS3ObjectException {
                         message: Some(
-                            "Unable to get object metadata from S3. Check object key, region and/or access permissions."
-                                .to_string(),
+                            crate::state::image_source::UNREADABLE_OBJECT_MESSAGE.to_string(),
                         ),
                         ..InvalidS3ObjectException::default()
                     },
@@ -304,8 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => IndexFacesErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(
-                            "Request has invalid parameters: Image must carry either Bytes or S3Object"
-                                .to_string(),
+                            crate::state::image_source::MISSING_IMAGE_CONTENT_MESSAGE.to_string(),
                         ),
                         ..InvalidParameterException::default()
                     },
