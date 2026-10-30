@@ -211,11 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // configuration, and an empty list contains nothing.
         let configured = input.configuration.as_ref().is_some_and(|c| !c.is_empty());
         // Modelled: "A resource group can contain either a ResourceQuery or a
-        // Configuration, but not both."
+        // Configuration, but not both." The refusal is the service's own FIXED
+        // sentence, naming the two request members and nothing the caller sent.
         if configured && input.resource_query.is_some() {
             return Err(bad_request(
-                "a resource group can contain either a ResourceQuery or a Configuration, \
-                 but not both",
+                "Please use only 'configuration' or 'query' in the request, but not both.",
             ));
         }
         // The service-configuration rules this service decides in one place, so
@@ -249,19 +249,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // any other possible capitalization; these are reserved." `get` keeps the
         // comparison on a char boundary: `Name` is request-supplied, so byte-indexing it
         // would panic on a name whose third byte is inside a multi-byte character.
+        // The refusal is the service's own FIXED sentence — the same one for every
+        // capitalization of the prefix — and it does not repeat the submitted name,
+        // which is already in the request.
         if input
             .name
             .get(..3)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("aws"))
         {
-            return Err(bad_request(format!(
-                "Name {} is not valid: a group name cannot start with a reserved prefix \
-                 (any capitalization of 'aws')",
-                input.name,
-            )));
+            return Err(bad_request("Group name must not start with 'AWS'"));
         }
         // The resource-query rules this service decides in one place, so every
-        // operation that takes a `ResourceQuery` refuses the same documents.
+        // operation that takes a `ResourceQuery` refuses the same documents — a
+        // document that defines no membership for its own `Type` among them, since
+        // a stored query that can never resolve membership is a group that can
+        // never hold anything.
         if let Some(query) = &input.resource_query {
             crate::state::check_resource_query(query).map_err(bad_request)?;
         }

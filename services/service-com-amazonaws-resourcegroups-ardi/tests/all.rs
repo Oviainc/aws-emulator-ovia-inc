@@ -55,6 +55,8 @@ mod put_group_configuration;
 mod region_isolation;
 #[path = "all/region_scoped_pagination_tokens.rs"]
 mod region_scoped_pagination_tokens;
+#[path = "all/rejection_contract.rs"]
+mod rejection_contract;
 #[path = "all/reported_list_wire_form.rs"]
 mod reported_list_wire_form;
 #[path = "all/reserved_tag_keys.rs"]

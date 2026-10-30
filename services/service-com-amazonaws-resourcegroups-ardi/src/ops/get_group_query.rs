@@ -204,11 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = store.lookup(&region, identifier).ok_or_else(not_found)?;
         let record = store.groups.get(&key).ok_or_else(not_found)?;
         // A resource query is an attribute only a query-based group has: a group
-        // created with a `Configuration`, or with neither, holds none.
+        // created with a `Configuration`, or with neither, holds none, so such a
+        // group is a target this operation does not support.
         let Some(resource_query) = record.to_resource_query() else {
             return Err(GetGroupQueryErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(format!("the group {} has no resource query", key.name)),
+                    message: Some(crate::state::UNSUPPORTED_TARGET_MESSAGE.to_string()),
                 },
             )
             .into());

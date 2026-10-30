@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // recorded against it.
         if group.static_membership_configuration_type().is_none() {
             return Err(GroupResourcesErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::unsupported_group_message(Self::NAME)),
+                message: Some(crate::state::UNSUPPORTED_TARGET_MESSAGE.to_string()),
             })
             .into());
         }

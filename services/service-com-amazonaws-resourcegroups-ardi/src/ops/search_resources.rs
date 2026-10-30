@@ -213,6 +213,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             query_type: input.resource_query.r#type.clone(),
             query: input.resource_query.query.clone(),
         };
+        // Read through the same shared parse the validation above used, so a search
+        // reads the document exactly as the validator judged it.
+        let document = crate::state::query_document(&query.query).map_err(bad_request)?;
 
         // A stack query matches the members of ONE CloudFormation stack, and this
         // service records no stack and no stack's members, so no stack of the account
@@ -220,8 +223,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CLOUDFORMATION_STACK_NOT_EXISTING` names, reported beside an empty result
         // the way the model documents `QueryErrors` ("a message that explains the
         // ErrorCode"), rather than refused.
-        if query.query_type == STACK_QUERY_TYPE {
-            let stack = stack_identifier(&query.query).map_err(bad_request)?;
+        if query.query_type == crate::state::STACK_QUERY_TYPE {
+            let stack = crate::state::stack_identifier(&document).map_err(bad_request)?;
             return Ok(SearchResourcesOutput {
                 resource_identifiers: Some(Vec::new()),
                 next_token: None,
@@ -234,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The tag filters the query matches resources on, read out of the stored
         // document; a document that carries none matches on resource type alone.
-        let filters = tag_filters(&query.query).map_err(bad_request)?;
+        let filters = crate::state::tag_filters(&document).map_err(bad_request)?;
         // `ResourceTypeFilters` means here what it means on a group's query: the
         // types a match is limited to, or no limit at all.
         let type_limit = query.resource_type_limit();
@@ -310,34 +313,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled `QueryType` whose query names a CloudFormation stack.
-///
-/// Source: `smithy_query(query="shape",shape="QueryType")`, whose pattern `^\w+$`
-/// admits one spelling of each value, so the comparison against it is exact.
-const STACK_QUERY_TYPE: &str = "CLOUDFORMATION_STACK_1_0";
-
-/// The element a [`STACK_QUERY_TYPE`] query names its stack in: "applicable only if
-/// `Type` = `CLOUDFORMATION_STACK_1_0`. The value of this parameter is the Amazon
-/// Resource Name (ARN) of the CloudFormation stack whose resources you want included in the
-/// group" (`smithy_query(query="doc",shape="ResourceQuery",member="Query")`).
-const STACK_IDENTIFIER_ELEMENT: &str = "StackIdentifier";
-
 /// The modelled `QueryErrorCode` for a stack a query names that the account holds
 /// none of.
 ///
 /// Source: `smithy_query(query="shape",shape="QueryErrorCode")`, which declares it
 /// beside the other codes in [`QUERY_ERROR_CODE_VALUES`].
 const STACK_NOT_EXISTING: &str = "CLOUDFORMATION_STACK_NOT_EXISTING";
-
-/// The element a tag query carries its tag filters in, and the two elements of one
-/// such filter.
-///
-/// Source: `smithy_query(query="doc",shape="ResourceQuery",member="Query")`, whose
-/// `TagFilters` entry documents the collection as
-/// `[ { "Key": "Stage", "Values": [ "Gamma", "Beta" ] } ]`.
-const TAG_FILTERS_ELEMENT: &str = "TagFilters";
-const TAG_FILTER_KEY_ELEMENT: &str = "Key";
-const TAG_FILTER_VALUES_ELEMENT: &str = "Values";
 
 /// The ARNs of `region`'s resources the query matches, each mapped to the resource
 /// type reported for it, in ARN order — which is both the order a page reports them
@@ -358,7 +339,7 @@ fn matching(
     store: &crate::state::ComAmazonawsResourcegroupsArdiState,
     region: &str,
     limit: Option<&[String]>,
-    filters: &[TagFilter],
+    filters: &[crate::state::QueryTagFilter],
 ) -> std::collections::BTreeMap<String, Option<String>> {
     // A membership's tags are not recorded, and a tag filter is satisfied only by
     // carrying its key, so a query that filters on any tag matches no membership at
@@ -414,101 +395,12 @@ fn admits_type(resource_type: Option<&str>, limit: Option<&[String]>) -> bool {
 /// key and value.
 fn carries_tags(
     tags: &std::collections::BTreeMap<String, String>,
-    filters: &[TagFilter],
+    filters: &[crate::state::QueryTagFilter],
 ) -> bool {
     filters.iter().all(|filter| {
         tags.get(&filter.key)
             .is_some_and(|value| filter.values.is_empty() || filter.values.contains(value))
     })
-}
-
-/// One tag filter of a tag query: the key a matching resource carries, and the
-/// values of that key it may carry (none meaning any).
-#[derive(Debug)]
-struct TagFilter {
-    key: String,
-    values: Vec<String>,
-}
-
-/// The tag filters `document` carries, or the message the refusal reports when its
-/// [`TAG_FILTERS_ELEMENT`] is not the documented collection.
-///
-/// A document that carries no such element filters on no tag, which is how a query
-/// that matches on resource type alone is written. One read is bounded by the
-/// modelled `Query` length (`0..4096`), so the work one request asks for is bounded
-/// by the request itself.
-fn tag_filters(document: &str) -> Result<Vec<TagFilter>, String> {
-    // `check_resource_query` has already proved the document is a JSON object.
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(document) else {
-        return Ok(Vec::new());
-    };
-    let Some(entries) = parsed.get(TAG_FILTERS_ELEMENT) else {
-        return Ok(Vec::new());
-    };
-    let Some(entries) = entries.as_array() else {
-        return Err(format!(
-            "ResourceQuery.Query is not valid: {TAG_FILTERS_ELEMENT} must be a JSON \
-             array of tag filters"
-        ));
-    };
-    let mut filters: Vec<TagFilter> = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let Some(key) = entry
-            .get(TAG_FILTER_KEY_ELEMENT)
-            .and_then(serde_json::Value::as_str)
-        else {
-            return Err(format!(
-                "ResourceQuery.Query is not valid: every {TAG_FILTERS_ELEMENT} entry \
-                 names the tag key it matches on in {TAG_FILTER_KEY_ELEMENT}"
-            ));
-        };
-        let values = match entry.get(TAG_FILTER_VALUES_ELEMENT) {
-            None | Some(serde_json::Value::Null) => Vec::new(),
-            Some(serde_json::Value::Array(values)) => {
-                let mut collected: Vec<String> = Vec::with_capacity(values.len());
-                for value in values {
-                    let Some(value) = value.as_str() else {
-                        return Err(format!(
-                            "ResourceQuery.Query is not valid: {TAG_FILTER_VALUES_ELEMENT} \
-                             of the {TAG_FILTERS_ELEMENT} entry for {key} must hold tag \
-                             values, which are strings"
-                        ));
-                    };
-                    collected.push(value.to_string());
-                }
-                collected
-            }
-            Some(_) => {
-                return Err(format!(
-                    "ResourceQuery.Query is not valid: {TAG_FILTER_VALUES_ELEMENT} of the \
-                     {TAG_FILTERS_ELEMENT} entry for {key} must be a JSON array of tag values"
-                ))
-            }
-        };
-        filters.push(TagFilter {
-            key: key.to_string(),
-            values,
-        });
-    }
-    Ok(filters)
-}
-
-/// The stack `document` names, or the message the refusal reports when it names
-/// none: a stack query matches the members of one stack, so a document carrying no
-/// [`STACK_IDENTIFIER_ELEMENT`] string defines no search at all.
-fn stack_identifier(document: &str) -> Result<String, String> {
-    serde_json::from_str::<serde_json::Value>(document)
-        .ok()
-        .as_ref()
-        .and_then(|parsed| parsed.get(STACK_IDENTIFIER_ELEMENT))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            format!(
-                "ResourceQuery.Query is not valid: a {STACK_QUERY_TYPE} query names the \
-                 stack whose resources it matches in {STACK_IDENTIFIER_ELEMENT}"
-            )
-        })
 }
 
 /// The listing one query's pagination tokens belong to: a token issued here resumes a

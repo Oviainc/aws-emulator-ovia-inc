@@ -212,18 +212,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = store.groups.get_mut(&key).ok_or_else(not_found)?;
         // Modelled: "A resource group can contain either a Configuration or a
         // ResourceQuery, but not both" — so a group whose configuration carries an
-        // item has no query to update and is given none here, whether that
-        // configuration is the one in effect or one an accepted update is about to
-        // put in effect. A group that carries neither contains no configuration, so
-        // the exclusion does not reach it and the query below becomes the one it is
-        // queried by.
-        if let Some(configured) = record.configured_type(now) {
-            let message = format!(
-                "a resource group can contain either a ResourceQuery or a Configuration, \
-                 but not both, and the group {} is configured as {configured}",
-                key.name,
-            );
-            return Err(bad_request(message));
+        // item has no query to update and is a target this operation does not
+        // support, whether that configuration is the one in effect or one an
+        // accepted update is about to put in effect. A group that carries neither
+        // contains no configuration, so the exclusion does not reach it and the
+        // query below becomes the one it is queried by.
+        if record.configured_type(now).is_some() {
+            return Err(bad_request(crate::state::UNSUPPORTED_TARGET_MESSAGE));
         }
         // The whole query replaces the stored one, and is stored verbatim: the
         // document a later read reports is byte for byte the one this request sent.

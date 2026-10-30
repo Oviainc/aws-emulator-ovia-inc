@@ -222,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call could ever drop.
         if !group.serves_static_membership_removal() {
             return Err(UngroupResourcesErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::unsupported_group_message(Self::NAME)),
+                message: Some(crate::state::UNSUPPORTED_TARGET_MESSAGE.to_string()),
             })
             .into());
         }

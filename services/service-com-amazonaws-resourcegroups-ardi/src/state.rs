@@ -434,22 +434,65 @@ pub fn check_tags<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> Res
     Ok(())
 }
 
+/// The message this service answers when a `ResourceQuery`'s `Query` document is
+/// not one that defines a membership for the query's own `Type`.
+///
+/// One FIXED sentence, whichever part of the document is at fault, and it names
+/// nothing the caller sent: the document is already in the request, so echoing a
+/// piece of it back says nothing the request does not say.
+pub const QUERY_NOT_VALID_MESSAGE: &str =
+    "Query not valid: Query format not valid: check JSON syntax";
+
+/// The modelled `QueryType` whose query names a CloudFormation stack.
+///
+/// Source: `smithy_query(query="shape",shape="QueryType")`, whose pattern `^\w+$`
+/// admits one spelling of each value, so the comparison against it is exact.
+pub const STACK_QUERY_TYPE: &str = "CLOUDFORMATION_STACK_1_0";
+
+/// The element a [`STACK_QUERY_TYPE`] query names its stack in: "applicable only
+/// if `Type` = `CLOUDFORMATION_STACK_1_0`. The value of this parameter is the
+/// Amazon Resource Name (ARN) of the CloudFormation stack whose resources you want
+/// included in the group"
+/// (`smithy_query(query="doc",shape="ResourceQuery",member="Query")`).
+pub const STACK_IDENTIFIER_ELEMENT: &str = "StackIdentifier";
+
+/// The element a tag query carries its tag filters in, and the two elements of one
+/// such filter.
+///
+/// Source: `smithy_query(query="doc",shape="ResourceQuery",member="Query")`, whose
+/// `TagFilters` entry documents the collection as
+/// `[ { "Key": "Stage", "Values": [ "Gamma", "Beta" ] } ]`.
+pub const TAG_FILTERS_ELEMENT: &str = "TagFilters";
+const TAG_FILTER_KEY_ELEMENT: &str = "Key";
+const TAG_FILTER_VALUES_ELEMENT: &str = "Values";
+
+/// One tag filter of a tag query: the key a matching resource carries, and the
+/// values of that key it may carry (none meaning any).
+#[derive(Debug, Clone)]
+pub struct QueryTagFilter {
+    pub key: String,
+    pub values: Vec<String>,
+}
+
 /// `Ok(())` when `query` is a resource query this service stores, else the
 /// message the refusal reports.
 ///
 /// The ONE place this service decides whether a `ResourceQuery` is well formed,
-/// so every operation that takes one — a create and a tag-sync task — refuses the
-/// same documents the same way:
+/// so every operation that takes one — a create, a query update, a search and a
+/// tag-sync task — refuses the same documents the same way:
 ///
 /// * `Type` is a value the modelled `QueryType` declares
 ///   ([`crate::ops::types::QUERY_TYPE_VALUES`]);
 /// * `Query` is a JSON object, which is what the model documents it as — "the
-///   query that defines a group or a search", `{"ResourceTypeFilters":[..],
-///   "TagFilters":[..]}` for a tag query and `{"StackIdentifier":".."}` for a
-///   stack query — so a body that is not an object defines no query.
+///   query that defines a group or a search" ([`query_document`]);
+/// * that object DEFINES a membership for its `Type`: a [`STACK_QUERY_TYPE`]
+///   document names the stack whose resources the group holds
+///   ([`stack_identifier`]), and a tag query's [`TAG_FILTERS_ELEMENT`] is the
+///   documented collection ([`tag_filters`]).
 ///
-/// Which keys a given `Type` accepts is NOT refused here: the query is stored
-/// without being run.
+/// A document that defines no membership is refused here rather than stored,
+/// because a group whose query cannot resolve membership is one nothing can ever
+/// resolve: the mistake belongs at the call that sent it.
 pub fn check_resource_query(query: &ResourceQuery) -> Result<(), String> {
     if !QUERY_TYPE_VALUES.contains(&query.r#type.as_str()) {
         return Err(format!(
@@ -458,12 +501,80 @@ pub fn check_resource_query(query: &ResourceQuery) -> Result<(), String> {
             QUERY_TYPE_VALUES.join(", "),
         ));
     }
-    if !serde_json::from_str::<serde_json::Value>(&query.query)
-        .is_ok_and(|parsed| parsed.is_object())
-    {
-        return Err("ResourceQuery.Query is not valid: it must be a JSON object".to_string());
+    let document = query_document(&query.query)?;
+    if query.r#type == STACK_QUERY_TYPE {
+        stack_identifier(&document)?;
+    } else {
+        tag_filters(&document)?;
     }
     Ok(())
+}
+
+/// The `Query` document parsed as the JSON object the model documents it as —
+/// `{"ResourceTypeFilters":[..], "TagFilters":[..]}` for a tag query and
+/// `{"StackIdentifier":".."}` for a stack query — or the message the refusal
+/// reports when it is not one.
+///
+/// One parse is bounded by the modelled `Query` length (`0..4096`), so the work
+/// one request asks for is bounded by the request itself.
+pub fn query_document(query: &str) -> Result<serde_json::Value, String> {
+    match serde_json::from_str::<serde_json::Value>(query) {
+        Ok(parsed) if parsed.is_object() => Ok(parsed),
+        _ => Err(QUERY_NOT_VALID_MESSAGE.to_string()),
+    }
+}
+
+/// The stack `document` names, or the message the refusal reports when it names
+/// none: a stack query matches the members of ONE stack, so a document carrying no
+/// non-empty [`STACK_IDENTIFIER_ELEMENT`] string defines no membership at all.
+pub fn stack_identifier(document: &serde_json::Value) -> Result<&str, String> {
+    document
+        .get(STACK_IDENTIFIER_ELEMENT)
+        .and_then(serde_json::Value::as_str)
+        .filter(|stack| !stack.trim().is_empty())
+        .ok_or_else(|| QUERY_NOT_VALID_MESSAGE.to_string())
+}
+
+/// The tag filters `document` carries, or the message the refusal reports when its
+/// [`TAG_FILTERS_ELEMENT`] is not the documented collection.
+///
+/// A document that carries no such element filters on no tag, which is how a query
+/// that matches on resource type alone is written.
+pub fn tag_filters(document: &serde_json::Value) -> Result<Vec<QueryTagFilter>, String> {
+    let Some(entries) = document.get(TAG_FILTERS_ELEMENT) else {
+        return Ok(Vec::new());
+    };
+    let Some(entries) = entries.as_array() else {
+        return Err(QUERY_NOT_VALID_MESSAGE.to_string());
+    };
+    let mut filters: Vec<QueryTagFilter> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(key) = entry
+            .get(TAG_FILTER_KEY_ELEMENT)
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Err(QUERY_NOT_VALID_MESSAGE.to_string());
+        };
+        let values = match entry.get(TAG_FILTER_VALUES_ELEMENT) {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(values)) => {
+                let mut collected: Vec<String> = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(value) = value.as_str() else {
+                        return Err(QUERY_NOT_VALID_MESSAGE.to_string());
+                    };
+                    collected.push(value.to_string());
+                }
+                collected
+            }
+            Some(_) => return Err(QUERY_NOT_VALID_MESSAGE.to_string()),
+        };
+        filters.push(QueryTagFilter {
+            key: key.to_string(),
+            values,
+        });
+    }
+    Ok(filters)
 }
 
 /// The modelled `GroupConfigurationStatus` of a service configuration that is in
@@ -582,18 +693,17 @@ pub const APPLICATION_GROUP_CONFIGURATION_TYPE: &str = "AWS::ResourceGroups::App
 /// application group reports has this single key.
 pub const APPLICATION_TAG_KEY: &str = "awsApplication";
 
-/// The message a static-membership operation reports for a group whose stored
-/// configuration declares none of [`STATIC_MEMBERSHIP_CONFIGURATION_TYPES`].
+/// The message this service answers when an operation is applied to a group whose
+/// FORM does not support it: a static-membership call on a group whose
+/// configuration declares none of [`STATIC_MEMBERSHIP_CONFIGURATION_TYPES`], a
+/// configuration call on a group that holds only a resource query, or a query call
+/// on a group that holds only a configuration.
 ///
-/// Built from the request's own operation name and the catalog above, so the
-/// refusal says which operation was refused and which groups it serves.
-pub fn unsupported_group_message(operation: &str) -> String {
-    format!(
-        "{operation} can only be used with a group whose configuration is one of {}; \
-         other resource group types are not supported by this operation",
-        STATIC_MEMBERSHIP_CONFIGURATION_TYPES.join(", "),
-    )
-}
+/// One FIXED sentence for every such refusal. It names neither the group nor the
+/// operation nor the forms this service supports: the request already names the
+/// group and the operation, and the catalog of supported forms is this emulator's
+/// own state, not something a refusal reports.
+pub const UNSUPPORTED_TARGET_MESSAGE: &str = "This operation does not support the target";
 
 /// One persisted resource group: its identity, its describable attributes, the
 /// query or the service configuration it was created with, its tags, and its

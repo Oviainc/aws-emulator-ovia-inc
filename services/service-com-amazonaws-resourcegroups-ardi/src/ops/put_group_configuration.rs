@@ -225,17 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = store.groups.get_mut(&key).ok_or_else(not_found)?;
         // Modelled on `PutGroupConfigurationInput$Configuration`: "A resource group can
         // contain either a Configuration or a ResourceQuery, but not both" — so a group
-        // that is queried takes no configuration, the same exclusion `UpdateGroupQuery`
-        // refuses a request for from the other side.
-        if configured {
-            if let Some(queried) = record.resource_query.as_ref() {
-                let message = format!(
-                    "a resource group can contain either a Configuration or a ResourceQuery, \
-                     but not both, and the group {} is queried by {}",
-                    key.name, queried.query_type,
-                );
-                return Err(bad_request(message));
-            }
+        // that is queried takes no configuration and is a target this operation does
+        // not support, the same exclusion `UpdateGroupQuery` refuses a request for from
+        // the other side.
+        if configured && record.resource_query.is_some() {
+            return Err(bad_request(crate::state::UNSUPPORTED_TARGET_MESSAGE));
         }
         // An application group's ARN QUALIFIES its name with its application id, and
         // the modelled `ApplicationArn` writes that name segment narrower than a group

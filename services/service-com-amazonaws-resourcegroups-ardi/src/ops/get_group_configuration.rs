@@ -207,10 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(configuration) = record.to_group_configuration() else {
             return Err(GetGroupConfigurationErrorModeled::BadRequestException(
                 BadRequestException {
-                    message: Some(format!(
-                        "the group {} has no service configuration",
-                        key.name,
-                    )),
+                    message: Some(crate::state::UNSUPPORTED_TARGET_MESSAGE.to_string()),
                 },
             )
             .into());

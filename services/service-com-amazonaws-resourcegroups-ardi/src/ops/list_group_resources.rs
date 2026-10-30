@@ -259,11 +259,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(limit) = group.query_resource_type_limit() {
             let invalid = unadmitted_types(&filters, &limit);
             if !invalid.is_empty() {
-                // The documented sentence, then the types that failed the
+                // The service's own FIXED sentence, then the types that failed the
                 // validation — which the model documents the error as including —
                 // taken from the request itself.
                 return Err(bad_request(format!(
-                    "The resource types specified as filters in the request are not valid. {}",
+                    "{INCOMPATIBLE_FILTER_TYPES_MESSAGE} {}",
                     invalid.join(", "),
                 )));
             }
@@ -329,6 +329,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The fixed part of the message this listing refuses an incompatible
+/// `resource-type` filter with, before the types that failed the validation.
+///
+/// The model documents a message "similar to" `The resource types specified as
+/// filters in the request are not valid.`
+/// (`smithy_query(query="doc",shape="ListGroupResourcesInput",member="Filters")`)
+/// and adds that "the error includes a list of resource types that failed the
+/// validation because they are not part of the query associated with the group" —
+/// which is what the service's own wording says: the types are not invalid in
+/// themselves, they are incompatible with THIS group's query.
+const INCOMPATIBLE_FILTER_TYPES_MESSAGE: &str = "Filters not valid: The resource types specified \
+     as filters in the request are incompatible with the group query:";
 
 /// The listing one group's pagination tokens belong to: a token issued here
 /// resumes THIS listing of THAT group, and no other. The region the group lives

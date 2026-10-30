@@ -28,13 +28,16 @@ use super::resource_group_lifecycle::{error_code, static_group, Emulator};
 /// `smithy_query(query="doc",shape="ListGroupResourcesInput",member="Filters")`.
 const ALL_SUPPORTED: &str = "AWS::AllSupported";
 
-/// The documented message the refusal carries.
+/// The fixed part of the message the refusal carries, before the list of resource
+/// types that failed the validation.
 ///
-/// Source: `smithy_query(query="doc",shape="ListGroupResourcesInput",member="Filters")`,
-/// which quotes it and adds that "the error includes a list of resource types that
-/// failed the validation".
-const INVALID_FILTER_TYPES_MESSAGE: &str =
-    "The resource types specified as filters in the request are not valid.";
+/// Source: the recorded refusal. The model quotes a message "similar to" `The
+/// resource types specified as filters in the request are not valid.` and adds that
+/// "the error includes a list of resource types that failed the validation because
+/// they are not part of the query associated with the group"
+/// (`smithy_query(query="doc",shape="ListGroupResourcesInput",member="Filters")`).
+const INVALID_FILTER_TYPES_MESSAGE: &str = "Filters not valid: The resource types specified as \
+     filters in the request are incompatible with the group query:";
 
 /// One group the table judges filters against: the `CreateGroup` request that
 /// stores it, and the resource types its stored query admits — `None` for a query
