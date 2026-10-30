@@ -53,6 +53,8 @@ mod metadata_sync;
 mod metadata_sync_is_not_gated_on_property_mappings;
 #[path = "all/metadata_sync_over_the_wire.rs"]
 mod metadata_sync_over_the_wire;
+#[path = "all/metadata_sync_publication_is_one_instant.rs"]
+mod metadata_sync_publication_is_one_instant;
 #[path = "all/metadata_sync_restart_supersedes_the_pending_sync.rs"]
 mod metadata_sync_restart_supersedes_the_pending_sync;
 #[path = "all/minted_identity_is_never_reused.rs"]

@@ -58,7 +58,7 @@ use backup_gateway::state::{
     SYNC_METADATA_CREATED, SYNC_METADATA_RUNNING, SYNC_METADATA_SUCCEEDED,
 };
 
-use crate::gateway_lifecycle::{build_engine, build_router, call, create, Reply, REGION};
+use crate::gateway_lifecycle::{build_engine, build_router, call, create, epoch_secs, Reply, REGION};
 
 /// A hypervisor ARN in `partition` naming `id`, so the rows span every partition the
 /// modelled `ServerArn` pattern accepts (`aws`, `aws-cn`, `aws-us-gov`).
@@ -177,13 +177,6 @@ fn reported_success_time(reply: &Reply) -> Option<f64> {
         .body
         .pointer("/Hypervisor/LastSuccessfulMetadataSyncTime")
         .and_then(Value::as_f64)
-}
-
-/// `time` as epoch seconds, the form the modelled `Time` timestamp takes on the wire.
-fn epoch_secs(time: SystemTime) -> f64 {
-    time.duration_since(SystemTime::UNIX_EPOCH)
-        .expect("the test clock is past the epoch")
-        .as_secs_f64()
 }
 
 /// A started sync is persisted on the hypervisor the ARN resolves to, and the status a

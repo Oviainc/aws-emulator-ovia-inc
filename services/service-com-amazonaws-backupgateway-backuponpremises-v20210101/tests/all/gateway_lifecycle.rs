@@ -41,6 +41,18 @@ const TARGET_PREFIX: &str = "BackupOnPremises_v20210101";
 /// `us-east-1` fallback: a minted ARN has to carry the region the caller addressed.
 pub(crate) const REGION: &str = "us-west-2";
 
+/// The tolerance a reported instant is compared with: the wire carries the modelled `Time`
+/// as epoch seconds, so a millisecond of rounding is not a difference.
+pub(crate) const INSTANT_TOLERANCE_SECS: f64 = 0.002;
+
+/// `time` as epoch seconds, the form the modelled `Time` timestamp takes on the wire —
+/// shared with the sibling suites, so one reported instant is read one way everywhere.
+pub(crate) fn epoch_secs(time: SystemTime) -> f64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .expect("the test clock is past the epoch")
+        .as_secs_f64()
+}
+
 /// The activation key the helpers below create gateways with: one the service ISSUED.
 ///
 /// A create REDEEMS the activation its key names, and a key is minted only by the
