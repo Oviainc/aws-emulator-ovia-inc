@@ -67,6 +67,8 @@ mod pagination_token_opacity;
 mod report_acceptance_type;
 #[path = "all/report_projection.rs"]
 mod report_projection;
+#[path = "all/report_published_description.rs"]
+mod report_published_description;
 #[path = "all/report_target_resolution_rule.rs"]
 mod report_target_resolution_rule;
 #[path = "all/report_workflow.rs"]

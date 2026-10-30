@@ -501,6 +501,12 @@ pub struct ReportVersion {
     pub upload_state: String,
     /// "The message associated with the current upload state."
     pub status_message: Option<String>,
+    /// The PUBLISHED description of the document this version carries — the publisher's
+    /// own prose about it, which is what `ReportSummary$description` and
+    /// `ReportDetail$description` report (both target `LongStringAttribute`,
+    /// `@length(min: 1, max: 2048)`, `@pattern ^[^<>]*$`). Held per version because the
+    /// member is projected per version, so a report that ever published two descriptions
+    /// can hold both.
     pub description: String,
     /// "Timestamp indicating the report resource effective start."
     pub period_start: SystemTime,
@@ -2987,7 +2993,6 @@ const UPLOAD_COMPLETE_MESSAGE: &str = "Document upload is complete.";
 /// One seeded report version, before it becomes a [`ReportVersion`].
 struct SeedVersion {
     version: i64,
-    description: &'static str,
     period_start: u64,
     period_end: u64,
     published_at: u64,
@@ -2998,6 +3003,16 @@ struct SeedVersion {
 struct SeedReport {
     id: &'static str,
     name: &'static str,
+    /// The report's PUBLISHED description — the text the publisher writes about the
+    /// document, which is what `ReportSummary$description` and `ReportDetail$description`
+    /// report. Both target `LongStringAttribute` (`@length(min: 1, max: 2048)`,
+    /// `@pattern ^[^<>]*$`), whose ceiling is the room a published description of several
+    /// sentences needs: a reader of the catalog gets the document's own description, not a
+    /// one-line label naming it.
+    ///
+    /// One per REPORT rather than per version: a description describes the document, and
+    /// the window one version covers is reported by that version's own period members.
+    description: &'static str,
     series: &'static str,
     category: &'static str,
     acceptance_type: &'static str,
@@ -3034,9 +3049,15 @@ const PRODUCT_NAME: &str = "AWS";
 /// and are this emulator's, not a claim that AWS issued them. They are here so the
 /// catalog is the published SET a client browses and PAGES — a set of a handful of rows
 /// is one no realistic page bound ever cuts — not to reach AWS's full catalog size, which
-/// no recording in this corpus discloses. Every version's `description` is likewise the
-/// emulator's own prose: the recording withholds its descriptions, and no rule derives
-/// one.
+/// no recording in this corpus discloses.
+///
+/// Every row's `description` is the PUBLISHED description of its document — the prose a
+/// publisher writes about a compliance document, which is what the member carries — and
+/// never a label restating the row's `name`. The first row's text is the published one the
+/// corpus records for that report
+/// (`issues/things-that-now-work/20261029T192742Z-artifact-read-plane-serves-an-incomplete-report-catalog.md`
+/// quotes it); the rest are this emulator's own, written in that same register, because
+/// the corpus discloses no other published description and no rule derives one.
 ///
 /// The rows span what the report surface generalises over: ten series, two categories,
 /// both `AcceptanceType` values, one, two, three and seven published versions, and
@@ -3055,6 +3076,12 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-073F0fUCdVVNKJrF",
         name: "AWS Outposts Rack Information Security FAQ",
+        description: "The AWS Outposts Information Security FAQ document is designed to help \
+                      customer teams responsible for information security evaluate the \
+                      service against their organizational requirements. The document is \
+                      aligned to common questions relating to people, process, and \
+                      technology that this audience often ask. This document is reviewed \
+                      and updated regularly with the latest information.",
         series: "AWS Services",
         category: "Alignment Documents",
         acceptance_type: "PASSTHROUGH",
@@ -3063,7 +3090,6 @@ const SEED: &[SeedReport] = &[
         versions: &[
             SeedVersion {
                 version: 1,
-                description: "Information security FAQ for AWS Outposts rack",
                 period_start: T2022NOV,
                 period_end: T2023OCT31,
                 published_at: T2022NOV,
@@ -3071,7 +3097,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 2,
-                description: "Information security FAQ for AWS Outposts rack",
                 period_start: T2023NOV,
                 period_end: T2024OCT31,
                 published_at: T2023NOV,
@@ -3079,7 +3104,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 3,
-                description: "Information security FAQ for AWS Outposts rack",
                 period_start: T2024NOV,
                 period_end: T2025OCT31,
                 published_at: T2024NOV,
@@ -3090,6 +3114,12 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-0c1IXmudeXuTlHJJ",
         name: "ISO 27001 2022 Certification",
+        description: "The ISO/IEC 27001:2022 certificate records the certification of the \
+                      AWS information security management system by an accredited \
+                      independent registrar. It names the services and AWS Regions in the \
+                      scope of the certification and the dates of the certification cycle \
+                      it was issued for. The certificate is reissued after each \
+                      surveillance and recertification audit.",
         series: "ISO",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -3098,7 +3128,6 @@ const SEED: &[SeedReport] = &[
         versions: &[
             SeedVersion {
                 version: 1,
-                description: "ISO 27001 2022 certificate covering AWS infrastructure services",
                 period_start: T2023JAN,
                 period_end: T2024JAN,
                 published_at: T2023JAN,
@@ -3106,7 +3135,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 2,
-                description: "ISO 27001 2022 certificate covering AWS infrastructure services",
                 period_start: T2024JAN,
                 period_end: T2025JAN,
                 published_at: T2024JAN,
@@ -3114,7 +3142,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 3,
-                description: "ISO 27001 2022 certificate covering AWS infrastructure services",
                 period_start: T2025JAN,
                 period_end: T2026JAN,
                 published_at: T2025JAN,
@@ -3125,6 +3152,13 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-5eevElBv6MyRmQsD",
         name: "UAE IAR Compliance Report",
+        description: "The UAE Information Assurance Regulation compliance report describes \
+                      how the AWS Regions in its scope meet the controls that the \
+                      Telecommunications and Digital Government Regulatory Authority \
+                      publishes in its Information Assurance Regulation. It is prepared by \
+                      an independent assessor and covers the assessment period stated on \
+                      the report. Customer teams use it to support their own assurance \
+                      obligations for workloads operated in the United Arab Emirates.",
         series: "UAE TDRA IAR",
         category: "Certifications and Attestations",
         acceptance_type: "EXPLICIT",
@@ -3133,7 +3167,6 @@ const SEED: &[SeedReport] = &[
         versions: &[
             SeedVersion {
                 version: 1,
-                description: "UAE TDRA Information Assurance Regulation compliance report",
                 period_start: T2022JAN,
                 period_end: T2022JUL,
                 published_at: T2022JUL,
@@ -3141,7 +3174,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 2,
-                description: "UAE TDRA Information Assurance Regulation compliance report",
                 period_start: T2022JUL,
                 period_end: T2023JAN,
                 published_at: T2023JAN,
@@ -3149,7 +3181,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 3,
-                description: "UAE TDRA Information Assurance Regulation compliance report",
                 period_start: T2023JAN,
                 period_end: T2023JUL,
                 published_at: T2023JUL,
@@ -3157,7 +3188,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 4,
-                description: "UAE TDRA Information Assurance Regulation compliance report",
                 period_start: T2023JUL,
                 period_end: T2024JAN,
                 published_at: T2024JAN,
@@ -3165,7 +3195,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 5,
-                description: "UAE TDRA Information Assurance Regulation compliance report",
                 period_start: T2024JAN,
                 period_end: T2024JUL,
                 published_at: T2024JUL,
@@ -3173,7 +3202,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 6,
-                description: "UAE TDRA Information Assurance Regulation compliance report",
                 period_start: T2024JUL,
                 period_end: T2025JAN,
                 published_at: T2025JAN,
@@ -3181,7 +3209,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 7,
-                description: "UAE TDRA Information Assurance Regulation compliance report",
                 period_start: T2025JAN,
                 period_end: T2025JUL,
                 published_at: T2025JUL,
@@ -3192,6 +3219,12 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-7g5j2DTVeNXWx7St",
         name: "Annual Compliance Report",
+        description: "The AWS annual compliance report consolidates the independent audits \
+                      AWS completed during the reporting period with the certifications \
+                      and attestations that were in force at the end of it. It states the \
+                      services and AWS Regions in scope and the standard each one was \
+                      assessed against. Customer teams use it as the single annual summary \
+                      of the AWS compliance program.",
         series: "ACR",
         category: "Certifications and Attestations",
         acceptance_type: "EXPLICIT",
@@ -3199,7 +3232,6 @@ const SEED: &[SeedReport] = &[
         term_object: "AWS-Annual-Compliance-Report-Term.txt",
         versions: &[SeedVersion {
             version: 1,
-            description: "AWS annual compliance report",
             period_start: T2024JAN,
             period_end: T2025JAN,
             published_at: T2025JAN,
@@ -3209,6 +3241,13 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-9pQ2mT8xLbV4sZ1c",
         name: "SOC 2 Type 2 Report",
+        description: "The AWS SOC 2 Type 2 report describes the AWS control environment and \
+                      the results of the independent auditor's tests of the controls \
+                      relevant to the security, availability and confidentiality trust \
+                      services criteria. It covers the services and AWS Regions listed in \
+                      the report over the examination period stated on it. The report is \
+                      confidential and is released under the term the customer accepts \
+                      before downloading it.",
         series: "SOC",
         category: "Certifications and Attestations",
         acceptance_type: "EXPLICIT",
@@ -3217,7 +3256,6 @@ const SEED: &[SeedReport] = &[
         versions: &[
             SeedVersion {
                 version: 1,
-                description: "SOC 2 Type 2 report for the first half of 2024",
                 period_start: T2024JAN,
                 period_end: T2024JUL,
                 published_at: T2024JUL,
@@ -3225,7 +3263,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 2,
-                description: "SOC 2 Type 2 report for the second half of 2024",
                 period_start: T2024JUL,
                 period_end: T2025JAN,
                 published_at: T2025JAN,
@@ -3236,6 +3273,12 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-Af3KdN7yRw2HqS5e",
         name: "PCI DSS Attestation of Compliance",
+        description: "The PCI DSS Attestation of Compliance records the assessment of the \
+                      AWS cardholder data environment against the Payment Card Industry \
+                      Data Security Standard by a qualified security assessor. It lists \
+                      the services and AWS Regions in scope and the requirements each one \
+                      was assessed against. Customer teams use it as the service provider \
+                      attestation for their own PCI DSS assessments.",
         series: "PCI",
         category: "Certifications and Attestations",
         acceptance_type: "EXPLICIT",
@@ -3244,7 +3287,6 @@ const SEED: &[SeedReport] = &[
         versions: &[
             SeedVersion {
                 version: 1,
-                description: "PCI DSS Attestation of Compliance for calendar year 2023",
                 period_start: T2023JAN,
                 period_end: T2024JAN,
                 published_at: T2024JAN,
@@ -3252,7 +3294,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 2,
-                description: "PCI DSS Attestation of Compliance for calendar year 2024",
                 period_start: T2024JAN,
                 period_end: T2025JAN,
                 published_at: T2025JAN,
@@ -3263,6 +3304,13 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-Bq7WmF3xTk9ZpL2a",
         name: "SOC 1 Report",
+        description: "The AWS SOC 1 report describes the AWS control environment and the \
+                      results of the independent auditor's tests of the controls that are \
+                      relevant to a customer's internal control over financial reporting. \
+                      It covers the services and AWS Regions listed in the report over the \
+                      examination period stated on it. Customer teams and their auditors \
+                      use it where AWS is a service organization in the scope of a \
+                      financial audit.",
         series: "SOC",
         category: "Certifications and Attestations",
         acceptance_type: "EXPLICIT",
@@ -3271,7 +3319,6 @@ const SEED: &[SeedReport] = &[
         versions: &[
             SeedVersion {
                 version: 1,
-                description: "SOC 1 report on the controls of the AWS infrastructure services",
                 period_start: T2024JAN,
                 period_end: T2024JUL,
                 published_at: T2024JUL,
@@ -3279,7 +3326,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 2,
-                description: "SOC 1 report on the controls of the AWS infrastructure services",
                 period_start: T2024JUL,
                 period_end: T2025JAN,
                 published_at: T2025JAN,
@@ -3290,6 +3336,12 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-C4tYhR8nJd6VxQ3b",
         name: "SOC 3 Report",
+        description: "The AWS SOC 3 report is the general use summary of the SOC 2 \
+                      examination: it carries the independent auditor's opinion on the AWS \
+                      control environment without the detailed tests of controls. It covers \
+                      the services and AWS Regions listed in the report over the \
+                      examination period stated on it. Unlike the SOC 1 and SOC 2 reports \
+                      it may be shared freely.",
         series: "SOC",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -3297,7 +3349,6 @@ const SEED: &[SeedReport] = &[
         term_object: "AWS-SOC-3-Term.txt",
         versions: &[SeedVersion {
             version: 1,
-            description: "SOC 3 general-use report on the AWS system and controls",
             period_start: T2024JUL,
             period_end: T2025JAN,
             published_at: T2025JAN,
@@ -3307,6 +3358,13 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-D9kPzX2mLb7TnR4c",
         name: "ISO 27017 Certification",
+        description: "The ISO/IEC 27017:2015 certificate records the certification of the \
+                      AWS information security controls for cloud services by an \
+                      accredited independent registrar. It names the services and AWS \
+                      Regions in the scope of the certification and the dates of the \
+                      certification cycle it was issued for. The controls it covers extend \
+                      the ISO/IEC 27002 guidance to the provision and use of cloud \
+                      services.",
         series: "ISO",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -3315,7 +3373,6 @@ const SEED: &[SeedReport] = &[
         versions: &[
             SeedVersion {
                 version: 1,
-                description: "ISO 27017 cloud services information security certificate",
                 period_start: T2023JAN,
                 period_end: T2024JAN,
                 published_at: T2023JAN,
@@ -3323,7 +3380,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 2,
-                description: "ISO 27017 cloud services information security certificate",
                 period_start: T2024JAN,
                 period_end: T2025JAN,
                 published_at: T2024JAN,
@@ -3334,6 +3390,13 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-E2nVbK6yQw8MsZ5d",
         name: "ISO 27018 Certification",
+        description: "The ISO/IEC 27018:2019 certificate records the certification of the \
+                      AWS controls for the protection of personally identifiable \
+                      information processed in a public cloud by an accredited independent \
+                      registrar. It names the services and AWS Regions in the scope of the \
+                      certification and the dates of the certification cycle it was issued \
+                      for. Customer teams use it as evidence of the privacy controls a \
+                      public cloud processor is certified against.",
         series: "ISO",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -3341,7 +3404,6 @@ const SEED: &[SeedReport] = &[
         term_object: "ISO-27018-Term.txt",
         versions: &[SeedVersion {
             version: 1,
-            description: "ISO 27018 certificate for the protection of personal data in the cloud",
             period_start: T2024JAN,
             period_end: T2025JAN,
             published_at: T2024JAN,
@@ -3351,6 +3413,13 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-F6sJdL9xRt3WqN7e",
         name: "ISO 27701 Certification",
+        description: "The ISO/IEC 27701:2019 certificate records the certification of the \
+                      AWS privacy information management system by an accredited \
+                      independent registrar. It names the services and AWS Regions in the \
+                      scope of the certification and the dates of the certification cycle \
+                      it was issued for. The certificate covers the extension of the \
+                      information security management system to the processing of \
+                      personally identifiable information.",
         series: "ISO",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -3358,7 +3427,6 @@ const SEED: &[SeedReport] = &[
         term_object: "ISO-27701-Term.txt",
         versions: &[SeedVersion {
             version: 1,
-            description: "ISO 27701 privacy information management certificate",
             period_start: T2024JUL,
             period_end: T2025JUL,
             published_at: T2024JUL,
@@ -3368,6 +3436,12 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-G3mQfT7bXz5KpV8h",
         name: "ISO 9001 Certification",
+        description: "The ISO 9001:2015 certificate records the certification of the AWS \
+                      quality management system by an accredited independent registrar. It \
+                      names the services and AWS Regions in the scope of the certification \
+                      and the dates of the certification cycle it was issued for. Customer \
+                      teams in regulated industries use it as evidence of the quality \
+                      management AWS applies to the services in that scope.",
         series: "ISO",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -3375,7 +3449,6 @@ const SEED: &[SeedReport] = &[
         term_object: "ISO-9001-Term.txt",
         versions: &[SeedVersion {
             version: 1,
-            description: "ISO 9001 quality management certificate covering AWS services",
             period_start: T2023JUL,
             period_end: T2024JUL,
             published_at: T2023JUL,
@@ -3385,6 +3458,13 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-H8wRnP4cYk2JsL6m",
         name: "FedRAMP Moderate Customer Package",
+        description: "The FedRAMP Moderate customer package carries the security \
+                      documentation for the AWS Regions that hold a FedRAMP Moderate \
+                      authorization, including the system security plan summary and the \
+                      assessment results an agency reviews before it issues its own \
+                      authority to operate. It names the services inside the authorization \
+                      boundary over the period stated on the package. Access is limited to \
+                      the customers the package may be released to.",
         series: "FedRAMP",
         category: "Certifications and Attestations",
         acceptance_type: "EXPLICIT",
@@ -3392,8 +3472,6 @@ const SEED: &[SeedReport] = &[
         term_object: "FedRAMP-Moderate-Customer-Package-Term.txt",
         versions: &[SeedVersion {
             version: 1,
-            description: "FedRAMP Moderate customer package for the AWS US East and US West \
-                          Regions",
             period_start: T2024JAN,
             period_end: T2025JAN,
             published_at: T2024APR,
@@ -3403,6 +3481,12 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-J5zXkM9dVb3QtR7n",
         name: "IRAP Assessment Report",
+        description: "The IRAP assessment report describes the assessment of the AWS Asia \
+                      Pacific Region in its scope against the controls of the Australian \
+                      Government Information Security Manual by an endorsed IRAP assessor. \
+                      It lists the services assessed and the control set each one was \
+                      assessed against over the period stated on the report. Australian \
+                      government customers use it when accrediting their own systems.",
         series: "IRAP",
         category: "Certifications and Attestations",
         acceptance_type: "EXPLICIT",
@@ -3410,7 +3494,6 @@ const SEED: &[SeedReport] = &[
         term_object: "IRAP-Assessment-Term.txt",
         versions: &[SeedVersion {
             version: 1,
-            description: "IRAP assessment of the AWS Asia Pacific Sydney Region",
             period_start: T2024APR,
             period_end: T2025APR,
             published_at: T2024APR,
@@ -3420,6 +3503,13 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-K7bNqS2fWx8LmT4p",
         name: "C5 Attestation Report",
+        description: "The C5 attestation report records the attestation of the AWS controls \
+                      against the Cloud Computing Compliance Controls Catalogue that the \
+                      German Federal Office for Information Security publishes. It lists \
+                      the services and AWS Regions in scope and the basic and additional \
+                      criteria each one was attested against over the period stated on the \
+                      report. Customer teams in Germany use it to meet their own cloud \
+                      assurance requirements.",
         series: "C5",
         category: "Certifications and Attestations",
         acceptance_type: "EXPLICIT",
@@ -3428,8 +3518,6 @@ const SEED: &[SeedReport] = &[
         versions: &[
             SeedVersion {
                 version: 1,
-                description: "C5 attestation report on the AWS cloud computing compliance \
-                              controls catalogue",
                 period_start: T2023APR,
                 period_end: T2024APR,
                 published_at: T2023APR,
@@ -3437,8 +3525,6 @@ const SEED: &[SeedReport] = &[
             },
             SeedVersion {
                 version: 2,
-                description: "C5 attestation report on the AWS cloud computing compliance \
-                              controls catalogue",
                 period_start: T2024APR,
                 period_end: T2025APR,
                 published_at: T2024APR,
@@ -3449,6 +3535,12 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-L4dTvJ8hZn6RkQ9s",
         name: "Cloud Security Alliance CAIQ",
+        description: "The Consensus Assessments Initiative Questionnaire is the Cloud \
+                      Security Alliance questionnaire answered for AWS: it records the AWS \
+                      response to each control question of the Cloud Controls Matrix. It \
+                      covers the services and AWS Regions named in the questionnaire for \
+                      the period stated on it. Customer teams use it to compare the AWS \
+                      control environment with the CSA control framework.",
         series: "CSA",
         category: "Alignment Documents",
         acceptance_type: "PASSTHROUGH",
@@ -3456,7 +3548,6 @@ const SEED: &[SeedReport] = &[
         term_object: "CSA-CAIQ-Term.txt",
         versions: &[SeedVersion {
             version: 1,
-            description: "Consensus Assessments Initiative Questionnaire answered for AWS",
             period_start: T2024JAN,
             period_end: T2025JAN,
             published_at: T2024JAN,
@@ -3498,7 +3589,7 @@ fn seed_catalog() -> BTreeMap<String, Report> {
                                 state: "PUBLISHED".to_string(),
                                 upload_state: "COMPLETE".to_string(),
                                 status_message: Some(UPLOAD_COMPLETE_MESSAGE.to_string()),
-                                description: version.description.to_string(),
+                                description: seed.description.to_string(),
                                 period_start: at(version.period_start),
                                 period_end: at(version.period_end),
                                 published_at: at(version.published_at),
@@ -3554,7 +3645,7 @@ fn report_document(seed: &SeedReport, version: &SeedVersion) -> Vec<u8> {
         String::new(),
         format!("Report id: {}", seed.id),
         format!("Series: {}  Category: {}", seed.series, seed.category),
-        format!("Description: {}", version.description),
+        format!("Description: {}", seed.description),
         format!(
             "Reporting period: {} to {} (seconds since the Unix epoch)",
             version.period_start, version.period_end
