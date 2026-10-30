@@ -732,6 +732,35 @@ pub fn missing_application_message(name: &str) -> String {
     format!("Application '{name}' does not exist.")
 }
 
+/// How this service words a create refused because an application of that name is already
+/// stored: the SAME sentence shape a lookup miss uses
+/// ([`missing_application_message`]) — the resource the request named, quoted, then what
+/// is true of it, as a sentence ending in a period.
+pub fn existing_application_message(name: &str) -> String {
+    format!("Application '{name}' already exists.")
+}
+
+/// How this service words a sentence about one application's SNAPSHOT: the snapshot the
+/// request named is quoted, because it is what the sentence is about, and the application
+/// it belongs to is named plainly as the scope it was looked up in.
+///
+/// `fact` is what is true of that snapshot (`does not exist`, `already exists`), so every
+/// operation that reports on a snapshot by name states it the same way.
+fn snapshot_message(snapshot: &str, fact: &str, application: &str) -> String {
+    format!("Snapshot '{snapshot}' {fact} for application {application}.")
+}
+
+/// A snapshot the application holds no record of, for the operations that read one by name.
+pub fn missing_snapshot_message(snapshot: &str, application: &str) -> String {
+    snapshot_message(snapshot, "does not exist", application)
+}
+
+/// A snapshot name the application already holds a snapshot under, for the operations that
+/// create one.
+pub fn existing_snapshot_message(snapshot: &str, application: &str) -> String {
+    snapshot_message(snapshot, "already exists", application)
+}
+
 /// The region every ARN this service mints carries: the one the caller signed for.
 ///
 /// Falls back to the emulator's default region when the request carries no SigV4

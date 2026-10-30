@@ -18,7 +18,9 @@
 //!
 //! The ONE thing m2 words for itself is the ORDER of an enumerated type's value set, which
 //! this module therefore states by handing that renderer a violation whose value set is
-//! re-ordered — not by rewriting its output. m2 states the permitted values SORTED where the
+//! re-ordered — not by rewriting its output — through
+//! `service_common::validation_message::in_sorted_enum_order`, this emulator's one
+//! statement of that ordering. m2 states the permitted values SORTED where the
 //! model declares them in its own order (recorded behaviour: corpus
 //! `simparity-wire-aws-v1`, fixture `m2-engine-discovery-and-blu-insights` step `task#5`,
 //! where `ListEngineVersions` with an `engineType` outside `EngineType` is answered
@@ -30,7 +32,9 @@
 //! cover. `service_common::validation`'s own header leaves which values an enum's value set
 //! lists, and in which order, to the service for exactly this reason.
 
-use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+use aws_smithy_schema_server::constraints::Violation;
+#[cfg(test)]
+use aws_smithy_schema_server::constraints::ViolationKind;
 use smithy_server_runtime::Refused;
 
 /// The wire error code (`__type` / `x-amzn-errortype`) of this service's
@@ -44,37 +48,23 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// How m2 states a set of broken modelled constraints: its `ValidationException`, carrying
 /// the framework's envelope over the clauses of the violations as m2 orders their contents.
 ///
+/// Each violation travels through `service_common::validation_message::in_sorted_enum_order`
+/// — this emulator's one statement of that ordering: an enum violation's value set sorted by
+/// VALUE, a total order over the strings the model declares, and every other violation
+/// unchanged. The CLAUSE is still the framework's, so the member path, the echoed value and
+/// the requirement's wording stay in the one place that writes them.
+///
 /// `None` when there is nothing to state, which keeps the framework's own wording rather
 /// than answering with an empty message.
 pub(super) fn validation_refusal(violations: &[Violation]) -> Option<Refused> {
-    let stated: Vec<Violation> = violations.iter().map(as_m2_states_it).collect();
+    let stated: Vec<Violation> = violations
+        .iter()
+        .map(::service_common::validation_message::in_sorted_enum_order)
+        .collect();
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_string(),
         message: ::aws_smithy_schema_server::envelope(&stated)?,
     })
-}
-
-/// `violation` as m2 states it: an enum violation with its permitted value set sorted, and
-/// every other violation unchanged.
-///
-/// The CLAUSE is still the framework's — this only re-orders what goes into it, so the
-/// member path, the echoed value and the requirement's wording stay in the one place that
-/// writes them.
-///
-/// The set is sorted by VALUE, lexicographically, which is a total order over the strings
-/// the model declares: the same enum renders the same way whatever order a model revision
-/// lists its values in.
-fn as_m2_states_it(violation: &Violation) -> Violation {
-    let ViolationKind::EnumValue(declared) = &violation.kind else {
-        return violation.clone();
-    };
-    let mut sorted = declared.clone();
-    sorted.sort_unstable();
-    Violation {
-        path: violation.path.clone(),
-        kind: ViolationKind::EnumValue(sorted),
-        value: violation.value.clone(),
-    }
 }
 
 #[cfg(test)]

@@ -176,9 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeApplicationSnapshotErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Snapshot '{}' does not exist for application '{}'.",
-                            input.snapshot_name, input.application_name
+                        message: Some(crate::state::missing_snapshot_message(
+                            &input.snapshot_name,
+                            &input.application_name,
                         )),
                     },
                 )

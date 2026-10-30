@@ -186,16 +186,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A snapshot captures the state a RUNNING application holds; in any other status
-        // there is no running state to capture, so the application is not available for
-        // this operation.
+        // there is no running state to capture, so the request is not a valid one for the
+        // application as it stands — the modelled `InvalidRequestException` (HTTP 400),
+        // which is what an SDK dispatches on and never retries. `ResourceInUseException`
+        // is the other class: an application already engaged in a lifecycle action of its
+        // own, or a name already taken. The sentence states the status the application is
+        // in and the status this operation requires, both read from the store and the
+        // model's `ApplicationStatus` enum, so it reads the same for every status a
+        // caller can catch the application in.
         if application.status != crate::state::STATUS_RUNNING {
             return Err(
-                CreateApplicationSnapshotErrorModeled::ResourceInUseException(
-                    ResourceInUseException {
+                CreateApplicationSnapshotErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
                         message: Some(format!(
-                            "Application {application_name} cannot be snapshotted while it \
-                             is in the {} state",
-                            application.status
+                            "Application {application_name} is in {} status. Snapshot \
+                             creation is only allowed when application is in {} status",
+                            application.status,
+                            crate::state::STATUS_RUNNING
                         )),
                     },
                 )
@@ -209,9 +216,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateApplicationSnapshotErrorModeled::ResourceInUseException(
                     ResourceInUseException {
-                        message: Some(format!(
-                            "Snapshot {snapshot_name} already exists for application \
-                             {application_name}"
+                        message: Some(crate::state::existing_snapshot_message(
+                            &snapshot_name,
+                            &application_name,
                         )),
                     },
                 )

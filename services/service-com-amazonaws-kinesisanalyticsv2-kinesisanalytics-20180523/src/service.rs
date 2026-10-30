@@ -45,6 +45,29 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// `refusal` with every enumerated value set stated in LEXICOGRAPHIC order, and everything
+/// else — the member paths, the values echoed, every other requirement — untouched.
+///
+/// A refusal of a value outside an enumerated type names the values that type admits, and
+/// the order it names them in is the service's rather than the model's: the order the model
+/// happens to declare an enum's members in is an artefact of how the model was written
+/// (`RuntimeEnvironment` declares its runtimes in release order), while this service states
+/// such a set sorted. The re-ordering itself is `service_common`'s one statement of that
+/// rule, and it is applied to the violations as they arrive, so it answers for every enum of
+/// this model and for every member targeting one, in any operation, rather than for a table
+/// of enums written out here.
+fn in_stated_value_order(refusal: &Refusal) -> Refusal {
+    let Refusal::Invalid(violations) = refusal else {
+        return refusal.clone();
+    };
+    Refusal::Invalid(
+        violations
+            .iter()
+            .map(service_common::validation_message::in_sorted_enum_order)
+            .collect(),
+    )
+}
+
 /// The `com-amazonaws-kinesisanalyticsv2-kinesisanalytics-20180523` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -121,16 +144,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound or an enumerated set)
+        // before any handler runs. This service is `awsJson1_1`, where AWS answers such a
+        // refusal as `400 ValidationException` with the `N validation error(s) detected:
+        // …` envelope — the envelope, the member paths and the requirement sentences the
+        // framework already renders, which is why this delegates to the ONE shared
+        // statement of them (`service_common::validation_message`) instead of writing a
+        // second one here. The `@pattern` rendering passed to it is the identity, so a
+        // pattern is quoted back as this model writes it, anchors included.
+        //
+        // What this service chooses is the ORDER an enumerated value set is stated in
+        // ([`in_stated_value_order`]), which is not the order the model declares it in.
+        service_common::validation_message::aws_validation_refusal_with(
+            &in_stated_value_order(refusal),
+            |pattern| pattern.to_string(),
+        )
     }
 
     fn override_routing_error(

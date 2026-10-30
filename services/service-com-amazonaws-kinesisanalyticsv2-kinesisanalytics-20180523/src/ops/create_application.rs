@@ -240,7 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.applications.contains_key(&name) {
             return Err(CreateApplicationErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!("Application {name} already exists")),
+                    message: Some(crate::state::existing_application_message(&name)),
                 },
             )
             .into());

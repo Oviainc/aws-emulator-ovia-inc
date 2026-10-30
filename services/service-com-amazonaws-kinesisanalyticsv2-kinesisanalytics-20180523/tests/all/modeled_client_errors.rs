@@ -65,10 +65,10 @@ async fn a_runtime_environment_outside_the_enum_is_refused_as_a_validation_excep
             "case {value:?}: expected ValidationException, got {body}"
         );
         let message = error_message(&body);
-        // The envelope, the member path and the constraint are the requirement; the VALUE
-        // SET it lists is the one this account/region advertises (the model's own order),
-        // so what is asserted about it is that every admitted value is named, not its
-        // position.
+        // The envelope, the member path and the constraint are the requirement; what is
+        // asserted here is that every admitted value is named. The ORDER the set is
+        // stated in is its own rule, asserted over several enums in
+        // `tests/all/error_envelope_wording.rs`.
         let expected_prefix = format!(
             "1 validation error detected: Value '{value}' at 'runtimeEnvironment' failed to \
              satisfy constraint: Member must satisfy enum value set: ["
@@ -405,9 +405,9 @@ async fn start_refuses_an_application_with_no_valid_code_content() {
 // ---------------------------------------------------------------------------
 
 /// A snapshot of a RUNNING application is stored and read back, and every other request
-/// for one is refused with the modelled code: a duplicate name and a non-running
-/// application are `ResourceInUseException`, a snapshot nothing stored is
-/// `ResourceNotFoundException`.
+/// for one is refused with the modelled code: a duplicate name is
+/// `ResourceInUseException`, an application outside RUNNING is `InvalidRequestException`,
+/// and a snapshot nothing stored is `ResourceNotFoundException`.
 #[tokio::test]
 async fn a_snapshot_of_a_running_application_is_stored_and_read_back() {
     let router = router();
@@ -422,7 +422,9 @@ async fn a_snapshot_of_a_running_application_is_stored_and_read_back() {
     let (status, created) = call(&router, "CreateApplication", &body).await;
     assert_eq!(status, 200, "CreateApplication got {created}");
 
-    // A READY application holds no running state, so there is nothing to snapshot yet.
+    // A READY application holds no running state, so there is nothing to snapshot yet:
+    // the request is not a valid one for the application as it stands. The status gate's
+    // own rule is asserted over every status in `tests/all/error_envelope_wording.rs`.
     let (status, refused) = call(
         &router,
         "CreateApplicationSnapshot",
@@ -431,8 +433,8 @@ async fn a_snapshot_of_a_running_application_is_stored_and_read_back() {
     .await;
     assert_eq!(
         (status, error_code(&refused).as_str()),
-        (400, "ResourceInUseException"),
-        "case not-running: expected ResourceInUseException, got {status} {refused}"
+        (400, "InvalidRequestException"),
+        "case not-running: expected InvalidRequestException, got {status} {refused}"
     );
 
     let (status, started) =

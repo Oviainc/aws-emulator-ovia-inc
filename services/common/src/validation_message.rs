@@ -53,6 +53,11 @@
 //! [`aws_validation_refusal_withholding`]; the clause, the envelope and every other
 //! requirement stay this module's and the framework's.
 //!
+//! One rendering here is not a sentence but an ORDER: [`in_sorted_enum_order`] states an
+//! enumerated type's value set lexicographically, which is how AWS lists it where a model
+//! declares its members in an order of its own. A service hands its violations through it
+//! before the envelope is rendered, so the clause itself stays the framework's.
+//!
 //! One constraint class reaches no refusal seam at all: a map's KEY, which the walk treats
 //! as a path segment rather than as a constrained leaf, so nothing is reported about it and
 //! the HANDLER applies the key shape's own constraints. [`map_key_refusal`] is the message
@@ -228,6 +233,32 @@ pub fn enum_value_not_found<S: AsRef<str>>(value: &str, permitted: &[S]) -> Stri
         "instance value (\"{value}\") not found in enum (possible values: [{}])",
         quoted.join(",")
     )
+}
+
+/// `violation` with an enumerated type's value set stated in LEXICOGRAPHIC order, and any
+/// other violation returned unchanged.
+///
+/// A refusal of a value outside an enumerated type names the values that type admits, and
+/// AWS states that set sorted where a model declares its members in an order of its own
+/// (release order, or simply the order the model was written in). The CLAUSE stays the
+/// framework's: this only re-orders what goes into it, so the member path, the echoed value
+/// and the requirement's wording keep coming from the one place that writes them.
+///
+/// The order is over the declared values themselves, a total order on strings, so one enum
+/// is stated the same way whatever order a model revision lists it in — and a service wires
+/// this in for EVERY enum of its model rather than for a table of them.
+#[must_use]
+pub fn in_sorted_enum_order(violation: &Violation) -> Violation {
+    let ViolationKind::EnumValue(declared) = &violation.kind else {
+        return violation.clone();
+    };
+    let mut sorted = declared.clone();
+    sorted.sort_unstable();
+    Violation {
+        path: violation.path.clone(),
+        kind: ViolationKind::EnumValue(sorted),
+        value: violation.value.clone(),
+    }
 }
 
 /// The findings of one refusal as that layer LISTS them: `[<finding>, <finding>]`.
