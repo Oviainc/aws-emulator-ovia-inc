@@ -281,7 +281,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) = input
             .temporary_password
             .as_deref()
-            .and_then(|password| pool.check_password(password))
+            .and_then(|password| {
+                pool.check_password(
+                    password,
+                    crate::state::PasswordPolicyWording::AdminCreatesUser,
+                )
+            })
         {
             return Err(invalid_password(message));
         }

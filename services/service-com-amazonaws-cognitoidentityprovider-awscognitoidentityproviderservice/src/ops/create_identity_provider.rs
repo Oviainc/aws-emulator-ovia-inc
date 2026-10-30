@@ -268,10 +268,13 @@ fn user_pool_not_found(user_pool_id: &str) -> CreateIdentityProviderError {
 
 /// This operation's `DuplicateProviderException` for a provider name the pool
 /// already holds.
+///
+/// The sentence names the provider the request asked for and the pool it asked
+/// of — both values the caller submitted — and nothing stored beside them.
 fn duplicate_provider(provider_name: &str, user_pool_id: &str) -> CreateIdentityProviderError {
     CreateIdentityProviderErrorModeled::DuplicateProviderException(DuplicateProviderException {
         message: Some(format!(
-            "Provider {provider_name} already exists in user pool {user_pool_id}."
+            "{provider_name} already exists for tenant {user_pool_id}."
         )),
     })
     .into()

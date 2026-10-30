@@ -198,7 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pool = guard
             .pool_mut(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-        if let Some(message) = pool.check_password(&input.password) {
+        if let Some(message) = pool.check_password(
+            &input.password,
+            crate::state::PasswordPolicyWording::AdminSetsPassword,
+        ) {
             return Err(invalid_password(message));
         }
         let user = pool

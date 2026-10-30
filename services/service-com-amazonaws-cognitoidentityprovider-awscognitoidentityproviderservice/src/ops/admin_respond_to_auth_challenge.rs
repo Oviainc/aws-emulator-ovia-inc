@@ -389,7 +389,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(invalid_session());
             }
         }
-        if let Some(message) = pool.check_password(&new_password) {
+        if let Some(message) = pool.check_password(
+            &new_password,
+            crate::state::PasswordPolicyWording::UserSuppliesPassword,
+        ) {
             return Err(invalid_password(message));
         }
         let requested_names: Vec<String> = requested.keys().cloned().collect();

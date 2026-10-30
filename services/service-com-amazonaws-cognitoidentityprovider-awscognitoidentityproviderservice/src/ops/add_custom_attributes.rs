@@ -198,9 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .iter()
                     .any(|(earlier, _)| *earlier == stored_name);
             if taken {
-                return Err(invalid_parameter(format!(
-                    "Invalid attributes given, {stored_name} already exists in the schema of \
-                     this user pool"
+                return Err(invalid_parameter(attribute_name_not_unique(
+                    &stored_name,
+                    addition
+                        .attribute_data_type
+                        .as_deref()
+                        // The entry always carries one, since
+                        // `custom_schema_attribute` fills the documented default
+                        // in; named here so the record cannot lose its slot if
+                        // that default ever moves.
+                        .unwrap_or(crate::state::DEFAULT_ATTRIBUTE_DATA_TYPE),
                 )));
             }
             additions.push((stored_name, addition));
@@ -231,6 +238,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through `DescribeUserPool`.
         Ok(AddCustomAttributesOutput {})
     }
+}
+
+/// The message this operation's `InvalidParameterException` carries for an
+/// attribute name the pool's schema already declares.
+///
+/// Amazon Cognito reports a rejected schema attribute as a structured record of
+/// the entity the schema belongs to — a user pool's schema declares the
+/// attributes of its USERS — the attribute as the request named it, and what is
+/// wrong with it. The name is the BARE one, without the `custom:` or `dev:`
+/// prefix Amazon Cognito stores it under (`SchemaAttributeType.Name` in this
+/// service's model), and `data_type` is the `AttributeDataType` the entry
+/// carries, in upper case, so the record reads in the same case whichever
+/// casing the request wrote.
+fn attribute_name_not_unique(stored_name: &str, data_type: &str) -> String {
+    let bare_name = stored_name
+        .strip_prefix("custom:")
+        .or_else(|| stored_name.strip_prefix("dev:"))
+        .unwrap_or(stored_name);
+    format!(
+        "Entity Type: USER, Message: AttributeName: {bare_name}, DataType: {}, Error: Attribute \
+         name is not unique",
+        data_type.to_uppercase()
+    )
 }
 
 /// This operation's `ResourceNotFoundException` for an absent user pool.

@@ -16,10 +16,12 @@
 //! * the `ResourceNotFoundException` of a group lookup carries ONE fixed
 //!   sentence too, the same for every group name and for every operation that
 //!   resolves a `GroupName` against a pool's stored groups.
-//! * a password-policy refusal (`InvalidPasswordException`) carries a fixed
-//!   prefix that says the password missed the pool's password policy, followed by
-//!   the fixed clause for the requirement it missed — a clause per requirement,
-//!   never the value the pool configured for that requirement.
+//! * a password-policy refusal (`InvalidPasswordException`) carries the fixed
+//!   clause for the requirement the password missed — a clause per requirement,
+//!   never the value the pool configured for that requirement — behind the
+//!   prefix the ASKING API words that refusal with, which is not the same
+//!   sentence in the administrative password set, the administrative create and
+//!   the paths where the user supplies its own password.
 //! * a feature-plan refusal (`FeatureUnavailableInTierException`) carries one
 //!   template naming the pool's configured feature plan and the feature that plan
 //!   does not include, so the feature can be parsed back out of it.
@@ -51,9 +53,16 @@ const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
 /// The one sentence a group lookup that found nothing says.
 const GROUP_NOT_FOUND_MESSAGE: &str = "Group not found.";
 
-/// The prefix a password-policy refusal carries ahead of the clause for the
-/// requirement the password missed.
-const PASSWORD_POLICY_PREFIX: &str = "Password did not conform with password policy: ";
+/// The prefix `AdminSetUserPassword` words its policy refusal with.
+const ADMIN_SET_PASSWORD_PREFIX: &str = "Password does not conform to policy: ";
+
+/// The prefix `AdminCreateUser` words its policy refusal with, for a
+/// `TemporaryPassword` the policy refuses.
+const ADMIN_CREATE_USER_PREFIX: &str = "Password did not conform with password policy: ";
+
+/// The prefix the paths where the user itself supplies the password — here
+/// `SignUp` — word their policy refusal with.
+const USER_PASSWORD_PREFIX: &str = "Password did not conform with policy: ";
 
 /// One emulator with just this service mounted.
 fn router() -> MultiServiceRouter {
@@ -405,8 +414,8 @@ struct PasswordCase {
     /// for a pool that configures none (the documented default policy).
     policy: Value,
     password: String,
-    /// The clause behind [`PASSWORD_POLICY_PREFIX`], or `None` when the password
-    /// satisfies the policy.
+    /// The clause behind the asking operation's prefix, or `None` when the
+    /// password satisfies the policy.
     requirement: Option<&'static str>,
 }
 
@@ -507,12 +516,27 @@ async fn a_password_policy_refusal_names_the_requirement_and_not_the_policy_valu
             &json!({ "UserPoolId": user_pool_id, "Username": "target" }),
         )
         .await;
+        // An app client of the same pool, so the self-service sign-up is judged
+        // by the SAME policy as the two administrative calls.
+        let created = ok(
+            &router,
+            "CreateUserPoolClient",
+            &json!({ "UserPoolId": user_pool_id, "ClientName": format!("policy-app-{index}") }),
+        )
+        .await;
+        let client_id = created["UserPoolClient"]["ClientId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("CreateUserPoolClient must mint a client id, got {created}"))
+            .to_string();
 
-        // Both implemented callers of the policy check: the create that carries a
-        // `TemporaryPassword` and the admin password set.
+        // Every implemented caller of the policy check, each with the prefix
+        // ITS API words the refusal with: the administrative create carrying a
+        // `TemporaryPassword`, the administrative password set, and the
+        // self-service sign-up where the user supplies its own password.
         let requests = [
             (
                 "AdminCreateUser",
+                ADMIN_CREATE_USER_PREFIX,
                 json!({
                     "UserPoolId": user_pool_id,
                     "Username": format!("fresh-{index}"),
@@ -521,6 +545,7 @@ async fn a_password_policy_refusal_names_the_requirement_and_not_the_policy_valu
             ),
             (
                 "AdminSetUserPassword",
+                ADMIN_SET_PASSWORD_PREFIX,
                 json!({
                     "UserPoolId": user_pool_id,
                     "Username": "target",
@@ -528,9 +553,18 @@ async fn a_password_policy_refusal_names_the_requirement_and_not_the_policy_valu
                     "Permanent": true,
                 }),
             ),
+            (
+                "SignUp",
+                USER_PASSWORD_PREFIX,
+                json!({
+                    "ClientId": client_id,
+                    "Username": format!("signed-up-{index}"),
+                    "Password": row.password,
+                }),
+            ),
         ];
 
-        for (operation, body) in &requests {
+        for (operation, prefix, body) in &requests {
             let case = format!("{operation}: {}", row.case);
             let (status, payload) = call(&router, operation, body).await;
             let Some(requirement) = row.requirement else {
@@ -547,7 +581,7 @@ async fn a_password_policy_refusal_names_the_requirement_and_not_the_policy_valu
                  {payload}"
             );
             let message = error_message(&payload);
-            let expected = format!("{PASSWORD_POLICY_PREFIX}{requirement}");
+            let expected = format!("{prefix}{requirement}");
             assert_eq!(
                 message, expected,
                 "case {case:?}: expected {expected:?}, got {message:?}"

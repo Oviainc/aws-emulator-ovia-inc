@@ -260,12 +260,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A domain string resolves to one pool (`DescribeUserPoolDomain` takes
         // `Domain` alone), so a name any pool already holds is not free. This
         // spans the whole store, so it is checked before the pool this create
-        // writes to is borrowed mutably.
-        if let Some(taken) = guard.domain(&input.domain) {
-            return Err(invalid_parameter(format!(
-                "Domain {} is already associated with user pool {}.",
-                input.domain, taken.user_pool_id
-            )));
+        // writes to is borrowed mutably. The refusal reports only that the
+        // domain is taken: it names neither the domain nor the pool holding it,
+        // so it discloses nothing about a pool the caller may not own.
+        if guard.domain(&input.domain).is_some() {
+            return Err(invalid_parameter(
+                "Domain already associated with another user pool.".to_string(),
+            ));
         }
 
         // The record to store, built before the pool is borrowed mutably; it is

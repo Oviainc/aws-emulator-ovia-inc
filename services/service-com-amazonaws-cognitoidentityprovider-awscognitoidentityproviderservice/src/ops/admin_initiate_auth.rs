@@ -337,7 +337,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| client_not_found(&input.client_id))?;
             if !client.allows_admin_password_auth() {
                 return Err(invalid_parameter(
-                    crate::state::auth_flow_not_enabled_message(&input.auth_flow),
+                    crate::state::ADMIN_AUTH_FLOW_NOT_ENABLED_MESSAGE.to_string(),
                 ));
             }
             let hides_user_existence = client.hides_user_existence();

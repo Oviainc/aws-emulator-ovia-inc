@@ -77,6 +77,8 @@ mod describe_terms_by_client;
 mod device_remembering;
 #[path = "all/domain_lookup_and_condition_messages.rs"]
 mod domain_lookup_and_condition_messages;
+#[path = "all/duplicate_resource_refusal_wording.rs"]
+mod duplicate_resource_refusal_wording;
 #[path = "all/error_message_wording.rs"]
 mod error_message_wording;
 #[path = "all/error_wire.rs"]

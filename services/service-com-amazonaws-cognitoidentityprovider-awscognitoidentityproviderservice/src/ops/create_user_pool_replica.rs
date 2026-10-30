@@ -229,12 +229,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A replica lives in a Region OTHER than the pool's own: the pool
         // already is the PRIMARY replica there, and this operation creates a
-        // secondary one.
+        // secondary one. The refusal states that rule as fixed text and
+        // interpolates neither the Region asked for nor the pool's own.
         if input.region_name == pool.region {
-            return Err(invalid_parameter(format!(
-                "User pool {} is the primary replica in Region {}, so it can't be replicated there.",
-                pool.id, pool.region
-            )));
+            return Err(invalid_parameter(
+                "Replica must be created in a different region".to_string(),
+            ));
         }
 
         // One Region holds at most one replica of a pool, so a Region this pool

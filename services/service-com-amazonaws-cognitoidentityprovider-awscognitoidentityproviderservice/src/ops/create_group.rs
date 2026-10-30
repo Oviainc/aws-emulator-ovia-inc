@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`CreateGroup.GroupName`) — a second group under a stored name is
         // refused, and the stored group is left exactly as it was.
         if pool.groups.contains_key(&input.group_name) {
-            return Err(group_exists(&input.group_name));
+            return Err(group_exists());
         }
 
         // This emulator holds a pool's groups in memory, so the store is bounded.
@@ -241,9 +241,13 @@ fn user_pool_not_found(user_pool_id: &str) -> CreateGroupError {
 }
 
 /// This operation's `GroupExistsException` for a name the pool already holds.
-fn group_exists(group_name: &str) -> CreateGroupError {
+///
+/// The sentence is fixed: it reports that a group of the submitted name exists
+/// without quoting that name or the pool it was looked up in, so the refusal is
+/// the same for every name a pool already holds.
+fn group_exists() -> CreateGroupError {
     CreateGroupErrorModeled::GroupExistsException(GroupExistsException {
-        message: Some(format!("A group named {group_name} already exists.")),
+        message: Some("A group with the name already exists.".to_string()),
     })
     .into()
 }

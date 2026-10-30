@@ -165,21 +165,33 @@ pub fn exclusive_auth_flow_violation(flows: &[String]) -> Option<&'static str> {
     (names_exclusive_flow && names_another_flow).then_some(EXCLUSIVE_AUTH_FLOW_MESSAGE)
 }
 
-/// The message a sign-in refused because the app client's stored
-/// `ExplicitAuthFlows` do not enable the requested flow carries.
+/// The message the ADMINISTRATIVE sign-in refuses with when the app client's
+/// stored `ExplicitAuthFlows` do not enable the requested flow.
 ///
 /// `ExplicitAuthFlows` is "the authentication flows that you want your user pool
 /// client to support" (`CreateUserPoolClient.ExplicitAuthFlows` in this
 /// service's model), so a request whose `AuthFlow` the stored list does not
-/// enable asks for a flow this app client is not configured for. Amazon Cognito
-/// reports that in ONE sentence whose only variable part is the flow the request
-/// asked for — `auth_flow`, the `AuthFlowType` member as SUBMITTED, so an alias
-/// is echoed as the caller wrote it — and which says nothing else about the app
-/// client: the sentence is the same for every client id, so this refusal, which
-/// an unauthenticated caller can provoke, carries no identifier of the app
-/// client it was sent to. Every sign-in operation that checks a client's
-/// configured flows asks this one function, so the admin and the client-side
-/// paths cannot word it differently.
+/// enable asks for a flow this app client is not configured for. The
+/// administrative API reports that in ONE fixed sentence: it interpolates
+/// neither the flow asked for nor the app client it was asked of, so the refusal
+/// is the same for every flow and every client id. The client-side sign-in and
+/// the machine-to-machine grant word the same condition with the flow the
+/// request asked for ([`auth_flow_not_enabled_message`]) — Amazon Cognito does
+/// not word this refusal identically in every API, so each path carries the
+/// sentence ITS OWN API answers.
+pub const ADMIN_AUTH_FLOW_NOT_ENABLED_MESSAGE: &str = "Auth flow not enabled for this client";
+
+/// The message the CLIENT-SIDE sign-in and the machine-to-machine grant refuse
+/// with when the app client's stored `ExplicitAuthFlows` do not enable the
+/// requested flow.
+///
+/// One sentence whose only variable part is the flow the request asked for —
+/// `auth_flow`, the `AuthFlowType` member as SUBMITTED, so an alias is echoed as
+/// the caller wrote it — and which says nothing else about the app client: the
+/// sentence is the same for every client id, so this refusal, which an
+/// unauthenticated caller can provoke, carries no identifier of the app client
+/// it was sent to. The administrative sign-in's own wording is
+/// [`ADMIN_AUTH_FLOW_NOT_ENABLED_MESSAGE`].
 pub fn auth_flow_not_enabled_message(auth_flow: &str) -> String {
     format!("{auth_flow} flow not enabled for this client")
 }
@@ -481,9 +493,38 @@ pub const TERMS_NOT_FOUND_MESSAGE: &str = "Terms does not exist.";
 // policy values to a caller that has not read them.
 // ---------------------------------------------------------------------------
 
-/// The prefix every password-policy rejection message carries, ahead of the
-/// clause for the requirement the password missed.
-const PASSWORD_POLICY_PREFIX: &str = "Password did not conform with password policy: ";
+/// Which wording a password-policy rejection carries, ahead of the clause for
+/// the requirement the password missed.
+///
+/// Amazon Cognito does not word this refusal identically in every API that
+/// judges a password: the administrative password set, the administrative create
+/// and the paths where the user supplies its own password each answer their own
+/// sentence. The clause for the requirement is the same in all of them, so only
+/// the prefix is chosen here and every operation names the wording ITS OWN API
+/// answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordPolicyWording {
+    /// The wording `AdminSetUserPassword` answers.
+    AdminSetsPassword,
+    /// The wording `AdminCreateUser` answers for a `TemporaryPassword` the
+    /// policy refuses.
+    AdminCreatesUser,
+    /// The wording the paths where the user itself supplies the password answer
+    /// — a sign-up, a forgotten-password confirmation, a new password given in
+    /// answer to a challenge.
+    UserSuppliesPassword,
+}
+
+impl PasswordPolicyWording {
+    /// The prefix this wording carries ahead of the requirement's clause.
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::AdminSetsPassword => "Password does not conform to policy: ",
+            Self::AdminCreatesUser => "Password did not conform with password policy: ",
+            Self::UserSuppliesPassword => "Password did not conform with policy: ",
+        }
+    }
+}
 
 /// The clause for a password shorter than `PasswordPolicyType.MinimumLength`.
 const PASSWORD_TOO_SHORT: &str = "Password not long enough";
@@ -500,10 +541,10 @@ const PASSWORD_NEEDS_NUMBERS: &str = "Password must have numeric characters";
 /// The clause for `PasswordPolicyType.RequireSymbols`.
 const PASSWORD_NEEDS_SYMBOLS: &str = "Password must have symbol characters";
 
-/// The message a password-policy rejection carries for the requirement
-/// `requirement` names.
-fn password_policy_message(requirement: &str) -> String {
-    format!("{PASSWORD_POLICY_PREFIX}{requirement}")
+/// The message a password-policy rejection worded as `wording` asks for
+/// carries for the requirement `requirement` names.
+fn password_policy_message(wording: PasswordPolicyWording, requirement: &str) -> String {
+    format!("{}{requirement}", wording.prefix())
 }
 
 // ---------------------------------------------------------------------------
@@ -2575,28 +2616,34 @@ impl UserPool {
     }
 
     /// `None` when `password` satisfies this pool's password policy, else the
-    /// requirement it misses — the message a client has to fix the request from.
+    /// requirement it misses — the message a client has to fix the request
+    /// from, worded as the asking operation's own API words it
+    /// ([`PasswordPolicyWording`]).
     ///
-    /// The message is the fixed clause for the requirement missed, behind the
-    /// fixed policy-rejection prefix: it reports WHICH requirement the password
-    /// failed and never the value this pool configured for it.
-    pub fn check_password(&self, password: &str) -> Option<String> {
+    /// The message is the fixed clause for the requirement missed, behind that
+    /// wording's prefix: it reports WHICH requirement the password failed and
+    /// never the value this pool configured for it.
+    pub fn check_password(
+        &self,
+        password: &str,
+        wording: PasswordPolicyWording,
+    ) -> Option<String> {
         let policy = self.password_policy();
         let minimum = policy.minimum_length.unwrap_or(DEFAULT_PASSWORD_MIN_LENGTH);
         if i64::try_from(password.chars().count()).unwrap_or(i64::MAX) < i64::from(minimum) {
-            return Some(password_policy_message(PASSWORD_TOO_SHORT));
+            return Some(password_policy_message(wording, PASSWORD_TOO_SHORT));
         }
         if policy.require_uppercase && !password.chars().any(char::is_uppercase) {
-            return Some(password_policy_message(PASSWORD_NEEDS_UPPERCASE));
+            return Some(password_policy_message(wording, PASSWORD_NEEDS_UPPERCASE));
         }
         if policy.require_lowercase && !password.chars().any(char::is_lowercase) {
-            return Some(password_policy_message(PASSWORD_NEEDS_LOWERCASE));
+            return Some(password_policy_message(wording, PASSWORD_NEEDS_LOWERCASE));
         }
         if policy.require_numbers && !password.chars().any(|c| c.is_ascii_digit()) {
-            return Some(password_policy_message(PASSWORD_NEEDS_NUMBERS));
+            return Some(password_policy_message(wording, PASSWORD_NEEDS_NUMBERS));
         }
         if policy.require_symbols && !password.chars().any(is_symbol) {
-            return Some(password_policy_message(PASSWORD_NEEDS_SYMBOLS));
+            return Some(password_policy_message(wording, PASSWORD_NEEDS_SYMBOLS));
         }
         None
     }
@@ -6419,6 +6466,21 @@ pub enum VerifiedFlagAuthority {
     Records,
 }
 
+/// The message a request refused because it would change an attribute the
+/// pool's schema does not let change carries.
+///
+/// `SchemaAttributeType.Mutable` is what "specifies whether the value of the
+/// attribute can be changed" (this service's model), so an attribute it freezes
+/// is one no request may write — storing a new value or taking the stored one
+/// away alike, since both change it. Amazon Cognito reports that in one
+/// sentence whose only variable part is the attribute the request named, and
+/// names neither the pool nor the user: the schema, not this user's state, is
+/// what refused it. Every path that enforces that flag carries this one
+/// template, so an update and a delete cannot word it differently.
+pub fn non_mutable_attribute_message(attribute_name: &str) -> String {
+    format!("Cannot modify the non-mutable attribute {attribute_name}")
+}
+
 /// Decide what `requested` does to `user` of `pool`, or the refusal it earns.
 ///
 /// A pure read of the stored pool and user: it returns the plan rather than
@@ -6514,9 +6576,9 @@ pub fn plan_attribute_update(
         // `SchemaAttributeType.Mutable` is what says a stored value may change,
         // so an attribute the schema freezes cannot be updated at all.
         if !pool.attribute_mutable(&name) {
-            return Err(AttributeUpdateRefusal::Invalid(format!(
-                "Attribute {name} cannot be updated: this user pool's schema declares it immutable"
-            )));
+            return Err(AttributeUpdateRefusal::Invalid(
+                non_mutable_attribute_message(&name),
+            ));
         }
         let value = (*value).to_string();
         if value.is_empty() {
@@ -6694,9 +6756,7 @@ pub fn plan_attribute_deletion(
     let mut deletions = BTreeSet::new();
     for name in names {
         if !pool.attribute_mutable(&name) {
-            return Err(format!(
-                "Attribute {name} cannot be deleted: this user pool's schema declares it immutable"
-            ));
+            return Err(non_mutable_attribute_message(&name));
         }
         if pool.attribute_required(&name) {
             return Err(format!(
@@ -7138,6 +7198,13 @@ pub fn effective_schema(requested: Option<Vec<SchemaAttributeType>>) -> Vec<Sche
     schema
 }
 
+/// The `AttributeDataType` a requested custom attribute that names none is
+/// stored with: `SchemaAttributeType.AttributeDataType` is "the data type of the
+/// attribute" and `String` is the one every unqualified custom attribute reads
+/// back as (this service's model). One of
+/// [`crate::ops::types::ATTRIBUTE_DATA_TYPE_VALUES`].
+pub const DEFAULT_ATTRIBUTE_DATA_TYPE: &str = "String";
+
 /// The STORED NAME and the schema entry a requested CUSTOM attribute becomes,
 /// with the defaults a custom attribute carries filled in.
 ///
@@ -7172,7 +7239,7 @@ pub fn custom_schema_attribute(
             requested
                 .attribute_data_type
                 .clone()
-                .unwrap_or_else(|| "String".to_string()),
+                .unwrap_or_else(|| DEFAULT_ATTRIBUTE_DATA_TYPE.to_string()),
         ),
         developer_only_attribute: Some(developer_only),
         // A custom attribute is mutable unless the request says otherwise;

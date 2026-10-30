@@ -9,11 +9,12 @@
 //! `ExplicitAuthFlows` — "the authentication flows that you want your user pool
 //! client to support" (`CreateUserPoolClient.ExplicitAuthFlows` in this
 //! service's model) — do not enable is refused with a 400
-//! `InvalidParameterException` whose message names the requested flow and
-//! nothing else: `"<AuthFlow> flow not enabled for this client"`. The only
+//! `InvalidParameterException` carrying the sentence the ASKING API words that
+//! refusal with. The administrative sign-in answers ONE fixed sentence that
+//! names no flow at all; the client-side sign-in answers a sentence whose only
 //! variable part is the `AuthFlowType` member as SUBMITTED, so an alias is
-//! echoed as the caller wrote it; the sentence names no app client id, which
-//! matters because an unauthenticated caller can provoke this refusal.
+//! echoed as the caller wrote it. Neither names the app client id, which matters
+//! because an unauthenticated caller can provoke this refusal.
 //!
 //! The rows span what the rule generalises over: the operation that performs the
 //! sign-in (the client-side one and the admin one), the flow asked for and the
@@ -50,9 +51,22 @@ const USERNAME: &str = "alice";
 /// gets PAST the flow check still fails on the token rather than signing in.
 const UNISSUED_REFRESH_TOKEN: &str = "not-a-token-this-emulator-issued";
 
-/// The sentence the rule owes for `auth_flow`.
-fn expected_message(auth_flow: &str) -> String {
+/// The one sentence the administrative sign-in owes, whatever flow was asked
+/// for.
+const ADMIN_MESSAGE: &str = "Auth flow not enabled for this client";
+
+/// The sentence the client-side sign-in owes for `auth_flow`.
+fn client_message(auth_flow: &str) -> String {
     format!("{auth_flow} flow not enabled for this client")
+}
+
+/// The sentence `operation` owes for `auth_flow`.
+fn expected_message(operation: &str, auth_flow: &str) -> String {
+    if operation == "AdminInitiateAuth" {
+        ADMIN_MESSAGE.to_string()
+    } else {
+        client_message(auth_flow)
+    }
 }
 
 /// One emulator with just this service mounted.
@@ -281,13 +295,19 @@ async fn a_flow_the_app_client_does_not_enable_is_refused_with_one_sentence() {
             "case {case:?}: expected a 400 InvalidParameterException, got {status} with {payload}"
         );
         let message = error_message(&payload);
-        let expected = expected_message(row.auth_flow);
+        let expected = expected_message(row.operation, row.auth_flow);
         assert_eq!(
             message, expected,
             "case {case:?}: expected {expected:?}, got {message:?}"
         );
-        // The sentence reports the flow the request asked for and discloses
-        // nothing about the app client it was sent to.
+        // The administrative sentence names no flow; the client-side one names
+        // the flow asked for and nothing else.
+        assert_eq!(
+            message.contains(row.auth_flow),
+            row.operation != "AdminInitiateAuth",
+            "case {case:?}: only the client-side sentence names the flow asked for, got \
+             {message:?}"
+        );
         assert!(
             !message.contains(client_id.as_str()),
             "case {case:?}: the refusal must not name the app client, got {message:?}"
@@ -383,7 +403,7 @@ async fn a_client_that_enables_the_flow_is_never_answered_that_sentence() {
         let message = error_message(&payload);
         assert_ne!(
             message,
-            expected_message(row.auth_flow).as_str(),
+            expected_message(row.operation, row.auth_flow).as_str(),
             "case {case:?}: an enabled flow must not be refused as not enabled, got {status} \
              with {payload}"
         );

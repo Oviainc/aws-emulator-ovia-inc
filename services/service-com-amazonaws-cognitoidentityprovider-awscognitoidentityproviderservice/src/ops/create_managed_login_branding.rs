@@ -281,12 +281,12 @@ fn client_not_found(client_id: &str) -> CreateManagedLoginBrandingError {
 
 /// This operation's `ManagedLoginBrandingExistsException` for an app client that
 /// already has an assigned style, naming the app client whose style is in the
-/// way.
+/// way and nothing else: the sentence carries no terminating period.
 fn branding_exists(client_id: &str) -> CreateManagedLoginBrandingError {
     CreateManagedLoginBrandingErrorModeled::ManagedLoginBrandingExistsException(
         ManagedLoginBrandingExistsException {
             message: Some(format!(
-                "Managed login branding already exists for Client {client_id}."
+                "A ManagedLoginBranding already exists for client {client_id}"
             )),
         },
     )

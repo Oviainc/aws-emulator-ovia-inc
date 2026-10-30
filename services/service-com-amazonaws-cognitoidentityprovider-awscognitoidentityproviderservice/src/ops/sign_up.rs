@@ -295,7 +295,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .password
             .as_deref()
             .filter(|password| !password.is_empty());
-        if let Some(message) = password.and_then(|password| pool.check_password(password)) {
+        if let Some(message) = password.and_then(|password| {
+            pool.check_password(
+                password,
+                crate::state::PasswordPolicyWording::UserSuppliesPassword,
+            )
+        }) {
             return Err(invalid_password(message));
         }
 
@@ -349,7 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_deref()
                 .is_some_and(|_| pool.sign_in_name_holder_key(&input.username).is_some());
         if taken {
-            return Err(username_exists(&input.username));
+            return Err(username_exists());
         }
         // This emulator holds a pool's users in memory, so the store is bounded; the
         // operation's own `LimitExceededException` is "thrown when a user exceeds the
@@ -475,9 +480,14 @@ fn unverified_secret_hash(client_id: &str) -> SignUpError {
 }
 
 /// This operation's `UsernameExistsException` for a username already taken.
-fn username_exists(username: &str) -> SignUpError {
+///
+/// The sentence is fixed: Amazon Cognito states that the account exists and
+/// interpolates no part of the request, so this refusal — which any
+/// unauthenticated caller of a self-service sign-up can provoke — echoes neither
+/// the submitted name nor the sign-in value the pool resolved it to.
+fn username_exists() -> SignUpError {
     SignUpErrorModeled::UsernameExistsException(UsernameExistsException {
-        message: Some(format!("User account already exists for {username}")),
+        message: Some("User already exists".to_string()),
     })
     .into()
 }
