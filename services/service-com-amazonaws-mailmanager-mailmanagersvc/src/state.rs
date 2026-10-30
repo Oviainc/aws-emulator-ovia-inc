@@ -43,6 +43,18 @@ pub const DEFAULT_RETENTION_PERIOD: &str = "PERMANENT";
 /// documents `us-east-1` as the emulator default.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The most address lists this emulator keeps, i.e. its per-account address-list quota.
+///
+/// `CreateAddressList` models `ServiceQuotaExceededException` ("Occurs when an operation
+/// exceeds a predefined service quota or limit") precisely because the real service caps
+/// the resource. The model does not state the number, so this value is CHOSEN on the same
+/// reasoning as [`MAX_ARCHIVES`]: large enough that ordinary use never reaches it, small
+/// enough that a caller cannot grow the process's memory without limit. It bounds the
+/// whole address-list side of the store: `address_list_names` holds one entry per live
+/// address list, and `address_list_idempotency` is only written on a create that
+/// succeeded.
+pub const MAX_ADDRESS_LISTS: usize = 100;
+
 /// The most archives this emulator keeps, i.e. its per-account archive quota.
 ///
 /// `CreateArchive` is the only operation that grows this service's store, and it models
@@ -77,14 +89,32 @@ pub struct ArchiveRecord {
     pub pending_deletion_at_millis: Option<i64>,
 }
 
+/// One stored address list: "a list of emails and domains that are used in MailManager
+/// Ingress endpoints and Rules for email management" (the model's `AddressList` doc).
+///
+/// The single source of truth for every address-list operation: `CreateAddressList` writes
+/// it and `GetAddressList` reads it back. The model declares no status member for an
+/// address list, so a created one is immediately usable — there is no transition for the
+/// clock to owe.
+#[derive(Debug, Clone)]
+pub struct AddressListRecord {
+    pub address_list_id: String,
+    pub address_list_name: String,
+    pub address_list_arn: String,
+    pub created_at_millis: i64,
+    pub last_updated_at_millis: i64,
+    pub tags: Vec<Tag>,
+}
+
 /// Per-service state for com-amazonaws-mailmanager-mailmanagersvc. A handler reaches it through [`service_state`].
 ///
 /// Every map is a `BTreeMap`, so `ListArchives` walks the archives in one stable,
 /// deterministic order and a pagination token can name the next key to resume from.
 ///
 /// BOUNDED: `CreateArchive` refuses a create that would take `archives` past
-/// [`MAX_ARCHIVES`], and the other two maps carry at most one entry per live archive (see
-/// [`MAX_ARCHIVES`]), so no caller can grow this store without limit.
+/// [`MAX_ARCHIVES`] and `CreateAddressList` one that would take `address_lists` past
+/// [`MAX_ADDRESS_LISTS`]; every other map carries at most one entry per live archive or
+/// address list, so no caller can grow this store without limit.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMailmanagerMailmanagersvcState {
     /// Archives by `ArchiveId`.
@@ -98,6 +128,19 @@ pub struct ComAmazonawsMailmanagerMailmanagersvcState {
     /// Monotonic counter feeding [`ComAmazonawsMailmanagerMailmanagersvcState::mint_archive_id`];
     /// it is what makes a minted id unique even within one clock tick.
     pub archive_sequence: u64,
+    /// Address lists by `AddressListId`.
+    pub address_lists: BTreeMap<String, AddressListRecord>,
+    /// `AddressListName` -> `AddressListId`; the index behind the name-uniqueness
+    /// `ConflictException`.
+    pub address_list_names: BTreeMap<String, String>,
+    /// `ClientToken` -> the `CreateAddressList` it completed. Separate from
+    /// [`Self::idempotency`] so a token recorded for one resource is never read as a retry
+    /// of a create of the other.
+    pub address_list_idempotency: BTreeMap<String, IdempotentCreate>,
+    /// Monotonic counter feeding
+    /// [`ComAmazonawsMailmanagerMailmanagersvcState::mint_address_list_id`]; see
+    /// [`Self::archive_sequence`].
+    pub address_list_sequence: u64,
 }
 
 impl ComAmazonawsMailmanagerMailmanagersvcState {
@@ -133,35 +176,48 @@ impl ComAmazonawsMailmanagerMailmanagersvcState {
         }
         let live: std::collections::BTreeSet<String> = self.archives.keys().cloned().collect();
         self.idempotency
-            .retain(|_, create| live.contains(&create.archive_id));
+            .retain(|_, create| live.contains(&create.resource_id));
     }
 
-    /// Mint a fresh `ArchiveId`: 32 lowercase hex characters, well inside
-    /// `ArchiveIdString`'s modelled 1..66 length.
-    ///
-    /// The low half is a bijection of the per-service sequence number, so two archives
-    /// can never share an id; the high half mixes in the creation instant so ids are not
-    /// consecutive and a caller cannot derive the next one from the last.
+    /// Mint a fresh `ArchiveId`: 32 lowercase hex characters (see [`mint_id`]), well
+    /// inside `ArchiveIdString`'s modelled 1..66 length.
     pub fn mint_archive_id(&mut self, now_millis: i64) -> String {
         self.archive_sequence = self.archive_sequence.wrapping_add(1);
-        let sequence = self.archive_sequence;
-        let high = splitmix64((now_millis as u64) ^ sequence.rotate_left(32));
-        let low = splitmix64(sequence);
-        format!("{high:016x}{low:016x}")
+        mint_id(self.archive_sequence, now_millis)
+    }
+
+    /// Mint a fresh `AddressListId`, the same way [`Self::mint_archive_id`] mints an
+    /// archive id: 32 lowercase hex characters, which satisfy `AddressListId`'s modelled
+    /// 1..255 length and `^[a-zA-Z0-9-]+$` pattern.
+    pub fn mint_address_list_id(&mut self, now_millis: i64) -> String {
+        self.address_list_sequence = self.address_list_sequence.wrapping_add(1);
+        mint_id(self.address_list_sequence, now_millis)
     }
 }
 
-/// The message the archive handlers report when the shared store cannot be reached.
+/// The identifier minted for the `sequence`-th resource of its kind: 32 lowercase hex
+/// characters.
+///
+/// The low half is a bijection of that per-kind sequence number, so two resources can
+/// never share an id; the high half mixes in the creation instant so ids are not
+/// consecutive and a caller cannot derive the next one from the last.
+fn mint_id(sequence: u64, now_millis: i64) -> String {
+    let high = splitmix64((now_millis as u64) ^ sequence.rotate_left(32));
+    let low = splitmix64(sequence);
+    format!("{high:016x}{low:016x}")
+}
+
+/// The message a handler reports when the shared store cannot be reached.
 ///
 /// Each handler still builds its own modelled error (the generated error enums are
 /// per-operation), so this is the one part of that answer they can share.
-pub const STORE_UNAVAILABLE: &str = "archive store is unavailable; retry the request";
+pub const STORE_UNAVAILABLE: &str = "service state is unavailable; retry the request";
 
-/// What one `ClientToken` recorded: which archive the first call created, and a
+/// What one `ClientToken` recorded: which resource the first call created, and a
 /// description of the request it created it from.
 #[derive(Debug, Clone)]
 pub struct IdempotentCreate {
-    pub archive_id: String,
+    pub resource_id: String,
     pub fingerprint: String,
 }
 
@@ -181,20 +237,34 @@ pub fn create_archive_fingerprint(
         Some(ArchiveRetention::RetentionPeriod(period)) => period.as_str(),
         None => "",
     };
-    // `\u{1f}` (unit separator) and `\u{1e}` (record separator) cannot appear in any of
-    // these members, so the joined description is unambiguous. Tags are sorted: the same
-    // set in a different order is the same request.
-    let mut rendered_tags: Vec<String> = tags
+    // `\u{1e}` (record separator) cannot appear in any of these members, so the joined
+    // description is unambiguous.
+    format!(
+        "{archive_name}\u{1e}{retention}\u{1e}{}\u{1e}{}",
+        kms_key_arn.unwrap_or_default(),
+        render_tags(tags)
+    )
+}
+
+/// A stable description of the members an address list is created from; see
+/// [`create_archive_fingerprint`] for what it is compared against and why.
+pub fn create_address_list_fingerprint(address_list_name: &str, tags: Option<&[Tag]>) -> String {
+    format!("{address_list_name}\u{1e}{}", render_tags(tags))
+}
+
+/// The tags of a create request, rendered into one unambiguous string for a fingerprint.
+///
+/// Sorted: the same set in a different order is the same request. `\u{1f}` (unit
+/// separator) and `\u{1e}` (record separator) cannot appear in a `TagKey` or `TagValue`
+/// (both are patterned), so the rendering is injective.
+fn render_tags(tags: Option<&[Tag]>) -> String {
+    let mut rendered: Vec<String> = tags
         .unwrap_or_default()
         .iter()
         .map(|tag| format!("{}\u{1f}{}", tag.key, tag.value))
         .collect();
-    rendered_tags.sort();
-    format!(
-        "{archive_name}\u{1e}{retention}\u{1e}{}\u{1e}{}",
-        kms_key_arn.unwrap_or_default(),
-        rendered_tags.join("\u{1e}")
-    )
+    rendered.sort();
+    rendered.join("\u{1e}")
 }
 
 /// SplitMix64, a standard 64-bit mixing function: a bijection on `u64`, so distinct
@@ -255,6 +325,19 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// the archive resource type is `mail-manager-archive`.
 pub fn archive_arn(region: &str, archive_id: &str) -> String {
     ::engine::emulator_arn("ses", region, &format!("mail-manager-archive/{archive_id}"))
+}
+
+/// The ARN of an address list, in this service's ARN namespace.
+///
+/// `AddressListArn` carries `@arnReference(service: "ses")`
+/// (`smithy_query(query="shape",shape="AddressListArn")`), and SES names the Mail Manager
+/// address-list resource type `mailmanager-address-list` in an ARN.
+pub fn address_list_arn(region: &str, address_list_id: &str) -> String {
+    ::engine::emulator_arn(
+        "ses",
+        region,
+        &format!("mailmanager-address-list/{address_list_id}"),
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAddressList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAddressList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAddressList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints an `AddressListId`, stores the address list in this service's state
+//! and returns the stored id. `ClientToken` (`@idempotencyToken`) makes a retry return the
+//! id the first call minted; a name already in use is refused with the modelled
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAddressList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAddressListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAddressList"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the service is always mounted on the shared
+            // `InMemoryEngine`. Answered with a modelled retryable error rather than a
+            // 501, which would claim the operation is unwritten.
+            return Err(CreateAddressListErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        let fingerprint = crate::state::create_address_list_fingerprint(
+            &input.address_list_name,
+            input.tags.as_deref(),
+        );
+
+        // `ClientToken` is `@idempotencyToken`: a retry must observe the first call's
+        // outcome, so it is resolved BEFORE the name-uniqueness check — otherwise the
+        // retry would be refused as a duplicate of the list it itself created. A token
+        // presented with a DIFFERENT request is not a retry and is refused, rather than
+        // being answered with the first request's address list.
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.address_list_idempotency.get(token))
+        {
+            if recorded.fingerprint == fingerprint {
+                return Ok(CreateAddressListOutput {
+                    address_list_id: recorded.resource_id.clone(),
+                });
+            }
+            return Err(CreateAddressListErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "ClientToken was already used to create address list {} with different \
+                     parameters.",
+                    recorded.resource_id
+                )),
+            })
+            .into());
+        }
+
+        if let Some(existing) = store.address_list_names.get(&input.address_list_name) {
+            return Err(CreateAddressListErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Address list name {} is already used by address list {existing}.",
+                    input.address_list_name
+                )),
+            })
+            .into());
+        }
+
+        // The per-account address-list quota. Checked AFTER the idempotency lookup, so a
+        // retry of a create that already succeeded is never refused by a quota it did not
+        // consume, and BEFORE any insert, so a refused create stores nothing.
+        if store.address_lists.len() >= crate::state::MAX_ADDRESS_LISTS {
+            return Err(CreateAddressListErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The maximum number of address lists ({}) has been reached. Delete \
+                         an address list before creating another.",
+                        crate::state::MAX_ADDRESS_LISTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let address_list_id = store.mint_address_list_id(now);
+        let record = crate::state::AddressListRecord {
+            address_list_arn: crate::state::address_list_arn(&region, &address_list_id),
+            address_list_id: address_list_id.clone(),
+            address_list_name: input.address_list_name.clone(),
+            created_at_millis: now,
+            // A created address list has never been updated, so its
+            // `LastUpdatedTimestamp` is its creation instant.
+            last_updated_at_millis: now,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        store
+            .address_list_names
+            .insert(input.address_list_name, address_list_id.clone());
+        if let Some(token) = input.client_token {
+            store.address_list_idempotency.insert(
+                token,
+                crate::state::IdempotentCreate {
+                    resource_id: address_list_id.clone(),
+                    fingerprint,
+                },
+            );
+        }
+        store
+            .address_lists
+            .insert(address_list_id.clone(), record);
+
+        Ok(CreateAddressListOutput { address_list_id })
     }
 }

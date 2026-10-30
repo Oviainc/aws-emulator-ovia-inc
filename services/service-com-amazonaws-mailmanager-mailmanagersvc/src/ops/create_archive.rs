@@ -188,14 +188,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             if recorded.fingerprint == fingerprint {
                 return Ok(CreateArchiveOutput {
-                    archive_id: recorded.archive_id.clone(),
+                    archive_id: recorded.resource_id.clone(),
                 });
             }
             return Err(CreateArchiveErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
                     "ClientToken was already used to create archive {} with different \
                      parameters.",
-                    recorded.archive_id
+                    recorded.resource_id
                 )),
             })
             .into());
@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.idempotency.insert(
                 token,
                 crate::state::IdempotentCreate {
-                    archive_id: archive_id.clone(),
+                    resource_id: archive_id.clone(),
                     fingerprint,
                 },
             );
