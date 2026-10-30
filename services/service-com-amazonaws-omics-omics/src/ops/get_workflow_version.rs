@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWorkflowVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWorkflowVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWorkflowVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored workflow version from [`crate::state`]: every member it answers comes
+//! from the record `CreateWorkflowVersion` persisted inside that workflow, plus the status
+//! transition the clock already owed it.
 //!
 //! ## Shape of an operation
 //!
@@ -213,18 +207,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWorkflowVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWorkflowVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Reporting only: this answers from the one stored version record and changes
+        // nothing beyond the status transition the clock already owed it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWorkflowVersion"))
+        // An export asks this emulator to produce a presigned URL to an exported
+        // definition or README. It serves no object store for them, so there is nothing
+        // to export and nothing to sign: the request is refused with the scaffold's 501
+        // rather than answered 200 with the member unset, which would read as an export
+        // that succeeded and produced nothing — the same answer `GetWorkflow` gives.
+        if input.export.as_deref().is_some_and(|export| !export.is_empty()) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotImplemented,
+                Some(&input.workflow_id),
+            );
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetWorkflowVersion with an export requested",
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            GetWorkflowVersionErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics workflow store is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        store.settle(now_ms);
+
+        // `type` narrows the lookup to versions of a workflow of that type, and
+        // `workflowOwnerId` to this emulator's own account, exactly as `GetWorkflow`
+        // narrows its own: a request naming another type or owner finds nothing rather
+        // than this account's private record.
+        let foreign_owner = input
+            .workflow_owner_id
+            .as_deref()
+            .is_some_and(|owner| !crate::state::is_emulator_account(owner));
+        let wanted_type = input.r#type.as_deref();
+        let version = store
+            .workflow(&input.workflow_id)
+            .filter(|_| !foreign_owner)
+            .and_then(|workflow| workflow.versions.get(&input.version_name))
+            .filter(|version| wanted_type.is_none_or(|wanted| wanted == version.r#type))
+            .ok_or_else(|| {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::NotFound,
+                    Some(&input.version_name),
+                );
+                GetWorkflowVersionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::get_workflow_version_not_found_message(
+                            &input.workflow_id,
+                            &input.version_name,
+                        ),
+                    },
+                )
+            })?;
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::Reported,
+            Some(&version.arn),
+        );
+
+        Ok(GetWorkflowVersionOutput {
+            arn: Some(version.arn.clone()),
+            workflow_id: Some(input.workflow_id.clone()),
+            version_name: Some(version.version_name.clone()),
+            accelerators: version.accelerators.clone(),
+            creation_time: Some(crate::state::timestamp(version.creation_time_ms)),
+            description: version.description.clone(),
+            definition: version.definition.clone(),
+            digest: version.digest.clone(),
+            engine: version.engine.clone(),
+            main: version.main.clone(),
+            // `metadata` is documented as metadata that "may vary depending on the
+            // workflow, and there may also be no metadata to return". This slice
+            // derives none, so it returns none rather than inventing entries.
+            metadata: None,
+            parameter_template: version.parameter_template_output(),
+            status: Some(version.status.clone()),
+            status_message: version.status_message.clone(),
+            storage_type: version.storage_type.clone(),
+            storage_capacity: version.storage_capacity,
+            r#type: Some(version.r#type.clone()),
+            tags: version.tags_output(),
+            uuid: Some(version.uuid.clone()),
+            workflow_bucket_owner_id: version.workflow_bucket_owner_id.clone(),
+            container_registry_map: version.container_registry_map.clone(),
+            // `readme`, and the presigned form of `definition`, are the S3 URLs the
+            // real service mints for an export. No export reaches here (one is refused
+            // above), so nothing is reported for them; `definition` and `readmePath`,
+            // which the create supplied, are reported from state.
+            readme: None,
+            definition_repository_details: version.definition_repository_details(),
+            readme_path: version.readme_path.clone(),
+            // Workflow profiles are declared inside the definition file, which this
+            // slice does not parse; `CreateWorkflowVersion` accepts no profile member
+            // either.
+            profiles: None,
+            profile_parameter_templates: None,
+        })
     }
 }

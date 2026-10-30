@@ -240,6 +240,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A version is a resource of its own, reclaimed by `DeleteWorkflowVersion`, so
+        // a workflow that still holds one cannot be deleted: the request would have to
+        // remove resources it does not name. The recorded service refuses this with the
+        // modelled `ValidationException`, not with the conflict a live run raises.
+        let versions = store
+            .workflows
+            .get(&key)
+            .map_or(0, |workflow| workflow.versions.len());
+        if versions > 0 {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&input.id),
+            );
+            return Err(
+                DeleteWorkflowErrorModeled::ValidationException(ValidationException {
+                    message: crate::state::WORKFLOW_HAS_VERSIONS_MESSAGE.to_string(),
+                })
+                .into(),
+            );
+        }
+
         store.workflows.remove(&key);
         crate::state::audit(
             Self::NAME,

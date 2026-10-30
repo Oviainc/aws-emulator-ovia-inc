@@ -30,9 +30,12 @@ use sha2::Digest;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below signs for; the ARNs must carry exactly this one.
-const REGION: &str = "us-west-2";
+///
+/// This module owns the HTTP harness every suite in this crate drives the emulator
+/// through, so the items the other suites reuse are `pub(crate)`.
+pub(crate) const REGION: &str = "us-west-2";
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A role ARN satisfying the modelled `RunRoleArn` (len 1..128, `^arn:.+$`).
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/OmicsWorkflowRole";
@@ -42,10 +45,10 @@ const OUTPUT_URI: &str = "s3://omics-emulator-bucket/runs";
 /// Every value the modelled `WorkflowEngine` enum admits.
 /// Source: `smithy_query(query="shape",shape="WorkflowEngine")` -> CWL | NEXTFLOW | WDL |
 /// WDL_LENIENT.
-const WORKFLOW_ENGINES: &[&str] = &["CWL", "NEXTFLOW", "WDL", "WDL_LENIENT"];
+pub(crate) const WORKFLOW_ENGINES: &[&str] = &["CWL", "NEXTFLOW", "WDL", "WDL_LENIENT"];
 /// Every value the modelled `StorageType` enum admits.
 /// Source: `smithy_query(query="shape",shape="StorageType")` -> STATIC | DYNAMIC.
-const STORAGE_TYPES: &[&str] = &["STATIC", "DYNAMIC"];
+pub(crate) const STORAGE_TYPES: &[&str] = &["STATIC", "DYNAMIC"];
 /// Every value the modelled `RunLogLevel` enum admits.
 /// Source: `smithy_query(query="shape",shape="RunLogLevel")` -> OFF | FATAL | ERROR | ALL.
 const RUN_LOG_LEVELS: &[&str] = &["OFF", "FATAL", "ERROR", "ALL"];
@@ -55,10 +58,10 @@ const RUN_RETENTION_MODES: &[&str] = &["RETAIN", "REMOVE"];
 /// The published bounds of the modelled `storageCapacity` / `priority` range (0..100000).
 /// Source: the `storageCapacity` and `priority` members of `CreateWorkflowRequest` and
 /// `StartRunRequest`.
-const CAPACITY_RANGE: (i64, i64) = (0, 100_000);
+pub(crate) const CAPACITY_RANGE: (i64, i64) = (0, 100_000);
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -102,7 +105,7 @@ fn request_as(
 }
 
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -143,7 +146,7 @@ async fn call_as(
 }
 
 /// The modelled error shape a failed call reported.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -154,15 +157,15 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-async fn create_workflow(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+pub(crate) async fn create_workflow(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "POST", "/workflow", Some(body)).await
 }
 
-async fn get_workflow(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn get_workflow(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/workflow/{id}"), None).await
 }
 
-async fn delete_workflow(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn delete_workflow(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "DELETE", &format!("/workflow/{id}"), None).await
 }
 
@@ -187,7 +190,7 @@ async fn list_runs(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
 }
 
 /// The `id` member of a 201 response, after asserting the status.
-fn created_id(case: &str, status: u16, body: &Value) -> String {
+pub(crate) fn created_id(case: &str, status: u16, body: &Value) -> String {
     assert_eq!(status, 201, "case {case:?}: expected 201, got {body:?}");
     body.get("id")
         .and_then(Value::as_str)
@@ -212,7 +215,7 @@ fn assert_numeric_id(case: &str, id: &str) {
 }
 
 /// Assert `arn` is this emulator's ARN for `resource/id`.
-fn assert_arn(case: &str, arn: &str, resource: &str, id: &str) {
+pub(crate) fn assert_arn(case: &str, arn: &str, resource: &str, id: &str) {
     let expected = format!("arn:aws:omics:{REGION}:{ACCOUNT}:{resource}/{id}");
     assert_eq!(
         arn, expected,
@@ -222,7 +225,7 @@ fn assert_arn(case: &str, arn: &str, resource: &str, id: &str) {
 
 /// Assert `uuid` satisfies the modelled `WorkflowUuid` pattern
 /// `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`.
-fn assert_uuid(case: &str, uuid: &str) {
+pub(crate) fn assert_uuid(case: &str, uuid: &str) {
     let groups: Vec<&str> = uuid.split('-').collect();
     let widths = [8usize, 4, 4, 4, 12];
     assert_eq!(
@@ -239,7 +242,7 @@ fn assert_uuid(case: &str, uuid: &str) {
 }
 
 /// The hex SHA-256 of `bytes`: the digest a workflow's definition must report.
-fn expected_digest(bytes: &[u8]) -> String {
+pub(crate) fn expected_digest(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
@@ -248,7 +251,7 @@ fn expected_digest(bytes: &[u8]) -> String {
 /// The modelled `WorkflowTimestamp`/`RunTimestamp` are timestamps; the framework renders
 /// them on the wire as epoch seconds, so what is asserted here is that the value is a
 /// real instant, not its textual shape.
-fn assert_timestamp(case: &str, member: &str, body: &Value) -> f64 {
+pub(crate) fn assert_timestamp(case: &str, member: &str, body: &Value) -> f64 {
     let value = body
         .get(member)
         .and_then(Value::as_f64)
@@ -261,7 +264,7 @@ fn assert_timestamp(case: &str, member: &str, body: &Value) -> f64 {
 }
 
 /// Every member of `expected` must appear in `actual` with exactly that value.
-fn assert_members(case: &str, via: &str, expected: &Value, actual: &Value) {
+pub(crate) fn assert_members(case: &str, via: &str, expected: &Value, actual: &Value) {
     let expected = expected.as_object().expect("an object of expected members");
     for (member, want) in expected {
         let got = actual.get(member);
@@ -275,7 +278,7 @@ fn assert_members(case: &str, via: &str, expected: &Value, actual: &Value) {
 }
 
 /// Assert `actual` carries none of `members`.
-fn assert_absent(case: &str, members: &[&str], actual: &Value) {
+pub(crate) fn assert_absent(case: &str, members: &[&str], actual: &Value) {
     for member in members {
         assert!(
             actual.get(*member).is_none(),
@@ -321,10 +324,10 @@ const IN_FLIGHT_RUN_STATUSES: &[&str] = &["PENDING", "STARTING", "RUNNING", "STO
 /// Generously above the spans the handlers actually owe, so a loaded machine cannot turn
 /// an assertion into a timing failure; the polls below return as soon as the status is
 /// there, so the slack costs nothing when the machine is idle.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 
 /// How often a poll re-reads while waiting for a status.
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Read the workflow until it reports `expected`, and answer that response.
 ///
@@ -2367,6 +2370,7 @@ const WITHHELD_FROM_AUDIT: &[&str] = &[
     "audit-start",
     "audit-missing",
     "audit-tags",
+    "audit-version",
     ROLE_ARN,
     OUTPUT_URI,
     "audited-tag-value",
@@ -2657,6 +2661,52 @@ async fn every_call_emits_a_structured_audit_record() {
         let target = format!("{method} {}", uri.split('?').next().unwrap_or(&uri));
         assert_audit_record(case, &record, operation, &target, outcome, &resource);
     }
+
+    // The two version operations change the store too, so each leaves its own record.
+    // They act on a workflow of their own, so the delete rows below are unaffected by the
+    // version this creates.
+    let versioned = workflow_for_runs(&router, "audit-versioned-workflow").await;
+    let version_arn =
+        format!("arn:aws:omics:{REGION}:{ACCOUNT}:workflow/{versioned}/version/av1");
+    let case = "a workflow version created";
+    let (status, body, record) = audited_call(
+        captured,
+        &router,
+        case,
+        "POST",
+        &format!("/workflow/{versioned}/version"),
+        Some(&json!({ "versionName": "av1", "requestId": "audit-version" })),
+    )
+    .await;
+    assert_eq!(status, 201, "case {case:?}: expected 201, got {body:?}");
+    assert_audit_record(
+        case,
+        &record,
+        "CreateWorkflowVersion",
+        &format!("POST /workflow/{versioned}/version"),
+        "workflow-version-created",
+        &version_arn,
+    );
+
+    let case = "a workflow version deleted";
+    let (status, body, record) = audited_call(
+        captured,
+        &router,
+        case,
+        "DELETE",
+        &format!("/workflow/{versioned}/version/av1"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 202, "case {case:?}: expected 202, got {body:?}");
+    assert_audit_record(
+        case,
+        &record,
+        "DeleteWorkflowVersion",
+        &format!("DELETE /workflow/{versioned}/version/av1"),
+        "workflow-version-deleted",
+        &version_arn,
+    );
 
     // The two deletes. Which outcome each is owed depends on which side of the clock the
     // call lands on — a run that has not finished cannot be deleted and its workflow is

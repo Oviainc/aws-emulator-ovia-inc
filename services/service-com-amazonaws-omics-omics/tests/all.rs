@@ -15,3 +15,5 @@
 mod private_workflow_runs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/workflow_versions.rs"]
+mod workflow_versions;

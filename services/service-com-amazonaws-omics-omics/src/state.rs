@@ -3,10 +3,12 @@
 //! Engine state for the com-amazonaws-omics-omics service.
 //!
 //! This slice holds the service's primary resource pair: the **private workflow**
-//! (`CreateWorkflow` / `GetWorkflow` / `ListWorkflows` / `DeleteWorkflow`) and the
-//! **run** started from it (`StartRun` / `GetRun` / `ListRuns` / `DeleteRun`). Each
+//! (`CreateWorkflow` / `GetWorkflow` / `ListWorkflows` / `DeleteWorkflow`), the
+//! **versions** of that workflow (`CreateWorkflowVersion` / `GetWorkflowVersion`) and
+//! the **run** started from it (`StartRun` / `GetRun` / `ListRuns` / `DeleteRun`). Each
 //! resource is stored exactly once, keyed by the numeric id the model's
-//! `^[0-9]+$` patterns describe, so every operation reads and writes the one record.
+//! `^[0-9]+$` patterns describe (a version by its name, inside its workflow's record),
+//! so every operation reads and writes the one record.
 //!
 //! Both stores are `BTreeMap<u64, _>` keyed by that numeric id. The ids are minted
 //! from a monotonic counter, so the map's own key order IS creation order: a page
@@ -30,6 +32,12 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// The resource portion a workflow ARN carries before its id.
 pub const WORKFLOW_ARN_RESOURCE_PREFIX: &str = "workflow/";
+
+/// What a workflow VERSION ARN carries between its workflow's id and the version
+/// name: a version is named inside its workflow's resource path, which is what
+/// `CreateWorkflowVersion` documents when it says "Version names appear in the workflow
+/// version ARN".
+pub const WORKFLOW_VERSION_ARN_INFIX: &str = "/version/";
 
 /// The resource portion a run ARN carries before its id.
 pub const RUN_ARN_RESOURCE_PREFIX: &str = "run/";
@@ -110,6 +118,33 @@ pub fn is_deletable_run_status(status: &str) -> bool {
     DELETABLE_RUN_STATUSES.contains(&status)
 }
 
+/// What `GetWorkflowVersion` answers when the workflow version the request names is
+/// not one this emulator holds — either the workflow or the version is missing, which
+/// are the same answer: the pair was not found.
+///
+/// The variable parts are the workflow id and the version name the REQUEST carried.
+/// `DeleteWorkflowVersion` words the same condition its own way, so each operation
+/// carries its own wording rather than sharing one.
+pub fn get_workflow_version_not_found_message(workflow_id: &str, version_name: &str) -> String {
+    format!("Workflow {workflow_id} with version name {version_name} not found")
+}
+
+/// The same condition as [`get_workflow_version_not_found_message`], as
+/// `DeleteWorkflowVersion` words it.
+pub fn delete_workflow_version_not_found_message(
+    workflow_id: &str,
+    version_name: &str,
+) -> String {
+    format!("Workflow {workflow_id} version {version_name} not found")
+}
+
+/// What `DeleteWorkflow` answers when the workflow still holds versions.
+///
+/// Fixed text: the refusal names no resource, because the rule is about the workflow in
+/// the request's own path.
+pub const WORKFLOW_HAS_VERSIONS_MESSAGE: &str = "Cannot delete the requested workflow, as it \
+     has one or more versions. Delete the versions and try again.";
+
 /// The modelled `StorageType` value that allocates a fixed amount of storage.
 ///
 /// Source: `smithy_query(query="shape",shape="StorageType")` -> STATIC | DYNAMIC.
@@ -163,6 +198,12 @@ pub const MAX_WORKFLOWS: usize = 500;
 /// The most runs this emulator will hold. Emulator resource guard, not an AWS quota.
 pub const MAX_RUNS: usize = 1000;
 
+/// The most versions this emulator will hold for one workflow. Emulator resource
+/// guard, not an AWS quota: each version is created by a caller and reclaimed only by
+/// an explicit delete, so the per-workflow collection carries a cap too. A create past
+/// it is refused with the modelled `ServiceQuotaExceededException`.
+pub const MAX_WORKFLOW_VERSIONS: usize = 100;
+
 /// The most tags one workflow or run may carry.
 ///
 /// From the `tags` member's own documentation on `CreateWorkflow`: "You can define
@@ -209,30 +250,31 @@ pub struct Workflow {
     /// `None` once it has settled.
     pub status_due_at_ms: Option<i64>,
     pub tags: BTreeMap<String, String>,
+    /// Every version `CreateWorkflowVersion` minted for this workflow, keyed by the
+    /// modelled `WorkflowVersionName` — which that operation documents as unique for
+    /// the workflow and unchangeable afterwards, so the name IS the key and the map
+    /// holds each version exactly once.
+    pub versions: BTreeMap<String, WorkflowVersion>,
 }
 
 impl Workflow {
-    /// Apply every status change the clock already owed this workflow by `now_ms`.
+    /// Apply every status change the clock already owed this workflow, or any version
+    /// it holds, by `now_ms`.
     ///
     /// Reporting-only: it materialises a change that was due at the same instant
     /// whether or not anybody called, and the status it lands on does not depend on
     /// when the read happened.
     pub fn settle(&mut self, now_ms: i64) {
-        if self.status_due_at_ms.is_some_and(|due| due <= now_ms) {
-            self.status = WORKFLOW_STATUS_ACTIVE.to_string();
-            self.status_due_at_ms = None;
+        settle_creating(&mut self.status, &mut self.status_due_at_ms, now_ms);
+        for version in self.versions.values_mut() {
+            version.settle(now_ms);
         }
     }
 
     /// `parameterTemplate` as the wire shape wants it: omitted when the workflow
     /// carries no parameter at all.
     pub fn parameter_template_output(&self) -> Option<HashMap<String, WorkflowParameter>> {
-        (!self.parameter_template.is_empty()).then(|| {
-            self.parameter_template
-                .iter()
-                .map(|(name, parameter)| (name.clone(), parameter.clone()))
-                .collect()
-        })
+        parameter_template_output(&self.parameter_template)
     }
 
     /// `tags` as the wire shape wants it: omitted when none were ever set.
@@ -241,20 +283,114 @@ impl Workflow {
     }
 
     /// `definitionRepositoryDetails` for the repository the create named.
-    ///
-    /// `providerType` and `providerEndpoint` are reported by the real service from
-    /// the CodeConnections connection the ARN names; this emulator resolves no
-    /// connection, so it reports only what the request itself carried.
     pub fn definition_repository_details(&self) -> Option<DefinitionRepositoryDetails> {
-        let repository = self.definition_repository.as_ref()?;
-        Some(DefinitionRepositoryDetails {
-            connection_arn: Some(repository.connection_arn.clone()),
-            full_repository_id: Some(repository.full_repository_id.clone()),
-            source_reference: repository.source_reference.clone(),
-            provider_type: None,
-            provider_endpoint: None,
-        })
+        definition_repository_details(self.definition_repository.as_ref())
     }
+}
+
+/// One stored workflow version: every member `GetWorkflowVersion` reports.
+///
+/// A version carries its own configuration rather than the workflow's:
+/// `CreateWorkflowVersion` documents that "It doesn't inherit any configuration values
+/// from the workflow", so no member here is filled in from the parent record.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowVersion {
+    /// The modelled `WorkflowVersionName`: this record's key inside its workflow.
+    pub version_name: String,
+    pub arn: String,
+    pub uuid: String,
+    pub description: Option<String>,
+    pub engine: Option<String>,
+    pub main: Option<String>,
+    /// The S3 URI the definition was read from, when the create named one.
+    pub definition: Option<String>,
+    /// Content digest of the definition the create supplied.
+    pub digest: Option<String>,
+    pub parameter_template: BTreeMap<String, WorkflowParameter>,
+    pub storage_capacity: Option<i32>,
+    pub storage_type: Option<String>,
+    pub accelerators: Option<String>,
+    pub readme_path: Option<String>,
+    pub container_registry_map: Option<ContainerRegistryMap>,
+    pub definition_repository: Option<DefinitionRepository>,
+    pub workflow_bucket_owner_id: Option<String>,
+    /// The `WorkflowType` of the workflow this version belongs to.
+    pub r#type: String,
+    pub status: String,
+    pub status_message: Option<String>,
+    pub creation_time_ms: i64,
+    /// When the transition this record owes the clock becomes due, in epoch millis;
+    /// `None` once it has settled.
+    pub status_due_at_ms: Option<i64>,
+    pub tags: BTreeMap<String, String>,
+    /// The `@idempotencyToken` of the request that created this version, so a replay
+    /// of that token answers with this record instead of minting a second one. The
+    /// token's namespace is the workflow's own version collection, which
+    /// [`MAX_WORKFLOW_VERSIONS`] already bounds, so no separate token map grows here.
+    pub request_id: String,
+}
+
+impl WorkflowVersion {
+    /// Apply every status change the clock already owed this version by `now_ms`,
+    /// under the same rule a workflow settles by.
+    pub fn settle(&mut self, now_ms: i64) {
+        settle_creating(&mut self.status, &mut self.status_due_at_ms, now_ms);
+    }
+
+    /// `parameterTemplate` as the wire shape wants it: omitted when the version
+    /// carries no parameter at all.
+    pub fn parameter_template_output(&self) -> Option<HashMap<String, WorkflowParameter>> {
+        parameter_template_output(&self.parameter_template)
+    }
+
+    /// `tags` as the wire shape wants it: omitted when none were ever set.
+    pub fn tags_output(&self) -> Option<HashMap<String, String>> {
+        tags_output(&self.tags)
+    }
+
+    /// `definitionRepositoryDetails` for the repository the create named.
+    pub fn definition_repository_details(&self) -> Option<DefinitionRepositoryDetails> {
+        definition_repository_details(self.definition_repository.as_ref())
+    }
+}
+
+/// Apply the `CREATING` -> `ACTIVE` move the clock owes a freshly created workflow or
+/// workflow version: one rule, stated once, so both records settle identically.
+fn settle_creating(status: &mut String, status_due_at_ms: &mut Option<i64>, now_ms: i64) {
+    if status_due_at_ms.is_some_and(|due| due <= now_ms) {
+        *status = WORKFLOW_STATUS_ACTIVE.to_string();
+        *status_due_at_ms = None;
+    }
+}
+
+/// A parameter template as the wire shapes want it: omitted when it defines nothing.
+fn parameter_template_output(
+    parameter_template: &BTreeMap<String, WorkflowParameter>,
+) -> Option<HashMap<String, WorkflowParameter>> {
+    (!parameter_template.is_empty()).then(|| {
+        parameter_template
+            .iter()
+            .map(|(name, parameter)| (name.clone(), parameter.clone()))
+            .collect()
+    })
+}
+
+/// `definitionRepositoryDetails` for the repository a create named.
+///
+/// `providerType` and `providerEndpoint` are reported by the real service from the
+/// CodeConnections connection the ARN names; this emulator resolves no connection, so
+/// it reports only what the request itself carried.
+fn definition_repository_details(
+    repository: Option<&DefinitionRepository>,
+) -> Option<DefinitionRepositoryDetails> {
+    let repository = repository?;
+    Some(DefinitionRepositoryDetails {
+        connection_arn: Some(repository.connection_arn.clone()),
+        full_repository_id: Some(repository.full_repository_id.clone()),
+        source_reference: repository.source_reference.clone(),
+        provider_type: None,
+        provider_endpoint: None,
+    })
 }
 
 /// One stored run: every member `GetRun` reports.
@@ -402,6 +538,13 @@ impl ComAmazonawsOmicsOmicsState {
         self.workflows.get(&numeric_id(id)?)
     }
 
+    /// The same record, for an operation that CHANGES the workflow or the versions it
+    /// holds. One lookup rule for both, so a create and a read cannot disagree about
+    /// which workflow an id names.
+    pub fn workflow_mut(&mut self, id: &str) -> Option<&mut Workflow> {
+        self.workflows.get_mut(&numeric_id(id)?)
+    }
+
     /// The run the modelled `RunId` `id` names, or `None`.
     pub fn run(&self, id: &str) -> Option<&Run> {
         self.runs.get(&numeric_id(id)?)
@@ -521,6 +664,22 @@ pub fn workflow_arn(region: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{WORKFLOW_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The ARN of the version `version_name` of the workflow `workflow_id` in `region`.
+///
+/// The version is named inside its workflow's own resource path, so one ARN names the
+/// pair and no version ARN can collide with a workflow ARN. The result is well inside
+/// the modelled `WorkflowVersionArn` length (1..150): the account and region are
+/// fixed, the workflow id is at most 18 characters and the name at most 64.
+pub fn workflow_version_arn(region: &str, workflow_id: &str, version_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{WORKFLOW_ARN_RESOURCE_PREFIX}{workflow_id}{WORKFLOW_VERSION_ARN_INFIX}{version_name}"
+        ),
     )
 }
 
@@ -751,6 +910,10 @@ pub enum AuditOutcome {
     WorkflowCreated,
     /// A stored workflow was removed from the store.
     WorkflowDeleted,
+    /// A version was minted and stored against a stored workflow.
+    WorkflowVersionCreated,
+    /// A stored workflow version was removed from its workflow.
+    WorkflowVersionDeleted,
     /// A run was minted and stored against a stored workflow.
     RunStarted,
     /// A stored run was removed from the store.
@@ -781,6 +944,8 @@ impl AuditOutcome {
         match self {
             Self::WorkflowCreated => "workflow-created",
             Self::WorkflowDeleted => "workflow-deleted",
+            Self::WorkflowVersionCreated => "workflow-version-created",
+            Self::WorkflowVersionDeleted => "workflow-version-deleted",
             Self::RunStarted => "run-started",
             Self::RunDeleted => "run-deleted",
             Self::NoChange => "no-change",

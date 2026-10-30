@@ -377,6 +377,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time_ms: now_ms,
             status_due_at_ms: Some(now_ms + crate::state::TRANSITION_DELAY.as_millis() as i64),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // A workflow is created with no versions: `CreateWorkflowVersion` is what
+            // adds one.
+            versions: Default::default(),
         };
         let status = workflow.status.clone();
         let tags = workflow.tags_output();
