@@ -87,6 +87,8 @@ mod recommendations_pending_aggregation;
 mod refusal_message_formats;
 #[path = "all/refusal_message_rules.rs"]
 mod refusal_message_rules;
+#[path = "all/removal_reports_the_policy.rs"]
+mod removal_reports_the_policy;
 #[path = "all/resource_policy.rs"]
 mod resource_policy;
 #[path = "all/resource_tags.rs"]

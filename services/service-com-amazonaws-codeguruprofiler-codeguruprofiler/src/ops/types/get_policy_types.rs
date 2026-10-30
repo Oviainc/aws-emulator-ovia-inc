@@ -20,10 +20,10 @@ pub struct GetPolicyInput {
 /// `GetPolicyResponse`. Its schema and codec come from [`profiler_schema_and_codec!`]
 /// rather than `#[smithy_macros::smithy(shape = ...)]` because BOTH its members are
 /// `@required` in the model yet neither is in the body of the 200 this operation answers
-/// a profiling group that has no resource-based policy attached — the state a group is
-/// created in, and the state the last `RemovePermission` leaves it in. The derive makes
-/// a `@required` member a non-`Option` field its serializer always writes, which cannot
-/// express that; see `types/date_time_wire.rs`.
+/// a profiling group that has no resource-based policy at all — the state a group is
+/// created in, before any `PutPermission`. The derive makes a `@required` member a
+/// non-`Option` field its serializer always writes, which cannot express that; see
+/// `types/date_time_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct GetPolicyOutput {
     pub policy: Option<String>,

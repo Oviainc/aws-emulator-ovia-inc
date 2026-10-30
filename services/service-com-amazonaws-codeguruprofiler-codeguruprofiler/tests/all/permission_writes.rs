@@ -10,9 +10,10 @@
 //! fresh `revisionId`; a write is applied only when it names the revision the stored
 //! policy currently carries (and, for the first write, names none); `GetPolicy` reports
 //! that stored document and revision unchanged; and `RemovePermission` drops the
-//! statement, leaving the group with no policy once the last one is gone — reported as
-//! a 200 carrying neither `policy` nor `revisionId`, the same empty answer `GetPolicy`
-//! then gives.
+//! statement and reports the policy as it then stands with the revision it then carries,
+//! including when it took the last statement — the policy goes on existing, holding no
+//! statement, which is what `GetPolicy` then reports and what the next write must name
+//! the revision of.
 //!
 //! The harness and the group table are the ones [`crate::profiling_group_lifecycle`]
 //! already builds, so the group variation (compute platform, orchestration flag, tag
@@ -215,8 +216,9 @@ fn expected_principals(requested: &[String]) -> Vec<String> {
 
 /// `true` when `value` has the form the modelled `RevisionId` pattern fixes,
 /// `[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`
-/// (`smithy_query(query="shape",shape="RevisionId")`).
-fn is_revision_id(value: &str) -> bool {
+/// (`smithy_query(query="shape",shape="RevisionId")`). `pub(crate)` so the suites that
+/// check a reported revision against the model read the pattern from one place.
+pub(crate) fn is_revision_id(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == 5
         && [8_usize, 4, 4, 4, 12]
@@ -537,7 +539,7 @@ async fn the_first_write_must_name_no_revision_and_every_later_write_must_name_t
 }
 
 #[tokio::test]
-async fn remove_permission_drops_the_statement_and_deletes_the_policy_with_its_last_one() {
+async fn remove_permission_drops_the_statement_and_reports_the_policy_it_leaves_behind() {
     let harness = Harness::new();
 
     for case in created_cases(&harness).await {
@@ -575,58 +577,106 @@ async fn remove_permission_drops_the_statement_and_deletes_the_policy_with_its_l
             removed.status,
             String::from_utf8_lossy(&removed.body)
         );
-        // It took the policy's only statement, so the group now has no resource-based
-        // policy: no document and no revision are reported, because none is stored.
-        assert_eq!(
-            removed.json(),
-            serde_json::json!({}),
-            "case {case:?}: removing the last statement must answer an empty body, got {}",
-            String::from_utf8_lossy(&removed.body)
+        // The removal took the policy's only statement, so what it reports is the
+        // policy document with no statement in it, at the revision the removal minted.
+        let removal_revision = string_member(&removed, "revisionId");
+        assert!(
+            is_revision_id(&removal_revision),
+            "case {case:?}: expected a UUID revisionId, got {removal_revision:?}"
         );
+        assert_ne!(
+            removal_revision, revision,
+            "case {case:?}: an applied removal must mint a new revision, got \
+             {removal_revision}"
+        );
+        let left = policy_document(&removed);
+        assert_eq!(
+            left.get("Statement").and_then(|value| value.as_array()),
+            Some(&Vec::new()),
+            "case {case:?}: the policy left behind must hold no statement, got {left}"
+        );
+        for granted in expected_principals(&case.first) {
+            assert!(
+                !string_member(&removed, "policy").contains(&granted),
+                "case {case:?}: {granted} was removed, so it must not still be granted in {left}"
+            );
+        }
 
-        // The last statement went with the policy: there is none left to read, and
-        // none stored.
+        // The policy the removal left behind is the group's policy now: the store holds
+        // it at the revision the removal reported, and `GetPolicy` reports both.
         assert_eq!(
             harness.stored_policy_revision(group),
-            None,
-            "case {case:?}: removing the last statement must leave the group with no policy"
+            Some(removal_revision.clone()),
+            "case {case:?}: the group must carry the revision the removal minted, got {:?}",
+            harness.stored_policy_revision(group)
         );
-        let gone = get_policy(&harness, group).await;
+        let read = get_policy(&harness, group).await;
         assert_eq!(
-            gone.status,
+            read.status,
             200,
             "case {case:?}: the group still exists, so GetPolicy must answer 200, got {} {}",
-            gone.status,
-            String::from_utf8_lossy(&gone.body)
+            read.status,
+            String::from_utf8_lossy(&read.body)
         );
         assert_eq!(
-            gone.json(),
-            serde_json::json!({}),
-            "case {case:?}: GetPolicy must answer an empty body once the policy is gone, got {}",
-            String::from_utf8_lossy(&gone.body)
+            read.json(),
+            removed.json(),
+            "case {case:?}: GetPolicy must report the policy and revision the removal \
+             left, got {}",
+            String::from_utf8_lossy(&read.body)
         );
 
-        // Nothing left to remove from, and the group is back to its first-write rules:
-        // a write that names no revision creates the policy again.
-        let again = remove_permission(&harness, group, ACTION_GROUP, FOREIGN_REVISION).await;
+        // There is no statement left for the action group, so a second removal naming
+        // the CURRENT revision has nothing to remove — while one naming a revision the
+        // policy has moved past is a conflict, as on any other policy.
+        let again = remove_permission(&harness, group, ACTION_GROUP, &removal_revision).await;
         assert_eq!(
             again.status,
             404,
-            "case {case:?}: removing from a group with no policy must answer 404, got {} {}",
+            "case {case:?}: removing a statement the policy does not hold must answer \
+             404, got {} {}",
             again.status,
             String::from_utf8_lossy(&again.body)
         );
-        let recreated = put_permission(&harness, group, ACTION_GROUP, &case.second, None).await;
+        let moved_past = remove_permission(&harness, group, ACTION_GROUP, &revision).await;
         assert_eq!(
-            recreated.status,
+            moved_past.status,
+            409,
+            "case {case:?}: a superseded revision must conflict, got {} {}",
+            moved_past.status,
+            String::from_utf8_lossy(&moved_past.body)
+        );
+
+        // The policy exists, so the next write must name the revision the removal
+        // handed back — and that revision is live: the write naming it is applied.
+        let unversioned = put_permission(&harness, group, ACTION_GROUP, &case.second, None).await;
+        assert_eq!(
+            unversioned.status,
+            409,
+            "case {case:?}: a write against an existing policy must name its revision, \
+             got {} {}",
+            unversioned.status,
+            String::from_utf8_lossy(&unversioned.body)
+        );
+        let regranted = put_permission(
+            &harness,
+            group,
+            ACTION_GROUP,
+            &case.second,
+            Some(&removal_revision),
+        )
+        .await;
+        assert_eq!(
+            regranted.status,
             200,
-            "case {case:?}: a policy must be creatable again after it was removed, got {} {}",
-            recreated.status,
-            String::from_utf8_lossy(&recreated.body)
+            "case {case:?}: the revision the removal reported must be the one the next \
+             write names, got {} {}",
+            regranted.status,
+            String::from_utf8_lossy(&regranted.body)
         );
         assert_policy_grants(
             &case,
-            &policy_document(&recreated),
+            &policy_document(&regranted),
             &expected_principals(&case.second),
         );
     }

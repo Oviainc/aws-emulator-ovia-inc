@@ -465,7 +465,7 @@ async fn an_applied_add_mints_one_id_per_channel_the_request_does_not_name() {
 }
 
 #[tokio::test]
-async fn an_applied_policy_write_mints_one_revision_and_a_write_that_stores_none_mints_none() {
+async fn an_applied_policy_write_mints_one_revision_and_a_refused_one_mints_none() {
     let harness = Harness::new();
     let group = "mint-policy-sequence";
     create_group(&harness, group).await;
@@ -543,26 +543,35 @@ async fn an_applied_policy_write_mints_one_revision_and_a_write_that_stores_none
          {after_second:?} from {after_first:?}"
     );
 
-    // Removing the policy's LAST statement leaves the group with no policy, so there is no
-    // revision to store and none is minted.
+    // Removing the policy's LAST statement is an applied write like any other: the
+    // policy it leaves behind holds no statement but still exists, so exactly one
+    // revision is minted and that revision is the one the group now carries.
     let removed = remove_permission(&harness, group, ACTION_GROUP, &second_revision).await;
     assert_eq!(
         removed.status,
         200,
-        "case clearing removal: expected 200, got {} / {}",
+        "case emptying removal: expected 200, got {} / {}",
         removed.status,
         String::from_utf8_lossy(&removed.body)
     );
+    let removal_revision = string_member(&removed, "revisionId");
+    assert_ne!(
+        removal_revision, second_revision,
+        "case emptying removal: an applied removal must carry a fresh revision, got \
+         {removal_revision}"
+    );
     let after_removal = mint_counts(&harness);
     assert_eq!(
-        after_removal, after_second,
-        "case clearing removal: a write that stores no policy must mint no revision, got \
+        after_removal,
+        (after_second.0, after_second.1 + 1),
+        "case emptying removal: an applied removal must mint exactly one revision, got \
          {after_removal:?} from {after_second:?}"
     );
     assert_eq!(
         harness.stored_policy_revision(group),
-        None,
-        "case clearing removal: the group must be left holding no policy, got {:?}",
+        Some(removal_revision.clone()),
+        "case emptying removal: the group must carry the revision the removal minted, got \
+         {:?}",
         harness.stored_policy_revision(group)
     );
 }

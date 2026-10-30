@@ -4,9 +4,10 @@
 //!
 //! Removes the action group's statement from the profiling group's resource-based
 //! policy under optimistic locking on `revisionId`, and answers with the policy as it
-//! then stands — or, once the removal has taken the LAST statement, with an empty body:
-//! the group then has no resource-based policy, so there is no document to report and no
-//! revision to report, which is also what `GetPolicy` then answers for it.
+//! then stands and the revision that removal minted — including when the removal took
+//! the LAST statement, where the policy goes on existing holding no statement at all,
+//! which is what `GetPolicy` then reports and what the next `PutPermission` must name
+//! the revision of.
 //!
 //! ## Shape of an operation
 //!
@@ -187,20 +188,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         match written {
+            // Every applied removal reports both members the model marks `@required`:
+            // the document the policy carries now and the revision it carries now —
+            // also when no statement is left, since the policy itself still exists.
             crate::state::PolicyWrite::Written {
                 policy,
                 revision_id,
             } => Ok(RemovePermissionOutput {
-                policy: Some(policy),
-                revision_id: Some(revision_id),
-            }),
-            // The removal took the last statement, so the group now has no
-            // resource-based policy: there is no document and no revision to report,
-            // and inventing a revision the store does not hold would hand the caller a
-            // token no later write could use.
-            crate::state::PolicyWrite::Cleared => Ok(RemovePermissionOutput {
-                policy: None,
-                revision_id: None,
+                policy,
+                revision_id,
             }),
             crate::state::PolicyWrite::UnknownGroup => {
                 Err(RemovePermissionErrorModeled::ResourceNotFoundException(

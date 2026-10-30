@@ -156,10 +156,14 @@ async fn both_policy_writes_answer_from_the_shared_action_group_rule() {
     create_group(&harness, GROUP).await;
 
     // The ACCEPT side of the shared path, driven through BOTH operations that take an
-    // `actionGroup`: every grantable group is written, read back and removed again.
+    // `actionGroup`: every grantable group is written, read back and removed again. The
+    // revision each write must name is the one the previous applied write reported,
+    // since a policy exists from its first write on.
+    let mut current: Option<String> = None;
     for action_group in state::grantable_action_groups() {
         let granted = principals(action_group);
-        let written = put_permission(&harness, GROUP, action_group, &granted, None).await;
+        let written =
+            put_permission(&harness, GROUP, action_group, &granted, current.as_deref()).await;
         assert_eq!(
             written.status,
             200,
@@ -210,12 +214,29 @@ async fn both_policy_writes_answer_from_the_shared_action_group_rule() {
             removed.status,
             String::from_utf8_lossy(&removed.body)
         );
+        // The statement is gone, and the policy that is left is reported by both the
+        // removal and the read: same document, same revision.
+        let after = get_policy(&harness, GROUP).await;
         assert_eq!(
-            get_policy(&harness, GROUP).await.json(),
-            serde_json::json!({}),
-            "case {action_group:?}: the group must hold no policy once its last statement is gone"
+            string_member(&after, "policy"),
+            string_member(&removed, "policy"),
+            "case {action_group:?}: GetPolicy must report the document the removal left"
         );
+        assert_eq!(
+            string_member(&after, "revisionId"),
+            string_member(&removed, "revisionId"),
+            "case {action_group:?}: GetPolicy must report the revision the removal minted"
+        );
+        assert!(
+            !string_member(&after, "policy").contains(sid.as_str()),
+            "case {action_group:?}: the removed action group must hold no statement, got {}",
+            string_member(&after, "policy")
+        );
+        current = Some(string_member(&removed, "revisionId"));
     }
+
+    // Whatever the accept side left stored, no refusal below may change it.
+    let before_refusals = get_policy(&harness, GROUP).await;
 
     // The REFUSE side, over HTTP: a value the rule does not admit is refused by both
     // writes with HTTP 400 `ValidationException`, and nothing is stored for it — whether
@@ -258,8 +279,8 @@ async fn both_policy_writes_answer_from_the_shared_action_group_rule() {
             );
         }
         assert_eq!(
-            get_policy(&harness, GROUP).await.json(),
-            serde_json::json!({}),
+            get_policy(&harness, GROUP).await.body,
+            before_refusals.body,
             "case {case:?}: a refused write must store nothing"
         );
     }

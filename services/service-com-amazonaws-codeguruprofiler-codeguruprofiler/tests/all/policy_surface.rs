@@ -8,10 +8,12 @@
 //! generalises over. None of the rows is the one the issue recorded: the group names,
 //! the principal ARNs and the revisions here are this suite's own.
 //!
-//! 1. ABSENCE. `policy` and `revisionId` are reported only where a policy is attached:
-//!    an operation on a profiling group that RESOLVES but holds no resource-based policy
-//!    answers 200 with both members absent (an empty body), and 404
-//!    `ResourceNotFoundException` is reserved for a profiling group that does not exist.
+//! 1. ABSENCE. `policy` and `revisionId` are reported wherever a policy exists: an
+//!    operation on a profiling group that RESOLVES but on which no write has ever
+//!    created a policy answers 200 with both members absent (an empty body), while a
+//!    policy whose last statement was removed still exists and is still reported — and
+//!    404 `ResourceNotFoundException` is reserved for a profiling group that does not
+//!    exist, or for a statement the existing policy does not hold.
 //!    Rows: a group that was never granted, a group whose last statement was just
 //!    removed, the same group granted and emptied again, and a name no group has.
 //!
@@ -122,6 +124,19 @@ fn expected_document(arn: &str, principals: &[String]) -> String {
     .join("\n")
 }
 
+/// The document a policy holding NO statement is reported as, built from the same layout
+/// rule as [`expected_document`]: an array is written on one line, so an empty one is
+/// `[ ]`.
+fn empty_document() -> String {
+    [
+        "{".to_string(),
+        "  \"Version\" : \"2012-10-17\",".to_string(),
+        "  \"Statement\" : [ ]".to_string(),
+        "}".to_string(),
+    ]
+    .join("\n")
+}
+
 /// One rendering row: a group from the shared table and the principal set granted on it.
 #[derive(Debug)]
 struct RenderCase {
@@ -189,7 +204,7 @@ fn assert_empty_policy_answer(case: &str, answer: &Answer) {
 }
 
 #[tokio::test]
-async fn a_resolved_group_with_no_policy_answers_an_empty_200_on_every_read() {
+async fn a_group_with_no_policy_answers_an_empty_200_while_an_emptied_policy_is_still_reported() {
     let harness = Harness::new();
 
     for group in created_groups(&harness, "absence").await {
@@ -200,47 +215,6 @@ async fn a_resolved_group_with_no_policy_answers_an_empty_200_on_every_read() {
             &format!("{name}: never granted"),
             &get_policy(&harness, name).await,
         );
-
-        // Rows: granted and emptied, twice over — the state a removal leaves is the
-        // state a create leaves, so the second cycle must behave like the first.
-        for round in 0..2 {
-            let created = put_permission(&harness, name, ACTION_GROUP, &principals(2), None).await;
-            assert_eq!(
-                created.status,
-                200,
-                "case {name}: round {round}: the policy must be creatable, got {} {}",
-                created.status,
-                String::from_utf8_lossy(&created.body)
-            );
-            let revision = string_member(&created, "revisionId");
-
-            let removed = remove_permission(&harness, name, ACTION_GROUP, &revision).await;
-            assert_empty_policy_answer(&format!("{name}: round {round}: removal"), &removed);
-            assert_empty_policy_answer(
-                &format!("{name}: round {round}: read after removal"),
-                &get_policy(&harness, name).await,
-            );
-
-            // The removal reported no revision because it stored none: a write naming
-            // the revision the policy used to carry is refused as a conflict, and the
-            // first-write rule (name no revision) applies again.
-            let stale = put_permission(
-                &harness,
-                name,
-                ACTION_GROUP,
-                &principals(1),
-                Some(&revision),
-            )
-            .await;
-            assert_eq!(
-                stale.status,
-                409,
-                "case {name}: round {round}: a revision of a policy that is gone names \
-                 nothing, got {} {}",
-                stale.status,
-                String::from_utf8_lossy(&stale.body)
-            );
-        }
 
         // ...and a removal has nothing to remove from, which is the other 404 class:
         // the group exists, so the message names it and the account the lookup was
@@ -268,6 +242,65 @@ async fn a_resolved_group_with_no_policy_answers_an_empty_200_on_every_read() {
                 "case {name}: expected {expected:?}, got {:?}",
                 answer.error_message()
             );
+        }
+
+        // Rows: granted and emptied, twice over — the second cycle starts from an
+        // emptied policy rather than from no policy, and must behave the same way: the
+        // write names the revision the store holds, and the removal reports the
+        // statement-less policy it leaves behind.
+        let mut current: Option<String> = None;
+        for round in 0..2 {
+            let created =
+                put_permission(&harness, name, ACTION_GROUP, &principals(2), current.as_deref())
+                    .await;
+            assert_eq!(
+                created.status,
+                200,
+                "case {name}: round {round}: the policy must be writable, got {} {}",
+                created.status,
+                String::from_utf8_lossy(&created.body)
+            );
+            let revision = string_member(&created, "revisionId");
+
+            let removed = remove_permission(&harness, name, ACTION_GROUP, &revision).await;
+            assert_eq!(
+                removed.status,
+                200,
+                "case {name}: round {round}: the removal must be applied, got {} {}",
+                removed.status,
+                String::from_utf8_lossy(&removed.body)
+            );
+            let emptied = string_member(&removed, "revisionId");
+            assert_eq!(
+                string_member(&removed, "policy"),
+                empty_document(),
+                "case {name}: round {round}: the policy left behind must hold no statement"
+            );
+            assert_eq!(
+                get_policy(&harness, name).await.json(),
+                removed.json(),
+                "case {name}: round {round}: GetPolicy must report the policy the removal \
+                 left"
+            );
+
+            // The revision the policy used to carry is one it has moved past, so a
+            // write naming it is a conflict; the one the removal reported is current.
+            let stale = put_permission(
+                &harness,
+                name,
+                ACTION_GROUP,
+                &principals(1),
+                Some(&revision),
+            )
+            .await;
+            assert_eq!(
+                stale.status,
+                409,
+                "case {name}: round {round}: a superseded revision must conflict, got {} {}",
+                stale.status,
+                String::from_utf8_lossy(&stale.body)
+            );
+            current = Some(emptied);
         }
     }
 

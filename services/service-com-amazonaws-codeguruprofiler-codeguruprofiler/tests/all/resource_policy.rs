@@ -7,8 +7,8 @@
 //! STORED on the named profiling group — one `Allow` statement per stored action group,
 //! carrying that action group's statement id, that action group's principals, the
 //! actions the action group grants and the group's own stored ARN, beside the stored
-//! revision id — and, when the group resolves but has NO policy stored, answers 200
-//! with `policy` and `revisionId` both absent, reserving 404
+//! revision id — and, when the group resolves but no write has ever created a policy on
+//! it, answers 200 with `policy` and `revisionId` both absent, reserving 404
 //! `ResourceNotFoundException` for a profiling group that does not exist. Being a read,
 //! it leaves what a later caller sees untouched.
 //!
@@ -106,7 +106,7 @@ fn has_stored_policy(harness: &Harness, name: &str) -> bool {
 }
 
 /// Whether the stored group holds a policy RECORD at all — the raw field, so the claim
-/// that a read wrote nothing does not lean on `resource_policy`'s empty-grants filter.
+/// that a read wrote nothing does not lean on the reader at all.
 fn holds_a_policy_record(harness: &Harness, name: &str) -> bool {
     let state = harness
         .engine()
@@ -354,9 +354,9 @@ async fn no_stored_policy_answers_an_empty_200_and_stores_nothing() {
     let harness = Harness::new();
 
     // Rows: every group of the shared table, created and never granted anything (the
-    // recorded "absent before any permission" case, across both name-length bounds);
-    // the first of them then has a policy holding NO grants attached, because no grants
-    // is no policy.
+    // recorded "absent before any permission" case, across both name-length bounds). A
+    // policy a write created is reported even when it holds no statement, so no row
+    // here carries a policy record at all.
     let groups = group_cases();
     for (index, case) in groups.iter().enumerate() {
         assert_eq!(
@@ -365,7 +365,6 @@ async fn no_stored_policy_answers_an_empty_200_and_stores_nothing() {
             "case {case:?}: the group must be created first"
         );
     }
-    attach_policy(&harness, &groups[0].name, &[], PLACEHOLDER_REVISION);
 
     for case in &groups {
         for label in ["first read", "second read"] {
@@ -407,25 +406,59 @@ async fn no_stored_policy_answers_an_empty_200_and_stores_nothing() {
     }
 
     // The empty answer is a read too: it must not have attached a policy to anything.
-    // For every group that was never granted, the raw policy FIELD must still be empty —
-    // evidence of no write that is independent of the empty-grants filter; the seeded
-    // empty-grants row keeps its (grant-less) record, and must still read as absent.
-    for (index, case) in groups.iter().enumerate() {
+    // The raw policy FIELD must still be empty for every group — evidence of no write
+    // that does not lean on the reader at all.
+    for case in &groups {
         assert!(
             !has_stored_policy(&harness, &case.name),
             "case {case:?}: GetPolicy must not attach a policy, but one is readable"
         );
-        if index > 0 {
-            assert!(
-                !holds_a_policy_record(&harness, &case.name),
-                "case {case:?}: GetPolicy must write nothing, but a policy record is stored"
-            );
-        }
+        assert!(
+            !holds_a_policy_record(&harness, &case.name),
+            "case {case:?}: GetPolicy must write nothing, but a policy record is stored"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_statement_less_policy_is_still_the_group_s_policy() {
+    let harness = Harness::new();
+
+    // The state a removal of a policy's last statement leaves behind, seeded here: the
+    // policy record exists at a revision and holds no grant. It is still the group's
+    // resource-based policy, so `GetPolicy` reports its document — one with no
+    // statement in it — and its revision.
+    let case = group_cases().swap_remove(0);
+    assert_eq!(
+        harness.create(&case, "tok-statement-less").await.status,
+        201,
+        "case {case:?}: the group must be created first"
+    );
+    attach_policy(&harness, &case.name, &[], PLACEHOLDER_REVISION);
+
+    for label in ["first read", "second read"] {
+        let answer = get_policy(&harness, &case.name).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?} ({label}): expected 200, got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.json(),
+            serde_json::json!({
+                "policy": format!("{{\n  \"Version\" : \"{POLICY_VERSION}\",\n  \"Statement\" : [ ]\n}}"),
+                "revisionId": PLACEHOLDER_REVISION,
+            }),
+            "case {case:?} ({label}): a statement-less policy must be reported with no \
+             statement in it, got {}",
+            String::from_utf8_lossy(&answer.body)
+        );
     }
     assert!(
-        holds_a_policy_record(&harness, &groups[0].name),
-        "case {:?}: the seeded grant-less policy record must survive the reads",
-        groups[0]
+        has_stored_policy(&harness, &case.name),
+        "case {case:?}: the seeded statement-less policy must survive the reads"
     );
 }
 
