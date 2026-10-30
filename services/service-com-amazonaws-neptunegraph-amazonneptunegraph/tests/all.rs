@@ -71,6 +71,8 @@ mod import_task_read;
 mod listing_paging_rule;
 #[path = "all/minted_snapshot_name_rule.rs"]
 mod minted_snapshot_name_rule;
+#[path = "all/page_token_spelling.rs"]
+mod page_token_spelling;
 #[path = "all/pagination_token_codec.rs"]
 mod pagination_token_codec;
 #[path = "all/pass_role_authorization.rs"]

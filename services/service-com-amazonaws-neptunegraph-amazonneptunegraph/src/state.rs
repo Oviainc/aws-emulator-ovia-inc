@@ -2437,8 +2437,17 @@ pub fn encode_page_token(last_returned_key: &str) -> String {
 /// Membership in the store is deliberately NOT required: a resource deleted between two
 /// pages must still leave its successors reachable, which is what resuming from a
 /// position — rather than from a row — gives.
+///
+/// The accepted set is exactly the MINTED set: a value is a token of this service only
+/// when it is, byte for byte, the token [`encode_page_token`] produces for the position
+/// it decodes to. Decoding alone is weaker than that — several spellings of the token
+/// grammar can carry the same bytes, and only one of them is ever handed out — so the
+/// token is compared against its own canonical minting before the id space is consulted.
 pub fn decode_page_token(token: &str, in_id_space: impl Fn(&str) -> bool) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    if encode_page_token(&decoded) != token {
+        return None;
+    }
     in_id_space(&decoded).then_some(decoded)
 }
 

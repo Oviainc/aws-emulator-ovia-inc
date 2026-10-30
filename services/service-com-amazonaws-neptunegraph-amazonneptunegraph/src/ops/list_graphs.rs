@@ -242,6 +242,9 @@ mod tests {
             &hex::encode("not-a-graph-id"),
             &hex::encode("g-short"),
             &hex::encode("gs-0123456789"),
+            // Carries the bytes of a graph id, but in a spelling the minting half never
+            // emits, so it is not a token this service issued.
+            &encode_page_token("g-0123456789").to_ascii_uppercase(),
         ] {
             let decoded = decode_page_token(foreign);
             assert!(
