@@ -33,6 +33,8 @@ mod knowledge_base_listing_and_queries;
 mod modelled_refusals;
 #[path = "all/quick_response.rs"]
 mod quick_response;
+#[path = "all/quick_response_search.rs"]
+mod quick_response_search;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/session_configuration.rs"]

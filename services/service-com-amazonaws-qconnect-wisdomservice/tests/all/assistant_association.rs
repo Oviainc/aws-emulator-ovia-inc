@@ -17,7 +17,8 @@
 //!   answers out of the stored record, for every target an association can be made
 //!   against and every tag count the create accepts;
 //! * one assistant holds associations with SEVERAL DISTINCT targets, and a second
-//!   create naming a target it already holds is `ConflictException` (HTTP 409);
+//!   create naming a target it already holds is `ConflictException` (HTTP 409) with the
+//!   one fixed sentence this service words that class with;
 //! * `associationType` and the `association` union name the same thing: a create whose
 //!   pair disagrees is `ValidationException` (HTTP 400);
 //! * a replayed `clientToken` carrying the same request answers with the association it
@@ -27,7 +28,11 @@
 //!   knowledge base, an association of ANOTHER assistant — is
 //!   `ResourceNotFoundException` (HTTP 404);
 //! * a delete removes the record, so a read of it is not found and the same target can
-//!   be associated again; deleting the assistant takes its associations with it.
+//!   be associated again; deleting the assistant takes its associations with it;
+//! * a listing reports the associations its assistant holds — every summary projected out
+//!   of the stored record — bounded by `maxResults` and continued by the `nextToken` it
+//!   hands out, scoped to that assistant, and `ResourceNotFoundException` (HTTP 404) for
+//!   an assistant this account does not hold.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -60,6 +65,13 @@ const OTHER_BEDROCK_ARN: &str = "arn:aws:bedrock:eu-central-1:123456789012:knowl
 /// (`^arn:aws:iam::[0-9]{12}:role/(?:service-role/)?[a-zA-Z0-9_+=,.@-]{1,64}$`, len
 /// 32..2048).
 const ACCESS_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/QConnectBedrockAccess";
+
+/// The sentence a create naming a target its assistant is already associated with is
+/// refused with. Written out here rather than imported from the implementation, so the
+/// assertion pins the wording a client sees; it is FIXED text, with no part taken from
+/// the request or from the store.
+const MESSAGE_ASSOCIATION_ALREADY_EXISTS: &str =
+    "Association already exists for these two resources";
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
@@ -472,8 +484,8 @@ async fn a_create_persists_the_association_and_every_read_answers_from_the_recor
 }
 
 /// A second create naming a target the assistant is already associated with is the
-/// modelled conflict, for every target kind — and the refusal leaves the first
-/// association readable.
+/// modelled conflict, carrying the one sentence this class is worded with, for every
+/// target kind — and the refusal leaves the first association readable.
 #[tokio::test]
 async fn a_target_the_assistant_already_holds_is_a_conflict() {
     let emulator = Emulator::new();
@@ -519,6 +531,22 @@ async fn a_target_the_assistant_already_holds_is_a_conflict() {
             second.error_type,
             second.body
         );
+        // The sentence is FIXED text: one wording for this class, naming neither the
+        // assistant, nor the target, nor the association that already holds the pair.
+        let message = second.string("/message");
+        assert_eq!(
+            message, MESSAGE_ASSOCIATION_ALREADY_EXISTS,
+            "case {:?}: expected the sentence this class is worded with, got {message:?}",
+            case.label
+        );
+        for quoted in [&assistant_id, &knowledge_base_id] {
+            assert!(
+                quoted.is_empty() || !message.contains(quoted.as_str()),
+                "case {:?}: the conflict must quote nothing from the request or the store, \
+                 got {message:?}",
+                case.label
+            );
+        }
 
         let read = emulator.get_association(&assistant_id, &association_id).await;
         assert_eq!(
@@ -950,4 +978,266 @@ async fn distinct_external_bedrock_targets_are_distinct_associations() {
          {} twice",
         ids[0]
     );
+}
+
+/// `ListAssistantAssociations` on one assistant.
+async fn list_associations(
+    emulator: &Emulator,
+    assistant_label: &str,
+    max_results: Option<usize>,
+    next_token: Option<&str>,
+) -> Reply {
+    let mut uri = format!("/assistants/{}/associations", label(assistant_label));
+    let mut query = Vec::new();
+    if let Some(max_results) = max_results {
+        query.push(format!("maxResults={max_results}"));
+    }
+    if let Some(next_token) = next_token {
+        query.push(format!("nextToken={next_token}"));
+    }
+    if !query.is_empty() {
+        uri.push('?');
+        uri.push_str(&query.join("&"));
+    }
+    emulator.send("GET", &uri, None).await
+}
+
+/// The `assistantAssociationId`s one page reports, in the order it reported them.
+fn listed_ids(case: &str, reply: &Reply) -> Vec<String> {
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: expected HTTP 200, got {} with {}",
+        reply.status, reply.body
+    );
+    reply
+        .field("/assistantAssociationSummaries")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: assistantAssociationSummaries is required, got {}",
+                reply.body
+            )
+        })
+        .iter()
+        .map(|summary| {
+            summary
+                .get("assistantAssociationId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// RULE: a listing reports the associations the assistant HOLDS, projected out of the
+/// stored records, bounded by `maxResults` and continued by the `nextToken` it hands out
+/// until every one has been served exactly once; the listing is scoped to its own
+/// assistant, follows a create and a delete, and an assistant this account does not hold
+/// is `ResourceNotFoundException` (HTTP 404).
+#[tokio::test]
+async fn a_listing_reports_the_associations_the_assistant_holds() {
+    let emulator = Emulator::new();
+    let (assistant_id, assistant_arn) = emulator.assistant("assoc-listing-assistant").await;
+    let (other_assistant_id, _) = emulator.assistant("assoc-listing-other").await;
+
+    // An assistant holding nothing reports an empty page and no continuation.
+    let empty = list_associations(&emulator, &assistant_id, None, None).await;
+    assert!(
+        listed_ids("an assistant holding no association", &empty).is_empty(),
+        "case \"an assistant holding no association\": expected an empty page, got {}",
+        empty.body
+    );
+    assert_eq!(
+        empty.field("/nextToken"),
+        None,
+        "case \"an assistant holding no association\": expected no nextToken, got {}",
+        empty.body
+    );
+
+    // Several associations with DISTINCT targets, so the listing has rows to page: three
+    // knowledge bases of this account and one external Bedrock target.
+    let mut created: Vec<String> = Vec::new();
+    for knowledge_base_type in ["CUSTOM", "EXTERNAL", "QUICK_RESPONSES"] {
+        let (knowledge_base_id, _) = emulator
+            .knowledge_base(
+                &format!("listing-kb-{}", knowledge_base_type.to_lowercase()),
+                knowledge_base_type,
+            )
+            .await;
+        let reply = emulator
+            .create_association(
+                &assistant_id,
+                json!({
+                    "associationType": TYPE_KNOWLEDGE_BASE,
+                    "association": { "knowledgeBaseId": knowledge_base_id },
+                }),
+            )
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {knowledge_base_type:?}: expected the association to be created, got {} with {}",
+            reply.status, reply.body
+        );
+        created.push(reply.string("/assistantAssociation/assistantAssociationId"));
+    }
+    let bedrock = emulator
+        .create_association(
+            &assistant_id,
+            json!({
+                "associationType": TYPE_EXTERNAL_BEDROCK,
+                "association": {
+                    "externalBedrockKnowledgeBaseConfig": {
+                        "bedrockKnowledgeBaseArn": BEDROCK_ARN,
+                        "accessRoleArn": ACCESS_ROLE_ARN,
+                    }
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        bedrock.status, 200,
+        "case \"the Bedrock target\": expected the association to be created, got {} with {}",
+        bedrock.status, bedrock.body
+    );
+    created.push(bedrock.string("/assistantAssociation/assistantAssociationId"));
+    let mut expected = created.clone();
+    expected.sort();
+
+    // One page holding everything, and every summary projected out of the stored record:
+    // what a page reports is what `GetAssistantAssociation` answers for the same id.
+    let whole = list_associations(&emulator, &assistant_id, None, None).await;
+    let listed = listed_ids("the whole listing", &whole);
+    assert_eq!(
+        listed, expected,
+        "case \"the whole listing\": expected every association in id order, got {listed:?}"
+    );
+    let summaries = whole
+        .field("/assistantAssociationSummaries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for summary in &summaries {
+        let id = summary
+            .get("assistantAssociationId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let read = emulator.get_association(&assistant_id, id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {id:?}: the listed association must read back, got {} with {}",
+            read.status, read.body
+        );
+        for member in [
+            "assistantAssociationId",
+            "assistantAssociationArn",
+            "assistantId",
+            "assistantArn",
+            "associationType",
+            "associationData",
+        ] {
+            let expected_member = read.field(&format!("/assistantAssociation/{member}")).cloned();
+            let actual = summary.get(member).filter(|value| !value.is_null()).cloned();
+            assert_eq!(
+                actual, expected_member,
+                "case {id:?}: the summary's {member} must be the stored one, got {actual:?} \
+                 against {expected_member:?}"
+            );
+        }
+        assert_eq!(
+            summary.get("assistantArn").and_then(Value::as_str),
+            Some(assistant_arn.as_str()),
+            "case {id:?}: expected the parent's own ARN, got {summary}"
+        );
+    }
+
+    // The listing is scoped to its own assistant: the other one holds none of these.
+    let other = list_associations(&emulator, &other_assistant_id, None, None).await;
+    assert!(
+        listed_ids("another assistant", &other).is_empty(),
+        "case \"another assistant\": expected an empty page, got {}",
+        other.body
+    );
+
+    // Paging: every page size from one to past the selection, walked to exhaustion.
+    for page_size in [1usize, 2, 3, 4, 5] {
+        let case = format!("pages of {page_size}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = list_associations(&emulator, &assistant_id, Some(page_size), token.as_deref())
+                .await;
+            let ids = listed_ids(&case, &page);
+            assert!(
+                ids.len() <= page_size,
+                "case {case:?}: a page may not exceed maxResults, got {} entries",
+                ids.len()
+            );
+            seen.extend(ids);
+            token = page.field("/nextToken").and_then(Value::as_str).map(str::to_string);
+            pages += 1;
+            assert!(
+                pages <= expected.len() + 2,
+                "case {case:?}: the walk must terminate, got {pages} pages"
+            );
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen, expected,
+            "case {case:?}: the walk must serve every association exactly once, in one order, \
+             got {seen:?}"
+        );
+    }
+
+    // A delete is reflected in the next page, and so is the parent's own delete.
+    let removed = expected[0].clone();
+    assert_eq!(
+        emulator
+            .delete_association(&assistant_id, &removed)
+            .await
+            .status,
+        204,
+        "case \"delete one association\": expected HTTP 204"
+    );
+    let after = list_associations(&emulator, &assistant_id, None, None).await;
+    let listed = listed_ids("after a delete", &after);
+    assert_eq!(
+        listed,
+        expected[1..].to_vec(),
+        "case \"after a delete\": expected the remaining associations, got {listed:?}"
+    );
+
+    // A token this service did not mint names no position.
+    let bad_token = list_associations(&emulator, &assistant_id, None, Some("not-a-token")).await;
+    assert_eq!(
+        (bad_token.status, bad_token.error_type.as_str()),
+        (400, "ValidationException"),
+        "case \"a token this service did not mint\": expected HTTP 400 ValidationException, got \
+         {} {:?} with {}",
+        bad_token.status,
+        bad_token.error_type,
+        bad_token.body
+    );
+
+    // An assistant this account does not hold is not found rather than an empty page, by
+    // either label form.
+    for (case, assistant_label) in [
+        ("a bare id nothing holds", ABSENT_UUID.to_string()),
+        (
+            "an ARN of another account",
+            format!("arn:aws:wisdom:{REGION}:999999999999:assistant/{assistant_id}"),
+        ),
+    ] {
+        let reply = list_associations(&emulator, &assistant_label, None, None).await;
+        assert_eq!(
+            (reply.status, reply.error_type.as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected HTTP 404 ResourceNotFoundException, got {} {:?} with {}",
+            reply.status,
+            reply.error_type,
+            reply.body
+        );
+    }
 }

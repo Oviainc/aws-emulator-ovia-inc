@@ -11,7 +11,11 @@
 //! assistant, a knowledge base, a session or an assistant association. There is only one
 //! copy of a resource's tags, so what this merge stores is exactly what a later
 //! `ListTagsForResource` — or a read of the resource itself — reports. An ARN that names
-//! no resource this account holds is the modelled `ResourceNotFoundException` (HTTP 404).
+//! no resource this account holds is refused with HTTP 404 and the error code the
+//! recorded wire answer of this endpoint carries for that class
+//! ([`crate::scaffolded::NOT_FOUND_CODE`]), which is the tagging surface's own code
+//! rather than the name of the `ResourceNotFoundException` shape the operation's `errors`
+//! list names: a client branches on the code it is actually sent.
 //!
 //! A resource carries at most [`crate::state::MAX_TAGS_PER_RESOURCE`] tags, and a request
 //! that would leave it holding more is refused with HTTP 400 and the error code this
@@ -175,14 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let mut store = state.lock();
         let resource_arn = input.resource_arn;
+        // The ARN is resolved against the resource tables THIS account holds, through the
+        // one seam the whole tagging surface shares, so an ARN that pairs a stored id with
+        // another region, family or account names nothing and is refused as not found. The
+        // code and status are the ones this endpoint's recorded answer for that class
+        // carries — see `crate::scaffolded::NOT_FOUND_CODE`.
         let Some(tags) = store.tags_of_resource_mut(&resource_arn) else {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::MESSAGE_RESOURCE_NOT_FOUND.to_string()),
-                    resource_name: Some(resource_arn),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::not_found(
+                crate::state::MESSAGE_TAGGING_RESOURCE_NOT_FOUND,
+            ));
         };
 
         // Only a key the resource does not already hold grows its tag set, so a merge

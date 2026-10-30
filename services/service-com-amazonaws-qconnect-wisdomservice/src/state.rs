@@ -12,12 +12,14 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     AIAgentConfigurationData, AssistantAssociationData, AssistantAssociationInputData,
-    AssistantAssociationOutputData, AssistantCapabilityConfiguration, AssistantData,
+    AssistantAssociationOutputData, AssistantAssociationSummary, AssistantCapabilityConfiguration,
+    AssistantData,
     AssistantIntegrationConfiguration, AssistantSummary, ContentData, ContentSummary,
     ExternalBedrockKnowledgeBaseConfig,
     GroupingConfiguration, KnowledgeBaseAssociationData, KnowledgeBaseData, KnowledgeBaseSummary,
     OrchestratorConfigurationEntry,
-    QuickResponseContentProvider, QuickResponseContents, QuickResponseData, QuickResponseSummary,
+    QuickResponseContentProvider, QuickResponseContents, QuickResponseData,
+    QuickResponseSearchResultData, QuickResponseSummary,
     RenderingConfiguration, RecommendationData, RecommendationTrigger,
     ServerSideEncryptionConfiguration, SessionData, SessionIntegrationConfiguration,
     SourceConfiguration, TagFilter, VectorIngestionConfiguration,
@@ -99,16 +101,6 @@ pub const MESSAGE_SESSION_NOT_FOUND: &str = "Session does not exist.";
 /// assistant does not hold. See [`MESSAGE_ASSISTANT_NOT_FOUND`].
 pub const MESSAGE_ASSOCIATION_NOT_FOUND: &str = "Assistant Association does not exist.";
 
-/// The fixed text for a tagging request addressed to an ARN this account holds no
-/// resource under.
-///
-/// It is the model's own documentation of `ResourceNotFoundException`
-/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`: "The specified
-/// resource does not exist.") — a tagging operation takes an `Arn` rather than one
-/// family's label, so the refusal names no family. See
-/// [`MESSAGE_ASSISTANT_NOT_FOUND`] for why it carries nothing from the request.
-pub const MESSAGE_RESOURCE_NOT_FOUND: &str = "The specified resource does not exist.";
-
 /// The most tags one resource carries.
 ///
 /// AWS's tagging restrictions put the maximum number of tags per resource at 50, and
@@ -143,6 +135,15 @@ pub const MESSAGE_NAME_IN_USE: &str = "Name is already in use";
 /// `@idempotencyToken` with different parameters is refused with. See
 /// [`MESSAGE_ASSISTANT_NOT_FOUND`].
 pub const MESSAGE_IDEMPOTENCY_CONFLICT: &str = "Idempotency conflict";
+
+/// The fixed text of the modelled `ConflictException` a `CreateAssistantAssociation`
+/// naming a target its assistant is already associated with is refused with — the
+/// sentence the recorded answer of that endpoint carries for this class. Like every
+/// message constant here it is FIXED text: it names neither the assistant, nor the
+/// knowledge base, nor the association that already holds the pair. See
+/// [`MESSAGE_ASSISTANT_NOT_FOUND`].
+pub const MESSAGE_ASSOCIATION_ALREADY_EXISTS: &str =
+    "Association already exists for these two resources";
 
 /// The fixed text of the modelled `UnauthorizedException`. See
 /// [`MESSAGE_ASSISTANT_NOT_FOUND`].
@@ -264,6 +265,17 @@ pub const QUICK_RESPONSE_TYPE_PLAIN: &str = "application/x.quickresponse;format=
 /// carries the stored content.
 pub const QUICK_RESPONSE_TYPE_MARKDOWN: &str = "application/x.quickresponse;format=markdown";
 
+/// Whether a quick response whose create named no `isActive` is in service.
+///
+/// `isActive` is OPTIONAL on `CreateQuickResponse` and on `QuickResponseData`, but
+/// REQUIRED on `QuickResponseSearchResultData`
+/// (`smithy_query(query="shape",shape="QuickResponseSearchResultData")`), so a search hit
+/// has to report a value for a record whose create named none. A quick response nothing
+/// deactivated is usable the moment it is created — that is what the create answering it
+/// already `CREATED` means — so the value reported, and the one a filter on `isActive`
+/// matches against, is this one.
+pub const QUICK_RESPONSE_ACTIVE_BY_DEFAULT: bool = true;
+
 /// The message a read or a write of a quick response this knowledge base does not hold
 /// is refused with, worded as this endpoint words the other not-found resources of this
 /// family ([`MESSAGE_KNOWLEDGE_BASE_NOT_FOUND`]).
@@ -370,6 +382,15 @@ pub const MAX_CONTENT_UPLOADS: usize = 1_000;
 /// than stored.
 pub const MAX_CONTENT_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 
+/// The most written bytes this store holds across EVERY live upload, so the
+/// uploads x bytes-per-upload PRODUCT is finite and not just each factor: an upload's
+/// body stays in this process's heap until the upload expires, and each one may carry up
+/// to [`MAX_CONTENT_UPLOAD_BYTES`], so without this a caller that starts
+/// [`MAX_CONTENT_UPLOADS`] uploads and writes a full-size body to each would hold the
+/// product of the two. The counterpart of [`MAX_STORED_CONTENT_BYTES`] on the upload
+/// side, and refused the same way a body past the per-body bound is.
+pub const MAX_PENDING_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+
 /// The `ContentStatus` a `CreateContent` answers with: the service takes the uploaded
 /// asset and ingests it, so the content is reported in progress by the very call that
 /// started that work (`smithy_query(query="shape",shape="ContentStatus")` declares
@@ -434,10 +455,13 @@ pub const MESSAGE_RECOMMENDATION_NOT_AVAILABLE: &str =
 /// for that class.
 pub const MESSAGE_INVALID_UPLOAD_ID: &str = "Invalid uploadId";
 
-/// The fixed text the recorded `UntagResource` answer carries for a `resourceArn` that
-/// names no resource of this account. See [`crate::scaffolded::NOT_FOUND_CODE`] for why
-/// that answer's error code is not the modelled shape name.
-pub const MESSAGE_UNTAG_RESOURCE_NOT_FOUND: &str = "Resource was not found";
+/// The fixed text the recorded answers of this service's TAGGING endpoints carry for a
+/// `resourceArn` that names no resource of this account — the one sentence the whole
+/// tagging surface words that class with, whichever of the three operations was called.
+/// See [`crate::scaffolded::NOT_FOUND_CODE`] for why those answers' error code is not the
+/// modelled shape name, and [`MESSAGE_ASSISTANT_NOT_FOUND`] for why the sentence carries
+/// nothing from the request.
+pub const MESSAGE_TAGGING_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
 /// The header an upload's `PUT` carries the `contentType` the upload was started for
 /// under: an upload URL is minted for ONE media type, exactly as an S3 presigned `PUT`
@@ -1244,6 +1268,49 @@ impl QuickResponse {
             tags: tags_out(&self.tags),
         }
     }
+
+    /// Whether this quick response is in service, as the required `isActive` of a search
+    /// hit reports it: the value the create named, or
+    /// [`QUICK_RESPONSE_ACTIVE_BY_DEFAULT`] for a create that named none.
+    pub fn is_active_or_default(&self) -> bool {
+        self.is_active.unwrap_or(QUICK_RESPONSE_ACTIVE_BY_DEFAULT)
+    }
+
+    /// The `QuickResponseSearchResultData` a search of this quick response's knowledge
+    /// base reports it as: the same stored fields the other two projections answer with,
+    /// shaped to the members the search result declares
+    /// (`smithy_query(query="shape",shape="QuickResponseSearchResultData")`), so a search
+    /// hit and a read of the same record cannot disagree.
+    pub fn to_search_result(&self) -> QuickResponseSearchResultData {
+        QuickResponseSearchResultData {
+            quick_response_arn: self.quick_response_arn.clone(),
+            quick_response_id: self.quick_response_id.clone(),
+            knowledge_base_arn: self.knowledge_base_arn.clone(),
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            name: self.name.clone(),
+            content_type: self.content_type.clone(),
+            status: self.status.clone(),
+            contents: self.contents(),
+            created_time: ::aws_smithy_types::DateTime::from(self.created_at),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_at),
+            is_active: self.is_active_or_default(),
+            description: self.description.clone(),
+            grouping_configuration: self.grouping_configuration.clone(),
+            shortcut_key: self.shortcut_key.clone(),
+            // See [`Self::to_quick_response_data`]: nothing in this emulator attributes a
+            // write to an identity, so the member stays absent.
+            last_modified_by: None,
+            channels: self.channels.clone(),
+            language: self.language.clone(),
+            // These two report which of the contact attributes a search was given were
+            // resolved into the content it answers with. This endpoint resolves none —
+            // the content travels exactly as the create stored it — so neither list is
+            // claimed.
+            attributes_not_interpolated: None,
+            attributes_interpolated: None,
+            tags: tags_out(&self.tags),
+        }
+    }
 }
 
 /// What one assistant association associates the assistant WITH: the modelled
@@ -1324,6 +1391,23 @@ impl AssistantAssociation {
     /// answers with.
     pub fn to_assistant_association_data(&self) -> AssistantAssociationData {
         AssistantAssociationData {
+            assistant_association_id: self.assistant_association_id.clone(),
+            assistant_association_arn: self.assistant_association_arn.clone(),
+            assistant_id: self.assistant_id.clone(),
+            assistant_arn: self.assistant_arn.clone(),
+            association_type: self.association_type.clone(),
+            association_data: self.target.to_output_data(),
+            tags: tags_out(&self.tags),
+        }
+    }
+
+    /// The `AssistantAssociationSummary` a listing of this association reports: the same
+    /// stored fields [`Self::to_assistant_association_data`] answers with, shaped to the
+    /// members the summary declares
+    /// (`smithy_query(query="shape",shape="AssistantAssociationSummary")`), so a list page
+    /// and a read of the same record cannot disagree.
+    pub fn to_summary(&self) -> AssistantAssociationSummary {
+        AssistantAssociationSummary {
             assistant_association_id: self.assistant_association_id.clone(),
             assistant_association_arn: self.assistant_association_arn.clone(),
             assistant_id: self.assistant_id.clone(),
@@ -1910,6 +1994,33 @@ impl ComAmazonawsQconnectWisdomserviceState {
         self.content_uploads
             .insert(upload.upload_id.clone(), upload);
         true
+    }
+
+    /// Write one upload's body, as the upload plane's `PUT` does. `false` — nothing
+    /// stored — when the written bytes this store already holds leave no room for it
+    /// under [`MAX_PENDING_UPLOAD_BYTES`], so the aggregate bound holds however many
+    /// uploads a caller opens; the slot the body would have filled is left as it was.
+    ///
+    /// The bytes an upload already holds do not count against the sum, so re-writing one
+    /// upload is accepted at the ceiling: a second `PUT` to the same URL replaces the
+    /// first body rather than adding to it.
+    pub fn write_content_upload_body(&mut self, upload_id: &str, body: Vec<u8>) -> bool {
+        let held: usize = self
+            .content_uploads
+            .iter()
+            .filter(|(id, _)| id.as_str() != upload_id)
+            .filter_map(|(_, upload)| upload.body.as_ref().map(Vec::len))
+            .sum();
+        if held.saturating_add(body.len()) > MAX_PENDING_UPLOAD_BYTES {
+            return false;
+        }
+        match self.content_uploads.get_mut(upload_id) {
+            None => false,
+            Some(upload) => {
+                upload.body = Some(body);
+                true
+            }
+        }
     }
 
     /// The default AI agents an assistant comes with, and the bindings that name them:

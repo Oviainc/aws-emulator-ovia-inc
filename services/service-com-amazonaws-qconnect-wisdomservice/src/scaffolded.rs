@@ -255,11 +255,13 @@ impl SerializableStruct for BadRequest {
 /// the modelled error shape's name, with the status that answer carries.
 ///
 /// The ONE place that class is worded. Reach for it only where a RECORDING shows this
-/// code: today that is `UntagResource`, whose model declares
-/// `ResourceNotFoundException` (404) while the recorded answer to a `resourceArn` naming
-/// no resource of the account carries `NotFoundException` with the same 404 — the code a
-/// client branches on, so answering the modelled shape name there would send a code the
-/// service does not. Every operation whose recording shows the modelled name keeps it.
+/// code: today that is the TAGGING surface — `TagResource`, `UntagResource` and
+/// `ListTagsForResource`, the three operations addressed by a bare `Arn` and resolved
+/// through one seam — whose models declare `ResourceNotFoundException` (404) while the
+/// recorded answers to a `resourceArn` naming no resource of the account carry
+/// `NotFoundException` with the same 404: that is the code a client branches on, so
+/// answering the modelled shape name there would send a code the service does not. Every
+/// operation whose recording shows the modelled name keeps it.
 pub const NOT_FOUND_CODE: &str = "NotFoundException";
 
 /// The HTTP status that refusal carries: the not-found status the model declares for the

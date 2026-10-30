@@ -316,13 +316,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one assistant associated with several DISTINCT knowledge bases and succeeding
         // (`wisdom.assistant-association-multiple-distinct-knowledge-bases-allowed`), so
         // the refusal is keyed to the target rather than to the number of associations.
+        // The sentence it carries is the one the recorded answer of this endpoint words
+        // this class with ([`crate::state::MESSAGE_ASSOCIATION_ALREADY_EXISTS`]).
         let existing = store.assistant_associations_of(&assistant_id);
         if existing
             .iter()
             .any(|association| association.target == target)
         {
             return Err(conflict(
-                "The assistant is already associated with this resource.",
+                crate::state::MESSAGE_ASSOCIATION_ALREADY_EXISTS,
             ));
         }
         // The assistant's association bound, which is what keeps this store finite.

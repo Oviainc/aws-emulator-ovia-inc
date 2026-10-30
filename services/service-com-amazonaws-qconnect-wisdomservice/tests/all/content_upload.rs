@@ -28,7 +28,10 @@
 //! * a start against a knowledge base this account does not hold is
 //!   `ResourceNotFoundException` (HTTP 404), and one against a knowledge base whose type
 //!   is not `CUSTOM` is `ValidationException` (HTTP 400) — the operation's own
-//!   documentation: "You can only upload content to a knowledge base of type CUSTOM."
+//!   documentation: "You can only upload content to a knowledge base of type CUSTOM.";
+//! * the written bodies this endpoint holds are bounded in AGGREGATE as well as one by
+//!   one, so a caller cannot hold the product of the per-body bound and the number of
+//!   upload slots in the emulator's heap.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -38,6 +41,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_qconnect_wisdomservice::state::{
     self, DEFAULT_PRESIGNED_URL_TIME_TO_LIVE_MINUTES, MAX_CONTENT_UPLOAD_BYTES,
+    MAX_PENDING_UPLOAD_BYTES,
 };
 use service_com_amazonaws_qconnect_wisdomservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -751,6 +755,99 @@ async fn the_upload_plane_refuses_a_write_the_url_does_not_authorise() {
         emulator.stored_body(&upload_id).map(|body| body.len()),
         Some(MAX_CONTENT_UPLOAD_BYTES),
         "case \"asset at the ceiling\": the whole body must be stored"
+    );
+}
+
+/// RULE: the written upload bodies this endpoint holds are bounded in AGGREGATE as well
+/// as one by one, so what a caller can hold in this process's heap is the ceiling and not
+/// the PRODUCT of the per-body bound and the number of upload slots: writes are accepted
+/// up to that ceiling, the first byte past it is refused and stores nothing (leaving every
+/// body already held as it was), and re-writing an upload the store already holds is
+/// accepted even at the ceiling, because that upload's own bytes are replaced rather than
+/// added to.
+#[tokio::test]
+async fn written_upload_bodies_are_bounded_in_aggregate() {
+    let emulator = Emulator::new();
+    let (knowledge_base_id, _) = emulator
+        .given_knowledge_base("aggregate", "kb-aggregate", "CUSTOM", None)
+        .await;
+    let full = vec![b'x'; MAX_CONTENT_UPLOAD_BYTES];
+    let slots = MAX_PENDING_UPLOAD_BYTES / MAX_CONTENT_UPLOAD_BYTES;
+
+    // Fill the store to exactly the aggregate ceiling, one full-size body at a time.
+    let mut held: Option<(String, String, BTreeMap<String, String>)> = None;
+    for slot in 0..slots {
+        let reply = emulator
+            .start_upload(&knowledge_base_id, "text/plain", None)
+            .await;
+        let upload_id = reply.string("/uploadId").expect("an uploadId");
+        let url = reply.string("/url").expect("a url");
+        let headers = headers_of(&reply, "aggregate fill");
+        let answer = emulator.follow("PUT", &url, &headers, &full).await;
+        assert_eq!(
+            answer.status, 200,
+            "case \"fill slot {slot}\": a write inside the aggregate ceiling must be \
+             accepted, got {answer:?}"
+        );
+        assert_eq!(
+            emulator.stored_body(&upload_id).map(|body| body.len()),
+            Some(MAX_CONTENT_UPLOAD_BYTES),
+            "case \"fill slot {slot}\": the whole body must be stored"
+        );
+        held = Some((upload_id, url, headers));
+    }
+    let (held_id, held_url, held_headers) = held.expect("the store has at least one slot");
+
+    // One more byte would put the store past the ceiling, so it is refused and nothing of
+    // it is stored — while the bodies already held are untouched.
+    let reply = emulator
+        .start_upload(&knowledge_base_id, "text/plain", None)
+        .await;
+    let overflow_id = reply.string("/uploadId").expect("an uploadId");
+    let overflow_url = reply.string("/url").expect("a url");
+    let overflow_headers = headers_of(&reply, "past the aggregate ceiling");
+    let answer = emulator
+        .follow("PUT", &overflow_url, &overflow_headers, b"x")
+        .await;
+    assert_eq!(
+        answer.status, 413,
+        "case \"past the aggregate ceiling\": a write the store has no room for must be \
+         refused, got {answer:?}"
+    );
+    assert_eq!(
+        emulator.stored_body(&overflow_id),
+        None,
+        "case \"past the aggregate ceiling\": a refused write must store nothing"
+    );
+    assert_eq!(
+        emulator.stored_body(&held_id).map(|body| body.len()),
+        Some(MAX_CONTENT_UPLOAD_BYTES),
+        "case \"past the aggregate ceiling\": the bodies already held must be untouched"
+    );
+
+    // An upload's own bytes are replaced, not added to, so re-writing one the store
+    // already holds is accepted at the ceiling.
+    let answer = emulator
+        .follow("PUT", &held_url, &held_headers, b"a smaller asset")
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case \"re-write an upload already held\": replacing a stored body must be \
+         accepted at the ceiling, got {answer:?}"
+    );
+    assert_eq!(
+        emulator.stored_body(&held_id),
+        Some(b"a smaller asset".to_vec()),
+        "case \"re-write an upload already held\": the new body must be what is stored"
+    );
+    // And with that body shrunk, the write refused above fits.
+    let answer = emulator
+        .follow("PUT", &overflow_url, &overflow_headers, b"x")
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case \"after the store drained\": a write that now fits must be accepted, got \
+         {answer:?}"
     );
 }
 

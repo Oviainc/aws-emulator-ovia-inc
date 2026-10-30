@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssistantAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssistantAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: REPORTS one page of the associations the assistant its `assistantId`
+//! names holds, out of the stored records.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssistantAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The parent is resolved FIRST, as every other read of a nested resource does: an
+//! association is reachable only through the assistant that holds it, so an `assistantId`
+//! this account holds no assistant under is the modelled `ResourceNotFoundException`
+//! (HTTP 404) rather than an empty page. An assistant that holds no association reports
+//! an empty list, which is what the required output member says.
+//!
+//! The operation is `@readonly`, so it writes nothing: two listings of an unchanged
+//! assistant answer alike, and every summary is projected out of the record a create
+//! persisted ([`crate::state::AssistantAssociation::to_summary`]), so a page and a
+//! `GetAssistantAssociation` of the same record cannot disagree.
+//!
+//! The entries are ordered by `assistantAssociationId` and a continuation resumes at the
+//! first one at or after the cursor, through the cursor helper this crate mints every
+//! page token with — so an association deleted between two pages cannot invalidate a
+//! token already handed out.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +160,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssistantAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssistantAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssistantAssociations"))
+        // The modelled `UuidOrArn` pattern on `assistantId`, the `range 1..100` on
+        // `maxResults` and the `len 1..2048` on `nextToken` are refused before this
+        // handler runs, so what is left here is whether the parent exists and what it
+        // holds.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable in this emulator: the router builds one `InMemoryEngine` and
+            // hands it to every service.
+            crate::scaffolded::Scaffolded::not_implemented("ListAssistantAssociations")
+        })?;
+        let store = state.lock();
+
+        // The listing is of ONE assistant, so the parent is resolved first: an assistant
+        // this account does not hold is not found rather than an empty page.
+        let Some(assistant) = store.assistant(&input.assistant_id) else {
+            return Err(
+                ListAssistantAssociationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::MESSAGE_ASSISTANT_NOT_FOUND.to_string()),
+                        resource_name: Some(input.assistant_id.clone()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let assistant_id = assistant.assistant_id.clone();
+
+        // A token this service did not mint names no position, so it is refused rather
+        // than silently read as "from the beginning".
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_cursor(token).ok_or_else(|| {
+                ListAssistantAssociationsErrorModeled::ValidationException(ValidationException {
+                    message: Some("nextToken: the specified token is not valid.".to_string()),
+                })
+            })?),
+        };
+
+        // `maxResults` is modelled `range 1..100`, so the boundary validator refuses
+        // anything outside it before this handler runs. Refuse explicitly rather than
+        // defaulting, so a value this service cannot page with is never read as "the
+        // whole page".
+        let page_size = match input.max_results {
+            None => crate::state::DEFAULT_MAX_RESULTS,
+            Some(max) => usize::try_from(max)
+                .ok()
+                .filter(|size| *size > 0)
+                .ok_or_else(|| {
+                    ListAssistantAssociationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("maxResults: must be between 1 and 100.".to_string()),
+                        },
+                    )
+                })?,
+        };
+
+        // The entries are ordered by id, and a continuation resumes at the first one at
+        // or after the cursor: an association deleted between two pages cannot invalidate
+        // a token already handed out.
+        let entries = store.assistant_associations_of(&assistant_id);
+        let mut remaining = entries.into_iter().filter(|association| {
+            start_at
+                .as_ref()
+                .is_none_or(|from| &association.assistant_association_id >= from)
+        });
+        let assistant_association_summaries: Vec<AssistantAssociationSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::AssistantAssociation::to_summary)
+            .collect();
+        let next_token = remaining
+            .next()
+            .map(|association| crate::state::encode_cursor(&association.assistant_association_id));
+
+        Ok(ListAssistantAssociationsOutput {
+            assistant_association_summaries,
+            next_token,
+        })
     }
 }

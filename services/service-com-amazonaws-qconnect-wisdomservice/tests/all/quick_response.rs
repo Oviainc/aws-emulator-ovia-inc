@@ -43,22 +43,22 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request in this suite is signed for; the handler reads it out of the
 /// SigV4 credential scope to build ARNs.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// A UUID no create ever mints, for the not-found assertions.
-const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
+pub(crate) const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
 /// The `QuickResponseStatus` a quick response this service holds reports. Written out as
 /// the literal rather than imported from the implementation, so the assertion pins the
 /// modelled value (`smithy_query(query="shape",shape="QuickResponseStatus")` declares it
 /// beside the transient `CREATE_IN_PROGRESS`, `UPDATE_IN_PROGRESS` and the rest).
-const STATUS_CREATED: &str = "CREATED";
+pub(crate) const STATUS_CREATED: &str = "CREATED";
 
 /// Both values the modelled `QuickResponseType` pattern admits
 /// (`smithy_query(query="operation",operation="CreateQuickResponse")`: `contentType`
 /// matches `^(application/x\.quickresponse;format=(plain|markdown))$`).
-const CONTENT_TYPE_PLAIN: &str = "application/x.quickresponse;format=plain";
-const CONTENT_TYPE_MARKDOWN: &str = "application/x.quickresponse;format=markdown";
+pub(crate) const CONTENT_TYPE_PLAIN: &str = "application/x.quickresponse;format=plain";
+pub(crate) const CONTENT_TYPE_MARKDOWN: &str = "application/x.quickresponse;format=markdown";
 
 /// Every language code the model documents for `language`
 /// (`smithy_query(query="doc",shape="CreateQuickResponseRequest",member="language")`:
@@ -89,19 +89,19 @@ const MESSAGE_KNOWLEDGE_BASE_NOT_FOUND: &str = "Knowledge Base does not exist.";
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_type: String,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_type: String,
     content_type: String,
-    body: Value,
+    pub(crate) body: Value,
 }
 
 impl Reply {
-    fn field(&self, pointer: &str) -> Option<&Value> {
+    pub(crate) fn field(&self, pointer: &str) -> Option<&Value> {
         self.body.pointer(pointer).filter(|v| !v.is_null())
     }
 
-    fn string(&self, pointer: &str) -> Option<String> {
+    pub(crate) fn string(&self, pointer: &str) -> Option<String> {
         self.field(pointer)
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -110,12 +110,12 @@ impl Reply {
 
 /// An emulator with just this service mounted on a fresh engine, driven in-process
 /// through the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes by the
@@ -125,7 +125,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
+    pub(crate) async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/wisdom/aws4_request, \
              SignedHeaders=host, Signature=not-verified-in-this-suite"
@@ -172,7 +172,7 @@ impl Emulator {
     }
 
     /// A knowledge base to hold quick responses, created the way every other suite does.
-    async fn create_knowledge_base(&self, name: &str) -> Reply {
+    pub(crate) async fn create_knowledge_base(&self, name: &str) -> Reply {
         self.send(
             "POST",
             "/knowledgeBases",
@@ -186,7 +186,7 @@ impl Emulator {
             .await
     }
 
-    async fn create_quick_response(&self, knowledge_base: &str, body: Value) -> Reply {
+    pub(crate) async fn create_quick_response(&self, knowledge_base: &str, body: Value) -> Reply {
         self.send(
             "POST",
             &format!("/knowledgeBases/{}/quickResponses", path(knowledge_base)),
@@ -195,7 +195,11 @@ impl Emulator {
         .await
     }
 
-    async fn get_quick_response(&self, knowledge_base: &str, quick_response: &str) -> Reply {
+    pub(crate) async fn get_quick_response(
+        &self,
+        knowledge_base: &str,
+        quick_response: &str,
+    ) -> Reply {
         self.send(
             "GET",
             &format!(
@@ -235,7 +239,7 @@ impl Emulator {
     }
 
     /// A fresh knowledge base, answering with the id its create minted.
-    async fn knowledge_base_id(&self, name: &str) -> String {
+    pub(crate) async fn knowledge_base_id(&self, name: &str) -> String {
         let reply = self.create_knowledge_base(name).await;
         assert_eq!(
             reply.status, 200,
@@ -251,7 +255,7 @@ impl Emulator {
 
 /// A `UuidOrArn` label as one URI path segment: an ARN carries `/`, which must not be
 /// read as path structure.
-fn path(label: &str) -> String {
+pub(crate) fn path(label: &str) -> String {
     label.replace('/', "%2F")
 }
 

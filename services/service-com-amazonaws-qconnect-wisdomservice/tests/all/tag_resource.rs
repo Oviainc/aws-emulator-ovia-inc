@@ -10,8 +10,9 @@
 //! resource family this service holds tags on; a request that would leave a resource
 //! holding more tags than its ceiling is refused with HTTP 400 and the error code this
 //! endpoint words a tag set past that ceiling with (`BadRequestException`), storing
-//! nothing; and an ARN that names no resource this account holds is the modelled
-//! `ResourceNotFoundException` (HTTP 404).
+//! nothing; and an ARN that names no resource this account holds is refused with HTTP 404
+//! and the error code this service's tagging surface words that class with
+//! (`NotFoundException`).
 //!
 //! The rows differ along every axis the rule generalises over:
 //!
@@ -40,7 +41,8 @@ use service_com_amazonaws_qconnect_wisdomservice::state;
 
 use super::resource_tags::{
     create_tagged, label, tag_map, wisdom_arn, Emulator, Family, Reply, ABSENT_UUID, FAMILIES,
-    OTHER_ACCOUNT, OTHER_REGION, REGION,
+    MESSAGE_TAGGING_RESOURCE_NOT_FOUND, OTHER_ACCOUNT, OTHER_REGION, REGION,
+    TAGGING_NOT_FOUND_CODE,
 };
 
 /// The published bounds of the modelled tag map's key and value
@@ -496,9 +498,9 @@ fn assert_bad_request(reply: &Reply, case: &str) {
     );
 }
 
-/// An ARN this account holds no resource under is the modelled
-/// `ResourceNotFoundException` (HTTP 404), whatever makes it miss — and the merge stores
-/// nothing, so the ARN still names nothing afterwards.
+/// An ARN this account holds no resource under is refused with HTTP 404 and the error
+/// code this service's tagging surface words that class with, whatever makes it miss —
+/// and the merge stores nothing, so the ARN still names nothing afterwards.
 #[tokio::test]
 async fn tagging_an_arn_naming_no_resource_this_account_holds_is_not_found() {
     let emulator = Emulator::new();
@@ -620,17 +622,16 @@ async fn tagging_an_arn_naming_no_resource_this_account_holds_is_not_found() {
             reply.status, reply.body
         );
         assert!(
-            reply.error_type.contains("ResourceNotFoundException"),
-            "case {case:?}: expected the modelled ResourceNotFoundException for {arn}, \
+            reply.error_type.contains(TAGGING_NOT_FOUND_CODE),
+            "case {case:?}: expected the tagging surface's {TAGGING_NOT_FOUND_CODE} for {arn}, \
              got x-amzn-errortype {:?}",
             reply.error_type
         );
         assert_eq!(
-            reply.string("/resourceName"),
-            *arn,
-            "case {case:?}: expected the refusal to name the ARN asked about in \
-             resourceName, got {:?}",
-            reply.string("/resourceName")
+            reply.string("/message"),
+            MESSAGE_TAGGING_RESOURCE_NOT_FOUND,
+            "case {case:?}: expected the sentence this surface words that class with, got {:?}",
+            reply.string("/message")
         );
         // Nothing was stored under it: the follow-up read misses in the same way.
         let listed = emulator.list_tags(arn).await;
