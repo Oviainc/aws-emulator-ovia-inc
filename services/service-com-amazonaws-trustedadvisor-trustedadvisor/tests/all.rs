@@ -39,6 +39,8 @@ mod organization_recommendation_resources;
 mod organization_recommendations;
 #[path = "all/owning_account_from_arn.rs"]
 mod owning_account_from_arn;
+#[path = "all/priority_scoped_created_at.rs"]
+mod priority_scoped_created_at;
 #[path = "all/recommendation_loop.rs"]
 mod recommendation_loop;
 #[path = "all/recommendations_for_resource.rs"]

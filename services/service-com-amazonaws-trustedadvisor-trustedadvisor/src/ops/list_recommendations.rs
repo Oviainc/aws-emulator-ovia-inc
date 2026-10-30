@@ -122,6 +122,11 @@ use super::types::*;
 /// `statusReason` is left absent: the store records no discrepancy in how a
 /// status was determined, and the member is optional.
 ///
+/// `createdAt` is reported through [`crate::state::priority_created_at`], which
+/// applies the scoping the model states for it — present for a prioritized
+/// recommendation, absent for an automated one — so a summary and the single
+/// read of the same recommendation agree.
+///
 /// `pillarSpecificAggregates` is the same aggregate `GetRecommendation` reports
 /// — computed from the recommendation's own resources by
 /// [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::pillar_aggregates_for`],
@@ -145,7 +150,7 @@ fn recommendation_summary(
         name: entry.text.text(language).name.clone(),
         resources_aggregates,
         pillar_specific_aggregates,
-        created_at: Some(crate::state::date_time(entry.created_at_millis)),
+        created_at: crate::state::priority_created_at(&entry.r#type, entry.created_at_millis),
         last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
         arn: entry.arn.clone(),
         status_reason: None,

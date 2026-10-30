@@ -111,6 +111,11 @@ use super::types::*;
 
 /// The stored organization recommendation, as the modelled
 /// `OrganizationRecommendationSummary`.
+///
+/// `createdAt` is reported through [`crate::state::priority_created_at`], the
+/// one place the scoping the model states for that member is applied; the store
+/// holds an organization recommendation only for a prioritized recommendation,
+/// so every organization summary carries one.
 fn organization_recommendation_summary(
     entry: &crate::state::OrganizationRecommendationEntry,
     resources_aggregates: RecommendationResourcesAggregates,
@@ -131,7 +136,7 @@ fn organization_recommendation_summary(
         name: text.name.clone(),
         resources_aggregates,
         pillar_specific_aggregates,
-        created_at: Some(crate::state::date_time(entry.created_at_millis)),
+        created_at: crate::state::priority_created_at(&entry.r#type, entry.created_at_millis),
         last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
         arn: entry.arn.clone(),
     }

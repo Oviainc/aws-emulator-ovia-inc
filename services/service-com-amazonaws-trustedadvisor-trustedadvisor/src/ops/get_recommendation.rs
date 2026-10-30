@@ -103,6 +103,12 @@ use super::types::*;
 /// carrying an invented name. `statusReason` is absent for the same reason: the
 /// store records no discrepancy in how a status was determined.
 ///
+/// `createdAt` is the other member the model scopes to a recommendation created
+/// by Trusted Advisor Priority, so it is reported through
+/// [`crate::state::priority_created_at`]: present for a prioritized
+/// recommendation, absent for an automated one. `lastUpdatedAt` carries no such
+/// scoping and is reported for either.
+///
 /// `pillarSpecificAggregates` is computed from the recommendation's own
 /// resources by
 /// [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::pillar_aggregates_for`],
@@ -126,7 +132,7 @@ fn recommendation(
         name: text.name.clone(),
         resources_aggregates,
         pillar_specific_aggregates,
-        created_at: Some(crate::state::date_time(entry.created_at_millis)),
+        created_at: crate::state::priority_created_at(&entry.r#type, entry.created_at_millis),
         last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
         arn: entry.arn.clone(),
         status_reason: None,

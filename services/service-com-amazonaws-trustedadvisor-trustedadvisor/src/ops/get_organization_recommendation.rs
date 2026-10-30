@@ -90,6 +90,11 @@ use super::types::*;
 /// Trusted Advisor Priority person (or the Technical Account Manager) who acted
 /// on the recommendation; the store holds no such actor, so those optional
 /// members stay absent rather than carrying an invented name.
+///
+/// `createdAt` is reported through [`crate::state::priority_created_at`], the
+/// one place the scoping the model states for that member is applied; the store
+/// holds an organization recommendation only for a prioritized recommendation,
+/// so every one of them carries a creation instant.
 fn organization_recommendation(
     entry: &crate::state::OrganizationRecommendationEntry,
     resources_aggregates: RecommendationResourcesAggregates,
@@ -110,7 +115,7 @@ fn organization_recommendation(
         name: text.name.clone(),
         resources_aggregates,
         pillar_specific_aggregates,
-        created_at: Some(crate::state::date_time(entry.created_at_millis)),
+        created_at: crate::state::priority_created_at(&entry.r#type, entry.created_at_millis),
         last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
         arn: entry.arn.clone(),
         description: text.description.clone(),
