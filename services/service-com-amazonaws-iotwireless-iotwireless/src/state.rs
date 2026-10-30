@@ -8,7 +8,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
 
-use crate::ops::types::{LoRaWANDevice, LoRaWANDeviceProfile, SidewalkDevice, Tag};
+use crate::ops::types::{
+    LoRaWANDevice, LoRaWANDeviceProfile, LoRaWANMulticast, SidewalkDevice, Tag,
+};
 
 /// The ARN service namespace (`arn:aws:iotwireless:...`) and the SigV4 signing name
 /// this service publishes.
@@ -40,6 +42,11 @@ pub fn wireless_device_arn(region: &str, id: &str) -> String {
 /// `arn:aws:iotwireless:<region>:<account>:DeviceProfile/<id>`.
 pub fn device_profile_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("DeviceProfile/{id}"))
+}
+
+/// `arn:aws:iotwireless:<region>:<account>:MulticastGroup/<id>`.
+pub fn multicast_group_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("MulticastGroup/{id}"))
 }
 
 /// `ExpressionType`'s modelled values, as the model-generated
@@ -163,6 +170,24 @@ pub struct WirelessDevice {
     pub last_uplink_received_at: Option<String>,
 }
 
+/// A multicast group: the LoRaWAN downlink settings a set of wireless devices shares.
+///
+/// The membership itself lives on the devices (`WirelessDevice::multicast_group_id`),
+/// so the counts `GetMulticastGroup` reports are DERIVED from the device store rather
+/// than kept here as a second copy that could disagree with it.
+#[derive(Debug, Clone)]
+pub struct MulticastGroup {
+    pub id: String,
+    pub arn: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    /// The LoRaWAN settings the create carried, reported back by the group's reader.
+    pub lorawan: LoRaWANMulticast,
+    pub tags: Vec<Tag>,
+    /// When the group was created, reported as `GetMulticastGroup`'s `CreatedAt`.
+    pub created_at: SystemTime,
+}
+
 /// What an `@idempotencyToken` create remembers: which resource the token minted, and
 /// a fingerprint of the parameters it was minted with.
 ///
@@ -212,6 +237,13 @@ pub const MAX_WIRELESS_DEVICES: usize = 250;
 /// refuses with `ValidationException`.
 pub const MAX_DEVICE_PROFILES: usize = 100;
 
+/// The most multicast groups this emulator stores. A ceiling, for the same reason as
+/// [`MAX_DESTINATIONS`]; `CreateMulticastGroup` models no quota error either
+/// (`smithy_query(query="operation", operation="CreateMulticastGroup")` lists
+/// AccessDenied / Conflict / InternalServer / ResourceNotFound / Throttling /
+/// Validation), so a full store refuses with `ValidationException`.
+pub const MAX_MULTICAST_GROUPS: usize = 100;
+
 /// The most `ClientRequestToken` entries kept for `CreateDestination` idempotency.
 ///
 /// At most one token is recorded per stored destination and a token is dropped with the
@@ -228,6 +260,10 @@ pub const MAX_WIRELESS_DEVICE_TOKENS: usize = MAX_WIRELESS_DEVICES;
 /// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
 pub const MAX_DEVICE_PROFILE_TOKENS: usize = MAX_DEVICE_PROFILES;
 
+/// The most `ClientRequestToken` entries kept for `CreateMulticastGroup` idempotency.
+/// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
+pub const MAX_MULTICAST_GROUP_TOKENS: usize = MAX_MULTICAST_GROUPS;
+
 /// Per-service state for com-amazonaws-iotwireless-iotwireless. A handler reaches it through [`service_state`].
 ///
 /// The resource maps are `BTreeMap`s so every list enumerates in one stable, sorted key
@@ -235,12 +271,13 @@ pub const MAX_DEVICE_PROFILE_TOKENS: usize = MAX_DEVICE_PROFILES;
 /// resume exactly where the previous page stopped.
 ///
 /// Every store here is BOUNDED: the resource maps by [`MAX_DESTINATIONS`] /
-/// [`MAX_WIRELESS_DEVICES`] / [`MAX_DEVICE_PROFILES`] (the creates refuse once full),
-/// `dev_eui_index` by one entry per stored device, and the token maps by
-/// [`MAX_DESTINATION_TOKENS`] / [`MAX_WIRELESS_DEVICE_TOKENS`] /
-/// [`MAX_DEVICE_PROFILE_TOKENS`] with oldest-entry eviction. The token maps are private
-/// so every write goes through [`Self::record_destination_token`] /
-/// [`Self::record_wireless_device_token`] / [`Self::record_device_profile_token`] and
+/// [`MAX_WIRELESS_DEVICES`] / [`MAX_DEVICE_PROFILES`] / [`MAX_MULTICAST_GROUPS`] (the
+/// creates refuse once full), `dev_eui_index` by one entry per stored device, and the
+/// token maps by [`MAX_DESTINATION_TOKENS`] / [`MAX_WIRELESS_DEVICE_TOKENS`] /
+/// [`MAX_DEVICE_PROFILE_TOKENS`] / [`MAX_MULTICAST_GROUP_TOKENS`] with oldest-entry
+/// eviction. The token maps are private so every write goes through
+/// [`Self::record_destination_token`] / [`Self::record_wireless_device_token`] /
+/// [`Self::record_device_profile_token`] / [`Self::record_multicast_group_token`] and
 /// cannot bypass the cap.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotwirelessIotwirelessState {
@@ -250,6 +287,8 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     pub wireless_devices: BTreeMap<String, WirelessDevice>,
     /// Device profiles by `Id`. Bounded by [`MAX_DEVICE_PROFILES`].
     pub device_profiles: BTreeMap<String, DeviceProfile>,
+    /// Multicast groups by `Id`. Bounded by [`MAX_MULTICAST_GROUPS`].
+    pub multicast_groups: BTreeMap<String, MulticastGroup>,
     /// `DevEui` -> device id, so `GetWirelessDevice?identifierType=DevEui` resolves
     /// without scanning and a duplicate `DevEui` is refusable. At most one entry per
     /// stored device, and the entry is released when the device is deleted.
@@ -271,23 +310,31 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     device_profile_tokens: HashMap<String, IdempotentCreate>,
     /// Write order for [`Self::device_profile_tokens`].
     device_profile_token_order: VecDeque<String>,
+    /// `CreateMulticastGroup` client request tokens, bounded by
+    /// [`MAX_MULTICAST_GROUP_TOKENS`]. Private, like the destination tokens.
+    multicast_group_tokens: HashMap<String, IdempotentCreate>,
+    /// Write order for [`Self::multicast_group_tokens`].
+    multicast_group_token_order: VecDeque<String>,
 }
 
 /// Record `token` in `tokens`, evicting the oldest recorded token first if that would
 /// push the map past `cap`.
 ///
-/// Shared by both token maps so the two caps are enforced by one piece of code: the
+/// Shared by every token map so the caps are enforced by one piece of code: the
 /// order queue and the map are only ever written together, here.
 ///
 /// The cap cannot bind in practice, which is why evicting the oldest entry is a safe
 /// last resort rather than a behaviour change: at most one token is recorded per stored
-/// resource, a resource's tokens are dropped with it (`forget_*_tokens_for`), and each
+/// resource, a resource's tokens are dropped with it where its delete is implemented
+/// (`forget_*_tokens_for`, which the destination and wireless-device deletes call —
+/// the device-profile and multicast-group deletes are still scaffolded, so those two
+/// maps release a token only when the whole store is dropped), and each
 /// token cap equals its resource ceiling — so the map can only reach `cap` when every
-/// entry in it names a live resource and the resource store is itself full, which the
-/// create already refuses before it gets here. Eviction exists so the bound holds
-/// whatever a future caller does; if it ever did evict a live resource's token, the
-/// consequence is only that a replay of that token is treated as a fresh create (a 409
-/// for a destination whose name is taken, a second device otherwise).
+/// entry in it names a resource the store accepted and the resource store is itself
+/// full, which the create already refuses before it gets here. Eviction exists so the
+/// bound holds whatever a future caller does; if it ever did evict a live resource's
+/// token, the consequence is only that a replay of that token is treated as a fresh
+/// create (a 409 for a destination whose name is taken, a second device otherwise).
 fn record_token(
     tokens: &mut HashMap<String, IdempotentCreate>,
     order: &mut VecDeque<String>,
@@ -342,6 +389,41 @@ impl ComAmazonawsIotwirelessIotwirelessState {
     /// Mint a fresh, unused `DeviceProfileId`.
     pub fn mint_device_profile_id(&mut self) -> String {
         mint_unused_uuid(&self.device_profiles)
+    }
+
+    /// Mint a fresh, unused `MulticastGroupId`.
+    pub fn mint_multicast_group_id(&mut self) -> String {
+        mint_unused_uuid(&self.multicast_groups)
+    }
+
+    /// How many stored wireless devices belong to multicast group `id`.
+    ///
+    /// The membership is held by the devices, so this counts them rather than reading a
+    /// tally: every operation that reports a group's size answers from the same place
+    /// the associate/disassociate operations write.
+    pub fn devices_in_multicast_group(&self, id: &str) -> usize {
+        self.wireless_devices
+            .values()
+            .filter(|device| device.multicast_group_id.as_deref() == Some(id))
+            .count()
+    }
+
+    /// What a `CreateMulticastGroup` `ClientRequestToken` already minted, if anything.
+    pub fn multicast_group_token(&self, token: &str) -> Option<&IdempotentCreate> {
+        self.multicast_group_tokens.get(token)
+    }
+
+    /// Record `token` as having minted the multicast group named by `record`, evicting
+    /// the oldest token first if that would push the map past
+    /// [`MAX_MULTICAST_GROUP_TOKENS`].
+    pub fn record_multicast_group_token(&mut self, token: String, record: IdempotentCreate) {
+        record_token(
+            &mut self.multicast_group_tokens,
+            &mut self.multicast_group_token_order,
+            MAX_MULTICAST_GROUP_TOKENS,
+            token,
+            record,
+        );
     }
 
     /// What a `CreateDestination` `ClientRequestToken` already minted, if anything.

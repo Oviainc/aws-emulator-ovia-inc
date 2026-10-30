@@ -15,5 +15,7 @@
 mod destination_and_wireless_device_lifecycle;
 #[path = "all/device_profile_lifecycle.rs"]
 mod device_profile_lifecycle;
+#[path = "all/multicast_group_lifecycle.rs"]
+mod multicast_group_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
