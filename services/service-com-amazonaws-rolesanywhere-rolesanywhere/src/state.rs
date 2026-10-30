@@ -8,8 +8,13 @@
 //! `GetCrl`) are backed entirely by the maps below, so a write is visible to the next
 //! request on the same engine. The record types and their projections live here rather
 //! than in a handler because several operations reach each of them.
+//!
+//! Every one of those resources is taggable, and each keeps its own tag list on its
+//! record, so the ARN-keyed tag operations (`TagResource`, `ListTagsForResource`) resolve
+//! an ARN against the records themselves rather than against a second tag table that
+//! could disagree with them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use sha2::{Digest, Sha256};
@@ -57,6 +62,15 @@ pub const MAX_PROFILES: usize = 10_000;
 /// size the modelled `Blob` `@length(1, 300000)` already caps per request, so this count
 /// is what bounds the PRODUCT — the bytes every stored CRL can add up to.
 pub const MAX_CRLS: usize = 1_000;
+
+/// The most tags one resource holds at once.
+///
+/// `TagList` is `@length(0, 200)` both where a request carries tags and where a read
+/// reports them (`smithy_query(query="shape", shape="TagList")`), so 200 is also the most
+/// `ListTagsForResource` can answer with: a resource holding more could not be listed.
+/// A `TagResource` that would carry a resource past it is refused with that operation's
+/// modelled `TooManyTagsException` instead of storing tags no read could report.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
 /// The `sourceType` values a trust anchor can carry whose certificate data member the
 /// model names: `x509CertificateData` is "Included for trust anchors of type
@@ -116,8 +130,7 @@ pub struct CrlRecord {
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     /// Tags the import carried. `CrlDetail` models no tag member, so they are reachable
-    /// only through `ListTagsForResource` (still a stub, tracked by its own issue) and
-    /// are kept here rather than dropped.
+    /// only through `ListTagsForResource`.
     pub tags: Vec<Tag>,
 }
 
@@ -235,6 +248,77 @@ impl ComAmazonawsRolesanywhereRolesanywhereState {
             }
         }
     }
+
+    /// The tags attached to the resource this ARN names, or `None` when no stored trust
+    /// anchor, profile or certificate revocation list carries that ARN.
+    ///
+    /// The ARN is matched against the one every record was minted with, so an ARN is
+    /// resolvable exactly as long as the resource it names exists.
+    pub fn tags(&self, resource_arn: &str) -> Option<&Vec<Tag>> {
+        self.trust_anchors
+            .values()
+            .find(|record| record.trust_anchor_arn == resource_arn)
+            .map(|record| &record.tags)
+            .or_else(|| {
+                self.profiles
+                    .values()
+                    .find(|record| record.profile_arn == resource_arn)
+                    .map(|record| &record.tags)
+            })
+            .or_else(|| {
+                self.crls
+                    .values()
+                    .find(|record| record.crl_arn == resource_arn)
+                    .map(|record| &record.tags)
+            })
+    }
+
+    /// The tags attached to the resource this ARN names, for writing. See [`Self::tags`].
+    pub fn tags_mut(&mut self, resource_arn: &str) -> Option<&mut Vec<Tag>> {
+        if let Some(record) = self
+            .trust_anchors
+            .values_mut()
+            .find(|record| record.trust_anchor_arn == resource_arn)
+        {
+            return Some(&mut record.tags);
+        }
+        if let Some(record) = self
+            .profiles
+            .values_mut()
+            .find(|record| record.profile_arn == resource_arn)
+        {
+            return Some(&mut record.tags);
+        }
+        self.crls
+            .values_mut()
+            .find(|record| record.crl_arn == resource_arn)
+            .map(|record| &mut record.tags)
+    }
+}
+
+/// Merge the tags a request carried into the tags a resource already holds, keyed by tag
+/// key: a key the resource already carries takes the submitted value, a key it does not
+/// carry is added, and a key the request does not name keeps the value it had. So one
+/// tagging call never drops another's tags, and re-tagging a key replaces its value in
+/// place rather than attaching the key twice.
+pub fn merge_tags(held: &mut Vec<Tag>, incoming: Vec<Tag>) {
+    for tag in incoming {
+        match held.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value,
+            None => held.push(tag),
+        }
+    }
+}
+
+/// How many tags the resource would hold after [`merge_tags`]: the number of distinct
+/// keys across what it holds and what the request names, because a merge replaces a
+/// value in place rather than adding a second entry for the same key.
+pub fn merged_tag_count(held: &[Tag], incoming: &[Tag]) -> usize {
+    held.iter()
+        .chain(incoming)
+        .map(|tag| tag.key.as_str())
+        .collect::<BTreeSet<&str>>()
+        .len()
 }
 
 /// One page of a `BTreeMap`-backed collection, plus the cursor to resume from.
@@ -322,6 +406,13 @@ pub fn validation_message(member: &str, constraint: &str) -> String {
     format!(
         "1 validation error detected: Value at '{member}' failed to satisfy constraint: {constraint}"
     )
+}
+
+/// The `message` a `ResourceNotFoundException` carries when the resource a request names
+/// by ARN is not stored: the fixed wording this service words an ARN-keyed miss with,
+/// whose only variable part is the ARN the request carried.
+pub fn arn_not_found_message(resource_arn: &str) -> String {
+    format!("The item doesn't exist. arn: {resource_arn} ; aborting.")
 }
 
 /// The region this request was signed for, from its SigV4 credential scope; an
