@@ -303,7 +303,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     snapshot_identifier,
                     source.tags.clone(),
                 );
+                let snapshot_arn = snapshot.arn();
                 store.db_snapshots.insert(snapshot_key, snapshot);
+                // The final snapshot is a DB snapshot this service just started taking, so
+                // it records the event of its own source type.
+                store.record_event(
+                    &region,
+                    crate::state::events::DB_SNAPSHOT_CREATING,
+                    snapshot_identifier,
+                    snapshot_arn,
+                );
             } else {
                 // The region's manual snapshot quota is reached. This operation models no
                 // snapshot-quota fault, so the request is refused with the Query API code

@@ -394,8 +394,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A Multi-AZ DB cluster's members are terminated with it, as the operation
         // documents; each reports `deleting` and is removed by the same clock.
         for member in &live_members {
-            if let Some(instance) = store.db_instances.get_mut(&(region.clone(), member.clone())) {
-                instance.begin_deletion();
+            let terminated = store
+                .db_instances
+                .get_mut(&(region.clone(), member.clone()))
+                .map(|instance| {
+                    instance.begin_deletion();
+                    instance.arn()
+                });
+            // A member terminated with the cluster is a DB instance this service just
+            // deleted, so it records the event of its own source type.
+            if let Some(member_arn) = terminated {
+                store.record_event(
+                    &region,
+                    crate::state::events::DB_INSTANCE_DELETED,
+                    member,
+                    member_arn,
+                );
             }
         }
         // "Read replicas are promoted to standalone": a cluster that replicates from this
@@ -425,6 +439,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let db_cluster = store.cluster_to_wire(&accepted);
+        // The delete is accepted and cannot be reverted, so the region's event log records
+        // the cluster's deletion here, where it was accepted.
+        store.record_event(
+            &region,
+            crate::state::events::DB_CLUSTER_DELETED,
+            &identifier,
+            cluster_arn.clone(),
+        );
         // The resource is on its way out, so this service stops claiming the id it minted:
         // a monitoring service must not be told that an id whose resource is being deleted
         // is still one of ours. The RDS store is already locked here and the directory is

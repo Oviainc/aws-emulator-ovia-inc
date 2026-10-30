@@ -328,7 +328,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 snapshot_identifier,
                 source.tags.clone(),
             );
+            let snapshot_arn = snapshot.arn();
             store.db_snapshots.insert(snapshot_key, snapshot);
+            // The snapshot this stop takes is a DB snapshot this service just started
+            // taking, so it records the event of its own source type.
+            store.record_event(
+                &region,
+                crate::state::events::DB_SNAPSHOT_CREATING,
+                snapshot_identifier,
+                snapshot_arn,
+            );
         }
 
         // `DetachFromDBCapacityReservation` "controls the reservation that the DB instance
@@ -352,8 +361,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
             DB_INSTANCE_STATUS_STOPPED,
         ));
+        let instance_arn = record.arn();
+        let db_instance = record.to_wire();
+        // The stop happened, so the region's event log records it.
+        store.record_event(
+            &region,
+            crate::state::events::DB_INSTANCE_STOPPED,
+            &identifier,
+            instance_arn,
+        );
         Ok(StopDBInstanceOutput {
-            db_instance: Some(record.to_wire()),
+            db_instance: Some(db_instance),
         })
     }
 }

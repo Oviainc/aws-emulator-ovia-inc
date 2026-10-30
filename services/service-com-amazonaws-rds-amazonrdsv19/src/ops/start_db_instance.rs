@@ -314,8 +314,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
             DB_INSTANCE_STATUS_AVAILABLE,
         ));
+        let instance_arn = record.arn();
+        let db_instance = record.to_wire();
+        // The start happened, so the region's event log records it.
+        store.record_event(
+            &region,
+            crate::state::events::DB_INSTANCE_STARTED,
+            &identifier,
+            instance_arn,
+        );
         Ok(StartDBInstanceOutput {
-            db_instance: Some(record.to_wire()),
+            db_instance: Some(db_instance),
         })
     }
 }

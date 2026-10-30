@@ -223,8 +223,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // now and the clock owes it `available` once the outage is over.
         record.status = "rebooting".to_string();
         record.pending_status = Some(crate::state::PendingStatus::in_a_moment("available"));
+        let instance_arn = record.arn();
+        let db_instance = record.to_wire();
+        // The restart happened, so the region's event log records it.
+        store.record_event(
+            &region,
+            crate::state::events::DB_INSTANCE_RESTARTED,
+            &identifier,
+            instance_arn,
+        );
         Ok(RebootDBInstanceOutput {
-            db_instance: Some(record.to_wire()),
+            db_instance: Some(db_instance),
         })
     }
 }

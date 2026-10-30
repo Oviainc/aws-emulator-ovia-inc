@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the lifecycle events this service has recorded in
+//! the region the request is signed for (`crate::state::events`), narrowed by
+//! `SourceType` / `SourceIdentifier`, by the `StartTime` / `EndTime` / `Duration` window
+//! and by `EventCategories`, and paged by `MaxRecords` / `Marker`. It is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The one 501 left in it is for a service mounted on an engine this service holds no
+//! state in: there is no log to read there, so the operation cannot be served at all —
+//! never an empty list standing in for one.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +168,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEvents"))
+        let region =
+            crate::state::request_region(ctx).map_err(DescribeEventsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeEventsError::invalid_parameter_value)?;
+        // `Filters`: "This parameter isn't currently supported." Refused rather than
+        // dropped, so a caller is never served a list its filter asked to narrow.
+        let filters = input.filters.unwrap_or_default();
+        if !filters.is_empty() {
+            return Err(DescribeEventsError::invalid_parameter_value(format!(
+                "Filters is not currently supported by DescribeEvents; got {} filter(s)",
+                filters.len()
+            )));
+        }
+        // `SourceType`: "The event source to retrieve events for. If no value is
+        // specified, all events are returned." A value outside the modelled set names no
+        // source type at all, so it is refused rather than matching nothing.
+        if let Some(source_type) = &input.source_type {
+            crate::state::check_event_source_type(source_type)
+                .map_err(DescribeEventsError::invalid_parameter_value)?;
+        }
+        // `SourceIdentifier`: "Constraints: If SourceIdentifier is supplied, SourceType
+        // must also be provided" — an identifier alone does not say which kind of source
+        // it names, and the two parameters are what cannot be used together.
+        if input.source_identifier.is_some() && input.source_type.is_none() {
+            return Err(DescribeEventsError::invalid_parameter_combination(
+                "SourceType must be provided when SourceIdentifier is provided",
+            ));
+        }
+        let wanted_categories = input.event_categories.unwrap_or_default();
+        // Each named category is compared against every candidate record, so the count a
+        // caller chooses is capped before the scan runs, as every other list of this
+        // service is.
+        crate::state::check_request_list_len(
+            "EventCategories",
+            wanted_categories.len(),
+            crate::state::MAX_EVENT_CATEGORIES_PER_REQUEST,
+        )
+        .map_err(DescribeEventsError::invalid_parameter_value)?;
+        // `Duration` is "the number of minutes to retrieve events for", so a negative
+        // count names no window.
+        let minutes = match input.duration {
+            None => crate::state::DEFAULT_EVENT_WINDOW_MINUTES,
+            Some(value) if value < 0 => {
+                return Err(DescribeEventsError::invalid_parameter_value(format!(
+                    "Invalid value {value} for Duration. Must be a number of minutes, \
+                     which cannot be negative"
+                )));
+            }
+            Some(value) => i64::from(value),
+        };
+        // The window the read reports over: `EndTime` or now, back to `StartTime` or
+        // `Duration` minutes before that end — "By default, RDS returns events that were
+        // generated in the past hour", and a request that bounds both ends has already
+        // said what the window is, so `Duration` has nothing left to decide.
+        let now = crate::state::now_as_wire_timestamp();
+        let end = input.end_time.unwrap_or(now).as_secs_f64();
+        let start = input
+            .start_time
+            .map_or(end - (minutes as f64) * 60.0, |at| at.as_secs_f64());
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. 501 is the honest answer, never a fabricated
+        // empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // Only the transitions the clock has ALREADY made due are materialised here —
+        // including the events that have aged out of the published retention window — so
+        // this read writes nothing that was not owed at this instant even if nobody had
+        // called.
+        store.settle_due_transitions(&region);
+
+        // An event belongs to the region of the resource it is about, so a request sees
+        // one region's log. A `SourceIdentifier` that names a resource this service never
+        // recorded an event for narrows the page to nothing: `DescribeEvents` declares no
+        // not-found error, because an identifier is a filter here rather than a lookup.
+        let listed: Vec<(String, Event)> = store
+            .events_in(&region)
+            .iter()
+            .filter(|record| record.within(start, end))
+            .filter(|record| {
+                input
+                    .source_type
+                    .as_ref()
+                    .is_none_or(|wanted| wanted == record.source_type)
+            })
+            .filter(|record| {
+                input.source_identifier.as_ref().is_none_or(|wanted| {
+                    // The identifier members a source identifier carries are stored
+                    // lowercased, and the identifier "isn't case-sensitive", so the two
+                    // are compared the way the store is keyed.
+                    wanted.eq_ignore_ascii_case(&record.source_identifier)
+                })
+            })
+            .filter(|record| {
+                wanted_categories.is_empty()
+                    || wanted_categories
+                        .iter()
+                        .any(|wanted| wanted == record.category)
+            })
+            .map(|record| (record.marker(), record.to_wire()))
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(listed, input.marker.as_deref(), page_size)
+            .map_err(DescribeEventsError::invalid_parameter_value)?;
+        Ok(DescribeEventsOutput {
+            marker: page.next_marker,
+            events: Some(page.items),
+        })
     }
 }

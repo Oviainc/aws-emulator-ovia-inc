@@ -95,6 +95,8 @@ mod event_subscription_source_removal;
 mod event_subscription_sources;
 #[path = "all/event_subscriptions.rs"]
 mod event_subscriptions;
+#[path = "all/events.rs"]
+mod events;
 #[path = "all/existence_and_parameter_guards.rs"]
 mod existence_and_parameter_guards;
 #[path = "all/export_tasks.rs"]

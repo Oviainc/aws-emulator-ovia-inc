@@ -345,7 +345,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 snapshot_identifier,
                 source.tags.clone(),
             );
+            let snapshot_arn = snapshot.arn();
             store.db_snapshots.insert(snapshot_key, snapshot);
+            // The final snapshot is a DB snapshot this service just started taking, so it
+            // records the event of its own source type beside the instance's.
+            store.record_event(
+                &region,
+                crate::state::events::DB_SNAPSHOT_CREATING,
+                snapshot_identifier,
+                snapshot_arn,
+            );
         }
 
         let record = store
@@ -357,7 +366,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // read after it is a `DBInstanceNotFoundFault`.
         record.begin_deletion();
         let dbi_resource_id = record.dbi_resource_id.clone();
+        let instance_arn = record.arn();
         let db_instance = record.to_wire();
+        // The delete "can't be canceled or reverted after it begins", so the region's
+        // event log records the deletion of the instance here, where it was accepted.
+        store.record_event(
+            &region,
+            crate::state::events::DB_INSTANCE_DELETED,
+            &identifier,
+            instance_arn,
+        );
         // The resource is on its way out, so this service stops claiming the id it
         // minted: a monitoring service must not be told that an id whose resource is
         // being deleted is still one of ours.

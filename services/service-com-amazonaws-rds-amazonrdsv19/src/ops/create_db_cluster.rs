@@ -1103,6 +1103,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let cluster_arn = record.arn();
         store.db_clusters.insert(key, record);
+        // The create happened, so the region's event log records it: that entry is what
+        // `DescribeEvents` reports for this cluster from now on.
+        store.record_event(
+            &region,
+            crate::state::events::DB_CLUSTER_CREATED,
+            &identifier,
+            cluster_arn.clone(),
+        );
         // A cluster that joined a global database is a MEMBER of it from now on: the
         // global cluster's own record carries its members, so it is the record that is
         // updated, and `DescribeGlobalClusters` reports the membership from there.

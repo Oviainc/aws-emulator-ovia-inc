@@ -247,7 +247,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let db_snapshot = snapshot.to_wire();
+        let snapshot_arn = snapshot.arn();
+        let snapshot_identifier = snapshot.snapshot_identifier.clone();
         store.db_snapshots.insert(snapshot_key, snapshot);
+        // The snapshot is being taken, so the region's event log records it.
+        store.record_event(
+            &region,
+            crate::state::events::DB_SNAPSHOT_CREATING,
+            &snapshot_identifier,
+            snapshot_arn,
+        );
 
         Ok(CreateDBSnapshotOutput {
             db_snapshot: Some(db_snapshot),

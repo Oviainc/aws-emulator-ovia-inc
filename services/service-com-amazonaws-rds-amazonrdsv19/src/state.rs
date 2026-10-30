@@ -58,6 +58,8 @@
 //! carrying at most [`MAX_AUTHORIZATIONS_PER_DB_SECURITY_GROUP`] ingress rules and the
 //! same bounded tag list —
 //! and at most one CA certificate override per region,
+//! and at most `MAX_REGIONS * MAX_EVENTS_PER_REGION` recorded lifecycle events —
+//! the log `DescribeEvents` reports, a ring per region (see [`events`]) —
 //! whatever sequence of requests arrives, and every
 //! per-request scan reads one region's ordered range rather than the whole map.
 
@@ -104,6 +106,7 @@ pub mod blue_green;
 pub mod custom_engine_versions;
 pub mod db_proxies;
 pub mod engine_log;
+pub mod events;
 pub mod export_tasks;
 pub mod integrations;
 pub mod tags;
@@ -133,6 +136,10 @@ pub use db_proxies::{
     ENGINE_FAMILY_SQLSERVER, NETWORK_TYPE_IPV4,
 };
 pub use engine_log::InstanceLog;
+pub use events::{
+    check_event_source_type, EventLog, EventRecord, LifecycleEvent, DEFAULT_EVENT_WINDOW_MINUTES,
+    DESCRIBE_EVENTS_SOURCE_TYPES, EVENT_RETENTION_SECONDS, MAX_EVENTS_PER_REGION,
+};
 pub use export_tasks::{
     ExportTaskRecord, EXPORT_TASK_STATUS_CANCELED, EXPORT_TASK_STATUS_CANCELING,
     EXPORT_TASK_STATUS_COMPLETE, EXPORT_TASK_STATUS_FAILED, EXPORT_TASK_STATUS_IN_PROGRESS,
@@ -1318,6 +1325,16 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// [`CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION`] per region and by [`MAX_REGIONS`]
     /// regions.
     pub custom_db_engine_versions: BTreeMap<RegionalKey, CustomDbEngineVersionRecord>,
+    /// The lifecycle events this service has recorded, by region — what `DescribeEvents`
+    /// reports.
+    ///
+    /// Keyed by region ALONE, because an event is not a resource a caller names: it is a
+    /// record of a change this service made in that region, and the handlers that make
+    /// those changes append here through [`Self::record_event`]. Bounded by
+    /// [`MAX_EVENTS_PER_REGION`] records per region — the log is a ring — and by
+    /// [`MAX_REGIONS`] regions, which [`Self::has_room_for_region`] counts this map into;
+    /// see [`events`] for the published retention window a record also ages out of.
+    pub events: BTreeMap<String, EventLog>,
     /// Monotonic counter behind every server-assigned id this service mints, so
     /// resource ids and endpoint hosts are unique and reproducible.
     pub mint_counter: u64,
@@ -1528,6 +1545,46 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         for key in gone {
             self.event_subscriptions.remove(&key);
         }
+        // An event past the published retention window is one `DescribeEvents` does not
+        // report whether or not anybody calls, so dropping it here materialises an expiry
+        // the clock already owed rather than changing what a caller can see.
+        if let Some(log) = self.events.get_mut(region) {
+            log.prune(now_as_wire_timestamp().as_secs_f64());
+        }
+    }
+
+    /// Record `event` for the resource `source_identifier` / `source_arn` in `region`: the
+    /// log entry `DescribeEvents` then reports for the change the caller just made.
+    ///
+    /// Called by the handler that PERFORMED the change, with the store already locked, so
+    /// a record exists only because the service did the thing it records. A region holding
+    /// no log yet opens one only while the store has room for another region, the same gate
+    /// every create passes ([`Self::has_room_for_region`]) — a log cannot outlive that
+    /// bound by being opened from here. That guard cannot drop a record in practice: the
+    /// change being recorded was made to a resource stored in this region, so the region
+    /// already holds records and is already counted.
+    pub fn record_event(
+        &mut self,
+        region: &str,
+        event: LifecycleEvent,
+        source_identifier: &str,
+        source_arn: String,
+    ) {
+        if !self.events.contains_key(region) && !self.has_room_for_region(region) {
+            return;
+        }
+        self.events
+            .entry(region.to_string())
+            .or_default()
+            .record(event, source_identifier, source_arn);
+    }
+
+    /// The events recorded in `region`, oldest first — the order `DescribeEvents` reports
+    /// and pages them in. A region nothing has happened in has none.
+    pub fn events_in(&self, region: &str) -> &[EventRecord] {
+        self.events
+            .get(region)
+            .map_or(&[], |log| log.entries.as_slice())
     }
 
     /// The custom engine versions stored in `region`, in `(engine, version)` key order.
@@ -2142,6 +2199,10 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.custom_db_engine_versions.keys())
             .map(|(stored, _)| stored.as_str())
             .chain(self.certificate_overrides.keys().map(String::as_str))
+            // The event log outlives the records it is about — a deleted instance's events
+            // are still readable — so its regions are counted too, or a region whose
+            // records were all deleted would keep a bucket nothing bounds.
+            .chain(self.events.keys().map(String::as_str))
             .collect();
         known.contains(region) || known.len() < MAX_REGIONS
     }

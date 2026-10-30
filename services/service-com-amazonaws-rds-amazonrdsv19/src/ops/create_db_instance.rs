@@ -660,12 +660,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let db_instance = record.to_wire();
         let dbi_resource_id = record.dbi_resource_id.clone();
+        let instance_arn = record.arn();
         let engine = record.engine.clone();
         let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
             performance_insights_enabled: record.performance_insights_enabled,
             database_insights_mode: Some(record.database_insights_mode.clone()),
         };
         store.db_instances.insert(key, record);
+        // The create happened, so the region's event log records it: that entry is what
+        // `DescribeEvents` reports for this instance from now on.
+        store.record_event(
+            &region,
+            crate::state::events::DB_INSTANCE_CREATED,
+            &identifier,
+            instance_arn,
+        );
         // The id just minted is recorded in the SHARED data-source directory, so a
         // service that monitors this instance (Performance Insights addresses a data
         // source by its `DbiResourceId`) can tell that THIS service owns the id: the
