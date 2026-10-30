@@ -347,10 +347,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let features = input.additional_features.as_deref().unwrap_or_default();
         let wants = |feature: &str| features.iter().any(|asked| asked == feature);
-        // "A list of BCP 47 compliant language codes for the results to be rendered
-        // in. If there is no data for the result in the requested language, data
-        // will be returned in the default language for the entry."
-        let language = input.language.as_deref();
+        // The query is tokenized ONCE for the whole response, not once per item,
+        // and the language a suggestion's text is rendered in is resolved against
+        // it: "a list of BCP 47 compliant language codes for the results to be
+        // rendered in. If there is no data for the result in the requested
+        // language, data will be returned in the default language for the entry."
+        // The sections a suggestion marks are the sections of ITS OWN text that
+        // these same tokens accounted for.
+        let query_tokens = crate::state::normalize_tokens(query_text);
+        let language =
+            crate::state::ResultLanguage::matched(input.language.as_deref(), &query_tokens);
         let political_view = match crate::state::resolve_political_view(
             input.political_view.as_deref(),
         ) {
@@ -369,11 +375,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .max_results
             .unwrap_or(crate::state::DEFAULT_MAX_RESULTS)
             .clamp(1, crate::state::MAX_RESULTS_CEILING) as usize;
-
-        // The query is normalized ONCE for the whole response, not once per item:
-        // the sections a suggestion marks are the sections of ITS OWN text that
-        // these terms accounted for.
-        let query_tokens = crate::state::normalize_tokens(query_text);
 
         // The places the query names come first — Suggest is asked for "places or
         // point of interests candidates" — and the query terms that generalise them

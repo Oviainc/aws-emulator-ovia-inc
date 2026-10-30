@@ -16,6 +16,7 @@
 //! [`crate::places_catalog`].
 
 use serde_json::{json, Value};
+use service_com_amazonaws_geoplaces_placesservice::state::{encode_query_id, QUERY_TEXT_MAX};
 
 use crate::places_catalog::{
     assert_success, distance, items, position, text, Emulator, PRICING_BUCKET_HEADER,
@@ -957,11 +958,26 @@ async fn suggest_query_suggestions_resolve_through_search_text() {
         );
     }
 
-    // An id this service never minted names no query.
+    // An id this service never minted names no query. The last row is WELL-FORMED
+    // but carries more query text than a free-form query may itself hold
+    // (`SearchTextRequest$QueryText`, `len 1..200`), which no mint produces; the
+    // row before it sits exactly on that ceiling and is answered.
+    let at_the_ceiling = encode_query_id(TYPE_CATEGORY, &"a".repeat(QUERY_TEXT_MAX));
+    let past_the_ceiling = encode_query_id(TYPE_CATEGORY, &"a".repeat(QUERY_TEXT_MAX + 1));
+    let answered = emulator
+        .post_ok("term-at-the-ceiling", SEARCH_TEXT, &json!({"QueryId": at_the_ceiling}))
+        .await;
+    assert!(
+        items(&answered).is_empty(),
+        "case term-at-the-ceiling: expected a query no place matches to answer with no \
+         items, got {:?}",
+        items(&answered)
+    );
     for (case, query_id) in [
-        ("not-a-token", "not-a-query-id"),
-        ("empty-hex", ""),
-        ("foreign-hex", "6e6f7065"),
+        ("not-a-token", "not-a-query-id".to_string()),
+        ("empty-hex", String::new()),
+        ("foreign-hex", "6e6f7065".to_string()),
+        ("term-past-the-ceiling", past_the_ceiling),
     ] {
         let call = emulator
             .post(SEARCH_TEXT, &json!({"QueryId": query_id}))

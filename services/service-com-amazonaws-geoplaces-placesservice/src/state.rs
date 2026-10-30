@@ -542,6 +542,13 @@ impl<'a> QueryTokens<'a> {
         self.tokens.is_empty()
     }
 
+    /// The normalized tokens alone, as [`normalize_tokens`] yields them: what a
+    /// piece of a result's own text is matched against when the spans in the
+    /// QUERY are not needed (highlighting a response, scoring a term).
+    pub fn normalized(&self) -> Vec<String> {
+        self.tokens.iter().map(|token| token.text.clone()).collect()
+    }
+
     /// Each token with the span it occupies in the query: the text AS THE CALLER
     /// TYPED IT, the normalized token it indexes as, and the `[start, end)` CHAR
     /// span — the indices a `QueryRefinement` reports.
@@ -917,6 +924,55 @@ impl AddressNames {
         ]
         .into_iter()
         .flatten()
+    }
+}
+
+/// The language one request's results are rendered in: the `Language` it named,
+/// and the free-form query it matched records by, where it sent one.
+///
+/// `Language` is "a list of BCP 47 compliant language codes for the results to be
+/// rendered in", so a request that names one renders every result's text in it.
+/// A request that names NONE still asked for a place by SOME name: it typed the
+/// name one language gives the place, and that name is the display name of the
+/// result it gets back, so the place's own name is rendered in the language the
+/// query named it in. Only a request that neither names a language nor names the
+/// place by a name of another language leaves a result in "the default language
+/// for the entry".
+///
+/// An operation that resolves records by position or by id carries no query, so
+/// its results are rendered in the language asked for, or the entry's own.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResultLanguage<'a> {
+    /// The request's `Language` member, where it set one.
+    requested: Option<&'a str>,
+    /// The normalized tokens of the free-form query the request matched records
+    /// by, empty for a request that sent none.
+    query: &'a [String],
+}
+
+impl<'a> ResultLanguage<'a> {
+    /// The rendering for a request that matched records by a free-form query,
+    /// tokenized by [`normalize_tokens`].
+    pub fn matched(requested: Option<&'a str>, query: &'a [String]) -> Self {
+        Self { requested, query }
+    }
+
+    /// The `Language` the request named, which every piece of an entry's text
+    /// other than the place's own name is rendered in.
+    fn requested(&self) -> Option<&'a str> {
+        self.requested
+    }
+}
+
+/// A request that named no language renders results in the language asked for by
+/// nothing but the entry's own text — the rendering an operation with no
+/// free-form query to match a name against reports.
+impl<'a> From<Option<&'a str>> for ResultLanguage<'a> {
+    fn from(requested: Option<&'a str>) -> Self {
+        Self {
+            requested,
+            query: &[],
+        }
     }
 }
 
@@ -1486,15 +1542,47 @@ impl PlaceRecord {
         (self.place_type == PLACE_TYPE_POINT_OF_INTEREST).then_some(self.title.as_str())
     }
 
-    /// The place's own name as one language writes it: the localized name the
-    /// requested BCP 47 tag selects, or the record's own where it holds none in
-    /// that language.
-    pub fn name_in(&self, language: Option<&str>) -> Option<&str> {
+    /// The place's own name as one request renders it: the localized name the tag
+    /// that request resolves to selects ([`PlaceRecord::name_language`]), or the
+    /// record's own where it holds none in that language.
+    pub fn name_in<'a>(&'a self, language: ResultLanguage<'a>) -> Option<&'a str> {
         let name = self.name()?;
         Some(
-            lookup_language(&self.titles_by_language, language)
+            lookup_language(&self.titles_by_language, self.name_language(language))
                 .map_or(name, |(_, localized)| localized.as_str()),
         )
+    }
+
+    /// The BCP 47 language tag this place's own name is rendered under for one
+    /// request: the `Language` it named, and otherwise the language that request's
+    /// query named the place in ([`PlaceRecord::name_language_named_by`]).
+    pub fn name_language<'a>(&'a self, language: ResultLanguage<'a>) -> Option<&'a str> {
+        language
+            .requested()
+            .or_else(|| self.name_language_named_by(language.query))
+    }
+
+    /// The language a free-form query named this place in: the BCP 47 tag of the
+    /// localized name the query names BETTER than any name the entry writes in its
+    /// own language, or `None` when none of them does — in which case the query
+    /// called the place what the entry itself calls it, or named no name of it at
+    /// all.
+    ///
+    /// How much of a name a query names is [`named_share`]. The strictly-better
+    /// test is what keeps a query that names the entry's own name as well as
+    /// another language's answering in the entry's own — a query naming one word
+    /// several languages spell the same way names no language in particular.
+    pub fn name_language_named_by(&self, query_tokens: &[String]) -> Option<&str> {
+        let own = std::iter::once(self.title.as_str())
+            .chain(self.alternate_names.iter().map(String::as_str))
+            .map(|name| named_share(name, query_tokens))
+            .fold(0.0_f64, f64::max);
+        self.titles_by_language
+            .iter()
+            .map(|(tag, localized)| (tag.as_str(), named_share(localized, query_tokens)))
+            .filter(|(_, share)| *share > own)
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(tag, _)| tag)
     }
 
     /// Every name this place is KNOWN by: its own title, its localized titles and
@@ -1536,22 +1624,23 @@ impl PlaceRecord {
     pub fn address_rendered_in(
         &self,
         political_view: Option<&str>,
-        language: Option<&str>,
+        language: ResultLanguage<'_>,
     ) -> AddressRecord {
-        self.address_in(political_view).rendered_in(language)
+        self.address_in(political_view).rendered_in(language.requested())
     }
 
     /// This place's assembled address label: see [`assemble_label`].
     pub fn assembled_label(&self) -> String {
-        self.assembled_label_in(None, None)
+        self.assembled_label_in(None, ResultLanguage::default())
     }
 
     /// This place's assembled address label under a political view, rendered in
-    /// the requested language.
-    pub fn assembled_label_in(
-        &self,
+    /// the requested language — led, for a place that has a name of its own, by
+    /// that name as this request renders it.
+    pub fn assembled_label_in<'a>(
+        &'a self,
         political_view: Option<&str>,
-        language: Option<&str>,
+        language: ResultLanguage<'a>,
     ) -> String {
         assemble_label(
             &self.address_rendered_in(political_view, language),
@@ -1566,17 +1655,17 @@ impl PlaceRecord {
     /// shows this as the single display line for the place, so a bare address
     /// component is not one.
     pub fn title_modeled(&self) -> String {
-        self.title_modeled_in(None, None)
+        self.title_modeled_in(None, ResultLanguage::default())
     }
 
-    /// `Title` under a political view, rendered in the requested language: a label
-    /// that names a country names the one that view attributes the place to, and
-    /// the text is the entry's own unless the request asked for a language the
-    /// entry holds text in.
-    pub fn title_modeled_in(
-        &self,
+    /// `Title` under a political view, rendered as this request renders text: a
+    /// label that names a country names the one that view attributes the place to,
+    /// and the place's own name is written in the language the request resolves to
+    /// ([`PlaceRecord::name_language`]).
+    pub fn title_modeled_in<'a>(
+        &'a self,
         political_view: Option<&str>,
-        language: Option<&str>,
+        language: ResultLanguage<'a>,
     ) -> String {
         self.name_in(language).map_or_else(
             || self.assembled_label_in(political_view, language),
@@ -1586,14 +1675,14 @@ impl PlaceRecord {
 
     /// `Address`, with the assembled `Label` this place renders.
     pub fn address_modeled(&self) -> Address {
-        self.address_modeled_in(None, None)
+        self.address_modeled_in(None, ResultLanguage::default())
     }
 
     /// `Address` under a political view, rendered in the requested language.
-    pub fn address_modeled_in(
-        &self,
+    pub fn address_modeled_in<'a>(
+        &'a self,
         political_view: Option<&str>,
-        language: Option<&str>,
+        language: ResultLanguage<'a>,
     ) -> Address {
         self.address_rendered_in(political_view, language)
             .to_modeled(self.assembled_label_in(political_view, language))
@@ -1986,6 +2075,33 @@ fn score_against(terms: &[String], query_tokens: &[String]) -> Option<f64> {
         }
     }
     Some(matched / query_tokens.len() as f64)
+}
+
+/// How much of one of a place's NAMES a query named: the share of that name's
+/// words the query accounted for, counting a word named only by its leading
+/// characters, or by a standard abbreviation, as half ([`affinity`]).
+///
+/// Unlike [`text_affinity`], a query word the name accounts for nothing of costs
+/// the name nothing — a query naming a landmark and the city around it still names
+/// the landmark's name in full — and unlike [`locate`], the name's words need not
+/// sit together in the query. Dividing by the NAME's length is what makes two
+/// names comparable: a query naming one word of a two-word name names half of it,
+/// whichever language writes it.
+fn named_share(name: &str, query_tokens: &[String]) -> f64 {
+    let words = normalize_tokens(name);
+    if words.is_empty() || query_tokens.is_empty() {
+        return 0.0;
+    }
+    let named: f64 = words
+        .iter()
+        .map(|word| {
+            query_tokens
+                .iter()
+                .filter_map(|token| affinity(word, token))
+                .fold(0.0, f64::max)
+        })
+        .sum();
+    named / words.len() as f64
 }
 
 /// The normalized tokens of the text a record REPORTS: every name it is known by,
@@ -2632,6 +2748,11 @@ pub fn encode_query_id(query_type: &str, term: &str) -> String {
 
 /// Decode a `QueryId` back to the `(QueryType, term)` it names, refusing one this
 /// service never minted.
+///
+/// A minted id carries a query TERM — a category or a business chain the catalog
+/// holds — so one carrying more text than a free-form query may itself hold
+/// ([`QUERY_TEXT_MAX`]) is not an id this service issued, and the work of running
+/// the query it names is bounded by the same ceiling as a `QueryText`.
 pub fn decode_query_id(query_id: &str) -> Option<(String, String)> {
     let decoded = String::from_utf8(hex::decode(query_id).ok()?).ok()?;
     let mut fields = decoded.split(TOKEN_SEPARATOR);
@@ -2640,7 +2761,7 @@ pub fn decode_query_id(query_id: &str) -> Option<(String, String)> {
     else {
         return None;
     };
-    if kind != QUERY_ID_KIND || term.is_empty() {
+    if kind != QUERY_ID_KIND || term.is_empty() || term.chars().count() > QUERY_TEXT_MAX {
         return None;
     }
     Some((query_type.to_string(), term.to_string()))
@@ -3582,7 +3703,13 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             POINT_EXTENT_M,
         )
         .with_alternate_names(&["La Tour Eiffel"])
-        .with_localized_titles(&[("en", "Eiffel Tower")])
+        // The landmark's name as other languages write it: a query naming it by
+        // any of them is answered under the name it used.
+        .with_localized_titles(&[
+            ("en", "Eiffel Tower"),
+            ("de", "Eiffelturm"),
+            ("es", "Torre Eiffel"),
+        ])
         .with_categories(&[
             ("tourist_attraction", "Tourist Attraction"),
             ("monument", "Monument"),
@@ -4000,7 +4127,7 @@ fn seed_catalog() -> ComAmazonawsGeoplacesPlacesserviceState {
             POINT_EXTENT_M,
         )
         .with_alternate_names(&["The Louvre"])
-        .with_localized_titles(&[("en", "Louvre Museum")])
+        .with_localized_titles(&[("en", "Louvre Museum"), ("es", "Museo del Louvre")])
         .with_categories(&[("museum", "Museum"), ("tourist_attraction", "Tourist Attraction")])
         .with_contacts(&["+33 1 40 20 53 17"], &["https://www.louvre.fr"])
         .with_opening_hours(&["Wed-Mon: 09:00 - 18:00"])

@@ -256,8 +256,15 @@ async fn a_partial_query_is_completed_to_the_places_its_words_name() {
         },
         PrefixRow {
             case: "alternate-name",
-            query: "Eiffel Tow",
+            query: "La Tour Eif",
             expected_title: "Tour Eiffel",
+        },
+        PrefixRow {
+            // Typed in a language the entry holds a name in: the completion spells
+            // the name that was typed, not the entry's own.
+            case: "localized-name",
+            query: "Eiffel Tow",
+            expected_title: "Eiffel Tower",
         },
         PrefixRow {
             case: "long-name-partial-last-word",
@@ -417,9 +424,10 @@ struct HighlightRow {
 /// The rows differ along where in the response's text the typed words sit (at its
 /// start, in the middle of it), how many words they account for, and which members
 /// carry them (the title alone, the title and the label, the address components) —
-/// which is what the highlighting rule generalises over. The "alternate-name" row
-/// is the one that separates a section of the RESPONSE from a section of the query:
-/// "Eiffel" is typed first and reported second.
+/// which is what the highlighting rule generalises over. The
+/// "one-word-of-a-longer-name" row is the one that separates a section of the
+/// RESPONSE from a section of the query: "Louvre" is typed alone and reported as the
+/// third word of the name.
 #[tokio::test]
 async fn a_completion_marks_the_sections_of_its_own_text_the_query_named() {
     let emulator = Emulator::new();
@@ -434,11 +442,24 @@ async fn a_completion_marks_the_sections_of_its_own_text_the_query_named() {
             address_sections: &[("Label", &[(0, 10, "Space Need")])],
         },
         HighlightRow {
-            case: "alternate-name",
+            // The query names ONE word of a name the response spells later in its
+            // own text, which separates a section of the RESPONSE from a section of
+            // the query.
+            case: "one-word-of-a-longer-name",
+            query: "Louvre",
+            title: "Musee du Louvre",
+            title_sections: &[(9, 15, "Louvre")],
+            address_sections: &[("Label", &[(9, 15, "Louvre")])],
+        },
+        HighlightRow {
+            // Typed in a language the entry holds a name in: the response spells the
+            // name THAT language gives the place, and the sections mark the text the
+            // response carries.
+            case: "localized-name",
             query: "Eiffel Tow",
-            title: "Tour Eiffel",
-            title_sections: &[(5, 11, "Eiffel")],
-            address_sections: &[("Label", &[(5, 11, "Eiffel")])],
+            title: "Eiffel Tower",
+            title_sections: &[(0, 10, "Eiffel Tow")],
+            address_sections: &[("Label", &[(0, 10, "Eiffel Tow")])],
         },
         HighlightRow {
             case: "street-and-number",

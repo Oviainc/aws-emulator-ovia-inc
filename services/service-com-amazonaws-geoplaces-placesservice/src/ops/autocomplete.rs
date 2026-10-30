@@ -359,10 +359,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         let view = political_view.as_deref();
-        // "A list of BCP 47 compliant language codes for the results to be rendered
-        // in. If there is no data for the result in the requested language, data
-        // will be returned in the default language for the entry."
-        let language = input.language.as_deref();
         let pricing_bucket = state.pricing_bucket(Self::NAME, input.intended_use.as_deref());
 
         // Composing the items is the one part of this handler driven by the LENGTH
@@ -376,8 +372,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         drop(state);
 
-        // The query is normalized ONCE for the whole response, not once per result.
+        // The query is tokenized ONCE for the whole response, not once per result,
+        // and the language a completion's text is rendered in is resolved against
+        // it: "a list of BCP 47 compliant language codes for the results to be
+        // rendered in. If there is no data for the result in the requested
+        // language, data will be returned in the default language for the entry."
+        // The sections a completion marks are sections of ITS OWN text that these
+        // same tokens accounted for.
         let query_tokens = crate::state::normalize_tokens(query_text);
+        let language =
+            crate::state::ResultLanguage::matched(input.language.as_deref(), &query_tokens);
         let result_items = page
             .iter()
             .map(|(place, candidate)| {

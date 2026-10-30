@@ -343,8 +343,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let wants = |feature: &str| features.iter().any(|asked| asked == feature);
         // "A list of BCP 47 compliant language codes for the results to be rendered
         // in. If there is no data for the result in the requested language, data
-        // will be returned in the default language for the entry."
-        let language = input.language.as_deref();
+        // will be returned in the default language for the entry." A position names
+        // no place by name, so there is no query to resolve a language from.
+        let language = crate::state::ResultLanguage::from(input.language.as_deref());
         let political_view = match crate::state::resolve_political_view(
             input.political_view.as_deref(),
         ) {

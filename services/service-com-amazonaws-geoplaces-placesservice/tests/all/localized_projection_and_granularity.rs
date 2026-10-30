@@ -270,9 +270,13 @@ async fn result_text_is_rendered_in_the_requested_language_or_the_entry_s_own() 
             let case = format!("{}-{operation}", row.case);
             let returned = emulator.post_ok(&case, path, &body).await;
             let item = items(&returned).first().cloned().unwrap_or(Value::Null);
-            // The entry's own language is French; only an English request renames
-            // it, and every other tag falls back to the French name.
-            let expected = if row.rendered == "en" {
+            // The entry's own language is French. An English request renames it;
+            // every other tag asked for falls back to the French name. The request
+            // that asks for NO language is answered under the name its query used —
+            // the rule `a_place_found_by_the_name_one_language_gives_it_is_named_in
+            // _that_language` covers, exercised here only as the row that asks for
+            // nothing.
+            let expected = if row.rendered == "en" || row.asked.is_none() {
                 "Eiffel Tower"
             } else {
                 "Tour Eiffel"

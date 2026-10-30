@@ -21,6 +21,8 @@ mod localized_projection_and_granularity;
 mod places_catalog;
 #[path = "all/result_item_composition.rs"]
 mod result_item_composition;
+#[path = "all/result_name_language.rs"]
+mod result_name_language;
 #[path = "all/reverse_geocode_positions.rs"]
 mod reverse_geocode_positions;
 #[path = "all/state_roundtrip.rs"]

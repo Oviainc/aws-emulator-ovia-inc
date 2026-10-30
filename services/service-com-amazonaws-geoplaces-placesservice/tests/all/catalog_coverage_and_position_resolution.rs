@@ -62,13 +62,17 @@ struct LandmarkRow {
     /// The `Title` the service must report: a point of interest's own name, or the
     /// assembled label of a place that has no name of its own.
     title: &'static str,
+    /// The `Title` GetPlace must report for the SAME record. A `PlaceId` names no
+    /// place by name and this row asks for no `Language`, so a place queried by the
+    /// name another language gives it is read back under the entry's own name.
+    detail_title: &'static str,
     /// `Address.Country.Code3` of that place.
     country: &'static str,
 }
 
 /// A query naming a place is answered out of the catalog wherever that place is,
-/// and the `PlaceId` it hands out resolves through GetPlace to the same `Title` and
-/// `Position` — the chain a client doing "geocode, then fetch" walks.
+/// and the `PlaceId` it hands out resolves through GetPlace to the same record —
+/// the chain a client doing "geocode, then fetch" walks.
 ///
 /// The rows differ along the COUNTRY and region the place sits in, and along the
 /// name it is queried by: two of them are queried by a name the record does not
@@ -81,54 +85,64 @@ async fn a_query_naming_a_place_resolves_to_it_and_round_trips_through_get_place
             case: "golden-gate-bridge",
             query: "Golden Gate Bridge, San Francisco, CA, USA",
             title: "Golden Gate Bridge",
+            detail_title: "Golden Gate Bridge",
             country: "USA",
         },
         LandmarkRow {
             case: "statue-of-liberty",
             query: "Statue of Liberty, New York",
             title: "Statue of Liberty",
+            detail_title: "Statue of Liberty",
             country: "USA",
         },
         LandmarkRow {
             case: "empire-state-building",
             query: "Empire State Building",
             title: "Empire State Building",
+            detail_title: "Empire State Building",
             country: "USA",
         },
         LandmarkRow {
             case: "space-needle",
             query: "Space Needle",
             title: "Space Needle",
+            detail_title: "Space Needle",
             country: "USA",
         },
         LandmarkRow {
             case: "pier-39",
             query: "Pier 39, San Francisco",
             title: "Pier 39",
+            detail_title: "Pier 39",
             country: "USA",
         },
         LandmarkRow {
-            // Queried by its English name, which the record carries as an
-            // alternate name rather than as its title.
+            // Queried by its English name, which the record holds beside its own
+            // French one: with no `Language` asked for, the result is named the way
+            // the query named it, while the record itself keeps its own name.
             case: "eiffel-tower-by-english-name",
             query: "Eiffel Tower",
-            title: "Tour Eiffel",
+            title: "Eiffel Tower",
+            detail_title: "Tour Eiffel",
             country: "FRA",
         },
         LandmarkRow {
             case: "louvre-by-english-name",
             query: "Louvre Museum",
-            title: "Musee du Louvre",
+            title: "Louvre Museum",
+            detail_title: "Musee du Louvre",
             country: "FRA",
         },
         LandmarkRow {
             // A place with no name of its own: its `Title` is the assembled label.
             // Queried by its English name, which the entry holds beside its own
-            // text: with no `Language` asked for the label comes back in the
-            // entry's own language, "the default language for the entry".
+            // text: a place that has no name of its own has no name to answer
+            // under, so the label comes back in the entry's own language, "the
+            // default language for the entry".
             case: "simferopol",
             query: "Simferopol",
             title: "Сімферополь, Україна",
+            detail_title: "Сімферополь, Україна",
             country: "UKR",
         },
     ];
@@ -181,8 +195,8 @@ async fn a_query_naming_a_place_resolves_to_it_and_round_trips_through_get_place
             .await;
         assert_eq!(
             (text(&detail, "Title"), position(&detail)),
-            (text(&item, "Title"), position(&item)),
-            "case {}: GetPlace must report the same Title and Position as Geocode, got {:?}",
+            (row.detail_title.to_string(), position(&item)),
+            "case {}: GetPlace must report the same record at the same Position, got {:?}",
             row.case,
             (text(&detail, "Title"), position(&detail))
         );

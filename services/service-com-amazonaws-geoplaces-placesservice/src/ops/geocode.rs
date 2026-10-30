@@ -319,10 +319,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let features = input.additional_features.as_deref().unwrap_or_default();
         let wants = |feature: &str| features.iter().any(|asked| asked == feature);
-        // "A list of BCP 47 compliant language codes for the results to be rendered
-        // in. If there is no data for the result in the requested language, data
-        // will be returned in the default language for the entry."
-        let language = input.language.as_deref();
         let political_view = match crate::state::resolve_political_view(
             input.political_view.as_deref(),
         ) {
@@ -344,8 +340,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         drop(state);
 
-        // The query is tokenized ONCE for the whole response, not once per result.
+        // The query is tokenized ONCE for the whole response, not once per result,
+        // and the language a result's text is rendered in is resolved against it:
+        // "a list of BCP 47 compliant language codes for the results to be rendered
+        // in. If there is no data for the result in the requested language, data
+        // will be returned in the default language for the entry."
         let query = crate::state::QueryTokens::new(query_text);
+        let query_tokens = query.normalized();
+        let language =
+            crate::state::ResultLanguage::matched(input.language.as_deref(), &query_tokens);
         let result_items = page
             .iter()
             .map(|(place, candidate)| {
