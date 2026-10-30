@@ -18,10 +18,13 @@
 //! or value outside the documented rules, or more tags than a resource may carry,
 //! is a `BadRequestException` and the channel is not created.
 //!
-//! Authentication and authorization are NOT this handler's business: the emulator
-//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! Authentication is NOT this handler's business: the emulator verifies every
+//! request signature centrally (see `AGENTS.md`), so the modelled
 //! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
-//! constructed here.
+//! constructed here. Resource-scoped AUTHORIZATION is: this call asks for an action
+//! on the cluster its `ClusterArn` names, and that decision is taken on the ARN as
+//! submitted, before this handler validates the rest of the body
+//! ([`crate::state::authorization`]).
 //!
 //! The scaffold notes below describe the framework; they are kept because they document
 //! the seams this handler uses.
@@ -181,6 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Decided FIRST, on the ARN as submitted and from the request alone — and
+        // so BEFORE this handler's own body validation: the caller holds no
+        // resource-based policy over a cluster of another account, so such a
+        // request is refused rather than answered out of what this registry
+        // happens to hold under that ARN. See [`crate::state::authorization`].
+        crate::state::authorization::authorize_operation(Self::NAME, &input.cluster_arn)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateChannelErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {

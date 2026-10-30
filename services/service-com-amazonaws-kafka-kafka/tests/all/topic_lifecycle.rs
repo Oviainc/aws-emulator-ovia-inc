@@ -855,7 +855,8 @@ async fn deleting_a_cluster_takes_its_topics_with_it() {
 /// `BadRequestException` (400), and a well-formed one this endpoint's region holds
 /// no cluster for is the missing resource it names (404 `NotFoundException`,
 /// carrying the service's own not-found wording) — on a repeat as on the first
-/// call, and without creating anything.
+/// call, and without creating anything. A cluster of another ACCOUNT never reaches
+/// that resolution: the authorization decision answers it first.
 #[tokio::test]
 async fn every_topic_operation_resolves_the_cluster_first() {
     let emulator = Emulator::new();
@@ -863,8 +864,9 @@ async fn every_topic_operation_resolves_the_cluster_first() {
     let live = emulator.cluster("live", 1).await;
 
     // Rows: well-formed cluster ARNs no live cluster answers for (absent name,
-    // another region, another account, another partition), then one row per way
-    // the ARN grammar itself can fail.
+    // another region, another partition), the one whose account makes it a cluster
+    // the caller may not reach at all, then one row per way the ARN grammar itself
+    // can fail.
     let rows: Vec<(&str, String, u16, &str)> = vec![
         (
             "absent cluster",
@@ -881,10 +883,15 @@ async fn every_topic_operation_resolves_the_cluster_first() {
             "NotFoundException",
         ),
         (
+            // A cluster of another ACCOUNT is not a resource this endpoint cannot
+            // find: it is one the caller holds no policy over, which the
+            // authorization decision answers before any lookup — the rule the
+            // `cluster_authorization` suite states over the whole cluster-scoped
+            // surface.
             "another account's cluster",
             live.replace(ACCOUNT, "123456789012"),
-            404,
-            "NotFoundException",
+            403,
+            "AccessDeniedException",
         ),
         (
             "another partition",

@@ -140,6 +140,12 @@
 /// beside this one rather than in it.
 pub mod network;
 
+/// The authorization decision a cluster-scoped operation takes on the ARN its
+/// request names, BEFORE the resolution below runs. It is decided from the request
+/// alone, which is why it sits beside this module rather than in it — nothing it
+/// reads is held here.
+pub mod authorization;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};

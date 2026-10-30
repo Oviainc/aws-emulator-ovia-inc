@@ -647,13 +647,30 @@ async fn an_arn_that_names_no_policy_is_refused() {
         ("cluster-without-policy", without_policy.clone()),
         ("another-regions-cluster", elsewhere.clone()),
         ("this-regions-arn-with-another-region", held.replace(REGION, "eu-central-1")),
-        ("another-account", held.replace(ACCOUNT, "123456789012")),
         ("policy-already-deleted", already_deleted.clone()),
         ("cluster-already-deleted", cluster_gone.clone()),
     ];
     for (case, arn) in &not_found {
         assert_policy_not_found(&delete(&emulator, arn).await, &format!("delete {case}"));
         assert_policy_not_found(&get(&emulator, arn).await, &format!("get {case}"));
+    }
+
+    // The same ARN with only its ACCOUNT segment rewritten is not a policy this
+    // endpoint cannot find: it is a cluster the caller holds no policy over at all,
+    // which the authorization decision answers before any lookup — the rule the
+    // `cluster_authorization` suite states over the whole cluster-scoped surface.
+    let another_account = held.replace(ACCOUNT, "123456789012");
+    for (case, reply) in [
+        ("delete", delete(&emulator, &another_account).await),
+        ("get", get(&emulator, &another_account).await),
+    ] {
+        assert_eq!(
+            (reply.status, reply.error_code()),
+            (403, "AccessDeniedException"),
+            "case {case} another-account: expected the authorization denial, got {} {}",
+            reply.status,
+            reply.body
+        );
     }
 
     let configuration_arn = format!(

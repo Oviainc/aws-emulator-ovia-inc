@@ -25,11 +25,17 @@
 //! and no replicator record is written. Those interfaces are only ever created for
 //! a setup whose clusters resolve, so that gate runs only when the clusters did.
 //!
-//! Authentication and authorization are NOT this handler's business: the emulator
-//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! Authentication is NOT this handler's business: the emulator verifies every
+//! request signature centrally (see `AGENTS.md`), so the modelled
 //! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
 //! constructed here. `NotFoundException` likewise: nothing this operation looks up
 //! can be missing.
+//!
+//! The one authorization decision that IS this handler's is over the role the
+//! request hands the service. `ServiceExecutionRoleArn` is a role PASSED to MSK, and
+//! only a role of the caller's own account may be passed, which is decided before
+//! anything is pre-checked or minted
+//! ([`crate::state::authorization::authorize_pass_role`]).
 //!
 //! The scaffold notes below describe the framework; they are kept because they
 //! document the seams this handler uses.
@@ -199,6 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The service-execution role the request hands this service is decided
+        // FIRST, before anything the request asks for is pre-checked or minted:
+        // passing a role is the caller granting MSK that role's permissions, and
+        // only a role of the caller's own account may be passed. See
+        // [`crate::state::authorization`].
+        crate::state::authorization::authorize_pass_role(&input.service_execution_role_arn)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateReplicatorErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {

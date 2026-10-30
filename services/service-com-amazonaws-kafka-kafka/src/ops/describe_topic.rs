@@ -164,6 +164,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Decided FIRST, on the ARN as submitted and from the request alone. A
+        // topic call reaches the cluster's Apache Kafka data plane, so the action
+        // it is authorized under is connecting to that cluster — and the caller
+        // holds no resource-based policy over a cluster of another account, so
+        // such a request is refused rather than answered out of what this
+        // registry happens to hold under that ARN. See
+        // [`crate::state::authorization`].
+        crate::state::authorization::authorize_action(
+            crate::state::authorization::CLUSTER_CONNECT_ACTION,
+            &input.cluster_arn,
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeTopicErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {

@@ -17,10 +17,12 @@
 //! `BadRequestException`; a well-formed one this endpoint's region holds no cluster
 //! for is a `NotFoundException`. This operation only REPORTS: it writes nothing.
 //!
-//! Authentication and authorization are NOT this handler's business: the emulator
-//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! Authentication is NOT this handler's business: the emulator verifies every
+//! request signature centrally (see `AGENTS.md`), so the modelled
 //! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
-//! constructed here.
+//! constructed here. Resource-scoped AUTHORIZATION is, for a request that names a
+//! cluster: that decision is taken on the `ClusterArn` as submitted, before
+//! anything is resolved ([`crate::state::authorization`]).
 //!
 //! ## Shape of an operation
 //!
@@ -175,6 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ClusterArn` is optional in the model.
         let source_versions: Vec<String> = match input.cluster_arn.as_deref() {
             Some(cluster_arn) => {
+                // Decided FIRST, on the ARN as submitted and from the request
+                // alone: the caller holds no resource-based policy over a cluster
+                // of another account, so such a request is refused rather than
+                // answered out of what this registry happens to hold under that
+                // ARN. See [`crate::state::authorization`].
+                crate::state::authorization::authorize_operation(Self::NAME, cluster_arn)?;
                 if !crate::state::is_cluster_arn(cluster_arn) {
                     return Err(GetCompatibleKafkaVersionsErrorModeled::BadRequestException(
                         BadRequestException {
