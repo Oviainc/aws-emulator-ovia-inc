@@ -84,9 +84,10 @@
 //! decision, the one operation whose model declares no such refusal, and the refusal's
 //! wording). The resource half is [`RequestArns::named_resource`] beside
 //! [`authorization::judged_resource`]: the ARN the request names of the family its URI
-//! space addresses, else that family's collection, so a policy scoped to one resource or
-//! to one family is evaluated against what the caller addressed and never against an ARN
-//! of another family the request happens to carry.
+//! space addresses — or, where its URI carries that one resource's own ARN resource id
+//! instead of the whole ARN, the ARN built from that id — else that family's collection, so
+//! a policy scoped to one resource or to one family is evaluated against what the caller
+//! addressed and never against an ARN of another family the request happens to carry.
 
 pub mod authorization;
 pub mod validation;

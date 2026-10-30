@@ -23,10 +23,10 @@
 //!    assumed-role session, the account's own published key). The refusal's sentence is
 //!    asserted whole, with every part — principal, action, resource, reason — taken from
 //!    the request and the stored policy, and the resource it names being the one the
-//!    request ADDRESSED: the ARN where the request carries one, the collection of the
-//!    family whose URI space it was sent to where it names a target by bare id or names
-//!    none, and no resource clause at all where the operation addresses no resource of this
-//!    service.
+//!    request ADDRESSED: the ARN where the request carries one, that same ARN where the
+//!    request carries the resource's own ARN id in its URI, the collection of the family
+//!    whose URI space it was sent to where it names no single member of it, and no resource
+//!    clause at all where the operation addresses no resource of this service.
 //! 2. **A job create decides the `iam:PassRole` of the role it hands Amazon Bedrock.** The
 //!    job creates pass a role the service is to run the job under, so the create is admitted
 //!    only where this account's IAM holds that role and its trust policy grants
@@ -198,9 +198,9 @@ fn calls(guardrail_id: &str, guardrail_arn: &str, suffix: &str) -> Vec<Call> {
             method: "GET",
             path: format!("/guardrails/{}", label(guardrail_id)),
             body: None,
-            // A bare id is no ARN, so the action reaches the collection of the family the
-            // request's URI space addresses.
-            resource: collection("guardrail"),
+            // A bare `guardrailIdentifier` IS the id inside the guardrail's own ARN, so the
+            // request addresses that one guardrail just as spelling its ARN does.
+            resource: guardrail_arn.to_string(),
         },
         Call {
             case: "a read addressed by the guardrail's ARN",
@@ -502,10 +502,12 @@ fn assert_refused(case: &str, reply: &Reply, operation: &str, resource: &str, ve
 }
 
 /// RULE 1, the resource half: the resource an action is judged against is the one the
-/// request ADDRESSED — the collection of the family its URI space addresses, or the ARN it
-/// spells OF that family, and never an ARN of another family the request happens to carry
-/// — so a policy scoped to what the request addressed serves it and one scoped to another
-/// family does not.
+/// request ADDRESSED — the ARN it spells OF the family its URI space addresses, the ARN
+/// built from that one resource's own id where the URI carries the id instead, or the
+/// family's collection where it addresses no single member — and never an ARN of another
+/// family the request happens to carry, so a policy scoped to what the request addressed
+/// serves it and one scoped to another family does not. The id-addressed form has its own
+/// table in `crate::id_addressed_resource_authorization`.
 #[tokio::test]
 async fn an_action_is_judged_against_the_resource_the_request_addressed() {
     let emu = emulator();

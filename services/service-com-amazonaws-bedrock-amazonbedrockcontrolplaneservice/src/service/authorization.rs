@@ -243,23 +243,34 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     Ok(())
 }
 
+/// The ARN of the resource of `resource_type` that `resource_id` names, in the Region the
+/// caller signed for — built through the same builder every resource ARN this service
+/// mints comes from, so what IAM evaluates is spelled exactly as the ARNs of the resources
+/// the action reaches are, and a policy scoped to them covers it.
+fn family_arn(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    resource_type: &str,
+    resource_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        crate::state::ARN_NAMESPACE,
+        &crate::state::request_region(ctx.parts()),
+        &format!("{resource_type}/{resource_id}"),
+    )
+}
+
 /// The ARN a request that names no single resource of its own is judged against: every
 /// resource of `resource_type` in the Region the caller signed for.
 ///
 /// A create and a list name no one resource — the id a create would mint does not exist
 /// while the create is still being authorized — so what IAM evaluates is the collection
-/// the action reaches, built through the same ARN builder every resource ARN this service
-/// mints comes from, so a policy scoped to this account's resources covers it.
+/// the action reaches, written with IAM's own resource wildcard.
 #[must_use]
 pub fn collection_arn(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     resource_type: &str,
 ) -> String {
-    ::engine::emulator_arn(
-        crate::state::ARN_NAMESPACE,
-        &crate::state::request_region(ctx.parts()),
-        &format!("{resource_type}/*"),
-    )
+    family_arn(ctx, resource_type, ANY_RESOURCE)
 }
 
 /// The ARN an operation is judged against, given the ARN of one of this service's own
@@ -267,7 +278,7 @@ pub fn collection_arn(
 /// it was addressed to.
 ///
 /// IAM evaluates an action against the resource the request addresses, and a request
-/// addresses one in exactly three ways:
+/// addresses one in exactly four ways:
 ///
 /// * it NAMES it, by spelling the ARN of a resource of the family its URI space addresses —
 ///   `GetCustomModel$modelIdentifier` spelled as a `custom-model` ARN,
@@ -276,10 +287,14 @@ pub fn collection_arn(
 ///   `CreateModelInvocationJob$modelId` admits a `foundation-model`, `custom-model` or
 ///   `inference-profile` ARN, `ListModelCopyJobs$sourceModelArnEquals` a source model — and
 ///   the model a job runs is not the resource the job-creating action acts on;
-/// * it names no ARN of that family — a create, a listing, a read addressed by a bare name
-///   — and so addresses the family's whole collection in this account and Region
+/// * it carries that ONE resource's own ARN resource id in its URI instead of the whole ARN
+///   ([`ID_ADDRESSED_FAMILIES`]) — the bare id the identifier member's modelled form admits
+///   beside the ARN — so the resource it addresses is the member that id names, and its ARN
+///   is built from the id by this service's own builder for the family ([`family_arn`]);
+/// * it names no single member of that family — a create, a listing, a read addressed by a
+///   NAME — and so addresses the family's whole collection in this account and Region
 ///   ([`collection_arn`]): the id a create would mint does not exist while the create is
-///   still being authorized, and the id behind a bare name is one this service minted, so
+///   still being authorized, and the id behind a name is one this service minted, so
 ///   neither is an ARN this gate could resolve without reading the store;
 /// * its URI space addresses no family of its own and the request carries the TARGET's ARN
 ///   instead ([`ARN_ADDRESSED_SPACES`]) — the tagging and resource-policy operations, whose
@@ -296,8 +311,7 @@ pub fn judged_resource(
 ) -> String {
     match addressed(uri) {
         Addressed::Family(resource_types) => {
-            // The ARN the request spells, only where it is one of THIS family's; otherwise
-            // the family's collection, written with the type its own resources carry first.
+            // The ARN the request spells, only where it is one of THIS family's.
             if let Some(arn) = named {
                 if resource_types
                     .iter()
@@ -306,6 +320,12 @@ pub fn judged_resource(
                     return arn;
                 }
             }
+            // Else the one member the URI addresses by its own id, where it does.
+            if let Some((resource_type, resource_id)) = id_addressed_member(uri) {
+                return family_arn(ctx, resource_type, resource_id);
+            }
+            // Else the family's collection, written with the type its own resources carry
+            // first.
             match resource_types.first() {
                 Some(resource_type) => collection_arn(ctx, resource_type),
                 None => ANY_RESOURCE.to_string(),
@@ -315,6 +335,99 @@ pub fn judged_resource(
         Addressed::NoResource => ANY_RESOURCE.to_string(),
     }
 }
+
+/// The ARN resource type and resource id of the ONE member `uri` addresses by that
+/// member's own id, or `None` for a request that addresses no single member that way.
+///
+/// The id sits at the segment after the space ([`ID_ADDRESSED_FAMILIES`]), and is read as
+/// an id only where it is spelled as THAT family spells the resource id inside its ARNs
+/// ([`IdAddressedFamily::admits_id`]) — so the percent-encoded ARN a caller may put in the
+/// same label, a sub-resource segment, and a label of any other form fall through to the
+/// ARN the request named or to the family's collection rather than being read as an id, and
+/// the ARN this gate builds is always one a resource of that family could carry.
+fn id_addressed_member(uri: &str) -> Option<(&'static str, &str)> {
+    let space = path_segment(uri, 0);
+    let family = ID_ADDRESSED_FAMILIES
+        .iter()
+        .find(|family| family.space == space)?;
+    let identifier = path_segment(uri, 1);
+    family
+        .admits_id(identifier)
+        .then_some((family.resource_type, identifier))
+}
+
+/// One URI space whose single-resource operations address that resource by its OWN ARN
+/// resource id.
+struct IdAddressedFamily {
+    /// The URI space: the first path segment of those operations' `@http` URIs, with the
+    /// id at the segment right after it.
+    space: &'static str,
+    /// The ARN resource type the id belongs to — the type this service's own ARN builder
+    /// for that family spells.
+    resource_type: &'static str,
+    /// The lengths, inclusive, the model admits for that resource id.
+    id_length: (usize, usize),
+}
+
+impl IdAddressedFamily {
+    /// Whether `value` is spelled as this family spells the resource id inside its ARNs: a
+    /// run of lowercase letters and digits of a length the model admits, so an ARN built
+    /// from it is one a resource of this family could carry.
+    fn admits_id(&self, value: &str) -> bool {
+        let (shortest, longest) = self.id_length;
+        let length = value.chars().count();
+        length >= shortest
+            && length <= longest
+            && value
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+    }
+}
+
+/// Every URI space whose single-resource operations address that resource by its OWN ARN
+/// resource id, with the ARN resource type the id belongs to and the lengths the model
+/// admits for it.
+///
+/// A space is here exactly when the identifier member its operations carry declares the
+/// bare ARN resource id as an alternative beside the whole ARN, so a value that is no ARN
+/// IS that resource's id and the ARN follows from it without reading the store:
+///
+/// * `GuardrailIdentifier` — `^(([a-z0-9]+)|(arn:…:guardrail/[a-z0-9]+))$`, whose id is a
+///   `GuardrailId`: `^[a-z0-9]+$` with `@length(max: 64)`;
+/// * `ModelInvocationJobIdentifier` — `^((arn:…:model-invocation-job/)?[a-z0-9]{12})$`;
+/// * `AdvancedPromptOptimizationJobIdentifier` — the same shape over that family
+///   (`smithy_query(query="operation",operation="GetGuardrail,GetModelInvocationJob,GetAdvancedPromptOptimizationJob")`).
+///
+/// Every OTHER space of [`RESOURCE_FAMILIES`] is absent for one of two stated reasons, and
+/// a request there keeps the resource it had:
+///
+/// * its identifier admits nothing but the ARN (`EvaluationJobIdentifier`), or the label IS
+///   the ARN (`automated-reasoning-policies`, `model-copy-jobs`, `prompt-routers`), so the
+///   ARN the request named is already the resource it addresses;
+/// * its bare alternative is a resource NAME (`ModelIdentifier` and
+///   `ImportedModelIdentifier`'s `([0-9a-zA-Z][_-]?)+`, `ProvisionedModelId`,
+///   `CustomModelDeploymentIdentifier`, `ModelImportJobIdentifier`'s job name), or its ARN
+///   carries a second segment this gate cannot know (`custom-model/<base model>/<id>`,
+///   `model-customization-job/<base model>/<id>`), or the id belongs to either of two
+///   resource types (`InferenceProfileIdentifier`) — in each case the id this service
+///   minted is not derivable from the label, so the action reaches the family's collection.
+const ID_ADDRESSED_FAMILIES: &[IdAddressedFamily] = &[
+    IdAddressedFamily {
+        space: "advanced-prompt-optimization-jobs",
+        resource_type: "advanced-prompt-optimization-job",
+        id_length: (12, 12),
+    },
+    IdAddressedFamily {
+        space: "guardrails",
+        resource_type: "guardrail",
+        id_length: (1, 64),
+    },
+    IdAddressedFamily {
+        space: "model-invocation-job",
+        resource_type: "model-invocation-job",
+        id_length: (12, 12),
+    },
+];
 
 /// What the URI space a request was sent to addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,9 +444,9 @@ enum Addressed {
 }
 
 /// How `uri` addresses a resource, read off the FIRST path segment of the request target
-/// ([`first_path_segment`], which reads both the origin and the absolute form of one).
+/// ([`path_segment`], which reads both the origin and the absolute form of one).
 fn addressed(uri: &str) -> Addressed {
-    let space = first_path_segment(uri);
+    let space = path_segment(uri, 0);
     if let Some((_, resource_types)) = RESOURCE_FAMILIES
         .iter()
         .find(|(known, _)| *known == space)
@@ -355,7 +468,8 @@ fn addressed(uri: &str) -> Addressed {
     Addressed::NoResource
 }
 
-/// The first path segment of a request target, in either of the two forms one arrives in.
+/// The `index`-th path segment of a request target, in either of the two forms one arrives
+/// in, or the empty string where the target carries no such segment.
 ///
 /// Both readings are the shared crate's: the target is reduced to its PATH by the one
 /// reader of a whole request URI (`service_common::uri_path`, which strips the scheme, the
@@ -364,8 +478,8 @@ fn addressed(uri: &str) -> Addressed {
 /// (`/guardrails?maxResults=1`) and the absolute form the AWS SDK sends
 /// (`https://bedrock.<region>.amazonaws.com/guardrails`) read the same, and this crate grows
 /// no private copy of either.
-fn first_path_segment(uri: &str) -> &str {
-    ::service_common::nth_path_segment(::service_common::uri_path(uri), 0).unwrap_or_default()
+fn path_segment(uri: &str, index: usize) -> &str {
+    ::service_common::nth_path_segment(::service_common::uri_path(uri), index).unwrap_or_default()
 }
 
 /// The URI spaces whose operations address a resource of ANY family, named by the request
@@ -985,6 +1099,154 @@ mod tests {
                     "User: {principal} is not authorized to perform: {action}{clause} {reason}"
                 ),
                 "case {case:?}: expected IAM's wording, got {message:?}"
+            );
+        }
+    }
+
+    /// RULE: a request that carries ONE resource's own ARN resource id in its URI is judged
+    /// against that resource, so the id is read off the segment after the space — and only
+    /// where it is spelled as THAT family spells a resource id, never from an ARN label, a
+    /// sub-resource segment, or a label of any other form.
+    #[test]
+    fn a_uri_carrying_a_resource_id_addresses_that_one_resource() {
+        let encoded_arn = "arn%3Aaws%3Abedrock%3Aus-west-2%3A000000000000%3Aguardrail%2Fabc123";
+        /// One row: the case, the request target, and the resource type and id it
+        /// addresses.
+        type Row<'a> = (&'a str, &'a str, Option<(&'a str, &'a str)>);
+        // (case, the request target, the type and id it addresses)
+        let rows: &[Row<'_>] = &[
+            (
+                "a read addressed by a bare guardrail id",
+                "/guardrails/abc123",
+                Some(("guardrail", "abc123")),
+            ),
+            (
+                "the same id with a query string",
+                "/guardrails/abc123?guardrailVersion=DRAFT",
+                Some(("guardrail", "abc123")),
+            ),
+            (
+                "an absolute request target",
+                "https://bedrock.us-west-2.amazonaws.com/guardrails/abc123",
+                Some(("guardrail", "abc123")),
+            ),
+            (
+                "a batch inference job read",
+                "/model-invocation-job/0123456789ab",
+                Some(("model-invocation-job", "0123456789ab")),
+            ),
+            (
+                "a sub-resource of that job",
+                "/model-invocation-job/0123456789ab/stop",
+                Some(("model-invocation-job", "0123456789ab")),
+            ),
+            (
+                "an optimization job read",
+                "/advanced-prompt-optimization-jobs/0123456789ab",
+                Some((
+                    "advanced-prompt-optimization-job",
+                    "0123456789ab",
+                )),
+            ),
+            ("a create, which names no member", "/guardrails", None),
+            ("a listing, which names none either", "/guardrails?maxResults=1", None),
+            (
+                "a label carrying the whole ARN, which the request NAMES instead",
+                &format!("/guardrails/{encoded_arn}"),
+                None,
+            ),
+            (
+                "a label of a form no resource id of the family takes",
+                "/guardrails/Not-An-Id",
+                None,
+            ),
+            (
+                "a label longer than the family's id",
+                &format!("/guardrails/{}", "a".repeat(65)),
+                None,
+            ),
+            (
+                "a label shorter than a fixed-length family's id",
+                "/model-invocation-job/abc",
+                None,
+            ),
+            (
+                "a batch-delete, whose space addresses its targets by the request's body",
+                "/advanced-prompt-optimization-job/batch-delete",
+                None,
+            ),
+            (
+                "a family whose label may be a resource NAME",
+                "/imported-models/my-model",
+                None,
+            ),
+            (
+                "a space holding no resource of this service",
+                "/logging/modelinvocations",
+                None,
+            ),
+        ];
+        for (case, target, expected) in rows {
+            let read = id_addressed_member(target);
+            assert_eq!(
+                read, *expected,
+                "case {case:?}: expected {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// RULE: every space that addresses its resources by their own id is a space of this
+    /// service's own resource families, and the ARN this gate builds from a label is the
+    /// very ARN that family's own builder mints for the same id — so a policy scoped to the
+    /// resource the store holds covers the request that addresses it by id.
+    #[test]
+    fn every_id_addressed_family_builds_the_arn_its_own_resources_carry() {
+        let region = "us-west-2";
+        let id = "0123456789ab";
+        // (the space, the ARN that family's own builder in `crate::state` mints for `id`)
+        let minted: &[(&str, String)] = &[
+            (
+                "advanced-prompt-optimization-jobs",
+                crate::state::advanced_prompt_optimization_job_arn(region, id),
+            ),
+            ("guardrails", crate::state::guardrail_arn(region, id)),
+            (
+                "model-invocation-job",
+                crate::state::model_invocation_job_arn(region, id),
+            ),
+        ];
+        assert_eq!(
+            minted.len(),
+            ID_ADDRESSED_FAMILIES.len(),
+            "every id-addressed family needs a row here, got {} rows for {} families",
+            minted.len(),
+            ID_ADDRESSED_FAMILIES.len()
+        );
+        for (space, arn) in minted {
+            let family = ID_ADDRESSED_FAMILIES
+                .iter()
+                .find(|family| family.space == *space)
+                .expect("the row names an id-addressed family");
+            let Addressed::Family(resource_types) = addressed(&format!("/{space}")) else {
+                panic!("case {space:?}: this space must address a resource family");
+            };
+            assert!(
+                resource_types.contains(&family.resource_type),
+                "case {space:?}: {:?} is none of the family's types {resource_types:?}",
+                family.resource_type
+            );
+            assert!(
+                family.admits_id(id),
+                "case {space:?}: {id:?} must be a resource id of this family"
+            );
+            let built = ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                region,
+                &format!("{}/{id}", family.resource_type),
+            );
+            assert_eq!(
+                &built, arn,
+                "case {space:?}: expected the builder's {arn:?}, got {built:?}"
             );
         }
     }

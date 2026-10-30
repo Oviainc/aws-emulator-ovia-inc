@@ -73,6 +73,8 @@ mod guardrail_timestamp_wire_form;
 mod guardrail_wire_shape;
 #[path = "all/guardrails.rs"]
 mod guardrails;
+#[path = "all/id_addressed_resource_authorization.rs"]
+mod id_addressed_resource_authorization;
 #[path = "all/imported_models.rs"]
 mod imported_models;
 #[path = "all/inference_profile_listing.rs"]
