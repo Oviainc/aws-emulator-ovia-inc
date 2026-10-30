@@ -67,6 +67,8 @@ mod shared_distinct_account_ids;
 mod shared_page_builder;
 #[path = "all/shared_registration_delete.rs"]
 mod shared_registration_delete;
+#[path = "all/shared_supplemental_lifecycle.rs"]
+mod shared_supplemental_lifecycle;
 #[path = "all/shared_trn_settle.rs"]
 mod shared_trn_settle;
 #[path = "all/state_roundtrip.rs"]

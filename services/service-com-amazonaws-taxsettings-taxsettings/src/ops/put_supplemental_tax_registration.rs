@@ -192,37 +192,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_address("taxRegistrationEntry.address", &entry.address)
             .map_err(PutSupplementalTaxRegistrationErrorModeled::ValidationException)?;
 
-        let mut store = state.lock();
-        // The TRN the entry names is the identity of the record: a write of one
-        // the account already holds replaces it under the `authorityId` it was
-        // first stored with, so a repeated write adds nothing. Only a write that
-        // would ADD a record is refused once the store holds as many
-        // supplemental registrations as this emulator keeps resident.
-        let existing = store
-            .find_supplemental_authority(&entry.registration_type, &entry.registration_id);
-        let authority_id = match existing {
-            Some(authority_id) => authority_id,
-            None => {
-                if store.supplemental_registrations.len()
-                    >= crate::state::MAX_STORED_SUPPLEMENTAL_REGISTRATIONS
-                {
-                    return Err(PutSupplementalTaxRegistrationErrorModeled::ConflictException(
-                        crate::state::supplemental_store_full(),
-                    )
-                    .into());
-                }
-                store.mint_supplemental_authority_id()
-            }
-        };
-
-        let stored = crate::state::StoredSupplementalRegistration::from_entry(
-            entry,
-            ::std::time::Instant::now(),
-        );
-        let status = stored.status.clone();
-        store
-            .supplemental_registrations
-            .insert(authority_id.clone(), stored);
+        // The record itself is written by the one state method that stores a
+        // supplemental TRN, which owns the whole write decision — the TRN the
+        // entry names is the record's identity, so a write of one the account
+        // already holds replaces it under the `authorityId` it was first stored
+        // with, and only a write that would ADD a record is refused once the
+        // store is at its resident bound. This handler renders that method's
+        // refusal on its own `ConflictException` channel.
+        let (authority_id, status) = state
+            .lock()
+            .store_supplemental_registration(entry, ::std::time::Instant::now())
+            .map_err(PutSupplementalTaxRegistrationErrorModeled::ConflictException)?;
 
         Ok(PutSupplementalTaxRegistrationOutput {
             authority_id,

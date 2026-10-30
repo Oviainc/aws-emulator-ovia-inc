@@ -967,6 +967,81 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
         format!("supplemental-trn-{:08}", self.minted_authority_ids)
     }
 
+    /// Store `entry` as a supplemental tax registration of the account,
+    /// answering the `authorityId` it is held under and the status it was stored
+    /// with.
+    ///
+    /// The one place a `SupplementalTaxRegistrationEntry` becomes a stored
+    /// record, beside [`Self::store_registration`] and [`Self::store_exemptions`]:
+    /// the add-vs-replace question and the resident bound are decided here, with
+    /// the insert that acts on them, so no writer of a supplemental TRN can
+    /// decide them its own way.
+    ///
+    /// The entry carries no `authorityId`, so the TRN itself — its
+    /// `registrationType` and `registrationId` — is the identity the write
+    /// addresses ([`Self::find_supplemental_authority`]): writing a TRN the store
+    /// already holds REPLACES that record under the id it was first stored with,
+    /// and a TRN the store does not hold yet gets a freshly minted one
+    /// ([`Self::mint_supplemental_authority_id`]).
+    ///
+    /// One refusal, the modelled `ConflictException`: `registrationId` is
+    /// caller-supplied, so a write that would ADD a record is refused once the
+    /// store holds as many supplemental registrations as this emulator keeps
+    /// resident ([`MAX_STORED_SUPPLEMENTAL_REGISTRATIONS`],
+    /// [`supplemental_store_full`]) while rewriting a TRN the store already holds
+    /// adds nothing and is always allowed. A refused write stores nothing and
+    /// mints no id.
+    pub fn store_supplemental_registration(
+        &mut self,
+        entry: &SupplementalTaxRegistrationEntry,
+        written_at: Instant,
+    ) -> Result<(String, String), ConflictException> {
+        let authority_id = match self
+            .find_supplemental_authority(&entry.registration_type, &entry.registration_id)
+        {
+            Some(authority_id) => authority_id,
+            None => {
+                if self.supplemental_registrations.len()
+                    >= MAX_STORED_SUPPLEMENTAL_REGISTRATIONS
+                {
+                    return Err(supplemental_store_full());
+                }
+                self.mint_supplemental_authority_id()
+            }
+        };
+        let stored = StoredSupplementalRegistration::from_entry(entry, written_at);
+        let status = stored.status.clone();
+        self.supplemental_registrations
+            .insert(authority_id.clone(), stored);
+        Ok((authority_id, status))
+    }
+
+    /// Remove the supplemental tax registration `authority_id` names, or answer
+    /// the refusal that delete is refused with.
+    ///
+    /// The one place a stored supplemental record STOPS being one — the
+    /// delete-side counterpart of [`Self::store_supplemental_registration`], as
+    /// [`Self::delete_registration`] is of [`Self::store_registration`]. The
+    /// whole decision lives here: an `authorityId` the store does not hold names
+    /// nothing to delete and is refused ([`invalid_authority_id`]), whatever the
+    /// shape of the id, and nothing else is refused.
+    ///
+    /// A refused delete leaves the store exactly as it was, so a second delete of
+    /// an id already removed meets that same refusal.
+    pub fn delete_supplemental_registration(
+        &mut self,
+        authority_id: &str,
+    ) -> Result<(), ValidationException> {
+        if self
+            .supplemental_registrations
+            .remove(authority_id)
+            .is_none()
+        {
+            return Err(invalid_authority_id());
+        }
+        Ok(())
+    }
+
     /// Mint the id of the support case a `PutTaxExemption` submission opens.
     ///
     /// `caseId` is SERVER-generated (no request member carries one) and the model

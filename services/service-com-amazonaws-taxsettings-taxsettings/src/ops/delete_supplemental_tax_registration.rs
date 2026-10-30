@@ -152,21 +152,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         // The store holds the caller's own account's supplemental registrations
         // (this operation, like the write and the listing, names no account), so
-        // an `authorityId` the store does not hold names nothing to delete.
-        let mut store = state.lock();
-        if store
-            .supplemental_registrations
-            .remove(&input.authority_id)
-            .is_none()
-        {
-            return Err(
-                DeleteSupplementalTaxRegistrationErrorModeled::ValidationException(
-                    crate::state::invalid_authority_id(),
-                )
-                .into(),
-            );
-        }
-        drop(store);
+        // an `authorityId` the store does not hold names nothing to delete. The
+        // one state method that removes a stored supplemental record takes that
+        // whole decision; this handler renders its refusal on its own
+        // `ValidationException` channel.
+        state
+            .lock()
+            .delete_supplemental_registration(&input.authority_id)
+            .map_err(DeleteSupplementalTaxRegistrationErrorModeled::ValidationException)?;
         Ok(DeleteSupplementalTaxRegistrationOutput {})
     }
 }
