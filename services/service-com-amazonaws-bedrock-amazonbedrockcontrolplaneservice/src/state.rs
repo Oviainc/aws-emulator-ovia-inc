@@ -413,6 +413,54 @@ pub fn too_many_tags_message() -> String {
     format!("You can assign a maximum of {MAX_TAGS_PER_RESOURCE} tags to a resource")
 }
 
+/// What a tagging call whose `resourceARN` names no resource of this account answers as its
+/// `ResourceNotFoundException` message.
+///
+/// RECORDED behaviour: Amazon Bedrock names the resource TYPE the value addressed and
+/// nothing else — not the ARN the request carried, not the account — so the sentence tells a
+/// caller WHICH kind of resource is missing, and a caller cannot tell one family's miss from
+/// another's unless the type is in it. The type is the one the ARN itself spells, read
+/// through `service_common::arn` — this crate's ONE ARN parse, which ends a type at either
+/// separator AWS writes a resource with — and narrowed to this service's namespace, since an
+/// ARN of another vendor names no resource of this API. (`TaggableResourcesArn` admits one of
+/// this service's resource types there, or a bare resource NAME,
+/// `smithy_query(query="shape",shape="TaggableResourcesArn")`.) The type is then read as the
+/// noun phrase that opens the sentence: hyphens are spaces and only the first word is
+/// capitalised. A value that spells no type of this service's namespace — a bare NAME, an
+/// ARN of another vendor — names the resource generically.
+#[must_use]
+pub fn tagging_resource_not_found_message(resource_arn: &str) -> String {
+    match ::service_common::arn::parse_of(resource_arn, ARN_NAMESPACE)
+        .map(|arn| arn.resource_type())
+    {
+        Some(resource_type) if !resource_type.is_empty() => {
+            format!("{} not found", resource_type_noun(resource_type))
+        }
+        _ => "Resource not found".to_string(),
+    }
+}
+
+/// A resource type as the noun phrase that OPENS a sentence about it: the type spelled as
+/// words ([`spelled_resource_type`]) with its first word capitalised
+/// (`custom-model-deployment` is "Custom model deployment").
+fn resource_type_noun(resource_type: &str) -> String {
+    let spelled = spelled_resource_type(resource_type);
+    let mut chars = spelled.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => spelled,
+    }
+}
+
+/// An ARN resource type spelled as WORDS: an ARN writes a type as a hyphenated token
+/// (`custom-model`, `model-invocation-job`) and this service's sentences spell it with
+/// spaces. ONE rendering, so the sentences that carry a resource type
+/// ([`tagging_resource_not_found_message`], [`invalid_arn_format_message`]) cannot drift
+/// apart.
+fn spelled_resource_type(resource_type: &str) -> String {
+    resource_type.replace('-', " ")
+}
+
 /// `MarketplaceModelEndpoint$status` — an endpoint Amazon Bedrock Marketplace knows.
 ///
 /// The `Status` enum is `[REGISTERED, INCOMPATIBLE_ENDPOINT]`
@@ -960,6 +1008,17 @@ pub const MAX_CUSTOM_MODELS_PER_ACCOUNT: usize = 100;
 /// [`provisioned_model_not_found_message`] is, so every operation that addresses a custom
 /// model refuses an identifier it cannot resolve to one the same way.
 pub const CUSTOM_MODEL_NOT_FOUND_MESSAGE: &str = "Custom model not found.";
+
+/// What a create whose artifacts are named by a `modelSourceConfig` answers as its
+/// `ValidationException` message when the request names no role Amazon Bedrock can read
+/// those artifacts as.
+///
+/// RECORDED behaviour: the role is what Amazon Bedrock reads the Amazon S3 artifacts as, so
+/// a request that supplies none usable is refused ON THE ROLE — one FIXED sentence saying
+/// the role ARN provided is invalid, quoting neither the member name nor any value — rather
+/// than as a missing member, which would point a caller at the shape of its request instead
+/// of at the role it has to supply.
+pub const INVALID_ROLE_ARN_MESSAGE: &str = "The provided role ARN is invalid.";
 
 /// `ModelCustomizationJobStatus` — the customization job Amazon Bedrock accepted is
 /// training.
@@ -2588,19 +2647,35 @@ pub const BUILD_WORKFLOW_STATUS_FAILED: &str = "FAILED";
 /// sees the status that cancel recorded.
 pub const BUILD_WORKFLOW_CANCELLED_AFTER: Duration = Duration::from_millis(500);
 
-/// What a request addressing a build workflow this store does not hold answers as its
-/// `ResourceNotFoundException` message, wherever that request came from: a read of one, or
-/// the cancel of one.
+/// What an operation ADDRESSED BY a `buildWorkflowId` — the read of a build workflow, its
+/// cancel, its delete — answers as its `ResourceNotFoundException` message when this store
+/// holds no such workflow.
 ///
-/// RECORDED behaviour, and a message with NO variable parts: the corpus
-/// `simparity-behavioral-ga-prod-v1` records Amazon Bedrock naming neither the policy the
-/// request addressed nor the workflow id it carried, so the wording is the whole
-/// requirement and is shared by every operation that addresses the resource — the message
-/// belongs to the RESOURCE, not to one operation.
+/// RECORDED behaviour, and a message with NO variable parts: Amazon Bedrock names neither
+/// the policy the request addressed nor the workflow id it carried, so the wording is the
+/// whole requirement and is shared by every operation that ADDRESSES the resource.
+///
+/// The TEST surface words the same miss differently
+/// ([`REQUEST_BUILD_WORKFLOW_NOT_FOUND`]), as the two guardrail sentences differ
+/// ([`GUARDRAIL_NOT_FOUND`] against [`REQUEST_GUARDRAIL_NOT_FOUND`]): a resource a request
+/// is addressed by and a resource a request NAMES as the subject of other work are reported
+/// by different parts of the service, and each has its own recorded sentence.
 #[must_use]
 pub fn build_workflow_not_found_message() -> &'static str {
     "Build WorkflowExecution not found"
 }
+
+/// What the TEST surface — `StartAutomatedReasoningPolicyTestWorkflow` and
+/// `GetAutomatedReasoningPolicyTestResult`, whose requests NAME the build workflow the tests
+/// are run against — answers as its `ResourceNotFoundException` message when the named
+/// workflow is not there.
+///
+/// RECORDED behaviour, and wholly FIXED: Amazon Bedrock names the resource in the words its
+/// own API spells it with and carries neither the policy ARN nor the id the request sent. It
+/// is a different sentence from the one an operation addressed BY a workflow id answers
+/// ([`build_workflow_not_found_message`]) — the same split the guardrail has — so a caller
+/// learns which half of its request named the missing workflow.
+pub const REQUEST_BUILD_WORKFLOW_NOT_FOUND: &str = "Build workflow not found";
 
 /// What a write to a build workflow whose `lastUpdatedAt` concurrency token is not the one
 /// the stored workflow holds answers as its `ConflictException` message, for the write named
@@ -2608,9 +2683,14 @@ pub fn build_workflow_not_found_message() -> &'static str {
 ///
 /// Worded as this service words that error class for a child resource of an Automated
 /// Reasoning policy ([`automated_reasoning_policy_test_case_conflict_message`]): the
-/// conflict, the write it conflicts with, the resource as its own refusals name it, and then
-/// the id and the policy ARN the REQUEST carried — so the wording is fixed and no instant
-/// appears in it, neither the one the workflow holds nor the one the request submitted.
+/// conflict, the write it conflicts with, the resource, and then the id and the policy ARN
+/// the REQUEST carried — so the wording is fixed and no instant appears in it, neither the
+/// one the workflow holds nor the one the request submitted.
+///
+/// The resource NAME here is the one this conflict refusal carries, and it is not derived
+/// from [`build_workflow_not_found_message`]: the two refusals of this resource are worded
+/// independently, each from its own recording, so the noun in one is no evidence about the
+/// other.
 #[must_use]
 pub fn automated_reasoning_policy_build_workflow_conflict_message(
     action: &str,
@@ -2908,6 +2988,19 @@ pub const AUTOMATED_REASONING_POLICY_TEST_WORKFLOW_IN_PROGRESS: &str =
 /// carrying neither the ARN nor the number — rather than reporting the policy as absent, so
 /// a caller learns the policy is there and the revision it addressed is not.
 pub const AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND: &str = "Policy version does not exist";
+
+/// What a request addressing an Automated Reasoning policy this account holds no record of
+/// answers as its `ResourceNotFoundException` message, wherever that request came from: a
+/// read of the policy, a write of it, a listing of its children, or a call addressing one of
+/// those children.
+///
+/// RECORDED behaviour, and a message with NO variable parts: Amazon Bedrock reports that the
+/// policy is not there and names neither the ARN the request carried nor the account it
+/// looked in, so the wording is the whole requirement and is shared by every operation that
+/// resolves an `AutomatedReasoningPolicyArn` — the message belongs to the RESOURCE, not to
+/// one operation. Worded as its sibling [`AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND`] is,
+/// which reports the missing VERSION of a policy that IS there.
+pub const AUTOMATED_REASONING_POLICY_NOT_FOUND: &str = "Policy does not exist";
 
 /// One stored Automated Reasoning policy test: the identity
 /// `CreateAutomatedReasoningPolicyTestCase` minted, and the sample input and expected
@@ -3936,7 +4029,7 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         if version.is_some() && self.automated_reasoning_policy(base_arn).is_some() {
             AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND.to_string()
         } else {
-            format!("no automated reasoning policy {policy_arn} exists in this account")
+            AUTOMATED_REASONING_POLICY_NOT_FOUND.to_string()
         }
     }
 
@@ -6320,7 +6413,7 @@ pub fn invalid_arn_format_message(value: &str) -> Option<String> {
     let (_, resource_type) = self_validated_arn(value)?;
     // An ARN resource type is a hyphenated token (`custom-model`,
     // `model-invocation-job`); the recorded sentence spells it as words.
-    let words = resource_type.replace('-', " ");
+    let words = spelled_resource_type(resource_type);
     Some(format!("Invalid {words} ARN format"))
 }
 

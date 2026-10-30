@@ -41,7 +41,21 @@
 //!   suffix admits, before and after a version IS cut, beside an ARN whose policy is the
 //!   missing half;
 //! * the test workflow already in progress, and the form that was never submitted: both
-//!   wholly fixed sentences, asserted to carry no part of the request or of the store.
+//!   wholly fixed sentences, asserted to carry no part of the request or of the store;
+//! * the Automated Reasoning policy this account does not hold: EVERY operation that
+//!   resolves an `AutomatedReasoningPolicyArn`, over an id nothing minted, a live policy's
+//!   ARN moved to another region and a versioned ARN whose policy is the missing half, since
+//!   the sentence belongs to the resource rather than to the operation that addressed it;
+//! * the build workflow a policy holds none of: every operation that reports that miss, over
+//!   the id spellings the member admits, each asserted against the sentence ITS surface owns
+//!   — the one an operation addressed by a workflow id answers, and the one the test surface
+//!   answers for a workflow its request names;
+//! * the tagging value that names no resource: one row per resource TYPE
+//!   `TaggableResourcesArn` admits in an ARN, and the bare resource NAME it admits beside
+//!   one, through both tagging operations — the sentence names the TYPE the value spelled;
+//! * the create whose Amazon S3 model source has no role to be read as: Amazon S3 locations
+//!   of several shapes and the optional members that travel beside them, beside the same
+//!   request WITH a role and a model package source that needs none.
 
 use serde_json::{json, Value};
 
@@ -1030,4 +1044,553 @@ async fn a_policy_arn_naming_a_version_that_was_never_cut_reports_the_missing_ve
         "case \"a versioned ARN of a policy nothing created\": the policy is what is missing, \
          got {message:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// 9. The Automated Reasoning policy that is not there, over every operation that addresses
+//    one.
+// ---------------------------------------------------------------------------------------
+
+/// `ResourceNotFoundException` for an `AutomatedReasoningPolicyArn` this account holds no
+/// policy under: the service's own sentence for that class, carrying neither the ARN the
+/// request sent nor the account it looked in.
+const POLICY_NOT_FOUND: &str = "Policy does not exist";
+
+/// An `AutomatedReasoningPolicyTestCaseId` nothing has minted (`^[0-9A-Z]{12}$`) and an
+/// `AutomatedReasoningPolicyBuildWorkflowId` nothing has started (the UUIDv4 form
+/// `^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}$`), so a row
+/// fails on the POLICY rather than on the shape of a child id.
+const UNMINTED_TEST_CASE_ID: &str = "AAAAAAAAAAAA";
+const UNSTARTED_WORKFLOW_ID: &str = "00000000-0000-4000-8000-000000000000";
+
+/// A well-formed `AutomatedReasoningPolicyHash` (`@length(128, 128)`, `^[0-9a-z]{128}$`) for
+/// the member `CreateAutomatedReasoningPolicyVersion` requires: the version is refused on the
+/// policy, which is resolved before any hash is weighed.
+fn well_formed_hash() -> String {
+    "0".repeat(128)
+}
+
+/// Every request this suite drives at `policy_arn`, as
+/// `(operation, method, path, body)` — one row per operation that resolves an
+/// `AutomatedReasoningPolicyArn`, since the sentence belongs to the RESOURCE and not to the
+/// operation that addressed it. `versioned` says whether the ARN carries a `:<version>`
+/// suffix: a write of the DRAFT refuses such an ARN on its own terms ("policyArn must be the
+/// ARN of a draft policy"), so those two rows are driven at the unversioned spellings only.
+fn policy_requests(policy_arn: &str, versioned: bool) -> Vec<(&'static str, &'static str, String, Option<Value>)> {
+    let policy = format!("/automated-reasoning-policies/{}", label(policy_arn));
+    let tests = format!("{policy}/test-cases");
+    let workflows = format!("{policy}/build-workflows");
+    let epoch = at_millis("the epoch", 0);
+    let mut rows: Vec<(&'static str, &'static str, String, Option<Value>)> = vec![
+        ("GetAutomatedReasoningPolicy", "GET", policy.clone(), None),
+        (
+            "ExportAutomatedReasoningPolicyVersion",
+            "GET",
+            format!("{policy}/export"),
+            None,
+        ),
+        (
+            "ListAutomatedReasoningPolicyTestCases",
+            "GET",
+            tests.clone(),
+            None,
+        ),
+        (
+            "CreateAutomatedReasoningPolicyTestCase",
+            "POST",
+            tests.clone(),
+            Some(json!({
+                "guardContent": "a claim to check",
+                "expectedAggregatedFindingsResult": CHECK_RESULTS[0],
+            })),
+        ),
+        (
+            "GetAutomatedReasoningPolicyTestCase",
+            "GET",
+            format!("{tests}/{UNMINTED_TEST_CASE_ID}"),
+            None,
+        ),
+        (
+            "UpdateAutomatedReasoningPolicyTestCase",
+            "PATCH",
+            format!("{tests}/{UNMINTED_TEST_CASE_ID}"),
+            Some(json!({
+                "guardContent": "a rewritten claim",
+                "expectedAggregatedFindingsResult": CHECK_RESULTS[0],
+                "lastUpdatedAt": epoch,
+            })),
+        ),
+        (
+            "DeleteAutomatedReasoningPolicyTestCase",
+            "DELETE",
+            format!(
+                "{tests}/{UNMINTED_TEST_CASE_ID}?updatedAt={}",
+                label(&epoch)
+            ),
+            None,
+        ),
+        (
+            "ListAutomatedReasoningPolicyBuildWorkflows",
+            "GET",
+            workflows.clone(),
+            None,
+        ),
+        (
+            "StartAutomatedReasoningPolicyBuildWorkflow",
+            "POST",
+            format!("{workflows}/{INGEST_CONTENT}/start"),
+            Some(json!({
+                "workflowContent": {
+                    "documents": [{
+                        "document": DOCUMENT_BLOB,
+                        "documentContentType": "txt",
+                        "documentName": "rules.txt",
+                    }],
+                },
+            })),
+        ),
+        (
+            "StartAutomatedReasoningPolicyTestWorkflow",
+            "POST",
+            format!("{workflows}/{UNSTARTED_WORKFLOW_ID}/test-workflows"),
+            Some(json!({})),
+        ),
+        (
+            "GetAutomatedReasoningPolicyTestResult",
+            "GET",
+            format!(
+                "{workflows}/{UNSTARTED_WORKFLOW_ID}/test-cases/{UNMINTED_TEST_CASE_ID}/test-results"
+            ),
+            None,
+        ),
+    ];
+    if !versioned {
+        rows.push((
+            "UpdateAutomatedReasoningPolicy",
+            "PATCH",
+            policy.clone(),
+            Some(json!({ "policyDefinition": definition(1) })),
+        ));
+        rows.push((
+            "CreateAutomatedReasoningPolicyVersion",
+            "POST",
+            format!("{policy}/versions"),
+            Some(json!({ "lastUpdatedDefinitionHash": well_formed_hash() })),
+        ));
+    }
+    rows
+}
+
+#[tokio::test]
+async fn a_policy_this_account_does_not_hold_is_refused_in_one_fixed_sentence() {
+    let emu = emulator();
+
+    // A policy that IS there, so the ARN spellings below are refused for naming no policy
+    // rather than for an empty store — and so the row that moves its ARN to another region
+    // names a policy this account holds in a region it does not.
+    let live = create_policy(&emu, "the live policy").await;
+
+    // The rows differ along what the rule generalises over: which part of a well-formed
+    // `AutomatedReasoningPolicyArn` names nothing — the policy id, the region, or the id of
+    // an ARN that also carries a version suffix.
+    let unminted = format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:automated-reasoning-policy/zzzzzzzzzzzz");
+    let elsewhere = live.replace(REGION, "eu-west-1");
+    let versioned = format!("{unminted}:1");
+    let arns = [
+        ("a policy id nothing minted", unminted.as_str(), false),
+        ("a live policy addressed in another region", elsewhere.as_str(), false),
+        ("the versioned ARN of a policy nothing minted", versioned.as_str(), true),
+    ];
+
+    for (arn_case, policy_arn, is_versioned) in arns {
+        for (operation, method, path, body) in policy_requests(policy_arn, is_versioned) {
+            let case = format!("{operation} / {arn_case}");
+            let reply = emu.call(method, &path, body).await;
+            assert_refusal(
+                &case,
+                &reply,
+                404,
+                "ResourceNotFoundException",
+                POLICY_NOT_FOUND,
+            );
+            // The sentence carries no part of the request: not the ARN it addressed, not
+            // the account inside that ARN.
+            let message = message_of(&reply);
+            assert!(
+                !message.contains(policy_arn) && !message.contains(ACCOUNT),
+                "case {case:?}: the sentence must carry neither the ARN nor the account, got \
+                 {message:?}"
+            );
+        }
+    }
+
+    // The same requests reach the policy that IS there, so every row above was refused for
+    // the ARN it carried rather than for the request it was.
+    let read = read_policy(&emu, &live).await;
+    assert_eq!(
+        read.status, 200,
+        "case \"the live policy\": the read must still answer 200, got {} {:?}",
+        read.status, read.body
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// 10. The tagging ARN that names no resource: the sentence names the resource TYPE.
+// ---------------------------------------------------------------------------------------
+
+/// `POST /tagResource` — `TagResource`, by the `resourceARN` in its body
+/// (`smithy_query(query="operation",operation="TagResource,ListTagsForResource")`).
+async fn tag_resource(emu: &Emulator, resource_arn: &str) -> Reply {
+    emu.call(
+        "POST",
+        "/tagResource",
+        Some(json!({
+            "resourceARN": resource_arn,
+            "tags": [{ "key": "Environment", "value": "production" }],
+        })),
+    )
+    .await
+}
+
+/// `POST /listTagsForResource` — `ListTagsForResource`, by the same value.
+async fn list_tags_for_resource(emu: &Emulator, resource_arn: &str) -> Reply {
+    emu.call(
+        "POST",
+        "/listTagsForResource",
+        Some(json!({ "resourceARN": resource_arn })),
+    )
+    .await
+}
+
+/// The ARN of a resource of type `resource_type` with the resource id `id`, in the region and
+/// account these suites address.
+fn bedrock_arn(resource_type: &str, id: &str) -> String {
+    format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:{resource_type}/{id}")
+}
+
+#[tokio::test]
+async fn a_tagging_arn_that_names_nothing_is_refused_by_the_resource_type_it_spells() {
+    let emu = emulator();
+
+    // A live guardrail, so the rows below are refused for naming nothing rather than
+    // against an empty store.
+    let live_guardrail = emu.create_named("tagging-live").await;
+
+    // One row per resource TYPE `TaggableResourcesArn` admits in an ARN's resource field,
+    // each with the id form that member's pattern spells for it
+    // (`smithy_query(query="shape",shape="TaggableResourcesArn")`) — including the types no
+    // report cited — plus the bare resource NAME the member admits beside an ARN, which
+    // spells no type at all.
+    let missing = "zzzzzzzzzzzz";
+    let rows: Vec<(&str, String, &str)> = vec![
+        ("guardrail", bedrock_arn("guardrail", missing), "Guardrail not found"),
+        (
+            "provisioned-model",
+            bedrock_arn("provisioned-model", missing),
+            "Provisioned model not found",
+        ),
+        (
+            "evaluation-job",
+            bedrock_arn("evaluation-job", missing),
+            "Evaluation job not found",
+        ),
+        (
+            "model-evaluation-job",
+            bedrock_arn("model-evaluation-job", missing),
+            "Model evaluation job not found",
+        ),
+        (
+            "model-import-job",
+            bedrock_arn("model-import-job", missing),
+            "Model import job not found",
+        ),
+        (
+            "imported-model",
+            bedrock_arn("imported-model", missing),
+            "Imported model not found",
+        ),
+        (
+            "custom-model/imported",
+            bedrock_arn("custom-model", &format!("imported/{missing}")),
+            "Custom model not found",
+        ),
+        (
+            "custom-model-deployment",
+            bedrock_arn("custom-model-deployment", missing),
+            "Custom model deployment not found",
+        ),
+        (
+            "model-invocation-job",
+            bedrock_arn("model-invocation-job", missing),
+            "Model invocation job not found",
+        ),
+        (
+            "async-invoke",
+            bedrock_arn("async-invoke", missing),
+            "Async invoke not found",
+        ),
+        (
+            "prompt-router",
+            bedrock_arn("prompt-router", missing),
+            "Prompt router not found",
+        ),
+        (
+            "inference-profile",
+            bedrock_arn("inference-profile", "not-a-profile"),
+            "Inference profile not found",
+        ),
+        (
+            "application-inference-profile",
+            bedrock_arn("application-inference-profile", "not-a-profile"),
+            "Application inference profile not found",
+        ),
+        (
+            "automated-reasoning-policy",
+            bedrock_arn("automated-reasoning-policy", "Missing1"),
+            "Automated reasoning policy not found",
+        ),
+        (
+            "a bare resource name, which spells no type",
+            "unknown-resource-name-0001".to_string(),
+            "Resource not found",
+        ),
+    ];
+
+    for (case, resource_arn, expected) in rows {
+        for (operation, reply) in [
+            ("TagResource", tag_resource(&emu, &resource_arn).await),
+            (
+                "ListTagsForResource",
+                list_tags_for_resource(&emu, &resource_arn).await,
+            ),
+        ] {
+            let case = format!("{operation} / {case}");
+            assert_refusal(&case, &reply, 404, "ResourceNotFoundException", expected);
+            // The sentence names the type and nothing else of the request: no ARN, no
+            // account.
+            let message = message_of(&reply);
+            assert!(
+                !message.contains(&resource_arn) && !message.contains(ACCOUNT),
+                "case {case:?}: the sentence must carry neither the value nor the account, \
+                 got {message:?}"
+            );
+        }
+    }
+
+    // The resource that IS there is still reached by the same request, so every row above
+    // was refused for the value it carried. (`TaggableResourcesArn` is `@length(min: 20)`,
+    // which no 12-character guardrail id reaches, so the ARN is the spelling a tagging call
+    // carries for one.)
+    let listed = list_tags_for_resource(&emu, &bedrock_arn("guardrail", &live_guardrail)).await;
+    assert_eq!(
+        listed.status, 200,
+        "case \"the live guardrail\": ListTagsForResource must answer 200, got {} {:?}",
+        listed.status, listed.body
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// 11. The create whose model source has no role to be read as.
+// ---------------------------------------------------------------------------------------
+
+/// `ValidationException` for a create whose artifacts come from a `modelSourceConfig` and
+/// that names no role Amazon Bedrock can read them as.
+const INVALID_ROLE_ARN: &str = "The provided role ARN is invalid.";
+
+/// A `RoleArn` the member's pattern admits
+/// (`^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`).
+const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/BedrockCustomModelImport";
+
+/// `POST /custom-models/create-custom-model` — `CreateCustomModel`.
+async fn create_custom_model(emu: &Emulator, body: Value) -> Reply {
+    emu.call("POST", "/custom-models/create-custom-model", Some(body))
+        .await
+}
+
+/// A `modelSourceConfig` naming the Amazon S3 artifacts at `uri`
+/// (`smithy_query(query="shape",shape="ModelDataSource,S3DataSource")`).
+fn s3_source(uri: &str) -> Value {
+    json!({ "s3DataSource": { "s3Uri": uri } })
+}
+
+#[tokio::test]
+async fn a_model_source_create_without_a_usable_role_is_refused_on_the_role() {
+    let emu = emulator();
+
+    // The rows differ along what the rule generalises over: the Amazon S3 location the
+    // artifacts are named at and which optional members travel beside it. None of them
+    // names a role, which is what each is refused for.
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "a bucket root",
+            json!({
+                "modelName": "cm-no-role",
+                "modelSourceConfig": s3_source("s3://bedrock-model-artifacts/"),
+            }),
+        ),
+        (
+            "a deep prefix",
+            json!({
+                "modelName": "cm-no-role",
+                "modelSourceConfig": s3_source("s3://bedrock-model-artifacts/a/b/c/model/"),
+            }),
+        ),
+        (
+            "a request carrying tags and a KMS key beside the source",
+            json!({
+                "modelName": "cm-no-role",
+                "modelSourceConfig": s3_source("s3://bedrock-model-artifacts/tagged/"),
+                "modelKmsKeyArn":
+                    "arn:aws:kms:us-west-2:000000000000:key/abcd1234-ab12-cd34-ef56-abcdef123456",
+                "modelTags": [{ "key": "Team", "value": "research" }],
+            }),
+        ),
+        (
+            "a request carrying an idempotency token",
+            json!({
+                "modelName": "cm-no-role",
+                "modelSourceConfig": s3_source("s3://bedrock-model-artifacts/replayable/"),
+                "clientRequestToken": "token0001",
+            }),
+        ),
+    ];
+
+    for (case, body) in rows {
+        let reply = create_custom_model(&emu, body).await;
+        assert_refusal(case, &reply, 400, "ValidationException", INVALID_ROLE_ARN);
+        // The sentence is about the ROLE: it neither names the member that is missing nor
+        // quotes the source the request pointed at.
+        let message = message_of(&reply);
+        assert!(
+            !message.contains("modelSourceConfig") && !message.contains("s3://"),
+            "case {case:?}: the sentence must be about the role alone, got {message:?}"
+        );
+    }
+
+    // The same request WITH a role is admitted, and a model package source needs no role at
+    // all — so the rows above were refused for the role rather than for the source.
+    let with_role = create_custom_model(
+        &emu,
+        json!({
+            "modelName": "cm-with-role",
+            "modelSourceConfig": s3_source("s3://bedrock-model-artifacts/with-role/"),
+            "roleArn": ROLE_ARN,
+        }),
+    )
+    .await;
+    assert_eq!(
+        with_role.status, 202,
+        "case \"the same source with a role\": the create must be accepted, got {} {:?}",
+        with_role.status, with_role.body
+    );
+    let package = create_custom_model(
+        &emu,
+        json!({
+            "modelName": "cm-package",
+            "customModelDataSource": {
+                "modelPackageArnDataSource": {
+                    "modelPackageArn":
+                        "arn:aws:sagemaker:us-west-2:000000000000:model-package/nova-export-1",
+                },
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        package.status, 202,
+        "case \"a model package source\": the create needs no role, got {} {:?}",
+        package.status, package.body
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// 12. The build workflow that is not there: the sentence the surface that reports it owns.
+// ---------------------------------------------------------------------------------------
+
+/// `ResourceNotFoundException` for a build workflow an operation ADDRESSED BY its id — a
+/// read, a cancel, a delete — cannot find.
+const ADDRESSED_BUILD_WORKFLOW_NOT_FOUND: &str = "Build WorkflowExecution not found";
+
+/// `ResourceNotFoundException` for a build workflow a TEST-surface request NAMES as the
+/// subject of the tests it runs or reads. A different sentence of this service from the one
+/// above, as the guardrail a request BODY provides is a different sentence from the one an
+/// operation addressed by a guardrail identifier answers.
+const REQUEST_BUILD_WORKFLOW_NOT_FOUND: &str = "Build workflow not found";
+
+#[tokio::test]
+async fn a_build_workflow_that_is_not_there_is_refused_in_its_surfaces_fixed_sentence() {
+    let emu = emulator();
+    // The policy IS there, so each row is refused for the WORKFLOW rather than for the
+    // policy — the two misses are different sentences of this service.
+    let policy_arn = create_policy(&emu, "workflow-less policy").await;
+    let workflows = format!(
+        "/automated-reasoning-policies/{}/build-workflows",
+        label(&policy_arn)
+    );
+    let epoch = at_millis("the epoch", 0);
+
+    // The rows differ along what the rule generalises over: which operation reports the
+    // miss, which SURFACE that operation belongs to (addressed by the workflow, or naming it
+    // for the tests), and which of the `AutomatedReasoningPolicyBuildWorkflowId` spellings
+    // the member admits the request carries (hyphenated and unhyphenated UUIDv4,
+    // `^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}$`).
+    for (id_case, workflow_id) in [
+        ("the hyphenated form", UNSTARTED_WORKFLOW_ID.to_string()),
+        (
+            "the unhyphenated form",
+            UNSTARTED_WORKFLOW_ID.replace('-', ""),
+        ),
+        ("another id nothing started", "ffffffff-ffff-4fff-bfff-ffffffffffff".to_string()),
+    ] {
+        let rows: Vec<(&str, &str, String, Option<Value>, &str)> = vec![
+            (
+                "GetAutomatedReasoningPolicyBuildWorkflow",
+                "GET",
+                format!("{workflows}/{workflow_id}"),
+                None,
+                ADDRESSED_BUILD_WORKFLOW_NOT_FOUND,
+            ),
+            (
+                "CancelAutomatedReasoningPolicyBuildWorkflow",
+                "POST",
+                format!("{workflows}/{workflow_id}/cancel"),
+                None,
+                ADDRESSED_BUILD_WORKFLOW_NOT_FOUND,
+            ),
+            (
+                "DeleteAutomatedReasoningPolicyBuildWorkflow",
+                "DELETE",
+                format!("{workflows}/{workflow_id}?updatedAt={}", label(&epoch)),
+                None,
+                ADDRESSED_BUILD_WORKFLOW_NOT_FOUND,
+            ),
+            (
+                "StartAutomatedReasoningPolicyTestWorkflow",
+                "POST",
+                format!("{workflows}/{workflow_id}/test-workflows"),
+                Some(json!({})),
+                REQUEST_BUILD_WORKFLOW_NOT_FOUND,
+            ),
+            (
+                "GetAutomatedReasoningPolicyTestResult",
+                "GET",
+                format!(
+                    "{workflows}/{workflow_id}/test-cases/{UNMINTED_TEST_CASE_ID}/test-results"
+                ),
+                None,
+                REQUEST_BUILD_WORKFLOW_NOT_FOUND,
+            ),
+        ];
+        for (operation, method, path, body, expected) in rows {
+            let case = format!("{operation} / {id_case}");
+            let reply = emu.call(method, &path, body).await;
+            assert_refusal(&case, &reply, 404, "ResourceNotFoundException", expected);
+            let message = message_of(&reply);
+            assert!(
+                !message.contains(&workflow_id) && !message.contains(&policy_arn),
+                "case {case:?}: the sentence must carry neither the id nor the policy, got \
+                 {message:?}"
+            );
+        }
+    }
 }

@@ -119,6 +119,12 @@ const PAST_THE_CANCELLATION: Duration = Duration::from_millis(900);
 /// variable part to fill.
 const WORKFLOW_NOT_FOUND_MESSAGE: &str = "Build WorkflowExecution not found";
 
+/// The `ResourceNotFoundException` message a request addressing an Automated Reasoning
+/// policy this account holds none of is answered with — a FIXED text like
+/// [`WORKFLOW_NOT_FOUND_MESSAGE`], naming neither the ARN the request carried nor the
+/// account.
+const POLICY_NOT_FOUND_MESSAGE: &str = "Policy does not exist";
+
 /// The status a cancel answers with: `CancelAutomatedReasoningPolicyBuildWorkflow` carries
 /// no output members and is modelled `@http(code: 202)`
 /// (`smithy_query(query="operation",operation="CancelAutomatedReasoningPolicyBuildWorkflow")`).
@@ -1443,7 +1449,7 @@ async fn a_listing_is_scoped_to_the_policy_it_addresses() {
         );
         assert_eq!(
             refused.text("message"),
-            format!("no automated reasoning policy {policy_arn} exists in this account"),
+            POLICY_NOT_FOUND_MESSAGE,
             "case {case:?}: expected the wording this service answers for a policy it holds \
              none of, got {:?}",
             refused.get("message")

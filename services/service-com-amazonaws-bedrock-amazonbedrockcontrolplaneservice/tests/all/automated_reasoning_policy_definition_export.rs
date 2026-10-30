@@ -42,6 +42,11 @@ const DEFAULT_FORMAT_VERSION: &str = "1";
 /// `GetAutomatedReasoningPolicy` reports the same ARN.
 const VERSION_NOT_FOUND: &str = "Policy version does not exist";
 
+/// What the refusal of an ARN naming no policy of this account says, as every operation
+/// addressed by an `AutomatedReasoningPolicyArn` reports one: a FIXED sentence, carrying
+/// neither the ARN nor the account.
+const POLICY_NOT_FOUND: &str = "Policy does not exist";
+
 async fn create_policy(emu: &Emulator, body: Value) -> Reply {
     emu.call("POST", "/automated-reasoning-policies", Some(body))
         .await
@@ -442,16 +447,12 @@ async fn an_arn_that_names_no_revision_is_refused() {
         (
             "an id nothing minted",
             format!("{prefix}00000000000z"),
-            format!("no automated reasoning policy {prefix}00000000000z exists in this account"),
+            POLICY_NOT_FOUND.to_string(),
         ),
         (
             "the minted id in another region",
             format!("arn:aws:bedrock:eu-west-1:{ACCOUNT}:automated-reasoning-policy/{id}"),
-            format!(
-                "no automated reasoning policy \
-                 arn:aws:bedrock:eu-west-1:{ACCOUNT}:automated-reasoning-policy/{id} exists in \
-                 this account"
-            ),
+            POLICY_NOT_FOUND.to_string(),
         ),
         (
             "the version right past the last one cut",

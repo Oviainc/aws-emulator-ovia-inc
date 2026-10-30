@@ -12,7 +12,9 @@
 //! key it does not carry is added, so repeating a call leaves the resource exactly as the
 //! first one left it and a resource never holds one key twice.
 //!
-//! An ARN naming no resource this account holds is `ResourceNotFoundException`, and a
+//! An ARN naming no resource this account holds is `ResourceNotFoundException`, worded for
+//! the resource TYPE the ARN spells
+//! ([`crate::state::tagging_resource_not_found_message`]), and a
 //! request that would leave the resource carrying more than the 50 tags
 //! `TooManyTagsException` documents is refused in full, before any pair is applied, so a
 //! refused call changes nothing.
@@ -154,9 +156,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(held) = store.resource_tags_mut(&input.resource_arn, &region, now) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no resource {} exists in this account",
-                        input.resource_arn
+                    message: Some(crate::state::tagging_resource_not_found_message(
+                        &input.resource_arn,
                     )),
                 },
             )

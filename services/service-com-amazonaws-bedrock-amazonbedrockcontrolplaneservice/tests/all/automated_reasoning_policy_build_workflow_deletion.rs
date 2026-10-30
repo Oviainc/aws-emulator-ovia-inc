@@ -53,11 +53,17 @@ use crate::support::{
 /// (`@http(code: 202)`).
 const DELETE_ACCEPTED: u16 = 202;
 
-/// The `ResourceNotFoundException` message every request addressing a build workflow the
+/// The `ResourceNotFoundException` message a request ADDRESSED BY a build workflow id the
 /// store does not hold is answered with — the wording Amazon Bedrock answers for that error
 /// class, which names neither the policy nor the id the request carried, so it is a FIXED
 /// text with no variable part to fill.
 const WORKFLOW_NOT_FOUND_MESSAGE: &str = "Build WorkflowExecution not found";
+
+/// The message the TEST surface answers for the same miss, its request NAMING the workflow
+/// whose runs it reads rather than addressing that workflow: a different sentence of this
+/// service, as the guardrail a request BODY provides is a different sentence from the one an
+/// operation addressed by a guardrail identifier answers.
+const REQUEST_WORKFLOW_NOT_FOUND_MESSAGE: &str = "Build workflow not found";
 
 /// A source document's bytes on the wire: `AutomatedReasoningPolicyBuildDocumentBlob` is a
 /// `blob` (`@length(1, 5000000)`), which this protocol carries base64-encoded — this is
@@ -279,9 +285,17 @@ fn assert_accepted(case: &str, reply: &Reply) {
     );
 }
 
-/// Assert `reply` is the modelled 404 a request addressing a build workflow the store does
-/// not hold is refused with, carrying the service's wording for that error class.
+/// Assert `reply` is the modelled 404 a request ADDRESSED BY a build workflow id the store
+/// does not hold is refused with, carrying the service's wording for that error class.
 fn assert_not_found(case: &str, reply: &Reply) {
+    assert_not_found_with(case, reply, WORKFLOW_NOT_FOUND_MESSAGE);
+}
+
+/// Assert `reply` is that same modelled 404 carrying `message` — the sentence of the surface
+/// that reported the miss: a request addressed BY the workflow id answers
+/// [`WORKFLOW_NOT_FOUND_MESSAGE`], and the TEST surface, whose request NAMES the workflow its
+/// runs belong to, answers [`REQUEST_WORKFLOW_NOT_FOUND_MESSAGE`].
+fn assert_not_found_with(case: &str, reply: &Reply, message: &str) {
     assert_eq!(
         (reply.status, reply.error.as_deref()),
         (404, Some("ResourceNotFoundException")),
@@ -291,7 +305,7 @@ fn assert_not_found(case: &str, reply: &Reply) {
     );
     assert_eq!(
         reply.get("message"),
-        json!(WORKFLOW_NOT_FOUND_MESSAGE),
+        json!(message),
         "case {case:?}: the refusal must carry the service's wording for a build workflow it \
          does not hold, got {:?}",
         reply.body
@@ -772,9 +786,10 @@ async fn a_deleted_build_workflow_takes_its_artifacts_with_it() {
     // "Deletes an Automated Reasoning policy build workflow and its associated artifacts":
     // a run is addressed THROUGH the workflow it tested, so it is gone with it.
     for test_case_id in &test_case_ids {
-        assert_not_found(
+        assert_not_found_with(
             &format!("the run of {test_case_id:?} after the delete"),
             &get_test_result(&emu, &policy_arn, &built, test_case_id).await,
+            REQUEST_WORKFLOW_NOT_FOUND_MESSAGE,
         );
     }
 

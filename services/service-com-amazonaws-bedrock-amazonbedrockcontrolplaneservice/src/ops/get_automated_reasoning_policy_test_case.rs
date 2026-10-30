@@ -157,10 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // policy itself matches it; the test is then looked up under that policy, so an id
         // minted under another policy names no test here.
         if store.automated_reasoning_policy(&input.policy_arn).is_none() {
-            return Err(not_found(&format!(
-                "no automated reasoning policy {} exists in this account",
-                input.policy_arn
-            )));
+            return Err(not_found(
+                crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND,
+            ));
         }
         let Some(test_case) =
             store.automated_reasoning_policy_test_case(&input.policy_arn, &input.test_case_id)

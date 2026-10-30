@@ -6,9 +6,10 @@
 //! [`crate::state`]: the identity `CreateAutomatedReasoningPolicy` minted, the description
 //! and KMS key it was created with, the hash of its definition, and the instants it was
 //! created and last written. An ARN this account holds no policy under is answered with
-//! 404 `ResourceNotFoundException`, and so is one naming a VERSION the policy it names has
-//! not cut — which is reported as the missing version rather than as a missing policy
-//! ([`crate::state::AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND`]).
+//! 404 `ResourceNotFoundException`
+//! ([`crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND`]), and so is one naming a VERSION
+//! the policy it names has not cut — which is reported as the missing version rather than as
+//! a missing policy ([`crate::state::AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND`]).
 //!
 //! A pure READ: nothing about a policy is owed a change by the clock, so this writes
 //! nothing.

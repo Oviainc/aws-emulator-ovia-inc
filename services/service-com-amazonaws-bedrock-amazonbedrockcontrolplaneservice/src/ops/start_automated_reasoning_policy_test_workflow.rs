@@ -169,10 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StartAutomatedReasoningPolicyTestWorkflowErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no automated reasoning policy {} exists in this account",
-                            input.policy_arn
-                        )),
+                        message: Some(
+                            crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -189,7 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 StartAutomatedReasoningPolicyTestWorkflowErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::build_workflow_not_found_message().to_string()),
+                        message: Some(
+                            crate::state::REQUEST_BUILD_WORKFLOW_NOT_FOUND.to_string(),
+                        ),
                     },
                 )
                 .into(),

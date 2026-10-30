@@ -156,10 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under that policy, so neither an id of another policy's workflow nor an id of
         // another policy's test names anything here.
         if store.automated_reasoning_policy(&input.policy_arn).is_none() {
-            return Err(not_found(format!(
-                "no automated reasoning policy {} exists in this account",
-                input.policy_arn
-            )));
+            return Err(not_found(
+                crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND.to_string(),
+            ));
         }
         if store
             .automated_reasoning_policy_build_workflow(
@@ -170,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_none()
         {
             return Err(not_found(
-                crate::state::build_workflow_not_found_message().to_string(),
+                crate::state::REQUEST_BUILD_WORKFLOW_NOT_FOUND.to_string(),
             ));
         }
         if store
@@ -227,9 +226,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// of that test this store holds none of — a result is addressed by the TRIPLE, so every
 /// one of the four is "the resource was not found".
 ///
-/// The wording for a missing build workflow is the service's own for that resource
-/// ([`crate::state::build_workflow_not_found_message`]), and the wording for a missing test
-/// is the service's own for THAT resource
+/// The wording for a build workflow this request NAMES is the test surface's own for that
+/// miss ([`crate::state::REQUEST_BUILD_WORKFLOW_NOT_FOUND`], shared with the start of a test
+/// workflow), and the wording for a missing test is the service's own for THAT resource
 /// ([`crate::state::automated_reasoning_policy_test_case_not_found_message`]), so a request
 /// addressing either gets the same message wherever it came from.
 fn not_found(message: String) -> GetAutomatedReasoningPolicyTestResultError {

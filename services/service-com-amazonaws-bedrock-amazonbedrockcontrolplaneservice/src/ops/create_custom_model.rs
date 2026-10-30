@@ -19,7 +19,9 @@
 //!   with 400 `ValidationException`;
 //! * `roleArn` "is required when you use `modelSourceConfig` with an Amazon S3 data
 //!   source. It is not required when you use `customModelDataSource` with a model package
-//!   ARN", so the role is demanded exactly where the member says it is;
+//!   ARN", so the role is demanded exactly where the member says it is, and a request
+//!   naming none usable there is refused on the ROLE
+//!   ([`crate::state::INVALID_ROLE_ARN_MESSAGE`]);
 //! * "The Amazon S3 URI in the model source must be for the Amazon-managed Amazon S3
 //!   bucket containing your model artifacts", so a model source naming a bucket the
 //!   ACCOUNT holds does not satisfy the member's pre-condition and is refused with 400
@@ -267,16 +269,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             // `roleArn` "is required when you use modelSourceConfig with an Amazon S3 data
-            // source", because Amazon Bedrock reads that bucket as the caller; with a
-            // model package source it uses its own credentials and needs no role.
+            // source", because Amazon Bedrock reads that bucket AS the role; with a model
+            // package source it uses its own credentials and needs no role. A request that
+            // names no usable role for the artifacts it points at is refused on the ROLE,
+            // in the words this service refuses a role ARN it cannot use with.
             (Some(_), None) if input.role_arn.is_none() => {
                 return Err(CreateCustomModelErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(
-                            "roleArn is required when the model artifacts are named by \
-                             modelSourceConfig"
-                                .to_string(),
-                        ),
+                        message: Some(crate::state::INVALID_ROLE_ARN_MESSAGE.to_string()),
                     },
                 )
                 .into());

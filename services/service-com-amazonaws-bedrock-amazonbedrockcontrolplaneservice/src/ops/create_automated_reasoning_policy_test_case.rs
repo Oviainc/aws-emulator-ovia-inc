@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // matches it, so an ARN of another region — and a versioned ARN of a version
         // nothing has minted — names no policy this account holds.
         if store.automated_reasoning_policy(&input.policy_arn).is_none() {
-            return Err(not_found(&input.policy_arn));
+            return Err(not_found());
         }
 
         // `@idempotencyToken`: a replay answers with what the first request minted.
@@ -261,12 +261,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The modelled 404 this operation answers for a `policyArn` this account holds no policy
 /// under — the test is created UNDER a policy, so there is nothing to create one on.
-fn not_found(policy_arn: &str) -> CreateAutomatedReasoningPolicyTestCaseError {
+fn not_found() -> CreateAutomatedReasoningPolicyTestCaseError {
     CreateAutomatedReasoningPolicyTestCaseErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(format!(
-                "no automated reasoning policy {policy_arn} exists in this account"
-            )),
+            message: Some(crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND.to_string()),
         },
     )
     .into()

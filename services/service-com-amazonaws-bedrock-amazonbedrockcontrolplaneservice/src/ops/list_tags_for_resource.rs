@@ -9,7 +9,8 @@
 //! had already made due changes here.
 //!
 //! A resource carrying no tags is an EMPTY list, not an absent one; an ARN naming no
-//! resource this account holds is `ResourceNotFoundException`.
+//! resource this account holds is `ResourceNotFoundException`, worded for the resource TYPE
+//! the ARN spells ([`crate::state::tagging_resource_not_found_message`]).
 //!
 //! The one resolution of a tagging ARN lives in `crate::state` (`tagged_resource`), shared
 //! with `ops/tag_resource.rs`.
@@ -146,9 +147,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(tags) = store.resource_tags(&input.resource_arn, &region, now) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no resource {} exists in this account",
-                        input.resource_arn
+                    message: Some(crate::state::tagging_resource_not_found_message(
+                        &input.resource_arn,
                     )),
                 },
             )

@@ -169,10 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing has minted — names no policy this account holds, and a test hangs off
         // the policy it was created under.
         if store.automated_reasoning_policy(&input.policy_arn).is_none() {
-            return Err(not_found(format!(
-                "no automated reasoning policy {} exists in this account",
-                input.policy_arn
-            )));
+            return Err(not_found(
+                crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND.to_string(),
+            ));
         }
 
         // "This operation is idempotent; if you delete a test more than once, each call

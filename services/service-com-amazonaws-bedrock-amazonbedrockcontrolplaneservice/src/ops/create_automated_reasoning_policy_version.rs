@@ -221,9 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateAutomatedReasoningPolicyVersionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no automated reasoning policy {base_arn} exists in this account"
-                        )),
+                        message: Some(
+                            crate::state::AUTOMATED_REASONING_POLICY_NOT_FOUND.to_string(),
+                        ),
                     },
                 )
                 .into(),

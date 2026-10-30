@@ -99,11 +99,13 @@ const PAST_THE_CANCELLATION: Duration = Duration::from_millis(900);
 /// owes it, for the same reason [`PAST_THE_BUILD`] is long enough for a build.
 const PAST_THE_TEST_RUN: Duration = Duration::from_millis(900);
 
-/// The `ResourceNotFoundException` message a request addressing a build workflow nothing
-/// holds is answered with — the wording Amazon Bedrock answers for that error class, which
-/// names neither the policy nor the id the request carried, so it is a FIXED text with no
-/// variable part to fill.
-const WORKFLOW_NOT_FOUND_MESSAGE: &str = "Build WorkflowExecution not found";
+/// The `ResourceNotFoundException` message the TEST surface answers for a build workflow a
+/// request NAMES that nothing holds — the wording Amazon Bedrock answers for that error
+/// class, which names neither the policy nor the id the request carried, so it is a FIXED
+/// text with no variable part to fill. It is not the sentence an operation ADDRESSED BY a
+/// workflow id answers (a read, a cancel, a delete): those are different parts of the
+/// service, each with its own recorded wording.
+const WORKFLOW_NOT_FOUND_MESSAGE: &str = "Build workflow not found";
 
 /// A `AutomatedReasoningPolicyBuildWorkflowId` nothing in a fresh store has started: the
 /// hyphenated UUIDv4 form the member's pattern spells
