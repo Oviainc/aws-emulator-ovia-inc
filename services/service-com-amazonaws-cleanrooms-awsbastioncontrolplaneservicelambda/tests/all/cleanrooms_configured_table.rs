@@ -35,11 +35,11 @@ pub(crate) const ALL_TABLE_REFERENCE_TYPES: [&str; 4] =
 pub(crate) const ALL_ANALYSIS_METHODS: [&str; 3] = ["DIRECT_QUERY", "DIRECT_JOB", "MULTIPLE"];
 
 /// Every `SelectedAnalysisMethod` the model declares (shape `SelectedAnalysisMethod`).
-const ALL_SELECTED_ANALYSIS_METHODS: [&str; 2] = ["DIRECT_QUERY", "DIRECT_JOB"];
+pub(crate) const ALL_SELECTED_ANALYSIS_METHODS: [&str; 2] = ["DIRECT_QUERY", "DIRECT_JOB"];
 
 /// `CreateConfiguredTableInput$selectedAnalysisMethods`: "When configured, you must
 /// specify at least two analysis methods."
-const MIN_SELECTED_ANALYSIS_METHODS: usize = 2;
+pub(crate) const MIN_SELECTED_ANALYSIS_METHODS: usize = 2;
 
 /// The published maximum length of `ConfiguredTableArn` (model shape
 /// `ConfiguredTableArn`, len ..100).
@@ -48,7 +48,7 @@ const MAX_CONFIGURED_TABLE_ARN_LEN: usize = 100;
 /// A `TableReference` for one member of the union, built to the model's patterns for
 /// that member's shape. `table_type` is the `TableReferenceType` the service must report
 /// for it.
-fn table_reference(table_type: &str) -> Value {
+pub(crate) fn table_reference(table_type: &str) -> Value {
     match table_type {
         // `GlueTableReference`: tableName/databaseName, region from `CommercialRegion`.
         "GLUE" => json!({

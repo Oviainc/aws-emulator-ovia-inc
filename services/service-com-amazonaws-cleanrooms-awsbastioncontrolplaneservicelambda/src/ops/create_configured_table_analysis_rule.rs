@@ -10,13 +10,18 @@
 //! identifier resolves to, and `createTime` / `updateTime` are the creation instant. The
 //! caller decides only the rule's `type` and its `policy`.
 //!
-//! The two rules the model cannot express are enforced here with the errors the
+//! The three rules the model cannot express are enforced here with the errors the
 //! operation declares:
 //!
 //! * each member of the `ConfiguredTableAnalysisRulePolicyV1` union is the policy of
 //!   exactly one rule type, so a request whose `analysisRuleType` names another type is a
 //!   `ValidationException`
 //!   (`crate::state::configured_table_analysis_rule_policy_type`);
+//! * the table's `allowedColumns` are "the columns of the underlying table that can be
+//!   used by collaborations or analysis rules", so a policy naming a column the stored
+//!   table does not expose is a `ValidationException` too
+//!   (`crate::state::analysis_rule_columns_outside_allowed`) — the same rule
+//!   `UpdateConfiguredTable` keeps when it narrows that list;
 //! * "Currently, only one analysis rule can be created for a given configured table", so
 //!   a create against a table that already holds one is a `ConflictException` with reason
 //!   `ALREADY_EXISTS`
@@ -207,6 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let configured_table_id = table.id.clone();
         let configured_table_arn = table.arn.clone();
+        let table_allowed_columns = table.allowed_columns.clone();
 
         // Each member of the policy union carries the policy of exactly one analysis rule
         // type, so an `analysisRuleType` naming another type is a combination the model
@@ -228,6 +234,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 "must carry the policy of analysisRuleType {}",
                                 input.analysis_rule_type
                             ),
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A policy may only name columns the table exposes: `allowedColumns` are "the
+        // columns of the underlying table that can be used by collaborations or analysis
+        // rules", so a rule over any other column describes data the table does not offer.
+        let outside = st::analysis_rule_columns_outside_allowed(
+            &input.analysis_rule_policy,
+            &table_allowed_columns,
+        );
+        if !outside.is_empty() {
+            let listed = outside.join(", ");
+            let detail = format!(
+                "Cannot create a {} analysis rule that references columns outside the configured \
+                 table's allowedColumns: {listed}",
+                input.analysis_rule_type
+            );
+            return Err(
+                CreateConfiguredTableAnalysisRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(detail.clone()),
+                        reason: Some(st::VALIDATION_REASON_INVALID_CONFIGURATION.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "analysisRulePolicy".to_string(),
+                            message: detail,
                         }]),
                     },
                 )

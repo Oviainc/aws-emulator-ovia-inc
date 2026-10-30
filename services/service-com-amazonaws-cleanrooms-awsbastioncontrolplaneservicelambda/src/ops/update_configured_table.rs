@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfiguredTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfiguredTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfiguredTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! `UpdateConfiguredTable` is a PATCH over the stored `ConfiguredTable`: every member the
+//! request carries replaces the stored one, every member it omits leaves the stored value
+//! untouched, and `updateTime` is restamped on each successful call
+//! (`ConfiguredTable$updateTime`: "The time the configured table was last updated"). The
+//! members the SERVICE decides stay the service's: `id`, `arn` and `createTime` never
+//! move, `tableType` is recomputed from the stored `TableReference` variant
+//! (`crate::state::table_reference_type`) whenever the reference changes, and
+//! `analysisRuleTypes` is owned by the analysis-rule operations. The response is the
+//! stored record read back, so `GetConfiguredTable` reports exactly what this call
+//! persisted.
+//!
+//! The two rules the model cannot express are enforced here with the modelled
+//! `ValidationException`:
+//!
+//! * `selectedAnalysisMethods`, "when configured, you must specify at least two analysis
+//!   methods" (`crate::state::MIN_SELECTED_ANALYSIS_METHODS`) — documented on the same
+//!   member of `CreateConfiguredTable`, which enforces it on the same resource;
+//! * `allowedColumns` are "the columns of the underlying table that can be used by
+//!   collaborations or analysis rules", so the list this call leaves on the table must
+//!   still carry every column its stored analysis rule references
+//!   (`crate::state::analysis_rule_columns_outside_allowed`) — a narrowed list that drops
+//!   one is refused, and one that drops only columns no rule names is accepted.
+//!
+//! Both are judged against the resource this call would LEAVE behind, so a request that
+//! omits a member is judged against the stored value of that member.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +185,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfiguredTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfiguredTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfiguredTable"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(UpdateConfiguredTableErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let table_id = input.configured_table_identifier;
+
+        // `SelectedAnalysisMethods` carries no length constraint in the model, so the
+        // boundary validator cannot refuse a one-method list: the documented minimum is
+        // enforced here, on the number of DISTINCT methods the list configures.
+        if let Some(selected) = input.selected_analysis_methods.as_deref() {
+            let distinct = st::distinct_selected_analysis_methods(selected);
+            if distinct < st::MIN_SELECTED_ANALYSIS_METHODS {
+                return Err(UpdateConfiguredTableErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "selectedAnalysisMethods must specify at least {} analysis methods, got {distinct}",
+                            st::MIN_SELECTED_ANALYSIS_METHODS
+                        )),
+                        reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "selectedAnalysisMethods".to_string(),
+                            message: format!(
+                                "when configured, you must specify at least {} analysis methods",
+                                st::MIN_SELECTED_ANALYSIS_METHODS
+                            ),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        let Some(stored) = store.configured_tables.get(&table_id) else {
+            return Err(
+                UpdateConfiguredTableErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("configured table {table_id} not found"),
+                        resource_id: table_id,
+                        resource_type: st::RESOURCE_TYPE_CONFIGURED_TABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `allowedColumns` are "the columns of the underlying table that can be used by
+        // collaborations or analysis rules", so every column an analysis rule names has to
+        // be one of them: a narrowed list that no longer carries a column the table's
+        // stored analysis rule references would leave that rule naming columns the table
+        // does not expose, and is refused. The check is against the list this call would
+        // LEAVE on the table, so a request that omits the member is judged against the
+        // stored one and a request that keeps every referenced column is accepted,
+        // whichever other columns it drops.
+        let allowed_columns = input
+            .allowed_columns
+            .clone()
+            .unwrap_or_else(|| stored.allowed_columns.clone());
+        if let Some(rule) = store.analysis_rule_of_configured_table(&table_id) {
+            let rule_type = rule.r#type.clone();
+            let outside = st::analysis_rule_columns_outside_allowed(&rule.policy, &allowed_columns);
+            if !outside.is_empty() {
+                let listed = outside.join(", ");
+                let detail = format!(
+                    "Cannot remove columns from allowedColumns while the {rule_type} analysis \
+                     rule of configured table {table_id} references them: {listed}"
+                );
+                return Err(UpdateConfiguredTableErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(detail.clone()),
+                        reason: Some(st::VALIDATION_REASON_INVALID_CONFIGURATION.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "allowedColumns".to_string(),
+                            message: detail,
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(table) = store.configured_tables.get_mut(&table_id) else {
+            return Err(UpdateConfiguredTableErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("configured table {table_id} was not persisted")),
+                },
+            )
+            .into());
+        };
+
+        if let Some(name) = input.name {
+            table.name = name;
+        }
+        if let Some(description) = input.description {
+            table.description = Some(description);
+        }
+        if let Some(table_reference) = input.table_reference {
+            // `tableType` describes the reference the table points at, so it moves with
+            // the reference rather than staying on the variant the create carried.
+            table.table_type = Some(st::table_reference_type(&table_reference).to_string());
+            table.table_reference = table_reference;
+        }
+        if let Some(allowed_columns) = input.allowed_columns {
+            table.allowed_columns = allowed_columns;
+        }
+        if let Some(analysis_method) = input.analysis_method {
+            table.analysis_method = analysis_method;
+        }
+        if let Some(selected_analysis_methods) = input.selected_analysis_methods {
+            table.selected_analysis_methods = Some(selected_analysis_methods);
+        }
+        table.update_time = st::now();
+
+        // Answer from the store, so the response is the persisted resource rather than a
+        // value computed beside it.
+        Ok(UpdateConfiguredTableOutput {
+            configured_table: table.clone(),
+        })
     }
 }

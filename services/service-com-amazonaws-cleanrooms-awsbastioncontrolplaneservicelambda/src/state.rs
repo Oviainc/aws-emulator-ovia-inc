@@ -1954,6 +1954,78 @@ pub fn configured_table_analysis_rule_policy_type(
     }
 }
 
+/// The columns a configured table's analysis rule policy references that the table's
+/// `allowedColumns` do NOT contain, each named once, in the order the policy names them.
+///
+/// `allowedColumns` is documented as "the columns of the underlying table that can be
+/// used by collaborations or analysis rules", so every column an analysis rule names has
+/// to be one of them: this is what the analysis-rule and configured-table operations
+/// refuse a policy, or a narrowed column list, by. The answer is empty for a consistent
+/// pair, so an empty list is what "nothing to refuse" looks like.
+pub fn analysis_rule_columns_outside_allowed(
+    policy: &ConfiguredTableAnalysisRulePolicy,
+    allowed_columns: &[String],
+) -> Vec<String> {
+    let allowed: HashSet<&str> = allowed_columns.iter().map(String::as_str).collect();
+    let mut outside = Vec::new();
+    let mut seen = HashSet::new();
+    for column in analysis_rule_referenced_columns(policy) {
+        if !allowed.contains(column.as_str()) && seen.insert(column.clone()) {
+            outside.push(column);
+        }
+    }
+    outside
+}
+
+/// Every column name a configured table's analysis rule policy references, member by
+/// member of the policy union the rule carries.
+///
+/// One arm per member of `ConfiguredTableAnalysisRulePolicyV1`, and within each arm every
+/// member whose target is a column name: `AnalysisRuleList`'s `joinColumns` and
+/// `listColumns`; `AnalysisRuleAggregation`'s `aggregateColumns[].columnNames`,
+/// `joinColumns`, `dimensionColumns` and `outputConstraints[].columnName`;
+/// `AnalysisRuleCustom`'s `disallowedOutputColumns` and
+/// `differentialPrivacy.columns[].name`. A member that names an analysis, a function, a
+/// provider account or a threshold names no column and is not collected.
+fn analysis_rule_referenced_columns(policy: &ConfiguredTableAnalysisRulePolicy) -> Vec<String> {
+    let ConfiguredTableAnalysisRulePolicy::V1(v1) = policy;
+    match v1 {
+        ConfiguredTableAnalysisRulePolicyV1::List(list) => list
+            .join_columns
+            .iter()
+            .chain(list.list_columns.iter())
+            .cloned()
+            .collect(),
+        ConfiguredTableAnalysisRulePolicyV1::Aggregation(aggregation) => aggregation
+            .aggregate_columns
+            .iter()
+            .flat_map(|aggregate| aggregate.column_names.iter())
+            .chain(aggregation.join_columns.iter())
+            .chain(aggregation.dimension_columns.iter())
+            .cloned()
+            .chain(
+                aggregation
+                    .output_constraints
+                    .iter()
+                    .map(|constraint| constraint.column_name.clone()),
+            )
+            .collect(),
+        ConfiguredTableAnalysisRulePolicyV1::Custom(custom) => custom
+            .disallowed_output_columns
+            .iter()
+            .flatten()
+            .cloned()
+            .chain(
+                custom
+                    .differential_privacy
+                    .iter()
+                    .flat_map(|privacy| privacy.columns.iter())
+                    .map(|column| column.name.clone()),
+            )
+            .collect(),
+    }
+}
+
 /// How many DISTINCT analysis methods a `selectedAnalysisMethods` list configures.
 ///
 /// The list is a set of enum values, so a method repeated in the request still

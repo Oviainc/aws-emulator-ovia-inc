@@ -37,7 +37,7 @@ use super::cleanrooms_configured_table::{
 /// Every `ConfiguredTableAnalysisRuleType` the model declares (shape
 /// `ConfiguredTableAnalysisRuleType`: AGGREGATION | LIST | CUSTOM), which is also one per
 /// member of the `ConfiguredTableAnalysisRulePolicyV1` union.
-const ALL_ANALYSIS_RULE_TYPES: [&str; 3] = ["AGGREGATION", "LIST", "CUSTOM"];
+pub(crate) const ALL_ANALYSIS_RULE_TYPES: [&str; 3] = ["AGGREGATION", "LIST", "CUSTOM"];
 
 /// Every `AggregateFunctionName` the model declares (shape `AggregateFunctionName`).
 const ALL_AGGREGATE_FUNCTIONS: [&str; 5] = ["SUM", "SUM_DISTINCT", "COUNT", "COUNT_DISTINCT", "AVG"];
@@ -107,7 +107,7 @@ fn analysis_rule_policy(rule_type: &str, row: usize) -> Value {
 }
 
 impl Emulator {
-    async fn create_analysis_rule(
+    pub(crate) async fn create_analysis_rule(
         &self,
         configured_table_id: &str,
         rule_type: &str,
@@ -121,7 +121,7 @@ impl Emulator {
         .await
     }
 
-    async fn get_analysis_rule(&self, configured_table_id: &str, rule_type: &str) -> (u16, Value) {
+    pub(crate) async fn get_analysis_rule(&self, configured_table_id: &str, rule_type: &str) -> (u16, Value) {
         self.call(
             "GET",
             &format!("/configuredTables/{configured_table_id}/analysisRule/{rule_type}"),

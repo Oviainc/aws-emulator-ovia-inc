@@ -35,6 +35,8 @@ mod collaboration_change_requests;
 mod configured_table_analysis_rules;
 #[path = "all/configured_table_associations.rs"]
 mod configured_table_associations;
+#[path = "all/configured_table_updates.rs"]
+mod configured_table_updates;
 #[path = "all/membership_creation_and_departure.rs"]
 mod membership_creation_and_departure;
 #[path = "all/membership_updates.rs"]
