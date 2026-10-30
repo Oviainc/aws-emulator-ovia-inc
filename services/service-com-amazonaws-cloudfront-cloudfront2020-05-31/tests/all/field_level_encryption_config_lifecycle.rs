@@ -163,9 +163,9 @@ impl QueryArgMapping {
 /// One `ContentTypeProfile`, as a client submits it.
 #[derive(Debug, Clone)]
 pub(crate) struct ContentTypeMapping {
-    content_type: String,
+    pub(crate) content_type: String,
     /// `ProfileId`, or `None` to leave the optional member out entirely.
-    profile_id: Option<String>,
+    pub(crate) profile_id: Option<String>,
 }
 
 impl ContentTypeMapping {
@@ -215,7 +215,7 @@ impl ContentTypeMapping {
 /// mappings.
 #[derive(Debug, Clone)]
 pub(crate) struct Section<M> {
-    forward_when_unknown: bool,
+    pub(crate) forward_when_unknown: bool,
     /// `None` leaves the wrapper out entirely — an absent wrapper states no quantity at all.
     pub(crate) mappings: Option<Vec<M>>,
     /// The `Quantity` the request STATES, when it is not the number of mappings carried.
