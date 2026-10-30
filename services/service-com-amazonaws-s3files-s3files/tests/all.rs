@@ -15,6 +15,8 @@
 mod access_point_listing;
 #[path = "all/create_file_system_bucket_must_exist.rs"]
 mod create_file_system_bucket_must_exist;
+#[path = "all/creation_token_single_use.rs"]
+mod creation_token_single_use;
 #[path = "all/file_system_lifecycle.rs"]
 mod file_system_lifecycle;
 #[path = "all/file_system_policy.rs"]

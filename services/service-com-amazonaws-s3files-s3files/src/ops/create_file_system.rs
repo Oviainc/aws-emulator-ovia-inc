@@ -6,8 +6,10 @@
 //! record, so what this returns is exactly what `GetFileSystem` and `ListFileSystems`
 //! read back.
 //!
-//! `clientToken` is an `@idempotencyToken`: a second call carrying the same token
-//! returns the file system the first one created rather than minting another. A new
+//! `clientToken` targets `CreationToken`: it is a SINGLE-USE creation guard, so once a
+//! successful create has consumed a token, a later create carrying it is refused with
+//! the modelled 409 `ConflictException` naming the file system that holds it
+//! ([`crate::state::creation_token_in_use`]) instead of minting a second one. A new
 //! file system is reported `creating` and the clock owes it `available`
 //! ([`crate::state::PROVISIONING_SPAN`]).
 //!
@@ -217,6 +219,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // `clientToken` targets `CreationToken`: a creation token is consumed by the
+        // create that succeeds under it, so a later create carrying the same token is a
+        // conflict with the file system that already holds it, not a replay of it and
+        // not a second create. The refusal names that file system — in `resourceId` and
+        // in the sentence — so a caller that lost the first response recovers the id it
+        // is already provisioning against. A caller that sent no token gets one minted,
+        // which no earlier create can have consumed, so the creation is still recorded
+        // under a token without ever colliding.
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.mint_client_token(),
+        };
+        if let Some(owner) = store.creation_token_owner(Self::NAME, &client_token) {
+            return Err(CreateFileSystemErrorModeled::ConflictException(
+                crate::state::creation_token_in_use(&owner),
+            )
+            .into());
+        }
+
         // Caller-driven growth needs a ceiling, and this operation models the quota
         // error for refusing past one. See `state::MAX_FILE_SYSTEMS`.
         if store.file_systems.len() >= crate::state::MAX_FILE_SYSTEMS {
@@ -229,55 +250,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `clientToken` is an @idempotencyToken: a replay returns the file system the
-        // first request minted instead of creating a second one. A caller that sent
-        // none gets one minted, so the creation is still recorded under a token.
-        let client_token = match input.client_token {
-            Some(token) => token,
-            None => store.mint_client_token(),
+        let file_system_id = store.mint_file_system_id();
+        let sequence = store.next_sequence();
+        let tags = input.tags.unwrap_or_default();
+        let record = crate::state::FileSystem {
+            file_system_arn: crate::state::file_system_arn(&region, &file_system_id),
+            file_system_id: file_system_id.clone(),
+            bucket: input.bucket,
+            // `prefix` carries @default(""): a caller that named none scopes the file
+            // system to the whole bucket.
+            prefix: input.prefix.unwrap_or_default(),
+            kms_key_id: input.kms_key_id,
+            role_arn: input.role_arn,
+            owner_id: ::engine::emulator_account_id().to_string(),
+            // A new file system is not usable yet: the clock owes it `available`.
+            status: crate::state::STATUS_CREATING.to_string(),
+            status_message: None,
+            creation_time: now,
+            available_due_at: now + crate::state::PROVISIONING_SPAN,
+            client_token: Some(client_token.clone()),
+            name: crate::state::name_from_tags(&tags),
+            tags,
+            // A new file system carries no resource policy until
+            // `PutFileSystemPolicy` attaches one.
+            policy: None,
+            // Nor any synchronization configuration until
+            // `PutSynchronizationConfiguration` creates one.
+            synchronization: None,
+            sequence,
         };
-        let replayed = store
-            .replayed_id(Self::NAME, Some(client_token.as_str()))
-            .filter(|id| store.file_systems.contains_key(id));
-
-        let file_system_id = match replayed {
-            Some(file_system_id) => file_system_id,
-            None => {
-                let file_system_id = store.mint_file_system_id();
-                let sequence = store.next_sequence();
-                let tags = input.tags.unwrap_or_default();
-                let record = crate::state::FileSystem {
-                    file_system_arn: crate::state::file_system_arn(&region, &file_system_id),
-                    file_system_id: file_system_id.clone(),
-                    bucket: input.bucket,
-                    // `prefix` carries @default(""): a caller that named none scopes
-                    // the file system to the whole bucket.
-                    prefix: input.prefix.unwrap_or_default(),
-                    kms_key_id: input.kms_key_id,
-                    role_arn: input.role_arn,
-                    owner_id: ::engine::emulator_account_id().to_string(),
-                    // A new file system is not usable yet: the clock owes it
-                    // `available`.
-                    status: crate::state::STATUS_CREATING.to_string(),
-                    status_message: None,
-                    creation_time: now,
-                    available_due_at: now + crate::state::PROVISIONING_SPAN,
-                    client_token: Some(client_token.clone()),
-                    name: crate::state::name_from_tags(&tags),
-                    tags,
-                    // A new file system carries no resource policy until
-                    // `PutFileSystemPolicy` attaches one.
-                    policy: None,
-                    // Nor any synchronization configuration until
-                    // `PutSynchronizationConfiguration` creates one.
-                    synchronization: None,
-                    sequence,
-                };
-                store.file_systems.insert(file_system_id.clone(), record);
-                store.remember_client_token(Self::NAME, &client_token, &file_system_id);
-                file_system_id
-            }
-        };
+        store.file_systems.insert(file_system_id.clone(), record);
+        // The token is now consumed: it names this file system until the file system is
+        // deleted, and every later create carrying it is refused above.
+        store.remember_client_token(Self::NAME, &client_token, &file_system_id);
 
         // Answer from the stored record, so the response cannot drift from what a later
         // GetFileSystem / ListFileSystems reads.

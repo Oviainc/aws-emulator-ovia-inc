@@ -375,6 +375,16 @@ impl ComAmazonawsS3filesS3filesState {
         self.client_tokens.get(&token_key(scope, token)).cloned()
     }
 
+    /// The file system a previous request recorded under this creation token in this
+    /// `scope`, when that file system is still held.
+    ///
+    /// A record naming a file system this store no longer holds cannot name a conflict:
+    /// the token is free again, exactly as it is once the record has been evicted.
+    pub fn creation_token_owner(&self, scope: &str, client_token: &str) -> Option<String> {
+        self.replayed_id(scope, Some(client_token))
+            .filter(|id| self.file_systems.contains_key(id))
+    }
+
     /// Record which resource a `clientToken` minted in this `scope`, evicting the
     /// oldest record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held.
     pub fn remember_client_token(&mut self, scope: &str, client_token: &str, id: &str) {
@@ -851,6 +861,30 @@ pub fn conflict(
         resource_id: Some(resource_id.to_string()),
         resource_type: Some(resource_type.to_string()),
     }
+}
+
+/// What a `ConflictException` names in `resourceType` when the conflicting resource is
+/// a file system.
+///
+/// `ConflictException$resourceType` is "The type of the resource that caused the
+/// conflict", and S3 Files spells a file system's type with the model's own shape name
+/// rather than a path segment, so every conflict this service raises over a file system
+/// reports the one spelling.
+pub const RESOURCE_TYPE_FILE_SYSTEM: &str = "FileSystem";
+
+/// The modelled 409 for a `CreateFileSystem` whose creation token has already been
+/// consumed, naming the file system that holds it.
+///
+/// `CreateFileSystemRequest$clientToken` targets `CreationToken`: the token is a
+/// single-use creation guard, so the refusal has to hand the caller back the id of the
+/// file system the token already created — in `resourceId` and in the sentence — which
+/// is the only way a caller that lost the first response recovers it.
+pub fn creation_token_in_use(owner_file_system_id: &str) -> ConflictException {
+    conflict(
+        owner_file_system_id,
+        RESOURCE_TYPE_FILE_SYSTEM,
+        format!("File system '{owner_file_system_id}' already exists with this clientToken."),
+    )
 }
 
 /// The modelled 402 for a create that would take this store past one of its ceilings.

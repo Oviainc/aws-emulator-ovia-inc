@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteFileSystemErrorModeled::ConflictException(
                 crate::state::conflict(
                     &file_system_id,
-                    "file-system",
+                    crate::state::RESOURCE_TYPE_FILE_SYSTEM,
                     format!(
                         "file system {file_system_id} still has {} access point(s); \
                          delete them or retry with forceDelete=true",

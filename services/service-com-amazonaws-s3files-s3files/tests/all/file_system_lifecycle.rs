@@ -14,8 +14,11 @@
 //!    delete makes the resource observably gone.
 //! 2. A minted id and ARN satisfy the model's own patterns, and the ARN names the
 //!    region the request was signed for and the canonical emulator account.
-//! 3. `clientToken` is an `@idempotencyToken`: one token creates one resource, a
-//!    different token creates another.
+//! 3. A `CreateFileSystem` creation token is single-use: one token creates one file
+//!    system and then refuses every later create carrying it, and a different token
+//!    creates another. `CreateAccessPoint`'s `clientToken` is an ordinary
+//!    `@idempotencyToken`, so a repeat there replays the access point the first call
+//!    created.
 //! 4. An id-valued member accepts either form the model allows — the bare id or the
 //!    resource's ARN — and both name the same record.
 //! 5. A listing answers every persisted file system matching its filter, in one stable
@@ -375,11 +378,13 @@ async fn a_created_file_system_is_persisted_and_read_back_member_for_member() {
     }
 }
 
-/// Rule 3: one `clientToken` creates one file system, however many times it is sent; a
-/// different token creates another; and a create that names no token is a new create
-/// each time, because the token it is recorded under is minted per call.
+/// Rule 3: one creation token creates one file system and is then spent — a later create
+/// carrying it is refused rather than creating a second one; a different token creates
+/// another; and a create that names no token is a new create each time, because the token
+/// it is recorded under is minted per call. The refusal's own body is asserted member for
+/// member in `creation_token_single_use`.
 #[tokio::test]
-async fn client_tokens_make_creates_idempotent() {
+async fn one_creation_token_creates_exactly_one_file_system() {
     let router = new_router();
     let bucket = "arn:aws:s3:::s3files-idempotency";
     let long_token = "t".repeat(64);
@@ -393,11 +398,23 @@ async fn client_tokens_make_creates_idempotent() {
     for (case, token) in tokens {
         let first = created_file_system_id(&router, bucket, Some(token)).await;
         for attempt in 1..=2 {
-            let replayed = created_file_system_id(&router, bucket, Some(token)).await;
+            let refused = create_file_system(
+                &router,
+                json!({ "bucket": bucket, "roleArn": ROLE_ARN, "clientToken": token }),
+            )
+            .await;
             assert_eq!(
-                replayed, first,
-                "case {case:?} (replay {attempt}): the same clientToken must return the \
-                 same file system, expected {first}, got {replayed}"
+                refused.status, 409,
+                "case {case:?} (reuse {attempt}): a spent creation token must be refused \
+                 with the modelled 409, got {} / {:?}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.text("resourceId"),
+                first,
+                "case {case:?} (reuse {attempt}): the refusal names the file system \
+                 holding the token, got {:?}",
+                refused.body
             );
         }
         assert!(
@@ -819,6 +836,21 @@ async fn delete_refuses_a_file_system_in_use_unless_its_children_may_go_too() {
             refused.error_type, "ConflictException",
             "case \"forceDelete {case}\": expected the modelled ConflictException, got {:?}",
             refused.error_type
+        );
+        // The conflicting resource is a file system, so the conflict names that type the
+        // way S3 Files spells it on the wire, and names the file system itself.
+        assert_eq!(
+            refused.text("resourceType"),
+            "FileSystem",
+            "case \"forceDelete {case}\": resourceType names the conflicting resource's \
+             type, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.text("resourceId"),
+            parent,
+            "case \"forceDelete {case}\": resourceId names the file system in use, got {:?}",
+            refused.body
         );
         let still_there = call(&router, "GET", &format!("/file-systems/{parent}"), None).await;
         assert_eq!(
