@@ -16,7 +16,11 @@
 //! same rule the create of a mapping is: a QUEUE whose `VisibilityTimeout` is below the
 //! newly named function's `Timeout` would make a message visible to a second poller while
 //! the function is still working on it, and that pair is refused with the modelled
-//! `InvalidParameterValueException` (see [`crate::state::queue_visibility_refusal`]).
+//! `InvalidParameterValueException` (see [`crate::state::queue_visibility_refusal`]). The
+//! same modelled refusal covers the other rule the pair is held to: Lambda reads the source
+//! acting as the invoked function's execution role, so a re-target onto a function whose
+//! role may not read the source this mapping polls changes nothing (see
+//! [`crate::state::event_source_authorization`]).
 //!
 //! The operation answers 202 Accepted, so the change is NOT in effect when the call
 //! returns: the mapping moves into `Updating` — one of the states
@@ -405,23 +409,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The QUEUE this mapping polls, which no update changes: a `FunctionName` picks a
-        // new function for the SAME source, so it is the source the new function's timeout
-        // is checked against below. Only a queue carries a visibility timeout, so only a
-        // queue source is read here.
-        let queue_source = store
+        // The event source this mapping polls, which no update changes: a `FunctionName`
+        // picks a new function for the SAME source, so it is the source the new function is
+        // checked against below.
+        let mapped_source = store
             .event_source_mappings
             .get(&input.uuid)
-            .and_then(|record| record.event_source_arn.clone())
-            .filter(|arn| {
-                crate::state::event_source_vendor(arn)
-                    == Some(crate::state::EVENT_SOURCE_VENDOR_QUEUE)
-            });
+            .and_then(|record| record.event_source_arn.clone());
+        // Only a queue carries a visibility timeout, so only a queue source is one of those
+        // comparisons.
+        let queue_source = mapped_source.clone().filter(|arn| {
+            crate::state::event_source_vendor(arn) == Some(crate::state::EVENT_SOURCE_VENDOR_QUEUE)
+        });
 
         // A `FunctionName` re-targets the mapping, so it has to resolve to a function
         // this store holds — in any of its documented forms, qualified or not.
-        let (retarget, retarget_timeout) = match input.function_name.as_deref() {
-            None => (None, None),
+        let (retarget, retarget_timeout, retarget_role) = match input.function_name.as_deref() {
+            None => (None, None, None),
             Some(function_name) => {
                 let (function, version) =
                     crate::state::resolve_function(&mut store, function_name, None, &region, now)
@@ -435,9 +439,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // before stopping it", for the version this mapping would invoke. The
                 // resolution above refuses a version this store holds no configuration
                 // for, so a version with no timeout to compare is a failure of the store
-                // rather than of the request.
+                // rather than of the request. The same configuration carries the EXECUTION
+                // ROLE the mapping's poller would read the event source as.
                 let function_arn = function.versioned_arn(&version);
-                let Some(timeout) = function.config_of(&version).map(|config| config.timeout)
+                let Some((timeout, role)) = function
+                    .config_of(&version)
+                    .map(|config| (config.timeout, config.role.clone()))
                 else {
                     return Err(service_error(&format!(
                         "Lambda resolved {function_arn} without a configuration to read its \
@@ -453,6 +460,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         (version != crate::state::VERSION_LATEST).then_some(version),
                     )),
                     Some(timeout),
+                    Some(role),
                 )
             }
         };
@@ -469,6 +477,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::queue_visibility_refusal(visibility_timeout, function_timeout)
                     },
                 )
+            })
+        {
+            return Err(invalid_parameter(message));
+        }
+
+        // And to the other rule a create is held to: Lambda reads the source acting as the
+        // invoked function's execution role, so a re-target onto a function whose role may
+        // not read the source this mapping polls is refused and changes nothing (see
+        // [`crate::state::event_source_authorization`]).
+        if let Some(message) = mapped_source
+            .as_deref()
+            .zip(retarget_role.as_deref())
+            .and_then(|(event_source, role)| {
+                crate::state::unreadable_event_source(&*self.engine, role, event_source)
             })
         {
             return Err(invalid_parameter(message));

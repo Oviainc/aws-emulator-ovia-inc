@@ -83,6 +83,8 @@ mod event_source_mapping_event_counts;
 mod event_source_mapping_paused_state_and_response_types;
 #[path = "all/event_source_mapping_queue_visibility.rs"]
 mod event_source_mapping_queue_visibility;
+#[path = "all/event_source_mapping_role_access.rs"]
+mod event_source_mapping_role_access;
 #[path = "all/event_source_mapping_sqs_delivery.rs"]
 mod event_source_mapping_sqs_delivery;
 #[path = "all/event_source_mapping_update.rs"]

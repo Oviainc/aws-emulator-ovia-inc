@@ -30,6 +30,10 @@ tracing = { workspace = true }
 # which lives in the Amazon SQS emulator's queue store: it is reached through the shared
 # engine, which needs the owning service's state TYPE.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# A mapping is also accepted against what the invoked function's EXECUTION ROLE may read on
+# the event source (`state::event_source_authorization`): the role's policies live in the
+# IAM emulator's store, reached through that same shared engine.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # CodeSha256 is the SHA-256 of the stored deployment package...
 sha2 = { workspace = true }
 # ...reported base64-encoded, as the model's CodeSha256 member describes it.

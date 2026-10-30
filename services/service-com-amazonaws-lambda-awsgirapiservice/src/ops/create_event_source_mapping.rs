@@ -23,6 +23,12 @@
 //! refused with the same modelled 400 (see [`crate::state::queue_visibility_refusal`]),
 //! which is why the queue's timeout is read out of its own store here.
 //!
+//! Every mapping is also held to what the INVOKED FUNCTION'S EXECUTION ROLE may do: Lambda
+//! reads the event source acting as that role, so a role the policies in force on it do not
+//! let read the named source is refused with that same modelled 400 and no mapping is
+//! stored (see [`crate::state::event_source_authorization`]), rather than wired up as a
+//! trigger that could never fire.
+//!
 //! An accepted mapping on a queue also STARTS POLLING it: "Lambda reads items from the
 //! event source and invokes the function", so this call arms the poll loop
 //! ([`crate::state::drive_sqs_pollers`]) that takes each batch out of the queue and hands
@@ -512,8 +518,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `Timeout` of the version this mapping invokes: "The amount of time in
         // seconds that Lambda allows a function to run before stopping it." The resolution
         // above refuses a version this store holds no configuration for, so a version with
-        // no timeout to compare is a failure of the store rather than of the request.
-        let Some(function_timeout) = function.config_of(&version).map(|config| config.timeout)
+        // no timeout to compare is a failure of the store rather than of the request. The
+        // same configuration carries the EXECUTION ROLE the mapping's poller would read the
+        // event source as.
+        let Some((function_timeout, function_role)) = function
+            .config_of(&version)
+            .map(|config| (config.timeout, config.role.clone()))
         else {
             return Err(CreateEventSourceMappingErrorModeled::ServiceException(
                 ServiceException {
@@ -544,6 +554,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // leaving the duplicate delivery to surface later.
         if let Some(message) = queue_visibility_timeout.and_then(|visibility_timeout| {
             crate::state::queue_visibility_refusal(visibility_timeout, function_timeout)
+        }) {
+            return Err(invalid_parameter(message));
+        }
+
+        // Lambda reads the event source ACTING AS the function's execution role, so a role
+        // the policies in force on it do not let read this source is a trigger that could
+        // never fire: it is refused here, before anything is persisted, rather than stood
+        // up as a mapping that polls nothing. The role is the one the VERSION this mapping
+        // invokes carries, and the decision is IAM's own over its own store — see
+        // [`crate::state::event_source_authorization`], including the cases that show
+        // nothing about the role and refuse nothing.
+        if let Some(message) = event_source_arn.as_deref().and_then(|event_source| {
+            crate::state::unreadable_event_source(&*self.engine, &function_role, event_source)
         }) {
             return Err(invalid_parameter(message));
         }

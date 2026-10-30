@@ -231,6 +231,14 @@ pub mod metrics;
 pub mod sqs_poller;
 pub use sqs_poller::{drive_sqs_pollers, poll_due, PollSession, POLL_INTERVAL};
 
+/// Whether the execution role of the function a mapping invokes may READ the event source
+/// that mapping names — the gate every call that wires the two together passes through —
+/// lives in [`event_source_authorization`], beside the pollers that make those reads. It is
+/// re-exported here for the same reason as [`capacity_provider`]: a handler names it as
+/// `crate::state::…`.
+pub mod event_source_authorization;
+pub use event_source_authorization::unreadable_event_source;
+
 /// What the account's CONCURRENCY does with no client action at all — the series Lambda
 /// publishes about how much of the Region's capacity the account has claimed, and how much
 /// of its unreserved pool is in use — lives in [`concurrency_metering`], beside the

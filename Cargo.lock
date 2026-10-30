@@ -11099,6 +11099,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kinesis-kinesis-20131202",
  "service-com-amazonaws-sqs-amazonsqs",
  "service-common",
