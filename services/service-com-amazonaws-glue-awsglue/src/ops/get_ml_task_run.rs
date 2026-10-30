@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMLTaskRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMLTaskRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMLTaskRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE task run of ONE machine learning transform: "gets details for a specific
+//! task run on a machine learning transform… You can check the stats of any task run by
+//! calling GetMLTaskRun with the TaskRunID and its parent transform's TransformID." A run
+//! is addressed by that pair, so the lookup resolves the transform first and then the run
+//! among the runs started OF it, and what it reports is the whole stored run — the same
+//! projection the transform's listing reports element for element.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +165,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMLTaskRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMLTaskRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMLTaskRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(GetMLTaskRunErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue machine learning transform store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // `TransformId` and `TaskRunId` are both `@required` with `length 1..255`, so an
+        // absent or over-long one is refused at the boundary: reaching here, the only
+        // question is which half of the run's address this account can resolve. A run is
+        // held ON its transform, so a `TransformId` this account holds no transform under
+        // addresses no run at all.
+        let Some(transform) = store.ml_transforms.get_mut(&input.transform_id) else {
+            return Err(GetMLTaskRunErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::ml_transform_not_found(
+                        &input.transform_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The only write a read makes: the status change the clock had already made due,
+        // which was owed at the same instant whether or not anybody read the run. It is
+        // materialised BEFORE the run is projected, so the status reported is the one the
+        // clock has really reached, and a listing of the same runs agrees with it.
+        transform.settle_due_task_runs(now);
+
+        let Some(run) = transform.task_run(&input.task_run_id) else {
+            return Err(GetMLTaskRunErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::messages::ml_task_run_not_found(
+                        &input.task_run_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // Projected through the stored run's own modelled `TaskRun`, so this single read
+        // and the transform's listing report one run identically by construction rather
+        // than by two hand-written projections happening to agree.
+        let TaskRun {
+            transform_id,
+            task_run_id,
+            status,
+            log_group_name,
+            properties,
+            error_string,
+            started_on,
+            last_modified_on,
+            completed_on,
+            execution_time,
+        } = run.to_task_run();
+
+        Ok(GetMLTaskRunOutput {
+            transform_id,
+            task_run_id,
+            status,
+            log_group_name,
+            properties,
+            error_string,
+            started_on,
+            last_modified_on,
+            completed_on,
+            execution_time,
+        })
     }
 }
+

@@ -7517,6 +7517,20 @@ impl MlTransformEntry {
         }
     }
 
+    /// The ONE task run of this transform the id `run_id` addresses, if it holds one.
+    ///
+    /// A run's address is its parent `TransformId` and then the `TaskRunId` the start
+    /// minted, so the search is over THIS transform's runs alone and a run of another
+    /// transform is unreachable through it. The id is matched exactly, as the store's own
+    /// key: the service mints it ([`new_ml_task_run_id`]) rather than taking it from a
+    /// request, so no other spelling of it names a run.
+    ///
+    /// Call [`Self::settle_due_task_runs`] first, or the run is reported in a status the
+    /// clock has already moved it out of.
+    pub fn task_run(&self, run_id: &str) -> Option<&MlTaskRunEntry> {
+        self.task_runs.iter().find(|run| run.id == run_id)
+    }
+
     /// Every task run of this transform `filter` admits, in the order `sort` names, each
     /// paired with its ordering key — which is what the listing's continuation token
     /// carries ([`MlTaskRunEntry::ordering_key`]).
@@ -11569,6 +11583,22 @@ pub mod messages {
     pub fn ml_transform_not_found(transform_id: &str) -> String {
         format!(
             "Cannot find MLTransform in account {} with handle {transform_id}",
+            ::engine::emulator_account_id()
+        )
+    }
+
+    /// A machine learning task run lookup (`GetMLTaskRun`) for a `TaskRunId` the addressed
+    /// transform holds no run under.
+    ///
+    /// NOT recorded: the sentence follows the template this same machine learning surface
+    /// words its recorded parent miss in ([`ml_transform_not_found`]) — the account whose
+    /// namespace the lookup was served in and the id the request itself sent — because the
+    /// run and its transform are missed by the same surface, so one miss cannot be worded
+    /// one way for the parent and another for the child. The `TaskRunId` is the half of a
+    /// run's address the transform could not resolve, so it is what the sentence names.
+    pub fn ml_task_run_not_found(task_run_id: &str) -> String {
+        format!(
+            "Cannot find MLTaskRun in account {} with handle {task_run_id}",
             ::engine::emulator_account_id()
         )
     }

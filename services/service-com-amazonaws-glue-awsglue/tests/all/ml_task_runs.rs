@@ -203,7 +203,7 @@ async fn walk_pages(
 /// Move the due instant of every unsettled task run to `at`, so a test can hold the
 /// transient window open or make the owed transition due without sleeping. The instants
 /// themselves come from [`crate::job_runs`], which every run suite of this crate shares.
-fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, at: SystemTime) {
+pub(crate) fn set_due_instant(engine: &Arc<engine::InMemoryEngine>, at: SystemTime) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
     for transform in store.ml_transforms.values_mut() {
