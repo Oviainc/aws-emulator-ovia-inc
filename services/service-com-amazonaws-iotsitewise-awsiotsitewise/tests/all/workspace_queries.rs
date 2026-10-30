@@ -85,7 +85,7 @@ pub(crate) fn query_uri(workspace: &str, query_id: &str) -> String {
 }
 
 /// `StartQuery` with `statement` and, when given, a `clientToken`.
-async fn start_in(
+pub(crate) async fn start_in(
     router: &MultiServiceRouter,
     workspace: &str,
     statement: &str,
@@ -168,7 +168,7 @@ async fn rows_through_execute_query(router: &MultiServiceRouter, statement: &str
 /// How many queries the store holds, across every workspace — the only way to
 /// observe that a refused request started nothing, since no reader enumerates a
 /// workspace's queries yet.
-fn queries_held(engine: &engine::InMemoryEngine) -> usize {
+pub(crate) fn queries_held(engine: &engine::InMemoryEngine) -> usize {
     let state = service_state(engine).expect("the IoT SiteWise store");
     let store = state.lock();
     store.queries.len()

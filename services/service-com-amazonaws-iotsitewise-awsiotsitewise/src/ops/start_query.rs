@@ -177,18 +177,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None,
         );
 
+        // The token is resolved from the ONE instant this request was anchored at,
+        // at BOTH of the points below it is resolved — before the statement runs and
+        // again once the write lock is re-taken — so the answer a retry gets cannot
+        // depend on which of them caught it. The replayed query's status is a pure
+        // function of that instant, and the statement run BETWEEN the two points is
+        // unbounded by this handler, so a second reading of the clock there would be
+        // one request disagreeing with itself about where "now" was. Bound here,
+        // once, rather than passed at each site, so the two cannot drift apart again.
+        let token_answer_at_anchor =
+            |store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState| {
+                token_answer(
+                    store,
+                    Self::NAME,
+                    input.client_token.as_deref(),
+                    &fingerprint,
+                    &region,
+                    submitted_at,
+                )
+            };
+
         // Everything that can REFUSE this request is decided before the statement
         // runs, so a refused request runs nothing and writes nothing.
         {
             let store = state.lock();
-            if let Some(answer) = token_answer(
-                &store,
-                Self::NAME,
-                input.client_token.as_deref(),
-                &fingerprint,
-                &region,
-                submitted_at,
-            )? {
+            if let Some(answer) = token_answer_at_anchor(&store)? {
                 return Ok(answer);
             }
             check_can_start(&store, &input.workspace_name)?;
@@ -245,15 +258,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Checked again now the write lock is held: another request carrying this
         // same token may have landed while this one was running its statement, and
-        // one token names one query.
-        if let Some(answer) = token_answer(
-            &store,
-            Self::NAME,
-            input.client_token.as_deref(),
-            &fingerprint,
-            &region,
-            ::std::time::SystemTime::now(),
-        )? {
+        // one token names one query. Resolved at the SAME anchor as the check above,
+        // so a retry caught here is answered exactly as one caught there.
+        if let Some(answer) = token_answer_at_anchor(&store)? {
             return Ok(answer);
         }
         check_can_start(&store, &input.workspace_name)?;
@@ -308,10 +315,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// What the `clientToken` this request carries says about it, as of `now`: the
-/// answer a RETRY replays (`Some`), the modelled conflict for a token a DIFFERENT
-/// request already spent (`Err`), or nothing to say (`None`), which is a request
-/// to be served as the start it is.
+/// What the `clientToken` this request carries says about it, as of `now` — the one
+/// instant the REQUEST was anchored at, whichever point of the handler resolves the
+/// token: the answer a RETRY replays (`Some`), the modelled conflict for a token a
+/// DIFFERENT request already spent (`Err`), or nothing to say (`None`), which is a
+/// request to be served as the start it is.
 ///
 /// A token identifies the CALL that spent it, so a retry — the same request under
 /// that token — reports the query that call started, at the status the clock has

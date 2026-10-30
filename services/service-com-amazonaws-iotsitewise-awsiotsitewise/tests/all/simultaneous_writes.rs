@@ -53,7 +53,7 @@ use crate::support::now_seconds;
 const RACER_COUNTS: [usize; 4] = [2, 3, 5, 8];
 
 /// One racer's answer: its index, the HTTP status and the parsed body.
-type Answer = (usize, u16, Value);
+pub(crate) type Answer = (usize, u16, Value);
 
 /// Fire `count` requests at `router` AT ONCE and answer one [`Answer`] per
 /// racer, ordered by racer index.
@@ -62,7 +62,11 @@ type Answer = (usize, u16, Value);
 /// which shares the one engine and the one service instance — so on the
 /// multi-thread runtime these tests declare the calls really do overlap rather
 /// than interleaving at a single task's await points.
-async fn race<F, Fut>(router: &MultiServiceRouter, count: usize, make: F) -> Vec<Answer>
+pub(crate) async fn race<F, Fut>(
+    router: &MultiServiceRouter,
+    count: usize,
+    make: F,
+) -> Vec<Answer>
 where
     F: Fn(usize, MultiServiceRouter) -> Fut,
     Fut: Future<Output = (u16, Value)> + Send + 'static,

@@ -219,6 +219,13 @@ mod composition_relationships;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 
+// `start_query_anchor` is declared HERE, beside the note above, for the reason it
+// gives: the sorted list and the END of this file are both where every concurrent
+// iotsitewise change puts a declaration of its own. Fold it into the list once the
+// churn settles.
+#[path = "all/start_query_anchor.rs"]
+mod start_query_anchor;
+
 // `property_aggregates` is declared here, ahead of the sorted list, rather than in
 // its alphabetical place: every other suite this crate has gained was inserted
 // into that list or appended after it, so those are the two spots a concurrent
