@@ -65,7 +65,10 @@ fn share(engine: &engine::InMemoryEngine, arn: &str) {
 
 /// Create `names` as report groups of the account and hand back the ARN each was stored
 /// with, read from the service's own answer rather than assembled here.
-async fn create_report_groups(router: &MultiServiceRouter, names: &[&str]) -> Vec<String> {
+///
+/// `pub(crate)` because `tests/all/list_report_groups.rs` seeds the listing of ALL report
+/// groups the same way rather than growing a second copy of this helper.
+pub(crate) async fn create_report_groups(router: &MultiServiceRouter, names: &[&str]) -> Vec<String> {
     let mut arns = Vec::new();
     for name in names {
         let (status, body) = call(
@@ -103,7 +106,10 @@ async fn list(router: &MultiServiceRouter, request: Value) -> Value {
 
 /// The `reportGroups` member of a listing, as a vector of ARNs — asserting it was stated
 /// as a list at all.
-fn listed(body: &Value, case: &str) -> Vec<String> {
+///
+/// `pub(crate)` because both report-group listings state their result in a `reportGroups`
+/// member of the same shape, so `tests/all/list_report_groups.rs` reads one through this.
+pub(crate) fn listed(body: &Value, case: &str) -> Vec<String> {
     let entries = body["reportGroups"].as_array().unwrap_or_else(|| {
         panic!("case {case:?}: reportGroups must be stated as a list, got {body}")
     });

@@ -20,7 +20,7 @@
 //! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
 //! `BatchGetFleets`, `BatchGetSandboxes`, `BatchGetCommandExecutions`,
 //! `BatchGetReportGroups`, `BatchGetReports`, `GetReportGroupTrend`, `ListProjects`,
-//! `ListSharedProjects`,
+//! `ListSharedProjects`, `ListReportGroups`,
 //! `ListBuildsForProject`, `ListBuildBatches`, `ListBuildBatchesForProject`,
 //! `ListSandboxes`, `ListSandboxesForProject`,
 //! `ListSourceCredentials`) only read them.

@@ -376,7 +376,7 @@ async fn an_unmodelled_sort_order_is_refused_in_codebuilds_own_words() {
     );
 
     // Operations whose input models a `sortOrder`, with the other members each one
-    // requires. The last two are still scaffolded handlers, which is the point: the
+    // requires. The last one is still a scaffolded handler, which is the point: the
     // refusal belongs to the sort order, not to what the operation goes on to do.
     let operations: [(&str, Value); 6] = [
         ("ListBuildsForProject", json!({"projectName": "sorted-proj"})),

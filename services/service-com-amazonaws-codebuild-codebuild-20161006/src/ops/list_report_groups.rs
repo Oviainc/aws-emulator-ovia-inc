@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReportGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReportGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReportGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the ARNs of the report groups this account holds: this is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,23 +143,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_REPORT_GROUPS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the ARNs of every report group this account holds, ordered and paged as
+    /// the request asks.
+    ///
+    /// The listing is the store's own report groups — "a list ARNs for the report groups
+    /// in the current Amazon Web Services account" — so a group `CreateReportGroup` wrote
+    /// is reported until `DeleteReportGroup` removes it, and nothing else is. Ordering
+    /// reads the record each criterion names (`ReportGroupSortByType`: when the group was
+    /// created, when it was last changed, or its name), with the name breaking a tie so
+    /// two groups stamped in the same millisecond still have one order; `sortOrder`
+    /// reverses that order, and `maxResults` / `nextToken` cut and resume the pages — the
+    /// way `crate::ops::list_shared_report_groups` reports the shared subset.
+    ///
+    /// Purely reporting: nothing in the store changes, so a later caller sees exactly
+    /// what this one saw.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReportGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReportGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReportGroups"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListReportGroups (this engine carries no CodeBuild state)",
+            ));
+        };
+        let _ = ctx;
+
+        let guard = state.lock();
+        // Every report group of the account, each with the two instants a criterion may
+        // order on and the name that breaks a tie between equal instants.
+        let mut held: Vec<(&str, i64, i64, &str)> = guard
+            .report_groups
+            .iter()
+            .filter_map(|(name, stored)| {
+                let arn = stored.report_group.arn.as_deref()?;
+                Some((
+                    name.as_str(),
+                    stored.created_millis,
+                    stored.last_modified_millis,
+                    arn,
+                ))
+            })
+            .collect();
+        match input.sort_by.as_deref() {
+            Some(CREATED_TIME_SORT_BY) => {
+                held.sort_unstable_by_key(|&(name, created, _, _)| (created, name));
+            }
+            Some(LAST_MODIFIED_TIME_SORT_BY) => {
+                held.sort_unstable_by_key(|&(name, _, last_modified, _)| (last_modified, name));
+            }
+            // `NAME`, or absent: the model documents no default for either member, so
+            // this listing takes the one the sibling listing of the account's other named
+            // resource kind takes (`crate::ops::list_projects`) — the name, which every
+            // report group has exactly one of, which is unique per account, and which the
+            // store is already keyed by.
+            _ => held.sort_unstable_by_key(|&(name, _, _, _)| name),
+        }
+        let mut arns: Vec<String> = held
+            .into_iter()
+            .map(|(_, _, _, arn)| arn.to_string())
+            .collect();
+        // Dropped before the page is cut: nothing below reads the store.
+        drop(guard);
+        if input.sort_order.as_deref() == Some(DESCENDING_SORT_ORDER) {
+            arns.reverse();
+        }
+
+        let Some((page, next_token)) =
+            crate::state::page_limited(&arns, input.next_token.as_deref(), input.max_results)
+        else {
+            return Err(ListReportGroupsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("Invalid nextToken".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListReportGroupsOutput {
+            // Serialized whether or not the account holds a report group, `[]` when it
+            // holds none: the `@length(min: 1)` on `ReportGroupArns` bounds what a request
+            // may carry, not whether the answer states its result (see
+            // `crate::ops::list_shared_report_groups`).
+            report_groups: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The `ReportGroupSortByType` value that orders the listing by when each report group
+/// was created. That enum's values are `CREATED_TIME`, `LAST_MODIFIED_TIME` and `NAME`
+/// (`crate::ops::types::REPORT_GROUP_SORT_BY_TYPE_VALUES`).
+const CREATED_TIME_SORT_BY: &str = "CREATED_TIME";
+
+/// The `ReportGroupSortByType` value that orders the listing by when information about
+/// each report group was last changed.
+const LAST_MODIFIED_TIME_SORT_BY: &str = "LAST_MODIFIED_TIME";
+
+/// The `SortOrderType` value that asks for the reverse of the criterion's natural order;
+/// the only other value is `ASCENDING`.
+const DESCENDING_SORT_ORDER: &str = "DESCENDING";

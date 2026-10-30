@@ -33,6 +33,8 @@ mod list_build_batches;
 mod list_build_batches_for_project;
 #[path = "all/list_builds.rs"]
 mod list_builds;
+#[path = "all/list_report_groups.rs"]
+mod list_report_groups;
 #[path = "all/list_sandboxes.rs"]
 mod list_sandboxes;
 #[path = "all/list_sandboxes_for_project.rs"]
