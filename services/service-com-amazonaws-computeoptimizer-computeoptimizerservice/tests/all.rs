@@ -103,5 +103,7 @@ mod state_roundtrip;
 mod summary_resource_type_surface;
 #[path = "all/timestamp_probe.rs"]
 mod timestamp_probe;
+#[path = "all/tracked_resource_type_summaries.rs"]
+mod tracked_resource_type_summaries;
 #[path = "all/unrestricted_preference_resource_types.rs"]
 mod unrestricted_preference_resource_types;

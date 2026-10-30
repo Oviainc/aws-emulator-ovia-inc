@@ -4,13 +4,15 @@
 //!
 //! One rule, asserted over the whole cross product rather than the one resource type a
 //! recording happened to use: `PutRecommendationPreferences` stores a preference member
-//! only for the resource types the service supports that preference for, and refuses it for
-//! every other `ResourceType` the model's enum admits with `InvalidParameterValueException`
-//! (HTTP 400), storing nothing — so a refused request leaves `GetRecommendationPreferences`
-//! reporting no record.
+//! only for the resource types the member's own documentation restricts it to, and refuses
+//! it for every other `ResourceType` the model's enum admits with
+//! `InvalidParameterValueException` (HTTP 400), storing nothing — so a refused request
+//! leaves `GetRecommendationPreferences` reporting no record.
 //!
 //! The supported set of each member is stated once, in [`members`], with the source of
-//! each list on its row.
+//! each list on its row. A member whose documentation restricts NOTHING is settable for
+//! every resource type and is asserted in
+//! `tests/all/unrestricted_preference_resource_types.rs`.
 //!
 //! Every call goes through the shared wire harness (`tests/all/harness.rs`), i.e. the same
 //! `MultiServiceRouter::dispatch` the emulator's front door uses.
@@ -20,13 +22,6 @@ use serde_json::{json, Value};
 use crate::harness::{
     call, emulator, error_code, get_preferences, opt_in, scope_for, RESOURCE_TYPES,
 };
-
-/// The resource types whose recommendations carry an instance-level analysis feature:
-/// `EffectiveRecommendationPreferences` — the shape reported for EC2 instance and Auto
-/// Scaling group recommendations — is the only one in the model carrying
-/// `enhancedInfrastructureMetrics` together with `inferredWorkloadTypes`, and the service
-/// refuses either preference for any other resource type.
-const INSTANCE_FEATURE: &[&str] = &["Ec2Instance", "AutoScalingGroup"];
 
 /// The resource types a preference the service analyses per resource may be set for, from
 /// `PutRecommendationPreferences$lookBackPeriod`: "You can only set this preference for the
@@ -42,26 +37,22 @@ const ANALYSED_PER_RESOURCE: &[&str] = &[
     "AuroraDBClusterStorage",
 ];
 
-/// One row per preference member of this operation: the member, a value from its modelled
-/// shape, and the `ResourceType` values it may be set for.
+/// One row per preference member of this operation whose documentation RESTRICTS the
+/// resource types it may be set for: the member, a value from its modelled shape, and the
+/// `ResourceType` values it may be set for.
 ///
 /// * `externalMetricsPreference` — "This preference can only be set for the Ec2Instance
 ///   resource type."
 /// * `utilizationPreferences` — "You can only set CPU and memory utilization preferences
 ///   for the Amazon EC2 instance resource type."
 /// * `lookBackPeriod` / `preferredResources` — the six analysed-per-resource types.
-/// * `enhancedInfrastructureMetrics` / `inferredWorkloadTypes` — the instance-feature pair.
 ///
-/// `savingsEstimationMode`, the one member no resource type is refused for, is asserted
-/// over the whole enum in `tests/all/unrestricted_preference_resource_types.rs`.
+/// The members whose documentation restricts nothing — `savingsEstimationMode` and the two
+/// status switches `enhancedInfrastructureMetrics` and `inferredWorkloadTypes` — are
+/// asserted over the whole enum in
+/// `tests/all/unrestricted_preference_resource_types.rs`.
 fn members() -> Vec<(&'static str, Value, &'static [&'static str])> {
     vec![
-        (
-            "enhancedInfrastructureMetrics",
-            json!("Active"),
-            INSTANCE_FEATURE,
-        ),
-        ("inferredWorkloadTypes", json!("Inactive"), INSTANCE_FEATURE),
         (
             "externalMetricsPreference",
             json!({"source": "Datadog"}),
@@ -179,48 +170,3 @@ async fn every_preference_member_is_settable_exactly_where_its_resource_types_al
     }
 }
 
-/// Each `EnhancedInfrastructureMetrics` / `InferredWorkloadTypesPreference` value (the
-/// model's enums: Active | Inactive) is refused for a resource type outside the
-/// instance-feature pair, and accepted inside it: the refusal turns on the resource type
-/// alone, never on which status was asked for.
-#[tokio::test]
-async fn an_instance_feature_preference_is_refused_outside_its_pair_for_either_status() {
-    for member in ["enhancedInfrastructureMetrics", "inferredWorkloadTypes"] {
-        for status_value in ["Active", "Inactive"] {
-            for resource_type in RESOURCE_TYPES {
-                let scope = scope_for(resource_type);
-                let case = format!("{member}={status_value} on {resource_type}");
-                let accepted = INSTANCE_FEATURE.contains(resource_type);
-
-                let router = emulator();
-                opt_in(&router).await;
-
-                let mut request = json!({"resourceType": resource_type, "scope": scope});
-                request[member] = json!(status_value);
-                let (status, body) =
-                    call(&router, "PutRecommendationPreferences", request.clone()).await;
-                assert_eq!(
-                    status,
-                    if accepted { 200 } else { 400 },
-                    "case {case:?}: expected {request} to be {}, got {status}: {body}",
-                    if accepted { "accepted" } else { "refused" }
-                );
-
-                let read = get_preferences(&router, resource_type, Some(&scope)).await;
-                let stored = &read["recommendationPreferencesDetails"][0][member];
-                if accepted {
-                    assert_eq!(
-                        stored,
-                        &json!(status_value),
-                        "case {case:?}: expected the stored {member} to be read back, got {read}"
-                    );
-                } else {
-                    assert!(
-                        stored.is_null(),
-                        "case {case:?}: a refused request must store nothing, got {read}"
-                    );
-                }
-            }
-        }
-    }
-}

@@ -7,14 +7,14 @@
 //! `MultiServiceRouter::dispatch` the emulator's front door uses, so what these tests prove
 //! is what a client sees — never what the state struct holds.
 //!
-//! The rule under test: `GetRecommendationSummaries` summarises EVERY record the service
-//! holds for the account grouped by `RecommendationSourceType` — the rightsizing findings
-//! catalog AND the idle resource analysis `GetIdleRecommendations` reports — so each summary
-//! carries a count of the account's resources of that type at each `IdleFinding`
-//! (`idleSummaries`), what dropping those idle resources would save (`idleSavingsOpportunity`),
-//! and an `aggregatedSavingsOpportunity` that is the rightsizing opportunity plus the idle
-//! one; a resource type the service holds only idle resources of is summarised too, and one it
-//! found none of idle carries neither idle member.
+//! The rule under test: `GetRecommendationSummaries` summarises EVERY resource type the
+//! service tracks for the account — the rightsizing findings catalog AND the idle resource
+//! analysis `GetIdleRecommendations` reports — so each summary of a resource type the idle
+//! analysis covers carries a count of the account's resources of that type at each
+//! `IdleFinding` (`idleSummaries`), zero where none was found idle, what dropping the idle
+//! ones would save (`idleSavingsOpportunity`), and an `aggregatedSavingsOpportunity` that is
+//! the rightsizing opportunity plus the idle one; a resource type the idle analysis does not
+//! cover carries neither idle member.
 //!
 //! Each assertion is made over a TABLE of idle records recorded into the analysis — differing
 //! in resource type, in `IdleFinding`, in how many resources share a group, in cost (including
@@ -365,14 +365,55 @@ async fn idle_members_count_and_cost_the_account_s_idle_resources_of_that_type()
                     );
                 }
             }
-            // A resource type nothing of which was found idle: there is nothing to describe,
-            // so neither idle member is reported.
+            // A resource type nothing of which was found idle: where the idle analysis covers
+            // the resource type the counts are reported and all zero — the zero count, not
+            // the absent member, is how "nothing found idle" is said — and where it does not
+            // cover it at all neither idle member is reported.
             None => {
-                assert!(
-                    summary["idleSummaries"].is_null()
-                        && summary["idleSavingsOpportunity"].is_null(),
-                    "case {case:?}: the service found no resource of this type idle, so neither \
-                     idle member is reported, got {summary}"
+                let covers_idle = SUMMARY_GROUP_OF_IDLE_TYPE
+                    .iter()
+                    .any(|(_, group)| *group == case);
+                if !covers_idle {
+                    assert!(
+                        summary["idleSummaries"].is_null()
+                            && summary["idleSavingsOpportunity"].is_null(),
+                        "case {case:?}: the idle analysis does not cover this resource type, so \
+                         neither idle member is reported, got {summary}"
+                    );
+                    continue;
+                }
+                let reported = summary["idleSummaries"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: the idle analysis covers this resource type, so its \
+                             summary reports a count at each IdleFinding, got {summary}"
+                        )
+                    });
+                let names: Vec<&str> = reported
+                    .iter()
+                    .map(|entry| entry["name"].as_str().unwrap_or_default())
+                    .collect();
+                assert_eq!(
+                    names, *IDLE_FINDING_VALUES,
+                    "case {case:?}: expected a count at each IdleFinding \
+                     {IDLE_FINDING_VALUES:?}, got {names:?}"
+                );
+                for entry in &reported {
+                    let finding = entry["name"].as_str().unwrap_or_default().to_string();
+                    assert_eq!(
+                        number(&entry["value"], &format!("{case}/{finding}")),
+                        0.0,
+                        "case {case:?}/{finding:?}: no resource of this type was found idle, \
+                         so its count is zero, got {summary}"
+                    );
+                }
+                assert_eq!(
+                    saving_of(summary, "idleSavingsOpportunity", &case),
+                    0.0,
+                    "case {case:?}: no resource of this type was found idle, so dropping them \
+                     saves nothing, got {summary}"
                 );
             }
         }
@@ -529,10 +570,10 @@ async fn recording_one_more_idle_resource_changes_exactly_its_own_group() {
     }
 }
 
-/// A resource type the service holds ONLY idle resources of is summarised too: it carries the
-/// idle members, no rightsizing finding counts at all (the service documents no `Finding`
-/// vocabulary for it), and a rightsizing opportunity of nothing — so its aggregated saving is
-/// the idle one.
+/// A resource type the service holds ONLY idle resources of is summarised with the idle
+/// members, a rightsizing finding vocabulary whose counts are all zero (the service analyses
+/// no resource of that type for rightsizing), and a rightsizing opportunity of nothing — so
+/// its aggregated saving is the idle one.
 #[tokio::test]
 async fn a_resource_type_only_found_idle_is_summarised_with_no_rightsizing_counts() {
     let router = analysed_emulator_with_recorded_idle_resources().await;
@@ -556,11 +597,20 @@ async fn a_resource_type_only_found_idle_is_summarised_with_no_rightsizing_count
             .unwrap_or_else(|| {
                 panic!("case {case:?}: a resource type found idle must be summarised, got {summaries:?}")
             });
-        assert!(
-            summary["summaries"].is_null(),
-            "case {case:?}: the service reports no Finding vocabulary for this resource type, \
-             so it carries no rightsizing counts, got {summary}"
-        );
+        for entry in summary["summaries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+        {
+            let finding = entry["name"].as_str().unwrap_or_default().to_string();
+            assert_eq!(
+                number(&entry["value"], &format!("{case}/{finding}")),
+                0.0,
+                "case {case:?}/{finding:?}: the service analyses no resource of this type for \
+                 rightsizing, so its finding counts are zero, got {summary}"
+            );
+        }
         assert!(
             !summary["idleSummaries"]
                 .as_array()

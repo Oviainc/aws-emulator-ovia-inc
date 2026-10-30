@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, ANALYSIS_DELAY, SOURCE_TYPE_RDS_DB_INSTANCE,
+    reports_idle_recommendations, service_state, ANALYSIS_DELAY, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -127,8 +127,9 @@ fn items(case: &str, member: &str, body: &Value) -> Vec<Value> {
 }
 
 /// Every count one roll-up entry carries is zero: the account has nothing analysed yet, so
-/// each `Summary` count, each `CurrentPerformanceRisk` rating and each saving it states is
-/// nothing, and the members that describe records the analysis holds none of are absent.
+/// each `Summary` count, each `IdleSummary` count of a resource type the idle analysis
+/// covers, each `CurrentPerformanceRisk` rating and each saving it states is nothing — and
+/// a resource type that analysis does not cover reports no idle member at all.
 fn assert_counts_are_zero(case: &str, entry: &Value) {
     let resource_type = entry["recommendationResourceType"]
         .as_str()
@@ -155,11 +156,21 @@ fn assert_counts_are_zero(case: &str, entry: &Value) {
         "case {case:?}/{resource_type}: nothing is analysed yet, so there is nothing to save, \
          got {entry}"
     );
-    assert!(
-        entry["idleSummaries"].is_null() && entry["idleSavingsOpportunity"].is_null(),
-        "case {case:?}/{resource_type}: nothing was found idle yet, so neither idle member is \
-         reported, got {entry}"
+    let idle = entry["idleSummaries"].as_array().cloned();
+    assert_eq!(
+        idle.is_some(),
+        reports_idle_recommendations(resource_type),
+        "case {case:?}/{resource_type}: the idle counts are reported exactly where the idle \
+         analysis covers the resource type, got {entry}"
     );
+    for count in idle.unwrap_or_default() {
+        assert_eq!(
+            count["value"].as_f64(),
+            Some(0.0),
+            "case {case:?}/{resource_type}: nothing was found idle yet, so every idle finding \
+             counts zero resources, got {count}"
+        );
+    }
 }
 
 /// Every reader is refused with the modelled `OptInRequiredException` (HTTP 403).
@@ -275,10 +286,26 @@ async fn every_reader_of_the_analysis_waits_for_the_enrollment_and_the_analysis(
              {body}"
         );
         match reader.no_analysis {
-            NoAnalysis::EmptyList(member) | NoAnalysis::ZeroCounts(member) => assert!(
+            NoAnalysis::EmptyList(member) => assert!(
                 !items(&case, member, &body).is_empty(),
                 "case {case:?}: once the analysis is due {member} carries it, got {body}"
             ),
+            NoAnalysis::ZeroCounts(member) => {
+                let rolled_up = items(&case, member, &body);
+                assert!(
+                    !rolled_up.is_empty(),
+                    "case {case:?}: once the analysis is due {member} carries it, got {body}"
+                );
+                let counted: f64 = rolled_up
+                    .iter()
+                    .flat_map(|entry| entry["summaries"].as_array().cloned().unwrap_or_default())
+                    .map(|count| count["value"].as_f64().unwrap_or_default())
+                    .sum();
+                assert!(
+                    counted > 0.0,
+                    "case {case:?}: once the analysis is due the roll-up counts it, got {body}"
+                );
+            }
             NoAnalysis::NotFound => assert!(
                 !items(&case, "recommendedOptionProjectedMetrics", &body).is_empty(),
                 "case {case:?}: once the analysis is due the projection is served, got {body}"

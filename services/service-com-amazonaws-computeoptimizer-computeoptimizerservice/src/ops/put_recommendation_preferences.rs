@@ -330,26 +330,15 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
         return Some(crate::state::AUTO_SCALING_GROUP_SCOPE_MESSAGE.to_string());
     }
 
-    // Each preference member is settable only for the `ResourceType` values the service
-    // supports that preference FOR, and a request that sets a member for any other
-    // resource type is refused. One table so no member's restriction can drift from
-    // another's; each allowed list names where the service applies that preference —
-    // either because the member's own documentation says so ("can only be set for …") or
-    // because the feature it switches is reported for those resource types alone. A member
-    // the service applies to every resource type (`savingsEstimationMode`, which every
-    // per-resource-type effective-preferences shape in the model carries) is absent from
-    // the table and so accepted for all of them.
+    // Each preference member is settable only for the `ResourceType` values the member's
+    // own documentation RESTRICTS it to ("This preference can only be set for …", "You can
+    // only set this preference for …"), and a request that sets it for any other resource
+    // type is refused. One table so no member's restriction can drift from another's; a
+    // member whose documentation states no restriction is absent from the table and so
+    // accepted for every resource type the `ResourceType` enum admits — `savingsEstimationMode`,
+    // and the two status switches `enhancedInfrastructureMetrics` and `inferredWorkloadTypes`,
+    // whose documentation describes only the Active/Inactive semantics of the feature.
     for (member, is_set, resource_types) in [
-        (
-            "enhancedInfrastructureMetrics",
-            input.enhanced_infrastructure_metrics.is_some(),
-            INSTANCE_FEATURE_RESOURCE_TYPES,
-        ),
-        (
-            "inferredWorkloadTypes",
-            input.inferred_workload_types.is_some(),
-            INSTANCE_FEATURE_RESOURCE_TYPES,
-        ),
         (
             "externalMetricsPreference",
             input.external_metrics_preference.is_some(),
@@ -429,19 +418,6 @@ fn request_rejection(input: &PutRecommendationPreferencesInput) -> Option<String
 /// The `CustomizableMetricName` value whose headroom, but not threshold, is settable.
 const MEMORY_UTILIZATION: &str = "MemoryUtilization";
 
-/// The `ResourceType` values a preference that switches an INSTANCE-level analysis feature
-/// may be set for — `enhancedInfrastructureMetrics` (the longer utilization-metric
-/// look-back) and `inferredWorkloadTypes` (the workload a resource is inferred to run).
-/// Both features belong to the instance recommendation surface: the model carries both
-/// members on `EffectiveRecommendationPreferences`, the shape reported for EC2 instance and
-/// Auto Scaling group recommendations, while every other resource type has its own
-/// effective-preferences shape carrying neither, and the service's own refusal for a
-/// resource type outside this pair names exactly these two as the ones to specify.
-const INSTANCE_FEATURE_RESOURCE_TYPES: &[&str] = &[
-    crate::state::RESOURCE_TYPE_EC2_INSTANCE,
-    crate::state::RESOURCE_TYPE_AUTO_SCALING_GROUP,
-];
-
 /// The `ResourceType` values an `externalMetricsPreference` may be set for: "This
 /// preference can only be set for the Ec2Instance resource type."
 const EXTERNAL_METRICS_RESOURCE_TYPES: &[&str] = &[crate::state::RESOURCE_TYPE_EC2_INSTANCE];
@@ -479,10 +455,6 @@ mod tests {
     #[test]
     fn every_restriction_list_names_only_modelled_resource_types() {
         for (name, resource_types) in [
-            (
-                "INSTANCE_FEATURE_RESOURCE_TYPES",
-                super::INSTANCE_FEATURE_RESOURCE_TYPES,
-            ),
             (
                 "EXTERNAL_METRICS_RESOURCE_TYPES",
                 super::EXTERNAL_METRICS_RESOURCE_TYPES,

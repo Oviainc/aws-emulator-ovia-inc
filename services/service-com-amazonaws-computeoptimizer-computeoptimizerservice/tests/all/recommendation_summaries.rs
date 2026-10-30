@@ -30,28 +30,38 @@ fn caller_account() -> String {
     engine::emulator_account_id().to_string()
 }
 
-/// The `Finding` values a summary of each resource type reports a count for.
+/// The findings a summary of each resource type reports a count at, under the name the
+/// summary reports them with.
 ///
-/// Source: the `GetRecommendationSummaries` documentation in this service's Smithy model —
-/// "It returns the number of: Amazon EC2 instances in an account that are
+/// WHICH findings: the `GetRecommendationSummaries` documentation in this service's Smithy
+/// model — "It returns the number of: Amazon EC2 instances in an account that are
 /// Underprovisioned, Overprovisioned, or Optimized. EC2 Auto Scaling groups in an account
 /// that are NotOptimized, or Optimized. Amazon EBS volumes in an account that are
 /// NotOptimized, or Optimized. Lambda functions in an account that are NotOptimized, or
 /// Optimized. Amazon ECS services in an account that are Underprovisioned,
 /// Overprovisioned, or Optimized. Commercial software licenses in an account that are
 /// InsufficientMetrics, NotOptimized or Optimized. Amazon Aurora and Amazon RDS databases
-/// in an account that are Underprovisioned, Overprovisioned, Optimized, or NotOptimized."
+/// in an account that are Underprovisioned, Overprovisioned, Optimized, or NotOptimized" —
+/// restricted to what `Summary$name` can carry, the model's `Finding` enum (`NotOptimized`
+/// | `Optimized` | `Overprovisioned` | `Underprovisioned`), which is why a license's
+/// documented `InsufficientMetrics` (a `LicenseFinding` value) is not expected here — and
+/// to the vocabulary of the resource type's OWN recommendations, which is why a database
+/// instance is counted at the three `RDSInstanceFinding` values while its storage carries
+/// the four of `RDSStorageFinding`. A tracked resource type the documentation names no
+/// vocabulary for is counted at the generic classification pair.
 ///
-/// `Summary$name` targets the model's `Finding` enum (`NotOptimized` | `Optimized` |
-/// `Overprovisioned` | `Underprovisioned`), so a license's documented
-/// `InsufficientMetrics` — a `LicenseFinding` value — is not a count a `Summary` can
-/// carry and is not expected here.
+/// Under WHICH NAME: a resource type whose recommendations carry a finding vocabulary of
+/// their own is counted in that vocabulary's spelling (`EBSFinding`,
+/// `LambdaFunctionRecommendationFinding`, `ECSServiceRecommendationFinding`,
+/// `RDSInstanceFinding`, `RDSStorageFinding`, `LicenseFinding` — all camel case), and every
+/// other one at the `Finding` vocabulary as the instance surface spells it, in upper snake
+/// case.
 const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
     (
         "Ec2Instance",
-        &["Underprovisioned", "Overprovisioned", "Optimized"],
+        &["UNDER_PROVISIONED", "OVER_PROVISIONED", "OPTIMIZED"],
     ),
-    ("AutoScalingGroup", &["NotOptimized", "Optimized"]),
+    ("AutoScalingGroup", &["NOT_OPTIMIZED", "OPTIMIZED"]),
     ("EbsVolume", &["NotOptimized", "Optimized"]),
     ("LambdaFunction", &["NotOptimized", "Optimized"]),
     (
@@ -61,6 +71,10 @@ const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
     ("License", &["NotOptimized", "Optimized"]),
     (
         "RdsDBInstance",
+        &["Underprovisioned", "Overprovisioned", "Optimized"],
+    ),
+    (
+        "RdsDBInstanceStorage",
         &[
             "Underprovisioned",
             "Overprovisioned",
@@ -68,6 +82,45 @@ const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
             "NotOptimized",
         ],
     ),
+    (
+        "AuroraDBClusterStorage",
+        &[
+            "Underprovisioned",
+            "Overprovisioned",
+            "Optimized",
+            "NotOptimized",
+        ],
+    ),
+    ("NatGateway", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("DynamoDBTable", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("ElastiCacheCluster", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("MemoryDBCluster", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("DocumentDBCluster", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("WorkSpaces", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("SageMakerEndpoint", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+];
+
+/// The `RecommendationSourceType` values the IDLE analysis covers, and so the groups whose
+/// summary carries `idleSummaries` and `idleSavingsOpportunity` — whether or not the account
+/// holds an idle resource of them.
+///
+/// Source: the model's `IdleRecommendationResourceType` enum
+/// (`crate::ops::types::IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES`) under the summary's own
+/// spelling of the same resources (`EC2Instance` against `Ec2Instance`, `EBSVolume` against
+/// `EbsVolume`, `ECSService` against `EcsService`, `RDSDBInstance` against `RdsDBInstance`).
+const IDLE_COVERED_RESOURCE_TYPES: &[&str] = &[
+    "Ec2Instance",
+    "AutoScalingGroup",
+    "EbsVolume",
+    "EcsService",
+    "RdsDBInstance",
+    "NatGateway",
+    "DynamoDBTable",
+    "ElastiCacheCluster",
+    "MemoryDBCluster",
+    "DocumentDBCluster",
+    "WorkSpaces",
+    "SageMakerEndpoint",
 ];
 
 /// The model's `IdleFinding` enum (`crate::ops::types::IDLE_FINDING_VALUES`), the only
@@ -234,29 +287,13 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
             .find(|(name, _)| *name == resource_type)
             .map(|(_, findings)| *findings)
             .unwrap_or_else(|| {
-                // A resource type the service names no `Finding` vocabulary for carries no
-                // rightsizing counts at all; it is summarised because the service reports
-                // recommendations for resources of it.
-                assert!(
-                    RECOMMENDATION_SOURCE_TYPE_VALUES.contains(&resource_type.as_str()),
-                    "case {case:?}: unknown resource type in {summary}"
-                );
-                &[]
+                panic!("case {case:?}: unknown resource type in {summary}");
             });
 
-        let finding_summaries = if expected_findings.is_empty() {
-            assert!(
-                summary["summaries"].is_null(),
-                "case {case:?}: the service names no Finding vocabulary for this resource \
-                 type, so it reports no rightsizing counts, got {summary}"
-            );
-            Vec::new()
-        } else {
-            summary["summaries"]
-                .as_array()
-                .unwrap_or_else(|| panic!("case {case:?}: summaries must be a list, got {summary}"))
-                .clone()
-        };
+        let finding_summaries = summary["summaries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: summaries must be a list, got {summary}"))
+            .clone();
         let reported: Vec<&str> = finding_summaries
             .iter()
             .map(|entry| entry["name"].as_str().unwrap_or_default())
@@ -279,23 +316,25 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
             resources += count;
 
             if let Some(reason_codes) = entry["reasonCodeSummaries"].as_array() {
+                let reported: Vec<&str> = reason_codes
+                    .iter()
+                    .map(|reason| reason["name"].as_str().unwrap_or_default())
+                    .collect();
+                assert_eq!(
+                    reported, *FINDING_REASON_CODES,
+                    "case {case:?}/{finding:?}: expected a count at each FindingReasonCode \
+                     {FINDING_REASON_CODES:?}, got {reported:?}"
+                );
                 for reason in reason_codes {
-                    let name = reason["name"].as_str().unwrap_or_default();
-                    assert!(
-                        FINDING_REASON_CODES.contains(&name),
-                        "case {case:?}/{finding:?}: {name:?} is not a FindingReasonCode, got \
-                         {reason}"
-                    );
                     let reason_count = number(&reason["value"], &format!("{case}/{finding}"));
                     assert!(
-                        reason_count > 0.0 && reason_count <= count,
+                        reason_count >= 0.0 && reason_count <= count,
                         "case {case:?}/{finding:?}: a reason code explains at most the {count} \
                          resources at that finding, got {reason_count}"
                     );
                 }
             }
         }
-        let mut idle_resources = 0.0;
         let idle_counts = summary["idleSummaries"].as_array().cloned();
 
         let ratings = &summary["currentPerformanceRiskRatings"];
@@ -311,10 +350,17 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
 
         // An idle resource is a record of its own — the analysis `GetIdleRecommendations`
         // reports — and a summary describes it beside the rightsizing findings: a count at
-        // each `IdleFinding` where resources of this type were found idle, with what
-        // dropping them saves, and nothing where none was.
+        // each `IdleFinding` for every resource type the idle analysis covers, zero where
+        // none of the account's resources of it was found idle, and no idle member at all
+        // for a resource type that analysis does not cover.
+        let covers_idle = IDLE_COVERED_RESOURCE_TYPES.contains(&resource_type.as_str());
         match idle_counts {
             Some(idle_counts) => {
+                assert!(
+                    covers_idle,
+                    "case {case:?}: the idle analysis does not cover this resource type, so it \
+                     has no idle counts to report, got {summary}"
+                );
                 let names: Vec<&str> = idle_counts
                     .iter()
                     .map(|entry| entry["name"].as_str().unwrap_or_default())
@@ -332,23 +378,24 @@ async fn every_summary_is_its_resource_type_s_resources_counted_and_costed() {
                         "case {case:?}/{finding:?}: an idle count is a whole number of \
                          resources, got {count}"
                     );
-                    idle_resources += count;
                 }
+            }
+            None => {
                 assert!(
-                    idle_resources > 0.0,
-                    "case {case:?}: idleSummaries is reported only where resources were found \
-                     idle, got {summary}"
+                    !covers_idle,
+                    "case {case:?}: the idle analysis covers this resource type, so its summary \
+                     reports a count at each IdleFinding, got {summary}"
+                );
+                assert!(
+                    summary["idleSavingsOpportunity"].is_null(),
+                    "case {case:?}: a resource type the idle analysis does not cover has no \
+                     idle saving to report either, got {summary}"
                 );
             }
-            None => assert!(
-                summary["idleSavingsOpportunity"].is_null(),
-                "case {case:?}: a resource type none of whose resources were found idle has no \
-                 idle saving to report either, got {summary}"
-            ),
         }
 
         let rightsizing = savings_value(summary, "savingsOpportunity", &case);
-        let idle = if idle_resources > 0.0 {
+        let idle = if covers_idle {
             savings_value(summary, "idleSavingsOpportunity", &case)
         } else {
             0.0

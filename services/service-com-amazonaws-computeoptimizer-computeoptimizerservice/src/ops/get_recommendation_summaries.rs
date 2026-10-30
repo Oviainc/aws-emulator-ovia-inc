@@ -5,11 +5,11 @@
 //! IMPLEMENTED: aggregates EVERYTHING the service holds for the account — its FINDINGS
 //! CATALOG (`crate::state::AnalysedResource`) and its IDLE resource analysis
 //! (`crate::state::IdleResourceAnalysis`, what `GetIdleRecommendations` reports) — into one
-//! summary per `RecommendationSourceType` the service reports recommendations for
-//! ([`crate::state::summarised_resource_types`]): how many of the account's rightsized
-//! resources carry each `Finding` the service reports for that resource type and why, how
-//! many of its resources the analysis found idle at each `IdleFinding`, how many run each
-//! `CurrentPerformanceRisk`, and what adopting the rightsizing recommendations, the idle
+//! summary per `RecommendationSourceType` the service TRACKS
+//! (`crate::state::TRACKED_SOURCE_TYPES`), whatever the account holds of it: how many of its
+//! rightsized resources carry each `Finding` the service reports for that resource type and
+//! why, how many of its resources the analysis found idle at each `IdleFinding`, how many run
+//! each `CurrentPerformanceRisk`, and what adopting the rightsizing recommendations, the idle
 //! ones, and both together would save per month — one page at a time: at most `maxResults`
 //! summaries plus an opaque `nextToken` while summaries remain.
 //!
@@ -19,7 +19,9 @@
 //!
 //! Every number is computed from the stored rows, so a count, a saving and a percentage
 //! can never disagree with each other or with the per-resource findings those same rows
-//! describe. This operation only reads: nothing it answers writes to the store.
+//! describe, and a resource type the account holds nothing of is summarised with those
+//! counts at zero rather than left out. This operation only reads: nothing it answers writes
+//! to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -208,17 +210,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::requested_account_id(input.account_ids.as_deref())
             .map_err(invalid_parameter)?;
 
-        // A `nextToken` this operation did not issue cannot name a page boundary.
+        // A `nextToken` this operation did not issue cannot name a page boundary, and
+        // neither can one naming a group this operation does not report — the token names
+        // the group the next page STARTS at, so it is resolved to that group's position in
+        // the reported order ([`crate::state::TRACKED_SOURCE_TYPES`]) rather than compared
+        // against the groups, which only an order-by-name walk could do.
         let resume_at = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::decode_summary_page_token(token) {
-                Some(resource_type) => Some(resource_type),
-                None => {
-                    return Err(invalid_parameter(
-                        "The value supplied for parameter nextToken is not valid.".to_string(),
-                    ))
+            None => 0,
+            Some(token) => {
+                match crate::state::decode_summary_page_token(token).and_then(|resource_type| {
+                    crate::state::TRACKED_SOURCE_TYPES
+                        .iter()
+                        .position(|tracked| *tracked == resource_type)
+                }) {
+                    Some(at) => at,
+                    None => {
+                        return Err(invalid_parameter(
+                            "The value supplied for parameter nextToken is not valid.".to_string(),
+                        ))
+                    }
                 }
-            },
+            }
         };
 
         // `maxResults` is modelled 0..1000 (the boundary refuses anything outside that).
@@ -260,21 +272,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below ARE and not which resource types are summarised.
         let analysed = guard.analysed_resources_by_type(&account_id);
         let idle = guard.idle_analyses_by_source_type(&account_id);
-        // One summary per resource type this service reports recommendations for
-        // ([`crate::state::summarised_resource_types`]), in one stable order, together with
-        // any resource type the account holds a record of outside that vocabulary so no group
-        // the store holds goes unsummarised. A summary is a COUNT ROLL-UP of the account's
-        // records of its resource type, so a resource type the account has no record of is
-        // summarised with counts of zero rather than left out: that is what tells a caller
-        // "enrolled, nothing to optimize of this kind" apart from "no such surface".
-        let resource_types: ::std::collections::BTreeSet<&str> =
-            crate::state::summarised_resource_types()
-                .iter()
-                .copied()
-                .chain(analysed.keys().copied())
-                .chain(idle.keys().copied())
-                .collect();
-        for resource_type in resource_types {
+        // One summary per resource type this service TRACKS — every value of the
+        // `RecommendationSourceType` vocabulary `RecommendationSummary$recommendationResourceType`
+        // names ([`crate::state::TRACKED_SOURCE_TYPES`]), in that vocabulary's order — and
+        // not only the types the account happens to hold rows of: "Returns the optimization
+        // findings for an account. It returns the number of" resources at each finding, and
+        // the number at a finding no resource carries is zero. So an enrolled account whose
+        // analysis has produced nothing yet reads a summary per tracked resource type with
+        // every count at zero, which is what tells a caller the type is tracked and has
+        // nothing to optimize — an absent entry would say the type is not reported at all.
+        // Every group the store holds is in that vocabulary, because a record names its
+        // resource type with one of its values.
+        for resource_type in crate::state::TRACKED_SOURCE_TYPES
+            .iter()
+            .skip(resume_at)
+            .copied()
+        {
             let resources = analysed
                 .get(resource_type)
                 .map(Vec::as_slice)
@@ -283,9 +296,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(resource_type)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            if resume_at.as_deref().is_some_and(|start| resource_type < start) {
-                continue;
-            }
             if recommendation_summaries.len() >= page_size {
                 // The page is full and this resource type is the next page's first.
                 next_token = Some(crate::state::encode_summary_page_token(resource_type));
@@ -354,17 +364,24 @@ fn summarise(
 
     let finding_summaries = finding_summaries(resource_type, resources);
     let inferred_workload_savings = inferred_workload_savings(resources);
+    // Whether the idle analysis covers this group at all: a group it covers carries a count
+    // at each `IdleFinding` — zero where nothing of it was found idle — and a group outside
+    // the idle vocabulary carries no idle counts and no idle saving, because none is defined
+    // for it rather than because this account has none.
+    let reports_idle = crate::state::reports_idle_recommendations(resource_type);
     RecommendationSummary {
-        // A resource type this service names no `Finding` vocabulary for carries no
-        // rightsizing counts at all, rather than an empty list of them.
+        // Every tracked resource type has a `Finding` vocabulary, so this is the counts at
+        // it; a resource type the service names none for would carry no counts at all
+        // rather than an empty list of them.
         summaries: (!finding_summaries.is_empty()).then_some(finding_summaries),
         // "Describes the findings summary of the idle resources" — reported for a resource
-        // type the analysis found resources of idle, and absent for one it found none of.
-        idle_summaries: (!idle_resources.is_empty()).then(|| idle_summaries(idle_resources)),
+        // type the idle analysis covers, whether or not it found any of this account's
+        // resources of it idle.
+        idle_summaries: reports_idle.then(|| idle_summaries(idle_resources)),
         recommendation_resource_type: Some(resource_type.to_string()),
         account_id: Some(account_id.to_string()),
         savings_opportunity: Some(savings_opportunity(rightsizing_savings, current_monthly_cost)),
-        idle_savings_opportunity: (!idle_resources.is_empty())
+        idle_savings_opportunity: reports_idle
             .then(|| savings_opportunity(idle_savings, idle_monthly_cost)),
         // "The savings opportunity for recommendations of a given resource type": every
         // recommendation the service holds for this resource type, so the rightsizing
@@ -402,38 +419,39 @@ fn idle_summaries(idle_resources: &[&crate::state::IdleResourceAnalysis]) -> Vec
 /// the order the service documents them — including a finding none of them carries, whose
 /// count is then zero, because the summary states the number of resources AT each finding
 /// rather than only the findings that occurred. Each finding also carries how many of the
-/// resources at it name each `FindingReasonCode`.
+/// resources at it name each `FindingReasonCode`, by the same rule: a count at every value
+/// of the vocabulary `ReasonCodeSummary$name` admits, zero where no resource names it.
 fn finding_summaries(
     resource_type: &str,
     resources: &[&crate::state::AnalysedResource],
 ) -> Vec<Summary> {
     crate::state::findings_reported_for(resource_type)
         .iter()
-        .map(|finding| {
-            let mut reason_codes: ::std::collections::BTreeMap<&str, f64> =
-                ::std::collections::BTreeMap::new();
-            let mut count = 0.0;
-            for resource in resources
+        .map(|(finding, reported_as)| {
+            let at_finding: Vec<&&crate::state::AnalysedResource> = resources
                 .iter()
                 .filter(|resource| resource.finding == *finding)
-            {
-                count += 1.0;
-                for reason_code in &resource.finding_reason_codes {
-                    *reason_codes.entry(reason_code.as_str()).or_insert(0.0) += 1.0;
-                }
-            }
+                .collect();
             Summary {
-                name: Some((*finding).to_string()),
-                value: count,
-                reason_code_summaries: (!reason_codes.is_empty()).then(|| {
-                    reason_codes
-                        .into_iter()
-                        .map(|(name, value)| ReasonCodeSummary {
-                            name: Some(name.to_string()),
-                            value,
+                name: Some((*reported_as).to_string()),
+                value: at_finding.len() as f64,
+                reason_code_summaries: Some(
+                    crate::state::finding_reason_codes_reported_for()
+                        .iter()
+                        .map(|reason_code| ReasonCodeSummary {
+                            name: Some((*reason_code).to_string()),
+                            value: at_finding
+                                .iter()
+                                .filter(|resource| {
+                                    resource
+                                        .finding_reason_codes
+                                        .iter()
+                                        .any(|held| held == reason_code)
+                                })
+                                .count() as f64,
                         })
-                        .collect()
-                }),
+                        .collect(),
+                ),
             }
         })
         .collect()

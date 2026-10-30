@@ -986,10 +986,18 @@ async fn the_auto_scaling_group_summary_agrees_with_the_recommendations() {
         .unwrap_or_else(|| panic!("no Auto Scaling group summary was reported: {summaries}"));
 
     // The summary reports a count at every finding of the resource type, including the
-    // ones no group carries, so a finding the recommendations do not show counts zero.
+    // ones no group carries, so a finding the recommendations do not show counts zero. The
+    // roll-up names the `Finding` vocabulary in the instance surface's upper-snake spelling
+    // (`NOT_OPTIMIZED`) while this reader reports the modelled enum value (`NotOptimized`):
+    // the same classification, named as each surface names it.
     for finding in summary["summaries"].as_array().cloned().unwrap_or_default() {
         let name = finding["name"].as_str().unwrap_or_default().to_string();
-        let expected = expected_counts.get(&name).copied().unwrap_or(0.0);
+        let reported_as = match name.as_str() {
+            "NOT_OPTIMIZED" => "NotOptimized",
+            "OPTIMIZED" => "Optimized",
+            other => other,
+        };
+        let expected = expected_counts.get(reported_as).copied().unwrap_or(0.0);
         assert!(
             (number(&finding["value"]) - expected).abs() < 0.01,
             "case {name:?}: the summary must count the groups this operation reports \

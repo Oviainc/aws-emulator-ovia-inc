@@ -39,29 +39,37 @@ fn caller_account() -> String {
     ::engine::emulator_account_id().to_string()
 }
 
-/// The `Finding` values a summary of each resource type reports a count for.
+/// The findings a summary of each resource type reports a count at, under the name the
+/// summary reports them with.
 ///
-/// Source: the `GetRecommendationSummaries` documentation in this service's Smithy model —
-/// "It returns the number of: Amazon EC2 instances in an account that are Underprovisioned,
-/// Overprovisioned, or Optimized. EC2 Auto Scaling groups in an account that are
-/// NotOptimized, or Optimized. Amazon EBS volumes in an account that are NotOptimized, or
-/// Optimized. Lambda functions in an account that are NotOptimized, or Optimized. Amazon ECS
-/// services in an account that are Underprovisioned, Overprovisioned, or Optimized.
-/// Commercial software licenses in an account that are InsufficientMetrics, NotOptimized or
-/// Optimized. Amazon Aurora and Amazon RDS databases in an account that are
-/// Underprovisioned, Overprovisioned, Optimized, or NotOptimized." `Summary$name` targets the
-/// model's `Finding` enum, so a license's documented `InsufficientMetrics` — a
-/// `LicenseFinding` value — is not a count a `Summary` can carry.
+/// WHICH findings: the `GetRecommendationSummaries` documentation in this service's Smithy
+/// model — "It returns the number of: Amazon EC2 instances in an account that are
+/// Underprovisioned, Overprovisioned, or Optimized. EC2 Auto Scaling groups in an account
+/// that are NotOptimized, or Optimized. Amazon EBS volumes in an account that are
+/// NotOptimized, or Optimized. Lambda functions in an account that are NotOptimized, or
+/// Optimized. Amazon ECS services in an account that are Underprovisioned, Overprovisioned,
+/// or Optimized. Commercial software licenses in an account that are InsufficientMetrics,
+/// NotOptimized or Optimized. Amazon Aurora and Amazon RDS databases in an account that are
+/// Underprovisioned, Overprovisioned, Optimized, or NotOptimized." `Summary$name` targets
+/// the model's `Finding` enum, so a license's documented `InsufficientMetrics` — a
+/// `LicenseFinding` value — is not a count a `Summary` can carry; and each group is counted
+/// at the vocabulary of its OWN recommendations, so a database instance carries the three
+/// `RDSInstanceFinding` values while its storage carries the four of `RDSStorageFinding`. A
+/// resource type the documentation names no vocabulary for is counted at the generic
+/// classification pair.
 ///
-/// A resource type absent from this table is one the service documents no `Finding`
-/// vocabulary for: it is summarised too (the rule under test), carrying no rightsizing counts
-/// at all rather than an invented vocabulary.
+/// Under WHICH NAME: a resource type whose recommendations carry a finding vocabulary of
+/// their own is counted in that vocabulary's spelling (`EBSFinding`,
+/// `LambdaFunctionRecommendationFinding`, `ECSServiceRecommendationFinding`,
+/// `RDSInstanceFinding`, `RDSStorageFinding`, `LicenseFinding` — all camel case), and every
+/// other one at the `Finding` vocabulary as the instance surface spells it, in upper snake
+/// case.
 const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
     (
         "Ec2Instance",
-        &["Underprovisioned", "Overprovisioned", "Optimized"],
+        &["UNDER_PROVISIONED", "OVER_PROVISIONED", "OPTIMIZED"],
     ),
-    ("AutoScalingGroup", &["NotOptimized", "Optimized"]),
+    ("AutoScalingGroup", &["NOT_OPTIMIZED", "OPTIMIZED"]),
     ("EbsVolume", &["NotOptimized", "Optimized"]),
     ("LambdaFunction", &["NotOptimized", "Optimized"]),
     (
@@ -71,6 +79,10 @@ const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
     ("License", &["NotOptimized", "Optimized"]),
     (
         "RdsDBInstance",
+        &["Underprovisioned", "Overprovisioned", "Optimized"],
+    ),
+    (
+        "RdsDBInstanceStorage",
         &[
             "Underprovisioned",
             "Overprovisioned",
@@ -78,6 +90,22 @@ const FINDINGS_BY_RESOURCE_TYPE: &[(&str, &[&str])] = &[
             "NotOptimized",
         ],
     ),
+    (
+        "AuroraDBClusterStorage",
+        &[
+            "Underprovisioned",
+            "Overprovisioned",
+            "Optimized",
+            "NotOptimized",
+        ],
+    ),
+    ("NatGateway", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("DynamoDBTable", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("ElastiCacheCluster", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("MemoryDBCluster", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("DocumentDBCluster", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("WorkSpaces", &["NOT_OPTIMIZED", "OPTIMIZED"]),
+    ("SageMakerEndpoint", &["NOT_OPTIMIZED", "OPTIMIZED"]),
 ];
 
 /// One idle Amazon DynamoDB table to record into the analysis: a resource of a type the
@@ -160,6 +188,18 @@ fn resource_types(summaries: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// How many idle resources `summary` counts across the `IdleFinding` values it reports; a
+/// resource type the idle analysis does not cover reports none at all.
+fn idle_counts(summary: &Value, case: &str) -> f64 {
+    summary["idleSummaries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| number(&entry["value"], case))
+        .sum()
+}
+
 /// How many resources `summary` counts across the `Finding` values it reports, plus the
 /// `CurrentPerformanceRisk` ratings it rates and the idle resources it counts.
 fn counted(summary: &Value, case: &str) -> f64 {
@@ -224,39 +264,28 @@ fn assert_rolls_up_every_resource_type(case: &str, summaries: &[Value]) {
         let findings = FINDINGS_BY_RESOURCE_TYPE
             .iter()
             .find(|(name, _)| *name == resource_type)
-            .map(|(_, findings)| *findings);
-        match findings {
-            // A resource type the service documents a `Finding` vocabulary for: a count at
-            // each of those findings, present and zero where no resource carries it.
-            Some(findings) => {
-                let counts = summary["summaries"].as_array().cloned().unwrap_or_else(|| {
-                    panic!("case {row:?}: expected a count at each of {findings:?}, got {summary}")
-                });
-                let names: Vec<&str> = counts
-                    .iter()
-                    .map(|entry| entry["name"].as_str().unwrap_or_default())
-                    .collect();
-                assert_eq!(
-                    names, *findings,
-                    "case {row:?}: expected a count at each documented finding {findings:?}, got \
-                     {names:?}"
-                );
-                for entry in &counts {
-                    let count = number(&entry["value"], &row);
-                    assert!(
-                        count >= 0.0 && count.fract() == 0.0,
-                        "case {row:?}: a finding count is a whole number of resources, got {entry}"
-                    );
-                }
-            }
-            // A resource type the service documents no `Finding` vocabulary for carries no
-            // rightsizing counts at all, rather than an invented vocabulary — it is still
-            // summarised.
-            None => assert!(
-                summary["summaries"].is_null(),
-                "case {row:?}: the service documents no Finding vocabulary for this resource \
-                 type, so it reports no rightsizing counts, got {summary}"
-            ),
+            .map(|(_, findings)| *findings)
+            .unwrap_or_else(|| {
+                panic!("case {row:?}: unknown resource type in {summary}");
+            });
+        let counts = summary["summaries"].as_array().cloned().unwrap_or_else(|| {
+            panic!("case {row:?}: expected a count at each of {findings:?}, got {summary}")
+        });
+        let names: Vec<&str> = counts
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names, *findings,
+            "case {row:?}: expected a count at each documented finding {findings:?}, got \
+             {names:?}"
+        );
+        for entry in &counts {
+            let count = number(&entry["value"], &row);
+            assert!(
+                count >= 0.0 && count.fract() == 0.0,
+                "case {row:?}: a finding count is a whole number of resources, got {entry}"
+            );
         }
     }
 }
@@ -292,10 +321,10 @@ async fn an_enrolled_account_is_summarised_per_resource_type_the_service_reports
             0.0,
             "case {row:?}: with nothing analysed there is nothing to save, got {summary}"
         );
-        assert!(
-            summary["idleSummaries"].is_null() && summary["idleSavingsOpportunity"].is_null(),
-            "case {row:?}: nothing was found idle, so neither idle member is reported, got \
-             {summary}"
+        assert_eq!(
+            idle_counts(summary, &row),
+            0.0,
+            "case {row:?}: nothing was found idle, so every idle count is zero, got {summary}"
         );
     }
 

@@ -89,6 +89,7 @@ use crate::ops::types::{
     VolumeConfiguration, VolumeRecommendation, VolumeRecommendationOption,
     ENROLLMENT_FILTER_NAME_VALUES, EXTERNAL_METRICS_SOURCE_VALUES,
     EXTERNAL_METRIC_STATUS_CODE_VALUES, FILTER_NAME_VALUES,
+    FINDING_REASON_CODE_VALUES,
     FINDING_VALUES,
     IDLE_FINDING_VALUES,
     IDLE_RECOMMENDATION_FILTER_NAME_VALUES, IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES,
@@ -2136,8 +2137,17 @@ pub fn percentage_of(part: f64, whole: f64) -> f64 {
 
 /// Round a derived figure to two decimal places, so a money amount lands on whole cents
 /// and a percentage does not report binary-float noise.
+///
+/// A figure that rounds to zero is reported as `0`, never as the negative zero binary
+/// floating point also has: a response states what a resource costs or saves, and no such
+/// amount is a negative zero.
 pub fn round_hundredths(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
+    let rounded = (value * 100.0).round() / 100.0;
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
 }
 
 /// A resource's tags as the modelled `Tags` list, or `None` where it carries none. Every
@@ -2428,6 +2438,25 @@ pub const FINDING_OPTIMIZED: &str = "Optimized";
 /// See [`FINDING_UNDERPROVISIONED`].
 pub const FINDING_NOT_OPTIMIZED: &str = "NotOptimized";
 
+/// The `Finding` values AS A RECOMMENDATION SUMMARY SPELLS THEM: the EC2 instance
+/// surface's own upper-snake spelling of the same four classifications
+/// ([`FINDING_UNDERPROVISIONED`] and the three below it), which is what
+/// `GetRecommendationSummaries` names a count under for a resource type counted at the
+/// `Finding` vocabulary itself.
+///
+/// A resource type whose recommendations carry their OWN finding vocabulary — an Amazon EBS
+/// volume (`EBSFinding`), a Lambda function (`LambdaFunctionRecommendationFinding`), an
+/// Amazon ECS service (`ECSServiceRecommendationFinding`), a license (`LicenseFinding`), a
+/// database (`RDSInstanceFinding`, `RDSStorageFinding`) — is counted at THAT vocabulary and
+/// in its spelling instead; [`findings_reported_for`] is the one table of which is which.
+pub const SUMMARY_FINDING_UNDERPROVISIONED: &str = "UNDER_PROVISIONED";
+/// See [`SUMMARY_FINDING_UNDERPROVISIONED`].
+pub const SUMMARY_FINDING_OVERPROVISIONED: &str = "OVER_PROVISIONED";
+/// See [`SUMMARY_FINDING_UNDERPROVISIONED`].
+pub const SUMMARY_FINDING_OPTIMIZED: &str = "OPTIMIZED";
+/// See [`SUMMARY_FINDING_UNDERPROVISIONED`].
+pub const SUMMARY_FINDING_NOT_OPTIMIZED: &str = "NOT_OPTIMIZED";
+
 /// The `RecommendationSourceType` values the findings catalog holds resources of
 /// (`crate::ops::types::RECOMMENDATION_SOURCE_TYPE_VALUES`).
 pub const SOURCE_TYPE_EC2_INSTANCE: &str = "Ec2Instance";
@@ -2446,9 +2475,9 @@ pub const SOURCE_TYPE_LICENSE: &str = "License";
 
 /// The `RecommendationSourceType` values this service holds resources of ONLY as idle
 /// resources (`crate::ops::types::RECOMMENDATION_SOURCE_TYPE_VALUES`): a resource kind
-/// Compute Optimizer reports an idle recommendation for and no rightsizing finding, so a
-/// summary of one counts what was found idle and no `Finding` at all
-/// ([`findings_reported_for`]).
+/// Compute Optimizer reports an idle recommendation for and no rightsizing analysis, so a
+/// summary of one counts what was found idle beside a rightsizing classification every one
+/// of whose counts is zero ([`findings_reported_for`]).
 pub const SOURCE_TYPE_NAT_GATEWAY: &str = "NatGateway";
 /// See [`SOURCE_TYPE_NAT_GATEWAY`].
 pub const SOURCE_TYPE_DYNAMODB_TABLE: &str = "DynamoDBTable";
@@ -2463,63 +2492,147 @@ pub const SOURCE_TYPE_WORKSPACES: &str = "WorkSpaces";
 /// See [`SOURCE_TYPE_NAT_GATEWAY`].
 pub const SOURCE_TYPE_SAGEMAKER_ENDPOINT: &str = "SageMakerEndpoint";
 
-/// The `RecommendationSourceType` values an enrolled account's recommendation summaries
-/// cover: every resource type this service reports recommendations for, which is the model's
-/// own `RecommendationSourceType` vocabulary
-/// (`crate::ops::types::RECOMMENDATION_SOURCE_TYPE_VALUES`).
+/// The two `RecommendationSourceType` values naming a database's STORAGE rather than the
+/// database itself (`crate::ops::types::RECOMMENDATION_SOURCE_TYPE_VALUES`): groups this
+/// service tracks and holds no analysis of, so a summary of one counts nothing.
+pub const SOURCE_TYPE_RDS_DB_INSTANCE_STORAGE: &str = "RdsDBInstanceStorage";
+/// See [`SOURCE_TYPE_RDS_DB_INSTANCE_STORAGE`].
+pub const SOURCE_TYPE_AURORA_DB_CLUSTER_STORAGE: &str = "AuroraDBClusterStorage";
+
+/// Every `RecommendationSourceType` this service TRACKS — the whole vocabulary
+/// `RecommendationSummary$recommendationResourceType` names — in the order the model
+/// declares it, which is the order `GetRecommendationSummaries` reports one summary per
+/// group in.
 ///
 /// A recommendation summary is a COUNT ROLL-UP per resource type — `Summary$value` is a
 /// count whose default is `0` — so the summaries an enrolled account is answered with are
 /// this whole vocabulary rather than the subset the analysis happens to hold a row of: a
 /// resource type nothing of which has been analysed is summarised with counts of zero, which
 /// is how a caller reads an enrolled account's zero-finding baseline instead of being unable
-/// to tell it from no summary surface at all.
-///
-/// What a summary COUNTS is the analysis a caller can read
+/// to tell it from no summary surface at all. What a summary COUNTS is the analysis a caller
+/// can read
 /// ([`ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]),
 /// so the analysis an enrollment starts ([`ANALYSIS_DELAY`]) decides what the counts ARE and
 /// never whether the summary exists.
-pub fn summarised_resource_types() -> &'static [&'static str] {
-    RECOMMENDATION_SOURCE_TYPE_VALUES
-}
+///
+/// `crate::ops::types::RECOMMENDATION_SOURCE_TYPE_VALUES` holds the same values SORTED,
+/// which is the order a value LOOKUP wants and not the order the groups are reported in;
+/// `tests/all/tracked_resource_type_summaries.rs` pins this list against it, so a value the
+/// model adds or renames cannot be missed here.
+pub const TRACKED_SOURCE_TYPES: &[&str] = &[
+    SOURCE_TYPE_EC2_INSTANCE,
+    SOURCE_TYPE_AUTO_SCALING_GROUP,
+    SOURCE_TYPE_EBS_VOLUME,
+    SOURCE_TYPE_LAMBDA_FUNCTION,
+    SOURCE_TYPE_ECS_SERVICE,
+    SOURCE_TYPE_LICENSE,
+    SOURCE_TYPE_RDS_DB_INSTANCE,
+    SOURCE_TYPE_RDS_DB_INSTANCE_STORAGE,
+    SOURCE_TYPE_AURORA_DB_CLUSTER_STORAGE,
+    SOURCE_TYPE_NAT_GATEWAY,
+    SOURCE_TYPE_DYNAMODB_TABLE,
+    SOURCE_TYPE_ELASTICACHE_CLUSTER,
+    SOURCE_TYPE_MEMORYDB_CLUSTER,
+    SOURCE_TYPE_DOCUMENTDB_CLUSTER,
+    SOURCE_TYPE_WORKSPACES,
+    SOURCE_TYPE_SAGEMAKER_ENDPOINT,
+];
 
-/// The `Finding` values a summary of `resource_type` reports a count for, from the
-/// `GetRecommendationSummaries` documentation: "It returns the number of: Amazon EC2
-/// instances in an account that are Underprovisioned, Overprovisioned, or Optimized.
-/// EC2 Auto Scaling groups in an account that are NotOptimized, or Optimized. Amazon EBS
-/// volumes in an account that are NotOptimized, or Optimized. Lambda functions in an
-/// account that are NotOptimized, or Optimized. Amazon ECS services in an account that
-/// are Underprovisioned, Overprovisioned, or Optimized. Commercial software licenses in
-/// an account that are InsufficientMetrics, NotOptimized or Optimized. Amazon Aurora and
-/// Amazon RDS databases in an account that are Underprovisioned, Overprovisioned,
-/// Optimized, or NotOptimized."
+/// The findings a summary of `resource_type` reports a count at, each as the `Finding` a
+/// catalog row at it STORES paired with the NAME the summary reports that count under.
 ///
-/// Every value here is one of the model's `Finding` enum, because that is what
-/// `Summary$name` targets: the one documented finding outside it — a license's
-/// `InsufficientMetrics`, which belongs to `LicenseFinding` — is therefore not a count a
-/// `Summary` can carry, so a `License` summary reports the two findings `Finding` holds.
+/// Which findings, from the `GetRecommendationSummaries` documentation: "It returns the
+/// number of: Amazon EC2 instances in an account that are Underprovisioned,
+/// Overprovisioned, or Optimized. EC2 Auto Scaling groups in an account that are
+/// NotOptimized, or Optimized. Amazon EBS volumes in an account that are NotOptimized, or
+/// Optimized. Lambda functions in an account that are NotOptimized, or Optimized. Amazon
+/// ECS services in an account that are Underprovisioned, Overprovisioned, or Optimized.
+/// Commercial software licenses in an account that are InsufficientMetrics, NotOptimized or
+/// Optimized. Amazon Aurora and Amazon RDS databases in an account that are
+/// Underprovisioned, Overprovisioned, Optimized, or NotOptimized."
 ///
-/// An empty slice for a resource type whose findings this emulator does not summarise, so
-/// a reader reports no summary for it rather than an invented vocabulary.
-pub fn findings_reported_for(resource_type: &str) -> &'static [&'static str] {
+/// Under WHICH NAME: the vocabulary of the resource type's OWN recommendations. A resource
+/// type the model gives a finding enum of its own is counted at that enum and in its
+/// spelling — `EBSFinding` for a volume, `LambdaFunctionRecommendationFinding` for a
+/// function, `ECSServiceRecommendationFinding` for an Amazon ECS service,
+/// `RDSInstanceFinding` for a database and `RDSStorageFinding` for its storage. Every other
+/// tracked resource type is counted at the `Finding` vocabulary itself, which the instance
+/// surface spells in upper snake case ([`SUMMARY_FINDING_UNDERPROVISIONED`]) — so an EC2
+/// instance count is reported under `OPTIMIZED` while an EBS volume count is reported under
+/// `Optimized`, each as the surface that produced the finding names it.
+///
+/// Each vocabulary is narrowed to the values `Summary$name` can carry, the model's `Finding`
+/// enum: a license's documented `InsufficientMetrics` is a `LicenseFinding` value outside
+/// it, so a license whose metrics the analysis could not read is counted at no finding at all
+/// — and is no catalog row either ([`ObservedLicensedInstance::to_analysed_resource`]), so a
+/// count and the rows behind it still agree.
+///
+/// An empty slice for a `RecommendationSourceType` this service does not track
+/// ([`TRACKED_SOURCE_TYPES`]) and for any other string, so a caller reports no counts for
+/// it rather than an invented vocabulary.
+pub fn findings_reported_for(resource_type: &str) -> &'static [(&'static str, &'static str)] {
     match resource_type {
-        SOURCE_TYPE_EC2_INSTANCE | SOURCE_TYPE_ECS_SERVICE => &[
-            FINDING_UNDERPROVISIONED,
-            FINDING_OVERPROVISIONED,
-            FINDING_OPTIMIZED,
+        // The `Finding` vocabulary, in the instance surface's own spelling.
+        SOURCE_TYPE_EC2_INSTANCE => &[
+            (FINDING_UNDERPROVISIONED, SUMMARY_FINDING_UNDERPROVISIONED),
+            (FINDING_OVERPROVISIONED, SUMMARY_FINDING_OVERPROVISIONED),
+            (FINDING_OPTIMIZED, SUMMARY_FINDING_OPTIMIZED),
         ],
         SOURCE_TYPE_AUTO_SCALING_GROUP
-        | SOURCE_TYPE_EBS_VOLUME
-        | SOURCE_TYPE_LAMBDA_FUNCTION
-        | SOURCE_TYPE_LICENSE => &[FINDING_NOT_OPTIMIZED, FINDING_OPTIMIZED],
+        | SOURCE_TYPE_NAT_GATEWAY
+        | SOURCE_TYPE_DYNAMODB_TABLE
+        | SOURCE_TYPE_ELASTICACHE_CLUSTER
+        | SOURCE_TYPE_MEMORYDB_CLUSTER
+        | SOURCE_TYPE_DOCUMENTDB_CLUSTER
+        | SOURCE_TYPE_WORKSPACES
+        | SOURCE_TYPE_SAGEMAKER_ENDPOINT => &[
+            (FINDING_NOT_OPTIMIZED, SUMMARY_FINDING_NOT_OPTIMIZED),
+            (FINDING_OPTIMIZED, SUMMARY_FINDING_OPTIMIZED),
+        ],
+        // `ECSServiceRecommendationFinding`.
+        SOURCE_TYPE_ECS_SERVICE => &[
+            (FINDING_UNDERPROVISIONED, FINDING_UNDERPROVISIONED),
+            (FINDING_OVERPROVISIONED, FINDING_OVERPROVISIONED),
+            (FINDING_OPTIMIZED, FINDING_OPTIMIZED),
+        ],
+        // `EBSFinding` and `LambdaFunctionRecommendationFinding`.
+        SOURCE_TYPE_EBS_VOLUME | SOURCE_TYPE_LAMBDA_FUNCTION => &[
+            (FINDING_NOT_OPTIMIZED, FINDING_NOT_OPTIMIZED),
+            (FINDING_OPTIMIZED, FINDING_OPTIMIZED),
+        ],
+        // `LicenseFinding`.
+        SOURCE_TYPE_LICENSE => &[
+            (FINDING_NOT_OPTIMIZED, FINDING_NOT_OPTIMIZED),
+            (FINDING_OPTIMIZED, FINDING_OPTIMIZED),
+        ],
+        // `RDSInstanceFinding`: a database's own finding vocabulary, which names no
+        // `NotOptimized` — that is its STORAGE's classification (`RDSStorageFinding`), and
+        // the documentation's four findings for "Amazon Aurora and Amazon RDS databases"
+        // are the two vocabularies together.
         SOURCE_TYPE_RDS_DB_INSTANCE => &[
-            FINDING_UNDERPROVISIONED,
-            FINDING_OVERPROVISIONED,
-            FINDING_OPTIMIZED,
-            FINDING_NOT_OPTIMIZED,
+            (FINDING_UNDERPROVISIONED, FINDING_UNDERPROVISIONED),
+            (FINDING_OVERPROVISIONED, FINDING_OVERPROVISIONED),
+            (FINDING_OPTIMIZED, FINDING_OPTIMIZED),
+        ],
+        // `RDSStorageFinding`.
+        SOURCE_TYPE_RDS_DB_INSTANCE_STORAGE | SOURCE_TYPE_AURORA_DB_CLUSTER_STORAGE => &[
+            (FINDING_UNDERPROVISIONED, FINDING_UNDERPROVISIONED),
+            (FINDING_OVERPROVISIONED, FINDING_OVERPROVISIONED),
+            (FINDING_OPTIMIZED, FINDING_OPTIMIZED),
+            (FINDING_NOT_OPTIMIZED, FINDING_NOT_OPTIMIZED),
         ],
         _ => &[],
     }
+}
+
+/// The `FindingReasonCode` values a summary reports a count at, beside the finding they
+/// explain: the whole vocabulary `ReasonCodeSummary$name` admits
+/// (`crate::ops::types::FINDING_REASON_CODE_VALUES`, the memory pair), whatever the resource
+/// type — the reason codes a resource type's OWN recommendations carry are spelled by their
+/// own enums (`InstanceRecommendationFindingReasonCode`, `LicenseFindingReasonCode`, …),
+/// which this shape cannot hold.
+pub fn finding_reason_codes_reported_for() -> &'static [&'static str] {
+    FINDING_REASON_CODE_VALUES
 }
 
 /// One resource Compute Optimizer has analysed for an account: the optimization finding
@@ -3102,6 +3215,23 @@ pub fn source_type_of_idle_resource_type(idle_resource_type: &str) -> Option<&'s
         "a summary group may only name a modelled RecommendationSourceType value"
     );
     Some(source_type)
+}
+
+/// Whether this service's idle analysis covers resources of `source_type`, i.e. whether a
+/// summary of that group has an `IdleFinding` vocabulary to count at all.
+///
+/// The idle vocabulary is `IdleRecommendationResourceType`
+/// (`crate::ops::types::IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES`) and a summary names its
+/// group with a `RecommendationSourceType`, so membership is decided by mapping the idle
+/// vocabulary through [`source_type_of_idle_resource_type`] rather than by a second list
+/// that could drift from it — and so a `RecommendationSourceType` outside the idle
+/// vocabulary (a Lambda function, a license, a storage group) is summarised with no idle
+/// counts at all.
+pub fn reports_idle_recommendations(source_type: &str) -> bool {
+    IDLE_RECOMMENDATION_RESOURCE_TYPE_VALUES
+        .iter()
+        .filter_map(|idle_resource_type| source_type_of_idle_resource_type(idle_resource_type))
+        .any(|covered| covered == source_type)
 }
 
 /// Check an `IdleRecommendationFilters` list against the vocabulary the model declares for
@@ -4629,7 +4759,10 @@ impl ObservedFunction {
     pub fn to_analysed_resource(&self, look_back_period: &str) -> Option<AnalysedResource> {
         let look_back_days = self.analysed_days(look_back_period);
         let finding = self.finding(look_back_days);
-        if !findings_reported_for(SOURCE_TYPE_LAMBDA_FUNCTION).contains(&finding) {
+        if !findings_reported_for(SOURCE_TYPE_LAMBDA_FUNCTION)
+            .iter()
+            .any(|(stored, _)| *stored == finding)
+        {
             return None;
         }
         Some(AnalysedResource {
