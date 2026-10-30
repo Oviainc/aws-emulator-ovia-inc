@@ -469,13 +469,13 @@ async fn an_arn_naming_no_resource_this_store_holds_is_refused_in_this_services_
         ),
         (
             "a registered location nobody registered",
-            format!("arn:aws:s3:{REGION}:{account}:access-grants/location/absent"),
+            format!("arn:aws:s3:{REGION}:{account}:access-grants/default/location/absent"),
             404,
             NO_SUCH_RESOURCE_CODE,
         ),
         (
             "an access grant nobody created",
-            format!("arn:aws:s3:{REGION}:{account}:access-grants/grant/absent"),
+            format!("arn:aws:s3:{REGION}:{account}:access-grants/default/grant/absent"),
             404,
             NO_SUCH_RESOURCE_CODE,
         ),

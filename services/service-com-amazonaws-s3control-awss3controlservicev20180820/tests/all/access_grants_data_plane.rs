@@ -35,9 +35,9 @@ use crate::access_point_lifecycle::{
 };
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
-    ACCESS_GRANTS_LOCATION_DEFAULT_ID, DATA_ACCESS_DEFAULT_DURATION_SECONDS,
-    DEFAULT_LOCATION_SCOPE, PERMISSION_READ, PERMISSION_READWRITE, PERMISSION_WRITE,
-    PRIVILEGE_DEFAULT, PRIVILEGE_MINIMAL,
+    ACCESS_GRANTS_INSTANCE_ID, ACCESS_GRANTS_LOCATION_DEFAULT_ID,
+    DATA_ACCESS_DEFAULT_DURATION_SECONDS, DEFAULT_LOCATION_SCOPE, PERMISSION_READ,
+    PERMISSION_READWRITE, PERMISSION_WRITE, PRIVILEGE_DEFAULT, PRIVILEGE_MINIMAL,
 };
 
 /// A second signing Region, used to pin that a grant belongs to the instance of
@@ -222,21 +222,24 @@ async fn get_data_access(
     call_in_region(&emulator.router, region, "GET", &uri, account_id, "").await
 }
 
-/// The ARN a grant of this id must report, per `AccessGrantArn`'s pattern
-/// `^arn:[a-z\-]+:s3:[a-z0-9\-]+:\d{12}:access\-grants\/grant/[a-zA-Z0-9\-]+$`.
+/// The ARN a grant of this id must report: the `grant/<id>` subresource of the
+/// Access Grants instance that holds it, so the instance segment
+/// (`ACCESS_GRANTS_INSTANCE_ID`) sits between `access-grants` and `grant`.
 fn expected_grant_arn(region: &str, grant_id: &str) -> String {
     format!(
-        "arn:aws:s3:{region}:{}:access-grants/grant/{grant_id}",
-        ::emulator_server::emulator_account_id()
+        "arn:aws:s3:{region}:{}:access-grants/{}/grant/{grant_id}",
+        ::emulator_server::emulator_account_id(),
+        ACCESS_GRANTS_INSTANCE_ID
     )
 }
 
-/// The ARN a registered location of this id must report, per
-/// `AccessGrantsLocationArn`'s pattern.
+/// The ARN a registered location of this id must report: the `location/<id>`
+/// subresource of the same instance. See [`expected_grant_arn`].
 fn expected_location_arn(region: &str, location_id: &str) -> String {
     format!(
-        "arn:aws:s3:{region}:{}:access-grants/location/{location_id}",
-        ::emulator_server::emulator_account_id()
+        "arn:aws:s3:{region}:{}:access-grants/{}/location/{location_id}",
+        ::emulator_server::emulator_account_id(),
+        ACCESS_GRANTS_INSTANCE_ID
     )
 }
 

@@ -4,9 +4,10 @@
 //!
 //! Reports the resource policy `PutAccessGrantsInstanceResourcePolicy` stored on
 //! the account's S3 Access Grants instance in the Region the request was signed
-//! for — the document verbatim, the organization the put named, and when it was
-//! stored. Refuses when that instance carries no policy, or the account has no
-//! instance in that Region. A pure read: it writes nothing.
+//! for — the document in the canonical rendering of the policy language it is
+//! written in, the organization the put named, and when it was stored. Refuses
+//! when that instance carries no policy, or the account has no instance in that
+//! Region. A pure read: it writes nothing.
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -157,7 +158,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetAccessGrantsInstanceResourcePolicyOutput {
-            policy: Some(policy.policy.clone()),
+            // The instance holds the POLICY the put expressed, so the read
+            // answers it in the policy language's canonical rendering rather
+            // than in the bytes that call reported back
+            // (`crate::state::canonical_resource_policy`).
+            policy: Some(crate::state::canonical_resource_policy(&policy.policy)),
             organization: policy.organization.clone(),
             created_at: Some(policy.created_at),
         })

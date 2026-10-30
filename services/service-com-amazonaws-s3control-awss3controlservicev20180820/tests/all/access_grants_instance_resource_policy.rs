@@ -7,16 +7,24 @@
 //! Grants instance — the one the request's account owns in the Region it was
 //! signed for — so a put stores the document it was given on that instance and
 //! reports it with the organization it named and the instant it was stored, a
-//! read answers the stored document byte for byte, a further put replaces it,
-//! and a delete leaves the instance with none, which a read then refuses. An
-//! account with no instance in that Region has no resource to carry a policy.
+//! read answers the POLICY that document expresses in the canonical rendering
+//! of the policy language (the elements of the document and of each statement in
+//! the language's own order, no insignificant whitespace, and an element naming
+//! one value written as that value rather than as a one-entry list), a further
+//! put replaces it, and a delete leaves the instance with none, which a read
+//! then refuses. An account with no instance in that Region has no resource to
+//! carry a policy.
 //!
 //! Every row below differs along something that rule generalises over: the form
 //! and size of the policy document (the shortest policy document this surface
 //! takes, one statement, several statements with conditions, a document with
-//! characters the XML envelope has to escape), whether the put
-//! names an organization and the length of the one it names, and the account
-//! and Region that own the instance.
+//! characters the XML envelope has to escape, a document whose elements are
+//! written out of the language's order and spread over several lines, one whose
+//! statement is the object itself rather than a list, one carrying a member the
+//! language does not define, one whose condition values are a boolean and a
+//! number rather than strings), which elements name one value and which name
+//! several, whether the put names an organization and the length of the one it
+//! names, and the account and Region that own the instance.
 //!
 //! Every assertion goes through the same front door a client uses: a buffered
 //! `http::Request` dispatched by the multi-service router. The router, the
@@ -95,23 +103,42 @@ async fn delete_policy(emulator: &Emulator, account_id: &str, region: &str) -> R
     .await
 }
 
-/// One policy case: the instance it is put on, the documents successive puts
-/// store, and the organization each names.
+/// One policy case: the instance it is put on, and the puts made on it.
 struct PolicyCase {
     case: &'static str,
     account_id: &'static str,
     region: &'static str,
-    /// The (document, organization) pairs successive puts store, in order. More
-    /// than one row has several, because a put replaces the policy.
-    puts: Vec<(String, Option<&'static str>)>,
+    /// The puts made in order. More than one row has several, because a put
+    /// replaces the policy.
+    puts: Vec<Put>,
+}
+
+/// One put: the document it submits, the organization it names, and the
+/// canonical rendering of that document a read then reports.
+struct Put {
+    document: String,
+    organization: Option<&'static str>,
+    /// Written out here rather than computed, so what is pinned is the canonical
+    /// rendering itself and not the emulator's own idea of it.
+    canonical: String,
 }
 
 /// A resource policy document granting `action` to `principal`, the shape an IAM
-/// resource policy takes.
+/// resource policy takes, with the action named by a list of one.
 fn policy_document(principal: &str, action: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\"Principal\":\
          {{\"AWS\":\"{principal}\"}},\"Action\":[\"{action}\"],\"Resource\":\"*\"}}]}}"
+    )
+}
+
+/// [`policy_document`]'s canonical rendering: the one action it names is written
+/// as that value rather than as a one-entry list, and everything else is already
+/// canonical.
+fn canonical_policy_document(principal: &str, action: &str) -> String {
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\"Principal\":\
+         {{\"AWS\":\"{principal}\"}},\"Action\":\"{action}\",\"Resource\":\"*\"}}]}}"
     )
 }
 
@@ -122,39 +149,72 @@ fn policy_cases() -> Vec<PolicyCase> {
             case: "one statement, no organization",
             account_id: ACCOUNT,
             region: REGION,
-            puts: vec![(
-                policy_document("arn:aws:iam::123456789012:root", "s3:GetDataAccess"),
-                None,
-            )],
+            puts: vec![Put {
+                document: policy_document("arn:aws:iam::123456789012:root", "s3:GetDataAccess"),
+                organization: None,
+                canonical: canonical_policy_document(
+                    "arn:aws:iam::123456789012:root",
+                    "s3:GetDataAccess",
+                ),
+            }],
         },
         PolicyCase {
             case: "replaced twice, the second put naming an organization",
             account_id: ACCOUNT,
             region: OTHER_REGION,
             puts: vec![
-                (
-                    policy_document("arn:aws:iam::123456789012:root", "s3:GetDataAccess"),
-                    None,
-                ),
-                (
-                    policy_document("arn:aws:iam::210987654321:root", "s3:ListAccessGrants"),
+                Put {
+                    document: policy_document(
+                        "arn:aws:iam::123456789012:root",
+                        "s3:GetDataAccess",
+                    ),
+                    organization: None,
+                    canonical: canonical_policy_document(
+                        "arn:aws:iam::123456789012:root",
+                        "s3:GetDataAccess",
+                    ),
+                },
+                Put {
+                    document: policy_document(
+                        "arn:aws:iam::210987654321:root",
+                        "s3:ListAccessGrants",
+                    ),
                     // `Organization`'s pattern is `^o-[a-z0-9]{10,32}$`: this is
                     // the shortest id it admits.
-                    Some("o-abcde12345"),
-                ),
-                (
-                    // Several statements, each with a condition.
-                    "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
-                     \"Principal\":{\"AWS\":\"*\"},\"Action\":[\"s3:GetDataAccess\"],\
-                     \"Resource\":\"*\",\"Condition\":{\"StringEquals\":\
-                     {\"aws:PrincipalOrgID\":\"o-abcde12345\"}}},{\"Effect\":\"Deny\",\
-                     \"Principal\":{\"AWS\":\"*\"},\"Action\":[\"s3:DeleteAccessGrant\"],\
-                     \"Resource\":\"*\"}]}"
+                    organization: Some("o-abcde12345"),
+                    canonical: canonical_policy_document(
+                        "arn:aws:iam::210987654321:root",
+                        "s3:ListAccessGrants",
+                    ),
+                },
+                Put {
+                    // Several statements: one naming a single action and a
+                    // condition value written as a list of one, one naming two
+                    // actions.
+                    document: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+                               \"Principal\":{\"AWS\":\"*\"},\"Action\":[\"s3:GetDataAccess\"],\
+                               \"Resource\":\"*\",\"Condition\":{\"StringEquals\":\
+                               {\"aws:PrincipalOrgID\":[\"o-abcde12345\"]}}},\
+                               {\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"*\"},\
+                               \"Action\":[\"s3:DeleteAccessGrant\",\"s3:DeleteAccessGrantsLocation\"],\
+                               \"Resource\":\"*\"}]}"
                         .to_string(),
                     // The longest id `Organization`'s pattern admits: `o-` and
                     // 32 characters.
-                    Some("o-abcdefghij0123456789abcdefghij01"),
-                ),
+                    organization: Some("o-abcdefghij0123456789abcdefghij01"),
+                    // Each element naming ONE value is written as that value —
+                    // the first statement's action and its condition value —
+                    // while the second statement's two actions stay a list, in
+                    // the order they were written.
+                    canonical: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+                                \"Principal\":{\"AWS\":\"*\"},\"Action\":\"s3:GetDataAccess\",\
+                                \"Resource\":\"*\",\"Condition\":{\"StringEquals\":\
+                                {\"aws:PrincipalOrgID\":\"o-abcde12345\"}}},\
+                                {\"Effect\":\"Deny\",\"Principal\":{\"AWS\":\"*\"},\
+                                \"Action\":[\"s3:DeleteAccessGrant\",\"s3:DeleteAccessGrantsLocation\"],\
+                                \"Resource\":\"*\"}]}"
+                        .to_string(),
+                },
             ],
         },
         PolicyCase {
@@ -164,22 +224,108 @@ fn policy_cases() -> Vec<PolicyCase> {
             // `PolicyDocument` is constrained to `len 1..350000`; this is a
             // policy document close to that floor — an empty statement list is
             // the shortest one an IAM resource policy has.
-            puts: vec![(
-                "{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string(),
-                Some("o-abcde12345"),
-            )],
+            puts: vec![Put {
+                document: "{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string(),
+                organization: Some("o-abcde12345"),
+                canonical: "{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string(),
+            }],
         },
         PolicyCase {
             case: "a document carrying characters the XML envelope escapes",
             account_id: ACCOUNT,
             region: "ap-southeast-2",
-            puts: vec![(
-                policy_document(
+            puts: vec![Put {
+                document: policy_document(
                     "arn:aws:iam::123456789012:role/reader&writer",
                     "s3:GetDataAccess",
                 ),
-                None,
-            )],
+                organization: None,
+                canonical: canonical_policy_document(
+                    "arn:aws:iam::123456789012:role/reader&writer",
+                    "s3:GetDataAccess",
+                ),
+            }],
+        },
+        PolicyCase {
+            case: "elements written out of the language's order, over several lines",
+            account_id: OTHER_ACCOUNT,
+            region: "us-east-2",
+            puts: vec![Put {
+                document: "{\n  \"Statement\": [\n    {\n      \"Resource\": \"*\",\n      \
+                           \"Action\": [\"s3:ListAccessGrants\", \"s3:GetDataAccess\"],\n      \
+                           \"Principal\": {\"AWS\": [\"arn:aws:iam::123456789012:root\"]},\n      \
+                           \"Effect\": \"Allow\",\n      \"Sid\": \"two actions\"\n    }\n  ],\n  \
+                           \"Version\": \"2012-10-17\"\n}"
+                    .to_string(),
+                organization: None,
+                canonical: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"two actions\",\
+                            \"Effect\":\"Allow\",\"Principal\":\
+                            {\"AWS\":\"arn:aws:iam::123456789012:root\"},\
+                            \"Action\":[\"s3:ListAccessGrants\",\"s3:GetDataAccess\"],\
+                            \"Resource\":\"*\"}]}"
+                    .to_string(),
+            }],
+        },
+        PolicyCase {
+            case: "one statement written as the object itself, with an Id",
+            account_id: ACCOUNT,
+            region: "us-west-1",
+            puts: vec![Put {
+                document: "{\"Id\":\"grants-policy\",\"Version\":\"2012-10-17\",\"Statement\":\
+                           {\"Effect\":\"Allow\",\"Principal\":\"*\",\
+                           \"Action\":[\"s3:ListAccessGrants\"],\
+                           \"Resource\":[\"arn:aws:s3:us-east-2:123456789012:access-grants/default\"]}}"
+                    .to_string(),
+                organization: None,
+                canonical: "{\"Version\":\"2012-10-17\",\"Id\":\"grants-policy\",\"Statement\":\
+                            {\"Effect\":\"Allow\",\"Principal\":\"*\",\
+                            \"Action\":\"s3:ListAccessGrants\",\
+                            \"Resource\":\"arn:aws:s3:us-east-2:123456789012:access-grants/default\"}}"
+                    .to_string(),
+            }],
+        },
+        PolicyCase {
+            case: "a document carrying a member the policy language does not define",
+            account_id: OTHER_ACCOUNT,
+            region: "ap-southeast-2",
+            puts: vec![Put {
+                document: "{\"Version\":\"2012-10-17\",\"Note\":{\"owner\":\"data-team\"},\
+                           \"Statement\":[{\"Effect\":\"Allow\",\"Principal\":\"*\",\
+                           \"Action\":[\"s3:GetDataAccess\"],\"Comment\":[\"kept\"]}]}"
+                    .to_string(),
+                organization: None,
+                // A member the language places nothing about is written back
+                // after the ones it does place, in the form it was written in.
+                canonical: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+                            \"Principal\":\"*\",\"Action\":\"s3:GetDataAccess\",\
+                            \"Comment\":[\"kept\"]}],\"Note\":{\"owner\":\"data-team\"}}"
+                    .to_string(),
+            }],
+        },
+        PolicyCase {
+            case: "condition values that are not strings, written as lists of one and of two",
+            account_id: ACCOUNT,
+            region: "ca-central-1",
+            puts: vec![Put {
+                document: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\
+                           \"Principal\":\"*\",\"Action\":[\"s3:GetDataAccess\"],\
+                           \"Resource\":\"*\",\"Condition\":{\"Bool\":\
+                           {\"aws:SecureTransport\":[false]},\"NumericLessThan\":\
+                           {\"s3:TlsVersion\":[2]},\"StringEquals\":\
+                           {\"aws:PrincipalAccount\":[\"123456789012\",\"210987654321\"]}}}]}"
+                    .to_string(),
+                organization: None,
+                // What decides the one-value form is the list naming exactly one
+                // value, whatever scalar that value is; a list naming two stays
+                // a list.
+                canonical: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\
+                            \"Principal\":\"*\",\"Action\":\"s3:GetDataAccess\",\
+                            \"Resource\":\"*\",\"Condition\":{\"Bool\":\
+                            {\"aws:SecureTransport\":false},\"NumericLessThan\":\
+                            {\"s3:TlsVersion\":2},\"StringEquals\":\
+                            {\"aws:PrincipalAccount\":[\"123456789012\",\"210987654321\"]}}}]}"
+                    .to_string(),
+            }],
         },
     ]
 }
@@ -235,13 +381,13 @@ async fn a_put_policy_is_what_every_later_read_reports_until_it_is_replaced() {
             &get_policy(&emulator, case.account_id, case.region).await,
         );
 
-        for (policy, organization) in &case.puts {
+        for put_case in &case.puts {
             let put = put_policy(
                 &emulator,
                 case.account_id,
                 case.region,
-                policy,
-                *organization,
+                &put_case.document,
+                put_case.organization,
             )
             .await;
             assert_eq!(
@@ -251,14 +397,14 @@ async fn a_put_policy_is_what_every_later_read_reports_until_it_is_replaced() {
             );
             assert_eq!(
                 put.text("Policy").as_deref(),
-                Some(policy.as_str()),
-                "case {:?}: expected the put to report the document it stored, got body {}",
+                Some(put_case.document.as_str()),
+                "case {:?}: expected the put to report the document it was handed, got body {}",
                 case.case,
                 put.body
             );
             assert_eq!(
                 put.text("Organization").as_deref(),
-                *organization,
+                put_case.organization,
                 "case {:?}: expected the put to report the organization it was given, got body {}",
                 case.case,
                 put.body
@@ -270,8 +416,9 @@ async fn a_put_policy_is_what_every_later_read_reports_until_it_is_replaced() {
                 put.body
             );
 
-            // The read reports the stored document, and reports it twice over:
-            // a read changes nothing.
+            // The read reports the policy that document expresses, in the
+            // language's canonical rendering — and reports it twice over: a read
+            // changes nothing.
             let read = get_policy(&emulator, case.account_id, case.region).await;
             assert_eq!(
                 read.status, 200,
@@ -280,14 +427,15 @@ async fn a_put_policy_is_what_every_later_read_reports_until_it_is_replaced() {
             );
             assert_eq!(
                 read.text("Policy").as_deref(),
-                Some(policy.as_str()),
-                "case {:?}: expected the read to report the stored document, got body {}",
+                Some(put_case.canonical.as_str()),
+                "case {:?}: expected the read to report the canonical rendering of the stored \
+                 document, got body {}",
                 case.case,
                 read.body
             );
             assert_eq!(
                 read.text("Organization").as_deref(),
-                *organization,
+                put_case.organization,
                 "case {:?}: expected the read to report the stored organization, got body {}",
                 case.case,
                 read.body
@@ -311,18 +459,18 @@ async fn a_put_policy_is_what_every_later_read_reports_until_it_is_replaced() {
     // Every instance carries its OWN policy: the last put of each case is what
     // that instance reports, and no other instance's put changed it.
     for case in &cases {
-        let (policy, organization) = case.puts.last().expect("a case puts a policy");
+        let put_case = case.puts.last().expect("a case puts a policy");
         let read = get_policy(&emulator, case.account_id, case.region).await;
         assert_eq!(
             read.text("Policy").as_deref(),
-            Some(policy.as_str()),
+            Some(put_case.canonical.as_str()),
             "case {:?}: expected the instance to carry its own last put, got body {}",
             case.case,
             read.body
         );
         assert_eq!(
             read.text("Organization").as_deref(),
-            *organization,
+            put_case.organization,
             "case {:?}: expected the instance to carry its own organization, got body {}",
             case.case,
             read.body
@@ -336,14 +484,14 @@ async fn a_deleted_policy_is_gone_and_can_be_put_again() {
     let emulator = emulator_with_instances(&cases).await;
 
     for case in &cases {
-        let (policy, organization) = &case.puts[0];
+        let put_case = &case.puts[0];
         assert_eq!(
             put_policy(
                 &emulator,
                 case.account_id,
                 case.region,
-                policy,
-                *organization
+                &put_case.document,
+                put_case.organization
             )
             .await
             .status,
@@ -379,8 +527,8 @@ async fn a_deleted_policy_is_gone_and_can_be_put_again() {
             &emulator,
             case.account_id,
             case.region,
-            policy,
-            *organization,
+            &put_case.document,
+            put_case.organization,
         )
         .await;
         assert_eq!(
@@ -393,7 +541,7 @@ async fn a_deleted_policy_is_gone_and_can_be_put_again() {
                 .await
                 .text("Policy")
                 .as_deref(),
-            Some(policy.as_str()),
+            Some(put_case.canonical.as_str()),
             "case {:?}: expected the re-put policy to read back",
             case.case
         );
@@ -405,14 +553,14 @@ async fn a_document_that_is_not_a_policy_is_refused_and_stores_nothing() {
     let cases = policy_cases();
     let emulator = emulator_with_instances(&cases).await;
     let case = &cases[0];
-    let (policy, organization) = &case.puts[0];
+    let put_case = &case.puts[0];
     assert_eq!(
         put_policy(
             &emulator,
             case.account_id,
             case.region,
-            policy,
-            *organization
+            &put_case.document,
+            put_case.organization
         )
         .await
         .status,
@@ -440,7 +588,7 @@ async fn a_document_that_is_not_a_policy_is_refused_and_stores_nothing() {
         let read = get_policy(&emulator, case.account_id, case.region).await;
         assert_eq!(
             read.text("Policy").as_deref(),
-            Some(policy.as_str()),
+            Some(put_case.canonical.as_str()),
             "case {malformed:?}: expected the refused put to leave the stored policy alone, got \
              body {}",
             read.body
@@ -452,7 +600,7 @@ async fn a_document_that_is_not_a_policy_is_refused_and_stores_nothing() {
 async fn an_account_with_no_instance_in_that_region_has_no_policy_to_carry() {
     let cases = policy_cases();
     let emulator = emulator_with_instances(&cases).await;
-    let (policy, _) = &cases[0].puts[0];
+    let policy = &cases[0].puts[0].document;
 
     // Each row addresses an instance that was never created: another account in
     // a Region where it has none, and the owning account in a Region where it

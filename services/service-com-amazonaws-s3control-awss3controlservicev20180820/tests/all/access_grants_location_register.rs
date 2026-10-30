@@ -36,7 +36,7 @@ use crate::access_point_lifecycle::{
 };
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
-    ACCESS_GRANTS_LOCATION_DEFAULT_ID, DEFAULT_LOCATION_SCOPE,
+    ACCESS_GRANTS_INSTANCE_ID, ACCESS_GRANTS_LOCATION_DEFAULT_ID, DEFAULT_LOCATION_SCOPE,
 };
 
 /// A second signing Region, used to pin that a registered location belongs to
@@ -181,13 +181,15 @@ fn register_cases() -> Vec<RegisterCase> {
 }
 
 /// The ARN a registered location of this id must report: the
-/// `access-grants/location/<id>` resource in the `s3` ARN namespace, in the
-/// signing Region, under the emulator's canonical account — the shape
-/// `AccessGrantsLocationArn`'s pattern states.
+/// `location/<id>` subresource of the Access Grants instance that holds it, in
+/// the `s3` ARN namespace, in the signing Region, under the emulator's
+/// canonical account — so the instance segment sits between `access-grants` and
+/// `location`.
 fn expected_arn(region: &str, location_id: &str) -> String {
     format!(
-        "arn:aws:s3:{region}:{}:access-grants/location/{location_id}",
-        ::emulator_server::emulator_account_id()
+        "arn:aws:s3:{region}:{}:access-grants/{}/location/{location_id}",
+        ::emulator_server::emulator_account_id(),
+        ACCESS_GRANTS_INSTANCE_ID
     )
 }
 

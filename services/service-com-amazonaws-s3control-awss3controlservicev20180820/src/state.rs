@@ -1165,8 +1165,8 @@ pub struct AccessGrantsInstanceRecord {
 /// `GetAccessGrantsInstanceResourcePolicy` report.
 #[derive(Debug, Clone)]
 pub struct AccessGrantsResourcePolicyRecord {
-    /// The document the put call sent, byte for byte: the read answers what the
-    /// caller stored, not a re-serialized form of it.
+    /// The document the put call sent, byte for byte: it is what that call
+    /// reports back, and what [`canonical_resource_policy`] renders for a read.
     pub policy: String,
     /// "The Organization of the resource policy of the S3 Access Grants
     /// instance" (`PutAccessGrantsInstanceResourcePolicyRequest$Organization`) —
@@ -1176,6 +1176,232 @@ pub struct AccessGrantsResourcePolicyRecord {
     /// When the policy was stored. A further put replaces the policy, so this
     /// is the instant of the put the read reports.
     pub created_at: ::aws_smithy_types::DateTime,
+}
+
+/// The top-level elements of an IAM JSON policy document, in the order the
+/// policy language presents them — the order a document held in that language
+/// is written back in. See [`canonical_resource_policy`].
+const POLICY_ELEMENT_ORDER: [&str; 3] = ["Version", "Id", STATEMENT_ELEMENT];
+
+/// The element that carries a policy's statements, which is the one top-level
+/// element whose value is itself written in the policy language rather than
+/// being a plain value.
+const STATEMENT_ELEMENT: &str = "Statement";
+
+/// The elements of ONE statement, in the policy language's own order. See
+/// [`canonical_resource_policy`].
+const STATEMENT_ELEMENT_ORDER: [&str; 9] = [
+    "Sid",
+    "Effect",
+    "Principal",
+    "NotPrincipal",
+    "Action",
+    "NotAction",
+    "Resource",
+    "NotResource",
+    "Condition",
+];
+
+/// The statement elements the policy language writes as ONE value or as a list
+/// of values — the principals, the actions, the resources and a condition's
+/// values. A list naming a single value says exactly what that value says on
+/// its own, so it is the value that is written back. See
+/// [`canonical_resource_policy`].
+const STATEMENT_VALUE_ELEMENTS: [&str; 7] = [
+    "Principal",
+    "NotPrincipal",
+    "Action",
+    "NotAction",
+    "Resource",
+    "NotResource",
+    "Condition",
+];
+
+/// The resource policy `document` as the Access Grants instance HOLDS it: the
+/// canonical rendering of the policy language it is written in.
+///
+/// S3 Access Grants takes the document the put call submitted — which is what
+/// that call reports back — and holds the POLICY it expresses, so a read
+/// answers that policy written back in the language's canonical form rather
+/// than the caller's bytes: the elements of the document and of each statement
+/// in the order the policy language presents them
+/// ([`POLICY_ELEMENT_ORDER`], [`STATEMENT_ELEMENT_ORDER`]), no insignificant
+/// whitespace, and an element that names ONE value written as that value rather
+/// than as a one-entry list ([`STATEMENT_VALUE_ELEMENTS`]).
+///
+/// Everything the language does not define the form of — a member it places
+/// nothing about, and the inside of any value it states no form for — is written
+/// back as `::serde_json` renders it, which orders an object's members by name;
+/// a `document` that is not JSON at all expresses no policy, so it is answered
+/// unchanged.
+///
+/// The order the CALLER wrote the members in is not available to write back:
+/// `::serde_json`'s object is ordered by member name, and the insertion-ordered
+/// form of it is a crate-wide feature every service in this workspace would
+/// then render its JSON through. So the one order this rendering can state is
+/// the policy language's own, which is also the order that makes the rendering
+/// canonical rather than caller-shaped.
+///
+/// The walk below recurses over the PARSED document, so its depth is bounded by
+/// the nesting `::serde_json` admits when it reads the text, and the text itself
+/// by the modelled `PolicyDocument` length.
+pub fn canonical_resource_policy(document: &str) -> String {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
+        return document.to_string();
+    };
+    let mut rendered = String::with_capacity(document.len());
+    write_policy_document(&mut rendered, &parsed);
+    rendered
+}
+
+/// Write the whole document: its elements in the language's order, with the
+/// statements written as statements.
+///
+/// Reading the text is `::serde_json`'s — nothing here parses JSON — and so is
+/// every VALUE written back out ([`write_parsed`]), quoting, escaping and number
+/// forms included. What these walkers add is the ORDER the members are written
+/// in and the one-value form of an element, neither of which `::serde_json`'s
+/// own object can express: its `Map` is ordered by member name.
+fn write_policy_document(rendered: &mut String, document: &::serde_json::Value) {
+    let Some(elements) = document.as_object() else {
+        write_parsed(rendered, document);
+        return;
+    };
+    rendered.push('{');
+    for (index, (name, value)) in ordered_members(elements, &POLICY_ELEMENT_ORDER)
+        .into_iter()
+        .enumerate()
+    {
+        if index > 0 {
+            rendered.push(',');
+        }
+        write_member_name(rendered, name);
+        if name == STATEMENT_ELEMENT {
+            write_statements(rendered, value);
+        } else {
+            write_parsed(rendered, value);
+        }
+    }
+    rendered.push('}');
+}
+
+/// Write the `Statement` element, which the language writes as one statement or
+/// as a list of them.
+fn write_statements(rendered: &mut String, element: &::serde_json::Value) {
+    let ::serde_json::Value::Array(entries) = element else {
+        write_statement(rendered, element);
+        return;
+    };
+    rendered.push('[');
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            rendered.push(',');
+        }
+        write_statement(rendered, entry);
+    }
+    rendered.push(']');
+}
+
+/// Write ONE statement: its elements in the language's order, with each element
+/// that names values written in the form the language gives it.
+fn write_statement(rendered: &mut String, statement: &::serde_json::Value) {
+    let Some(elements) = statement.as_object() else {
+        write_parsed(rendered, statement);
+        return;
+    };
+    rendered.push('{');
+    for (index, (name, value)) in ordered_members(elements, &STATEMENT_ELEMENT_ORDER)
+        .into_iter()
+        .enumerate()
+    {
+        if index > 0 {
+            rendered.push(',');
+        }
+        write_member_name(rendered, name);
+        if STATEMENT_VALUE_ELEMENTS.contains(&name) {
+            write_element_values(rendered, value);
+        } else {
+            write_parsed(rendered, value);
+        }
+    }
+    rendered.push('}');
+}
+
+/// Write an element that names values: a list naming a single value is written
+/// as that value, and the values a principal type or a condition key names are
+/// written the same way.
+///
+/// The single value may be of any scalar form the language writes — a string
+/// names an action, a resource or a principal, and a condition key's value may
+/// be a number or a boolean — so what decides the collapse is the list naming
+/// exactly ONE value, not which scalar that value is. A one-entry list whose
+/// entry is itself a list or an object names no value, so it is left as the list
+/// it is.
+fn write_element_values(rendered: &mut String, element: &::serde_json::Value) {
+    match element {
+        ::serde_json::Value::Array(entries) => {
+            if let [single] = entries.as_slice() {
+                if !single.is_array() && !single.is_object() {
+                    write_parsed(rendered, single);
+                    return;
+                }
+            }
+            rendered.push('[');
+            for (index, entry) in entries.iter().enumerate() {
+                if index > 0 {
+                    rendered.push(',');
+                }
+                write_element_values(rendered, entry);
+            }
+            rendered.push(']');
+        }
+        ::serde_json::Value::Object(members) => {
+            rendered.push('{');
+            for (index, (name, member)) in members.iter().enumerate() {
+                if index > 0 {
+                    rendered.push(',');
+                }
+                write_member_name(rendered, name.as_str());
+                write_element_values(rendered, member);
+            }
+            rendered.push('}');
+        }
+        value => write_parsed(rendered, value),
+    }
+}
+
+/// Write `value` as `::serde_json` renders it: JSON's own compact form, which is
+/// the rendering for everything the policy language states no form for.
+fn write_parsed(rendered: &mut String, value: &::serde_json::Value) {
+    rendered.push_str(&value.to_string());
+}
+
+/// Write one member's name and the colon after it, quoted and escaped by
+/// `::serde_json` as a JSON string.
+fn write_member_name(rendered: &mut String, name: &str) {
+    write_parsed(rendered, &::serde_json::Value::String(name.to_string()));
+    rendered.push(':');
+}
+
+/// `members`, with the ones `order` names first and in that order, and every
+/// other one after them in the order `::serde_json` holds them, which is by
+/// member name — so a member the policy language places nothing about is
+/// written back rather than dropped.
+fn ordered_members<'a>(
+    members: &'a ::serde_json::Map<String, ::serde_json::Value>,
+    order: &[&'a str],
+) -> Vec<(&'a str, &'a ::serde_json::Value)> {
+    let mut ordered: Vec<(&str, &::serde_json::Value)> = order
+        .iter()
+        .filter_map(|name| members.get(*name).map(|value| (*name, value)))
+        .collect();
+    ordered.extend(
+        members
+            .iter()
+            .filter(|(name, _)| !order.contains(&name.as_str()))
+            .map(|(name, value)| (name.as_str(), value)),
+    );
+    ordered
 }
 
 /// How a stored S3 Access Grants instance is keyed: the owning account id and
@@ -1926,8 +2152,10 @@ const STORAGE_LENS_GROUP_RESOURCE_TYPE: &str = "storage-lens-group";
 
 /// The resource type shared by the three S3 Access Grants ARNs, as
 /// [`access_grants_instance_arn`], [`access_grants_location_arn`] and
-/// [`access_grant_arn`] build them; the id after it is what tells the three
-/// apart.
+/// [`access_grant_arn`] build them: an instance's resource field is this type
+/// and the instance id, and a location's or a grant's carries the subresource
+/// type and id after that pair
+/// ([`access_grants_subresource_arn`]).
 const ACCESS_GRANTS_RESOURCE_TYPE: &str = "access-grants";
 
 /// The largest tag set an S3 resource carries.
@@ -2380,30 +2608,59 @@ pub fn access_grants_instance_arn(region: &str, instance_id: &str) -> String {
     ::emulator_server::emulator_arn("s3", region, &format!("access-grants/{instance_id}"))
 }
 
-/// The ARN of a registered S3 Access Grants location, in the Region the
-/// location was registered in — the form `AccessGrantsLocationArn`'s pattern
-/// (`^arn:[a-z\-]+:s3:[a-z0-9\-]+:\d{12}:access\-grants\/location/[a-zA-Z0-9\-]+$`)
-/// admits.
+/// The resource-type token of a registered location in the ARN of an S3 Access
+/// Grants location, as [`access_grants_location_arn`] builds it.
+const ACCESS_GRANTS_LOCATION_SUBRESOURCE: &str = "location";
+
+/// The resource-type token of a grant in the ARN of an access grant, as
+/// [`access_grant_arn`] builds it.
+const ACCESS_GRANT_SUBRESOURCE: &str = "grant";
+
+/// The ARN of a resource held INSIDE one S3 Access Grants instance — a
+/// registered location or a grant.
+///
+/// Both are subresources of the instance that holds them, so the ARN each
+/// reports is the instance's own resource path
+/// (`access-grants/<instance-id>`, see [`access_grants_instance_arn`])
+/// followed by the subresource's type and the id S3 Access Grants assigned it:
+/// `arn:<partition>:s3:<region>:<account>:access-grants/<instance-id>/<type>/<id>`.
+/// The instance segment is what says WHICH instance the location or grant
+/// belongs to, so an ARN without it addresses no resource; an instance carries
+/// the one id [`ACCESS_GRANTS_INSTANCE_ID`], which is the id this path names.
+///
+/// DELIBERATELY not the form `AccessGrantsLocationArn`'s and `AccessGrantArn`'s
+/// modelled patterns state (`…:access\-grants\/location/<id>`,
+/// `…:access\-grants\/grant/<id>`): those patterns omit the instance segment,
+/// and the recorded wire — which is the authority for the ARN a client is
+/// handed — carries it. The patterns bind an INPUT member's value and the
+/// framework validates them there; nothing validates an output member's value
+/// against them, so the longer resource field is what every projection reports.
+/// Do not "repair" this back to the pattern.
 ///
 /// The account segment comes from [`::emulator_server::emulator_arn`], the
 /// single source of truth for the canonical emulator account.
-pub fn access_grants_location_arn(region: &str, location_id: &str) -> String {
+fn access_grants_subresource_arn(region: &str, subresource_type: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(
         "s3",
         region,
-        &format!("access-grants/location/{location_id}"),
+        &format!(
+            "{ACCESS_GRANTS_RESOURCE_TYPE}/{ACCESS_GRANTS_INSTANCE_ID}/{subresource_type}/{id}"
+        ),
     )
 }
 
-/// The ARN of an access grant, in the Region the grant was created in — the
-/// form `AccessGrantArn`'s pattern
-/// (`^arn:[a-z\-]+:s3:[a-z0-9\-]+:\d{12}:access\-grants\/grant/[a-zA-Z0-9\-]+$`)
-/// admits.
-///
-/// The account segment comes from [`::emulator_server::emulator_arn`], the
-/// single source of truth for the canonical emulator account.
+/// The ARN of a registered S3 Access Grants location, in the Region the
+/// location was registered in: the location subresource of the instance that
+/// holds it ([`access_grants_subresource_arn`]).
+pub fn access_grants_location_arn(region: &str, location_id: &str) -> String {
+    access_grants_subresource_arn(region, ACCESS_GRANTS_LOCATION_SUBRESOURCE, location_id)
+}
+
+/// The ARN of an access grant, in the Region the grant was created in: the
+/// grant subresource of the instance that holds it
+/// ([`access_grants_subresource_arn`]).
 pub fn access_grant_arn(region: &str, grant_id: &str) -> String {
-    ::emulator_server::emulator_arn("s3", region, &format!("access-grants/grant/{grant_id}"))
+    access_grants_subresource_arn(region, ACCESS_GRANT_SUBRESOURCE, grant_id)
 }
 
 /// How many characters of the Identity Center application segment an
