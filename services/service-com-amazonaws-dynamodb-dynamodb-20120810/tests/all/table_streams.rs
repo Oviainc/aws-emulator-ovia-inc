@@ -30,7 +30,9 @@ use service_com_amazonaws_dynamodb_dynamodb_20120810::state::STATUS_TRANSITION;
 use service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::ops::types::STREAM_VIEW_TYPE_VALUES;
 use service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::state::MAX_STREAMS_PER_TABLE;
 
-use crate::emulator::{call_in, call_streams, emulator_with_streams, error_code, REGION};
+use crate::emulator::{
+    call_in, call_streams, describe_when_active, emulator_with_streams, error_code, REGION,
+};
 
 /// Every value the model's `StreamViewType` enum declares, taken from the list the
 /// streams crate derives from that model
@@ -129,9 +131,10 @@ fn text(value: &Value, pointer: &str) -> String {
         .to_string()
 }
 
-/// Wait out the `CREATING` -> `ACTIVE` transition the clock owes a new table, so a
-/// control-plane call that needs a settled table is not refused as in-use. The
-/// margin is slack for a loaded machine, not part of the rule.
+/// Wait out a transition the clock owes a table — the `CREATING` -> `ACTIVE` one a new
+/// table gets, and the `UPDATING` -> `ACTIVE` one an accepted stream change leaves
+/// behind — so a control-plane call that needs a settled table is not refused as
+/// in-use. The margin is slack for a loaded machine, not part of the rule.
 async fn settle() {
     tokio::time::sleep(STATUS_TRANSITION + std::time::Duration::from_millis(150)).await;
 }
@@ -524,6 +527,17 @@ async fn update_table_turns_a_stream_on_and_off_and_refuses_the_contradictions()
             "case {case:?}: the enabled stream must be discoverable"
         );
 
+        // Turning a stream on is asynchronous work the clock finishes, so the table is
+        // UPDATING until it falls due; the contradictions below are asserted on a
+        // SETTLED table, because an overlapping UpdateTable is a conflict whatever it
+        // asks for.
+        assert_eq!(
+            text(&updated, "/TableDescription/TableStatus"),
+            "UPDATING",
+            "case {case:?}: an accepted stream change leaves the table UPDATING, got {updated}"
+        );
+        settle().await;
+
         // Enabling a stream on a table that already has one can never succeed as sent,
         // so it is a parameter error rather than a transient resource conflict.
         let (status, body) = ddb(
@@ -568,6 +582,12 @@ async fn update_table_turns_a_stream_on_and_off_and_refuses_the_contradictions()
             first_arn,
             "case {case:?}: the table still names its latest stream, got {disabled}"
         );
+        assert_eq!(
+            text(&disabled, "/TableDescription/TableStatus"),
+            "UPDATING",
+            "case {case:?}: turning a stream off leaves the table UPDATING too, got {disabled}"
+        );
+        settle().await;
         let described = streams_ok(
             &router,
             &case,
@@ -726,17 +746,21 @@ async fn a_table_may_not_grow_the_stream_registry_without_limit() {
         "TableName": "busy",
         "StreamSpecification": {"StreamEnabled": false},
     });
+    // Each stream change is asynchronous, so every cycle waits for the table to come
+    // back to ACTIVE before the next UpdateTable: an overlapping one is a conflict.
     for cycle in 0..MAX_STREAMS_PER_TABLE {
         let (status, body) = ddb(&router, "UpdateTable", enable.clone()).await;
         assert_eq!(
             status, 200,
             "case {case:?}: cycle {cycle} must be accepted, got {status} with {body}"
         );
+        describe_when_active(&router, case, "busy").await;
         let (status, body) = ddb(&router, "UpdateTable", disable.clone()).await;
         assert_eq!(
             status, 200,
             "case {case:?}: cycle {cycle} must disable again, got {status} with {body}"
         );
+        describe_when_active(&router, case, "busy").await;
     }
 
     let (status, body) = ddb(&router, "UpdateTable", enable).await;

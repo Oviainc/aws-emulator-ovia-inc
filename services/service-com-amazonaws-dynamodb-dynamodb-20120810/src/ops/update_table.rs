@@ -6,15 +6,16 @@
 //! update), its table class and its deletion protection, and reports the table back as
 //! a `TableDescription` read from the stored table.
 //!
-//! Only the part of an update that asks DynamoDB to MOVE CAPACITY is asynchronous —
-//! the table's capacity mode, its provisioned throughput, its table class or one of
-//! its secondary indexes. Such a request leaves the table `UPDATING` ("while it's
-//! executing, the table status changes from ACTIVE to UPDATING" — the doc below) and
-//! the clock owes it the move back to `ACTIVE` [`crate::state::STATUS_TRANSITION`]
-//! later; a second `UpdateTable` inside that span is refused with
-//! `ResourceInUseException`, while item operations keep being served. A request that
-//! only flips a flag the service applies with the call — deletion protection — moves
-//! no capacity, so it leaves nothing for the clock to finish and the table is reported
+//! The part of an update whose work OUTLIVES the call is asynchronous — a request that
+//! moves capacity (the table's capacity mode, its provisioned throughput, its warm
+//! throughput, its table class or one of its secondary indexes) and one that starts or
+//! stops the table's change feed (a `StreamSpecification`). Such a request leaves the
+//! table `UPDATING` ("while it's executing, the table status changes from ACTIVE to
+//! UPDATING" — the doc below) and the clock owes it the move back to `ACTIVE`
+//! [`crate::state::STATUS_TRANSITION`] later; a second `UpdateTable` inside that span is
+//! refused with `ResourceInUseException`, while item operations keep being served. A
+//! request that only flips a flag the service applies with the call — deletion
+//! protection — leaves nothing for the clock to finish and the table is reported
 //! `ACTIVE`, which is what the recorded service answers and what lets consecutive
 //! control-plane calls through. Either way the NEW configuration is in effect from the
 //! moment the call returns, which is what `DescribeTable` and the capacity accounting
@@ -495,16 +496,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Represents the time when PAY_PER_REQUEST was last set as the read/write
         // capacity mode" is recorded below, once the instant the switch takes effect is
         // known.
-        // An update that moves capacity finishes later — the clock owes the move back
-        // to ACTIVE; one that moves none is finished when it returns, so it leaves the
-        // table settled and the next control-plane call is served.
-        let moves_capacity = asks_to_move_capacity(&input);
-        let settles_at = if moves_capacity {
+        // An update whose work outlives the call finishes later — the clock owes the
+        // move back to ACTIVE; one the service applies with the call is finished when it
+        // returns, so it leaves the table settled and the next control-plane call is
+        // served.
+        let settles_later = asks_for_asynchronous_work(&input);
+        let settles_at = if settles_later {
             now + crate::state::STATUS_TRANSITION
         } else {
             now
         };
-        table.updated_at = moves_capacity.then_some(settles_at);
+        table.updated_at = settles_later.then_some(settles_at);
         // "The time when PAY_PER_REQUEST was last set as the read/write capacity mode"
         // (`BillingModeSummary$LastUpdateToPayPerRequestDateTime`) is the instant the
         // SWITCH takes effect, so a request that re-states the mode the table is
@@ -717,22 +719,28 @@ fn empty_update_message() -> String {
     }
 }
 
-/// Whether this request asks DynamoDB to MOVE CAPACITY, which is the part of an
-/// `UpdateTable` that finishes after the call returns.
+/// Whether this request asks DynamoDB for work that OUTLIVES the call, which is the
+/// part of an `UpdateTable` the clock has to finish ("while it's executing, the table
+/// status changes from ACTIVE to UPDATING" — the doc above).
 ///
-/// The table's capacity mode and provisioned throughput, the warm throughput it keeps
-/// ready ("the minimum provisioned capacity maintained for immediate data access" — the
-/// `TableWarmThroughputDescription` doc), its table class and its secondary indexes are
-/// all backed by provisioned capacity or stored data, so changing one is the asynchronous
-/// update the doc describes ("while it's executing, the table status changes from ACTIVE
-/// to UPDATING"). Deletion protection is a guard flag with no capacity behind it: the
-/// service applies it with the call and answers with the table still `ACTIVE`, so nothing
-/// is left for the clock to finish and the next control-plane call is served.
-fn asks_to_move_capacity(input: &UpdateTableInput) -> bool {
+/// Two kinds of change are that work. One MOVES CAPACITY: the table's capacity mode and
+/// provisioned throughput, the warm throughput it keeps ready ("the minimum provisioned
+/// capacity maintained for immediate data access" — the `TableWarmThroughputDescription`
+/// doc), its table class and its secondary indexes are all backed by provisioned
+/// capacity or stored data. The other RE-PLUMBS THE TABLE'S CHANGE FEED: a
+/// `StreamSpecification` starts or stops a DynamoDB Streams stream, a resource with its
+/// own lifecycle in the streams service (a stream being turned off is `DISABLING` before
+/// it is `DISABLED`), so that too is settled after the call returns.
+///
+/// Deletion protection is a guard flag with nothing behind it: the service applies it
+/// with the call and answers with the table still `ACTIVE`, so nothing is left for the
+/// clock to finish and the next control-plane call is served.
+fn asks_for_asynchronous_work(input: &UpdateTableInput) -> bool {
     input.billing_mode.is_some()
         || input.provisioned_throughput.is_some()
         || input.warm_throughput.is_some()
         || input.table_class.is_some()
+        || input.stream_specification.is_some()
         || list_named(input.global_secondary_index_updates.as_ref())
 }
 

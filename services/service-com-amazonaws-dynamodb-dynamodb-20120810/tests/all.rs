@@ -173,6 +173,9 @@ mod undefined_expression_tokens;
 #[path = "all/update_contributor_insights_writes.rs"]
 mod update_contributor_insights_writes;
 
+#[path = "all/update_table_transient_status.rs"]
+mod update_table_transient_status;
+
 #[path = "all/validation_message_fidelity.rs"]
 mod validation_message_fidelity;
 

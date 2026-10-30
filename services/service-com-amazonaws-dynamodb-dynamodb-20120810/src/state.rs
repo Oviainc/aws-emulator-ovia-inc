@@ -3879,7 +3879,7 @@ pub struct Table {
     pub active_at: SystemTime,
     /// When the clock owes this table the end of an `UpdateTable` — its `UPDATING` ->
     /// `ACTIVE` transition. `None` once no update is in flight, which is also the case
-    /// for an update that asks for no capacity work at all (see `UpdateTable`).
+    /// for an update the service applies with the call itself (see `UpdateTable`).
     pub updated_at: Option<SystemTime>,
     /// When `PAY_PER_REQUEST` TAKES EFFECT as this table's read/write capacity mode,
     /// which is what `BillingModeSummary.LastUpdateToPayPerRequestDateTime` reports:
