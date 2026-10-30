@@ -188,7 +188,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.vector_bucket_arn.as_deref(),
         )
         .map_err(refusal)?;
-        crate::state::validate_resource_name("indexName", &input.index_name).map_err(refusal)?;
+        crate::state::validate_resource_name(crate::state::NameKind::Index, &input.index_name)
+            .map_err(refusal)?;
         // The `aws:` tag-key namespace is AWS's own wherever a caller names tags.
         if let Some(tags) = input.tags.as_ref() {
             crate::state::validate_tag_keys(tags.keys().map(String::as_str)).map_err(refusal)?;

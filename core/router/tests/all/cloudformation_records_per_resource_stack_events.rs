@@ -66,6 +66,18 @@ const STACK_RESOURCE_TYPE: &str = "AWS::CloudFormation::Stack";
 const VECTOR_BUCKET: &str = "AWS::S3Vectors::VectorBucket";
 const VECTOR_INDEX: &str = "AWS::S3Vectors::Index";
 
+/// The refusals Amazon S3 Vectors answers for the declarations these rows ask for, which
+/// are what a failed resource's reason quotes: ONE fixed sentence per resource kind for a
+/// name outside the form that kind is named by, and — for a name outside the modelled
+/// `@length` of the member it travelled in — the clause that service states for a value
+/// outside a MODELLED constraint, naming the member by its JSON pointer.
+const INVALID_BUCKET_NAME: &str = "Invalid vector bucket name";
+/// See [`INVALID_BUCKET_NAME`].
+const INVALID_INDEX_NAME: &str = "Invalid index name";
+/// See [`INVALID_BUCKET_NAME`].
+const BUCKET_NAME_LENGTH: &str = "Value at '/vectorBucketName' failed to satisfy constraint: \
+                                  Member must have length between 3 and 63, inclusive";
+
 /// One `StackEvent` as the wire reports it.
 #[derive(Debug, Clone)]
 struct WireEvent {
@@ -201,8 +213,11 @@ struct Transit {
     /// deployment carried through, `CREATE_FAILED` for one the owning service refused.
     terminal: &'static str,
     /// For a refused resource, a fragment of the OWNING service's own message the reason must
-    /// quote — the member of its API whose value it would not accept. `None` for a resource
-    /// the deployment carried through, which states no reason at all.
+    /// quote — the refusal that service answers for the declaration it would not accept:
+    /// its fixed sentence for a name outside the form that kind of resource is named by, or
+    /// the clause it states for a value outside a MODELLED constraint, which names the
+    /// member by its JSON pointer. `None` for a resource the deployment carried through,
+    /// which states no reason at all.
     quotes: Option<&'static str>,
 }
 
@@ -269,7 +284,7 @@ const ROWS: &[Row] = &[
             logical_id: "Vectors",
             resource_type: VECTOR_BUCKET,
             terminal: "CREATE_FAILED",
-            quotes: Some("vectorBucketName"),
+            quotes: Some(INVALID_BUCKET_NAME),
         }],
         unreached: &[],
         stack_status: "ROLLBACK_COMPLETE",
@@ -295,7 +310,7 @@ const ROWS: &[Row] = &[
             logical_id: "Store",
             resource_type: VECTOR_BUCKET,
             terminal: "CREATE_FAILED",
-            quotes: Some("vectorBucketName"),
+            quotes: Some(BUCKET_NAME_LENGTH),
         }],
         unreached: &[],
         stack_status: "ROLLBACK_COMPLETE",
@@ -339,7 +354,7 @@ const ROWS: &[Row] = &[
                 logical_id: "Embeddings",
                 resource_type: VECTOR_INDEX,
                 terminal: "CREATE_FAILED",
-                quotes: Some("indexName"),
+                quotes: Some(INVALID_INDEX_NAME),
             },
         ],
         unreached: &[],
@@ -372,7 +387,7 @@ const ROWS: &[Row] = &[
             logical_id: "Vectors",
             resource_type: VECTOR_BUCKET,
             terminal: "CREATE_FAILED",
-            quotes: Some("vectorBucketName"),
+            quotes: Some(INVALID_BUCKET_NAME),
         }],
         unreached: &["Later"],
         stack_status: "ROLLBACK_COMPLETE",

@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.vector_bucket_arn.as_deref(),
         )
         .map_err(refusal)?;
-        crate::state::validate_bucket_policy("policy", &input.policy).map_err(refusal)?;
+        crate::state::validate_bucket_policy(&input.policy).map_err(refusal)?;
 
         // The policy REPLACES whatever the bucket carried: this operation "creates a
         // bucket policy for a vector bucket", a bucket has at most one policy, and

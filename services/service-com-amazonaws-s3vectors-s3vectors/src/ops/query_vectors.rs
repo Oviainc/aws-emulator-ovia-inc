@@ -244,7 +244,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let VectorData::Float32(query) = &input.query_vector;
-        crate::state::validate_vector_data("queryVector", index, query).map_err(refusal)?;
+        // The vector a query is run with is held to the same rules as a stored one,
+        // and the member it travelled in is the path the refusal names.
+        if let Some(defect) = crate::state::vector_data_defect(index, query) {
+            return Err(refusal(crate::state::LookupError::invalid(
+                "queryVector",
+                defect,
+            )));
+        }
 
         let filter = input.filter.unwrap_or(::aws_smithy_types::Document::Null);
         let non_filterable: &[String] = index

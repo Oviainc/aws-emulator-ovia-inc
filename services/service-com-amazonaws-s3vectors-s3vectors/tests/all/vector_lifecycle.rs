@@ -66,6 +66,19 @@ pub(crate) async fn call_uri(
     path_and_query: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
+    let (status, _, parsed) = call_reporting_errortype(router, method, path_and_query, body).await;
+    (status, parsed)
+}
+
+/// As [`call_uri`], reporting the `x-amzn-errortype` header too: restJson1 resolves
+/// an error SHAPE from that header rather than from the body, so a suite that pins
+/// which error a client sees reads it as well as the body's `__type`.
+pub(crate) async fn call_reporting_errortype(
+    router: &MultiServiceRouter,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&Value>,
+) -> (u16, Option<String>, Value) {
     let payload = match body {
         Some(body) => {
             bytes::Bytes::from(serde_json::to_vec(body).expect("the request body serializes"))
@@ -83,13 +96,18 @@ pub(crate) async fn call_uri(
         .expect("a well-formed request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let errortype = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let payload = response.into_body();
     let parsed = if payload.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&payload).unwrap_or(Value::Null)
     };
-    (status, parsed)
+    (status, errortype, parsed)
 }
 
 /// The wire error code (`__type`) of an error response, or `""`.

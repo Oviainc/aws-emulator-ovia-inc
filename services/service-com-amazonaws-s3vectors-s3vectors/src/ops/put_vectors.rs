@@ -210,19 +210,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
 
         // Every vector in the batch is checked against the index BEFORE anything is
-        // written, so a refused batch leaves the index exactly as it was.
+        // written, so a refused batch leaves the index exactly as it was. A record the
+        // index cannot hold is refused as the record it is: `fieldList` names the
+        // element of `vectors` it was submitted in, and the message names it by the
+        // `key` the caller gave it.
         let mut prepared: Vec<crate::state::StoredVector> = Vec::with_capacity(input.vectors.len());
         for (position, vector) in input.vectors.into_iter().enumerate() {
             let VectorData::Float32(data) = vector.data;
-            crate::state::validate_vector_data(
-                &format!("vectors[{position}].data"),
-                index,
-                &data,
-            )
-            .map_err(refusal)?;
+            let element = format!("vectors[{position}]");
+            if let Some(defect) = crate::state::vector_data_defect(index, &data) {
+                return Err(refusal(crate::state::LookupError::invalid_record(
+                    &element,
+                    &vector.key,
+                    defect,
+                )));
+            }
             let metadata = crate::state::normalized_metadata(vector.metadata);
-            crate::state::validate_metadata(&format!("vectors[{position}].metadata"), &metadata)
-                .map_err(refusal)?;
+            if let Some(defect) = crate::state::metadata_defect(&metadata) {
+                return Err(refusal(crate::state::LookupError::invalid_record(
+                    &element,
+                    &vector.key,
+                    defect,
+                )));
+            }
             prepared.push(crate::state::StoredVector {
                 key: vector.key,
                 data,

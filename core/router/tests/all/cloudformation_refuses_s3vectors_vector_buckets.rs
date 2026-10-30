@@ -89,18 +89,16 @@ struct Row {
     /// The name the template declares for the refused resource.
     refused_name: String,
     declared: Declared,
+    /// The OWNING service's own refusal of this declaration, which the failed resource's
+    /// reason therefore carries: the fixed sentence S3 Vectors answers for a name outside
+    /// the form that kind of resource is named by, or — for a name outside the modelled
+    /// `@length` of the member it travelled in — the clause that service states for a
+    /// value outside a modelled constraint, which names the member by its JSON pointer.
+    /// Stated per row because which of the two a name gets is a property of the name.
+    refusal: &'static str,
 }
 
 impl Row {
-    /// The member of the create S3 Vectors refuses for this row's type, which its refusal
-    /// names and which the failed resource's reason therefore carries:
-    /// `CreateVectorBucket`'s `vectorBucketName` and `CreateIndex`'s `indexName`.
-    fn refused_member(&self) -> &'static str {
-        match self.declared {
-            Declared::Bucket => "vectorBucketName",
-            Declared::IndexIn(_) => "indexName",
-        }
-    }
 
     /// The logical id of the resource whose create is refused.
     fn failed_logical_id(&self) -> &'static str {
@@ -173,6 +171,19 @@ impl Row {
     }
 }
 
+/// The sentence S3 Vectors answers for a name outside the form a vector bucket is named
+/// by, and the one it answers for an index name — one fixed sentence per resource kind,
+/// echoing no part of the rejected name.
+const INVALID_BUCKET_NAME: &str = "Invalid vector bucket name";
+/// See [`INVALID_BUCKET_NAME`].
+const INVALID_INDEX_NAME: &str = "Invalid index name";
+
+/// The clause S3 Vectors states for a `vectorBucketName` outside the `@length(min: 3,
+/// max: 63)` its model declares: a value outside a MODELLED constraint, which that
+/// service refuses naming the member by its JSON pointer and the bounds it declares.
+const BUCKET_NAME_LENGTH: &str = "Value at '/vectorBucketName' failed to satisfy constraint: \
+                                  Member must have length between 3 and 63, inclusive";
+
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -180,11 +191,13 @@ fn rows() -> Vec<Row> {
             case: "an upper-case vector bucket name",
             refused_name: "Sim2Real-Probe-Vec".to_string(),
             declared: Declared::Bucket,
+            refusal: INVALID_BUCKET_NAME,
         },
         Row {
             case: "a vector bucket name under the published minimum of three characters",
             refused_name: "ab".to_string(),
             declared: Declared::Bucket,
+            refusal: BUCKET_NAME_LENGTH,
         },
         Row {
             // One byte past the published maximum of 63, built from characters the form
@@ -192,21 +205,25 @@ fn rows() -> Vec<Row> {
             case: "a vector bucket name over the published maximum of 63 characters",
             refused_name: "a".repeat(64),
             declared: Declared::Bucket,
+            refusal: BUCKET_NAME_LENGTH,
         },
         Row {
             case: "a vector bucket name carrying a character outside the published set",
             refused_name: "under_score-vectors".to_string(),
             declared: Declared::Bucket,
+            refusal: INVALID_BUCKET_NAME,
         },
         Row {
             case: "a vector bucket name beginning with a separator",
             refused_name: "-leading-hyphen".to_string(),
             declared: Declared::Bucket,
+            refusal: INVALID_BUCKET_NAME,
         },
         Row {
             case: "a vector bucket name ending with a separator",
             refused_name: "trailing.dot.".to_string(),
             declared: Declared::Bucket,
+            refusal: INVALID_BUCKET_NAME,
         },
         Row {
             // The same name form holds for the other type, and this row's bucket IS created
@@ -214,6 +231,7 @@ fn rows() -> Vec<Row> {
             case: "an upper-case index name in a vector bucket the same template declares",
             refused_name: "Titan-V2".to_string(),
             declared: Declared::IndexIn("refused-index-host"),
+            refusal: INVALID_INDEX_NAME,
         },
     ]
 }
@@ -381,14 +399,14 @@ async fn an_s3vectors_name_the_owning_service_refuses_rolls_the_stack_back() {
              {reason:?}"
         );
 
-        // The resource itself FAILED, with the owning service's own refusal of the member it
-        // refused as the reason.
-        let member = row.refused_member();
+        // The resource itself FAILED, with the owning service's own refusal of the
+        // declaration it refused as the reason.
+        let refusal = row.refusal;
         let failures = create_failure_reasons(&router, case, &stack_name, failed_logical_id).await;
         assert!(
-            failures.iter().any(|reason| reason.contains(member)),
+            failures.iter().any(|reason| reason.contains(refusal)),
             "case {case:?}: expected a CREATE_FAILED event for {failed_logical_id:?} whose \
-             reason names {member:?}, got {failures:?}"
+             reason carries {refusal:?}, got {failures:?}"
         );
 
         // ...and the rollback disposed of every resource the create acted on, so each one's

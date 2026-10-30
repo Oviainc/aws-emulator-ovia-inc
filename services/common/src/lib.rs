@@ -289,6 +289,10 @@ pub mod json_document;
 /// line and column — for every service whose refusal carries its JSON parser's own
 /// diagnostic.
 pub mod json_parse_fault;
+/// The ONE spelling of a request member as an RFC 6901 JSON pointer, built from the
+/// dotted path the framework's constraint walk reports — for every service whose refusal
+/// addresses a failing input that way rather than by the dotted path.
+pub mod json_pointer;
 /// The ONE evaluation of a caller-supplied JSON path that has to name a SINGLE value,
 /// for every service whose API takes such a path as a string — bounded to a reference
 /// path, so what it costs is its segment count rather than the size of the document.

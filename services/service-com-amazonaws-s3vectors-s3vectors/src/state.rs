@@ -40,6 +40,25 @@ pub const DEFAULT_SSE_TYPE: &str = "AES256";
 /// set to `aws:kms`".
 pub const KMS_SSE_TYPE: &str = "aws:kms";
 
+/// The `fieldList` path the service names a broken encryption configuration by: the
+/// CONFIGURATION, spelled as the recorded response spells it, rather than either of
+/// the two members whose combination is what is wrong.
+pub const ENCRYPTION_CONFIGURATION_PATH: &str = "EncryptionConfiguration";
+
+/// The `ValidationException` message for an encryption configuration that names the
+/// KMS encryption type with no key for it: ONE fixed sentence naming the two members
+/// of the rule, carrying no value from the request. This is the sentence the real
+/// service answered in the recorded response; the status (400) and the error code
+/// (`ValidationException`) are the requirements either way.
+pub const KMS_KEY_ARN_REQUIRED: &str =
+    "kmsKeyArn must be specified when sseType is set to aws:kms";
+
+/// See [`KMS_KEY_ARN_REQUIRED`]: the other direction of the same biconditional — a key
+/// named beside an encryption type that takes none — stated the same way, so a client
+/// reads which half of the rule it broke from the sentence.
+pub const KMS_KEY_ARN_NOT_ALLOWED: &str =
+    "kmsKeyArn is not allowed when sseType is not set to aws:kms";
+
 /// `DistanceMetric` values, from the model's enum (`cosine`, `euclidean`).
 pub const DISTANCE_METRIC_COSINE: &str = "cosine";
 /// See [`DISTANCE_METRIC_COSINE`].
@@ -226,17 +245,22 @@ pub enum LookupError {
     /// cannot express -> `ValidationException` (400).
     Invalid {
         message: String,
-        /// The input member the failure is about, for `fieldList`.
-        path: Option<String>,
+        /// The input the failure is about, for `fieldList`: the path that entry
+        /// names and the sentence it carries. That sentence is the top-level
+        /// `message` for a refusal about the member alone, and the member's own
+        /// half of it where the top-level sentence says more about the request
+        /// (see [`LookupError::invalid_record`]).
+        field: Option<(String, String)>,
     },
 }
 
 impl LookupError {
     /// A refusal about `path`, an input member path.
     pub fn invalid(path: &str, message: impl Into<String>) -> Self {
+        let message = message.into();
         Self::Invalid {
-            message: message.into(),
-            path: Some(path.to_string()),
+            field: Some((path.to_string(), message.clone())),
+            message,
         }
     }
 
@@ -244,7 +268,24 @@ impl LookupError {
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::Invalid {
             message: message.into(),
-            path: None,
+            field: None,
+        }
+    }
+
+    /// A refusal about ONE RECORD of a batch: the element of the input list that
+    /// record was submitted in, and `defect`, the sentence saying what is wrong
+    /// with it.
+    ///
+    /// The two halves of the body say different things here, which is what this
+    /// constructor exists for: `fieldList` names the list ELEMENT and carries the
+    /// defect alone, while the top-level `message` states which record of the batch
+    /// was rejected — by the `key` the caller submitted it under, the only thing
+    /// that identifies a record to the client that sent the batch.
+    pub fn invalid_record(path: &str, key: &str, defect: impl Into<String>) -> Self {
+        let defect = defect.into();
+        Self::Invalid {
+            message: format!("Invalid record for key '{key}': {defect}"),
+            field: Some((path.to_string(), defect)),
         }
     }
 
@@ -269,16 +310,33 @@ impl LookupError {
         }
     }
 
-    /// The modelled 400 payload, naming the offending member in `fieldList`.
+    /// The modelled 400 payload, naming the offending input in `fieldList`.
+    ///
+    /// HOW that input is spelled is the refusing LAYER's, not this service's choice to
+    /// make once: a `ValidationExceptionField$path` is "a path about the validation
+    /// exception" and the recorded responses show S3 Vectors spelling it three ways, one
+    /// per layer that refuses —
+    ///
+    /// * a value outside a constraint the MODEL declares is refused ahead of every
+    ///   handler and names its member by a JSON POINTER into the request (`/dimension`),
+    ///   which is `crate::service`'s half of the refusal;
+    /// * a rule a handler enforces about ONE input member names that member as the model
+    ///   spells it (`vectorBucketName`), or the input STRUCTURE whose members cannot hold
+    ///   together as the model spells that shape ([`ENCRYPTION_CONFIGURATION_PATH`]);
+    /// * a rule about one RECORD of a batch names the element of the input list it was
+    ///   submitted in, in the subscript form ([`LookupError::invalid_record`]).
+    ///
+    /// Each of the three is the spelling the real service answered in a recorded
+    /// response, so they are reproduced rather than unified.
     pub fn validation_exception(&self) -> ValidationException {
         match self {
             Self::NotFound(message) => ValidationException {
                 message: message.clone(),
                 field_list: None,
             },
-            Self::Invalid { message, path } => ValidationException {
+            Self::Invalid { message, field } => ValidationException {
                 message: message.clone(),
-                field_list: path.as_ref().map(|path| {
+                field_list: field.as_ref().map(|(path, message)| {
                     vec![ValidationExceptionField {
                         path: path.clone(),
                         message: message.clone(),
@@ -431,11 +489,50 @@ pub fn index_from_arn(member: &str, arn: &str) -> Result<(String, String), Looku
     }
 }
 
+/// Which resource a request's name was for, for the one refusal a name outside the
+/// form that kind of resource is named by gets.
+///
+/// The kinds are worded differently — the service says "vector bucket" where it says
+/// "index", exactly as its not-found and already-exists sentences do (see
+/// [`BUCKET_NOT_FOUND`]) — so a client branching on the text tells them apart, and the
+/// member a request carries the name in is the path the refusal names it by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameKind {
+    /// A vector bucket's name, carried in `vectorBucketName`.
+    VectorBucket,
+    /// A vector index's name, carried in `indexName`.
+    Index,
+}
+
+impl NameKind {
+    /// The input member a request carries this kind of name in, which is the path the
+    /// refusal's `fieldList` entry names.
+    pub const fn member(self) -> &'static str {
+        match self {
+            Self::VectorBucket => "vectorBucketName",
+            Self::Index => "indexName",
+        }
+    }
+
+    /// The `ValidationException` message for a name outside this kind's form: ONE
+    /// fixed sentence, which neither echoes the rejected name nor restates the rule,
+    /// so a client matching the text matches one constant string. This is the sentence
+    /// the real service answered in the recorded response for a vector bucket; the
+    /// status (400) and the error code (`ValidationException`) are the requirements
+    /// either way.
+    pub const fn invalid_name(self) -> &'static str {
+        match self {
+            Self::VectorBucket => "Invalid vector bucket name",
+            Self::Index => "Invalid index name",
+        }
+    }
+}
+
 /// The bucket name form the model's `VectorBucketArn` / `IndexArn` patterns
 /// encode for both a bucket and an index segment:
 /// `[a-z0-9][a-z0-9-.]{1,61}[a-z0-9]` — 3 to 63 characters, lowercase
 /// alphanumerics, dots and hyphens, starting and ending alphanumeric.
-pub fn validate_resource_name(member: &str, value: &str) -> Result<(), LookupError> {
+pub fn validate_resource_name(kind: NameKind, value: &str) -> Result<(), LookupError> {
     let bytes = value.as_bytes();
     let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     let well_formed = (3..=63).contains(&bytes.len())
@@ -447,14 +544,16 @@ pub fn validate_resource_name(member: &str, value: &str) -> Result<(), LookupErr
     if well_formed {
         return Ok(());
     }
-    Err(LookupError::invalid(
-        member,
-        format!(
-            "`{member}` must be 3 to 63 characters of lowercase letters, numbers, \
-             hyphens and dots, and must begin and end with a letter or a number: {value}"
-        ),
-    ))
+    Err(LookupError::invalid(kind.member(), kind.invalid_name()))
 }
+
+/// The `ValidationException` message for a `policy` document the service will not
+/// accept, as the service words it: ONE fixed sentence that says the document is not a
+/// policy and nothing about WHICH rule it broke — no parser diagnostic, no line or
+/// column, no member name. This is the sentence the real service answered in the
+/// recorded response; the status (400) and the error code (`ValidationException`) are
+/// the requirements either way.
+pub const POLICY_MALFORMED: &str = "The provided policy is malformed or invalid";
 
 /// Check a bucket policy document against the IAM resource-policy grammar.
 ///
@@ -468,70 +567,54 @@ pub fn validate_resource_name(member: &str, value: &str) -> Result<(), LookupErr
 /// never stored: a stored non-policy would be handed back by
 /// GetVectorBucketPolicy as if the service had accepted it.
 ///
+/// Which rule the document broke decides only WHETHER it is refused, never what the
+/// refusal says: every one of them is [`POLICY_MALFORMED`], the one sentence the
+/// service answers for a document that is not a policy.
+///
 /// Only the grammar is checked here. Whether the principals, actions and
 /// resources a well-formed statement names exist is not a grammar question, and
 /// a policy may legitimately name a principal or a resource in another account.
-pub fn validate_bucket_policy(member: &str, policy: &str) -> Result<(), LookupError> {
-    let refuse = |detail: String| {
-        Err(LookupError::invalid(
-            member,
-            format!("`{member}` is not a valid policy document: {detail}"),
-        ))
-    };
-
-    if policy.len() > MAX_POLICY_BYTES {
-        return refuse(format!(
-            "a policy document is at most {MAX_POLICY_BYTES} bytes, and this one is {} bytes",
-            policy.len()
-        ));
+pub fn validate_bucket_policy(policy: &str) -> Result<(), LookupError> {
+    if is_policy_document(policy) {
+        Ok(())
+    } else {
+        Err(LookupError::invalid_request(POLICY_MALFORMED))
     }
+}
 
-    let document: serde_json::Value = match serde_json::from_str(policy) {
-        Ok(document) => document,
-        Err(error) => return refuse(format!("it is not well-formed JSON ({error})")),
+/// Whether `policy` is a policy document by the grammar [`validate_bucket_policy`]
+/// states, and within the size [`MAX_POLICY_BYTES`] bounds.
+fn is_policy_document(policy: &str) -> bool {
+    if policy.len() > MAX_POLICY_BYTES {
+        return false;
+    }
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(policy) else {
+        return false;
     };
     let Some(object) = document.as_object() else {
-        return refuse("a policy document is a JSON object".to_string());
+        return false;
     };
     for key in ["Version", "Id"] {
         if object.get(key).is_some_and(|value| !value.is_string()) {
-            return refuse(format!("`{key}` is a string"));
+            return false;
         }
     }
-    let Some(statement) = object.get("Statement") else {
-        return refuse("a policy document has a `Statement`".to_string());
-    };
-    let statements: Vec<&serde_json::Value> = match statement {
-        serde_json::Value::Array(statements) => statements.iter().collect(),
-        other => vec![other],
+    let statements: Vec<&serde_json::Value> = match object.get("Statement") {
+        Some(serde_json::Value::Array(statements)) => statements.iter().collect(),
+        Some(other) => vec![other],
+        None => return false,
     };
     if statements.is_empty() {
-        return refuse("`Statement` names at least one statement".to_string());
+        return false;
     }
-    for (position, statement) in statements.iter().enumerate() {
+    statements.iter().all(|statement| {
         let Some(statement) = statement.as_object() else {
-            return refuse(format!("statement {position} is a JSON object"));
+            return false;
         };
-        match statement.get("Effect").and_then(serde_json::Value::as_str) {
-            Some(POLICY_EFFECT_ALLOW) | Some(POLICY_EFFECT_DENY) => {}
-            other => {
-                return refuse(format!(
-                    "statement {position}'s `Effect` is `{POLICY_EFFECT_ALLOW}` or \
-                     `{POLICY_EFFECT_DENY}`, not {}",
-                    match other {
-                        Some(effect) => format!("`{effect}`"),
-                        None => "absent".to_string(),
-                    }
-                ));
-            }
-        }
-        if !statement.contains_key("Action") && !statement.contains_key("NotAction") {
-            return refuse(format!(
-                "statement {position} names an `Action` or a `NotAction`"
-            ));
-        }
-    }
-    Ok(())
+        let effect = statement.get("Effect").and_then(serde_json::Value::as_str);
+        matches!(effect, Some(POLICY_EFFECT_ALLOW) | Some(POLICY_EFFECT_DENY))
+            && (statement.contains_key("Action") || statement.contains_key("NotAction"))
+    })
 }
 
 /// The `ValidationException` message for a bucket selector that is not EXACTLY one
@@ -809,12 +892,23 @@ pub fn encryption_record(
     } else {
         requested.sse_type.as_str()
     };
-    if requested.kms_key_arn.is_some() && sse_type != KMS_SSE_TYPE {
+    // `kmsKeyArn` "is allowed if and only if `sseType` is set to `aws:kms`" — a
+    // BICONDITIONAL, so both directions are refused: a key named beside another
+    // encryption type, and the KMS type named with no key for it. Either way the
+    // refusal is about the configuration as a whole rather than about one of the two
+    // members, which is the path the service's `fieldList` entry names.
+    let names_key = requested.kms_key_arn.is_some();
+    let names_kms = sse_type == KMS_SSE_TYPE;
+    if names_kms && !names_key {
         return Err(LookupError::invalid(
-            "encryptionConfiguration.kmsKeyArn",
-            format!(
-                "`kmsKeyArn` is allowed if and only if `sseType` is `{KMS_SSE_TYPE}`, not `{sse_type}`"
-            ),
+            ENCRYPTION_CONFIGURATION_PATH,
+            KMS_KEY_ARN_REQUIRED,
+        ));
+    }
+    if names_key && !names_kms {
+        return Err(LookupError::invalid(
+            ENCRYPTION_CONFIGURATION_PATH,
+            KMS_KEY_ARN_NOT_ALLOWED,
         ));
     }
     Ok(EncryptionRecord {
@@ -902,15 +996,21 @@ pub fn vector_distance(metric: &str, left: &[f32], right: &[f32]) -> f32 {
         let right_norm: f32 = right.iter().map(|r| r * r).sum::<f32>().sqrt();
         if left_norm == 0.0 || right_norm == 0.0 {
             // Unreachable for stored and query vectors, which
-            // `validate_vector_data` refuses as zero vectors under `cosine`.
+            // `vector_data_defect` refuses as zero vectors under `cosine`.
             return 1.0;
         }
         1.0 - dot / (left_norm * right_norm)
     }
 }
 
-/// Check one vector's `float32` data against the index it is being written to or
-/// queried with.
+/// Why one vector's `float32` data cannot be written to (or queried against) the
+/// index, or `None` when it can.
+///
+/// ONE sentence about the VECTOR, which names no member and no index: WHICH vector
+/// the request got wrong is the path the refusal carries (the element of the input
+/// list, or the query member), so the sentence is the same wherever a vector is
+/// checked. The dimension sentence is the one the real service answered in the
+/// recorded response.
 ///
 /// `PutInputVector$data` documents all three rules: "vector dimensions must
 /// match the dimension count that's configured for the vector index"; "for the
@@ -918,38 +1018,27 @@ pub fn vector_distance(metric: &str, left: &[f32], right: &[f32]) -> f32 {
 /// allowed"; and "for both cosine and euclidean distance metrics, vector data
 /// must contain only valid floating-point values. Invalid values such as NaN
 /// (Not a Number) or Infinity aren't allowed".
-pub fn validate_vector_data(
-    member: &str,
-    index: &VectorIndexRecord,
-    data: &[f32],
-) -> Result<(), LookupError> {
-    if data.len() != usize::try_from(index.dimension.max(0)).unwrap_or(0) {
-        return Err(LookupError::invalid(
-            member,
-            format!(
-                "`{member}` has {} values, but vector index {} is configured for {} dimensions",
-                data.len(),
-                index.name,
-                index.dimension
-            ),
+pub fn vector_data_defect(index: &VectorIndexRecord, data: &[f32]) -> Option<String> {
+    let dimension = usize::try_from(index.dimension.max(0)).unwrap_or(0);
+    if data.len() != dimension {
+        return Some(format!(
+            "vector must have length {dimension}, but has length {}",
+            data.len()
         ));
     }
     if data.iter().any(|value| !value.is_finite()) {
-        return Err(LookupError::invalid(
-            member,
-            format!("`{member}` must contain only finite values: NaN and Infinity aren't allowed"),
-        ));
+        return Some(
+            "vector data must contain only valid floating-point values, so NaN and \
+             Infinity aren't allowed"
+                .to_string(),
+        );
     }
     if index.distance_metric == DISTANCE_METRIC_COSINE && data.iter().all(|value| *value == 0.0) {
-        return Err(LookupError::invalid(
-            member,
-            format!(
-                "`{member}` is a zero vector, which isn't allowed for the \
-                 `{DISTANCE_METRIC_COSINE}` distance metric"
-            ),
+        return Some(format!(
+            "zero vectors aren't allowed for the {DISTANCE_METRIC_COSINE} distance metric"
         ));
     }
-    Ok(())
+    None
 }
 
 /// Normalize an input metadata document: `PutInputVector$metadata` declares the
@@ -962,34 +1051,32 @@ pub fn normalized_metadata(metadata: Document) -> Document {
     }
 }
 
-/// Refuse a vector's `metadata` document that holds more elements than
-/// [`MAX_METADATA_NODES`] or nests deeper than [`MAX_METADATA_DEPTH`], so one
-/// request cannot store an unbounded document — and so the equality walk a later
-/// filter runs over the stored document has a known bound.
+/// Why a vector's `metadata` document cannot be stored — it holds more elements than
+/// [`MAX_METADATA_NODES`] or nests deeper than [`MAX_METADATA_DEPTH`] — or `None` when
+/// it can, so one request cannot store an unbounded document and the equality walk a
+/// later filter runs over the stored document has a known bound.
+///
+/// As with [`vector_data_defect`], ONE sentence about the document: which record of a
+/// batch it belongs to is the path the refusal carries, not something the sentence
+/// says.
 ///
 /// Walks the document with an explicit stack rather than recursively, so the
 /// walk itself costs no stack whatever the caller nests.
-pub fn validate_metadata(member: &str, metadata: &Document) -> Result<(), LookupError> {
+pub fn metadata_defect(metadata: &Document) -> Option<String> {
     let mut pending: Vec<(&Document, u32)> = vec![(metadata, 0)];
     let mut nodes: usize = 0;
     while let Some((node, depth)) = pending.pop() {
         nodes += 1;
         if nodes > MAX_METADATA_NODES {
-            return Err(LookupError::invalid(
-                member,
-                format!(
-                    "`{member}` holds more than the {MAX_METADATA_NODES} elements this \
-                     service stores for one vector"
-                ),
+            return Some(format!(
+                "metadata holds more than the {MAX_METADATA_NODES} elements this \
+                 service stores for one vector"
             ));
         }
         if depth > MAX_METADATA_DEPTH {
-            return Err(LookupError::invalid(
-                member,
-                format!(
-                    "`{member}` nests deeper than the {MAX_METADATA_DEPTH} levels this \
-                     service stores for one vector"
-                ),
+            return Some(format!(
+                "metadata nests deeper than the {MAX_METADATA_DEPTH} levels this \
+                 service stores for one vector"
             ));
         }
         match node {
@@ -1002,7 +1089,7 @@ pub fn validate_metadata(member: &str, metadata: &Document) -> Result<(), Lookup
             _ => {}
         }
     }
-    Ok(())
+    None
 }
 
 /// The quota message for one more vector bucket, or `None` when there is room.
@@ -1320,7 +1407,7 @@ fn too_wide() -> LookupError {
 /// Call [`validate_filter`] ONCE before evaluating, which is where the size
 /// bounds live. The `depth_left` counters below are the explicit recursion bound
 /// of the code that recurses; a filter `validate_filter` admitted, over metadata
-/// [`validate_metadata`] admitted, cannot reach either of them.
+/// [`metadata_defect`] admitted, cannot reach either of them.
 pub fn metadata_matches(
     filter: &Document,
     metadata: &Document,
@@ -1434,7 +1521,7 @@ fn in_list(actual: Option<&Document>, operand: &Document) -> bool {
 /// by value.
 ///
 /// `depth_left` bounds the recursion into a list-valued entry.
-/// [`validate_metadata`] stores no document that deep, so the bound is the
+/// [`metadata_defect`] stores no document that deep, so the bound is the
 /// explicit recursion limit of this function rather than a behaviour a caller
 /// can observe.
 fn document_equals(actual: Option<&Document>, expected: &Document, depth_left: u32) -> bool {
