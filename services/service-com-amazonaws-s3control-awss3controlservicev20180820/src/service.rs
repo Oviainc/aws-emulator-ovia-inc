@@ -39,9 +39,21 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two modules beside this file carry what those seams are used FOR here, so
+//! the rules live in one place each rather than inside the seam bodies:
+//!
+//! - [`routes`] — the routes whose URI template puts literal segments after a
+//!   greedy `@httpLabel`, which the model-derived routing table cannot match,
+//!   and the rule that resolves them;
+//! - [`envelope`] — the error envelope every refusal this service answers is
+//!   finished in, and the one dispatch seam `override_operation` hands back.
+
+pub mod envelope;
+pub mod routes;
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -51,7 +63,12 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    entry: envelope::S3ControlDefinition<Eng>,
+    /// Resolves the operation a request names — the sub-resource routes the
+    /// generated table cannot name included — and finishes the error envelope
+    /// of every response this service answers. Held here because
+    /// [`Service::override_operation`] hands back a borrow of it.
+    dispatch: envelope::Dispatch,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +77,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: envelope::S3ControlDefinition::new(engine),
+            dispatch: envelope::Dispatch,
         }
     }
 
@@ -124,12 +142,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request this service serves is served through the one seam in
+        // `envelope`: it runs the same routing-table entry the router would have
+        // run — plus the Multi-Region Access Point sub-resource routes that table
+        // cannot name, whose templates put a literal segment after a greedy label
+        // (see `routes`) — and then finishes the response's error envelope. A
+        // request the seam resolves to nothing is left alone, so naming no
+        // modelled operation is still refused in front of the service, in the
+        // entry's own envelope, which `envelope::S3ControlDefinition` finishes the
+        // same way.
+        self.entry
+            .routes(req)
+            .then_some(&self.dispatch as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

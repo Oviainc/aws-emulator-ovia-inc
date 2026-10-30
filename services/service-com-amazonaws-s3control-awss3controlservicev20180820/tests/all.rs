@@ -41,6 +41,8 @@ mod batch_job_status;
 mod batch_job_tagging;
 #[path = "all/multi_region_access_point_lifecycle.rs"]
 mod multi_region_access_point_lifecycle;
+#[path = "all/multi_region_access_point_sub_resources.rs"]
+mod multi_region_access_point_sub_resources;
 #[path = "all/public_access_block.rs"]
 mod public_access_block;
 #[path = "all/resource_tagging.rs"]

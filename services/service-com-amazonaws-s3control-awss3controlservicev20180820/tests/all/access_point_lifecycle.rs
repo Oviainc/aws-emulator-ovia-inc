@@ -100,13 +100,26 @@ pub(crate) const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20
 /// service-assigned segment, and the hyphen before it.
 const ALIAS_NAME_ROOM: usize = 63 - "-s3alias".len() - 26 - 1;
 
-/// One response: the status and the body, with readers for the XML elements.
+/// One response: the status, the headers and the body, with readers for the XML
+/// elements.
 pub(crate) struct Reply {
     pub(crate) status: u16,
+    /// The response headers as `(lower-case name, value)` pairs, in arrival
+    /// order — the correlation headers an error answer carries are read from
+    /// here.
+    pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: String,
 }
 
 impl Reply {
+    /// The value of the first `name` header, compared case-insensitively as HTTP
+    /// compares a header name.
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .iter()
+            .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
     /// The text of the first `element` in the body, or `None` when the body
     /// carries none.
     pub(crate) fn text(&self, element: &str) -> Option<String> {
@@ -346,6 +359,16 @@ pub(crate) async fn call_in_region(
     let response = router.dispatch(request).await;
     Reply {
         status: response.status().as_u16(),
+        headers: response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_ascii_lowercase(),
+                    String::from_utf8_lossy(value.as_bytes()).to_string(),
+                )
+            })
+            .collect(),
         body: String::from_utf8(response.body().to_vec()).expect("a UTF-8 response body"),
     }
 }

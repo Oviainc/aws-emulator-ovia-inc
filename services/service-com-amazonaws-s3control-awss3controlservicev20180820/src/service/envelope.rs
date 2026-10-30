@@ -1,0 +1,579 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! This service's error envelope, and the one seam every request it serves runs
+//! through.
+//!
+//! S3 Control is `restXml`, and its refusals travel in the S3-style document
+//! `<ErrorResponse><Error><Code/><Message/>[<member/>…]</Error><RequestId/><HostId/></ErrorResponse>`:
+//! the `Error` element states WHAT failed, and the `RequestId` and `HostId`
+//! BESIDE it name the request it failed for, so a caller can correlate the
+//! failure with the service's own record of it. Neither is a member of any error
+//! shape the model declares — the model declares no error shapes for most of
+//! this service at all — so the protocol serializer, which renders an error from
+//! its shape's members, cannot put them there. [`with_error_correlation`] does,
+//! for every failure this service answers: one a handler raised, and one the
+//! request boundary made before any handler ran, alike. The pair is also
+//! reported in the matching `x-amz-request-id` / `x-amz-id-2` response headers,
+//! which is where a client that does not parse the body reads it.
+//!
+//! Where the elements BELONG is the vendored wrapped-restXml renderer, which
+//! already writes both on its `noErrorWrapping` path beside those two headers.
+//! That tree is read-only from here, and the framework's pre-dispatch renderer
+//! for a boundary refusal lives in it too, so the elements are added to the
+//! finished document instead. Two sibling services splice an envelope element
+//! into their own document the same way —
+//! `service-com-amazonaws-cloudfront-cloudfront2020-05-31`'s `service::envelope`
+//! and `service-com-amazonaws-cloudformation-cloudformation`'s
+//! `service::query_error_envelope` — so hoisting all three belongs with the
+//! vendored change that makes them unnecessary rather than with this fix.
+//!
+//! [`Dispatch`] is also where two things this service decides about a request
+//! are decided, both BEFORE the generated routing table gets it:
+//!
+//! * a request addressed to a sub-resource of a Multi-Region Access Point
+//!   reaches the operation that sub-resource's route names, with the greedy
+//!   label bound to the resource alone — see [`super::routes`] for the rule;
+//! * a request that polls an asynchronous request by a token this service could
+//!   not have minted is answered the refusal that says the token names no
+//!   request, rather than the boundary's shape-validation refusal: a request
+//!   token is an opaque identifier the service handed its caller, so it is
+//!   RESOLVED against the requests this service holds rather than checked
+//!   against a shape, and every token that resolves to nothing is the same
+//!   not-found answer whatever its text. A client polling an operation by a
+//!   token it did not construct then sees the 404 that means "unknown", not a
+//!   400 it reads as its own bug.
+
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_schema_server::xml_escape;
+use aws_smithy_types::body::SdkBody;
+use smithy_server_runtime::{
+    BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, OperationRoutingTable,
+    ServerHttpProtocol, Service, ServiceIdentity,
+};
+
+use super::routes;
+
+/// This service's `@xmlNamespace`, which its error envelope carries exactly as
+/// its success documents do (`smithy_query(query="service_info")`:
+/// `xmlNamespace.uri = http://awss3control.amazonaws.com/doc/2018-08-20/`).
+const XML_NAMESPACE: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
+
+/// The envelope element that names the request a failure answers.
+const REQUEST_ID_ELEMENT: &str = "RequestId";
+
+/// The envelope element that carries the extended request id.
+const HOST_ID_ELEMENT: &str = "HostId";
+
+/// The response header mirroring [`REQUEST_ID_ELEMENT`].
+const REQUEST_ID_HEADER: &str = "x-amz-request-id";
+
+/// The response header mirroring [`HOST_ID_ELEMENT`].
+const EXTENDED_REQUEST_ID_HEADER: &str = "x-amz-id-2";
+
+/// The envelope root, whose close is where the missing elements are added.
+const ERROR_RESPONSE_OPEN: &str = "<ErrorResponse";
+const ERROR_RESPONSE_CLOSE: &str = "</ErrorResponse>";
+
+/// `<Error><Type>`: a 4xx is the caller's fault, which restXml words `Sender`.
+const SENDER: &str = "Sender";
+
+/// The error code the framework names a request it refused before any handler
+/// ran. Not a shape this service's model declares, which is why a response
+/// carrying it is a refusal to restate rather than an S3 Control error.
+const FRAMEWORK_REFUSAL_CODE: &str = "ValidationException";
+
+/// The status the framework answers such a refusal with.
+const REFUSED: u16 = 400;
+
+/// The path space the asynchronous Multi-Region Access Point request
+/// operations are bound under: `DescribeMultiRegionAccessPointOperation` is
+/// `GET /v20180820/async-requests/mrap/{RequestTokenARN+}`, so a GET under this
+/// prefix addresses one request token (`smithy_query(query="operation",
+/// operation="DescribeMultiRegionAccessPointOperation")`).
+const ASYNC_REQUEST_PATH: &str = "/v20180820/async-requests/mrap/";
+
+/// How a refusal names the member it refused, as the request boundary states it
+/// (`Value '<x>' at '<member>' failed to satisfy constraint: …`) — the member
+/// path of `DescribeMultiRegionAccessPointOperationRequest$RequestTokenARN`.
+const REQUEST_TOKEN_MEMBER: &str = "requestTokenARN";
+
+/// The path component of a request URI, without the scheme, the authority or
+/// the query.
+fn request_path(uri: &str) -> &str {
+    let after_authority = match uri.split_once("://") {
+        None => uri,
+        Some((_, after_scheme)) => match after_scheme.find('/') {
+            None => "/",
+            Some(path_start) => after_scheme.split_at(path_start).1,
+        },
+    };
+    after_authority
+        .split('?')
+        .next()
+        .unwrap_or(after_authority)
+}
+
+/// The query component of a request URI (everything after the first `?`), or
+/// the empty string when it has none.
+fn request_query(uri: &str) -> &str {
+    uri.split_once('?').map_or("", |(_, query)| query)
+}
+
+/// The body of `resp` as text, when it is in memory and valid UTF-8.
+fn body_text(resp: &RtResponse) -> Option<&str> {
+    std::str::from_utf8(resp.body().bytes()?).ok()
+}
+
+/// The text of the first `<name>` element of `document`.
+///
+/// Enough for the envelope's own flat elements (`Code`, `Message`), which is
+/// all this module reads: the documents it reads are the ones this service just
+/// serialized.
+fn element_text<'a>(document: &'a str, name: &str) -> Option<&'a str> {
+    let after_open = document.split_once(&format!("<{name}>"))?.1;
+    Some(after_open.split_once(&format!("</{name}>"))?.0)
+}
+
+/// `req` with its path replaced by `path`, so the operation a sub-resource
+/// route names binds its `@httpLabel` members from the resource's own path (see
+/// [`super::routes`]). Everything else about the request — its method, its
+/// query and its headers — is carried through unchanged, because the route and
+/// the input are read from all of them.
+///
+/// `None` when the request body is not in memory or the rewritten URI is not
+/// one the HTTP layer can hold, which leaves the request to the generated
+/// routing table rather than failing it.
+fn with_bound_path(req: &RtRequest, path: &str) -> Option<RtRequest> {
+    let query = request_query(req.uri());
+    let uri = match query.is_empty() {
+        true => path.to_string(),
+        false => format!("{path}?{query}"),
+    };
+    let body = req.body().bytes()?.to_vec();
+    let mut rebuilt = RtRequest::new(SdkBody::from(body));
+    rebuilt.set_uri(uri.as_str()).ok()?;
+    rebuilt.set_method(req.method()).ok()?;
+    for (name, value) in req.headers().iter() {
+        rebuilt
+            .headers_mut()
+            .append(name.to_string(), value.to_string());
+    }
+    Some(rebuilt)
+}
+
+/// The error envelope this service answers `status` / `code` / `message` with,
+/// carrying its correlation pair.
+///
+/// The one renderer for a failure this module answers itself; a failure a
+/// handler raised or the boundary refused is rendered by the protocol and
+/// reaches the same envelope through [`with_error_correlation`].
+fn error_response(status: u16, code: &str, message: &str) -> RtResponse {
+    let (request_id, host_id) = crate::state::new_error_correlation();
+    let body = format!(
+        "<ErrorResponse xmlns=\"{namespace}\"><Error><Type>{SENDER}</Type><Code>{code}</Code>\
+         <Message>{message}</Message></Error>\
+         <{REQUEST_ID_ELEMENT}>{request_id}</{REQUEST_ID_ELEMENT}>\
+         <{HOST_ID_ELEMENT}>{host_id}</{HOST_ID_ELEMENT}></ErrorResponse>",
+        namespace = xml_escape(XML_NAMESPACE),
+        code = xml_escape(code),
+        message = xml_escape(message),
+    );
+    let mut resp = RtResponse::new(
+        StatusCode::try_from(status)
+            .unwrap_or(StatusCode::try_from(REFUSED).expect("400 is a valid status code")),
+        SdkBody::from(body),
+    );
+    resp.headers_mut().insert("content-type", "application/xml");
+    with_correlation_headers(resp, request_id, host_id)
+}
+
+/// `resp` reporting `request_id` and `host_id` in the two headers whose values
+/// the envelope's own elements mirror.
+fn with_correlation_headers(
+    mut resp: RtResponse,
+    request_id: String,
+    host_id: String,
+) -> RtResponse {
+    resp.headers_mut().insert(REQUEST_ID_HEADER, request_id);
+    resp.headers_mut()
+        .insert(EXTENDED_REQUEST_ID_HEADER, host_id);
+    resp
+}
+
+/// `resp` with its error envelope naming the request it answers.
+///
+/// A response that is not an error envelope, or one that already names the
+/// request, is handed back untouched — so this is applied to EVERY response
+/// without having to know which ones are errors.
+pub fn with_error_correlation(mut resp: RtResponse) -> RtResponse {
+    // A success is never an error envelope, whatever its document happens to
+    // contain: the status is what says this response states a failure.
+    if resp.status().as_u16() < 400 {
+        return resp;
+    }
+    let Some(body) = body_text(&resp) else {
+        return resp;
+    };
+    if !body.contains(ERROR_RESPONSE_OPEN) || body.contains(&format!("<{REQUEST_ID_ELEMENT}>")) {
+        return resp;
+    }
+    let Some(close_at) = body.rfind(ERROR_RESPONSE_CLOSE) else {
+        return resp;
+    };
+    let (request_id, host_id) = crate::state::new_error_correlation();
+    let mut rewritten = String::with_capacity(body.len() + 128);
+    rewritten.push_str(body.split_at(close_at).0);
+    rewritten.push_str(&format!(
+        "<{REQUEST_ID_ELEMENT}>{request_id}</{REQUEST_ID_ELEMENT}>\
+         <{HOST_ID_ELEMENT}>{host_id}</{HOST_ID_ELEMENT}>"
+    ));
+    rewritten.push_str(body.split_at(close_at).1);
+    let length = rewritten.len();
+    *resp.body_mut() = SdkBody::from(rewritten);
+    // Only a response that already states its length gets the new one: a
+    // renderer that left the framing to the transport keeps doing so.
+    if resp.headers().get("content-length").is_some() {
+        resp.headers_mut()
+            .insert("content-length", length.to_string());
+    }
+    with_correlation_headers(resp, request_id, host_id)
+}
+
+/// `resp`'s body when `resp` is a refusal the request boundary made before any
+/// handler ran, and `None` for anything else — including every refusal this
+/// service's own handlers answer, whose codes are its own.
+fn framework_refusal(resp: &RtResponse) -> Option<&str> {
+    if resp.status().as_u16() != REFUSED {
+        return None;
+    }
+    let body = body_text(resp)?;
+    (element_text(body, "Code")? == FRAMEWORK_REFUSAL_CODE).then_some(body)
+}
+
+/// Whether `refusal` is the boundary refusing the request over the TOKEN its
+/// path carries.
+///
+/// Read off the refusal's own sentence, which names the member it refused: a
+/// request under the same route refused for something else — the account id it
+/// names, say — keeps the cause its caller has to fix. Both spellings of the
+/// quotation marks are looked for, because the sentence is XML-escaped into the
+/// envelope.
+fn refused_over_request_token(refusal: &str) -> bool {
+    let Some(message) = element_text(refusal, "Message") else {
+        return false;
+    };
+    [
+        format!("at '{REQUEST_TOKEN_MEMBER}'"),
+        format!("at &apos;{REQUEST_TOKEN_MEMBER}&apos;"),
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+/// This service's own answer to a refusal the boundary stated in the
+/// framework's vocabulary, or `None` to keep the framework's rendering.
+///
+/// Reads the REQUEST and the REFUSAL, not the operation: a GET under the
+/// asynchronous-request path space addresses one request token, and a token the
+/// boundary would not read is one this service never minted, so it names no
+/// request — which is the one refusal that says so (see the module docs).
+fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
+    let refusal = framework_refusal(resp)?;
+    if !req.method().eq_ignore_ascii_case("GET")
+        || !request_path(req.uri()).starts_with(ASYNC_REQUEST_PATH)
+        || !refused_over_request_token(refusal)
+    {
+        return None;
+    }
+    Some(error_response(
+        crate::state::NO_SUCH_ASYNC_REQUEST_STATUS,
+        crate::state::NO_SUCH_ASYNC_REQUEST_CODE,
+        crate::state::NO_SUCH_ASYNC_REQUEST_MESSAGE,
+    ))
+}
+
+/// The generated definition, with the error envelope finished on the three
+/// failures the router renders OUTSIDE the dispatch path: a request that names
+/// no modelled operation, a transport-level failure, and a refusal made before
+/// any operation runs. Each is the generated renderer's own document with the
+/// envelope's correlation pair added, so a caller correlating a failure never
+/// has to care which layer refused it.
+///
+/// Identity, the protocol and the routing table come from the generated
+/// [`crate::ServiceDefinition`] untouched — nothing model-derived is restated
+/// here.
+pub struct S3ControlDefinition<Eng: Send + Sync + 'static> {
+    entry: crate::ServiceDefinition<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> S3ControlDefinition<Eng> {
+    /// Build the definition from the shared engine, which the generated entry
+    /// threads into every operation.
+    pub fn new(engine: ::std::sync::Arc<Eng>) -> Self {
+        Self {
+            entry: crate::ServiceDefinition::new(engine),
+        }
+    }
+
+    /// Whether this request is one [`Dispatch`] serves: either the generated
+    /// routing table resolves it, or it addresses a sub-resource whose route
+    /// the table cannot name (see [`super::routes`]).
+    pub fn routes(&self, req: &RtRequest) -> bool {
+        let modelled = self
+            .entry
+            .protocol()
+            .routing_key(req)
+            .ok()
+            .and_then(|key| self.entry.routing_table().get(key))
+            .is_some();
+        modelled || routes::resolve(req.method(), request_path(req.uri())).is_some()
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedServiceDefinition for S3ControlDefinition<Eng> {
+    fn identity(&self) -> &ServiceIdentity {
+        self.entry.identity()
+    }
+
+    fn protocol(&self) -> &dyn ServerHttpProtocol {
+        self.entry.protocol()
+    }
+
+    fn routing_table(&self) -> &OperationRoutingTable {
+        self.entry.routing_table()
+    }
+
+    fn routing_error_response(&self, req: &RtRequest) -> RtResponse {
+        with_error_correlation(self.entry.routing_error_response(req))
+    }
+
+    fn framework_error_response(
+        &self,
+        error: aws_smithy_schema_server::ProtocolError,
+    ) -> RtResponse {
+        with_error_correlation(self.entry.framework_error_response(error))
+    }
+
+    fn refusal_response(
+        &self,
+        error: aws_smithy_schema_server::ProtocolError,
+        chosen: Option<smithy_server_runtime::Refused>,
+    ) -> RtResponse {
+        with_error_correlation(ErasedServiceDefinition::refusal_response(
+            &self.entry,
+            error,
+            chosen,
+        ))
+    }
+}
+
+/// The modelled operation the request names, read from the model-derived
+/// routing table (never from the service's own override, which routes straight
+/// back here).
+fn modelled_operation<'s>(
+    svc: &'s dyn Service,
+    req: &RtRequest,
+) -> Option<&'s dyn ErasedOperation> {
+    let key = svc.definition().protocol().routing_key(req).ok()?;
+    svc.definition().routing_table().get(key)
+}
+
+/// The seam every request this service serves runs through: it resolves the
+/// operation — including the sub-resource routes the generated table cannot
+/// name — runs it unchanged, then finishes the response's error envelope (see
+/// the module docs).
+///
+/// Stateless and engine-free: the operation it runs is looked up on the service
+/// the router hands it, so this holds nothing per request and nothing per
+/// engine.
+#[derive(Debug, Default)]
+pub struct Dispatch;
+
+impl ErasedOperation for Dispatch {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // A sub-resource of a Multi-Region Access Point: the operation that
+            // route names, handed the request with the route's trailing literal
+            // segments taken off its path, so the greedy label binds the
+            // resource alone.
+            let sub_resource = routes::resolve(req.method(), request_path(req.uri())).and_then(
+                |(operation, bound)| {
+                    let op = svc.definition().routing_table().get(operation)?;
+                    Some((op, with_bound_path(req, &bound)?))
+                },
+            );
+            // The generated deserialize -> validate -> handle -> serialize
+            // walk, run exactly as the router would have run it.
+            let resp = match &sub_resource {
+                Some((op, rebuilt)) => op.run(svc, rebuilt, ctx).await,
+                None => match modelled_operation(svc, req) {
+                    Some(op) => op.run(svc, req, ctx).await,
+                    None => svc.definition().routing_error_response(req),
+                },
+            };
+            let resp = restated(req, &resp).unwrap_or(resp);
+            with_error_correlation(resp)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The envelope surgery and the restatement condition, read off documents
+    //! and requests rather than through the router (the crate's integration
+    //! suite drives the same rules end to end over HTTP).
+
+    use super::*;
+
+    /// An error envelope as the protocol serializer renders one: no correlation
+    /// pair.
+    fn serialized_error(status: u16, code: &str, message: &str) -> RtResponse {
+        let body = format!(
+            "<ErrorResponse xmlns=\"{XML_NAMESPACE}\"><Error><Type>Sender</Type>\
+             <Code>{code}</Code><Message>{message}</Message></Error></ErrorResponse>"
+        );
+        RtResponse::new(
+            StatusCode::try_from(status).expect("a valid status"),
+            SdkBody::from(body),
+        )
+    }
+
+    fn request(method: &str, uri: &str) -> RtRequest {
+        let mut req = RtRequest::new(SdkBody::empty());
+        req.set_uri(uri).expect("a valid uri");
+        req.set_method(method).expect("a valid method");
+        req
+    }
+
+    #[test]
+    fn every_error_envelope_gains_the_correlation_pair_once() {
+        let answered = with_error_correlation(serialized_error(
+            404,
+            "NoSuchMultiRegionAccessPoint",
+            "The specified Multi-Region Access Point does not exist.",
+        ));
+        let body = body_text(&answered).expect("a text body").to_string();
+        let request_id = element_text(&body, REQUEST_ID_ELEMENT).map(str::to_string);
+        let host_id = element_text(&body, HOST_ID_ELEMENT).map(str::to_string);
+        assert!(
+            request_id.as_deref().is_some_and(|id| !id.is_empty()),
+            "case \"a serialized refusal\": expected a RequestId element, got {body}"
+        );
+        assert!(
+            host_id.as_deref().is_some_and(|id| !id.is_empty()),
+            "case \"a serialized refusal\": expected a HostId element, got {body}"
+        );
+        assert_eq!(
+            answered
+                .headers()
+                .get(REQUEST_ID_HEADER)
+                .map(str::to_string),
+            request_id,
+            "case \"a serialized refusal\": the header must mirror the element, got {body}"
+        );
+        assert!(
+            body.find("</Error>").is_some_and(|error_end| {
+                body.find(&format!("<{REQUEST_ID_ELEMENT}>"))
+                    .is_some_and(|at| at > error_end)
+            }),
+            "case \"a serialized refusal\": the pair sits beside Error, not inside it: {body}"
+        );
+
+        // Idempotent: a document that already names the request is untouched.
+        let again = with_error_correlation(answered);
+        assert_eq!(
+            body_text(&again).map(str::to_string),
+            Some(body.clone()),
+            "case \"an envelope that already names the request\": expected no second pair"
+        );
+    }
+
+    #[test]
+    fn a_success_is_never_given_a_correlation_pair() {
+        let mut ok = RtResponse::new(
+            StatusCode::try_from(200u16).expect("200"),
+            SdkBody::from("<GetMultiRegionAccessPointResult/>".to_string()),
+        );
+        ok.headers_mut().insert("content-type", "application/xml");
+        let answered = with_error_correlation(ok);
+        assert_eq!(
+            body_text(&answered),
+            Some("<GetMultiRegionAccessPointResult/>"),
+            "case \"a success\": expected the document untouched"
+        );
+    }
+
+    #[test]
+    fn a_token_the_boundary_refused_is_restated_as_the_not_found_refusal() {
+        let req = request("GET", "/v20180820/async-requests/mrap/not-an-arn");
+        let refusal = serialized_error(
+            400,
+            FRAMEWORK_REFUSAL_CODE,
+            "1 validation error detected: Value &apos;not-an-arn&apos; at \
+             &apos;requestTokenARN&apos; failed to satisfy constraint: Member must satisfy \
+             regular expression pattern: ^arn:.+$",
+        );
+        let restated = restated(&req, &refusal).expect("the refusal is restated");
+        let body = body_text(&restated).expect("a text body").to_string();
+        assert_eq!(
+            (
+                restated.status().as_u16(),
+                element_text(&body, "Code").map(str::to_string)
+            ),
+            (
+                crate::state::NO_SUCH_ASYNC_REQUEST_STATUS,
+                Some(crate::state::NO_SUCH_ASYNC_REQUEST_CODE.to_string())
+            ),
+            "case \"a token that is not an ARN\": expected the not-found refusal, got {body}"
+        );
+        assert_eq!(
+            element_text(&body, "Message"),
+            Some(crate::state::NO_SUCH_ASYNC_REQUEST_MESSAGE),
+            "case \"a token that is not an ARN\": expected the fixed message, got {body}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_this_rule_does_not_own_keeps_its_own_wording() {
+        let cases: [(&str, RtRequest, RtResponse); 3] = [
+            (
+                "a refusal over another member of the same route",
+                request("GET", "/v20180820/async-requests/mrap/arn:aws:s3:::request"),
+                serialized_error(
+                    400,
+                    FRAMEWORK_REFUSAL_CODE,
+                    "1 validation error detected: Value &apos;nope&apos; at &apos;accountId&apos; \
+                     failed to satisfy constraint: Member must satisfy regular expression \
+                     pattern: ^\\d{12}$",
+                ),
+            ),
+            (
+                "a token refusal on another route",
+                request("GET", "/v20180820/mrap/instances/reports-mrap"),
+                serialized_error(
+                    400,
+                    FRAMEWORK_REFUSAL_CODE,
+                    "1 validation error detected: Value &apos;x&apos; at \
+                     &apos;requestTokenARN&apos; failed to satisfy constraint: Member must \
+                     satisfy regular expression pattern: ^arn:.+$",
+                ),
+            ),
+            (
+                "a refusal this service worded itself",
+                request("GET", "/v20180820/async-requests/mrap/arn:aws:s3:::request"),
+                serialized_error(404, "NoSuchAsyncRequest", "The specified request was not found."),
+            ),
+        ];
+        for (case, req, resp) in cases {
+            assert!(
+                restated(&req, &resp).is_none(),
+                "case {case:?}: expected the refusal to keep its own wording"
+            );
+        }
+    }
+}

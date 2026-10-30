@@ -242,6 +242,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.details.public_access_block.as_ref(),
             ),
             regions: regions.clone(),
+            // Every associated bucket starts out ACTIVE: the routing
+            // configuration a create leaves behind is one active route per
+            // bucket it associated.
+            routes: crate::state::default_routes(&regions),
+            // A Multi-Region Access Point carries no access control policy
+            // until a `PutMultiRegionAccessPointPolicy` puts one on it.
+            established_policy: None,
+            proposed_policy: None,
+            policy_due_at: None,
             // The create is asynchronous, so the access point is reported as
             // `CREATING` until the clock owes it `READY`.
             status: crate::state::multi_region_access_point_status(crate::state::STATUS_CREATING),

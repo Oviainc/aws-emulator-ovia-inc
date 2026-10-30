@@ -151,9 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_multi_region_access_points(now);
 
         let Some(request) = store.async_requests.get(&key) else {
-            return Err(crate::state::no_such_async_request(
-                &input.request_token_arn,
-            ));
+            return Err(crate::state::no_such_async_request());
         };
 
         Ok(DescribeMultiRegionAccessPointOperationOutput {

@@ -93,6 +93,7 @@ fn job_summaries(reply: &Reply) -> Vec<String> {
 fn summary_text(summary: &str, element: &str) -> Option<String> {
     Reply {
         status: 200,
+        headers: Vec::new(),
         body: summary.to_string(),
     }
     .text(element)

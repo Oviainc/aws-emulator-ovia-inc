@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutMultiRegionAccessPointPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutMultiRegionAccessPointPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutMultiRegionAccessPointPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates an access control policy with the Multi-Region Access Point the
+//! submitted details name, asynchronously: the document is PROPOSED until the
+//! request's span has elapsed and ESTABLISHED after it, and the call answers
+//! the token of the request that put it. Each access point has one policy, so a
+//! later put replaces what an earlier one left.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +143,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutMultiRegionAccessPointPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutMultiRegionAccessPointPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutMultiRegionAccessPointPolicy"))
+        // The document is retained verbatim on the record, so its size is
+        // bounded before anything is stored, and a document that is not JSON at
+        // all is not a resource policy — the same two rules this service
+        // applies to a single-Region access point's policy
+        // (`crate::ops::put_access_point_policy`).
+        if input.details.policy.len() > crate::state::MAX_POLICY_BYTES {
+            return Err(crate::state::malformed_policy(&format!(
+                "it is {} bytes, past the {} byte maximum",
+                input.details.policy.len(),
+                crate::state::MAX_POLICY_BYTES
+            )));
+        }
+        if ::serde_json::from_str::<::serde_json::Value>(&input.details.policy).is_err() {
+            return Err(crate::state::malformed_policy(
+                "it is not a well-formed JSON document",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let region = crate::state::signing_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let request_token_arn = crate::state::async_request_token_arn(
+            &region,
+            crate::state::ASYNC_VERB_PUT_POLICY,
+            &input.account_id,
+            &input.client_token,
+            &crate::state::put_policy_details_fingerprint(&input.details),
+        );
+
+        let mut store = state.lock();
+        store.settle_multi_region_access_points(now);
+
+        let request_key = (input.account_id.clone(), request_token_arn.clone());
+        if store.async_requests.contains_key(&request_key) {
+            // This exact request was already accepted: `ClientToken` is an
+            // `@idempotencyToken`, so the retry is handed the token the first
+            // call returned rather than proposing the document a second time.
+            return Ok(PutMultiRegionAccessPointPolicyOutput {
+                request_token_arn: Some(request_token_arn),
+            });
+        }
+
+        let key = (input.account_id.clone(), input.details.name.clone());
+        let due_at = now + crate::state::MULTI_REGION_ACCESS_POINT_SETTLE_AFTER;
+        let Some(record) = store.multi_region_access_points.get_mut(&key) else {
+            return Err(crate::state::no_such_multi_region_access_point(
+                &input.details.name,
+                &input.account_id,
+            ));
+        };
+
+        // Stored verbatim, as the document the caller sent: until the clock owes
+        // the request its outcome the policy is the PROPOSED one, which is what
+        // `GetMultiRegionAccessPointPolicy` reports it as.
+        record.proposed_policy = Some(input.details.policy.clone());
+        record.policy_due_at = Some(due_at);
+        let regions: Vec<String> = record
+            .regions
+            .iter()
+            .filter_map(|report| report.region.clone())
+            .collect();
+
+        store.record_async_request(crate::state::AsyncRequestRecord {
+            request_token_arn: request_token_arn.clone(),
+            account_id: input.account_id.clone(),
+            operation: crate::state::async_operation_name("PutMultiRegionAccessPointPolicy"),
+            creation_time: ::aws_smithy_types::DateTime::from(now),
+            request_parameters: AsyncRequestParameters {
+                create_multi_region_access_point_request: None,
+                delete_multi_region_access_point_request: None,
+                put_multi_region_access_point_policy_request: Some(input.details.clone()),
+            },
+            regions,
+            due_at,
+        });
+
+        Ok(PutMultiRegionAccessPointPolicyOutput {
+            request_token_arn: Some(request_token_arn),
+        })
     }
 }

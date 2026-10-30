@@ -190,6 +190,33 @@ static SERVICE_FAILURE_MESSAGE: Schema = Schema::new_member(
 )
 .with_xml_name("Message");
 
+/// One member a refusal carries BESIDE its message, inside the same error
+/// element: the identity of what the request named, which a client reads out of
+/// the refusal rather than out of the request it sent.
+///
+/// The member is named by a `Schema` rather than by a string because the
+/// element name is a property of the SHAPE the value is written through, which
+/// is what the protocol's serializer renders it from — so the one place a
+/// detail member is declared is the service's own state module, beside the
+/// refusal that carries it.
+#[derive(Debug, Clone)]
+pub struct ErrorDetail {
+    /// The member the value is written through; its XML name is the element.
+    pub schema: &'static Schema,
+    /// The value, taken from the request or from this service's own state.
+    pub value: String,
+}
+
+impl ErrorDetail {
+    /// A detail member carrying `value`.
+    pub fn new(schema: &'static Schema, value: impl Into<String>) -> Self {
+        Self {
+            schema,
+            value: value.into(),
+        }
+    }
+}
+
 /// Schema for the synthetic `ServiceFailure` error shape.
 ///
 /// In the `smithy.framework` namespace for the same reason as `NotImplemented`:
@@ -225,6 +252,10 @@ pub struct ServiceFailure {
     pub status: u16,
     /// Why the request was refused.
     pub message: String,
+    /// The members this refusal names what the request named in, written after
+    /// the message in the same error element. Empty for a refusal that names
+    /// nothing beyond its message.
+    pub details: Vec<ErrorDetail>,
 }
 
 impl std::fmt::Display for ServiceFailure {
@@ -238,6 +269,9 @@ impl std::error::Error for ServiceFailure {}
 impl SerializableStruct for ServiceFailure {
     fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
         s.write_string(&SERVICE_FAILURE_MESSAGE, self.message.as_str())?;
+        for detail in &self.details {
+            s.write_string(detail.schema, detail.value.as_str())?;
+        }
         Ok(())
     }
 }
@@ -284,6 +318,28 @@ impl<E> Scaffolded<E> {
             code,
             status,
             message: message.into(),
+            details: Vec::new(),
+        })
+    }
+
+    /// [`Self::service_failure`] carrying the members that name what the
+    /// request named — the resource it could not find, the account it named it
+    /// under — beside the message.
+    ///
+    /// Use it wherever the real service's refusal carries such a member: the
+    /// message then states the CLASS of failure in fixed words and the members
+    /// state the instance, which is what a client branches and reports on.
+    pub fn service_failure_naming(
+        code: &'static str,
+        status: u16,
+        message: impl Into<String>,
+        details: Vec<ErrorDetail>,
+    ) -> Self {
+        Self::Service(ServiceFailure {
+            code,
+            status,
+            message: message.into(),
+            details,
         })
     }
 

@@ -12,14 +12,18 @@
 use crate::ops::types::{
     AccessGrantsLocationConfiguration, AccessPoint, AsyncOperation, AsyncRequestParameters,
     AsyncResponseDetails, CreateJobInput, CreateMultiRegionAccessPointInput2,
-    DeleteMultiRegionAccessPointInput2, Grantee, JobDescriptor, JobListDescriptor, JobManifest,
-    JobManifestGenerator, JobOperation, JobReport, ListStorageLensConfigurationEntry,
+    DeleteMultiRegionAccessPointInput2, EstablishedMultiRegionAccessPointPolicy, Grantee,
+    JobDescriptor, JobListDescriptor, JobManifest, JobManifestGenerator, JobOperation, JobReport,
+    ListStorageLensConfigurationEntry, MultiRegionAccessPointPolicyDocument,
     MultiRegionAccessPointRegionalResponse, MultiRegionAccessPointReport,
-    MultiRegionAccessPointsAsyncResponse, PublicAccessBlockConfiguration, RegionReport, S3Tag,
-    StorageLensConfiguration, StorageLensGroup, StorageLensTag, Tag, VpcConfiguration,
-    ASYNC_OPERATION_NAME_VALUES, JOB_STATUS_VALUES, MULTI_REGION_ACCESS_POINT_STATUS_VALUES,
-    NETWORK_ORIGIN_VALUES, OPERATION_NAME_VALUES,
+    MultiRegionAccessPointRoute, MultiRegionAccessPointsAsyncResponse, PolicyStatus,
+    ProposedMultiRegionAccessPointPolicy, PublicAccessBlockConfiguration,
+    PutMultiRegionAccessPointPolicyInput2, RegionReport, S3Tag, StorageLensConfiguration,
+    StorageLensGroup, StorageLensTag, Tag, VpcConfiguration, ASYNC_OPERATION_NAME_VALUES,
+    JOB_STATUS_VALUES, MULTI_REGION_ACCESS_POINT_STATUS_VALUES, NETWORK_ORIGIN_VALUES,
+    OPERATION_NAME_VALUES,
 };
+use aws_smithy_schema::{Schema, ShapeId, ShapeType};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -860,6 +864,23 @@ pub struct MultiRegionAccessPointRecord {
     /// The Regions and buckets the create request associated, in the order it
     /// listed them.
     pub regions: Vec<RegionReport>,
+    /// Where this access point's traffic may be routed: one entry per member of
+    /// [`Self::regions`], in the same order, each carrying that bucket's
+    /// traffic dial. Recorded at create ([`default_routes`]) so a read reports
+    /// the routes of the buckets this record actually associates.
+    pub routes: Vec<MultiRegionAccessPointRoute>,
+    /// The policy document the last COMPLETED policy put left on the access
+    /// point — what `GetMultiRegionAccessPointPolicy` reports as `Established`
+    /// and what its policy status is derived from. `None` until a put
+    /// completes.
+    pub established_policy: Option<String>,
+    /// The document a policy put submitted whose span the clock has not yet
+    /// run out — what `GetMultiRegionAccessPointPolicy` reports as `Proposed`,
+    /// "first listed as the proposed policy" until every Region has it.
+    pub proposed_policy: Option<String>,
+    /// When the clock owes [`Self::proposed_policy`] its promotion to
+    /// [`Self::established_policy`]; `None` once nothing is owed.
+    pub policy_due_at: Option<SystemTime>,
     /// One of [`MULTI_REGION_ACCESS_POINT_STATUS_VALUES`].
     pub status: String,
     /// When the clock owes `status` its settled outcome, for the transient
@@ -882,6 +903,41 @@ impl MultiRegionAccessPointRecord {
         }
     }
 
+    /// The record's access control policy as
+    /// `GetMultiRegionAccessPointPolicy` reports it: the document the last
+    /// completed put established, and — while a put's span has not run out —
+    /// the one it proposed. A member with no document is left unset rather
+    /// than reported as an empty policy.
+    pub fn policy_document(&self) -> MultiRegionAccessPointPolicyDocument {
+        MultiRegionAccessPointPolicyDocument {
+            established: self.established_policy.clone().map(|policy| {
+                EstablishedMultiRegionAccessPointPolicy {
+                    policy: Some(policy),
+                }
+            }),
+            proposed: self
+                .proposed_policy
+                .clone()
+                .map(|policy| ProposedMultiRegionAccessPointPolicy {
+                    policy: Some(policy),
+                }),
+        }
+    }
+
+    /// Whether the policy in force on this access point grants public access —
+    /// the derivation `PolicyStatus$IsPublic` reports, run over the
+    /// ESTABLISHED document on every read, so a policy a later put replaced is
+    /// reported as it now reads. An access point carrying no established
+    /// document grants nobody anything, so it is not public.
+    pub fn policy_status(&self) -> PolicyStatus {
+        PolicyStatus {
+            is_public: self
+                .established_policy
+                .as_deref()
+                .is_some_and(policy_grants_public_access),
+        }
+    }
+
     /// Whether the clock has already released this record: a delete request's
     /// span has elapsed, so the Multi-Region Access Point is gone whether or not
     /// anybody called.
@@ -890,7 +946,8 @@ impl MultiRegionAccessPointRecord {
     }
 
     /// Move `status` on if the clock already owes it: a creating access point
-    /// reaches `READY`. A record whose removal is due is dropped by
+    /// reaches `READY`, and a proposed policy whose span has run out becomes
+    /// the established one. A record whose removal is due is dropped by
     /// [`ComAmazonawsS3controlAwss3controlservicev20180820State::settle_multi_region_access_points`]
     /// rather than here.
     fn settle(&mut self, now: SystemTime) {
@@ -898,7 +955,32 @@ impl MultiRegionAccessPointRecord {
             self.status = multi_region_access_point_status(STATUS_READY);
             self.status_due_at = None;
         }
+        if self.policy_due_at.is_some_and(|due| now >= due) {
+            if let Some(proposed) = self.proposed_policy.take() {
+                self.established_policy = Some(proposed);
+            }
+            self.policy_due_at = None;
+        }
     }
+}
+
+/// The traffic dial of an ACTIVE route, which is what every bucket a create
+/// request associates starts out as: "a value of `100` indicates an active
+/// state, which means that traffic will be routed to the specified Region"
+/// (`MultiRegionAccessPointRoute$TrafficDialPercentage`).
+pub const TRAFFIC_DIAL_ACTIVE: i32 = 100;
+
+/// The routes a Multi-Region Access Point carries when it is created: one per
+/// associated bucket, in the order the create request listed them, each active.
+pub fn default_routes(regions: &[RegionReport]) -> Vec<MultiRegionAccessPointRoute> {
+    regions
+        .iter()
+        .map(|report| MultiRegionAccessPointRoute {
+            bucket: report.bucket.clone(),
+            region: report.region.clone(),
+            traffic_dial_percentage: TRAFFIC_DIAL_ACTIVE,
+        })
+        .collect()
 }
 
 /// One asynchronous Multi-Region Access Point request, as
@@ -1679,6 +1761,25 @@ impl ComAmazonawsS3controlAwss3controlservicev20180820State {
         }
     }
 
+    /// The Multi-Region Access Point of `account_id` that `alias` names, if the
+    /// account holds one.
+    ///
+    /// An alias is the service-assigned identity of an access point
+    /// (`multi_region_access_point_alias`) and is what a
+    /// `MultiRegionAccessPointId` carries, so this is the resolution the
+    /// routing operations read their `Mrap` member through — a different
+    /// lookup from the one by NAME that `multi_region_access_points` is keyed
+    /// by.
+    pub fn multi_region_access_point_by_alias(
+        &self,
+        account_id: &str,
+        alias: &str,
+    ) -> Option<&MultiRegionAccessPointRecord> {
+        self.multi_region_access_points
+            .values()
+            .find(|record| record.account_id == account_id && record.alias == alias)
+    }
+
     /// Retain `record`, releasing the oldest retained request first when the
     /// store is already holding [`ASYNC_REQUESTS_RETAINED`] of them, so the
     /// number of async request records a caller can accumulate is bounded.
@@ -2365,6 +2466,11 @@ pub const ASYNC_VERB_CREATE: &str = "create";
 /// The `delete` half of a request token ARN. See [`ASYNC_VERB_CREATE`].
 pub const ASYNC_VERB_DELETE: &str = "delete";
 
+/// The `put-policy` half of a request token ARN, spelled as the operation's own
+/// route spells it (`POST /v20180820/async-requests/mrap/put-policy`). See
+/// [`ASYNC_VERB_CREATE`].
+pub const ASYNC_VERB_PUT_POLICY: &str = "put-policy";
+
 /// How many hex characters of the digest a request token ARN carries.
 const ASYNC_REQUEST_ID_LEN: usize = 32;
 
@@ -2426,6 +2532,14 @@ pub fn create_details_fingerprint(details: &CreateMultiRegionAccessPointInput2) 
 /// [`async_request_token_arn`].
 pub fn delete_details_fingerprint(details: &DeleteMultiRegionAccessPointInput2) -> String {
     format!("name={}", details.name)
+}
+
+/// A `PutMultiRegionAccessPointPolicy` request's details as one string, for
+/// [`async_request_token_arn`]: the access point it names and the document it
+/// submitted, so two puts of DIFFERENT documents under one client token are two
+/// requests while a byte-identical retry is one.
+pub fn put_policy_details_fingerprint(details: &PutMultiRegionAccessPointPolicyInput2) -> String {
+    format!("name={}|policy={}", details.name, details.policy)
 }
 
 // ---------------------------------------------------------------------------
@@ -2711,12 +2825,36 @@ pub fn duplicate_job_tag_key<E>(key: &str) -> crate::scaffolded::Scaffolded<E> {
 /// access point refusals above — the refusal is carried in the S3-style XML
 /// `<Code>`/`<Message>` envelope, with the `NoSuch<Resource>` code and the 404
 /// this service answers a missing named resource with.
-pub fn no_such_multi_region_access_point<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure(
+///
+/// The message is FIXED text: what was looked up travels in the members BESIDE
+/// it — the name the request named and the account it named it under — which is
+/// where a client reads the offending identity from
+/// ([`MULTI_REGION_ACCESS_POINT_NAME_MEMBER`], [`ACCOUNT_ID_MEMBER`]).
+pub fn no_such_multi_region_access_point<E>(
+    name: &str,
+    account_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure_naming(
         "NoSuchMultiRegionAccessPoint",
         404,
-        format!("The specified Multi-Region Access Point does not exist: {name}"),
+        "The specified Multi-Region Access Point does not exist.",
+        vec![
+            crate::scaffolded::ErrorDetail::new(&MULTI_REGION_ACCESS_POINT_NAME_MEMBER, name),
+            crate::scaffolded::ErrorDetail::new(&ACCOUNT_ID_MEMBER, account_id),
+        ],
     )
+}
+
+/// `InvalidRequest` (HTTP 400): the request names a Multi-Region Access Point
+/// this service cannot resolve, so there is nothing for it to act on.
+///
+/// The routing operations take a `MultiRegionAccessPointId` — the
+/// service-assigned ALIAS of an access point, not its name — and a value that
+/// names none is a request this service will not carry out rather than a
+/// resource that is missing: the code and the fixed message are the ones S3
+/// Control answers such a request with.
+pub fn invalid_multi_region_access_point_request<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure("InvalidRequest", 400, "Request invalid")
 }
 
 /// `MultiRegionAccessPointAlreadyOwnedByYou` (HTTP 409): the account already
@@ -2773,20 +2911,133 @@ pub fn too_many_storage_lens_groups<E>() -> crate::scaffolded::Scaffolded<E> {
     )
 }
 
-/// `NotFoundException` (HTTP 404): no asynchronous request with that token was
-/// made by the account the request names, or it was made so long ago that the
-/// store no longer retains it (see [`ASYNC_REQUESTS_RETAINED`]).
+/// `NoSuchAsyncRequest` (HTTP 404): the token names no asynchronous request
+/// this account made — because none was ever made under it, because it is not a
+/// token this service mints at all, or because the request was made so long ago
+/// that the store no longer retains it (see [`ASYNC_REQUESTS_RETAINED`]).
 ///
-/// An asynchronous request is not an S3 resource with a `NoSuch<Resource>` code
-/// of its own, so the code and status here are this service's own modelled
-/// `NotFoundException` ("The requested resource could not be found", a 404),
-/// which this operation's model does not list.
-pub fn no_such_async_request<E>(request_token_arn: &str) -> crate::scaffolded::Scaffolded<E> {
+/// A request token is an OPAQUE identifier the service minted and handed its
+/// caller, so a token is RESOLVED against the requests this service holds
+/// rather than checked against a shape: whatever its text, a token that matches
+/// no record names no request, which is what this one refusal says. The code
+/// and the fixed message are the ones S3 Control answers it with.
+pub fn no_such_async_request<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
-        "NotFoundException",
-        404,
-        format!("The specified request token names no asynchronous request: {request_token_arn}"),
+        NO_SUCH_ASYNC_REQUEST_CODE,
+        NO_SUCH_ASYNC_REQUEST_STATUS,
+        NO_SUCH_ASYNC_REQUEST_MESSAGE,
     )
+}
+
+/// The wire `<Code>` of [`no_such_async_request`], which a client branches on.
+///
+/// Named separately because the refusal is answered from two places: the
+/// handler, which resolved the token against the store and found no request,
+/// and `crate::service::envelope`, which answers it for a token the request
+/// boundary would otherwise refuse on the modelled shape of the label — the
+/// same refusal, so it carries the same code, status and message.
+pub const NO_SUCH_ASYNC_REQUEST_CODE: &str = "NoSuchAsyncRequest";
+
+/// The HTTP status of [`no_such_async_request`].
+pub const NO_SUCH_ASYNC_REQUEST_STATUS: u16 = 404;
+
+/// The message of [`no_such_async_request`]: fixed text, naming no token.
+pub const NO_SUCH_ASYNC_REQUEST_MESSAGE: &str = "The specified request was not found.";
+
+/// The `<Error>` member a refusal names the Multi-Region Access Point it could
+/// not find in.
+///
+/// S3 Control's model declares no error shape for these operations, so this
+/// member exists only on the wire: it carries the name the REQUEST named, which
+/// is what a client reads the offending identity out of instead of re-parsing
+/// the request it sent.
+static MULTI_REGION_ACCESS_POINT_NAME_MEMBER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.s3control#ErrorDetails$MultiRegionAccessPointName",
+        "com.amazonaws.s3control",
+        "MultiRegionAccessPointName",
+    ),
+    ShapeType::String,
+    "MultiRegionAccessPointName",
+    1,
+)
+.with_xml_name("MultiRegionAccessPointName");
+
+/// The `<Error>` member a refusal names the account it was made for in. See
+/// [`MULTI_REGION_ACCESS_POINT_NAME_MEMBER`].
+static ACCOUNT_ID_MEMBER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.s3control#ErrorDetails$AccountId",
+        "com.amazonaws.s3control",
+        "AccountId",
+    ),
+    ShapeType::String,
+    "AccountId",
+    2,
+)
+.with_xml_name("AccountId");
+
+/// How many hex characters the `RequestId` of an error envelope carries — the
+/// length of the `x-amz-request-id` an S3-family service answers with.
+const ERROR_REQUEST_ID_LEN: usize = 16;
+
+/// How many hex characters the `HostId` of an error envelope carries, matching
+/// the extended request id (`x-amz-id-2`) this emulator's framework renders for
+/// an unwrapped S3 error: 32 bytes as lowercase hex.
+const ERROR_HOST_ID_LEN: usize = 64;
+
+/// The correlation pair ONE error response names the request it answers with:
+/// the `RequestId` and `HostId` siblings of `<Error>`, which the matching
+/// `x-amz-request-id` / `x-amz-id-2` headers mirror.
+///
+/// Both VALUES are per-response and neither is a requirement: nothing can
+/// predict one and no caller may depend on a particular one. What they must do
+/// is name ONE response — so each is drawn afresh, and two responses carry two
+/// different pairs — in the shape an S3-family service renders them: the
+/// request id as [`ERROR_REQUEST_ID_LEN`] upper-case hex characters, the host id
+/// as [`ERROR_HOST_ID_LEN`] lower-case ones. They are identifiers for
+/// correlation, never secrets: nothing authenticates with them.
+///
+/// A free function rather than a mint on the store: a refusal the request
+/// boundary made never reaches a handler, so the envelope that answers it has
+/// no state to reach.
+pub fn new_error_correlation() -> (String, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ANSWERED: AtomicU64 = AtomicU64::new(0);
+
+    let sequence = ANSWERED.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let request_id: String = correlation_hex("request", sequence, nanos)
+        .chars()
+        .take(ERROR_REQUEST_ID_LEN)
+        .flat_map(char::to_uppercase)
+        .collect();
+    let host_id: String = correlation_hex("host", sequence, nanos)
+        .chars()
+        .take(ERROR_HOST_ID_LEN)
+        .collect();
+    (request_id, host_id)
+}
+
+/// The hex digest one correlation id of [`new_error_correlation`] is rendered
+/// from: the OS-seeded randomness a `RandomState` draws, the system clock in
+/// nanoseconds, a counter so two responses in the same nanosecond cannot
+/// collide, and `label` so the two ids of one response are independent of each
+/// other.
+fn correlation_hex(label: &str, sequence: u64, nanos: u128) -> String {
+    use sha2::Digest;
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(label.as_bytes());
+    hasher.update(RandomState::new().hash_one(sequence).to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    hex::encode(hasher.finalize())
 }
 
 // The refusals the S3 Access Grants instance lifecycle shares.

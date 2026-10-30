@@ -65,31 +65,35 @@ const ALIAS_MAX_LEN: usize = 63;
 /// How long to wait before reading a transition the clock owes: longer than the
 /// span the service holds a Multi-Region Access Point in its transient status,
 /// so the settled outcome is due whether or not anybody called.
-fn settled_wait() -> Duration {
+pub(crate) fn settled_wait() -> Duration {
     MULTI_REGION_ACCESS_POINT_SETTLE_AFTER + Duration::from_millis(250)
 }
 
 /// One `CreateMultiRegionAccessPoint` request: the members the model lets a
 /// caller vary, plus the account and Region the call is made under.
-struct CreateCase {
-    case: &'static str,
-    name: &'static str,
+///
+/// `pub(crate)`, with [`create`] below it: the sibling suite that drives the
+/// Multi-Region Access Point SUB-RESOURCES creates its access points the same
+/// way rather than building a second request body.
+pub(crate) struct CreateCase {
+    pub(crate) case: &'static str,
+    pub(crate) name: &'static str,
     /// The `ClientToken` idempotency token (`^\S+$`, at most 64 characters).
-    client_token: &'static str,
+    pub(crate) client_token: &'static str,
     /// One (bucket, owning account) pair per associated Region, in request
     /// order. The model's `Region` names the bucket and, for a cross-account
     /// bucket, its owner — never the Region itself.
-    regions: Vec<(&'static str, Option<&'static str>)>,
+    pub(crate) regions: Vec<(&'static str, Option<&'static str>)>,
     /// `BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`,
     /// `RestrictPublicBuckets` — in the order
     /// `PublicAccessBlockConfiguration` declares them.
-    public_access_block: Option<[bool; 4]>,
-    region: &'static str,
-    account: &'static str,
+    pub(crate) public_access_block: Option<[bool; 4]>,
+    pub(crate) region: &'static str,
+    pub(crate) account: &'static str,
 }
 
 impl CreateCase {
-    fn new(
+    pub(crate) fn new(
         case: &'static str,
         name: &'static str,
         client_token: &'static str,
@@ -206,7 +210,7 @@ fn create_cases() -> Vec<CreateCase> {
     ]
 }
 
-async fn create(emulator: &Emulator, case: &CreateCase) -> Reply {
+pub(crate) async fn create(emulator: &Emulator, case: &CreateCase) -> Reply {
     call_in_region(
         &emulator.router,
         case.region,
@@ -230,7 +234,12 @@ async fn get(emulator: &Emulator, region: &str, account: &str, name: &str) -> Re
     .await
 }
 
-async fn describe(emulator: &Emulator, region: &str, account: &str, token: &str) -> Reply {
+pub(crate) async fn describe(
+    emulator: &Emulator,
+    region: &str,
+    account: &str,
+    token: &str,
+) -> Reply {
     call_in_region(
         &emulator.router,
         region,
@@ -840,7 +849,7 @@ async fn requests_and_names_the_store_does_not_hold_are_refused() {
     );
     assert_eq!(
         described.code(),
-        "NotFoundException",
+        "NoSuchAsyncRequest",
         "expected the not-found code for an unknown request token, got body {}",
         described.body
     );

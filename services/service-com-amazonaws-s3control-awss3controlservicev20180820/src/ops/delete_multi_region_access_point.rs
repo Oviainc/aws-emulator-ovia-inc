@@ -179,6 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.multi_region_access_points.get_mut(&key) else {
             return Err(crate::state::no_such_multi_region_access_point(
                 &input.details.name,
+                &input.account_id,
             ));
         };
 
