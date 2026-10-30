@@ -111,6 +111,8 @@ mod portal_publication_revocation;
 mod portal_update;
 #[path = "all/probe.rs"]
 mod probe;
+#[path = "all/product_page_deletion.rs"]
+mod product_page_deletion;
 #[path = "all/product_page_lifecycle.rs"]
 mod product_page_lifecycle;
 #[path = "all/product_page_update.rs"]
