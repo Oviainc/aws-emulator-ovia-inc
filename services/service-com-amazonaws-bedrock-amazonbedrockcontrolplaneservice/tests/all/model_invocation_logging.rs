@@ -16,13 +16,21 @@
 //! A configuration is only ADMITTED when every role it asks Amazon Bedrock to take on is
 //! one this account may hand it. The CloudWatch Logs destination is the one destination
 //! that names such a role (`CloudWatchConfig.roleArn` is `@required`, while `S3Config`
-//! declares no role member at all), and the decision is the ACCOUNT that role ARN names:
-//! `iam:PassRole` is granted by the account that HOLDS the role, so a role of the CALLING
-//! account is installable — the put answers 200 and the get reports the destination back —
-//! while a role whose embedded 12-digit account is another one is refused with HTTP 403 and
-//! the modelled `AccessDeniedException` carrying the recorded sentence, before anything is
-//! stored, so the record in force is left exactly as it was and no part of the refused
-//! configuration is readable afterwards.
+//! declares no role member at all), and one half of the decision is the ACCOUNT that role
+//! ARN names: `iam:PassRole` is granted by the account that HOLDS the role, so a role of
+//! the CALLING account is installable — the put answers 200 and the get reports the
+//! destination back — while a role whose embedded 12-digit account is another one is
+//! refused with HTTP 403 and the modelled `AccessDeniedException` carrying the recorded
+//! sentence, before anything is stored, so the record in force is left exactly as it was
+//! and no part of the refused configuration is readable afterwards.
+//!
+//! The pass is refused only on what this account's IAM ANSWERED about the role, and this
+//! suite mounts the one service, so there is no IAM here to answer: these rows pin the
+//! grounding half of the decision. The half IAM answers — whether the trust policy the role
+//! carries admits the Amazon Bedrock service principal the `sts:AssumeRole` such a hand-off
+//! is — is pinned in
+//! `core/router/tests/all/bedrock_model_invocation_logging_pass_role.rs`, where this
+//! service and IAM are mounted over one engine.
 //!
 //! # What the tables below generalise over
 //!

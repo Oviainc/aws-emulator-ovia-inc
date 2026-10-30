@@ -22,14 +22,15 @@
 //! a role the CALLER supplied can only be installed by passing Amazon Bedrock that role,
 //! and [`crate::state::pass_role_denial`] takes that decision — for the CloudWatch Logs
 //! destination, the one whose `roleArn` is `@required` — BEFORE anything is stored. That
-//! decision is the ACCOUNT the role ARN names: a role of the CALLING account may be passed,
-//! so its destination is installed and read back, while a role of ANOTHER account may not,
-//! because `iam:PassRole` is granted by the account that holds the role. A denied pass is
-//! answered with the modelled `AccessDeniedException` (HTTP 403) and leaves the account
-//! singleton exactly as it was, so an independent
-//! `GetModelInvocationLoggingConfiguration` reports no part of the refused configuration.
-//! A configuration that passes no role (`s3Config` only, or no destination at all) has no
-//! such decision to take and is stored as given.
+//! decision is taken over the SUBMITTED value: the role has to be one of the CALLING
+//! account (`iam:PassRole` is granted by the account that holds the role), and, where this
+//! account's IAM holds it, its trust policy has to admit the Amazon Bedrock service
+//! principal the `sts:AssumeRole` such a hand-off is. A pass neither part refuses installs
+//! the destination, so it is read back; a denied pass is answered with the modelled
+//! `AccessDeniedException` (HTTP 403) and leaves the account singleton exactly as it was,
+//! so an independent `GetModelInvocationLoggingConfiguration` reports no part of the
+//! refused configuration. A configuration that passes no role (`s3Config` only, or no
+//! destination at all) has no such decision to take and is stored as given.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -136,12 +137,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata this operation has no use for: the
-        // configuration it sets is account-level.
-        let _ = ctx;
+        // The region the request was signed for, which is where the role a destination
+        // names is resolved against this account's IAM.
+        let region = crate::state::request_region(ctx.parts());
         // The PassRole step first, ahead of the store: a destination whose role may not be
         // passed to Amazon Bedrock is refused, and a refused put installs nothing.
-        if let Some(denial) = crate::state::pass_role_denial(&input.logging_config) {
+        if let Some(denial) =
+            crate::state::pass_role_denial(ctx, &region, &input.logging_config).await
+        {
             return Err(
                 PutModelInvocationLoggingConfigurationErrorModeled::AccessDeniedException(
                     AccessDeniedException {
