@@ -219,10 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // resolved across both kinds wherever this service takes a snapshot
             // name (`ExportSnapshot`) — so copying onto a name already taken is
             // refused rather than silently replacing a record a restore may
-            // already be using.
-            if store.disk_snapshot(&target_name).is_some()
-                || store.instance_snapshot(&target_name).is_some()
-            {
+            // already be using. The same question the two creates ask, asked in
+            // the one place that answers it.
+            if store.holds_snapshot_named(&target_name) {
                 return Err(invalid(format!(
                     "a snapshot named '{target_name}' already exists"
                 )));

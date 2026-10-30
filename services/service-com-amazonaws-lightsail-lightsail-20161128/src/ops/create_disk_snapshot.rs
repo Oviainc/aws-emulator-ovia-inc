@@ -198,9 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled `diskName` and `instanceName` documentation says the two "are
         // mutually exclusive", and a snapshot of nothing is not a snapshot), the
         // source must be a resource this account holds, the snapshot name must
-        // not already be taken, and the caller-sized tag list must be within the
-        // store's bounds. Every one of those is checked BEFORE the first write,
-        // so a refused request creates nothing.
+        // be held by no snapshot of this account, and the caller-sized tag list
+        // must be within the store's bounds. Every one of those is checked
+        // BEFORE the first write, so a refused request creates nothing.
         let tags = input.tags.unwrap_or_default();
         if tags.len() > crate::state::MAX_TAGS {
             return Err(invalid(format!(
@@ -233,12 +233,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now_ms();
 
         crate::state::with_state(&*self.engine, |store| {
-            // A snapshot name addresses one snapshot, so creating one this
-            // account already holds is refused rather than silently replacing a
-            // record a restore may already be using.
-            if store.disk_snapshot(&name).is_some() {
+            // A snapshot name addresses ONE snapshot of this account — a
+            // snapshot name is taken unqualified and resolved across both kinds
+            // wherever this service takes one (`ExportSnapshot`, the tag plane)
+            // — so taking a snapshot onto a name any snapshot already holds, of
+            // either kind, is refused rather than leaving one name addressing
+            // two records and a record a restore may already be using
+            // unreachable.
+            if store.holds_snapshot_named(&name) {
                 return Err(invalid(format!(
-                    "a disk snapshot named '{name}' already exists"
+                    "a snapshot named '{name}' already exists"
                 )));
             }
             if store.disk_snapshots.len() >= crate::state::MAX_DISK_SNAPSHOTS {

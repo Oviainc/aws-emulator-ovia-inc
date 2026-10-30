@@ -51,15 +51,18 @@ const WAIT: Duration = Duration::from_secs(5);
 /// The kind of snapshot a copy is: the two the operation's own documentation
 /// names ("a manual snapshot of an instance or disk"), which are the two kinds
 /// this store holds.
+///
+/// `pub(crate)` so a sibling suite in this test target names the two kinds and
+/// reads one back the same way rather than describing them a second time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     DiskSnapshot,
     InstanceSnapshot,
 }
 
 impl Kind {
     /// The modelled `ResourceType` value a snapshot of this kind reports.
-    fn resource_type(self) -> &'static str {
+    pub(crate) fn resource_type(self) -> &'static str {
         match self {
             Self::DiskSnapshot => "DiskSnapshot",
             Self::InstanceSnapshot => "InstanceSnapshot",
@@ -67,7 +70,7 @@ impl Kind {
     }
 
     /// The operation that reads one back, and the member naming it.
-    fn reader(self) -> (&'static str, &'static str) {
+    pub(crate) fn reader(self) -> (&'static str, &'static str) {
         match self {
             Self::DiskSnapshot => ("GetDiskSnapshot", "diskSnapshotName"),
             Self::InstanceSnapshot => ("GetInstanceSnapshot", "instanceSnapshotName"),
@@ -75,7 +78,7 @@ impl Kind {
     }
 
     /// The member of that answer the snapshot is reported under.
-    fn reported_as(self) -> &'static str {
+    pub(crate) fn reported_as(self) -> &'static str {
         match self {
             Self::DiskSnapshot => "diskSnapshot",
             Self::InstanceSnapshot => "instanceSnapshot",
@@ -90,7 +93,7 @@ impl Kind {
 
     /// The state it settles into: `completed` for a disk snapshot,
     /// `available` for an instance snapshot.
-    fn settled(self) -> &'static str {
+    pub(crate) fn settled(self) -> &'static str {
         match self {
             Self::DiskSnapshot => "completed",
             Self::InstanceSnapshot => "available",
@@ -99,7 +102,7 @@ impl Kind {
 }
 
 /// The stored snapshot `name` of `kind`, as its reader reports it.
-async fn snapshot(emulator: &Emulator, kind: Kind, name: &str) -> Value {
+pub(crate) async fn snapshot(emulator: &Emulator, kind: Kind, name: &str) -> Value {
     let (operation, member) = kind.reader();
     emulator.ok(operation, json!({member: name})).await[kind.reported_as()].clone()
 }
@@ -109,7 +112,7 @@ async fn snapshot(emulator: &Emulator, kind: Kind, name: &str) -> Value {
 ///
 /// The transition is owed by the clock, not by the poll: it arrives without
 /// anyone asking more than once.
-async fn wait_for_snapshot_state(
+pub(crate) async fn wait_for_snapshot_state(
     emulator: &Emulator,
     kind: Kind,
     name: &str,

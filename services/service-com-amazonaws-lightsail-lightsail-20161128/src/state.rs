@@ -13943,6 +13943,23 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.instance_snapshots.get(name)
     }
 
+    /// Whether this account already holds a snapshot called `name`, of EITHER
+    /// kind of snapshot the service's snapshot operations address.
+    ///
+    /// A snapshot name addresses ONE snapshot: every operation that takes a
+    /// snapshot name takes it unqualified — `ExportSnapshot`'s
+    /// `sourceSnapshotName`, `CopySnapshot`'s `sourceSnapshotName`, the
+    /// `resourceName` the tag plane resolves ([`Self::with_tagged_record`]) —
+    /// and resolves it by asking the disk snapshots and then the instance
+    /// snapshots, so a name both maps held would leave the second record
+    /// unreachable through every one of them. This is the one place the
+    /// question "is this snapshot name taken?" is asked, so each operation that
+    /// MINTS a snapshot name refuses exactly the names that resolution already
+    /// answers for.
+    pub fn holds_snapshot_named(&self, name: &str) -> bool {
+        self.disk_snapshots.contains_key(name) || self.instance_snapshots.contains_key(name)
+    }
+
     /// Store a newly created instance snapshot.
     pub fn insert_instance_snapshot(&mut self, snapshot: StoredInstanceSnapshot) {
         self.instance_snapshots
