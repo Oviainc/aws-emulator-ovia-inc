@@ -243,19 +243,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Accepted. `KeyspaceStatus` models `DELETING` and `GetKeyspace` reports a
         // keyspace's status, so the deletion is observable rather than instantaneous: the
-        // keyspace enters `DELETING` now, and so does every table and type it holds, since
-        // they go with it. The clock owes their removal one span from here; `settle`
-        // materialises it, and nothing sleeps for it.
+        // keyspace enters `DELETING` now, and so does every table and type it holds that
+        // is not there already, since they go with it. The clock owes their removal one
+        // span from here; `settle` materialises it, and nothing sleeps for it.
         let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
         keyspace.status = crate::state::KEYSPACE_STATUS_DELETING.to_string();
         keyspace.status_due_at = Some(settles_at);
+        // A table or type that is ALREADY `DELETING` — the one in-flight resource this
+        // call accepts rather than refuses, because dropping the keyspace is where it was
+        // already going — keeps the instant the clock already owes its removal at: this
+        // call starts no transition for it, so it may not re-date one, exactly as
+        // `DeleteTable` leaves a repeated delete's owed instant alone. `settle` keeps the
+        // EARLIEST pending instant, so the removal still happens when it was due.
         for table in keyspace.tables.values_mut() {
-            table.status = crate::state::TABLE_STATUS_DELETING.to_string();
-            table.status_due_at = Some(settles_at);
+            if table.status != crate::state::TABLE_STATUS_DELETING {
+                table.status = crate::state::TABLE_STATUS_DELETING.to_string();
+                table.status_due_at = Some(settles_at);
+            }
         }
         for udt in keyspace.types.values_mut() {
-            udt.status = crate::state::TYPE_STATUS_DELETING.to_string();
-            udt.status_due_at = Some(settles_at);
+            if udt.status != crate::state::TYPE_STATUS_DELETING {
+                udt.status = crate::state::TYPE_STATUS_DELETING.to_string();
+                udt.status_due_at = Some(settles_at);
+            }
         }
         let deleted_tables: Vec<String> = keyspace.tables.keys().cloned().collect();
         // Tell the store the earliest instant at which `settle` has to look at the

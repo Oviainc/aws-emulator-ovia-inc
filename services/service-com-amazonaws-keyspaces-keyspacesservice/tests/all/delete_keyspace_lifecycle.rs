@@ -21,6 +21,13 @@
 //! 3. A keyspace whose deletion is in progress takes no new resource: the modelled
 //!    `ConflictException` while it is still there, and the modelled
 //!    `ResourceNotFoundException` once it is gone.
+//! 4. A removal the clock already owes a resource keeps the instant it is owed at: a
+//!    later call that puts that same resource in the status it is already in starts no
+//!    transition for it, so it cannot defer the one in flight. The resource is therefore
+//!    gone from every reader once its OWN instant passes, whatever else the keyspace is
+//!    still waiting out.
+
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_keyspaces_keyspacesservice::ops::types::{
@@ -802,4 +809,259 @@ async fn a_keyspace_being_deleted_takes_no_new_resource() {
         400,
         "ResourceNotFoundException",
     );
+}
+
+/// Which resource of the keyspace already has its removal owed, and therefore which
+/// sibling call owed it and which reader reports it.
+#[derive(Clone, Copy, Debug)]
+enum Owed {
+    /// The table of this name, put in `DELETING` by `DeleteTable`.
+    Table(&'static str),
+    /// The type of this name, put in `DELETING` by `DeleteType`.
+    Type(&'static str),
+}
+
+impl Owed {
+    /// The call that deletes just this resource, leaving the rest of the keyspace alone.
+    fn delete_request(self, keyspace: &str) -> (&'static str, Value) {
+        match self {
+            Owed::Table(table) => (
+                "DeleteTable",
+                json!({"keyspaceName": keyspace, "tableName": table}),
+            ),
+            Owed::Type(udt) => (
+                "DeleteType",
+                json!({"keyspaceName": keyspace, "typeName": udt}),
+            ),
+        }
+    }
+
+    /// The read that reports this resource.
+    async fn read(self, emulator: &Emulator, keyspace: &str) -> (u16, Value) {
+        match self {
+            Owed::Table(table) => get_table(emulator, keyspace, table).await,
+            Owed::Type(udt) => get_type(emulator, keyspace, udt).await,
+        }
+    }
+
+    /// The `DELETING` member of this resource's own modelled status value set.
+    fn deleting_status(self) -> &'static str {
+        match self {
+            Owed::Table(_) => keyspaces::TABLE_STATUS_DELETING,
+            Owed::Type(_) => keyspaces::TYPE_STATUS_DELETING,
+        }
+    }
+}
+
+/// One row of RULE 4: a keyspace, which of its resources is deleted first on its own, and
+/// how far into that resource's span the `DeleteKeyspace` lands.
+struct AlreadyOwed {
+    /// The case name, which is also the keyspace name.
+    keyspace: &'static str,
+    /// The tables the keyspace holds, every one of them `ACTIVE` before the first delete.
+    tables: &'static [&'static str],
+    /// The types it holds, likewise.
+    types: &'static [&'static str],
+    /// The one resource whose own deletion is started first, named among the above.
+    owed: Owed,
+    /// How long after that delete the `DeleteKeyspace` is called — short of the span, so
+    /// the resource is still `DELETING` when the keyspace delete arrives.
+    keyspace_deleted_after: Duration,
+}
+
+impl AlreadyOwed {
+    /// The tables that are still `ACTIVE` when `DeleteKeyspace` lands, so they go with the
+    /// keyspace and settle on ITS instant rather than on the owed one.
+    fn staying_tables(&self) -> Vec<&'static str> {
+        self.tables
+            .iter()
+            .copied()
+            .filter(|table| !matches!(self.owed, Owed::Table(owed) if owed == *table))
+            .collect()
+    }
+
+    /// The same for the types it holds.
+    fn staying_types(&self) -> Vec<&'static str> {
+        self.types
+            .iter()
+            .copied()
+            .filter(|udt| !matches!(self.owed, Owed::Type(owed) if owed == *udt))
+            .collect()
+    }
+}
+
+/// The rows: each kind of resource the clock can already owe a removal to, each both alone
+/// in its keyspace and beside resources that are still `ACTIVE`, and the keyspace delete
+/// landing both early and late inside the owed span.
+fn already_owed_rows() -> Vec<AlreadyOwed> {
+    let span = keyspaces::TRANSIENT_STATUS_SPAN;
+    vec![
+        AlreadyOwed {
+            keyspace: "owed_table_alone_ks",
+            tables: &["going_tbl"],
+            types: &[],
+            owed: Owed::Table("going_tbl"),
+            keyspace_deleted_after: span.mul_f64(0.8),
+        },
+        AlreadyOwed {
+            keyspace: "owed_table_beside_others_ks",
+            tables: &["going_tbl", "staying_tbl", "other_tbl"],
+            types: &["staying_type"],
+            owed: Owed::Table("going_tbl"),
+            keyspace_deleted_after: span.mul_f64(0.4),
+        },
+        AlreadyOwed {
+            keyspace: "owed_type_alone_ks",
+            tables: &[],
+            types: &["going_type"],
+            owed: Owed::Type("going_type"),
+            keyspace_deleted_after: span.mul_f64(0.8),
+        },
+        AlreadyOwed {
+            keyspace: "owed_type_beside_others_ks",
+            tables: &["staying_tbl"],
+            types: &["going_type", "staying_type"],
+            owed: Owed::Type("going_type"),
+            keyspace_deleted_after: span.mul_f64(0.5),
+        },
+    ]
+}
+
+/// RULE 4: `DeleteKeyspace` does not re-date a removal the clock already owes.
+///
+/// Every row deletes one resource on its own, calls `DeleteKeyspace` while that resource
+/// is still `DELETING`, and then reads it back just past the instant its OWN delete owed
+/// it: the resource is gone, while the keyspace and everything that was still `ACTIVE`
+/// when the keyspace delete arrived are waiting out the keyspace's own span.
+#[tokio::test]
+async fn a_removal_the_clock_already_owes_is_not_postponed_by_deleting_the_keyspace() {
+    // How long past the owed instant the reader runs: late enough that the removal has
+    // happened, early enough to still be inside the keyspace's own span, which starts
+    // `keyspace_deleted_after` later than the owed one.
+    let read_after_owed = keyspaces::TRANSIENT_STATUS_SPAN.mul_f64(0.2);
+
+    for row in already_owed_rows() {
+        let emulator = Emulator::start();
+        let case = row.keyspace;
+        seed(
+            &emulator,
+            &Shape {
+                keyspace: case,
+                regions: None,
+                tables: row.tables,
+                types: row.types,
+            },
+        )
+        .await;
+
+        // The sibling delete: from here the clock owes this one resource its removal at
+        // `owed_due`, and no later call may move that instant.
+        let (operation, request) = row.owed.delete_request(case);
+        let delete_called_at = SystemTime::now();
+        assert_ok(case, emulator.call(operation, request).await);
+        let owed_due = delete_called_at + keyspaces::TRANSIENT_STATUS_SPAN;
+
+        tokio::time::sleep(row.keyspace_deleted_after).await;
+
+        // Inside the span the resource is reported in the status the delete put it in, and
+        // is still there: its removal is not due yet. A reader that a stalled machine puts
+        // past the owed instant sees the removal instead, which is the same rule — nothing
+        // may remove it EARLY either.
+        let (status, body) = row.owed.read(&emulator, case).await;
+        let in_flight_read_at = SystemTime::now();
+        if status == 200 {
+            assert_eq!(
+                reported_status(case, &body),
+                row.owed.deleting_status(),
+                "case {case:?}: expected {:?} to be {} when the keyspace delete arrives, \
+                 got {body}",
+                row.owed,
+                row.owed.deleting_status()
+            );
+        } else {
+            assert!(
+                in_flight_read_at >= owed_due,
+                "case {case:?}: {:?} was removed before the clock owed its removal, got \
+                 {status} {body}",
+                row.owed
+            );
+        }
+
+        // The keyspace delete is accepted — a resource already on its way out blocks
+        // nothing — and ITS span starts here, one span later than the owed one.
+        let keyspace_called_at = SystemTime::now();
+        assert_ok(
+            case,
+            emulator
+                .call("DeleteKeyspace", json!({"keyspaceName": case}))
+                .await,
+        );
+        let keyspace_due = keyspace_called_at + keyspaces::TRANSIENT_STATUS_SPAN;
+
+        // Wait out the remainder of the OWED span, plus a margin, which is still short of
+        // the keyspace's own instant.
+        if let Ok(remaining) = (owed_due + read_after_owed).duration_since(SystemTime::now()) {
+            tokio::time::sleep(remaining).await;
+        }
+
+        let (status, body) = row.owed.read(&emulator, case).await;
+        assert_ne!(
+            status, 200,
+            "case {case:?}: the removal the clock owed {:?} has not happened — deleting the \
+             keyspace must not re-date it, got {status} {body}",
+            row.owed
+        );
+        assert_failure(case, (status, body), 400, "ResourceNotFoundException");
+
+        // Read the keyspace and everything that was still `ACTIVE` when its delete
+        // arrived, then check the clock: those settle on the KEYSPACE's instant, so while
+        // that instant is still ahead they are all reported, `DELETING`.
+        let keyspace_seen = get_keyspace(&emulator, case).await;
+        let mut tables_seen = Vec::new();
+        for table in row.staying_tables() {
+            tables_seen.push((table, get_table(&emulator, case, table).await));
+        }
+        let mut types_seen = Vec::new();
+        for udt in row.staying_types() {
+            types_seen.push((udt, get_type(&emulator, case, udt).await));
+        }
+        let read_at = SystemTime::now();
+        if read_at < keyspace_due {
+            let (status, body) = keyspace_seen;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the keyspace's own span has not elapsed, so it is still \
+                 reported, got {status} {body}"
+            );
+            for (table, seen) in tables_seen {
+                let body = assert_ok(case, seen);
+                assert_eq!(
+                    reported_status(case, &body),
+                    keyspaces::TABLE_STATUS_DELETING,
+                    "case {case:?}: table {table:?} goes with its keyspace, so it is {} \
+                     until the keyspace's own span elapses, got {body}",
+                    keyspaces::TABLE_STATUS_DELETING
+                );
+            }
+            for (udt, seen) in types_seen {
+                let body = assert_ok(case, seen);
+                assert_eq!(
+                    reported_status(case, &body),
+                    keyspaces::TYPE_STATUS_DELETING,
+                    "case {case:?}: type {udt:?} goes with its keyspace, so it is {} until \
+                     the keyspace's own span elapses, got {body}",
+                    keyspaces::TYPE_STATUS_DELETING
+                );
+            }
+        }
+
+        // And once the keyspace's own instant passes, the whole keyspace is gone.
+        tokio::time::sleep(settle_wait()).await;
+        assert_failure(
+            case,
+            get_keyspace(&emulator, case).await,
+            400,
+            "ResourceNotFoundException",
+        );
+    }
 }
