@@ -85,7 +85,7 @@ pub(crate) fn stored_allocations(harness: &Harness, catalog: &str) -> Vec<Benefi
 /// This is the out-of-API grant path (`grant_allocation`): the API models no operation that
 /// creates an allocation, so a grant arrives from an in-process caller holding the engine,
 /// standing in for AWS's own fulfillment workflow.
-fn grant(
+pub(crate) fn grant(
     harness: &Harness,
     catalog: &str,
     benefit_identifier: &str,

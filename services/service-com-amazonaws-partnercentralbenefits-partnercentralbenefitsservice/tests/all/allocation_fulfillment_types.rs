@@ -54,7 +54,15 @@ async fn offered_types(harness: &Harness, catalog: &str) -> BTreeMap<String, Vec
 
 /// Every allocation `catalog` reports under `filter`, as `(id, BenefitId)` pairs in the
 /// order they were reported.
-async fn reported(harness: &Harness, case: &str, catalog: &str, filter: &Value) -> Vec<Value> {
+///
+/// Shared with `crate::allocation_fulfillment_type_recorded`, which reads the same report
+/// for the records whose fulfillment type is absent.
+pub(crate) async fn reported(
+    harness: &Harness,
+    case: &str,
+    catalog: &str,
+    filter: &Value,
+) -> Vec<Value> {
     let mut body = filter.clone();
     body["Catalog"] = json!(catalog);
     let (summaries, token) = list(harness, case, &body).await;

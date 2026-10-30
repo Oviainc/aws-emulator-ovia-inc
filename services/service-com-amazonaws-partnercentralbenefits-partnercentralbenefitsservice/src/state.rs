@@ -737,6 +737,25 @@ pub struct Benefit {
     pub status: String,
 }
 
+impl Benefit {
+    /// Whether this benefit offers `fulfillment_type`, which is what an allocation of it
+    /// may be fulfilled with (see [`BenefitAllocation::fulfillment_type`]).
+    pub fn offers(&self, fulfillment_type: &str) -> bool {
+        self.fulfillment_types
+            .iter()
+            .any(|offered| offered == fulfillment_type)
+    }
+
+    /// The fulfillment type an allocation of this benefit is granted with: the FIRST type it
+    /// offers — a benefit offering two is fulfilled with one of them and nothing picks which
+    /// — and `None` for a benefit that offers none, which can be fulfilled with nothing at
+    /// all. The one place that answers this, so no record is written with a type its benefit
+    /// does not offer.
+    pub fn offered_fulfillment_type(&self) -> Option<&str> {
+        self.fulfillment_types.first().map(String::as_str)
+    }
+}
+
 /// A monetary amount as the store holds it: minor units of its currency, so an amount is
 /// an integer in the store and is rendered into the modelled `MonetaryValue$Amount` once,
 /// on the way out (see [`Self::amount_text`]).
@@ -938,7 +957,11 @@ pub struct BenefitAllocation {
     /// the types its benefit offers: a benefit may offer two, and the allocation is
     /// fulfilled with one of them. The benefit's offer list is the BENEFIT's own field —
     /// what an allocation carries is the fulfillment it got (see
-    /// [`Self::fulfillment_types`]).
+    /// [`Self::fulfillment_types`]). Every path that records an allocation — the catalog
+    /// seeds and
+    /// [`ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState::grant_allocation`]
+    /// — takes it from [`Benefit::offered_fulfillment_type`] or records no allocation at
+    /// all, and every report reads it through [`Self::fulfillment_types`].
     pub fulfillment_type: String,
     /// How this allocation is fulfilled: the amounts, issuances and credit codes behind
     /// [`Self::fulfillment_type`]. `None` for a fulfillment type this store holds no record
@@ -1371,11 +1394,7 @@ impl Catalog {
                 let benefit = benefits
                     .values()
                     .find(|benefit| benefit.name == seed.benefit_name)?;
-                if !benefit
-                    .fulfillment_types
-                    .iter()
-                    .any(|offered| offered == seed.fulfillment_type)
-                {
+                if !benefit.offers(seed.fulfillment_type) {
                     return None;
                 }
                 let created_at_millis =
@@ -1871,8 +1890,9 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
     /// Record an allocation AWS granted for a benefit, and report the id it minted.
     ///
     /// `None` when the catalog does not exist, when it holds no benefit `benefit_identifier`
-    /// names, when `application_identifier` names no application of it, or when the catalog
-    /// already holds [`MAX_ALLOCATIONS_PER_CATALOG`] allocations. Both identifiers accept
+    /// names, when `application_identifier` names no application of it, when that benefit
+    /// offers no fulfillment type to be fulfilled with, or when the catalog already holds
+    /// [`MAX_ALLOCATIONS_PER_CATALOG`] allocations. Both identifiers accept
     /// either form their modelled patterns allow (a bare id or an ARN), resolved exactly as
     /// every operation resolves them — and since a grant arrives on no request, an ARN is
     /// resolved against [`DEFAULT_REGION`], which is the region an ARN carries when no
@@ -1913,8 +1933,14 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         let stored = self.catalogs.get(catalog)?;
         let benefit = stored.benefits.get(&benefit_id)?.clone();
         let applicable_benefit_ids = applicable_benefit_ids(&stored.benefits, &benefit);
+        // An allocation carries the fulfillment it GOT, which is one of the types its
+        // benefit offers ([`Benefit::offered_fulfillment_type`]), so a benefit offering none
+        // can be fulfilled with nothing and grants no allocation at all — exactly as the
+        // catalog seeds no allocation whose fulfillment type its benefit does not offer,
+        // rather than recording a value no modelled `FulfillmentType` declares. Asked
+        // BEFORE an id is minted, so a grant that records nothing spends no id.
+        let fulfillment_type = benefit.offered_fulfillment_type()?.to_string();
         let id = self.mint_allocation_id(now_millis);
-        let fulfillment_type = benefit.fulfillment_types.first().cloned();
         let expires_at_millis = now_millis.saturating_add(ALLOCATION_TERM_MILLIS);
         let allocation = BenefitAllocation {
             id: id.clone(),
@@ -1925,17 +1951,15 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
             description: Some(benefit.description.clone()),
             status: ALLOCATION_STATUS_ACTIVE.to_string(),
             status_reason: None,
-            fulfillment: fulfillment_type.as_deref().and_then(|fulfillment_type| {
-                AllocationFulfillment::new(
-                    fulfillment_type,
-                    GRANTED_ALLOCATION_AMOUNT_MINOR,
-                    0,
-                    &id,
-                    now_millis,
-                    expires_at_millis,
-                )
-            }),
-            fulfillment_type: fulfillment_type.unwrap_or_default(),
+            fulfillment: AllocationFulfillment::new(
+                &fulfillment_type,
+                GRANTED_ALLOCATION_AMOUNT_MINOR,
+                0,
+                &id,
+                now_millis,
+                expires_at_millis,
+            ),
+            fulfillment_type,
             applicable_benefit_ids,
             created_at_millis: now_millis,
             updated_at_millis: now_millis,

@@ -306,7 +306,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_reason: allocation.status_reason.clone(),
             benefit_application_id: allocation.benefit_application_id.clone(),
             benefit_id: Some(allocation.benefit_id.clone()),
-            fulfillment_type: Some(allocation.fulfillment_type.clone()),
+            // The one type the allocation was fulfilled with, read through the store's own
+            // accessor (`crate::state::BenefitAllocation::fulfillment_types`) — the SAME
+            // fact `ListBenefitAllocations` reports as `FulfillmentTypes` — so an
+            // allocation no fulfillment type was recorded for reports none here rather
+            // than a value the modelled `FulfillmentType` enum does not declare, and the
+            // two reports of one record always agree.
+            fulfillment_type: allocation.fulfillment_types().first().cloned(),
             applicable_benefit_ids: crate::state::optional_list(&allocation.applicable_benefit_ids),
             fulfillment_detail: fulfillment_detail(allocation),
             created_at: Some(crate::state::timestamp(allocation.created_at_millis)),
