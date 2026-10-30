@@ -90,8 +90,14 @@ pub const RULE_NOT_FOUND_MESSAGE: &str = "Rule not found.";
 /// fixed text, with the submitted name NOT interpolated.
 pub const RULE_ALREADY_EXISTS_MESSAGE: &str = "Telemetry Rule already exists.";
 
-/// The resource portion a telemetry-pipeline ARN carries before its name, so an ARN
-/// reads `arn:aws:observabilityadmin:<region>:<account>:telemetry-pipeline/<Name>`.
+/// The resource portion a telemetry-pipeline ARN carries before the id this service
+/// assigns the pipeline, so an ARN reads
+/// `arn:aws:observabilityadmin:<region>:<account>:telemetry-pipeline/<id>`.
+///
+/// The resource type is the resource's own API name, the same hyphenated form
+/// [`RULE_ARN_RESOURCE_PREFIX`] takes. What follows it is NOT the submitted `Name`:
+/// the pipeline's handle is the id the service assigns it ([`new_resource_id`]), and
+/// the name is the OTHER identifier `PipelineIdentifier` ("name or ARN") accepts.
 pub const PIPELINE_ARN_RESOURCE_PREFIX: &str = "telemetry-pipeline/";
 
 /// The `ResourceNotFoundException` message for a read of a telemetry pipeline no
@@ -210,14 +216,20 @@ pub const PIPELINE_NAME_RESOURCE_TYPE: &str = "PipelineName";
 
 /// The resource portion an S3 Table integration's ARN carries before its id, so an
 /// ARN reads
-/// `arn:aws:observabilityadmin:<region>:<account>:s3-table-integration/<id>`.
+/// `arn:aws:observabilityadmin:<region>:<account>:s3tableintegration/<id>`.
+///
+/// The resource type is this service's own name for the resource, written as one
+/// unseparated token: that is the form an integration is addressed by, so an ARN a
+/// caller stores, names in a policy or hands back to
+/// `GetS3TableIntegration`/`DeleteS3TableIntegration` is the same string on both
+/// sides.
 ///
 /// `CreateS3TableIntegration` takes no caller-supplied name — only an `Encryption`
 /// configuration, a `RoleArn` and `Tags` — so the id is minted by the service
 /// ([`new_s3_table_integration_id`]) and the ARN it goes into is the only handle a
 /// caller ever has on the integration: `GetS3TableIntegration` and
 /// `DeleteS3TableIntegration` both take `Arn`.
-pub const S3_TABLE_INTEGRATION_ARN_RESOURCE_PREFIX: &str = "s3-table-integration/";
+pub const S3_TABLE_INTEGRATION_ARN_RESOURCE_PREFIX: &str = "s3tableintegration/";
 
 /// The `ResourceType` a modelled error names the S3 Table integration RESOURCE by —
 /// its own API name (the noun its summary, status and refusal shapes use), for the
@@ -315,17 +327,22 @@ pub const ENRICHMENT_STATUS_STOPPED: &str = "Stopped";
 /// pattern (`^arn:aws([a-z0-9\-]+)?:resource-explorer-2:...`) fixes it.
 pub const ENRICHMENT_VIEW_ARN_SERVICE: &str = "resource-explorer-2";
 
-/// The resource portion of that managed view's ARN.
+/// The resource portion of that managed view's ARN, up to the id the service assigns
+/// the view it creates.
 ///
 /// One managed view per account and region — the feature is a single per-account
-/// switch, and the ARN's own region and account fields are what tell two of them
-/// apart — so the resource portion is a constant name rather than a minted id. The
-/// NAME is this emulator's own choice: the model fixes the ARN's shape (the
-/// `AwsResourceExplorerManagedViewArn` pattern, which admits any `managed-view/<x>`)
-/// but publishes no name for the view AWS creates, so nothing here is a recorded
-/// value — only the partition, region and account come from the request, through
-/// `engine::emulator_arn`.
-pub const ENRICHMENT_VIEW_RESOURCE: &str = "managed-view/AWSManagedViewForResourceTagsForTelemetry";
+/// switch — and the view is a RESOURCE the service creates in Resource Explorer when
+/// the feature is first started, so its ARN carries a service-assigned id after the
+/// view name, the way every Resource Explorer view ARN names the view and then the id
+/// that tells two views of one name apart. The id is minted ONCE per region and kept
+/// on the record ([`new_managed_view_id`]), so the ARN a `Start` answers is the one a
+/// status read reports and the one a caller takes to `resource-explorer-2`. The view
+/// NAME is this emulator's own choice: the model fixes only the ARN's shape (the
+/// `AwsResourceExplorerManagedViewArn` pattern, which admits any `managed-view/<x>`),
+/// so nothing here is a recorded value — the partition, region and account come from
+/// the request, through `engine::emulator_arn`.
+pub const ENRICHMENT_VIEW_RESOURCE_PREFIX: &str =
+    "managed-view/AWSManagedViewForResourceTagsForTelemetry/";
 
 /// The most regions ONE telemetry-feature store will hold a record for.
 ///
@@ -452,9 +469,11 @@ pub type PipelineKey = (String, String);
 /// One stored telemetry pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct StoredTelemetryPipeline {
+    /// The id this service assigned the pipeline, which its ARN carries.
+    pub id: String,
     pub name: String,
     pub region: String,
-    /// `arn:aws:observabilityadmin:<region>:<account>:telemetry-pipeline/<Name>`.
+    /// `arn:aws:observabilityadmin:<region>:<account>:telemetry-pipeline/<id>`.
     pub arn: String,
     /// The configuration body exactly as the caller supplied it: the YAML document
     /// `TelemetryPipelineConfiguration$Body` carries, stored verbatim so a read
@@ -487,12 +506,42 @@ impl StoredTelemetryPipeline {
         }
     }
 
+    /// The `StatusReason` of the `Status` this pipeline reports at `now_ms`.
+    ///
+    /// `StatusReason` is "additional information about the pipeline status", so EVERY
+    /// status has one: the member describes the state the pipeline is in, which it is
+    /// in whether or not that state is transient, and a read that reported it only
+    /// for some states would leave a caller unable to tell "no reason" from "not
+    /// reported".
+    pub fn status_reason_at(&self, now_ms: i64) -> TelemetryPipelineStatusReason {
+        let description = match self.status_at(now_ms) {
+            PIPELINE_STATUS_CREATING => "The pipeline is being created.",
+            PIPELINE_STATUS_ACTIVE => "The pipeline is active.",
+            // Unreachable while a stored pipeline reports one of the two statuses
+            // above: a status added here needs its own sentence rather than
+            // inheriting another status's.
+            _ => "The pipeline status has no further context to report.",
+        };
+        TelemetryPipelineStatusReason {
+            description: Some(description.to_string()),
+        }
+    }
+
+    /// The tags this pipeline carries, as the modelled `TagMapOutput` a read reports.
+    ///
+    /// Always a map, EMPTY when nothing tagged the pipeline: the member reports the
+    /// resource's tag set, and an untagged resource has an empty one — a different
+    /// observation from a member a response never carried.
+    pub fn tag_map(&self) -> ::std::collections::HashMap<String, String> {
+        self.tags
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
     /// This record as the `TelemetryPipeline` a read reports, as it stands at
-    /// `now_ms`. `StatusReason` "provid[es] additional context about the current
-    /// state", so it is reported while the pipeline is still being created and
-    /// omitted once it is active and there is no further context to give.
+    /// `now_ms`.
     pub fn as_pipeline(&self, now_ms: i64) -> TelemetryPipeline {
-        let status = self.status_at(now_ms);
         TelemetryPipeline {
             created_time_stamp: Some(self.created_timestamp_ms),
             last_update_time_stamp: Some(self.last_update_timestamp_ms),
@@ -501,22 +550,9 @@ impl StoredTelemetryPipeline {
             configuration: Some(TelemetryPipelineConfiguration {
                 body: self.configuration_body.clone(),
             }),
-            status: Some(status.to_string()),
-            status_reason: (status == PIPELINE_STATUS_CREATING).then(|| {
-                TelemetryPipelineStatusReason {
-                    description: Some(
-                        "the pipeline configuration is being provisioned".to_string(),
-                    ),
-                }
-            }),
-            // A pipeline nobody tagged carries no `Tags` member at all, rather than an
-            // empty map: the member reports the tags the resource has.
-            tags: (!self.tags.is_empty()).then(|| {
-                self.tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+            status: Some(self.status_at(now_ms).to_string()),
+            status_reason: Some(self.status_reason_at(now_ms)),
+            tags: Some(self.tag_map()),
         }
     }
 }
@@ -534,7 +570,7 @@ pub struct StoredS3TableIntegration {
     /// The service-minted id the integration's ARN carries.
     pub id: String,
     pub region: String,
-    /// `arn:aws:observabilityadmin:<region>:<account>:s3-table-integration/<id>`.
+    /// `arn:aws:observabilityadmin:<region>:<account>:s3tableintegration/<id>`.
     pub arn: String,
     /// `RoleArn` exactly as the caller supplied it: the IAM role the integration
     /// assumes to reach the destination table bucket.
@@ -1444,16 +1480,20 @@ impl ComAmazonawsObservabilityadminObservabilityadminState {
     ///
     /// The managed view is minted by the first `Start` in the region and kept from
     /// then on, so a feature started, stopped and started again reads the one view
-    /// its first start created.
+    /// its first start created — the ARN it answers is the one every later read of
+    /// that region reports.
     ///
     /// Answers `None`, having written NOTHING, when a record for a region this store
     /// does not hold yet would take it past [`MAX_TELEMETRY_FEATURE_REGIONS`].
     #[must_use]
     pub fn start_telemetry_enrichment(&mut self, region: &str) -> Option<TelemetryEnrichment> {
-        let view_arn = enrichment_view_arn(region);
         let record = self.enrichment_entry(region, true)?;
         record.running = true;
-        record.managed_view_arn.get_or_insert(view_arn);
+        // Minted only where there is no view yet, so a restart draws no id it would
+        // throw away.
+        record
+            .managed_view_arn
+            .get_or_insert_with(|| enrichment_view_arn(region, &new_managed_view_id()));
         Some(record.clone())
     }
 
@@ -1753,6 +1793,78 @@ pub fn telemetry_rule_rejection(rule: &TelemetryRule, home_region: &str) -> Opti
     .or_else(|| replication_rejection(rule, home_region))
 }
 
+/// The telemetry source type a `ResourceType` CORRELATES with, for every resource
+/// type exactly one of the modelled source types names.
+///
+/// `TelemetrySourceTypes` is documented as "the specific telemetry source types to
+/// configure for the resource, such as VPC_FLOW_LOGS or EKS_AUDIT_LOGS.
+/// TelemetrySourceTypes must be correlated with the specific resource type", so the
+/// correlation below is the one the two enums' own values state — each entry pairs a
+/// `ResourceType` value with the `TelemetrySourceType` value that names the SAME
+/// resource (`smithy_query(query="shape", shape="ResourceType,TelemetrySourceType")`,
+/// mirrored in `types::RESOURCE_TYPE_VALUES` / `types::TELEMETRY_SOURCE_TYPE_VALUES`).
+///
+/// Only an unambiguous correlation is listed: an EKS cluster is named by five of the
+/// source types (`EKS_AUDIT_LOGS`, `EKS_AUTHENTICATOR_LOGS`,
+/// `EKS_CONTROLLER_MANAGER_LOGS`, `EKS_SCHEDULER_LOGS`, `EKS_API_LOGS`), so no single
+/// one of them is what a rule for that resource asked for, and a resource type no
+/// source type names correlates with none.
+const CORRELATED_TELEMETRY_SOURCE_TYPES: &[(&str, &str)] = &[
+    ("AWS::EC2::VPC", "VPC_FLOW_LOGS"),
+    (
+        "AWS::Route53Resolver::ResolverEndpoint",
+        "ROUTE53_RESOLVER_QUERY_LOGS",
+    ),
+];
+
+/// The `TelemetryType` every modelled telemetry source type belongs to: all of
+/// `TelemetrySourceType`'s values name a LOG source, so a rule configuring any other
+/// kind of telemetry has no source type correlated with its resource.
+const TELEMETRY_TYPE_LOGS: &str = "Logs";
+
+/// The telemetry source types `resource_type` determines for a `telemetry_type` rule,
+/// or `None` when it determines none.
+pub fn correlated_telemetry_source_types(
+    resource_type: Option<&str>,
+    telemetry_type: &str,
+) -> Option<Vec<String>> {
+    if telemetry_type != TELEMETRY_TYPE_LOGS {
+        return None;
+    }
+    let resource_type = resource_type?;
+    CORRELATED_TELEMETRY_SOURCE_TYPES
+        .iter()
+        .find(|(resource, _)| *resource == resource_type)
+        .map(|(_, source_type)| vec![(*source_type).to_string()])
+}
+
+/// `rule` as the service RECORDS it: the body the caller supplied, with every member
+/// the caller left to the service filled in.
+///
+/// `TelemetrySourceTypes` is the one such member. It is "the specific telemetry source
+/// types to configure for the resource" and it "must be correlated with the specific
+/// resource type", so a rule whose resource type correlates with exactly one source
+/// type has asked for that source type whether or not it spelled the member out — and
+/// a resource is configured for it either way, so the record keeps it and every read
+/// of the rule reports it. That the SERVICE settles the member, rather than leaving a
+/// rule with none, is what the recorded `GetTelemetryRule` and `ListTelemetryRules`
+/// responses for a rule created without it show: both report the source type its
+/// resource type correlates with. A rule that named its own source types keeps those:
+/// the request is what the resource is configured for.
+///
+/// Every operation that stores a `TelemetryRule` records it through this one function,
+/// so a read, a listing and the rule a later update replaces all agree.
+pub fn recorded_rule(rule: TelemetryRule) -> TelemetryRule {
+    let mut rule = rule;
+    if rule.telemetry_source_types.is_none() {
+        rule.telemetry_source_types = correlated_telemetry_source_types(
+            rule.resource_type.as_deref(),
+            rule.telemetry_type.as_str(),
+        );
+    }
+    rule
+}
+
 /// Why a member that targets a modelled enum is unacceptable. A member the request
 /// omits is one the model admits, so it is not refused here.
 pub fn enum_rejection(member: &str, value: Option<&str>, catalog: &[&str]) -> Option<String> {
@@ -1948,10 +2060,25 @@ pub fn multi_region_rejection(
         })
 }
 
-/// The ARN of the Resource Explorer managed view the resource tags for telemetry
-/// feature of `region` reads.
-pub fn enrichment_view_arn(region: &str) -> String {
-    ::engine::emulator_arn(ENRICHMENT_VIEW_ARN_SERVICE, region, ENRICHMENT_VIEW_RESOURCE)
+/// The ARN of the Resource Explorer managed view `view_id` that the resource tags for
+/// telemetry feature of `region` reads.
+pub fn enrichment_view_arn(region: &str, view_id: &str) -> String {
+    ::engine::emulator_arn(
+        ENRICHMENT_VIEW_ARN_SERVICE,
+        region,
+        &format!("{ENRICHMENT_VIEW_RESOURCE_PREFIX}{view_id}"),
+    )
+}
+
+/// A newly minted id for the managed view a first `StartTelemetryEnrichment` in a
+/// region creates.
+///
+/// The view is a Resource Explorer resource, and a Resource Explorer view's ARN carries
+/// a UUID after the view's name — so this id keeps the hyphenated UUID form the same
+/// already-vendored generator produces, rather than the unseparated form this service's
+/// OWN handles take ([`new_resource_id`]).
+pub fn new_managed_view_id() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().to_string()
 }
 
 /// The ARN of the telemetry rule `name` in `region`.
@@ -1987,12 +2114,12 @@ pub fn resource_does_not_exist_message(arn: &str) -> String {
     format!("Resource {arn} does not exist.")
 }
 
-/// The ARN of the telemetry pipeline `name` in `region`.
-pub fn pipeline_arn(region: &str, name: &str) -> String {
+/// The ARN of the telemetry pipeline `id` in `region`.
+pub fn pipeline_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(
         ARN_SERVICE,
         region,
-        &format!("{PIPELINE_ARN_RESOURCE_PREFIX}{name}"),
+        &format!("{PIPELINE_ARN_RESOURCE_PREFIX}{id}"),
     )
 }
 
@@ -2003,6 +2130,41 @@ pub fn s3_table_integration_arn(region: &str, id: &str) -> String {
         region,
         &format!("{S3_TABLE_INTEGRATION_ARN_RESOURCE_PREFIX}{id}"),
     )
+}
+
+/// A newly minted id for a resource this service names itself.
+///
+/// The id is OPAQUE — the model gives it no form of its own — and it is a token of
+/// [`MINTED_ID_DIGITS`] hexadecimal digits: the entropy is a random v4 UUID's, reached
+/// through `emulator_telemetry`'s `BatchId::random()` constructor
+/// (`uuid::Uuid::new_v4().as_hyphenated()` verbatim,
+/// `vendor/emulator-telemetry/src/types.rs`), because `emulator-telemetry` is already
+/// one of this crate's dependencies, so nothing new enters the workspace lockfile.
+/// Only the generator is borrowed; the newtype's telemetry meaning is dropped here,
+/// and so are the hyphens that make a UUID a UUID rather than an id of this service's
+/// own.
+///
+/// Used wherever this service assigns a resource its own handle:
+/// [`new_s3_table_integration_id`] and the telemetry pipeline's id.
+pub fn new_resource_id() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().replace('-', "")
+}
+
+/// How many hexadecimal digits an id [`new_resource_id`] mints carries, which is the
+/// entropy of the v4 UUID it draws it from.
+pub const MINTED_ID_DIGITS: usize = 32;
+
+/// Whether `id` has the form [`new_resource_id`] mints: [`MINTED_ID_DIGITS`] lowercase
+/// hexadecimal digits.
+///
+/// It lives beside the generator so that the operations reading an id back — the page
+/// token `ListS3TableIntegrations` hands out carries one — cannot drift from the form
+/// this service mints.
+pub fn is_minted_resource_id(id: &str) -> bool {
+    id.len() == MINTED_ID_DIGITS
+        && id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The ARN of the S3 Tables table bucket the integration `id` in `region` delivers
@@ -2030,15 +2192,10 @@ pub fn table_bucket_arn(region: &str, id: &str) -> String {
 /// A newly minted S3 Table integration id.
 ///
 /// `CreateS3TableIntegration` carries no caller-supplied identifier, so the service
-/// mints one per create and the integration's ARN is what the caller holds it by. The
-/// id is opaque — the model gives it no form of its own — and the entropy is a random
-/// v4 UUID's, reached through `emulator_telemetry`'s `BatchId::random()` constructor
-/// (`uuid::Uuid::new_v4().as_hyphenated()` verbatim,
-/// `vendor/emulator-telemetry/src/types.rs`), because `emulator-telemetry` is already
-/// one of this crate's dependencies, so nothing new enters the workspace lockfile.
-/// Only the generator is borrowed; the newtype's telemetry meaning is dropped here.
+/// mints one per create and the integration's ARN is what the caller holds it by:
+/// the id is [`new_resource_id`]'s, the one form this service's own handles take.
 pub fn new_s3_table_integration_id() -> String {
-    ::emulator_telemetry::BatchId::random().as_str().to_string()
+    new_resource_id()
 }
 
 /// Why `encryption` and `role_arn` are not an S3 Table integration this service will

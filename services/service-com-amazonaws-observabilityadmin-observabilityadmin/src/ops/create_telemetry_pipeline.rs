@@ -255,9 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let arn = crate::state::pipeline_arn(&region, &input.name);
+        // The pipeline's handle is the id the service assigns it; the submitted name
+        // is the other identifier a read resolves it by.
+        let id = crate::state::new_resource_id();
+        let arn = crate::state::pipeline_arn(&region, &id);
         let name = input.name;
         store.insert_pipeline(crate::state::StoredTelemetryPipeline {
+            id,
             name: name.clone(),
             region: region.clone(),
             arn: arn.clone(),

@@ -35,9 +35,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use service_com_amazonaws_observabilityadmin_observabilityadmin::ops::types::TELEMETRY_PIPELINE_STATUS_VALUES;
 use service_com_amazonaws_observabilityadmin_observabilityadmin::state::{
-    now_epoch_millis, pipeline_arn, ComAmazonawsObservabilityadminObservabilityadminState,
-    StoredTelemetryPipeline, MAX_STORED_PIPELINE_RECORDS, MAX_TELEMETRY_PIPELINES,
-    PIPELINE_ACTIVATION_DELAY_MS,
+    is_minted_resource_id, now_epoch_millis, pipeline_arn,
+    ComAmazonawsObservabilityadminObservabilityadminState, StoredTelemetryPipeline,
+    MAX_STORED_PIPELINE_RECORDS, MAX_TELEMETRY_PIPELINES, PIPELINE_ACTIVATION_DELAY_MS,
 };
 
 use crate::telemetry_rules::{call, emulator, error_code, Emulator, ACCOUNT};
@@ -76,9 +76,26 @@ fn created_arn(body: &Value) -> String {
         .to_string()
 }
 
-/// The ARN the service must mint for `name` in `region`.
-fn expected_arn(region: &str, name: &str) -> String {
-    format!("arn:aws:observabilityadmin:{region}:{ACCOUNT}:telemetry-pipeline/{name}")
+/// The ARN the service must mint for the pipeline id `id` in `region`.
+fn arn_of(region: &str, id: &str) -> String {
+    format!("arn:aws:observabilityadmin:{region}:{ACCOUNT}:telemetry-pipeline/{id}")
+}
+
+/// The id inside a pipeline ARN, having asserted the ARN is one this service mints:
+/// the resource type its ARNs carry, and then the opaque id the service assigned the
+/// pipeline (asked of the service's own predicate, so the test cannot drift from the
+/// minting site).
+fn minted_id(case: &str, region: &str, arn: &str) -> String {
+    let prefix = arn_of(region, "");
+    let Some(id) = arn.strip_prefix(&prefix) else {
+        panic!("case {case:?}: expected a pipeline ARN under {prefix}, got {arn:?}");
+    };
+    assert!(
+        is_minted_resource_id(id),
+        "case {case:?}: expected the service-assigned pipeline id to be an opaque \
+         hexadecimal token, got {id:?}"
+    );
+    id.to_string()
 }
 
 /// A `TelemetryPipeline` member of a `GetTelemetryPipeline` response.
@@ -205,9 +222,10 @@ async fn a_create_persists_the_pipeline_every_read_reports() {
              got {status} {created:?}"
         );
         let arn = created_arn(&created);
+        let id = minted_id(case, HOME_REGION, &arn);
         assert_eq!(
             arn,
-            expected_arn(HOME_REGION, &name),
+            arn_of(HOME_REGION, &id),
             "case {case:?}: CreateTelemetryPipeline minted the wrong ARN"
         );
 
@@ -241,7 +259,7 @@ async fn a_create_persists_the_pipeline_every_read_reports() {
             );
             assert_eq!(
                 member(&got, "Tags"),
-                tags.as_ref(),
+                Some(tags.clone().unwrap_or_else(|| json!({}))).as_ref(),
                 "case {case:?}: GetTelemetryPipeline({identifier}) reported the wrong Tags: {got:?}"
             );
             let status_value = member(&got, "Status")
@@ -327,18 +345,18 @@ async fn a_pipeline_is_creating_until_the_transition_the_create_started_comes_du
         .and_then(Value::as_str)
         .unwrap_or("<no Status>")
         .to_string();
+    let reason_while_creating = member(&creating, "StatusReason")
+        .and_then(|reason| reason.get("Description"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     if now_epoch_millis() < active_at_ms {
         assert_eq!(
             status_value, "CREATING",
             "a read inside the span reports CREATING, got {creating:?}"
         );
-        let reason = member(&creating, "StatusReason")
-            .and_then(|reason| reason.get("Description"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
         assert!(
-            !reason.is_empty(),
+            !reason_while_creating.is_empty(),
             "a CREATING pipeline reports why, got {creating:?}"
         );
     }
@@ -355,11 +373,22 @@ async fn a_pipeline_is_creating_until_the_transition_the_create_started_comes_du
         Some("ACTIVE"),
         "once the transition comes due the pipeline is ACTIVE, got {active:?}"
     );
-    assert_eq!(
-        member(&active, "StatusReason"),
-        None,
-        "an ACTIVE pipeline has no further status context to report, got {active:?}"
+    let active_reason = member(&active, "StatusReason")
+        .and_then(|reason| reason.get("Description"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !active_reason.is_empty(),
+        "every status a pipeline reports carries the reason for it, got {active:?}"
     );
+    if status_value == "CREATING" {
+        assert_ne!(
+            active_reason, reason_while_creating,
+            "the reason describes the status the pipeline is IN, so the ACTIVE one is not the \
+             CREATING one, got {active:?}"
+        );
+    }
     // The clock moved the status; it did not re-create the resource.
     assert_eq!(
         member(&active, "CreatedTimeStamp").and_then(Value::as_i64),
@@ -530,10 +559,12 @@ async fn a_create_past_either_cap_is_refused_and_stores_nothing() {
                     format!("{OTHER_REGION}-{}", index / 10)
                 };
                 let name = format!("filler-{index}");
+                let id = format!("filler{index:026}");
                 store.insert_pipeline(StoredTelemetryPipeline {
+                    id: id.clone(),
                     name: name.clone(),
                     region: region.clone(),
-                    arn: pipeline_arn(&region, &name),
+                    arn: pipeline_arn(&region, &id),
                     configuration_body: body.to_string(),
                     created_timestamp_ms: 1_700_000_000_000,
                     last_update_timestamp_ms: 1_700_000_000_000,
@@ -625,9 +656,10 @@ async fn a_name_identifies_one_pipeline_in_the_region_it_was_created_in() {
     .await;
     assert_eq!(status, 200, "expected 200, got {status} {elsewhere:?}");
     let other_arn = created_arn(&elsewhere);
+    let other_id = minted_id("the other region's pipeline", OTHER_REGION, &other_arn);
     assert_eq!(
         other_arn,
-        expected_arn(OTHER_REGION, "shared-name"),
+        arn_of(OTHER_REGION, &other_id),
         "the other region's pipeline carries its own region in its ARN"
     );
     assert_ne!(
@@ -676,20 +708,21 @@ async fn an_identifier_that_names_no_stored_pipeline_is_a_modelled_404() {
     )
     .await;
     assert_eq!(status, 200, "expected 200, got {status} {created:?}");
+    let stored_arn = created_arn(&created);
 
     let rows: Vec<(&str, String)> = vec![
         ("a name nothing was created under", "absent-pipeline".to_string()),
         (
             "a well-formed ARN for a pipeline that does not exist",
-            expected_arn(HOME_REGION, "absent-pipeline"),
+            arn_of(HOME_REGION, &"a".repeat(32)),
         ),
         (
-            "the stored pipeline's name under another account",
-            expected_arn(HOME_REGION, "stored-pipeline").replace(ACCOUNT, "123456789012"),
+            "the stored pipeline's ARN under another account",
+            stored_arn.replace(ACCOUNT, "123456789012"),
         ),
         (
-            "the stored pipeline's name under another service namespace",
-            expected_arn(HOME_REGION, "stored-pipeline").replace("observabilityadmin", "osis"),
+            "the stored pipeline's ARN under another service namespace",
+            stored_arn.replace("observabilityadmin", "osis"),
         ),
     ];
 

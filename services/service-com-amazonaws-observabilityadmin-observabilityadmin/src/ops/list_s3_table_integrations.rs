@@ -137,17 +137,17 @@ fn encode_page_token(id: &str) -> String {
 /// nothing this operation could have issued.
 ///
 /// What it can decide is the FORM: every token this operation hands out carries an id
-/// this service minted (`crate::state::new_s3_table_integration_id` — a hyphenated,
-/// lowercase-hex UUID, 8-4-4-4-12), so a token decoding to anything else is one this
-/// operation never issued and is refused rather than read as a position. A
-/// well-formed id the store no longer holds is NOT refused: it is a position, and a
-/// page resumes strictly after it, which is what lets a walk survive the integration
-/// its last page ended on being deleted between the two calls.
+/// this service minted, so a token decoding to anything else
+/// (`crate::state::is_minted_resource_id`, which lives beside the generator) is one
+/// this operation never issued and is refused rather than read as a position. A
+/// well-formed id the store no longer holds is NOT refused: it names the first record
+/// a page did not return, and the next page resumes AT it, which is what lets a walk
+/// survive the integration its last page ended on being deleted between the two calls.
 fn decode_page_token(token: &str) -> Result<String, ListS3TableIntegrationsError> {
     hex::decode(token)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
-        .filter(|id| is_minted_id_form(id))
+        .filter(|id| crate::state::is_minted_resource_id(id))
         .ok_or_else(|| {
             ListS3TableIntegrationsErrorModeled::ValidationException(ValidationException {
                 message: Some(
@@ -158,21 +158,6 @@ fn decode_page_token(token: &str) -> Result<String, ListS3TableIntegrationsError
             })
             .into()
         })
-}
-
-/// Whether `id` has the form this service mints an integration id in: five
-/// hyphen-separated groups of 8, 4, 4, 4 and 12 lowercase hex digits
-/// (`crate::state::new_s3_table_integration_id`).
-fn is_minted_id_form(id: &str) -> bool {
-    let mut groups = id.split('-');
-    [8usize, 4, 4, 4, 12].iter().all(|width| {
-        groups.next().is_some_and(|group| {
-            group.len() == *width
-                && group
-                    .bytes()
-                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-        })
-    }) && groups.next().is_none()
 }
 
 /// The `ListS3TableIntegrations` operation.

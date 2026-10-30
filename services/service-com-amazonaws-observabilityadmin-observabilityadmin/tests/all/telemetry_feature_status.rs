@@ -557,14 +557,41 @@ async fn enrichment_status(emulator: &Emulator, region: &str) -> (u16, Value) {
     call(emulator, region, "/GetTelemetryEnrichmentStatus", &json!({})).await
 }
 
-/// The managed view ARN this emulator must mint for `region`: the modelled
-/// `AwsResourceExplorerManagedViewArn` pattern fixes every field but the region and
-/// the account.
-fn expected_view_arn(region: &str) -> String {
+/// The managed view ARN prefix this emulator must mint for `region`: the modelled
+/// `AwsResourceExplorerManagedViewArn` pattern fixes every field but the region, the
+/// account, and the id the service assigns the view it creates — which is per-view and
+/// so is asserted by its FORM below rather than by a value.
+fn expected_view_arn_prefix(region: &str) -> String {
     format!(
         "arn:aws:resource-explorer-2:{region}:{ACCOUNT}:managed-view/\
-         AWSManagedViewForResourceTagsForTelemetry"
+         AWSManagedViewForResourceTagsForTelemetry/"
     )
+}
+
+/// Whether `id` has the canonical hyphenated UUID form (8-4-4-4-12 lowercase hex) the
+/// service assigns a managed view in.
+fn is_uuid(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == 5
+        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|group| group.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()))
+}
+
+/// Assert `arn` is the ARN of a managed view of `region`: the prefix the pattern fixes,
+/// then the id the service assigned the view.
+fn assert_view_arn(case: &str, region: &str, arn: Option<&String>) {
+    let prefix = expected_view_arn_prefix(region);
+    let arn = arn.map(String::as_str).unwrap_or("<none>");
+    let Some(id) = arn.strip_prefix(&prefix) else {
+        panic!("case {case}: expected a managed view ARN under {prefix}, got {arn:?}");
+    };
+    assert!(
+        is_uuid(id),
+        "case {case}: expected the view's service-assigned id to be a hyphenated UUID, \
+         got {id:?} in {arn:?}"
+    );
 }
 
 /// The resource tags for telemetry feature reports what its own `Start`/`Stop`
@@ -596,11 +623,10 @@ async fn the_enrichment_feature_reports_what_start_and_stop_recorded() {
             "case {region}: expected the modelled 202 with Status Running, \
              got {status} {started:?}"
         );
-        assert_eq!(
-            member(&started, "AwsResourceExplorerManagedViewArn"),
-            Some(expected_view_arn(region)),
-            "case {region}: expected the start to report the region's managed view, \
-             got {started:?}"
+        assert_view_arn(
+            region,
+            region,
+            member(&started, "AwsResourceExplorerManagedViewArn").as_ref(),
         );
 
         // The read reports the same pair the start recorded.
@@ -694,11 +720,10 @@ async fn a_redundant_enrichment_stop_is_an_idempotent_no_op() {
             (202, Some("Running")),
             "case {name}: expected the restart to answer 202 Running, got {status} {restarted:?}"
         );
-        assert_eq!(
-            member(&restarted, "AwsResourceExplorerManagedViewArn"),
-            Some(expected_view_arn(HOME_REGION)),
-            "case {name}: expected the restart to read the region's one managed view, \
-             got {restarted:?}"
+        assert_view_arn(
+            name,
+            HOME_REGION,
+            member(&restarted, "AwsResourceExplorerManagedViewArn").as_ref(),
         );
         if let Some(minted) = minted {
             assert_eq!(
@@ -740,11 +765,10 @@ async fn a_region_outside_the_catalog_is_served_in_the_default_region() {
             status, 202,
             "case {region}: expected the enrichment start to answer 202, got {status} {started:?}"
         );
-        assert_eq!(
-            member(&started, "AwsResourceExplorerManagedViewArn"),
-            Some(expected_view_arn(DEFAULT_REGION)),
-            "case {region}: an unrecognised scope is served in the default region, \
-             got {started:?}"
+        assert_view_arn(
+            region,
+            DEFAULT_REGION,
+            member(&started, "AwsResourceExplorerManagedViewArn").as_ref(),
         );
 
         // The default region is where both features were recorded, and it is the ONLY

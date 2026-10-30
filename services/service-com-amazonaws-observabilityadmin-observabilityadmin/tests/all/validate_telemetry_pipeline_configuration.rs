@@ -17,11 +17,14 @@
 //!    `PIPELINE_CONFIGURATION_PARSE_ERROR` defect and the only one reported for such a
 //!    body, since a body that was never read has no fields to report anything else
 //!    against;
-//! 3. a document that WAS read is checked against the rules a pipeline definition
-//!    follows: it declares a pipeline, its sections form one chain, each section
-//!    declares exactly one source and exactly one sink, its processors are ones
-//!    this emulator runs with options they take, and every field naming an ARN carries
-//!    one — the IAM role syntax where the field names the role a plugin assumes;
+//! 3. a document that WAS read is checked against the SCHEMA a pipeline definition
+//!    follows, one reported error per problem: a required property the document does not
+//!    declare (`MISSING_FIELD`), a property the schema does not define (`UNKNOWN_PROPERTY`,
+//!    carrying the path it is written at), a property carrying a number of items the
+//!    schema does not allow, a POSITION of the processor sequence this emulator cannot
+//!    run (its own category, since the document may be one the real service accepts),
+//!    and every field naming an ARN carrying one — the IAM role syntax where the field
+//!    names the role a plugin assumes;
 //! 4. nothing is stored and nothing is created: the call leaves the store exactly as it
 //!    found it, so the same call answers the same way twice.
 
@@ -43,6 +46,10 @@ const INVALID_PATTERN: &str = "INVALID_PATTERN";
 /// The category for a processor, or a processor option, this emulator does not run —
 /// its own code, because such a document may be one the real service accepts.
 const UNSUPPORTED_PROCESSOR: &str = "UNSUPPORTED_PROCESSOR";
+/// The two categories a schema validator reports a property problem under: a required
+/// property that is not there, and a property the schema does not define.
+const MISSING_FIELD: &str = "MISSING_FIELD";
+const UNKNOWN_PROPERTY: &str = "UNKNOWN_PROPERTY";
 
 /// One ARN of each form this service's model declares
 /// (`smithy_query(query="shape", shape="IamRoleArn,ResourceArn")`): the IAM role a
@@ -337,32 +344,36 @@ async fn every_defect_of_a_document_is_reported_against_its_field() {
         (
             "a document that is not a mapping",
             "just some text\n".to_string(),
-            vec![(VALIDATION_ERROR, "Configuration.Body")],
+            vec![(MISSING_FIELD, "source"), (MISSING_FIELD, "sink")],
         ),
         (
             "an empty document declaring no pipeline",
             " \n".to_string(),
-            vec![(VALIDATION_ERROR, "Configuration.Body")],
+            vec![(MISSING_FIELD, "source"), (MISSING_FIELD, "sink")],
         ),
         (
             "a mapping declaring no pipeline section",
             "version: \"2\"\ntags:\n  owner: team\n".to_string(),
-            vec![(VALIDATION_ERROR, "Configuration.Body")],
+            vec![
+                (UNKNOWN_PROPERTY, "path"),
+                (MISSING_FIELD, "source"),
+                (MISSING_FIELD, "sink"),
+            ],
         ),
         (
             "a top-level pipeline with no source",
             "processor:\n  - parse_json: {}\nsink:\n  - cloudwatch_logs: {}\n".to_string(),
-            vec![(VALIDATION_ERROR, "source")],
+            vec![(MISSING_FIELD, "source")],
         ),
         (
             "a top-level pipeline with no sink",
             "source:\n  http: {}\nprocessor:\n  - parse_json: {}\n".to_string(),
-            vec![(VALIDATION_ERROR, "sink")],
+            vec![(MISSING_FIELD, "sink")],
         ),
         (
             "a named section with neither a source nor a sink",
             "log-pipeline:\n  processor:\n    - parse_json: {}\n".to_string(),
-            vec![(VALIDATION_ERROR, "sink"), (VALIDATION_ERROR, "source")],
+            vec![(MISSING_FIELD, "sink"), (MISSING_FIELD, "source")],
         ),
         (
             "a section naming two sources",
@@ -382,12 +393,12 @@ async fn every_defect_of_a_document_is_reported_against_its_field() {
         (
             "a processor this emulator does not run",
             top_level("processor:\n  - grok:\n      match: \"%{COMMONAPACHELOG}\"\n"),
-            vec![(UNSUPPORTED_PROCESSOR, "processor")],
+            vec![(UNSUPPORTED_PROCESSOR, "path")],
         ),
         (
             "an option the processor does not take",
             top_level("processor:\n  - csv:\n      delete_source: true\n"),
-            vec![(UNSUPPORTED_PROCESSOR, "processor")],
+            vec![(UNSUPPORTED_PROCESSOR, "path")],
         ),
         (
             "an entry naming two processors at once",
@@ -433,7 +444,7 @@ async fn every_defect_of_a_document_is_reported_against_its_field() {
         (
             "a section with a processor defect AND no sink",
             "source:\n  http: {}\nprocessor:\n  - grok: {}\n".to_string(),
-            vec![(UNSUPPORTED_PROCESSOR, "processor"), (VALIDATION_ERROR, "sink")],
+            vec![(UNSUPPORTED_PROCESSOR, "path"), (MISSING_FIELD, "sink")],
         ),
         (
             "a role ARN that is not an ARN at all",

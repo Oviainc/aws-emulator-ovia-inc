@@ -26,6 +26,9 @@ mod s3_table_integrations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/success_response_projection.rs"]
+mod success_response_projection;
+
 #[path = "all/telemetry_feature_status.rs"]
 mod telemetry_feature_status;
 

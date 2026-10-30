@@ -369,8 +369,8 @@ async fn a_next_token_this_operation_did_not_issue_is_refused() {
 
     // The rows differ along the ways a token can fail to carry an id this service mints:
     // not hex at all, hex that is not UTF-8, hex of free text, hex of an ARN rather than
-    // the id inside it, a UUID with a group of the wrong width, a UUID in upper case, and
-    // the issued token with one hex digit dropped.
+    // the id inside it, an id one digit short, an id in upper case, and the issued token
+    // with one hex digit dropped.
     let rows: Vec<(&str, String)> = vec![
         ("not hex at all", "not-a-token".to_string()),
         ("hex that is not UTF-8", "ff".to_string()),
@@ -383,13 +383,10 @@ async fn a_next_token_this_operation_did_not_issue_is_refused() {
             hex::encode(s3_table_integration_arn(HOME_REGION, "abc")),
         ),
         (
-            "hex of a UUID with a group of the wrong width",
-            hex::encode("ffffffff-ffff-4fff-8fff-fffffffffff"),
+            "hex of an id one digit short",
+            hex::encode("f".repeat(31)),
         ),
-        (
-            "hex of a UUID in upper case",
-            hex::encode("FFFFFFFF-FFFF-4FFF-8FFF-FFFFFFFFFFFF"),
-        ),
+        ("hex of an id in upper case", hex::encode("F".repeat(32))),
         (
             "the issued token with one hex digit dropped",
             issued[..issued.len() - 1].to_string(),
@@ -436,7 +433,7 @@ async fn a_next_token_this_operation_did_not_issue_is_refused() {
     let (page, next) = list(
         &emulator,
         HOME_REGION,
-        &json!({ "NextToken": hex::encode("ffffffff-ffff-4fff-8fff-ffffffffffff") }),
+        &json!({ "NextToken": hex::encode("f".repeat(32)) }),
         case,
     )
     .await;
@@ -537,13 +534,13 @@ async fn a_delete_of_an_arn_that_names_nothing_is_refused_and_retires_nothing() 
         ),
         (
             "an ARN of another account",
-            format!("arn:aws:observabilityadmin:{HOME_REGION}:000000000001:s3-table-integration/{id}"),
+            format!("arn:aws:observabilityadmin:{HOME_REGION}:000000000001:s3tableintegration/{id}"),
             HOME_REGION,
         ),
         (
             "an ARN of another partition",
             format!(
-                "arn:aws-us-gov:observabilityadmin:{HOME_REGION}:{ACCOUNT}:s3-table-integration/{id}"
+                "arn:aws-us-gov:observabilityadmin:{HOME_REGION}:{ACCOUNT}:s3tableintegration/{id}"
             ),
             HOME_REGION,
         ),
@@ -554,7 +551,7 @@ async fn a_delete_of_an_arn_that_names_nothing_is_refused_and_retires_nothing() 
         ),
         (
             "an id nothing was created under",
-            s3_table_integration_arn(HOME_REGION, "ffffffff-ffff-4fff-8fff-ffffffffffff"),
+            s3_table_integration_arn(HOME_REGION, &"f".repeat(32)),
             HOME_REGION,
         ),
     ];

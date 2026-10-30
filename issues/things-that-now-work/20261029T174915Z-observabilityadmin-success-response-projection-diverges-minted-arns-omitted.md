@@ -97,3 +97,41 @@ Cause 8: ListTelemetryRules, expected $.TelemetryRuleSummaries[0] to include Tel
 6. Cause 5: fixture observabilityadmin-telemetry-pipeline-workflow, step task#3 — ValidateTelemetryPipelineConfiguration with per-source processor restrictions; same comparison.
 7. Cause 6: fixture observabilityadmin-telemetry-pipeline-workflow, step task#5 — GetTelemetryPipeline after a successful create; check Pipeline.ConfigurationSummary / StatusReason / Tags.
 8. Causes 7 and 8: fixture observabilityadmin-telemetry-rule-lifecycle, steps task#4 (and task#9) and task#5 — create a rule with TelemetrySourceTypes, then GetTelemetryRule and ListTelemetryRules and check TelemetrySourceTypes.
+
+## Resolution
+
+Causes 1, 2, 3, 7 and 8 are FIXED, and so are cause 6's `Pipeline.StatusReason` and
+`Pipeline.Tags`: the enrichment-lifecycle and telemetry-rule-lifecycle units replay
+clean, and neither minted ARN nor either projected pipeline member is among the
+remaining divergences.
+
+Three parts are NOT reproduced byte-for-byte, deliberately, and are recorded here so a
+later reader is not told they work:
+
+* **Cause 4 is implemented but not byte-identical.** The validator now answers the
+  recorded vocabulary and wording, and the recorded `UNKNOWN_PROPERTY` entry of fixture
+  observabilityadmin-telemetry-pipeline-error-paths step task#6 (message plus
+  `FieldMap {'path': 'root'}`) is reproduced exactly. That step's remaining divergence is
+  its `$.Errors[0]`, the recorded `MISSING_FIELD` entry: which property the real
+  service's pipeline schema REQUIRES at the document's root, and what its `FieldMap`
+  value carries, are schema facts the Smithy model does not state (the issue's own
+  evidence redacts both as `'<name>'` and `...`). The emulator reports the properties the
+  pipeline format requires of a section (`source`, `sink`), at the path they were
+  expected, rather than guessing the recorded one.
+* **Cause 5** (`ValidateTelemetryPipelineConfiguration`, fixture
+  observabilityadmin-telemetry-pipeline-workflow step task#3) still diverges. Cause 4's
+  vocabulary and wording ARE implemented — the validator now reports one error per
+  schema problem — but the nine recorded entries of
+  this step are per-`(source_type, data_source_name)` `DATA_SOURCE_PROCESSOR_RESTRICTED`
+  entries whose facts are an ALLOWED-PROCESSOR catalog. That catalog is data the real
+  service ships: it is not in this service's Smithy model (the operation's whole closure
+  exposes only `ValidationError{Message,Reason,FieldMap}`) and no configuration document
+  the caller sends states it, so reproducing those nine entries would mean writing a
+  table fitted to the recording rather than a rule. It was left unwritten.
+* **Cause 6's `Pipeline.ConfigurationSummary`.**
+  `smithy_query(query="shape", shape="TelemetryPipeline")` shows the shape
+  `GetTelemetryPipelineOutput$Pipeline` targets carries no `ConfigurationSummary`
+  member — the member is modelled on `TelemetryPipelineSummary`, the LISTING shape,
+  only — and projection here is schema-driven, so the emulator cannot carry it on this
+  shape. Its one modelled home is `ListTelemetryPipelines`, still a scaffold stub with
+  its own issue.

@@ -482,7 +482,11 @@ async fn a_summary_reports_the_stored_rule_body() {
 #[tokio::test]
 async fn a_second_create_of_one_name_conflicts_and_changes_nothing() {
     let emulator = emulator();
-    let first = json!({ "ResourceType": "AWS::EC2::VPC", "TelemetryType": "Logs" });
+    let first = json!({
+        "ResourceType": "AWS::EC2::VPC",
+        "TelemetryType": "Logs",
+        "TelemetrySourceTypes": ["VPC_FLOW_LOGS"],
+    });
     let (status, _) = create(
         &emulator,
         HOME_REGION,
@@ -1097,7 +1101,11 @@ async fn one_name_in_two_regions_is_two_rules() {
     let rows: Vec<(&str, Value)> = vec![
         (
             HOME_REGION,
-            json!({ "ResourceType": "AWS::EC2::VPC", "TelemetryType": "Logs" }),
+            json!({
+                "ResourceType": "AWS::EC2::VPC",
+                "TelemetryType": "Logs",
+                "TelemetrySourceTypes": ["VPC_FLOW_LOGS"],
+            }),
         ),
         (
             "eu-west-1",
@@ -1263,6 +1271,7 @@ async fn a_multi_region_rule_is_pending_in_its_spokes_until_the_fan_out_comes_du
     let rule = json!({
         "ResourceType": "AWS::EC2::VPC",
         "TelemetryType": "Logs",
+        "TelemetrySourceTypes": ["VPC_FLOW_LOGS"],
         "Regions": spokes,
     });
     let (status, created) = create(

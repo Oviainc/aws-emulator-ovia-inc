@@ -33,9 +33,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_observabilityadmin_observabilityadmin::ops::types::INTEGRATION_STATUS_VALUES;
 use service_com_amazonaws_observabilityadmin_observabilityadmin::state::{
-    s3_table_integration_arn, table_bucket_arn, ComAmazonawsObservabilityadminObservabilityadminState,
-    StoredS3TableIntegration, INTEGRATION_STATUS_ACTIVE,
-    MAX_STORED_S3_TABLE_INTEGRATION_RECORDS, TABLE_BUCKET_NAME_PREFIX,
+    is_minted_resource_id, s3_table_integration_arn, table_bucket_arn,
+    ComAmazonawsObservabilityadminObservabilityadminState, StoredS3TableIntegration,
+    INTEGRATION_STATUS_ACTIVE, MAX_STORED_S3_TABLE_INTEGRATION_RECORDS, TABLE_BUCKET_NAME_PREFIX,
 };
 
 use crate::telemetry_rules::{call, emulator, error_code, Emulator, ACCOUNT};
@@ -84,17 +84,6 @@ fn stored_count(emulator: &Emulator) -> usize {
         .lock()
         .s3_table_integrations
         .len()
-}
-
-/// Whether `id` has the canonical hyphenated UUID form (8-4-4-4-12 lowercase hex)
-/// the service mints an integration id in.
-fn is_uuid(id: &str) -> bool {
-    let groups: Vec<&str> = id.split('-').collect();
-    groups.len() == 5
-        && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
-        && groups
-            .iter()
-            .all(|group| group.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()))
 }
 
 /// Every encryption configuration and role ARN the model admits, differing along what
@@ -176,14 +165,17 @@ async fn a_create_persists_the_integration_a_read_reports() {
             .unwrap_or("<no id>")
             .to_string();
         assert!(
-            is_uuid(&id),
-            "case {case:?}: expected the minted id to be a hyphenated UUID, got {id:?}"
+            // The service's own predicate, so the test cannot drift from the site
+            // that mints the id.
+            is_minted_resource_id(&id),
+            "case {case:?}: expected the minted id to be an opaque hexadecimal token, \
+             got {id:?}"
         );
         assert_eq!(
             arn,
             s3_table_integration_arn(HOME_REGION, &id),
             "case {case:?}: expected \
-             arn:aws:observabilityadmin:{HOME_REGION}:{ACCOUNT}:s3-table-integration/<id>, \
+             arn:aws:observabilityadmin:{HOME_REGION}:{ACCOUNT}:s3tableintegration/<id>, \
              got {arn:?}"
         );
         assert!(
@@ -333,17 +325,17 @@ async fn an_arn_that_names_no_stored_integration_is_a_404() {
         ),
         (
             "an ARN naming an id nothing was created under",
-            s3_table_integration_arn(HOME_REGION, "ffffffff-ffff-4fff-8fff-ffffffffffff"),
+            s3_table_integration_arn(HOME_REGION, &"f".repeat(32)),
             HOME_REGION,
         ),
         (
             "an ARN of another account",
-            format!("arn:aws:observabilityadmin:{HOME_REGION}:000000000001:s3-table-integration/{id}"),
+            format!("arn:aws:observabilityadmin:{HOME_REGION}:000000000001:s3tableintegration/{id}"),
             HOME_REGION,
         ),
         (
             "an ARN of another partition",
-            format!("arn:aws-us-gov:observabilityadmin:{HOME_REGION}:{ACCOUNT}:s3-table-integration/{id}"),
+            format!("arn:aws-us-gov:observabilityadmin:{HOME_REGION}:{ACCOUNT}:s3tableintegration/{id}"),
             HOME_REGION,
         ),
         (

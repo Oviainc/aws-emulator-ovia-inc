@@ -149,8 +149,7 @@ async fn a_read_of_a_missing_resource_reports_the_services_own_sentence() {
     // which of the identifier forms the request carries (a bare name, the full ARN,
     // an ARN of another region or another account), how long the name is and which
     // of the characters the identifier's pattern admits it uses.
-    let unknown_integration =
-        s3_table_integration_arn(HOME_REGION, "ffffffff-ffff-4fff-8fff-ffffffffffff");
+    let unknown_integration = s3_table_integration_arn(HOME_REGION, &"f".repeat(32));
     let rows: Vec<(&str, &str, String, &str, &str)> = vec![
         (
             "a rule name nothing was created under",
@@ -233,8 +232,8 @@ async fn a_read_of_a_missing_resource_reports_the_services_own_sentence() {
             "an integration ARN of another account",
             "/GetS3TableIntegration",
             format!(
-                "arn:aws:observabilityadmin:{HOME_REGION}:000000000001:s3-table-integration/\
-                 ffffffff-ffff-4fff-8fff-ffffffffffff"
+                "arn:aws:observabilityadmin:{HOME_REGION}:000000000001:s3tableintegration/\
+                 ffffffffffffffffffffffffffffffff"
             ),
             "Integration not found",
             "Integration",

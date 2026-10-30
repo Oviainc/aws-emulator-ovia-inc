@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let rule_arn = store.replace_rule(&key, input.rule, now);
+        let rule_arn = store.replace_rule(&key, crate::state::recorded_rule(input.rule), now);
 
         Ok(UpdateTelemetryRuleOutput { rule_arn })
     }

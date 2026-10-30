@@ -900,12 +900,19 @@ fn compile_chain(chain: &[(&str, &Node)]) -> Result<Vec<Step>, String> {
         .collect()
 }
 
-/// Whether every processor of `chain` is one this emulator runs, with options it
-/// takes: the compiled chain itself is this operation's business, so a caller that
-/// only wants the DEFECT — `ValidateTelemetryPipelineConfiguration`, which reports it
-/// instead of refusing the request — gets the refusal text and nothing else.
-pub(crate) fn chain_defect(chain: &[(&str, &Node)]) -> Result<(), String> {
-    compile_chain(chain).map(|_| ())
+/// Whether the processor `name` with `options` is one this emulator runs, with options
+/// it takes, and the refusal text when it is not.
+///
+/// `ValidateTelemetryPipelineConfiguration` reports that refusal per POSITION of a
+/// document's processor sequence instead of refusing the request, and asks this rather
+/// than keeping a second copy of the catalogue [`compile_step`] reads.
+///
+/// `patterns` is the compiled-pattern count the caller carries across the whole
+/// request, so the automata ONE request holds stay bounded by
+/// [`MAX_COMPILED_PATTERNS`] however the document spreads its processors over the
+/// positions and sections it declares.
+pub(crate) fn step_defect(name: &str, options: &Node, patterns: &mut usize) -> Result<(), String> {
+    compile_step(name, options, patterns).map(|_| ())
 }
 
 fn compile_step(name: &str, options: &Node, patterns: &mut usize) -> Result<Step, String> {

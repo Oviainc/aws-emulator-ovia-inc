@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 region: region.clone(),
                 rule_arn: rule_arn.clone(),
                 replication_targets,
-                rule: ::std::sync::Arc::new(input.rule),
+                rule: ::std::sync::Arc::new(crate::state::recorded_rule(input.rule)),
                 created_timestamp_ms: created_at,
                 last_update_timestamp_ms: created_at,
                 home_region: region,
