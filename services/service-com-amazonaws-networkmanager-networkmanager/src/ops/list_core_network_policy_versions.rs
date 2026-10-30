@@ -164,12 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .policy_version_entries(now);
         drop(store);
 
-        // A token this service did not mint names no position in the history, so it is
+        // A token this listing did not mint names no position in the history, so it is
         // refused on the member rather than answered with an empty page — the refusal every
         // other paginated listing of this service gives it.
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
-                crate::state::decode_page_token_or_reject(token)
+                crate::state::decode_page_token_or_reject(Self::NAME, token)
                     .map_err(ListCoreNetworkPolicyVersionsErrorModeled::ValidationException)?,
             ),
             None => None,
@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A core network that holds no version at all is answered with an EMPTY list rather
         // than a refusal: the core network the path names exists, and an empty history is
         // what this listing then reports.
-        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        let page = crate::state::paginate(Self::NAME, entries, after.as_deref(), input.max_results);
         Ok(ListCoreNetworkPolicyVersionsOutput {
             core_network_policy_versions: Some(page.items),
             next_token: page.next_token,

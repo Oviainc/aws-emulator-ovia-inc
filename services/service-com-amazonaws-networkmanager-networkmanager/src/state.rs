@@ -8950,57 +8950,93 @@ pub struct Page<T> {
 /// something else (or a truncated one) is recognised as unparseable.
 const PAGE_TOKEN_PREFIX: &str = "networkmanager:";
 
-/// Encode the continuation token that resumes AFTER `last_key`.
+/// What separates the listing a token belongs to from the key offset it names inside that
+/// listing. A listing is named by its operation name, which carries no `:`, so the FIRST
+/// `:` after the listing name ends it and everything beyond it is the key — however many
+/// of these the key itself holds.
+const PAGE_TOKEN_LISTING_SEPARATOR: char = ':';
+
+/// Encode the continuation token that resumes `listing` AFTER `last_key`.
 ///
 /// The token is opaque to the caller: hex of a prefixed key offset into the relevant
 /// `BTreeMap`, which is why the listing map is ordered. Hex, so the token survives the
 /// query string a `NextToken` travels back in (`@httpQuery("nextToken")`) unescaped,
 /// whatever the key holds.
-fn encode_page_token(last_key: &str) -> String {
-    hex::encode(format!("{PAGE_TOKEN_PREFIX}{last_key}"))
+///
+/// `listing` is the listing the token names a position IN — each paginated operation passes
+/// its own operation name — because a key offset only means anything in the key space that
+/// produced it: an attachment id names no position among site ids, and a zero-padded
+/// version number names none among either. Carrying the listing in the token is what lets
+/// [`decode_page_token`] tell a token of THIS listing from one of another.
+fn encode_page_token(listing: &str, last_key: &str) -> String {
+    hex::encode(format!(
+        "{PAGE_TOKEN_PREFIX}{listing}{PAGE_TOKEN_LISTING_SEPARATOR}{last_key}"
+    ))
 }
 
-/// Decode a continuation token minted by [`encode_page_token`], or `None` when the token
-/// is not one this service produced — the caller answers that with a `ValidationException`.
+/// Decode a continuation token minted by [`encode_page_token`] FOR `listing`, or `None`
+/// when the token is not one this service produced for that listing — the caller answers
+/// that with a `ValidationException`.
 ///
 /// Only the ONE spelling [`encode_page_token`] writes for a position names that position: a
-/// token is accepted only when it is byte-identical to the token this service would mint
+/// token is accepted only when it is byte-identical to the token this listing would mint
 /// for the key it decodes to. `hex::decode` is laxer than `hex::encode` — it reads
 /// `A-F` as well as the `a-f` the minter emits — so without that check a re-cased copy of a
 /// token, a string no response of this service ever carried, would resume a listing.
-pub fn decode_page_token(token: &str) -> Option<String> {
+///
+/// A token minted by a DIFFERENT listing is rejected here too, rather than resolved against
+/// a key space it names no position in: the keys of one listing sort arbitrarily against
+/// another's, so such a token would otherwise be answered with an empty page (when no key of
+/// this listing sorts after it) or with this listing's first page again (when every key
+/// does), both of them silent.
+pub fn decode_page_token(listing: &str, token: &str) -> Option<String> {
     let text = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    let last_key = text.strip_prefix(PAGE_TOKEN_PREFIX)?;
-    (encode_page_token(last_key) == token).then(|| last_key.to_string())
+    let last_key = text
+        .strip_prefix(PAGE_TOKEN_PREFIX)?
+        .strip_prefix(listing)?
+        .strip_prefix(PAGE_TOKEN_LISTING_SEPARATOR)?;
+    (encode_page_token(listing, last_key) == token).then(|| last_key.to_string())
 }
 
 /// Decode a continuation token with [`decode_page_token`], or answer the ONE refusal every
-/// paginated listing of this service gives for a token it did not mint.
+/// paginated listing of this service gives for a token it did not mint — whether no listing
+/// of this service minted it or another one did.
 ///
 /// A request carrying such a token was itself read perfectly well — it is the value of the
-/// single input member `NextToken` that names no position in the listing — so the refusal
+/// single input member `NextToken` that names no position in the listing, which is what the
+/// refusal says, whether the token came from another listing of this service or from
+/// nowhere this service minted — so the refusal
 /// is the member failure [`REASON_FIELD_VALIDATION_FAILED`], naming [`FIELD_NEXT_TOKEN`]
 /// in `Fields`, and not [`REASON_CANNOT_PARSE`], which this service answers only where the
 /// TEXT it was handed could not be read at all (a resource policy document that is no
 /// JSON: [`validate_resource_policy_document`]). Stated once here so no listing of this
 /// service can answer another `Reason`, or another `Fields` entry, for the same input.
-pub fn decode_page_token_or_reject(token: &str) -> Result<String, ValidationException> {
-    decode_page_token(token).ok_or_else(|| ValidationException {
-        message: "NextToken is not a token this service issued".to_string(),
+pub fn decode_page_token_or_reject(
+    listing: &str,
+    token: &str,
+) -> Result<String, ValidationException> {
+    decode_page_token(listing, token).ok_or_else(|| ValidationException {
+        message: "NextToken does not name a position in this listing".to_string(),
         reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
         fields: Some(vec![ValidationExceptionField {
             name: FIELD_NEXT_TOKEN.to_string(),
-            message: "the token could not be parsed".to_string(),
+            message: "the token names no position in this listing".to_string(),
         }]),
     })
 }
 
-/// Take one page of `entries` (which must be sorted by key) starting after `after`.
+/// Take one page of `listing`'s `entries` (which must be sorted by key) starting after
+/// `after`.
 ///
 /// `max_results` is the caller's page size; absent means "every remaining item". A
 /// `next_token` is emitted only when items remain after this page, so a client that
 /// follows tokens sees every item exactly once.
+///
+/// `listing` is the same listing name the `after` key was decoded with
+/// ([`decode_page_token_or_reject`]): the token minted here names a position in THIS
+/// listing's key space, so only this listing accepts it back.
 pub fn paginate<T>(
+    listing: &str,
     entries: Vec<(String, T)>,
     after: Option<&str>,
     max_results: Option<i32>,
@@ -9022,7 +9058,7 @@ pub fn paginate<T>(
     let next_token = if end < entries.len() {
         entries
             .get(end.saturating_sub(1))
-            .map(|(key, _)| encode_page_token(key))
+            .map(|(key, _)| encode_page_token(listing, key))
     } else {
         None
     };

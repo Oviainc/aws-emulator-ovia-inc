@@ -160,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
-                crate::state::decode_page_token_or_reject(token)
+                crate::state::decode_page_token_or_reject(Self::NAME, token)
                     .map_err(GetSitesErrorModeled::ValidationException)?,
             ),
             None => None,
@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         drop(store);
 
-        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        let page = crate::state::paginate(Self::NAME, entries, after.as_deref(), input.max_results);
         Ok(GetSitesOutput {
             sites: Some(page.items),
             next_token: page.next_token,

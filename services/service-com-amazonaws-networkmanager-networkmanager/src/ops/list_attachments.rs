@@ -158,11 +158,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        // A token this service did not mint names no position in the listing, so it is
-        // refused on the member rather than answered with an empty page.
+        // A token this listing did not mint names no position in it, so it is refused on
+        // the member rather than answered with an empty page: the token carries the listing
+        // that minted it, which is this operation's name.
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
-                crate::state::decode_page_token_or_reject(token)
+                crate::state::decode_page_token_or_reject(Self::NAME, token)
                     .map_err(ListAttachmentsErrorModeled::ValidationException)?,
             ),
             None => None,
@@ -211,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting an attachment never writes: its state and the instant it last changed
         // are a function of the stored record and the clock, so this read leaves the store
         // exactly as the next caller would have found it.
-        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        let page = crate::state::paginate(Self::NAME, entries, after.as_deref(), input.max_results);
         Ok(ListAttachmentsOutput {
             attachments: Some(page.items),
             next_token: page.next_token,

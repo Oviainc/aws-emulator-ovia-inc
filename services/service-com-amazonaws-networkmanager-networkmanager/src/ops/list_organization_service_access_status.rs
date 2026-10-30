@@ -155,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // first one — it is read as "no token" rather than refused.
         let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
             Some(token) => Some(
-                crate::state::decode_page_token_or_reject(token).map_err(
+                crate::state::decode_page_token_or_reject(Self::NAME, token).map_err(
                     ListOrganizationServiceAccessStatusErrorModeled::ValidationException,
                 )?,
             ),
@@ -185,6 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MaxResults`, the page is that whole at-most-one-entry list. This read writes
         // nothing.
         let page = crate::state::paginate(
+            Self::NAME,
             record.account_statuses_at(now),
             after.as_deref(),
             input.max_results,

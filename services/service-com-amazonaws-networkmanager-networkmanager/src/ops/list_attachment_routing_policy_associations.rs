@@ -179,11 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A token this service did not mint names no position in the listing, so it is
+        // A token this listing did not mint names no position in it, so it is
         // refused on the member rather than answered with an empty page.
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
-                crate::state::decode_page_token_or_reject(token).map_err(
+                crate::state::decode_page_token_or_reject(Self::NAME, token).map_err(
                     ListAttachmentRoutingPolicyAssociationsErrorModeled::ValidationException,
                 )?,
             ),
@@ -219,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         drop(store);
 
-        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        let page = crate::state::paginate(Self::NAME, entries, after.as_deref(), input.max_results);
         Ok(ListAttachmentRoutingPolicyAssociationsOutput {
             attachment_routing_policy_associations: Some(page.items),
             next_token: page.next_token,

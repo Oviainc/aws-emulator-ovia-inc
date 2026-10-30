@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
-                crate::state::decode_page_token_or_reject(token).map_err(
+                crate::state::decode_page_token_or_reject(Self::NAME, token).map_err(
                     GetTransitGatewayConnectPeerAssociationsErrorModeled::ValidationException,
                 )?,
             ),
@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         drop(store);
 
-        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        let page = crate::state::paginate(Self::NAME, entries, after.as_deref(), input.max_results);
         Ok(GetTransitGatewayConnectPeerAssociationsOutput {
             transit_gateway_connect_peer_associations: Some(page.items),
             next_token: page.next_token,

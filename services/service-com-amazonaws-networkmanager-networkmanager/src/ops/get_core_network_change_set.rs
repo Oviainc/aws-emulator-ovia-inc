@@ -192,11 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let changes = version.change_set();
         drop(store);
 
-        // A continuation token this service did not mint names no page, so it is refused
+        // A continuation token this listing did not mint names no page, so it is refused
         // as the field failure it is rather than answered with an empty change set.
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
-                crate::state::decode_page_token_or_reject(token)
+                crate::state::decode_page_token_or_reject(Self::NAME, token)
                     .map_err(GetCoreNetworkChangeSetErrorModeled::ValidationException)?,
             ),
             None => None,
@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The changes are keyed by `IdentifierPath`, which "uniquely identifies the path
         // for a change within the changeset", so a page resumes after the last path it
         // carried — the same key `GetCoreNetworkChangeEvents` pages the same changes by.
-        let page = crate::state::paginate(changes, after.as_deref(), input.max_results);
+        let page = crate::state::paginate(Self::NAME, changes, after.as_deref(), input.max_results);
         Ok(GetCoreNetworkChangeSetOutput {
             core_network_changes: Some(page.items),
             next_token: page.next_token,
