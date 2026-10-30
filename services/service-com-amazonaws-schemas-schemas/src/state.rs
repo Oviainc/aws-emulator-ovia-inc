@@ -1792,6 +1792,13 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
         "AWS API Call Via CloudTrail",
         "AWSAPICallViaCloudTrail",
     ),
+    // `aws.b2bi` publishes the acknowledgement event of its own BESIDE the
+    // CloudTrail-delivered family [`AWS_EVENT_SOURCES`] carries for it.
+    ManagedEventType::identified(
+        "aws.b2bi",
+        "Acknowledgement Completed",
+        "AcknowledgementCompleted",
+    ),
     ManagedEventType::identified(
         "aws.cleanrooms",
         "Analysis Template Created",
@@ -1836,6 +1843,79 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
         "aws.deadline",
         "Step Run Status Change",
         "StepRunStatusChange",
+    ),
+    // The fleet event types `aws.ec2fleet` publishes: the five an EC2 Fleet delivers
+    // and the five a Spot Fleet delivers, both under this one source. It publishes
+    // nothing of the CloudTrail-delivered family, which is why it is absent from
+    // [`AWS_EVENT_SOURCES`].
+    ManagedEventType::identified("aws.ec2fleet", "EC2 Fleet Error", "EC2FleetError"),
+    ManagedEventType::identified(
+        "aws.ec2fleet",
+        "EC2 Fleet Information",
+        "EC2FleetInformation",
+    ),
+    ManagedEventType::identified(
+        "aws.ec2fleet",
+        "EC2 Fleet Instance Change",
+        "EC2FleetInstanceChange",
+    ),
+    ManagedEventType::identified(
+        "aws.ec2fleet",
+        "EC2 Fleet Spot Instance Request Change",
+        "EC2FleetSpotInstanceRequestChange",
+    ),
+    ManagedEventType::identified(
+        "aws.ec2fleet",
+        "EC2 Fleet State Change",
+        "EC2FleetStateChange",
+    ),
+    ManagedEventType::identified("aws.ec2fleet", "EC2 Spot Fleet Error", "EC2SpotFleetError"),
+    ManagedEventType::identified(
+        "aws.ec2fleet",
+        "EC2 Spot Fleet Information",
+        "EC2SpotFleetInformation",
+    ),
+    ManagedEventType::identified(
+        "aws.ec2fleet",
+        "EC2 Spot Fleet Instance Change",
+        "EC2SpotFleetInstanceChange",
+    ),
+    ManagedEventType::identified(
+        "aws.ec2fleet",
+        "EC2 Spot Fleet Spot Instance Request Change",
+        "EC2SpotFleetSpotInstanceRequestChange",
+    ),
+    ManagedEventType::identified(
+        "aws.ec2fleet",
+        "EC2 Spot Fleet State Change",
+        "EC2SpotFleetStateChange",
+    ),
+    // `aws.epfs` publishes the job and session lifecycle event types below and nothing
+    // of the CloudTrail-delivered family.
+    ManagedEventType::identified(
+        "aws.epfs",
+        "Node Identification Job State Changed",
+        "NodeIdentificationJobStateChanged",
+    ),
+    ManagedEventType::identified(
+        "aws.epfs",
+        "Power Flow Job State Changed",
+        "PowerFlowJobStateChanged",
+    ),
+    ManagedEventType::identified(
+        "aws.epfs",
+        "Power Flow Node Job State Changed",
+        "PowerFlowNodeJobStateChanged",
+    ),
+    ManagedEventType::identified(
+        "aws.epfs",
+        "Session State Changed",
+        "SessionStateChanged",
+    ),
+    ManagedEventType::identified(
+        "aws.epfs",
+        "Subsystem Analysis Job State Changed",
+        "SubsystemAnalysisJobStateChanged",
     ),
     ManagedEventType::identified(
         "aws.events",
@@ -1897,6 +1977,69 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
     // scheduled event ([`AWS_SERVICE_EVENT_TYPES`] above, which carries a document)
     // and the one whose payload is JSON.
     ManagedEventType::identified("aws.events", "Scheduled Json", "ScheduledJson"),
+    // `aws.factstore` publishes one event type of its own and nothing of the
+    // CloudTrail-delivered family.
+    ManagedEventType::identified("aws.factstore", "New Commit Pushed", "NewCommitPushed"),
+    // The event types `aws.glue-autodebug` publishes — the auto-version job lifecycle,
+    // the data-quality results and the metering event — and nothing of the
+    // CloudTrail-delivered family. The entries whose published names run words
+    // together carry the `detail-type` they were published under, spelling for
+    // spelling: the catalogue derives the name from the detail-type by taking the
+    // spaces out, so the name is what fixes the spelling of each word.
+    ManagedEventType::identified(
+        "aws.glue-autodebug",
+        "Auto Version Job State Change",
+        "AutoVersionJobStateChange",
+    ),
+    ManagedEventType::identified(
+        "aws.glue-autodebug",
+        "Autodebug metadata key shared from Orca",
+        "AutodebugmetadatakeysharedfromOrca",
+    ),
+    ManagedEventType::identified(
+        "aws.glue-autodebug",
+        "Autoversion job run completed",
+        "Autoversionjobruncompleted",
+    ),
+    ManagedEventType::identified(
+        "aws.glue-autodebug",
+        "Autoversion job version updated",
+        "Autoversionjobversionupdated",
+    ),
+    ManagedEventType::identified(
+        "aws.glue-autodebug",
+        "Data Quality Evaluation Results Available",
+        "DataQualityEvaluationResultsAvailable",
+    ),
+    ManagedEventType::identified(
+        "aws.glue-autodebug",
+        "Data Quality Task State Change",
+        "DataQualityTaskStateChange",
+    ),
+    ManagedEventType::identified(
+        "aws.glue-autodebug",
+        "Entity Metering Event",
+        "EntityMeteringEvent",
+    ),
+    // `aws.goshawk` publishes these two repository event types and nothing of the
+    // CloudTrail-delivered family.
+    ManagedEventType::identified(
+        "aws.goshawk",
+        "CodeArtifact Package Version State Change",
+        "CodeArtifactPackageVersionStateChange",
+    ),
+    ManagedEventType::identified(
+        "aws.goshawk",
+        "Goshawk Repository State Change",
+        "GoshawkRepositoryStateChange",
+    ),
+    // The abuse event `aws.health` publishes beside its health event (above, which
+    // carries a document).
+    ManagedEventType::identified(
+        "aws.health",
+        "AWS Health Abuse Event",
+        "AWSHealthAbuseEvent",
+    ),
     // `aws.labs` and `aws.maester` publish their own event types and NOTHING of the
     // CloudTrail-delivered family, which is why neither is in [`AWS_EVENT_SOURCES`].
     ManagedEventType::identified("aws.labs", "Lab Auto Cancelled", "LabAutoCancelled"),
@@ -1975,6 +2118,8 @@ const MANAGED_VERSION_COUNTS: &[(&str, u64)] = &[
     ("aws.aidevops@InvestigationInProgress", 2),
     ("aws.aidevops@InvestigationLinked", 2),
     ("aws.aidevops@InvestigationPendingTriage", 2),
+    ("aws.b2bi@AcknowledgementCompleted", 2),
+    ("aws.health@AWSHealthAbuseEvent", 4),
     ("aws.tag@TagChangeOnResource", 4),
 ];
 
@@ -2243,6 +2388,7 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.auditmanager",
     "aws.autoscaling",
     "aws.autoscaling-plans",
+    "aws.b2bi",
     "aws.backup",
     "aws.backup-gateway",
     "aws.batch",
@@ -2253,6 +2399,8 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.ce",
     "aws.chatbot",
     "aws.chime",
+    "aws.chime-sdk-media-pipelines",
+    "aws.chime-sdk-voice",
     "aws.cleanrooms",
     "aws.cloud9",
     "aws.clouddirectory",
@@ -2320,6 +2468,7 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.events",
     "aws.evidently",
     "aws.finspace",
+    "aws.finspace-api",
     "aws.firehose",
     "aws.fis",
     "aws.fms",
@@ -2335,11 +2484,13 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.groundstation",
     "aws.guardduty",
     "aws.health",
+    "aws.health-agent",
     "aws.healthlake",
     "aws.iam",
     "aws.identitystore",
     "aws.imagebuilder",
     "aws.inspector",
+    "aws.inspector-scan",
     "aws.inspector2",
     "aws.iot",
     "aws.iot1click",
@@ -2347,6 +2498,7 @@ pub const AWS_EVENT_SOURCES: &[&str] = &[
     "aws.iotdeviceadvisor",
     "aws.iotevents",
     "aws.iotfleethub",
+    "aws.iotsecuredtunneling",
     "aws.iotsitewise",
     "aws.iottwinmaker",
     "aws.iotwireless",
@@ -2623,6 +2775,21 @@ const MANAGED_PUBLICATION_INSTANTS: &[(&str, &str)] = &[
         "aws.autoscaling@AWSAPICallViaCloudTrail",
         "2019-12-01T00:59:43Z",
     ),
+    // The EC2 Fleet entries, published together and each carrying the instant of that
+    // publication: an instant years before the rest of the source's entries, which no
+    // digest of a name yields.
+    ("aws.ec2fleet@EC2FleetError", "2020-12-17T18:43:39Z"),
+    ("aws.ec2fleet@EC2FleetInformation", "2020-12-17T18:43:39Z"),
+    (
+        "aws.ec2fleet@EC2FleetInstanceChange",
+        "2020-12-17T18:43:39Z",
+    ),
+    (
+        "aws.ec2fleet@EC2FleetSpotInstanceRequestChange",
+        "2020-12-17T18:43:39Z",
+    ),
+    ("aws.ec2fleet@EC2FleetStateChange", "2020-12-17T18:43:39Z"),
+    ("aws.health@AWSHealthAbuseEvent", "2026-03-12T21:12:29Z"),
     ("aws.tag@TagChangeOnResource", "2022-03-24T16:40:20Z"),
 ];
 
