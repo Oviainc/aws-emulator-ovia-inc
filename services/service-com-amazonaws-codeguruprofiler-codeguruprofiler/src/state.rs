@@ -2392,55 +2392,67 @@ pub struct ListPage<'a, T> {
 ///
 /// The cursor is this service's own opaque token: the INDEX into the listing at which
 /// the next page starts, which satisfies the modelled `PaginationToken` constraints
-/// (len 1..64, `^[\w-]+$`) for a listing of any length. Anything else — a token that
-/// does not read as an index, or one past the end of the listing — is a token this
-/// service never issued and is refused with [`UNISSUED_TOKEN_MESSAGE`]; an index at
-/// exactly the end is one it DOES issue (the page before it ended at the last element),
-/// so it answers a final empty page.
+/// (len 1..64, `^[\w-]+$`) for a listing of any length. A token is issued only while
+/// elements remain PAST the page it closes, so every index this service hands out names
+/// an element of the listing: a token that does not read as an index, and one at or past
+/// the end of the listing, are both tokens this service never issued and are refused
+/// with [`UNISSUED_TOKEN_MESSAGE`]. A request that names NO token starts at the
+/// beginning, which is the whole listing however short it is — including empty.
 ///
 /// Parsing the token is separate from cutting the page so each handler can refuse a
 /// malformed cursor BEFORE it resolves the resource the listing is about, the way it
 /// refuses the rest of its input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListCursor {
-    /// The position in the listing this page starts at; no `nextToken` means the first.
-    start: usize,
+    /// The position in the listing this page starts at, as the `nextToken` named it;
+    /// `None` when the request named no token, which starts at the beginning.
+    start: Option<usize>,
 }
 
 impl ListCursor {
     /// The cursor `next_token` names, or the message for a token that is not one of
     /// this service's — which repeats the offending token, since the caller sent it.
     pub fn parse(next_token: Option<&str>) -> Result<Self, String> {
-        let start = match next_token {
-            None => 0usize,
-            Some(token) => token
-                .parse::<usize>()
-                .map_err(|_| format!("{UNISSUED_TOKEN_MESSAGE}: {token}"))?,
-        };
+        let start = next_token
+            .map(|token| {
+                token
+                    .parse::<usize>()
+                    .map_err(|_| format!("{UNISSUED_TOKEN_MESSAGE}: {token}"))
+            })
+            .transpose()?;
         Ok(Self { start })
     }
 
     /// The page of `items` this cursor starts, at most `max_results` long, plus the
-    /// token to continue from; or the message for a cursor past the end of `items`.
+    /// token to continue from; or the message for a cursor this service never issued —
+    /// one at or past the end of `items`.
     ///
     /// Without `max_results` the page is [`DEFAULT_LIST_PAGE_SIZE`] long, so one
     /// unparameterised request cannot materialise a response that grows with the number
     /// of stored elements. The boundary validator has already held `max_results` to the
-    /// modelled range by the time a handler calls this.
+    /// modelled range by the time a handler calls this; a page of zero elements would
+    /// hand back a token forever, so a size below that range is floored at one rather
+    /// than silently paging nothing.
     pub fn page_of<'a, T>(
         self,
         items: &'a [T],
         max_results: Option<i32>,
     ) -> Result<ListPage<'a, T>, String> {
-        if self.start > items.len() {
-            return Err(UNISSUED_TOKEN_MESSAGE.to_string());
-        }
+        let start = match self.start {
+            // A token is only ever issued with elements still after it, so a cursor at
+            // or past the end of the listing is one this service never issued.
+            Some(start) if start >= items.len() => {
+                return Err(UNISSUED_TOKEN_MESSAGE.to_string());
+            }
+            Some(start) => start,
+            None => 0usize,
+        };
         let limit = max_results.map_or(DEFAULT_LIST_PAGE_SIZE, |max| {
-            usize::try_from(max).unwrap_or(0)
+            usize::try_from(max).unwrap_or(1).max(1)
         });
-        let end = self.start.saturating_add(limit).min(items.len());
+        let end = start.saturating_add(limit).min(items.len());
         Ok(ListPage {
-            items: items.get(self.start..end).unwrap_or_default(),
+            items: items.get(start..end).unwrap_or_default(),
             next_token: (end < items.len()).then(|| end.to_string()),
         })
     }

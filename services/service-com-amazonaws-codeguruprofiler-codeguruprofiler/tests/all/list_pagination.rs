@@ -8,18 +8,18 @@
 //! in the listing the next page starts at — so paging from no token to no token visits
 //! every element of the listing exactly once and in the listing's own order; a page holds
 //! at most `maxResults` elements, and the whole listing when the caller names no
-//! `maxResults`; the token is present only while elements remain past the page; a cursor
-//! at exactly the end of the listing is one the service issued, so it answers a final
-//! empty page; and a cursor the service could not have issued — one that is not a
-//! position, or one past the end — is refused with HTTP 400 and the listing's own
+//! `maxResults`; the token is present only while elements remain past the page; and a
+//! cursor the service could not have issued — one that is not a position, or one at or
+//! past the end of the listing — is refused with HTTP 400 and the listing's own
 //! client-input error code.
 //!
 //! The rows span the operations that share the rule (`ListProfilingGroups`,
 //! `ListFindingsReports` and `GetFindingsReportAccountSummary`, whose listings differ in
 //! length and in what they are listing), the page size (every size below the listing
 //! length, one equal to it, one far above it, and no page size at all) and the cursor
-//! (the first position, a middle one, exactly the end, past the end, and a token that
-//! names no position).
+//! (the first position, a middle one, the last one, exactly the end, past the end, and a
+//! token that names no position). [`crate::unissued_cursor`] carries the same cursor
+//! rule across EVERY listing of this service, `ListProfileTimes` included.
 
 use std::sync::Arc;
 
@@ -439,13 +439,6 @@ async fn every_listing_reads_a_cursor_the_same_way() {
                 (length - 1).to_string(),
                 whole[length - 1..].to_vec(),
             ),
-            (
-                // The page before it ended at the last element, so this is a cursor the
-                // service DID issue: it answers a final empty page.
-                "exactly the end of the listing".to_string(),
-                length.to_string(),
-                Vec::new(),
-            ),
         ];
 
         for (label, cursor, expected) in served {
@@ -473,6 +466,14 @@ async fn every_listing_reads_a_cursor_the_same_way() {
 
         // (label, the cursor, the sentence the refusal states)
         let refused: Vec<(String, String, String)> = vec![
+            (
+                // A token is only ever issued with elements still after it, so no page
+                // ever hands back the listing's length: a cursor there is one the
+                // service never issued, refused the way one past the end is.
+                "exactly the end of the listing".to_string(),
+                length.to_string(),
+                "nextToken is not a token this service issued".to_string(),
+            ),
             (
                 "one position past the end".to_string(),
                 (length + 1).to_string(),

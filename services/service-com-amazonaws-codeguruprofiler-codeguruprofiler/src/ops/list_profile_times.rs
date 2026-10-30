@@ -11,6 +11,10 @@
 //! reversed or zero-width pair is refused with the operation's own modelled
 //! `ValidationException` (HTTP 400) before anything is looked up.
 //!
+//! The page is cut by this service's one pagination rule
+//! ([`crate::state::ListCursor`]), the same one its group and report listings page by, so
+//! a `nextToken` gets the same answer whichever listing it is handed to.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -227,17 +231,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::instant_key(input.end_time),
         );
 
-        // The page token is this service's own opaque cursor: the index into the
-        // ordered profile-time list at which the next page starts. It satisfies the
-        // modelled `PaginationToken` constraints (len 1..64, `^[\w-]+$`).
-        let first = match input.next_token.as_deref() {
-            None => 0usize,
-            Some(token) => token.parse::<usize>().map_err(|_| {
-                ListProfileTimesErrorModeled::ValidationException(ValidationException {
-                    message: format!("nextToken is not a token this service issued: {token}"),
-                })
-            })?,
-        };
+        // The cursor into the ordered profile-time list, read before any lookup:
+        // [`crate::state::ListCursor`] holds this service's pagination rule for every
+        // listing, so profile times page exactly the way the group and report listings
+        // do.
+        let cursor = crate::state::ListCursor::parse(input.next_token.as_deref()).map_err(
+            |message| {
+                ListProfileTimesErrorModeled::ValidationException(ValidationException { message })
+            },
+        )?;
 
         let guard = state.lock();
         let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
@@ -264,37 +266,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             starts.reverse();
         }
 
-        // A cursor is only ever issued while entries remain after it, so a token at or
-        // past the end of the list is one this service never issued: it is refused
-        // rather than answered with an empty page. A request with NO token starts at 0,
-        // which is the whole list however short it is — including empty.
-        if input.next_token.is_some() && first >= starts.len() {
-            return Err(ListProfileTimesErrorModeled::ValidationException(
-                ValidationException {
-                    message: "nextToken is not a token this service issued".to_string(),
-                },
-            )
-            .into());
-        }
-        // Without `maxResults` the page is this service's default size, so one
-        // unparameterised request cannot materialise a response that grows with the
-        // number of aggregated profiles a group holds. A page of zero entries would
-        // hand back a token forever, so a `maxResults` the modelled range 1..1000
-        // already refuses before this handler runs is floored at one rather than
-        // silently paging nothing.
-        let limit = input.max_results.map_or(
-            crate::state::DEFAULT_LIST_PAGE_SIZE,
-            |max| usize::try_from(max).unwrap_or(1).max(1),
-        );
-        let last = first.saturating_add(limit).min(starts.len());
-        let page = starts.get(first..last).unwrap_or_default();
+        // The shared rule cuts the page and decides the continuation token: a cursor at
+        // or past the end of this list is one the service never issued and is refused
+        // here with this operation's own modelled `ValidationException` (400), and a
+        // request with no token gets the whole list however short it is — including
+        // empty — at most one page long.
+        let page = cursor
+            .page_of(&starts, input.max_results)
+            .map_err(|message| {
+                ListProfileTimesErrorModeled::ValidationException(ValidationException { message })
+            })?;
 
         Ok(ListProfileTimesOutput {
             profile_times: page
+                .items
                 .iter()
                 .map(|start| ProfileTime { start: Some(*start) })
                 .collect(),
-            next_token: (last < starts.len()).then(|| last.to_string()),
+            next_token: page.next_token,
         })
     }
 }

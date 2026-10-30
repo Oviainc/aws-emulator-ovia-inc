@@ -48,8 +48,9 @@ fn iso(at: i64) -> String {
 ///
 /// restJson1 carries a `Timestamp` member either as epoch seconds or in the ISO 8601
 /// form, depending on the member's `timestampFormat`; these cases are about WHICH
-/// instant is reported, so both renderings are read back the same way.
-fn profile_times(answer: &Answer) -> Vec<i64> {
+/// instant is reported, so both renderings are read back the same way. `pub(crate)` so
+/// every suite in this target reads a reported profile time one way.
+pub(crate) fn profile_times(answer: &Answer) -> Vec<i64> {
     let json = answer.json();
     let times = json
         .get("profileTimes")

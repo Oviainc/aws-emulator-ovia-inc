@@ -99,6 +99,8 @@ mod state_roundtrip;
 mod stored_profile_representation;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/unissued_cursor.rs"]
+mod unissued_cursor;
 #[path = "all/unknown_channel_refusal.rs"]
 mod unknown_channel_refusal;
 #[path = "all/untag_resource.rs"]

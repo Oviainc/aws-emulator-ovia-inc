@@ -588,10 +588,12 @@ async fn the_summary_refuses_what_it_cannot_answer() {
             "ValidationException",
         ),
         (
-            "a nextToken at exactly the end of the summary is one this service issued",
+            // A token is only ever issued with reports still after it, so a cursor at
+            // exactly the end of the summary is one this service never issued.
+            "a nextToken at exactly the end of the summary",
             "?maxResults=1&nextToken=5",
-            200,
-            "",
+            400,
+            "ValidationException",
         ),
     ];
 
