@@ -13,10 +13,14 @@
 // points it into `tests/all/`.
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/cluster_snapshot_listing.rs"]
+mod cluster_snapshot_listing;
 #[path = "all/error_resource_identity.rs"]
 mod error_resource_identity;
 #[path = "all/maintenance_and_restore.rs"]
 mod maintenance_and_restore;
+#[path = "all/not_found_wording.rs"]
+mod not_found_wording;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/resource_tags.rs"]

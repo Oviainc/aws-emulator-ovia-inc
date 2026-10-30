@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClusterSnapshots
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClusterSnapshots`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages over the stored cluster snapshots in `snapshotArn` order, narrowed to the
+//! source cluster `clusterArn` names and to the type `snapshotType` names when the
+//! request carries either; `maxResults` is the page size and `nextToken` an opaque
+//! cursor, absent on the last page.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClusterSnapshots::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation models no not-found error, so a filter naming a cluster this store
+//! does not hold selects no snapshot: that is an empty page, never a refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +155,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClusterSnapshots` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClusterSnapshotsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClusterSnapshots"))
+        use crate::state;
+
+        let _ = ctx;
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(ListClusterSnapshotsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: state::STORE_UNREACHABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The filter value is checked before anything is read: `snapshotType` is
+        // modelled as a plain String, so a value naming no snapshot type this service
+        // has is a bad request rather than a silently empty page.
+        let wanted_type = match input.snapshot_type.as_deref() {
+            None => None,
+            Some(value) => Some(
+                state::canonical_snapshot_type("snapshotType", value)
+                    .map_err(ListClusterSnapshotsErrorModeled::ValidationException)?,
+            ),
+        };
+        // The cursor names the key the next page starts at. A token this service did
+        // not issue is a bad request, not an empty page.
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(state::decode_page_token(token).ok_or_else(|| {
+                ListClusterSnapshotsErrorModeled::ValidationException(state::invalid_input(
+                    token,
+                    "NextToken must be a pagination token this service issued.",
+                ))
+            })?),
+        };
+        // `maxResults` is modelled range(20, 100), so the boundary validator has
+        // already refused anything outside it by the time this runs; a request naming
+        // none gets the largest page the member can ask for.
+        let page_size = input.max_results.unwrap_or(state::DEFAULT_PAGE_SIZE) as usize;
+
+        let mut guard = store.lock();
+        let mut snapshots = Vec::new();
+        let mut next_token = None;
+        let first = match start {
+            Some(key) => std::ops::Bound::Included(key),
+            None => std::ops::Bound::Unbounded,
+        };
+        for (snapshot_arn, record) in guard
+            .snapshots
+            .range_mut((first, std::ops::Bound::Unbounded))
+        {
+            if snapshots.len() == page_size {
+                // The next page resumes at this key and re-applies the filters, so a
+                // record a filter skips is neither lost nor listed twice.
+                next_token = Some(state::encode_page_token(snapshot_arn));
+                break;
+            }
+            if input
+                .cluster_arn
+                .as_deref()
+                .is_some_and(|wanted| wanted != record.cluster_arn)
+            {
+                continue;
+            }
+            if wanted_type
+                .as_deref()
+                .is_some_and(|wanted| wanted != record.snapshot_type)
+            {
+                continue;
+            }
+            // Reporting only: materialise the status move the clock already made due.
+            record.settle_due();
+            snapshots.push(record.as_snapshot_in_list());
+        }
+        drop(guard);
+
+        Ok(ListClusterSnapshotsOutput {
+            snapshots: Some(snapshots),
+            next_token,
+        })
     }
 }

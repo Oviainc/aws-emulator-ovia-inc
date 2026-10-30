@@ -9,9 +9,9 @@
 //! the only place a response body is built from.
 
 use crate::ops::types::{
-    Cluster, ClusterInList, ClusterSnapshot, ConflictException, PendingMaintenanceActionDetails,
-    ResourceNotFoundException, ResourcePendingMaintenanceAction, ServiceQuotaExceededException,
-    Shard, ValidationException,
+    Cluster, ClusterInList, ClusterSnapshot, ClusterSnapshotInList, ConflictException,
+    PendingMaintenanceActionDetails, ResourceNotFoundException, ResourcePendingMaintenanceAction,
+    ServiceQuotaExceededException, Shard, ValidationException, SNAPSHOT_TYPE_VALUES,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -327,6 +327,19 @@ impl SnapshotRecord {
             admin_user_name: self.admin_user_name.clone(),
             kms_key_id: self.kms_key_id.clone(),
             snapshot_type: Some(self.snapshot_type.clone()),
+        }
+    }
+
+    /// The summary form `ListClusterSnapshots` returns. Every member of
+    /// `ClusterSnapshotInList` is `@required`, so all five are populated from the
+    /// record.
+    pub fn as_snapshot_in_list(&self) -> ClusterSnapshotInList {
+        ClusterSnapshotInList {
+            snapshot_name: self.snapshot_name.clone(),
+            snapshot_arn: self.snapshot_arn.clone(),
+            cluster_arn: self.cluster_arn.clone(),
+            status: self.status.clone(),
+            snapshot_creation_time: self.snapshot_creation_time.clone(),
         }
     }
 }
@@ -917,6 +930,32 @@ pub fn validate_snapshot_name(member: &str, value: &str) -> Result<(), Validatio
             member_label(member)
         ),
     ))
+}
+
+/// The wire spelling of a `snapshotType` filter value, or a refusal when the value
+/// names no snapshot type this service has.
+///
+/// The member is modelled as a plain `String` while the type a record carries is the
+/// `SnapshotType` enum, and the documentation writes the two values in lowercase
+/// prose (`ListClusterSnapshotsInput$snapshotType`: "automated" / "manual") while the
+/// enum spells them uppercase — so the filter is matched case-insensitively and
+/// normalised onto the enum spelling the record holds. A value outside the documented
+/// set is a bad request rather than a silently empty page.
+pub fn canonical_snapshot_type(member: &str, value: &str) -> Result<String, ValidationException> {
+    SNAPSHOT_TYPE_VALUES
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(value))
+        .map(|known| (*known).to_string())
+        .ok_or_else(|| {
+            invalid_input(
+                value,
+                &format!(
+                    "{} must be one of {}.",
+                    member_label(member),
+                    SNAPSHOT_TYPE_VALUES.join(", ")
+                ),
+            )
+        })
 }
 
 /// Refuse a `kmsKeyId` longer than [`MAX_KMS_KEY_ID_LEN`].
