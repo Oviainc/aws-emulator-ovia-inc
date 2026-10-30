@@ -7,7 +7,9 @@
 //! A tag the caller may not set — a key or value outside AWS's tag character set, or a key
 //! carrying the reserved `aws:` prefix only AWS itself may use — is refused with
 //! `UnprocessableEntityException` (422) keyed by `tags`, leaving the resource's tag set
-//! exactly as it was.
+//! exactly as it was. That judgement needs nothing but the request, so it is made before
+//! the `ResourceArn` is resolved against the store: what a tag may say is one rule at
+//! every door that names a tag, and an unresolvable ARN does not turn it into a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // What the request's own tags SAY is decided from the request ALONE — the
+        // character set, the reserved `aws:` key prefix and the per-tag lengths depend on
+        // no stored record — so it is judged BEFORE the ARN is resolved, exactly as
+        // `UntagResource` judges the keys it names and as both creates judge their tag
+        // maps. One tag rule therefore answers one refusal at every door that names a
+        // tag, keyed by the member the request carried, whatever the store happens to
+        // hold. The count the request itself carries is judged here too: the set the
+        // resource would be left holding is never smaller than the request's own map.
+        crate::state::bound_tag_entries(input.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
+
         // The ARN resolves only to a resource this REGION holds whose own ARN it is, so
         // one naming another Region, account or partition writes nothing and reports
         // not-found instead of tagging this Region's resource of the same id.
@@ -197,14 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // What the resource would be LEFT holding is what the tag rules judge, and they
-        // judge it BEFORE anything is written: a tag set grows by one entry per distinct
-        // caller-chosen key and shrinks only on an explicit `UntagResource`, so the
-        // ceiling is what keeps its size from being decided by how many requests arrive.
-        // The same call judges what each key and value is allowed to SAY — the character
-        // set and the reserved `aws:` prefix — so a refused request leaves the stored tag
-        // set untouched. Judging the MERGED map is judging the request's own tags: every
-        // key already stored passed this very check on the way in.
+        // The only half of the tag rules the request cannot decide on its own is the
+        // ceiling, because it is about what the resource would be LEFT holding: a tag set
+        // grows by one entry per distinct caller-chosen key and shrinks only on an
+        // explicit `UntagResource`, so the ceiling is what keeps its size from being
+        // decided by how many requests arrive. It is judged BEFORE anything is written, so
+        // a refused request leaves the stored tag set untouched. What the merged map SAYS
+        // needs no further judgement: the request's own entries were judged above, and
+        // every key already stored passed that very check on the way in.
         let mut merged = tags.clone();
         merged.extend(
             input
@@ -212,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
-        crate::state::bound_tag_entries(merged.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
+        crate::state::bound_tag_count(merged.len())?;
 
         // Assigning a tag whose key the resource already carries replaces that tag's
         // value and leaves every other tag alone.

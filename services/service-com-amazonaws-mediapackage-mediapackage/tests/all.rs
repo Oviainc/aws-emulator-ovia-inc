@@ -77,3 +77,5 @@ mod rotate_ingest_endpoint_credentials;
 mod startover_window_bound;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_content_judged_before_the_lookup.rs"]
+mod tag_content_judged_before_the_lookup;

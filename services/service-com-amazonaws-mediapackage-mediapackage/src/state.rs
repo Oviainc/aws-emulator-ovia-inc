@@ -627,6 +627,16 @@ fn validate_tag_value(member: &str, key: &str, value: &str) -> Result<(), Servic
     Ok(())
 }
 
+/// Refuse a tag set that would leave a resource carrying more than [`MAX_TAGS`] tags.
+///
+/// The half of [`bound_tag_entries`] that cannot be decided from a request alone: the
+/// ceiling is about the set the resource is LEFT holding, so an operation that MERGES its
+/// tags into a stored set judges it against that merged result — while what each tag SAYS,
+/// which depends on no stored record, is judged from the request before any lookup.
+pub fn bound_tag_count(count: usize) -> Result<(), ServiceError> {
+    bound_entries("tags", count, MAX_TAGS)
+}
+
 /// Refuse a tag set that breaks AWS's tagging rules: by entry count, by the length of each
 /// key and value, and by what each key and value is ALLOWED TO SAY — the character set,
 /// and the reserved `aws:` key prefix only AWS itself may use.
@@ -640,7 +650,7 @@ where
 {
     let mut entries: Vec<(&str, &str)> = tags.into_iter().collect();
     entries.sort_unstable();
-    bound_entries("tags", entries.len(), MAX_TAGS)?;
+    bound_tag_count(entries.len())?;
     for (key, value) in entries {
         bound_part_chars("tags", &format!("key {key:?}"), key, MAX_TAG_KEY_CHARS)?;
         bound_part_chars(
