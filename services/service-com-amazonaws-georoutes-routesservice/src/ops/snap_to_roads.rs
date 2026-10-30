@@ -8,7 +8,10 @@
 //! `OriginalPosition`, the point on the road as `SnappedPosition` and a `Confidence` that
 //! falls off with the snap offset over `SnapRadius`. A point whose nearest usable road is
 //! further away than `SnapRadius` is not matched: it keeps its submitted position, scores
-//! zero confidence, and its index is listed under a `TracePointsNotMatched` notice.
+//! zero confidence, and its index is listed under a `TracePointsNotMatched` notice. So is
+//! a point the network holds no road anywhere near — one in the open sea, where
+//! [`crate::state`] materialises no road at all — which is the case the notice exists for:
+//! a client reading `SnappedTracePoints` alone could not tell that fix from a road fix.
 //!
 //! `SnappedGeometry` is the line through the positions that DID match a road; a point
 //! reported unmatched is left out of it, so the geometry and the per-point confidence
@@ -262,7 +265,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut snapped_trace_points = Vec::with_capacity(positions.len());
         let mut snapped_path: Vec<Position> = Vec::with_capacity(positions.len());
-        let mut unmatched: Vec<i32> = Vec::new();
+        // The unmatched points, kept apart by WHY no road matched them: one lies beyond
+        // the radius of the roads around it, the other lies where the network holds no
+        // road at any radius. The notice states the reason, so the two cannot be reported
+        // as each other.
+        let mut beyond_radius: Vec<i32> = Vec::new();
+        let mut off_network: Vec<i32> = Vec::new();
         for ((index, position), candidate) in positions.iter().enumerate().zip(snapped) {
             // Within the radius the point matches a road; beyond it there is no candidate
             // to match, so the point is reported unmatched rather than moved.
@@ -281,7 +289,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 None => {
                     if let Ok(index) = i32::try_from(index) {
-                        unmatched.push(index);
+                        if state::is_mapped_territory(*position) {
+                            beyond_radius.push(index);
+                        } else {
+                            off_network.push(index);
+                        }
                     }
                     // An unmatched point is NOT on the snapped route, so it is left out of
                     // the snapped geometry: the line would otherwise run through a
@@ -295,16 +307,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The indexes of the points no road matched, as the model's notice reports them,
+        // under the title of the reason they were not matched.
+        // `TracePointIndexes` carries at most `MAX_NOTICE_INDEXES` entries, so a trace with
+        // more unmatched points than that is reported over as many notices of the same
+        // code as it takes: every unmatched index is reported, and no notice breaks the
+        // modeled length.
         let mut notices = Vec::new();
-        if !unmatched.is_empty() {
-            notices.push(RoadSnapNotice {
-                code: "TracePointsNotMatched".to_string(),
-                title: format!(
-                    "{} trace points had no road within the {snap_radius_m} metre snap radius",
-                    unmatched.len()
-                ),
-                trace_point_indexes: unmatched,
-            });
+        for (indexes, reason) in [
+            (
+                &beyond_radius,
+                format!("no road within the {snap_radius_m} metre snap radius"),
+            ),
+            (
+                &off_network,
+                "no road of the network at all: the position is outside the mapped territory the network covers"
+                    .to_string(),
+            ),
+        ] {
+            for indexes in indexes.chunks(MAX_NOTICE_INDEXES) {
+                notices.push(RoadSnapNotice {
+                    code: "TracePointsNotMatched".to_string(),
+                    title: format!("{} trace points had {reason}", indexes.len()),
+                    trace_point_indexes: indexes.to_vec(),
+                });
+            }
         }
 
         let snapped_geometry = snapped_geometry(&snapped_path, &geometry_format)?;
@@ -329,6 +356,10 @@ const MAX_TRACE_POINTS: usize = 5_000;
 
 /// How many trace points are snapped under one acquisition of the shared state lock.
 const SNAP_CHUNK: usize = 256;
+
+/// Most indexes one notice may carry (`RoadSnapNotice$TracePointIndexes` is `@length`
+/// 1..1000).
+const MAX_NOTICE_INDEXES: usize = 1_000;
 
 /// The interpolated geometry of the snapped route, in the requested format. `None` when
 /// there is no line to draw — a `LineString` carries two positions at least.

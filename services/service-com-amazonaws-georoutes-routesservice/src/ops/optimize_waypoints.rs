@@ -9,7 +9,8 @@
 //! per consecutive pair of the computed sequence, the clock walked forward across them
 //! (travel, then the rest a `Driver.RestCycles` schedule owes, then any wait for an
 //! `AppointmentTime`, then the waypoint's `ServiceDuration`), and the totals summed over
-//! those connections.
+//! those connections: the overall `Duration` is every phase `TimeBreakdown` splits the
+//! cycle into — travel, rest, wait and the service time spent at the waypoints.
 //!
 //! A request must say where the journey GOES, not only where it starts: `Origin` is the
 //! model's only `@required` member, and a request that sets neither `Destination` nor a
@@ -23,13 +24,22 @@
 //! failed constraint — the model's own channel for "waypoints that caused the optimization
 //! problem to fail, and the constraints that were unsatisfied".
 //!
-//! `Clustering`, `Driver.RestProfile`, `Exclude`, `AccessHours`, `Avoid.Areas` and
-//! `Avoid.ControlledAccessHighways` answer 501: clustering and the EU rest profile change
-//! the sequencing itself (the profile stands for statutory driving and break limits this
-//! emulator holds no data for), a country exclusion is "strictly excluded" and no road of
-//! the model carries the country it is in, an access window would move the arrival, the
-//! wait and the impeding waypoints, and a violated avoidance would have to be reported as
-//! a notice this answer has nowhere to carry. The rest of `Avoid` is satisfied trivially
+//! `Clustering` is HONOURED: the clusters the requested algorithm forms are what the
+//! sequencer keeps together — while the traveller is in a cluster, that cluster's own
+//! waypoints are the candidates for the next step and cost decides between them — and
+//! every optimized waypoint reports the `ClusterIndex` of the cluster it was assigned to.
+//! `DrivingDistance` clusters the stops that are within the configured driving distance of
+//! each other, costed by the same cost function as the connections; `TopologySegment`
+//! clusters the stops that snap onto one stretch of one road between two junctions of the
+//! network.
+//!
+//! `Driver.RestProfile`, `Exclude`, `AccessHours`, `Avoid.Areas` and
+//! `Avoid.ControlledAccessHighways` answer 501: the EU rest profile stands for statutory
+//! driving and break limits this emulator holds no data for, a country exclusion is
+//! "strictly excluded" and no road of the model carries the country it is in, an access
+//! window would move the arrival, the wait and the impeding waypoints, and a violated
+//! avoidance would have to be reported as a notice this answer has nowhere to carry. The
+//! rest of `Avoid` is satisfied trivially
 //! (no toll road, ferry, tunnel, dirt road or car shuttle train exists on this network),
 //! and `Traffic` and `TravelModeOptions` have nothing to act on: the model carries no
 //! traffic variation and no vehicle restriction.
@@ -147,7 +157,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{self, Instant, Position, RoutingObjective, TravelMode};
+use std::collections::HashMap;
+
+use crate::state::{self, Instant, Position, RoadOrientation, RoutingObjective, TravelMode};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -171,7 +183,7 @@ pub enum OptimizeWaypointsErrorModeled {
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::optimize_waypoints::OptimizeWaypointsError`). The wrapper is kept
-/// because `Clustering` and `Driver.RestProfile` are answered with its 501.
+/// because `Driver.RestProfile`, `Exclude` and `AccessHours` are answered with its 501.
 pub type OptimizeWaypointsError = crate::scaffolded::Scaffolded<OptimizeWaypointsErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -222,11 +234,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        if input.clustering.is_some() {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "OptimizeWaypoints with Clustering",
-            ));
-        }
         if input.driver.as_ref().is_some_and(|driver| driver.rest_profile.is_some()) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "OptimizeWaypoints with Driver.RestProfile",
@@ -321,6 +328,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         state::check_travel_mode_options(travel_mode.as_model(), &permitted, &declared)
             .map_err(|(member, message)| invalid(&member, message))?;
+
+        let clustering = match input.clustering.as_ref() {
+            None => None,
+            Some(options) => Some(Clustering::resolve(options)?),
+        };
 
         let departure = match &input.departure_time {
             Some(value) => {
@@ -508,6 +520,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state_handle =
             state::service_state(&*self.engine).ok_or_else(|| internal("the routes service state is unavailable"))?;
 
+        // The clusters the request asked for, by stop id. They are computed BEFORE the
+        // sequencing below, because a cluster is what the sequencer keeps together, and
+        // they are what every optimized waypoint reports its `ClusterIndex` from. A
+        // request that asked for no clustering has none, and reports none.
+        let clusters: HashMap<String, i32> = match clustering {
+            None => HashMap::new(),
+            Some(clustering) => {
+                let stops: Vec<&Stop> = std::iter::once(&origin)
+                    .chain(waypoints.iter())
+                    .chain(destination.iter())
+                    .collect();
+                let mut state = state_handle.lock();
+                clustering.assign(&mut state, &stops, travel_mode, objective)
+            }
+        };
+
         // Sequence: from the stop reached last, take the cheapest unvisited waypoint the
         // `Before` constraints allow — a waypoint another unvisited one requires to be
         // visited after it is not eligible yet. When no candidate is eligible the
@@ -537,6 +565,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 (0..remaining.len()).collect()
             } else {
                 eligible
+            };
+            // Clustering "improves the optimized sequence": the waypoints of one cluster
+            // are visited together, so while the traveller is in a cluster the candidates
+            // of that cluster come first and only cost decides between them. With the
+            // cluster exhausted, or with no clustering asked for, the whole pool competes.
+            let pool: Vec<usize> = match sequence.last().and_then(|stop| clusters.get(&stop.id)) {
+                None => pool,
+                Some(cluster) => {
+                    let same: Vec<usize> = pool
+                        .iter()
+                        .copied()
+                        .filter(|index| clusters.get(&remaining[*index].id) == Some(cluster))
+                        .collect();
+                    if same.is_empty() {
+                        pool
+                    } else {
+                        same
+                    }
+                }
             };
             let chosen = {
                 let mut state = state_handle.lock();
@@ -590,7 +637,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         optimized.push(WaypointOptimizationOptimizedWaypoint {
             arrival_time: None,
-            cluster_index: None,
+            cluster_index: clusters.get(&sequence[0].id).copied(),
             departure_time: state::format_timestamp(clock)
                 .ok_or_else(|| internal("the departure time is not representable"))?,
             id: sequence[0].id.clone(),
@@ -626,8 +673,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
             optimized.push(WaypointOptimizationOptimizedWaypoint {
                 arrival_time: state::format_timestamp(arrival),
-                // No clustering was performed, so no cluster index is reported.
-                cluster_index: None,
+                // The cluster this stop was assigned to, for a request that asked for
+                // clustering; a stop of a request that did not asks for no index.
+                cluster_index: clusters.get(&to.id).copied(),
                 departure_time: state::format_timestamp(departure_from_to)
                     .ok_or_else(|| internal("a departure time is not representable"))?,
                 id: to.id.clone(),
@@ -685,15 +733,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|c| c.distance)
                     .fold(0_i64, i64::saturating_add) as f64,
             ),
+            // What the whole cycle TAKES, which is every phase the breakdown splits it
+            // into: travelling, the rests the driver's cycles owe, the waits for an
+            // appointment, and the service time spent at the waypoints. A total that left
+            // the service time out would contradict the breakdown reporting it.
             duration: state::clamp_cost(
-                connections
-                    .iter()
-                    .map(|c| {
-                        c.travel_duration
-                            .saturating_add(c.rest_duration)
-                            .saturating_add(c.wait_duration)
-                    })
-                    .fold(0_i64, i64::saturating_add) as f64,
+                breakdown
+                    .travel_duration
+                    .saturating_add(breakdown.rest_duration)
+                    .saturating_add(breakdown.wait_duration)
+                    .saturating_add(breakdown.service_duration) as f64,
             ),
             connections,
             impeding_waypoints: impeding,
@@ -741,6 +790,180 @@ fn assign_id(supplied: Option<String>, preferred: &str, taken: &mut Vec<String>)
     }
     taken.push(candidate.clone());
     candidate
+}
+
+/// How the request asked nearby waypoints to be clustered, and with what.
+#[derive(Debug, Clone, Copy)]
+enum Clustering {
+    /// "DrivingDistance assigns all the waypoints that are within driving distance of each
+    /// other into a single cluster", with the distance the request configured.
+    DrivingDistance { distance_m: i64 },
+    /// "TopologySegment assigns all the waypoints that are within the same topology
+    /// segment into a single cluster. A Topology segment is a linear stretch of road
+    /// between two junctions."
+    TopologySegment,
+}
+
+impl Clustering {
+    /// The clustering a request's `Clustering` asks for, or a refusal naming the member it
+    /// broke.
+    fn resolve(options: &WaypointOptimizationClusteringOptions) -> Result<Self, OptimizeWaypointsError> {
+        if !WAYPOINT_OPTIMIZATION_CLUSTERING_ALGORITHM_VALUES.contains(&options.algorithm.as_str()) {
+            return Err(invalid(
+                "Clustering.Algorithm",
+                state::must_be_one_of(
+                    "Clustering.Algorithm",
+                    WAYPOINT_OPTIMIZATION_CLUSTERING_ALGORITHM_VALUES,
+                ),
+            ));
+        }
+        if options.algorithm == TOPOLOGY_SEGMENT_ALGORITHM {
+            // "Driving distance options to be used when the clustering algorithm is
+            // DrivingDistance": they configure the other algorithm, so they act on nothing
+            // here.
+            return Ok(Self::TopologySegment);
+        }
+        // `DrivingDistanceOptions` is the options structure "to be used when the
+        // clustering algorithm is DrivingDistance". It is optional while its only member
+        // is `@required` with `@default: 5` and `@range` 5..50000, so a request that sets
+        // no options structure asks for that member's own default rather than for no
+        // clustering. The modeled range is not enforced on a defaulted member, so it is
+        // checked here.
+        let member = "Clustering.DrivingDistanceOptions.DrivingDistance";
+        let distance_m = options
+            .driving_distance_options
+            .as_ref()
+            .map_or(DEFAULT_DRIVING_DISTANCE_M, |options| options.driving_distance);
+        state::check_range(member, DRIVING_DISTANCE_BOUNDS, distance_m as f64)
+            .map_err(|message| invalid(member, message))?;
+        Ok(Self::DrivingDistance { distance_m })
+    }
+
+    /// The cluster of each stop, by stop id. The clusters are numbered in the order the
+    /// stops are submitted, so the origin's cluster is the first; a stop the algorithm
+    /// places in no cluster — one lying on no topology segment, because the network holds
+    /// no road for it — reports no index.
+    fn assign(
+        self,
+        state: &mut state::ComAmazonawsGeoroutesRoutesserviceState,
+        stops: &[&Stop],
+        mode: TravelMode,
+        objective: RoutingObjective,
+    ) -> HashMap<String, i32> {
+        let groups: Vec<Option<usize>> = match self {
+            Self::DrivingDistance { distance_m } => driving_distance_groups(state, stops, mode, objective, distance_m),
+            Self::TopologySegment => topology_segment_groups(state, stops, mode),
+        };
+        // The group ids above are whichever representative each algorithm settled on, so
+        // they are renumbered into the indices the answer reports.
+        let mut numbering: Vec<usize> = Vec::new();
+        let mut clusters = HashMap::new();
+        for (stop, group) in stops.iter().zip(groups) {
+            let Some(group) = group else {
+                continue;
+            };
+            let index = match numbering.iter().position(|seen| *seen == group) {
+                Some(index) => index,
+                None => {
+                    numbering.push(group);
+                    numbering.len() - 1
+                }
+            };
+            if let Ok(index) = i32::try_from(index) {
+                clusters.insert(stop.id.clone(), index);
+            }
+        }
+        clusters
+    }
+}
+
+/// The `WaypointOptimizationClusteringAlgorithm` that clusters by topology segment; the
+/// other value of the enum is the driving-distance one.
+const TOPOLOGY_SEGMENT_ALGORITHM: &str = "TopologySegment";
+
+/// `WaypointOptimizationDrivingDistance`'s modeled range, in metres, and the default its
+/// member declares (`@range` min 5, max 50000; `@default` 5, on a `@required` member).
+const DRIVING_DISTANCE_BOUNDS: (f64, f64) = (5.0, 50_000.0);
+const DEFAULT_DRIVING_DISTANCE_M: i64 = 5;
+
+/// Groups the stops that are within `distance_m` of each other BY ROAD into one cluster:
+/// the relation is transitive, so two stops connected through a third belong to the same
+/// cluster even where the road between them is longer than the configured distance.
+///
+/// The driving distance of a pair is the one the shared cost function computes for it, so
+/// a cluster is what the same request's connections are costed against. A road route is
+/// never shorter than the straight line between its endpoints, so a pair further apart
+/// than the configured distance as the crow flies cannot be within driving distance and is
+/// not routed at all. A stop the network holds no road for is within driving distance of
+/// nothing, so it ends up in a cluster of its own rather than in none: the distance
+/// relation places every stop, where a topology segment exists only under a road.
+fn driving_distance_groups(
+    state: &mut state::ComAmazonawsGeoroutesRoutesserviceState,
+    stops: &[&Stop],
+    mode: TravelMode,
+    objective: RoutingObjective,
+    distance_m: i64,
+) -> Vec<Option<usize>> {
+    let mut parent: Vec<usize> = (0..stops.len()).collect();
+    for i in 0..stops.len() {
+        for j in i + 1..stops.len() {
+            if state::haversine_m(stops[i].position, stops[j].position) > distance_m as f64 {
+                continue;
+            }
+            let route = state.compute_route(&[stops[i].position, stops[j].position], mode, objective, 0);
+            if route.connected && route.distance_m <= distance_m {
+                let (a, b) = (find_group(&mut parent, i), find_group(&mut parent, j));
+                parent[a] = b;
+            }
+        }
+    }
+    (0..stops.len())
+        .map(|index| Some(find_group(&mut parent, index)))
+        .collect()
+}
+
+/// The representative of `index`'s group, with the path to it compressed.
+fn find_group(parent: &mut [usize], index: usize) -> usize {
+    let mut root = index;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    let mut walk = index;
+    while parent[walk] != root {
+        let next = parent[walk];
+        parent[walk] = root;
+        walk = next;
+    }
+    root
+}
+
+/// Groups the stops that lie on the same topology segment — one stretch of one road
+/// between two junctions — into one cluster. A stop the network holds no road for lies on
+/// no segment, so it is in no cluster.
+fn topology_segment_groups(
+    state: &mut state::ComAmazonawsGeoroutesRoutesserviceState,
+    stops: &[&Stop],
+    mode: TravelMode,
+) -> Vec<Option<usize>> {
+    let mut segments: Vec<(RoadOrientation, i64, i64)> = Vec::new();
+    stops
+        .iter()
+        .map(|stop| {
+            let snapped = state.snap(stop.position, mode)?;
+            let segment = (
+                snapped.road.orientation,
+                snapped.road.grid_index,
+                snapped.road.topology_segment(snapped.position),
+            );
+            Some(match segments.iter().position(|seen| *seen == segment) {
+                Some(index) => index,
+                None => {
+                    segments.push(segment);
+                    segments.len() - 1
+                }
+            })
+        })
+        .collect()
 }
 
 /// One stop of the sequence: the origin, a waypoint or the destination.

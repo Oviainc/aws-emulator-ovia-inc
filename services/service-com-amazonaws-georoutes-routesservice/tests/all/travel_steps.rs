@@ -605,12 +605,13 @@ async fn a_language_the_instructions_are_not_held_in_is_reported_as_a_notice() {
     // variant of it, one it is not held in, and lists mixing them.
     // name, requested `Languages`, the language tag the strings must carry, whether the
     // answer must carry the notice.
-    let cases: [(&str, Option<Vec<&str>>, &str, bool); 6] = [
-        ("no language asked for", None, "en", false),
+    let cases: [(&str, Option<Vec<&str>>, &str, bool); 7] = [
+        ("no language asked for", None, "en-us", false),
         ("the language the text is held in", Some(vec!["en"]), "en", false),
         ("a regional variant of it", Some(vec!["en-GB"]), "en-GB", false),
-        ("a language it is not held in", Some(vec!["de"]), "en", true),
-        ("several, none of them held", Some(vec!["fr-CA", "ja"]), "en", true),
+        ("another language it is held in", Some(vec!["es-ES"]), "es-ES", false),
+        ("a language it is not held in", Some(vec!["ja"]), "en-us", true),
+        ("several, none of them held", Some(vec!["ja", "zh-CN"]), "en-us", true),
         ("several, one of them held", Some(vec!["ja", "en-US"]), "en-US", false),
     ];
 

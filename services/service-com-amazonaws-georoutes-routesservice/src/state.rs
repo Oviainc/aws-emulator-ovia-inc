@@ -19,6 +19,12 @@
 //! sub-segment at its own posted speed would be a per-segment cost model, which this slice
 //! does not carry.
 //!
+//! The network has COVERAGE where a territory of the world is mapped and nowhere else
+//! ([`is_mapped_territory`]): a grid cell in the open sea materialises no road, so a
+//! position there snaps to nothing and a leg whose corridor crosses it is not carried by
+//! the network ([`CachedLeg::connected`]). That is the one place real geography enters
+//! this model; within a mapped territory the grid below is uniform.
+//!
 //! The network also carries the manoeuvre data a leg's TRAVEL STEPS are derived from. A
 //! road is a run of the grid with an orientation and a grid index ([`RoadSegment`]), two
 //! roads of different orientations meet in a [`Junction`] with the angle between their own
@@ -33,10 +39,12 @@
 
 use std::collections::HashMap;
 
+use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
+use country_boundaries::{CountryBoundaries, LatLon, BOUNDARIES_ODBL_360X180};
 
 /// The instant type this service computes its departure and arrival times with: the
 /// framework's own timestamp, already a dependency of every service crate, so no handler
@@ -80,6 +88,44 @@ const CELL_DEG: f64 = 0.002;
 /// network is a cache of a pure function of the position, so dropping it cannot change an
 /// answer, and nothing holds a reference into it across a call.
 const MAX_MATERIALISED_CELLS: usize = 4096;
+
+/// The mapped territories of the world, read once from the boundary data the
+/// `country-boundaries` crate embeds and shared by every request.
+///
+/// A road network exists where a territory is mapped and nowhere else: a position in
+/// international waters lies in no territory, so the grid below materialises no road for
+/// it. `None` when the data cannot be read at all, which leaves coverage unknown rather
+/// than empty — see [`is_mapped_territory`].
+fn mapped_territories() -> Option<&'static CountryBoundaries> {
+    static TERRITORIES: OnceLock<Option<CountryBoundaries>> = OnceLock::new();
+    TERRITORIES
+        .get_or_init(|| CountryBoundaries::from_reader(BOUNDARIES_ODBL_360X180).ok())
+        .as_ref()
+}
+
+/// Whether the road network covers `pos`: whether the GRID CELL holding it lies in a
+/// mapped territory. A cell that lies in none — the open sea — materialises no road, so
+/// nothing snaps to a position in it and no route travels through it.
+///
+/// The question is asked of the CELL, never of the bare position, so every reader of
+/// coverage answers alike: a position that snaps onto a road cannot also be one a leg
+/// reports leaving the network at, which is what keeps an endpoint's own `NoMatch` and a
+/// pair's `NoRoute` apart.
+///
+/// With the boundary data unreadable the coverage of a position is UNKNOWN, and the
+/// network answers for it as it does for mapped land: an emulator that could not read its
+/// own data would otherwise report every position of the world as unroutable.
+pub fn is_mapped_territory(pos: Position) -> bool {
+    let Some(territories) = mapped_territories() else {
+        return true;
+    };
+    let cell = cell_of(pos);
+    let centre = [
+        (cell.0 as f64 + 0.5) * CELL_DEG,
+        (cell.1 as f64 + 0.5) * CELL_DEG,
+    ];
+    LatLon::new(centre[1], centre[0]).is_ok_and(|at| !territories.ids(at).is_empty())
+}
 
 /// Every 10th meridian road is a footpath: pedestrians only.
 const FOOTPATH_EVERY: i64 = 10;
@@ -374,6 +420,18 @@ impl TravelledRoad {
         self.orientation == other.orientation && self.grid_index == other.grid_index
     }
 
+    /// Which TOPOLOGY SEGMENT of this road `position` lies on: a linear stretch of road
+    /// between two junctions.
+    ///
+    /// The roads crossing this one sit at every multiple of [`ROAD_SPACING_DEG`] along its
+    /// own axis ([`Self::junction_with`]), so its junctions cut it into the intervals of
+    /// that spacing and the segment is the interval `position` falls in. Two positions
+    /// report the same segment of the same road exactly when no junction of the network
+    /// lies between them.
+    pub fn topology_segment(&self, position: Position) -> i64 {
+        (position[self.orientation.axis()] / ROAD_SPACING_DEG).floor() as i64
+    }
+
     /// The junction this road and `other` meet in: the point they cross and the angle
     /// between their forward directions. `None` for two roads of the same orientation,
     /// which run parallel and so never meet.
@@ -528,6 +586,12 @@ pub struct CachedLeg {
     pub runs: Vec<LegRun>,
     pub travel_mode: TravelMode,
     pub leg_type: LegType,
+    /// Whether the network carries this leg the whole way: false when the corridor between
+    /// its endpoints leaves the mapped territory the network has roads in, so the leg has
+    /// no road to travel there. The distance and duration are still computed — a caller
+    /// that has nowhere to report "no route" needs an answer — so the flag is what an
+    /// answer with a channel for it reports on.
+    pub connected: bool,
 }
 
 /// The positions of a path, in order.
@@ -668,6 +732,8 @@ pub struct CachedRoute {
     /// network), which is what an `Avoid.ControlledAccessHighways` request is answered
     /// against.
     pub uses_controlled_access_highway: bool,
+    /// Whether EVERY leg of the route is carried by the network ([`CachedLeg::connected`]).
+    pub connected: bool,
 }
 
 /// A position snapped onto the road network.
@@ -768,6 +834,9 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
     }
 
     /// Materialise the grid cell holding `pos`, if it is not materialised yet.
+    ///
+    /// A cell outside every mapped territory carries NO road: the network covers mapped
+    /// land, so the open sea holds nothing to snap to or travel on.
     fn materialise_cell(&mut self, pos: Position) {
         let cell = cell_of(pos);
         if self.road_cells.contains_key(&cell) {
@@ -779,6 +848,10 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         }
         let (lon_min, lat_min) = (cell.0 as f64 * CELL_DEG, cell.1 as f64 * CELL_DEG);
         let (lon_max, lat_max) = (lon_min + CELL_DEG, lat_min + CELL_DEG);
+        if !is_mapped_territory(pos) {
+            self.road_cells.insert(cell, Vec::new());
+            return;
+        }
         let mut indices = Vec::new();
 
         // Meridian roads: constant longitude, spanning the cell north to south.
@@ -832,8 +905,9 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
 
     /// Snap `pos` onto the nearest road of the network that `mode` may travel on.
     ///
-    /// `None` only when the cell holds no road for `mode`, which the grid rule makes
-    /// unreachable; a caller still has to answer for it rather than inventing a position.
+    /// `None` where the network holds no road `mode` may use near `pos`: the position lies
+    /// outside every mapped territory, so there is no road network there at all. A caller
+    /// still has to answer for it rather than inventing a position.
     pub fn snap(&mut self, pos: Position, mode: TravelMode) -> Option<SnappedPosition> {
         self.materialise_cell(pos);
         let cell = cell_of(pos);
@@ -885,7 +959,7 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         let mut uses_controlled_access_highway = false;
 
         for pair in positions.windows(2) {
-            let path = self.path_between(pair[0], pair[1], mode, objective, variant);
+            let (path, carried) = self.path_between(pair[0], pair[1], mode, objective, variant);
             // The roads the route travelled, counted per SNAPPED sample: an endpoint that
             // inherited the road of its neighbour is the same travel on that road, not a
             // second traversal of it.
@@ -913,6 +987,7 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
                 path,
                 travel_mode: mode,
                 leg_type: LegType::for_mode(mode),
+                connected: carried,
             });
         }
 
@@ -930,6 +1005,7 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         let route = CachedRoute {
             distance_m: clamp_cost(legs.iter().map(|leg| leg.distance_m as f64).sum()),
             duration_s: clamp_cost(legs.iter().map(|leg| leg.duration_s as f64).sum()),
+            connected: legs.iter().all(|leg| leg.connected),
             legs,
             major_roads,
             uses_controlled_access_highway,
@@ -942,7 +1018,8 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         route
     }
 
-    /// The geometry of one leg: each vertex with the road the leg travels there.
+    /// The geometry of one leg: each vertex with the road the leg travels there, and
+    /// whether the network carried the leg the whole way.
     ///
     /// The straight line from `from` to `to` is sampled every [`SAMPLE_SPACING_M`], each
     /// interior sample is pushed sideways by the objective's detour plus
@@ -951,6 +1028,10 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
     /// the road network and its length is the leg's distance. Where a sample lands on a
     /// different road from the one before it, the two runs' own junction is recorded on the
     /// vertex: that is the manoeuvre boundary the leg's travel steps are cut at.
+    ///
+    /// A sample that snaps onto no road at all is outside the network's coverage, and a
+    /// leg with one is NOT carried by the network: nothing of this model connects its
+    /// endpoints by road.
     fn path_between(
         &mut self,
         from: Position,
@@ -958,18 +1039,22 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
         mode: TravelMode,
         objective: RoutingObjective,
         variant: u32,
-    ) -> Vec<PathVertex> {
+    ) -> (Vec<PathVertex>, bool) {
         let straight_m = haversine_m(from, to);
         // A leg between two positions that are the same place has nothing to travel: it
         // reports that pair as its geometry and costs zero, rather than wandering onto the
         // road network and back.
         if positions_equal(from, to) {
-            return vec![PathVertex::off_network(from), PathVertex::off_network(to)];
+            return (
+                vec![PathVertex::off_network(from), PathVertex::off_network(to)],
+                is_mapped_territory(from),
+            );
         }
         let steps = ((straight_m / SAMPLE_SPACING_M).ceil() as usize).clamp(2, MAX_PATH_SEGMENTS);
         let bow_m = self.factors(objective).detour_m + f64::from(variant) * ALTERNATIVE_OFFSET_M;
         let mut path = vec![PathVertex::off_network(from)];
         let mut previous_road: Option<TravelledRoad> = None;
+        let mut carried = is_mapped_territory(from) && is_mapped_territory(to);
         for step in 1..steps {
             let t = step as f64 / steps as f64;
             let mut sample = interpolate(from, to, t);
@@ -994,7 +1079,10 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
                         junction,
                     });
                 }
-                None => path.push(PathVertex::off_network(sample)),
+                None => {
+                    carried = false;
+                    path.push(PathVertex::off_network(sample));
+                }
             }
         }
         path.push(PathVertex::off_network(to));
@@ -1003,7 +1091,7 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
             path.push(PathVertex::off_network(to));
         }
         inherit_endpoint_roads(&mut path);
-        path
+        (path, carried)
     }
 }
 

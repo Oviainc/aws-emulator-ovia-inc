@@ -26,6 +26,16 @@
 //! toll road, ferry, tunnel, dirt road, car shuttle train, seasonal closure or zone), and
 //! the computed path never turns back on itself.
 //!
+//! ## Durations
+//!
+//! A route's `Summary.Duration` is what the whole journey TAKES: the travel of every leg
+//! plus the `StopDuration` of every waypoint it stops at, since a stop is time spent on
+//! the route. The same split runs through a leg's own summary — `Overview` covers "before
+//! travel, travel and after travel steps", so it includes the stop at the waypoint the leg
+//! ends at, while `TravelOnly` covers the travel steps alone — and a leg's `Departure` and
+//! `Arrival` times bound its travel, with the stop falling between one leg's arrival and
+//! the next leg's departure.
+//!
 //! ## Travel steps
 //!
 //! A leg's `TravelSteps` are its manoeuvres, one per RUN of road the leg travels: the road
@@ -56,13 +66,15 @@
 //! `RouteNumber` where the network numbers it and by its `RoadName` otherwise — in
 //! `MajorRoadLabels`, in a step's `CurrentRoad`/`NextRoad` and on a signpost label alike.
 //!
-//! `Languages` and `InstructionsMeasurementSystem` act on the instruction text: an
-//! instruction is
-//! rendered in the requested language where this emulator holds text in it (English only),
-//! and otherwise in the regional default with the model's own `MainLanguageNotFound`
-//! notice, since "the request uses the regional default as the fallback if the requested
-//! language can't be provided"; its distance is stated in metres and kilometres for
-//! `Metric` and in feet and miles for `Imperial`.
+//! `Languages` and `InstructionsMeasurementSystem` act on the instruction text: the
+//! requested tags are resolved in order against the languages this emulator holds
+//! narration phrases in ([`NARRATIONS`]), an instruction is rendered in the first that
+//! resolves and the leg reports the language it was rendered in. Only a request where
+//! NONE of the tags resolves falls back to the regional default, and that is the one case
+//! the model's own `MainLanguageNotFound` notice reports, since "the request uses the
+//! regional default as the fallback if the requested language can't be provided". A
+//! step's distance is stated in metres and kilometres for `Metric` and in feet and miles
+//! for `Imperial`.
 //!
 //! `Allow`, `Tolls`, `Traffic` and `TravelModeOptions` have nothing to act on: the model
 //! carries no HOV/HOT lane, toll, traffic variation or vehicle restriction. A
@@ -322,11 +334,195 @@ const COMPUTED_LEG_FEATURES: [&str; 2] = ["Summary", "TravelStepInstructions"];
 /// more.
 const TRAVEL_STEP_INSTRUCTIONS_FEATURE: &str = "TravelStepInstructions";
 
-/// The language this emulator holds instruction text in. A request whose `Languages` names
-/// no tag of this language is answered in it anyway — "the request uses the regional
-/// default as the fallback if the requested language can't be provided" — and carries the
-/// model's `MainLanguageNotFound` notice.
-const INSTRUCTION_LANGUAGE: &str = "en";
+/// The narration of a route in ONE language: the phrase of each manoeuvre a step of this
+/// model can perform, of the stop that follows a leg's travel, and of the words a phrase
+/// names a direction with.
+///
+/// Each phrase is a TEMPLATE of this emulator's own, filled from the computed route:
+/// `{road}` is the road the network holds there, `{distance}` the step's own distance in
+/// the requested measurement system, `{steering}` which way the junction turns and
+/// `{duration}` how long the stop lasts. Nothing in a phrase is read from the request.
+#[derive(Debug)]
+struct Narration {
+    /// The BCP 47 primary language subtag this entry holds the phrases in. A requested
+    /// tag resolves to this entry when its own primary subtag is this one, so `es-ES` and
+    /// `es-419` are both answered in Spanish.
+    language: &'static str,
+    depart: &'static str,
+    continue_on: &'static str,
+    continue_highway: &'static str,
+    enter_highway: &'static str,
+    exit_highway: &'static str,
+    keep: &'static str,
+    turn: &'static str,
+    u_turn: &'static str,
+    arrive: &'static str,
+    /// The after-travel step of a vehicle leg, and of a pedestrian leg.
+    park: &'static str,
+    wait: &'static str,
+    /// What a phrase calls a road the network left unnamed.
+    road_ahead: &'static str,
+    /// The `RouteSteeringDirection` values a phrase states in words.
+    straight: &'static str,
+    left: &'static str,
+    right: &'static str,
+}
+
+impl Narration {
+    /// The word for a `RouteSteeringDirection` of this model.
+    fn steering(&self, direction: &str) -> &'static str {
+        match direction {
+            "Left" => self.left,
+            "Right" => self.right,
+            _ => self.straight,
+        }
+    }
+
+    /// `template` with the values of this step filled in.
+    fn fill(template: &str, road: &str, distance: &str, steering: &str) -> String {
+        template
+            .replace("{road}", road)
+            .replace("{distance}", distance)
+            .replace("{steering}", steering)
+    }
+}
+
+/// The language tag this emulator reports when it renders the narration in its own
+/// regional default rather than in a language the request asked for: US English, the
+/// regional default of the region this emulator serves. A request that asked for a
+/// language the catalog HOLDS is answered under the tag it asked with instead.
+///
+/// The region subtag is lower-case because that is how the service's own fallback answers
+/// it; a requested tag is reported back as the caller spelled it, so the two forms sitting
+/// side by side in one answer is correct and not a normalisation to tidy up.
+const DEFAULT_LANGUAGE_TAG: &str = "en-us";
+
+/// The narration of the regional default language, which a request resolving to none of
+/// the catalog's languages is answered in.
+const DEFAULT_NARRATION: &Narration = &ENGLISH;
+
+/// The languages this emulator can render a route's narration in.
+///
+/// A request whose `Languages` names a tag of one of these languages is answered in that
+/// language and reports it; one naming no tag of any of them is answered in the default —
+/// "the request uses the regional default as the fallback if the requested language can't
+/// be provided" — and carries the model's `MainLanguageNotFound` notice, which is reserved
+/// for exactly that case.
+const NARRATIONS: &[Narration] = &[ENGLISH, SPANISH, FRENCH, GERMAN, ITALIAN, PORTUGUESE];
+
+const ENGLISH: Narration = Narration {
+    language: "en",
+    depart: "Depart on {road} and continue for {distance}.",
+    continue_on: "Continue on {road} for {distance}.",
+    continue_highway: "Continue on the highway {road} for {distance}.",
+    enter_highway: "Enter the highway {road} and continue for {distance}.",
+    exit_highway: "Exit the highway onto {road} and continue for {distance}.",
+    keep: "Keep {steering} onto {road} and continue for {distance}.",
+    turn: "Turn {steering} onto {road} and continue for {distance}.",
+    u_turn: "Make a U-turn onto {road} and continue for {distance}.",
+    arrive: "Arrive at your destination.",
+    park: "Park for {duration}.",
+    wait: "Wait for {duration}.",
+    road_ahead: "the road ahead",
+    straight: "straight",
+    left: "left",
+    right: "right",
+};
+
+const SPANISH: Narration = Narration {
+    language: "es",
+    depart: "Salga por {road} y continúe durante {distance}.",
+    continue_on: "Continúe por {road} durante {distance}.",
+    continue_highway: "Continúe por la autopista {road} durante {distance}.",
+    enter_highway: "Entre en la autopista {road} y continúe durante {distance}.",
+    exit_highway: "Salga de la autopista hacia {road} y continúe durante {distance}.",
+    keep: "Manténgase a la {steering} hacia {road} y continúe durante {distance}.",
+    turn: "Gire a la {steering} hacia {road} y continúe durante {distance}.",
+    u_turn: "Haga un cambio de sentido hacia {road} y continúe durante {distance}.",
+    arrive: "Ha llegado a su destino.",
+    park: "Aparque durante {duration}.",
+    wait: "Espere durante {duration}.",
+    road_ahead: "la vía actual",
+    straight: "recto",
+    left: "izquierda",
+    right: "derecha",
+};
+
+const FRENCH: Narration = Narration {
+    language: "fr",
+    depart: "Partez sur {road} et continuez pendant {distance}.",
+    continue_on: "Continuez sur {road} pendant {distance}.",
+    continue_highway: "Continuez sur l'autoroute {road} pendant {distance}.",
+    enter_highway: "Entrez sur l'autoroute {road} et continuez pendant {distance}.",
+    exit_highway: "Quittez l'autoroute vers {road} et continuez pendant {distance}.",
+    keep: "Serrez à {steering} vers {road} et continuez pendant {distance}.",
+    turn: "Tournez à {steering} vers {road} et continuez pendant {distance}.",
+    u_turn: "Faites demi-tour vers {road} et continuez pendant {distance}.",
+    arrive: "Vous êtes arrivé à destination.",
+    park: "Stationnez pendant {duration}.",
+    wait: "Attendez pendant {duration}.",
+    road_ahead: "la route actuelle",
+    straight: "tout droit",
+    left: "gauche",
+    right: "droite",
+};
+
+const GERMAN: Narration = Narration {
+    language: "de",
+    depart: "Starten Sie auf {road} und fahren Sie {distance} weiter.",
+    continue_on: "Folgen Sie {road} für {distance}.",
+    continue_highway: "Folgen Sie der Autobahn {road} für {distance}.",
+    enter_highway: "Fahren Sie auf die Autobahn {road} und fahren Sie {distance} weiter.",
+    exit_highway: "Verlassen Sie die Autobahn auf {road} und fahren Sie {distance} weiter.",
+    keep: "Halten Sie sich {steering} auf {road} und fahren Sie {distance} weiter.",
+    turn: "Biegen Sie {steering} auf {road} ab und fahren Sie {distance} weiter.",
+    u_turn: "Wenden Sie auf {road} und fahren Sie {distance} weiter.",
+    arrive: "Sie haben Ihr Ziel erreicht.",
+    park: "Parken Sie {duration}.",
+    wait: "Warten Sie {duration}.",
+    road_ahead: "die Straße voraus",
+    straight: "geradeaus",
+    left: "links",
+    right: "rechts",
+};
+
+const ITALIAN: Narration = Narration {
+    language: "it",
+    depart: "Parti su {road} e continua per {distance}.",
+    continue_on: "Continua su {road} per {distance}.",
+    continue_highway: "Continua sull'autostrada {road} per {distance}.",
+    enter_highway: "Entra sull'autostrada {road} e continua per {distance}.",
+    exit_highway: "Esci dall'autostrada su {road} e continua per {distance}.",
+    keep: "Mantieni la {steering} su {road} e continua per {distance}.",
+    turn: "Svolta a {steering} su {road} e continua per {distance}.",
+    u_turn: "Fai un'inversione a U su {road} e continua per {distance}.",
+    arrive: "Sei arrivato a destinazione.",
+    park: "Parcheggia per {duration}.",
+    wait: "Attendi per {duration}.",
+    road_ahead: "la strada attuale",
+    straight: "dritto",
+    left: "sinistra",
+    right: "destra",
+};
+
+const PORTUGUESE: Narration = Narration {
+    language: "pt",
+    depart: "Siga por {road} e continue por {distance}.",
+    continue_on: "Continue por {road} por {distance}.",
+    continue_highway: "Continue pela autoestrada {road} por {distance}.",
+    enter_highway: "Entre na autoestrada {road} e continue por {distance}.",
+    exit_highway: "Saia da autoestrada para {road} e continue por {distance}.",
+    keep: "Mantenha-se à {steering} para {road} e continue por {distance}.",
+    turn: "Vire à {steering} para {road} e continue por {distance}.",
+    u_turn: "Faça um retorno para {road} e continue por {distance}.",
+    arrive: "Chegou ao seu destino.",
+    park: "Estacione por {duration}.",
+    wait: "Aguarde por {duration}.",
+    road_ahead: "a estrada atual",
+    straight: "em frente",
+    left: "esquerda",
+    right: "direita",
+};
 
 /// The angle bands, in degrees, a manoeuvre at a junction is classified into: inside
 /// `STRAIGHT` the leg continues straight on, up to `KEEP` it keeps to one side of a fork,
@@ -406,8 +602,11 @@ impl Measurement {
 struct StepRendering<'a> {
     /// The effective `TravelStepType`.
     detail: StepDetail,
-    /// The language tag the instructions and the localized road names are rendered in.
+    /// The language tag the instructions and the localized road names are rendered in,
+    /// as the answer reports it.
     language: &'a str,
+    /// The phrases that language's narration is built from.
+    narration: &'static Narration,
     /// The effective `InstructionsMeasurementSystem`.
     measurement: Measurement,
     /// Whether `LegAdditionalFeatures` asked for the per-step narration
@@ -600,7 +799,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?,
         };
-        let (language, language_fell_back) =
+        let (language, narration, language_fell_back) =
             instruction_language(input.languages.as_deref().unwrap_or_default());
         // `Summary` and `TravelStepInstructions` are the leg features this slice computes;
         // every other one asks for data the road model does not carry (tolls, incidents,
@@ -733,6 +932,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     steps: StepRendering {
                         detail: step_detail,
                         language: &language,
+                        narration,
                         measurement,
                         narrate: wants_step_narration,
                     },
@@ -797,7 +997,17 @@ impl<Eng> CalculateRoutes<Eng> {
         rendering: Rendering<'_>,
     ) -> Result<Route, CalculateRoutesError> {
         let distance: i64 = state::clamp_cost(legs.iter().map(|leg| leg.distance_m as f64).sum());
-        let duration: i64 = state::clamp_cost(legs.iter().map(|leg| leg.duration_s as f64).sum());
+        // What the route SPENDS: travelling, plus the stop at every waypoint it stops at.
+        // A stop is time the traveller is on the route and not moving — the after-travel
+        // step of the leg it ends — so it belongs to the route's duration, which is what a
+        // client schedules the journey against. The per-leg travel-only summary is where
+        // the travelling alone is reported.
+        let travel_duration: i64 = state::clamp_cost(legs.iter().map(|leg| leg.duration_s as f64).sum());
+        let stops: i64 = legs
+            .iter()
+            .map(|leg| leg.end.stop_duration_s)
+            .fold(0_i64, i64::saturating_add);
+        let duration: i64 = state::clamp_cost(travel_duration.saturating_add(stops) as f64);
 
         // The clock walks the legs forward from the departure. An `ArrivalTime` request
         // pins the far end instead, so the departure is the arrival less everything the
@@ -805,16 +1015,9 @@ impl<Eng> CalculateRoutes<Eng> {
         // saturating, so no request's numbers can drive the clock past what an `i64` of
         // seconds holds (the model caps each `StopDuration` at 49,999 and each duration at
         // 4,294,967,295, and the waypoints at 23, but the arithmetic does not rely on it).
-        let stops: i64 = legs
-            .iter()
-            .take(legs.len().saturating_sub(1))
-            .map(|leg| leg.end.stop_duration_s)
-            .fold(0_i64, i64::saturating_add);
         let mut clock = match rendering.anchor {
             Anchor::Departure(departure) => departure,
-            Anchor::Arrival(arrival) => {
-                state::shift_seconds(arrival, duration.saturating_add(stops).saturating_neg())
-            }
+            Anchor::Arrival(arrival) => state::shift_seconds(arrival, duration.saturating_neg()),
         };
 
         let mut out = Vec::with_capacity(legs.len());
@@ -859,10 +1062,22 @@ impl<Eng> CalculateRoutes<Eng> {
 
         let mut route_leg = RouteLeg {
             geometry,
+            // The language the leg's instructions and localized names are rendered in,
+            // which is the language actually used — not the tag that was asked for when
+            // this emulator holds no text in it.
+            language: Some(rendering.steps.language.to_string()),
             travel_mode: travel_mode.as_model().to_string(),
             r#type: leg_type.as_model().to_string(),
             ..Default::default()
         };
+
+        // The leg's OVERVIEW covers "before travel, travel and after travel steps", so it
+        // includes the stop performed at the waypoint the leg ends at; TRAVEL ONLY covers
+        // the travel steps, so it does not.
+        let overview_duration = state::clamp_cost(
+            leg.duration_s
+                .saturating_add(after_travel_stop(leg).unwrap_or(0)) as f64,
+        );
 
         match leg_type {
             LegType::Pedestrian => {
@@ -872,7 +1087,7 @@ impl<Eng> CalculateRoutes<Eng> {
                         .map(|duration_s| RoutePedestrianAfterTravelStep {
                             duration: duration_s,
                             instruction: (rendering.steps.detail == StepDetail::Default)
-                                .then(|| format!("Wait for {}.", duration_text(duration_s))),
+                                .then(|| stop_instruction(rendering.steps.narration.wait, duration_s)),
                             // The one value `RoutePedestrianAfterTravelStepType` declares.
                             r#type: "Wait".to_string(),
                         })
@@ -894,7 +1109,7 @@ impl<Eng> CalculateRoutes<Eng> {
                     summary: Some(RoutePedestrianSummary {
                         overview: Some(RoutePedestrianOverviewSummary {
                             distance: leg.distance_m,
-                            duration: leg.duration_s,
+                            duration: overview_duration,
                         }),
                         travel_only: Some(RoutePedestrianTravelOnlySummary {
                             duration: leg.duration_s,
@@ -916,7 +1131,7 @@ impl<Eng> CalculateRoutes<Eng> {
                             charge_step_details: None,
                             duration: duration_s,
                             instruction: (rendering.steps.detail == StepDetail::Default)
-                                .then(|| format!("Park for {}.", duration_text(duration_s))),
+                                .then(|| stop_instruction(rendering.steps.narration.park, duration_s)),
                             // The one value `RouteVehicleAfterTravelStepType` declares.
                             r#type: "Park".to_string(),
                         })
@@ -948,10 +1163,10 @@ impl<Eng> CalculateRoutes<Eng> {
                         overview: Some(RouteVehicleOverviewSummary {
                             // This road model carries no traffic variation, so the best
                             // case and the typical case are the computed duration.
-                            best_case_duration: leg.duration_s,
+                            best_case_duration: overview_duration,
                             distance: leg.distance_m,
-                            duration: leg.duration_s,
-                            typical_duration: leg.duration_s,
+                            duration: overview_duration,
+                            typical_duration: overview_duration,
                         }),
                         travel_only: Some(RouteVehicleTravelOnlySummary {
                             best_case_duration: leg.duration_s,
@@ -1067,21 +1282,28 @@ fn pedestrian_place(point: &SequencePoint) -> RoutePedestrianPlace {
 /// The language a step's instruction and localized road names are rendered in, and whether
 /// the request asked for one this emulator has no text in.
 ///
-/// A requested tag counts as answered when its primary subtag is the language the text is
-/// held in, so `en-GB` is answered in English and reported as asked; anything else falls
-/// back to the regional default, which the caller is told about through the model's
-/// `MainLanguageNotFound` notice rather than by silently reading as a translation.
-fn instruction_language(requested: &[String]) -> (String, bool) {
-    if requested.is_empty() {
-        return (INSTRUCTION_LANGUAGE.to_string(), false);
+/// The requested tags are resolved IN ORDER against the languages this emulator holds
+/// narration in: the first whose primary subtag names one of them is the language used,
+/// and the tag is reported as asked, so `en-GB` is answered in English and `es-ES` in
+/// Spanish. Only a request where NONE of the tags resolves falls back to the regional
+/// default, which the caller is told about through the model's `MainLanguageNotFound`
+/// notice rather than by silently reading as a translation.
+fn instruction_language(requested: &[String]) -> (String, &'static Narration, bool) {
+    for tag in requested {
+        let primary = primary_subtag(tag);
+        if let Some(narration) = NARRATIONS
+            .iter()
+            .find(|narration| primary.eq_ignore_ascii_case(narration.language))
+        {
+            return (tag.clone(), narration, false);
+        }
     }
-    match requested
-        .iter()
-        .find(|tag| primary_subtag(tag).eq_ignore_ascii_case(INSTRUCTION_LANGUAGE))
-    {
-        Some(tag) => (tag.clone(), false),
-        None => (INSTRUCTION_LANGUAGE.to_string(), true),
-    }
+    (
+        DEFAULT_LANGUAGE_TAG.to_string(),
+        DEFAULT_NARRATION,
+        // A request that named no language asked for nothing that could not be provided.
+        !requested.is_empty(),
+    )
 }
 
 /// The primary language subtag of a BCP 47 tag: everything before the first subtag
@@ -1506,23 +1728,25 @@ fn localized(value: &str, language: &str) -> LocalizedString {
 /// manoeuvre the junction determined, the road name the network holds and the step's own
 /// distance in the requested measurement system. Nothing in it is read from the request.
 fn instruction(manoeuvre: &Manoeuvre, rendering: StepRendering<'_>) -> String {
+    let narration = rendering.narration;
     let road = manoeuvre
         .current_road
         .as_ref()
-        .map_or_else(|| "the road ahead".to_string(), |road| road.label.clone());
+        .map_or_else(|| narration.road_ahead.to_string(), |road| road.label.clone());
     let distance = distance_text(manoeuvre.distance_m, rendering.measurement);
-    let steering = steering_direction(manoeuvre.turn_angle_deg.unwrap_or_default()).to_lowercase();
-    match manoeuvre.kind {
-        StepKind::Depart => format!("Depart on {road} and continue for {distance}."),
-        StepKind::Continue => format!("Continue on {road} for {distance}."),
-        StepKind::ContinueHighway => format!("Continue on the highway {road} for {distance}."),
-        StepKind::EnterHighway => format!("Enter the highway {road} and continue for {distance}."),
-        StepKind::Exit => format!("Exit the highway onto {road} and continue for {distance}."),
-        StepKind::Keep => format!("Keep {steering} onto {road} and continue for {distance}."),
-        StepKind::Turn => format!("Turn {steering} onto {road} and continue for {distance}."),
-        StepKind::UTurn => format!("Make a U-turn onto {road} and continue for {distance}."),
-        StepKind::Arrive => "Arrive at your destination.".to_string(),
-    }
+    let steering = narration.steering(steering_direction(manoeuvre.turn_angle_deg.unwrap_or_default()));
+    let template = match manoeuvre.kind {
+        StepKind::Depart => narration.depart,
+        StepKind::Continue => narration.continue_on,
+        StepKind::ContinueHighway => narration.continue_highway,
+        StepKind::EnterHighway => narration.enter_highway,
+        StepKind::Exit => narration.exit_highway,
+        StepKind::Keep => narration.keep,
+        StepKind::Turn => narration.turn,
+        StepKind::UTurn => narration.u_turn,
+        StepKind::Arrive => narration.arrive,
+    };
+    Narration::fill(template, &road, &distance, steering)
 }
 
 /// `distance_m` as an instruction states it: metres below a kilometre and kilometres above
@@ -1536,6 +1760,12 @@ fn distance_text(distance_m: i64, measurement: Measurement) -> String {
         Measurement::Imperial if metres < METRES_PER_MILE => format!("{:.0} ft", metres / METRES_PER_FOOT),
         Measurement::Imperial => format!("{:.1} mi", metres / METRES_PER_MILE),
     }
+}
+
+/// The instruction of an after-travel step: the phrase for the stop, stating how long the
+/// traveller stays there.
+fn stop_instruction(template: &str, duration_s: i64) -> String {
+    template.replace("{duration}", &duration_text(duration_s))
 }
 
 /// A duration as an instruction states it: seconds below a minute and whole minutes above.

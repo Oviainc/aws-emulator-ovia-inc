@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Offline reverse country geocoding, with the boundary data embedded: tells the road
+# model where a road network exists (land) and where none does (open water). The crate is
+# Apache-2.0; the boundary data it embeds is ODbL, whose attribution terms are its own.
+country-boundaries = "1.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

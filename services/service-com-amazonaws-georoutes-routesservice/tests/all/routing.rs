@@ -98,9 +98,9 @@ pub(crate) fn int(value: &Value, member: &str, case: &str) -> i64 {
 }
 
 pub(crate) const ROUTES: &str = "/v2/routes";
-const MATRIX: &str = "/v2/route-matrix";
+pub(crate) const MATRIX: &str = "/v2/route-matrix";
 pub(crate) const SNAP: &str = "/v2/snap-to-roads";
-const OPTIMIZE: &str = "/v2/optimize-waypoints";
+pub(crate) const OPTIMIZE: &str = "/v2/optimize-waypoints";
 const ISOLINES: &str = "/v2/isolines";
 
 // ---------------------------------------------------------------------------
@@ -1081,8 +1081,9 @@ async fn every_matrix_entry_agrees_with_the_direct_route_for_its_pair() {
     }
 }
 
-/// A pair outside the routing boundary is not routed: its entry carries the matching
-/// out-of-bounds code and `ErrorCount` counts exactly those entries.
+/// A pair outside the routing boundary is not routed: its entry carries the unqualified
+/// out-of-bounds code, whichever endpoint the boundary left out, and `ErrorCount` counts
+/// exactly those entries.
 #[tokio::test]
 async fn matrix_entries_outside_the_routing_boundary_carry_an_error() {
     let router = routes_service();
@@ -1097,7 +1098,7 @@ async fn matrix_entries_outside_the_routing_boundary_carry_an_error() {
             json!({ "Geometry": { "Circle": { "Center": near, "Radius": 5000.0 } } }),
             json!([{ "Position": near }]),
             json!([{ "Position": near }, { "Position": far }]),
-            "OutOfBoundsDestination",
+            "OutOfBounds",
             1,
         ),
         (
@@ -1105,7 +1106,7 @@ async fn matrix_entries_outside_the_routing_boundary_carry_an_error() {
             json!({ "Geometry": { "Circle": { "Center": near, "Radius": 5000.0 } } }),
             json!([{ "Position": far }]),
             json!([{ "Position": near }]),
-            "OutOfBoundsOrigin",
+            "OutOfBounds",
             1,
         ),
         (
@@ -1113,7 +1114,7 @@ async fn matrix_entries_outside_the_routing_boundary_carry_an_error() {
             json!({ "Geometry": { "BoundingBox": [-123.3, 49.1, -123.0, 49.4] } }),
             json!([{ "Position": near }]),
             json!([{ "Position": far }, { "Position": near }]),
-            "OutOfBoundsDestination",
+            "OutOfBounds",
             1,
         ),
         (
@@ -1127,7 +1128,7 @@ async fn matrix_entries_outside_the_routing_boundary_carry_an_error() {
             }),
             json!([{ "Position": near }]),
             json!([{ "Position": far }]),
-            "OutOfBoundsDestination",
+            "OutOfBounds",
             1,
         ),
         (
@@ -2493,7 +2494,7 @@ async fn what_cannot_be_computed_answers_501() {
     let router = routes_service();
     let good = [-123.1, 49.28];
     let area = json!({ "Geometry": { "BoundingBox": [-124.0, 49.0, -123.0, 50.0] } });
-    let cases: [(&str, &str, Value); 14] = [
+    let cases: [(&str, &str, Value); 13] = [
         (
             "a transit route",
             ROUTES,
@@ -2503,14 +2504,6 @@ async fn what_cannot_be_computed_answers_501() {
             "an intermodal route",
             ROUTES,
             json!({ "Origin": good, "Destination": good, "TravelMode": "Intermodal" }),
-        ),
-        (
-            "a clustered optimization",
-            OPTIMIZE,
-            json!({
-                "Origin": good,
-                "Clustering": { "Algorithm": "DrivingDistance", "DrivingDistanceOptions": { "DrivingDistance": 1000 } }
-            }),
         ),
         (
             "a rest profile",

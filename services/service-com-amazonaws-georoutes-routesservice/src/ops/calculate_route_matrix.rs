@@ -7,10 +7,17 @@
 //! makes for that pair, so `RouteMatrix[i][j]` and a direct route for
 //! `(Origins[i], Destinations[j])` report the same distance and duration.
 //!
-//! A pair whose origin or destination falls outside the routing boundary is not routed:
-//! its entry carries the `OutOfBoundsOrigin` / `OutOfBoundsDestination` error code and
-//! `ErrorCount` counts those entries. Containment is decided once per submitted position,
-//! not once per pair.
+//! A pair the network cannot answer carries a `RouteMatrixErrorCode` instead of metrics,
+//! and `ErrorCount` is the number of entries that carry one:
+//!
+//! * outside the routing boundary — `OutOfBounds`. The boundary bounds the AREA the
+//!   matrix is computed in, equally for an origin and for a destination, so a containment
+//!   failure is not attributed to either endpoint's role. Containment is decided once per
+//!   submitted position, not once per pair.
+//! * an endpoint the road network cannot match — `NoMatchOrigin`, `NoMatchDestination`,
+//!   or `NoMatch` when neither endpoint matches. That failure IS the endpoint's, so the
+//!   code names it.
+//! * both endpoints matched but no road connects them — `NoRoute`.
 //!
 //! `Exclude` answers 501: a country exclusion is "strictly excluded" and no road of the
 //! model carries the country it is in. So do `Avoid.Areas` and
@@ -327,6 +334,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|destination| boundary.contains(*destination))
             .collect();
+        // Whether the road network matches each submitted position, decided once per
+        // position as well: a position the network holds no road near is matched by no
+        // pair it appears in. This pass takes the lock ONCE — unlike the costing below —
+        // because it is one snap per submitted position, and the documented limits cap
+        // those at 500 origins plus 500 destinations however large the matrix is.
+        let (origin_matched, destination_matched) = {
+            let mut state = state_handle.lock();
+            let matched = |state: &mut state::ComAmazonawsGeoroutesRoutesserviceState, positions: &[Position]| {
+                positions
+                    .iter()
+                    .map(|position| state.snap(*position, travel_mode).is_some())
+                    .collect::<Vec<bool>>()
+            };
+            let origins_matched = matched(&mut state, &origins);
+            let destinations_matched = matched(&mut state, &destinations);
+            (origins_matched, destinations_matched)
+        };
 
         // The matrix is costed ONE ROW at a time: the lock on the shared state is taken
         // per row (at most `Destinations.len()` route computations, itself capped by the
@@ -334,25 +358,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — so a large matrix neither holds the lock for the whole request nor leaves a
         // client's cancellation nowhere to land.
         let mut route_matrix = Vec::with_capacity(origins.len());
-        let mut error_count: i32 = 0;
         for (i, origin) in origins.iter().enumerate() {
             let mut row = Vec::with_capacity(destinations.len());
             {
                 let mut state = state_handle.lock();
                 for (j, destination) in destinations.iter().enumerate() {
                     // Out of the boundary is not routed: "All data, origins and
-                    // destinations outside the boundary are considered invalid."
-                    let error = if origin_inside[i] {
-                        if destination_inside[j] {
-                            None
-                        } else {
-                            Some("OutOfBoundsDestination")
-                        }
+                    // destinations outside the boundary are considered invalid." The
+                    // boundary applies to the pair's area rather than to one endpoint's
+                    // role in it, so the code it answers with is the unqualified one.
+                    let out_of_bounds = !origin_inside[i] || !destination_inside[j];
+                    let error = if out_of_bounds {
+                        Some(OUT_OF_BOUNDS)
                     } else {
-                        Some("OutOfBoundsOrigin")
+                        // A position the road network holds no road near is matched by
+                        // nothing, which the error code attributes to the endpoint it is.
+                        match (origin_matched[i], destination_matched[j]) {
+                            (false, false) => Some(NO_MATCH),
+                            (false, true) => Some(NO_MATCH_ORIGIN),
+                            (true, false) => Some(NO_MATCH_DESTINATION),
+                            (true, true) => None,
+                        }
                     };
                     if let Some(code) = error {
-                        error_count = error_count.saturating_add(1);
                         row.push(RouteMatrixEntry {
                             distance: 0,
                             duration: 0,
@@ -361,6 +389,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         continue;
                     }
                     let route = state.compute_route(&[*origin, *destination], travel_mode, objective, 0);
+                    // Both endpoints are on the network, but no road of it carries the
+                    // pair the whole way: there is no route, and reporting one would be
+                    // metrics for travel that cannot be made.
+                    if !route.connected {
+                        row.push(RouteMatrixEntry {
+                            distance: 0,
+                            duration: 0,
+                            error: Some(NO_ROUTE.to_string()),
+                        });
+                        continue;
+                    }
                     row.push(RouteMatrixEntry {
                         distance: route.distance_m,
                         duration: route.duration_s,
@@ -372,6 +411,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tokio::task::yield_now().await;
         }
         let pricing_bucket = state_handle.lock().pricing_bucket.clone();
+
+        // "The count of error results in the route matrix": derived from the entries that
+        // carry one, so the count and the matrix cannot disagree.
+        let error_count = i32::try_from(
+            route_matrix
+                .iter()
+                .flatten()
+                .filter(|entry| entry.error.is_some())
+                .count(),
+        )
+        .unwrap_or(i32::MAX);
 
         Ok(CalculateRouteMatrixOutput {
             error_count,
@@ -404,6 +454,20 @@ fn internal(message: &str) -> CalculateRouteMatrixError {
     })
     .into()
 }
+
+/// The `RouteMatrixErrorCode`s a cell of this matrix can carry.
+///
+/// `OutOfBounds` is the code for a pair the routing boundary rejects: the qualified
+/// `OutOfBoundsOrigin` / `OutOfBoundsDestination` name a failure of that endpoint itself,
+/// and a boundary that bounds the whole matrix area rejects the PAIR. The `NoMatch` codes
+/// do name an endpoint, because failing to match the road network is that position's own
+/// failure. `Other` and `Violation` are for conditions this model holds no data for (no
+/// road of it carries a restriction a pair could violate).
+const OUT_OF_BOUNDS: &str = "OutOfBounds";
+const NO_MATCH: &str = "NoMatch";
+const NO_MATCH_ORIGIN: &str = "NoMatchOrigin";
+const NO_MATCH_DESTINATION: &str = "NoMatchDestination";
+const NO_ROUTE: &str = "NoRoute";
 
 /// Every per-mode option block `RouteMatrixTravelModeOptions` declares, in the model's
 /// order, paired with whether the request set it — what
