@@ -17,10 +17,16 @@
 //! ([`claims_parts`], read by `Service::can_handle`) and the serving
 //! ([`serve`], reached from the two seams the router offers before and after
 //! authentication). Every status it answers is computed from the control plane's own
-//! records, and the one thing it WRITES is the metering a usage plan's throttle consists
-//! of ([`metered_refusal`]): the rate a key's requests are admitted at cannot be computed
-//! without recording the ones already admitted. Nothing else about a stage, an api or a
-//! key changes because it was invoked.
+//! records, and the two things it WRITES are the metering a usage plan's throttle consists
+//! of ([`metered_refusal`]) — the rate a key's requests are admitted at cannot be computed
+//! without recording the ones already admitted — and the stage's own RESPONSE CACHE
+//! ([`crate::state::StageEntry::response_cache`]), for the same reason: a cached response
+//! is the response a previous request was served, held and served again ("whether
+//! responses should be cached and returned for requests",
+//! `MethodSetting$cachingEnabled`), so a method whose settings enable caching cannot
+//! answer from the cache without the serving that filled it. Nothing else about a stage,
+//! an api or a key changes because it was invoked, and neither of those two is reported by
+//! any operation of this service.
 //!
 //! A client on the machine this emulator runs on cannot reach that host at all: nothing
 //! resolves `{rest-api-id}.execute-api.{region}.amazonaws.com` there, so it points at the
@@ -59,10 +65,17 @@
 //!    before the integration is reached;
 //! 8. the usage plan metering the presented API key admits the request at the plan's
 //!    throttle, or the request is shed ([`metered_refusal`]);
-//! 9. the method's integration decides the response, read with the STAGE's own variables
+//! 9. the STAGE's own cache is consulted for the method whose settings enable caching
+//!    ([`cache_plan`]): a cluster holding an entry for this call answers it without the
+//!    integration being performed at all, until that entry's TTL passes or a flush drops
+//!    it, and a request asking for it to be reloaded is honoured only as the stage's
+//!    `requireAuthorizationForCacheControl` and `unauthorizedCacheControlHeaderStrategy`
+//!    say;
+//! 10. the method's integration decides the response, read with the STAGE's own variables
 //!    resolved into its configuration ([`with_stage_variables`]): a reference to one
 //!    stands where the configuration carries an address, a connection or a role, so one
-//!    deployment reached through two stages addresses each stage's own backend.
+//!    deployment reached through two stages addresses each stage's own backend — and what
+//!    it answers is what the stage's cache then holds.
 //!
 //! A step that resolves nothing is answered the way API Gateway answers it: through the
 //! API's GATEWAY RESPONSE for the matching response type ([`GatewayRefusal`]), so a
@@ -136,6 +149,42 @@
 //! subset of it would silently produce the wrong body, so such a template is an
 //! integration this call cannot perform rather than a body built by guesswork.
 //!
+//! # The stage's response cache
+//!
+//! A method whose stage settings enable caching is answered from the stage's CACHE CLUSTER
+//! rather than by performing its integration again. Everything about it is the stage's own
+//! records ([`cache_plan`]):
+//!
+//! * WHETHER this call is cached: `cachingEnabled` on the method settings in force for it
+//!   — the entry keyed by this method, else the `*/*` entry that names every method of the
+//!   stage — and, because "a cache cluster must be enabled on the stage for responses to be
+//!   cached", a cluster that is actually up ([`crate::state::StageEntry::cache_cluster_status`]).
+//!   A `cacheTtlInSeconds` of zero caches nothing: "the higher the TTL, the longer the
+//!   response will be cached".
+//! * WHICH entry it is: the integration's `cacheNamespace` ("a group of related cached
+//!   parameters … you can specify the same cacheNamespace across resources to return the
+//!   same cached data"), the method's verb, and the value this request carries for each of
+//!   the integration's `cacheKeyParameters` ("a list of request parameters whose values API
+//!   Gateway caches") — [`cache_key`]. The namespace is the group, so two resources a
+//!   developer grouped under one share an entry and two carrying the per-resource default
+//!   `PutIntegration` writes do not.
+//! * HOW LONG it lasts: the TTL, after which a read of it is a miss — the expiry is a
+//!   transition the clock owes, materialised from the stored instant rather than by a timer
+//!   — and `FlushStageCache` drops every entry the cluster holds before that.
+//! * WHAT a client asking for it to be reloaded gets: `Cache-Control: max-age=0` asks for
+//!   the entry to be reloaded from the integration, and
+//!   `requireAuthorizationForCacheControl` decides whether that ask needs the
+//!   [`resource_policy::INVALIDATE_CACHE_ACTION`] grant. An ask that needs one and has none
+//!   is answered as `unauthorizedCacheControlHeaderStrategy` says: `FAIL_WITH_403` refuses
+//!   the request with the IAM-shaped sentence for that action, and the two `SUCCEED_…`
+//!   values serve the request with the header ignored — stating that in the response
+//!   ([`IGNORED_CACHE_CONTROL_WARNING`]) or not, as the value says.
+//!
+//! What is cached is what the INTEGRATION answered. A refusal the api itself produced (a
+//! gateway response for an unroutable path, an unauthorized call or an integration this
+//! emulator cannot perform) is not an integration's answer, so it is never held: the next
+//! request earns its own.
+//!
 //! # The half `TestInvokeMethod` shares
 //!
 //! `TestInvokeMethod` simulates "the invocation of a Method in your RestApi" — the same
@@ -146,7 +195,10 @@
 //! what this module performs FROM THE API'S OWN RECORDS, so neither can answer one stored
 //! configuration differently. Passing a request through is not that: the answer is another
 //! endpoint's response to a request this one forwarded, and a simulated invocation forwards
-//! nothing, so it keeps reporting such an integration as a configuration error.
+//! nothing, so it keeps reporting such an integration as a configuration error. Neither is
+//! the stage's response cache: `TestInvokeMethod` is not a request to the stage, so it
+//! neither reads nor fills what the cluster holds — it reports what the integration answers
+//! for the records as they stand.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -162,8 +214,10 @@ use crate::ops::put_integration::{
 use crate::ops::put_integration_response::is_static_mapping_value;
 use crate::ops::put_method::method_key;
 use crate::ops::put_method_response::METHOD_RESPONSE_HEADER_PREFIX;
-use crate::ops::types::{GetIntegrationOutput, GetIntegrationResponseOutput};
-use crate::state::{ApiKeyEntry, DeploymentEntry, MethodEntry, RestApiEntry};
+use crate::ops::types::{GetIntegrationOutput, GetIntegrationResponseOutput, MethodSetting};
+use crate::state::{
+    ApiKeyEntry, CachedResponse, DeploymentEntry, MethodEntry, RestApiEntry, StageEntry,
+};
 
 use ::service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
 
@@ -241,6 +295,57 @@ const API_KEY_HEADER: &str = "x-api-key";
 
 /// The `apiKeySource` that reads the key from the request header; see [`API_KEY_HEADER`].
 const API_KEY_SOURCE_HEADER: &str = "HEADER";
+
+/// The request header a client asks for the stage's CACHED entry to be reloaded with.
+///
+/// API Gateway's documented ask is one directive of it: "A client of your API can
+/// invalidate an existing cache entry and reload it from the integration endpoint … the
+/// request must contain the `Cache-Control: max-age=0` header."
+const CACHE_CONTROL_HEADER: &str = "cache-control";
+
+/// The `Cache-Control` directive that carries the ask; see [`CACHE_CONTROL_HEADER`]. A
+/// `max-age` of zero is the ask, and any other value of it is an ordinary freshness
+/// requirement that leaves the stage's cache alone.
+const MAX_AGE_DIRECTIVE: &str = "max-age";
+
+/// The `unauthorizedCacheControlHeaderStrategy` that refuses an unauthorized ask outright,
+/// from the modelled value set (`smithy_query(query="shape",
+/// shape="UnauthorizedCacheControlHeaderStrategy")`, which
+/// [`crate::ops::types::UNAUTHORIZED_CACHE_CONTROL_HEADER_STRATEGY_VALUES`] carries:
+/// `FAIL_WITH_403`, `SUCCEED_WITHOUT_RESPONSE_HEADER`, `SUCCEED_WITH_RESPONSE_HEADER`).
+const STRATEGY_FAIL_WITH_403: &str = "FAIL_WITH_403";
+
+/// The strategy that serves the request with the cache-control header ignored and SAYS so;
+/// see [`STRATEGY_FAIL_WITH_403`] for the value set and [`IGNORED_CACHE_CONTROL_WARNING`]
+/// for what it says.
+const STRATEGY_SUCCEED_WITH_RESPONSE_HEADER: &str = "SUCCEED_WITH_RESPONSE_HEADER";
+
+/// The response header a stage states an IGNORED cache-control header in: HTTP's own
+/// `Warning`, which is the field a response carries "additional information about the
+/// status or transformation of a message" in.
+const WARNING_HEADER: &str = "warning";
+
+/// What that header says. The warn-code is 199, the "miscellaneous warning" HTTP reserves
+/// for text a client may show its user, and the warn-agent is the endpoint that added it.
+/// AWS publishes the STRATEGY (`SUCCEED_WITH_RESPONSE_HEADER` — serve the request and state
+/// that the header was ignored) rather than a field or a sentence for it, so what is
+/// MODELLED here is that a response states it at all: the text names the permission the
+/// request lacked, which is what the caller would have to be granted, and the wire test
+/// asserts the header's PRESENCE rather than this text, so correcting the wording later
+/// changes no expectation.
+const IGNORED_CACHE_CONTROL_WARNING: &str = "199 execute-api \"Cache-Control header ignored: \
+                                             the caller is not authorized to perform \
+                                             execute-api:InvalidateCache\"";
+
+/// The `methodSettings` key that names EVERY method of a stage, which is the fallback for a
+/// method the stage holds no settings of its own for: `UpdateStage` keys a patch of
+/// `/*/*/…` under it.
+const EVERY_METHOD_SETTINGS_KEY: &str = "*/*";
+
+/// The JSON Pointer escape a `methodSettings` key spells the `/` of a resource path with:
+/// a patch addresses `/~1pets/GET/caching/enabled`, and the key the stage stores is the
+/// method path exactly as the patch spelled it.
+const ESCAPED_PATH_SEPARATOR: &str = "~1";
 
 /// The mapping-expression prefix of a request HEADER, which is how both an authorizer's
 /// identity source and a method's request parameter name one.
@@ -1019,7 +1124,7 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
     // a caller's own records decide, so it must not hold the lock every other request to
     // this service waits on, and recording a metered request needs an exclusive lock of
     // its own.
-    let (integration, pending_body, metering) = {
+    let (integration, pending_body, metering, caching) = {
         let store = state.lock();
         let Some(resolved) = resolve(&store, &addressed) else {
             // The api was deleted between the claim and now, or another process minted the
@@ -1075,38 +1180,42 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
         // before the api key, the request validator, the metering and the integration, none
         // of which a request it refuses ever reaches. An api carrying no document is asked
         // nothing and is served as it was before resource policies were read at all.
-        if let Some(policy) = api
+        //
+        // Who the request speaks for is the METHOD's authorization, not what the request
+        // carries: API Gateway authenticates nobody for a method whose `authorizationType`
+        // is `NONE`, so such a call speaks for nobody however it is signed, while an
+        // `AWS_IAM` method is reached with a credential the emulator has already verified.
+        // `service_common` owns the one definition of the identity this emulator's
+        // published credential speaks for, so the principal a refusal here blames is the
+        // one STS reports for it.
+        let signed_as = (authorization_type == AUTHORIZATION_AWS_IAM)
+            .then(::service_common::caller_principal::ambient_user_arn);
+        // Built once, because TWO decisions are taken about this call: whether the document
+        // lets it invoke the method, and whether it lets the caller ask for the stage's
+        // cached response to be reloaded.
+        let call_of = resource_policy::Call {
+            // The api's own Region, from the record: an api lives in exactly one
+            // Region, so the ARN a statement names its methods by carries the Region
+            // the api was created in, not one read off whichever endpoint this
+            // caller reached the emulator by (the path-addressed data plane reaches
+            // it at a host that spells no Region at all).
+            region: api.arn_region(),
+            api_id: &api.id,
+            stage: &stage.stage_name,
+            verb,
+            resource_path: matched_path,
+            source_vpce: resolved.source_vpce,
+            caller: match signed_as.as_deref() {
+                Some(principal) => resource_policy::Caller::Signed(principal),
+                None => resource_policy::Caller::Anonymous,
+            },
+        };
+        let attached_policy = api
             .policy
             .as_deref()
-            .filter(|policy| !policy.trim().is_empty())
-        {
-            // Who the request speaks for is the METHOD's authorization, not what the
-            // request carries: API Gateway authenticates nobody for a method whose
-            // `authorizationType` is `NONE`, so such a call speaks for nobody however it is
-            // signed, while an `AWS_IAM` method is reached with a credential the emulator
-            // has already verified. `service_common` owns the one definition of the identity
-            // this emulator's published credential speaks for, so the principal a refusal
-            // here blames is the one STS reports for it.
-            let signed_as = (authorization_type == AUTHORIZATION_AWS_IAM)
-                .then(::service_common::caller_principal::ambient_user_arn);
-            let call = resource_policy::Call {
-                // The api's own Region, from the record: an api lives in exactly one
-                // Region, so the ARN a statement names its methods by carries the Region
-                // the api was created in, not one read off whichever endpoint this
-                // caller reached the emulator by (the path-addressed data plane reaches
-                // it at a host that spells no Region at all).
-                region: api.arn_region(),
-                api_id: &api.id,
-                stage: &stage.stage_name,
-                verb,
-                resource_path: matched_path,
-                source_vpce: resolved.source_vpce,
-                caller: match signed_as.as_deref() {
-                    Some(principal) => resource_policy::Caller::Signed(principal),
-                    None => resource_policy::Caller::Anonymous,
-                },
-            };
-            if let Some(message) = resource_policy::denial(policy, &call) {
+            .filter(|policy| !policy.trim().is_empty());
+        if let Some(policy) = attached_policy {
+            if let Some(message) = resource_policy::denial(policy, &call_of) {
                 tracing::warn!(
                     api_id = %api.id,
                     stage = %stage.stage_name,
@@ -1140,6 +1249,36 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
             return refusal_response(Some(api), refusal);
         }
         let pending_body = pending_body_check(api, live_method, &call);
+
+        // The STAGE's own cache, which answers this call instead of its integration when
+        // the cluster holds an entry for it: WHICH entry, for how long, and what became of
+        // a cache-control header asking for it to be reloaded are all the stage's own
+        // settings ([`cache_plan`]). The lookup itself happens below, once the request has
+        // got past everything the method declares about it.
+        let caching = match cache_plan(
+            stage,
+            live_method.and_then(|method| method.integration.as_ref()),
+            &resource_path,
+            req,
+            attached_policy,
+            &call_of,
+        ) {
+            Caching::Off => None,
+            Caching::On(plan) => Some(plan),
+            // The stage requires authorization for a cache-control header, this caller
+            // holds none and the stage's strategy is to fail such a request: answered
+            // through `ACCESS_DENIED`, carrying the sentence for the action it asked for.
+            Caching::Refused(message) => {
+                tracing::warn!(
+                    api_id = %api.id,
+                    stage = %stage.stage_name,
+                    path = %matched_path,
+                    verb = %verb,
+                    "the caller is not authorized to invalidate this stage's cached response"
+                );
+                return refusal_response(Some(api), access_denied(message));
+            }
+        };
 
         // The integration is what answers, and it is READ here and PERFORMED below, after
         // the payload check: the step list this module opens with has the request validator
@@ -1190,7 +1329,7 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
         let metering = admission
             .filter(|admission| !admission.throttled_plans.is_empty())
             .map(|admission| (admission, refusal_response(Some(api), THROTTLED)));
-        (integration, pending_body, metering)
+        (integration, pending_body, metering, caching)
     };
 
     // The usage plan METERS the call before its payload is checked, as API Gateway's
@@ -1215,8 +1354,27 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
     }
 
     // The request has got past everything the method declares about it, so now — and only
-    // now — the integration is performed.
+    // now — the STAGE'S CACHE is asked, and then, on a miss, the integration is performed.
     //
+    // A cluster holding an entry for this call answers it with the integration never
+    // performed: that is what caching a response means. A request that asked for the entry
+    // to be reloaded, and that the stage honoured, skips this read, so what it gets is the
+    // integration's own fresh answer.
+    if let Some(plan) = caching.as_ref().filter(|plan| !plan.reload) {
+        let held = {
+            let store = state.lock();
+            store
+                .rest_apis
+                .get(&integration.api_id)
+                .and_then(|api| api.stages.get(&integration.stage))
+                .and_then(|stage| stage.cached_response(&plan.key))
+                .cloned()
+        };
+        if let Some(held) = held {
+            return warned(cached_response(held), plan.warn);
+        }
+    }
+
     // Every outcome an integration this call cannot be performed through earns is rendered
     // the same way: through the api's own gateway response for the refusal, so the records
     // are read again — briefly, and only to render it.
@@ -1243,23 +1401,41 @@ fn serve_resolved<Eng: Send + Sync + 'static>(
         .as_ref()
         .and_then(|method| method.integration.as_ref())
         .and_then(|record| passed_through(record, req, hop));
-    if let Some(passed_on) = passed_on {
+    let served = if let Some(passed_on) = passed_on {
         if let Some(reason) = integration.unusable_connection.clone() {
             return refuse(UnservedIntegration {
                 refusal: API_CONFIGURATION_ERROR,
                 reason,
             });
         }
-        return match passed_on {
-            PassedThrough::Unserved(unserved) => refuse(unserved),
+        match passed_on {
+            PassedThrough::Unserved(unserved) => return refuse(unserved),
             PassedThrough::Request(onward) => serve_resolved(engine, &onward, hop + 1),
-        };
-    }
+        }
+    } else {
+        match perform_integration(integration.method.as_ref(), &integration.call) {
+            Ok(served) => served_response(served),
+            Err(unserved) => return refuse(unserved),
+        }
+    };
 
-    match perform_integration(integration.method.as_ref(), &integration.call) {
-        Ok(served) => served_response(served),
-        Err(unserved) => refuse(unserved),
+    // What the integration answered is what the stage's cache now holds, for as long as
+    // the method's TTL says — which is how the NEXT request to it is answered without the
+    // integration being performed again. Only an integration's own answer is held: a
+    // refusal the api itself produced returned above, so none of them reaches here.
+    if let Some(plan) = &caching {
+        if let Some(entry) = cached_entry(&served, plan.ttl) {
+            let mut store = state.lock();
+            if let Some(stage) = store
+                .rest_apis
+                .get_mut(&integration.api_id)
+                .and_then(|api| api.stages.get_mut(&integration.stage))
+            {
+                stage.cache_response(plan.key.clone(), entry);
+            }
+        }
     }
+    warned(served, caching.is_some_and(|plan| plan.warn))
 }
 
 /// What the WAFv2 web ACL in front of the addressed stage made of the request.
@@ -1526,6 +1702,313 @@ fn metered_refusal(
         }
     }
     shed.then_some(())
+}
+
+/// What the stage's method settings make of this call's CACHING.
+#[derive(Debug)]
+enum Caching {
+    /// Nothing: the method's settings do not cache this call, so it is served by
+    /// performing the integration and nothing is held.
+    Off,
+    /// The stage caches this call, under this plan.
+    On(CachePlan),
+    /// The request asked for the held entry to be reloaded, the stage requires
+    /// authorization for that ask, the caller holds none and the stage's strategy for such
+    /// a request is to fail it: this is the sentence it is refused with.
+    Refused(String),
+}
+
+/// What this call's caching amounts to: the entry the stage's cluster holds it under, how
+/// long for, and what became of a cache-control header asking for that entry to be
+/// reloaded.
+#[derive(Debug)]
+struct CachePlan {
+    /// The key the stage's cache holds this call's response under; see [`cache_key`].
+    key: String,
+    /// `cacheTtlInSeconds`, as the duration an entry stored now is usable for.
+    ttl: ::std::time::Duration,
+    /// Whether the held entry is NOT to be read: the request asked for it to be reloaded
+    /// from the integration and the stage honoured the ask, so the integration answers and
+    /// what it answers replaces the entry.
+    reload: bool,
+    /// Whether the response is to state that an unauthorized cache-control header was
+    /// ignored ([`STRATEGY_SUCCEED_WITH_RESPONSE_HEADER`]).
+    warn: bool,
+}
+
+/// How the stage's cache serves this call, from the stage's own settings and the
+/// integration's own cache configuration.
+///
+/// `integration` is the LIVE method's integration, whose `cacheNamespace` and
+/// `cacheKeyParameters` say which entry this call is: a method with no integration caches
+/// nothing because there is nothing to cache. `request_path` is the path the request
+/// actually addressed, which is what a `method.request.path.{name}` cache key parameter
+/// reads its value out of — the deployed path TEMPLATE it matched, and the verb the method
+/// is addressed by, are `call`'s own members.
+///
+/// `policy` is the api's own resource policy and `call` the call it decides, which together
+/// say whether this caller may ask for the held entry to be reloaded
+/// ([`resource_policy::authorizes_invalidation`]).
+fn cache_plan(
+    stage: &StageEntry,
+    integration: Option<&GetIntegrationOutput>,
+    request_path: &str,
+    req: &RtRequest,
+    policy: Option<&str>,
+    call: &resource_policy::Call<'_>,
+) -> Caching {
+    let matched_path = call.resource_path;
+    let verb = call.verb;
+    let Some(settings) = method_settings_in_force(stage, matched_path, verb) else {
+        return Caching::Off;
+    };
+    // "Specifies whether responses should be cached and returned for requests. A cache
+    // cluster must be enabled on the stage for responses to be cached"
+    // (`MethodSetting$cachingEnabled`), so a method that asks for caching on a stage whose
+    // cluster is not up is served from its integration every time — as it is while the
+    // cluster is still coming up, being torn down, or being flushed.
+    if !settings.caching_enabled
+        || stage.cache_cluster_status() != crate::state::CACHE_CLUSTER_AVAILABLE
+    {
+        return Caching::Off;
+    }
+    // "Specifies the time to live (TTL), in seconds, for cached responses. The higher the
+    // TTL, the longer the response will be cached": a TTL of zero holds a response for no
+    // time at all, so nothing is cached.
+    let Ok(ttl) = u64::try_from(settings.cache_ttl_in_seconds) else {
+        return Caching::Off;
+    };
+    if ttl == 0 {
+        return Caching::Off;
+    }
+    let Some(integration) = integration else {
+        return Caching::Off;
+    };
+
+    // What the request asked about the entry the cluster holds, and what the stage's
+    // settings make of the ask.
+    let mut reload = false;
+    let mut warn = false;
+    if invalidation_asked(req) {
+        if !settings.require_authorization_for_cache_control
+            || resource_policy::authorizes_invalidation(policy, call)
+        {
+            reload = true;
+        } else {
+            match settings
+                .unauthorized_cache_control_header_strategy
+                .as_deref()
+            {
+                Some(STRATEGY_FAIL_WITH_403) => {
+                    return Caching::Refused(resource_policy::invalidation_not_authorized(call));
+                }
+                Some(STRATEGY_SUCCEED_WITH_RESPONSE_HEADER) => warn = true,
+                // `SUCCEED_WITHOUT_RESPONSE_HEADER`, and a stage that names no strategy at
+                // all: the header is ignored and nothing is said about it.
+                _ => {}
+            }
+        }
+    }
+    Caching::On(CachePlan {
+        key: cache_key(integration, matched_path, request_path, verb, req),
+        ttl: ::std::time::Duration::from_secs(ttl),
+        reload,
+        warn,
+    })
+}
+
+/// The method settings in force for the method `verb` on the deployed resource path
+/// `matched_path` of this stage: the entry keyed by THAT method, else the one that names
+/// every method of the stage, else none at all.
+///
+/// A `methodSettings` key is "the method path" a patch addressed —
+/// `{resource_path}/{http_method}`, with the path's own `/` written as the JSON Pointer
+/// escape ([`ESCAPED_PATH_SEPARATOR`]) — or [`EVERY_METHOD_SETTINGS_KEY`], and the stage
+/// stores it exactly as the patch spelled it. Both spellings of the method's own key are
+/// tried, the escaped one first, because a patch that addressed the path with a literal
+/// separator stored it that way; the whole-stage key is the fallback, which is what makes a
+/// `/*/*/caching/enabled` patch cache every method.
+fn method_settings_in_force<'s>(
+    stage: &'s StageEntry,
+    matched_path: &str,
+    verb: &str,
+) -> Option<&'s MethodSetting> {
+    let verb = method_key(verb);
+    let escaped = matched_path.replace('/', ESCAPED_PATH_SEPARATOR);
+    let literal = matched_path.trim_start_matches('/');
+    [format!("{escaped}/{verb}"), format!("{literal}/{verb}")]
+        .iter()
+        .find_map(|key| stage.method_settings.get(key))
+        .or_else(|| stage.method_settings.get(EVERY_METHOD_SETTINGS_KEY))
+}
+
+/// The key the stage's cache holds this call's response under.
+///
+/// `cacheNamespace` IS the group: it "specifies a group of related cached parameters. By
+/// default, API Gateway uses the resource ID as the cacheNamespace. You can specify the
+/// same cacheNamespace across resources to return the same cached data for requests to
+/// different resources" — so the key names the NAMESPACE and not the resource, which is
+/// what lets two resources share an entry. Nothing is lost by leaving the resource out:
+/// `PutIntegration` defaults the member to the resource's own id, so two resources a
+/// developer did not deliberately group carry two namespaces already. An integration stored
+/// with no namespace at all falls back to the deployed resource path, which is the group of
+/// one resource that default would have given it.
+///
+/// The verb follows — a namespace groups the resources a developer grouped, not the methods
+/// on them — and then the value this request carries for each `cacheKeyParameters` entry ("a
+/// list of request parameters whose values API Gateway caches"), in the order the integration
+/// lists them. A parameter the request does not carry contributes its absence, so a request
+/// carrying it and one that does not are two entries rather than one.
+///
+/// What is NOT in the key is anything the integration did not name: two requests differing
+/// only in a query parameter, or in a path parameter, that is no cache key parameter are ONE
+/// entry, which is the documented consequence of leaving it out.
+fn cache_key(
+    integration: &GetIntegrationOutput,
+    matched_path: &str,
+    request_path: &str,
+    verb: &str,
+    req: &RtRequest,
+) -> String {
+    let namespace = integration
+        .cache_namespace
+        .as_deref()
+        .filter(|namespace| !namespace.is_empty())
+        .unwrap_or(matched_path);
+    let mut key = format!("{namespace}|{verb}");
+    let path_parameters = matched_path_parameters(matched_path, request_path);
+    for parameter in integration.cache_key_parameters.iter().flatten() {
+        let carried = match parameter_source(parameter) {
+            Some((ParameterIn::Query, name)) => {
+                ::service_common::query_parameter(query_of(req.uri()), name).map(str::to_string)
+            }
+            Some((ParameterIn::Header, name)) => req
+                .headers()
+                .get(name.to_ascii_lowercase())
+                .map(str::to_string),
+            Some((ParameterIn::Path, name)) => path_parameters.get(name).cloned(),
+            // A `cacheKeyParameters` entry is required to be a request parameter of the
+            // method, so an entry in any other form names no value: it contributes its
+            // absence, which is the same for every request and so cannot make two calls
+            // one entry.
+            None => None,
+        };
+        key.push('|');
+        key.push_str(parameter);
+        key.push('=');
+        key.push_str(carried.as_deref().unwrap_or_default());
+    }
+    key
+}
+
+/// The value each `{parameter}` segment of the matched resource path takes in the path this
+/// request addressed.
+///
+/// A deployed resource path is matched by TEMPLATE ([`match_resource_path`]), so a
+/// `method.request.path.{name}` source names a `{name}` segment of that template and its
+/// value is the segment the REQUEST carried in that position; a greedy `{name+}` takes
+/// every remaining segment, which is what makes it greedy.
+fn matched_path_parameters(matched_path: &str, request_path: &str) -> BTreeMap<String, String> {
+    let declared = path_segments(matched_path);
+    let sent = path_segments(request_path);
+    let mut parameters = BTreeMap::new();
+    for (position, segment) in declared.iter().enumerate() {
+        let Some(name) = segment
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+        else {
+            continue;
+        };
+        let greedy = name.ends_with('+');
+        let name = name.trim_end_matches('+');
+        let carried = if greedy {
+            sent.get(position..).map(|rest| rest.join("/"))
+        } else {
+            sent.get(position).map(|segment| (*segment).to_string())
+        };
+        if let Some(carried) = carried {
+            parameters.insert(name.to_string(), carried);
+        }
+    }
+    parameters
+}
+
+/// Whether this request asks for the stage's held entry to be reloaded from the
+/// integration.
+///
+/// The ask is the documented `Cache-Control: max-age=0` ([`CACHE_CONTROL_HEADER`]). A
+/// `Cache-Control` value is a comma-separated list of directives, so the ask stands wherever
+/// in the list it sits, and the directive's name is compared case-insensitively as HTTP
+/// compares it.
+fn invalidation_asked(req: &RtRequest) -> bool {
+    req.headers()
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(CACHE_CONTROL_HEADER))
+        .flat_map(|(_, value)| value.split(','))
+        .any(|directive| {
+            let (name, value) = directive.split_once('=').unwrap_or((directive, ""));
+            name.trim().eq_ignore_ascii_case(MAX_AGE_DIRECTIVE) && value.trim() == "0"
+        })
+}
+
+/// The response a cache HIT serves: the response the integration produced, as it was
+/// served.
+///
+/// Every header is re-inserted through the FALLIBLE form for the reason
+/// [`served_response`] gives: the entry was built from a response this endpoint already
+/// sent, so a value the wire cannot carry is skipped rather than failing the request.
+fn cached_response(held: CachedResponse) -> RtResponse {
+    let mut response = response_with(held.status, &held.content_type, held.body);
+    for (name, value) in held.headers {
+        if let Err(refused) = response.headers_mut().try_insert(name.clone(), value) {
+            tracing::warn!(
+                header = %name,
+                error = %refused,
+                "the cached response's header cannot be sent on the wire and is skipped"
+            );
+        }
+    }
+    response
+}
+
+/// What the stage's cache is to hold for the response `served`, due to expire a TTL from
+/// now — or `None` for a response whose body is not readable as bytes, which is nothing a
+/// later request could be served.
+fn cached_entry(served: &RtResponse, ttl: ::std::time::Duration) -> Option<CachedResponse> {
+    let body = served.body().bytes()?.to_vec();
+    let mut headers = BTreeMap::new();
+    let mut content_type = JSON_CONTENT_TYPE.to_string();
+    for (name, value) in served.headers().iter() {
+        if name.eq_ignore_ascii_case("content-type") {
+            content_type = value.to_string();
+            continue;
+        }
+        // `content-length` is computed from the body when the entry is served again
+        // ([`response_with`]), so holding the one this response carried would be a second
+        // copy of a derived value.
+        if name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        headers.insert(name.to_string(), value.to_string());
+    }
+    Some(CachedResponse {
+        status: served.status().as_u16(),
+        content_type,
+        body,
+        headers,
+        expires_at: ::std::time::Instant::now() + ttl,
+    })
+}
+
+/// `response`, stating that the request's cache-control header was ignored when the stage's
+/// strategy for an unauthorized ask is to state it ([`IGNORED_CACHE_CONTROL_WARNING`]).
+fn warned(mut response: RtResponse, warn: bool) -> RtResponse {
+    if warn {
+        let _ = response
+            .headers_mut()
+            .try_insert(WARNING_HEADER, IGNORED_CACHE_CONTROL_WARNING.to_string());
+    }
+    response
 }
 
 /// The refusal the method's `authorizationType` earns this request, or `None` when the

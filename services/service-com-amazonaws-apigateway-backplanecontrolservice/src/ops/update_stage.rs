@@ -333,6 +333,9 @@ fn apply_cache_cluster_enabled(entry: &mut StageEntry, patch: &Patch) -> Result<
         return Ok(());
     }
     let now = ::std::time::Instant::now();
+    // A cluster that is provisioned or torn down holds nothing: the entries of the one
+    // that was there do not survive it (`StageEntry::response_cache`).
+    entry.flush_response_cache();
     if entry.cache_cluster_enabled {
         entry.cache_cluster_ready_at = Some(now + crate::state::CACHE_CLUSTER_CREATE_SPAN);
         entry.cache_flush_done_at = None;
@@ -362,6 +365,9 @@ fn apply_cache_cluster_size(entry: &mut StageEntry, patch: &Patch) -> Result<(),
             Some(::std::time::Instant::now() + crate::state::CACHE_CLUSTER_CREATE_SPAN);
         entry.cache_flush_done_at = None;
         entry.cache_cluster_removed_at = None;
+        // A cluster of the new capacity comes up holding nothing, as a provisioned one
+        // does in [`apply_cache_cluster_enabled`].
+        entry.flush_response_cache();
     }
     Ok(())
 }

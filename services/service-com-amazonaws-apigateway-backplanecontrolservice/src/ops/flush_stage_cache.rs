@@ -204,6 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // swallowed by the creation it overlapped.
             let starts_at = ready_at.max(::std::time::Instant::now());
             stage.cache_flush_done_at = Some(starts_at + crate::state::CACHE_CLUSTER_FLUSH_SPAN);
+            // And the entries themselves go: a flushed cache holds nothing, so the next
+            // request to a method whose caching is enabled is a MISS and is answered by
+            // the integration again (`crate::service::invoke`).
+            stage.flush_response_cache();
         }
         Ok(FlushStageCacheOutput)
     }

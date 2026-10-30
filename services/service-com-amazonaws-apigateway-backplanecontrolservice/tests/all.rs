@@ -303,3 +303,8 @@ mod usage_plan_state_and_refusals;
 // Appended for the reason the note above gives.
 #[path = "all/api_key_import_enablement.rs"]
 mod api_key_import_enablement;
+// Appended for the reason the note above gives: the STAGE RESPONSE CACHE of the
+// `execute-api` data plane — what a method whose settings enable caching is answered with,
+// until the entry the cluster holds expires, is flushed or is reloaded.
+#[path = "all/stage_response_cache.rs"]
+mod stage_response_cache;

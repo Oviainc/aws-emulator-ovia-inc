@@ -599,6 +599,19 @@ pub struct StageEntry {
     /// stage; empty until a patch sets one, which is the empty `methodSettings` map a
     /// freshly created stage reports.
     pub method_settings: BTreeMap<String, MethodSetting>,
+    /// The responses this stage's cache cluster is HOLDING, keyed by the cache key the
+    /// data plane builds for one method request
+    /// ([`crate::service::invoke`]); empty on a stage nothing has been
+    /// cached for, which is every stage whose methods do not enable caching.
+    ///
+    /// Written by the `execute-api` data plane while SERVING a request, which is what a
+    /// response cache is: a cached response cannot be served again without the serving
+    /// that stored it. Bounded at [`MAX_CACHED_RESPONSES_PER_STAGE`] entries
+    /// ([`StageEntry::cache_response`]), so it never grows with the request count, and
+    /// emptied by `FlushStageCache` ([`StageEntry::flush_response_cache`]). No operation
+    /// of this service REPORTS it: API Gateway's `Stage` has no member for what its cache
+    /// holds.
+    pub response_cache: BTreeMap<String, CachedResponse>,
     pub tags: BTreeMap<String, String>,
     pub created_date: Option<::aws_smithy_types::DateTime>,
     pub last_updated_date: Option<::aws_smithy_types::DateTime>,
@@ -639,6 +652,75 @@ impl StageEntry {
             }
         }
     }
+
+    /// The response this stage's cache is holding under `key`, or `None` when it holds
+    /// none or the one it holds has stopped being usable.
+    ///
+    /// A stage only serves from a cache cluster that is up, which is the caller's check,
+    /// not this one's: what this answers is what the cluster HOLDS. An entry whose
+    /// `cacheTtlInSeconds` has passed is no longer one of them — the expiry is a
+    /// transition the CLOCK owes, so it is materialised from the stored due instant here
+    /// rather than by a timer, and the entry itself is reclaimed the next time this stage
+    /// caches anything ([`Self::cache_response`]).
+    pub fn cached_response(&self, key: &str) -> Option<&CachedResponse> {
+        let now = ::std::time::Instant::now();
+        self.response_cache
+            .get(key)
+            .filter(|held| now < held.expires_at)
+    }
+
+    /// Hold `response` under `key`, as the stage's cache cluster holds a served response.
+    ///
+    /// Every entry whose TTL has passed is dropped first — nothing else reclaims them —
+    /// and a cluster that is at its bound makes room by dropping the entry due to expire
+    /// first, which is the one that would be a miss soonest anyway. See
+    /// [`MAX_CACHED_RESPONSES_PER_STAGE`] for why there is a bound at all.
+    pub fn cache_response(&mut self, key: String, response: CachedResponse) {
+        let now = ::std::time::Instant::now();
+        self.response_cache.retain(|_, held| now < held.expires_at);
+        while self.response_cache.len() >= MAX_CACHED_RESPONSES_PER_STAGE
+            && !self.response_cache.contains_key(&key)
+        {
+            let Some(dropped) = self
+                .response_cache
+                .iter()
+                .min_by_key(|(_, held)| held.expires_at)
+                .map(|(held_under, _)| held_under.clone())
+            else {
+                break;
+            };
+            self.response_cache.remove(&dropped);
+        }
+        self.response_cache.insert(key, response);
+    }
+
+    /// Drop every response this stage's cache is holding: what `FlushStageCache` empties,
+    /// and what a cache cluster that is re-provisioned comes up with.
+    pub fn flush_response_cache(&mut self) {
+        self.response_cache.clear();
+    }
+}
+
+/// One response a stage's cache cluster is holding for a method request, as the
+/// `execute-api` data plane stored it.
+///
+/// The WHOLE response is kept, because that is what a cache hit serves: the response the
+/// integration produced, served again, rather than a response derived a second time from
+/// the records.
+#[derive(Debug, Clone)]
+pub struct CachedResponse {
+    /// The status of the response the integration produced.
+    pub status: u16,
+    /// The media type that response was served under.
+    pub content_type: String,
+    /// Its body, verbatim.
+    pub body: Vec<u8>,
+    /// The other headers it carried, keyed by the header name.
+    pub headers: BTreeMap<String, String>,
+    /// When this entry stops being usable: when it was stored plus the method setting's
+    /// `cacheTtlInSeconds` ("the time to live (TTL), in seconds, for cached responses").
+    /// A read at or after this instant is a MISS; see [`StageEntry::cached_response`].
+    pub expires_at: ::std::time::Instant,
 }
 
 /// One stored `VpcLink`: a named set of target ARNs a private integration reaches a VPC
@@ -1859,6 +1941,15 @@ pub const CACHE_CLUSTER_FLUSH_SPAN: ::std::time::Duration =
 /// The `cacheClusterStatus` of a cache cluster that is being torn down, after an
 /// `UpdateStage` disabled it.
 pub const CACHE_CLUSTER_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
+
+/// How many responses one stage's cache cluster holds at once.
+///
+/// A cache cluster is a FIXED-SIZE store — `cacheClusterSize` is "the stage's cache
+/// capacity in GB" — so a full cluster makes room for a new entry by dropping one
+/// ([`StageEntry::cache_response`]), and what the stage holds is bounded by the stage
+/// rather than by how many distinct requests reach it. The COUNT is the emulator's own:
+/// AWS publishes a capacity in bytes, not in entries.
+pub const MAX_CACHED_RESPONSES_PER_STAGE: usize = 512;
 
 /// How long a stage's cache cluster stays `DELETE_IN_PROGRESS` after an `UpdateStage`
 /// disabled it, after which the stage reports `NOT_AVAILABLE`. API Gateway documents no

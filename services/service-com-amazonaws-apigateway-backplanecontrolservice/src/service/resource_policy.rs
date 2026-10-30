@@ -9,6 +9,12 @@
 //! integration is reached. An api carrying no document has no resource-based grant to read
 //! and is served exactly as it was before one existed.
 //!
+//! A second action the document decides is the one a request asking for the stage's CACHED
+//! response to be reloaded asks for ([`INVALIDATE_CACHE_ACTION`]): a stage whose method
+//! settings require authorization for a cache-control header reads that grant through
+//! [`authorizes_invalidation`], and what it does with an unauthorized ask is the stage's
+//! own `unauthorizedCacheControlHeaderStrategy` rather than this module's business.
+//!
 //! The DECISION is not made here: it is
 //! [`::service_common::iam_authorization`], the tree's one evaluation of IAM policy
 //! documents, so this data plane and every other service handed the same document decide
@@ -46,6 +52,15 @@ use ::service_common::iam_authorization::{self as iam, Decision, PreparedDocumen
 /// The IAM action an invoke of a deployed method asks for, which is the action an API
 /// Gateway resource policy is written about: `execute-api:Invoke`.
 pub const INVOKE_ACTION: &str = "execute-api:Invoke";
+
+/// The IAM action a request asking for the stage's CACHED response to be reloaded asks
+/// for: `execute-api:InvalidateCache`.
+///
+/// Invalidating a cached entry is a separate permission from invoking the method — a
+/// caller that may invoke a method is not thereby allowed to drop the entry the stage
+/// holds for it — which is what `MethodSetting$requireAuthorizationForCacheControl`
+/// ("whether authorization is required for a cache invalidation request") turns on.
+pub const INVALIDATE_CACHE_ACTION: &str = "execute-api:InvalidateCache";
 
 /// The condition key naming the VPC endpoint a request arrived through — the key a private
 /// api's policy is pinned to one of its interface endpoints with.
@@ -168,16 +183,50 @@ impl Call<'_> {
 /// `policy` is the document the api carries; an api carrying none is not asked at all.
 #[must_use]
 pub fn denial(policy: &str, call: &Call<'_>) -> Option<String> {
-    let stated = decision(policy, call);
-    let refused = match stated {
+    let refused = refuses(decision(policy, call, INVOKE_ACTION), call);
+    refused.then(|| not_authorized(INVOKE_ACTION, call.principal_named(), &call.method_arn()))
+}
+
+/// Whether this call may ask for the stage's cached response to be reloaded, which is what
+/// a stage requiring authorization for a cache-control header asks about.
+///
+/// `policy` is the document the api carries, `None` for an api carrying none — which
+/// states nothing about the action, and so is read exactly as a document that mentions it
+/// nowhere: a request to a method that authorizes nobody holds no grant at all, while an
+/// IAM-authorized caller may hold an identity-based one this emulator does not model (the
+/// module docs give the whole argument, and it is the same one [`denial`] reads an invoke
+/// by).
+#[must_use]
+pub fn authorizes_invalidation(policy: Option<&str>, call: &Call<'_>) -> bool {
+    let stated = policy.map_or(Decision::NotStated, |policy| {
+        decision(policy, call, INVALIDATE_CACHE_ACTION)
+    });
+    !refuses(stated, call)
+}
+
+/// The sentence a cache invalidation this call is not authorized for is refused with: the
+/// principal that asked, the action it asked for and the method it asked for, as
+/// [`not_authorized`] words every such refusal.
+#[must_use]
+pub fn invalidation_not_authorized(call: &Call<'_>) -> String {
+    not_authorized(
+        INVALIDATE_CACHE_ACTION,
+        call.principal_named(),
+        &call.method_arn(),
+    )
+}
+
+/// Whether what the document STATED about this call refuses it.
+///
+/// See the module docs: for a method that authorizes nobody the document is the only grant
+/// there can be, so an unstated one refuses, while an IAM-authorized caller may hold an
+/// identity-based grant this emulator does not model.
+fn refuses(stated: Decision, call: &Call<'_>) -> bool {
+    match stated {
         Decision::Denied => true,
         Decision::Allowed => false,
-        // See the module docs: for a method that authorizes nobody this document is the
-        // only grant there can be, so an unstated one refuses, while an IAM-authorized
-        // caller may hold an identity-based grant this emulator does not model.
         Decision::NotStated => matches!(call.caller, Caller::Anonymous),
-    };
-    refused.then(|| not_authorized(call.principal_named(), &call.method_arn()))
+    }
 }
 
 /// What `policy` states about this call, over BOTH spellings of the resource a statement
@@ -187,7 +236,7 @@ pub fn denial(policy: &str, call: &Call<'_>) -> Option<String> {
 /// whichever way the statement wrote the resource — and an `Allow` under either grants,
 /// because the two spellings name ONE method and a document is not read as stating less
 /// than it wrote.
-fn decision(policy: &str, call: &Call<'_>) -> Decision {
+fn decision(policy: &str, call: &Call<'_>, action: &str) -> Decision {
     let document = PreparedDocument::read(policy);
     let principals = call.principals();
     let context: Vec<(String, String)> = call
@@ -196,7 +245,7 @@ fn decision(policy: &str, call: &Call<'_>) -> Decision {
         .unwrap_or_default();
     let mut allowed = false;
     for resource in [call.method_arn(), call.scoped_resource()] {
-        let request = iam::Request::new(INVOKE_ACTION, &resource, &principals)
+        let request = iam::Request::new(action, &resource, &principals)
             .with_context(&context)
             .with_published_keys(PUBLISHED_KEYS);
         match iam::resource_outcome_prepared(&document, &request).decision {
@@ -212,18 +261,16 @@ fn decision(policy: &str, call: &Call<'_>) -> Decision {
     }
 }
 
-/// The sentence AWS refuses an invoke with when the api's policy grants the caller nothing:
-/// the principal that asked, the action it asked for and the method it asked for.
+/// The sentence AWS refuses a call with when the api's policy grants the caller nothing
+/// for the action it asked for: the principal that asked, that action and the method it
+/// asked for.
 ///
 /// Not `::service_common::iam_authorization::not_authorized_by_resource_policy`, whose
 /// sentence ends in the clause OTHER services word their refusal with ("because no
 /// resource-based policy allows …"); the `execute-api` endpoint's own answer ends at the
 /// resource.
-fn not_authorized(principal: &str, method_arn: &str) -> String {
-    format!(
-        "User: {principal} is not authorized to perform: {INVOKE_ACTION} on resource: \
-         {method_arn}"
-    )
+fn not_authorized(action: &str, principal: &str, method_arn: &str) -> String {
+    format!("User: {principal} is not authorized to perform: {action} on resource: {method_arn}")
 }
 
 #[cfg(test)]
@@ -351,6 +398,75 @@ mod tests {
             refusal,
             "User: anonymous is not authorized to perform: execute-api:Invoke on resource: \
              arn:aws:execute-api:us-west-2:000000000000:abc1230000/s/GET/whoami",
+            "case the refusal sentence: got {refusal:?}"
+        );
+    }
+
+    #[test]
+    fn invalidating_the_cached_response_is_authorized_by_its_own_action() {
+        let grant = |action: &str| {
+            format!(
+                "{{\"Statement\":[{{\"Effect\":\"Allow\",\"Principal\":\"*\",\
+                 \"Action\":\"{action}\",\"Resource\":\"execute-api:/*\"}}]}}"
+            )
+        };
+        let deny_invalidation = grant("execute-api:InvalidateCache").replace("Allow", "Deny");
+        let signed = Caller::Signed("arn:aws:iam::000000000000:user/emulator");
+        // Rows differ along what the document states about the INVALIDATION action — the
+        // action itself, another action of the same service, every action, nothing, an
+        // explicit deny — and along the method's own authorization, which is what decides
+        // an unstated document.
+        type Row<'a> = (&'a str, Option<String>, Caller<'a>, bool);
+        let rows: Vec<Row<'_>> = vec![
+            (
+                "the action itself, authorizing nobody",
+                Some(grant(INVALIDATE_CACHE_ACTION)),
+                Caller::Anonymous,
+                true,
+            ),
+            (
+                "the invoke alone, authorizing nobody",
+                Some(grant(INVOKE_ACTION)),
+                Caller::Anonymous,
+                false,
+            ),
+            (
+                "every action of the service, authorizing nobody",
+                Some(grant("execute-api:*")),
+                Caller::Anonymous,
+                true,
+            ),
+            ("no document at all, authorizing nobody", None, Caller::Anonymous, false),
+            ("no document at all, IAM-authorized", None, signed, true),
+            (
+                "an explicit deny, IAM-authorized",
+                Some(deny_invalidation.clone()),
+                signed,
+                false,
+            ),
+            (
+                "an explicit deny, authorizing nobody",
+                Some(deny_invalidation),
+                Caller::Anonymous,
+                false,
+            ),
+        ];
+        for (case, document, caller, authorized) in rows {
+            let read = authorizes_invalidation(document.as_deref(), &call(None, caller));
+            assert_eq!(
+                read, authorized,
+                "case {case}: expected authorized={authorized}, got {read}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unauthorized_invalidation_names_its_own_action() {
+        let refusal = invalidation_not_authorized(&call(None, Caller::Anonymous));
+        assert_eq!(
+            refusal,
+            "User: anonymous is not authorized to perform: execute-api:InvalidateCache on \
+             resource: arn:aws:execute-api:us-west-2:000000000000:abc1230000/s/GET/whoami",
             "case the refusal sentence: got {refusal:?}"
         );
     }

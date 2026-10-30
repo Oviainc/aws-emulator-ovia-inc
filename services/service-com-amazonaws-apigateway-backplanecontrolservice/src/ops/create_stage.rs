@@ -418,6 +418,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tracing_enabled: input.tracing_enabled,
             // `UpdateStage` writes the method settings, so a new stage carries none.
             method_settings: BTreeMap::new(),
+            // A stage this call creates has served nothing, so its cache holds nothing
+            // whether or not it asked for a cluster.
+            response_cache: BTreeMap::new(),
             tags: input
                 .tags
                 .unwrap_or_default()
