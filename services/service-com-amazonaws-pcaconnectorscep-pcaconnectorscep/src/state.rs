@@ -618,6 +618,31 @@ impl TaggableMut<'_> {
         }
         changed
     }
+
+    /// Drop the tags `keys` names from the record's own map and, when that leaves the record
+    /// different from what it was, record `now` as the instant it changed. Answers whether
+    /// anything changed.
+    ///
+    /// A tag is identified by its key alone, so a key the resource carries takes its value with
+    /// it and every other tag it carries stays. A key the resource does not carry leaves the
+    /// record exactly as it was — removing a tag that is not there is the same end state as
+    /// removing it twice — so there is no change for the timestamp to report.
+    pub fn remove_tags<K: AsRef<str>>(
+        &mut self,
+        keys: impl IntoIterator<Item = K>,
+        now: SystemTime,
+    ) -> bool {
+        let mut changed = false;
+        for key in keys {
+            if self.tags.remove(key.as_ref()).is_some() {
+                changed = true;
+            }
+        }
+        if changed {
+            *self.updated_at = now;
+        }
+        changed
+    }
 }
 
 /// The key a `ClientToken` seen in `region` is remembered under, so one token stands for one
@@ -861,21 +886,24 @@ fn is_tag_character(character: char) -> bool {
         || matches!(character, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
 }
 
-/// Why this one tag may not be stored, as the sentence to refuse the request with, or `None`
-/// when the pair is one a caller may set.
+/// Why this one tag KEY is not a key a caller may name, as the sentence to refuse the request
+/// with and naming `member` as the member it came in on, or `None` when it is.
 ///
-/// The key is checked before the value, and each half's length before its characters, so the
-/// text a message quotes back is always within the bound the quote came from.
-pub fn tag_entry_rejection(key: &str, value: &str) -> Option<String> {
+/// The service's ONE statement of what a tag key is — its length, its alphabet and the
+/// namespace Amazon Web Services keeps for itself — so every operation that takes tag keys,
+/// as the halves of `Tags` or as `TagKeys` on its own, holds a caller to the same rule. The
+/// length is checked before the characters, so the text a message quotes back is always
+/// within the bound the quote came from.
+pub fn tag_key_rejection(member: &str, key: &str) -> Option<String> {
     let key_length = key.chars().count();
     if key_length == 0 {
         return Some(format!(
-            "Tags carries an empty tag key; a tag key is 1 to {MAX_TAG_KEY_LENGTH} characters"
+            "{member} carries an empty tag key; a tag key is 1 to {MAX_TAG_KEY_LENGTH} characters"
         ));
     }
     if key_length > MAX_TAG_KEY_LENGTH {
         return Some(format!(
-            "Tags carries a tag key of {key_length} characters; a tag key is 1 to \
+            "{member} carries a tag key of {key_length} characters; a tag key is 1 to \
              {MAX_TAG_KEY_LENGTH} characters"
         ));
     }
@@ -893,6 +921,19 @@ pub fn tag_entry_rejection(key: &str, value: &str) -> Option<String> {
             "tag key `{key}` uses the `{RESERVED_TAG_KEY_PREFIX}` prefix, which is reserved \
              for the tags Amazon Web Services sets itself"
         ));
+    }
+    None
+}
+
+/// Why this one tag may not be stored, as the sentence to refuse the request with, or `None`
+/// when the pair is one a caller may set.
+///
+/// The key is checked before the value ([`tag_key_rejection`]), and each half's length before
+/// its characters, so the text a message quotes back is always within the bound the quote came
+/// from.
+pub fn tag_entry_rejection(key: &str, value: &str) -> Option<String> {
+    if let Some(why) = tag_key_rejection("Tags", key) {
+        return Some(why);
     }
     let value_length = value.chars().count();
     if value_length > MAX_TAG_VALUE_LENGTH {
@@ -934,6 +975,27 @@ pub fn tags_rejection<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) ->
     entries
         .into_iter()
         .find_map(|(key, value)| tag_entry_rejection(key, value))
+}
+
+/// Why the `TagKeys` of a request names something that is not a tag key, or `None` when every
+/// entry is a key a caller may name.
+///
+/// `TagKeys` is a `list<String>` with no modelled `@length` and no `@pattern`, on the list or
+/// on its member (smithy_query: operation UntagResource), so nothing is refused at the request
+/// boundary and the rule is the same one every other tagging operation holds a caller to
+/// ([`tag_key_rejection`]): a string outside it is not a tag key at all, and the reserved
+/// namespace holds the tags Amazon Web Services sets itself, which a caller may neither write
+/// nor remove.
+///
+/// No count ceiling applies: [`MAX_TAGS_PER_RESOURCE`] bounds what a resource CARRIES, and
+/// naming a key the resource does not have removes nothing. The keys are walked in key order,
+/// so the same list is always refused with the same sentence however the request happened to
+/// order it.
+pub fn tag_keys_rejection<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut keys: Vec<&str> = keys.into_iter().collect();
+    keys.sort_unstable();
+    keys.into_iter()
+        .find_map(|key| tag_key_rejection("TagKeys", key))
 }
 
 /// The region this request was signed for, read from its SigV4 credential scope.

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Drops the tags the request's `TagKeys` names from the connector or challenge `ResourceArn`
+//! names, out of the same single map `TagResource` writes and `ListTagsForResource` reads: a
+//! key the resource carries goes, with its value, and every other key it carries stays. A key
+//! the resource does not carry removes nothing, so the call is idempotent — as the model marks
+//! it — and repeating it answers the same 204. Removing a tag changes the record, so a removal
+//! that actually dropped something also moves the `UpdatedAt` the connector or challenge
+//! reports, while a call that dropped nothing leaves the record as it was.
+//!
+//! A connector whose `DeleteConnector` has been accepted is reported until its teardown
+//! completes but can no longer be changed, so a removal naming it — or a challenge hanging off
+//! it — is refused 400 `ValidationException` with `Reason` `INVALID_STATE` rather than answered
+//! 204 for a change the teardown would discard.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +178,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let now = ::std::time::SystemTime::now();
+        // This service is regional: a resource exists only in the Region its ARN names, so
+        // the Region the request was signed for is part of resolving that ARN.
+        let region = crate::state::request_region(ctx);
+
+        // `ResourceArn` is parsed BEFORE anything is looked up — before the store is even
+        // reached — so a value that names no resource at all is refused as the input error it
+        // is, rather than reported as a resource this service does not hold.
+        if let Some(why) = crate::state::resource_arn_rejection(&input.resource_arn) {
+            return Err(validation(why));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        // The transition the clock already owes, materialised before the lookup, so a
+        // connector whose teardown has come due cannot have its tags changed.
+        store.settle(now);
+
+        // `TagKeys` carries neither a modelled `@length` nor a `@pattern`, on the list or on
+        // its member, so what a tag key may be is this handler's to enforce — the same rule
+        // every other tagging operation holds a caller to. Checked BEFORE the lookup, so a
+        // request naming something that is not a tag key is refused for that and changes
+        // nothing.
+        if let Some(why) =
+            crate::state::tag_keys_rejection(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(validation(why));
+        }
+
+        let resource_arn = input.resource_arn.clone();
+
+        // A connector whose deletion has already been accepted is a record this service only
+        // REPORTS until it disappears: a tag removed from it — or from a challenge hanging off
+        // it, which goes with it — is a change to a record on its way out, so the removal is
+        // refused for the status it is in instead of being answered as a success. A status
+        // refusal is for a resource that EXISTS: an ARN this service holds no record under is
+        // the 404 below, so the owning connector's status is consulted only once the tag map
+        // is known to be there. The connector's own strings are cloned out, so the write below
+        // takes the store mutably with nothing borrowed from this lookup.
+        let under_teardown = if store.tags_of(&region, &resource_arn).is_some() {
+            store
+                .owning_connector(&region, &resource_arn)
+                .filter(|connector| connector.is_deleting())
+                .map(|connector| (connector.arn.clone(), connector.status.clone()))
+        } else {
+            None
+        };
+        if let Some((connector_arn, status)) = under_teardown {
+            return Err(invalid_state(&resource_arn, &connector_arn, &status));
+        }
+
+        // The removal's own lookup, taken mutably: it lands on the very map
+        // `ListTagsForResource` reads, and carries the record's own change timestamp beside
+        // that map, because dropping a tag changes the record. It is also what answers a
+        // `ResourceArn` this service holds no record under.
+        let Some(mut target) = store.taggable_mut(&region, &resource_arn) else {
+            return Err(not_found(&resource_arn));
+        };
+
+        // AWS tagging semantics: a tag is identified by its key alone, so each named key takes
+        // its value with it and every other tag the resource carries stays. A key the resource
+        // does not carry removes nothing — which is what makes the modelled idempotence hold —
+        // and a call that dropped nothing leaves the record's `UpdatedAt` where it was.
+        target.remove_tags(&input.tag_keys, now);
+
+        // `UntagResource` models no output members (its output shape is `Unit`): the modelled
+        // 204 and an empty body are the whole answer, and what the resource is left carrying is
+        // read back through `ListTagsForResource`.
+        Ok(UntagResourceOutput)
     }
+}
+
+/// Refuse a request this operation cannot act on — HTTP 400 `ValidationException`, whose own
+/// doc names this class and this case ("invalid characters in a name tag"). The modelled shape
+/// is used rather than the scaffold's synthetic one, so the caller also gets the `Reason`
+/// member.
+fn validation(message: String) -> UntagResourceError {
+    UntagResourceErrorModeled::ValidationException(ValidationException {
+        message,
+        // "The service doesn't return a reason for every validation exception" (`Reason`'s
+        // own doc), and `ValidationExceptionReason` carries no value for a malformed member
+        // or for a tag key a caller may not name.
+        reason: None,
+    })
+    .into()
+}
+
+/// The resource exists, but the connector it hangs off has been accepted for teardown, so
+/// nothing on it may be changed — HTTP 400 `ValidationException` carrying the modelled `Reason`
+/// for a call a connector's status does not allow. The record is still READ through
+/// `ListTagsForResource` and `GetConnector`; only the change is refused.
+fn invalid_state(resource_arn: &str, connector_arn: &str, status: &str) -> UntagResourceError {
+    let message = if resource_arn == connector_arn {
+        format!("Connector {connector_arn} has status {status}; its tags cannot be changed")
+    } else {
+        format!(
+            "{} {resource_arn} belongs to connector {connector_arn}, which has status {status}; \
+             its tags cannot be changed",
+            crate::state::resource_type_of(resource_arn)
+        )
+    };
+    UntagResourceErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some(crate::state::REASON_INVALID_STATE.to_string()),
+    })
+    .into()
+}
+
+/// This service holds no connector or challenge under this ARN — HTTP 404
+/// `ResourceNotFoundException`, whose own doc covers both the resource that is gone and the
+/// one "incorrectly specified". A call naming a deleted resource, or one whose owning
+/// connector's teardown has completed, lands here.
+///
+/// Reserved for an ARN that could name one of this service's resources: a value that is not
+/// such an ARN is refused by [`validation`] before any lookup.
+fn not_found(resource_arn: &str) -> UntagResourceError {
+    let resource_type = crate::state::resource_type_of(resource_arn);
+    UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("{resource_type} {resource_arn} could not be found"),
+        resource_id: resource_arn.to_string(),
+        resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, which this operation models as
+/// `InternalServerException` (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> UntagResourceError {
+    UntagResourceErrorModeled::InternalServerException(InternalServerException {
+        message: "the Connector for SCEP connector store is unavailable".to_string(),
+    })
+    .into()
 }
