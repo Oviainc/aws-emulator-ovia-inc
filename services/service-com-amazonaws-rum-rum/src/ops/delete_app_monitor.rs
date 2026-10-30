@@ -178,8 +178,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // "This immediately stops the collection of data": the record goes — with its
         // tags and its event buffer, which live on it — and its id leaves the index, so
-        // a later `GetAppMonitor` by name and a later `PutRumEvents` with the old id both
-        // answer `ResourceNotFoundException`.
+        // nothing resolves the monitor afterwards and every later call is refused by the
+        // rule its OWN addressing establishes. A call that resolves the monitor by name
+        // (`GetAppMonitor` and the other name-addressed operations) answers
+        // `ResourceNotFoundException`, and so do the ARN-addressed tagging operations —
+        // that shape, under the shorter code their frontend puts on the wire. The
+        // data-plane `PutRumEvents`, which is authorized AGAINST the monitor its `Id`
+        // resolves to, is left with no resource to establish the grant against and answers
+        // `AccessDeniedException`, disclosing nothing about whether such a monitor exists
+        // (`crate::state::caller_lacks_permissions`).
         if store.remove_app_monitor(&region, &input.name).is_none() {
             return Err(DeleteAppMonitorErrorModeled::ResourceNotFoundException(
                 crate::state::app_monitor_not_found(&input.name),
