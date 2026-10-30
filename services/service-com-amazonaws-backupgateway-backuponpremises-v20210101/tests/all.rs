@@ -57,6 +57,8 @@ mod metadata_sync_over_the_wire;
 mod metadata_sync_publication_is_one_instant;
 #[path = "all/metadata_sync_restart_supersedes_the_pending_sync.rs"]
 mod metadata_sync_restart_supersedes_the_pending_sync;
+#[path = "all/minted_hypervisor_identity.rs"]
+mod minted_hypervisor_identity;
 #[path = "all/minted_identity_is_never_reused.rs"]
 mod minted_identity_is_never_reused;
 #[path = "all/missing_resource_refusal_is_one_answer.rs"]

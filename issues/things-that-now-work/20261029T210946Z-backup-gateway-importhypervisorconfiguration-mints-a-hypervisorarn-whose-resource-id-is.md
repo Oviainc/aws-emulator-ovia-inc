@@ -46,3 +46,10 @@ Status, HTTP method and every other member of the response matched; 57 of 68 cor
 4. Compare with the recorded AWS response for the same call: the ARN's resource id is an opaque AWS-minted hypervisor id, not `hv-` + a zero-padded 16-digit counter, so the replay's shape assertion on $.HypervisorArn fails.
 5. Restart the emulator and repeat step 2 -> the identical ARN is handed out again, showing the id is a deterministic counter rather than an opaque minted identity.
 6. Replay the whole corpus (replay_wire_corpus) and read the cluster for fixture backup-gateway-import-hypervisor-password-validation, step task#2.
+
+## Resolution
+DECLINED, with the behaviour pinned by a test — the minted id form was NOT changed.
+
+The `hypervisor/<id>` resource id is a per-run, service-generated value: the Smithy model fixes only the member's form (`ServerArn`, `@length(min: 50, max: 500)` and the ARN pattern) and its documentation says only "The Amazon Resource Name (ARN) of the hypervisor", and the recorded response asserts no literal for it. Adopting another prefix or width would fit one recorded instance with a spelling no documented AWS rule produces, so the mint (`state.rs` `mint_resource` / `minted_resource_id`) is left as it is, and with it the determinism several suites and the page-token provenance check (`is_minted_resource_arn` / `minted_resource_sequence`) rest on.
+
+What the service owes instead is asserted end-to-end in `tests/all/minted_hypervisor_identity.rs`: every import mints its own identity in the modelled form, naming this service, the region the caller signed for, the emulator's account and the `hypervisor` resource type; the identity is unique per region however the request repeats itself; it reads back unchanged through every surface that names the record; and nothing but the exact identity — not a near miss in any segment or in any character of its id — names the record. No case asserts an id prefix or width. The replay key `backup-gateway|ImportHypervisorConfiguration|2xx->2xx|$.HypervisorArn` therefore still reports as failing: it is a shape assertion on a value AWS generates per run.
