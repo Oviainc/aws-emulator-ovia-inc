@@ -21,6 +21,13 @@
 //! another order, a filter repeated, another `maxResults`) — because a rule that
 //! refused every difference between two requests would break the paginator that
 //! resumes by repeating the request.
+//!
+//! What that refusal protects is pinned too, over the page sizes a listing
+//! distinguishes: a caller whose filters changed is sent back to the START of
+//! the sequence it now asks for, and walking that sequence reports every row it
+//! holds — including the rows that sort BEFORE the id a token of the other
+//! sequence resumes at, which are the ones a silently resumed token leaves out
+//! of the walk.
 
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
@@ -207,6 +214,48 @@ async fn check_resumes<F, Fut>(
             );
         }
     }
+}
+
+/// Every row a listing taken under `filters` reports, walked page by page at
+/// `page_size` through the `nextToken`s it mints: what a caller starting that
+/// sequence from the beginning — the only thing a refused token leaves it able
+/// to do — gets to see.
+///
+/// Bounded, so a listing that never stops handing out tokens fails the case
+/// instead of looping: no case here seeds more than a handful of rows.
+async fn walk<F, Fut>(
+    listing: &str,
+    page: &F,
+    member: &str,
+    key: &str,
+    filters: Option<Value>,
+    page_size: u32,
+) -> Vec<String>
+where
+    F: Fn(Option<Value>, u32, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Resp>,
+{
+    let mut rows = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..64 {
+        let served = page(filters.clone(), page_size, token.clone()).await;
+        assert_eq!(
+            served.status, 200,
+            "{listing} at page size {page_size}: expected 200, got {served:?}"
+        );
+        let reported_rows = reported(&served, member, key);
+        assert!(
+            reported_rows.len() <= page_size as usize,
+            "{listing} at page size {page_size}: a page may not exceed the size asked for, got \
+             {served:?}"
+        );
+        rows.extend(reported_rows);
+        token = served.member("nextToken").as_str().map(str::to_string);
+        if token.is_none() {
+            return rows;
+        }
+    }
+    panic!("{listing} at page size {page_size}: the listing kept handing out nextTokens");
 }
 
 /// The workspace the `ListEntities` cases page over.
@@ -833,9 +882,50 @@ const JOB_OTHER_WORKSPACE: &str = "filterScopeJobsTwo";
 const JOB_SOURCE_TYPE: &str = "s3";
 const JOB_DESTINATION_TYPE: &str = "iottwinmaker";
 
+/// One seeded metadata transfer job: its id, and the workspace the IoT
+/// TwinMaker end of its transfer names.
+struct SeededJob {
+    metadata_transfer_job_id: &'static str,
+    workspace_id: &'static str,
+}
+
 /// The metadata transfer jobs the `ListMetadataTransferJobs` cases page over:
-/// three naming one workspace at their destination and one naming the other,
-/// which is the row an unfiltered resume would have to report.
+/// three naming one workspace at their destination and three naming the other.
+///
+/// `jobAbacus` sorts BEFORE every job of the first workspace and `jobAnchor`
+/// sits between two of them in `metadataTransferJobId` order, so each is a row
+/// the whole-account sequence holds ahead of the id a one-row page of the
+/// filtered sequence resumes at — exactly the rows a token resumed under other
+/// filters would walk past.
+const SEEDED_JOBS: &[SeededJob] = &[
+    SeededJob {
+        metadata_transfer_job_id: "jobAbacus",
+        workspace_id: JOB_OTHER_WORKSPACE,
+    },
+    SeededJob {
+        metadata_transfer_job_id: "jobAlpha",
+        workspace_id: JOB_WORKSPACE,
+    },
+    SeededJob {
+        metadata_transfer_job_id: "jobAnchor",
+        workspace_id: JOB_OTHER_WORKSPACE,
+    },
+    SeededJob {
+        metadata_transfer_job_id: "jobBravo",
+        workspace_id: JOB_WORKSPACE,
+    },
+    SeededJob {
+        metadata_transfer_job_id: "jobCharlie",
+        workspace_id: JOB_WORKSPACE,
+    },
+    SeededJob {
+        metadata_transfer_job_id: "jobDelta",
+        workspace_id: JOB_OTHER_WORKSPACE,
+    },
+];
+
+/// The workspaces and the metadata transfer jobs the
+/// `ListMetadataTransferJobs` cases page over.
 async fn seed_transfer_jobs(emulator: &Emulator) {
     for workspace_id in [JOB_WORKSPACE, JOB_OTHER_WORKSPACE] {
         let created = emulator.create_workspace(workspace_id).await;
@@ -845,13 +935,11 @@ async fn seed_transfer_jobs(emulator: &Emulator) {
         );
     }
 
-    let jobs: Vec<(&str, &str)> = vec![
-        ("jobAlpha", JOB_WORKSPACE),
-        ("jobBravo", JOB_WORKSPACE),
-        ("jobCharlie", JOB_WORKSPACE),
-        ("jobDelta", JOB_OTHER_WORKSPACE),
-    ];
-    for (metadata_transfer_job_id, workspace_id) in jobs {
+    for &SeededJob {
+        metadata_transfer_job_id,
+        workspace_id,
+    } in SEEDED_JOBS
+    {
         let created = emulator
             .create_metadata_transfer_job(json!({
                 "metadataTransferJobId": metadata_transfer_job_id,
@@ -1006,4 +1094,66 @@ async fn a_list_metadata_transfer_jobs_token_is_bound_to_the_filters_that_select
         ],
     )
     .await;
+
+    // What the refusal protects: a caller that changes its filters is sent back
+    // to the START of the sequence it now asks for, where every job that
+    // sequence holds is still reported — none of them lost to a resume key
+    // taken in another sequence. Both sequences are read off the seeded jobs,
+    // so this states what the account holds rather than restating a page.
+    let mut whole_account: Vec<String> = SEEDED_JOBS
+        .iter()
+        .map(|job| job.metadata_transfer_job_id.to_string())
+        .collect();
+    whole_account.sort();
+    let mut of_workspace: Vec<String> = SEEDED_JOBS
+        .iter()
+        .filter(|job| job.workspace_id == JOB_WORKSPACE)
+        .map(|job| job.metadata_transfer_job_id.to_string())
+        .collect();
+    of_workspace.sort();
+    // Where a one-row page of the filtered sequence resumes: its second job.
+    let resume_key = &of_workspace[1];
+    assert!(
+        whole_account
+            .iter()
+            .any(|id| id < resume_key && !of_workspace.contains(id)),
+        "the seeded jobs must put a job of the whole-account sequence before the id a filtered \
+         page resumes at ({resume_key:?}), so resuming that token unfiltered would walk past it: \
+         got {whole_account:?}, of which {of_workspace:?} are the workspace's"
+    );
+
+    // The walks the refusal keeps whole, at the page sizes this listing
+    // distinguishes over these jobs: one per page, a size that divides the set,
+    // one that does not, exactly the set and more than the set.
+    for page_size in [1u32, 2, 4, 6, PAGE] {
+        let walked = walk(
+            "ListMetadataTransferJobs unfiltered",
+            &page,
+            "metadataTransferJobSummaries",
+            "metadataTransferJobId",
+            None,
+            page_size,
+        )
+        .await;
+        assert_eq!(
+            walked, whole_account,
+            "page size {page_size}: the unfiltered walk must report every job of the account \
+             exactly once in id order, got {walked:?}"
+        );
+
+        let walked = walk(
+            "ListMetadataTransferJobs under a workspace filter",
+            &page,
+            "metadataTransferJobSummaries",
+            "metadataTransferJobId",
+            Some(json!([{"workspaceId": JOB_WORKSPACE}])),
+            page_size,
+        )
+        .await;
+        assert_eq!(
+            walked, of_workspace,
+            "page size {page_size}: the filtered walk must report every job the filter selects \
+             exactly once in id order, got {walked:?}"
+        );
+    }
 }
