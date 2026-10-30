@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEc2DeepInspectionConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEc2DeepInspectionConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEc2DeepInspectionConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records the calling account's Amazon Inspector deep inspection activation
+//! and its deep inspection custom paths, then reports the configuration the account now
+//! has. An activation CHANGE is applied over a span, so the status it reports is `PENDING`
+//! until that span falls due and the activation asked for afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEc2DeepInspectionConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEc2DeepInspectionConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEc2DeepInspectionConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateEc2DeepInspectionConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "Amazon Inspector deep inspection state is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        // Deep inspection is configured per account and this operation names none, so it
+        // writes the configuration of the calling account — the single account this
+        // emulator presents.
+        let account_id = ::engine::emulator_account_id().to_string();
+        let now = ::std::time::SystemTime::now();
+
+        // `packagePaths` is the account's custom paths IN FULL: the response member is
+        // documented as "The current Amazon Inspector deep inspection custom paths for
+        // your account" (`smithy_query(query="doc",
+        // shape="UpdateEc2DeepInspectionConfigurationResponse", member="packagePaths")`),
+        // so what the account has afterwards is what the request named — a request naming
+        // fewer leaves it with fewer and one naming an empty list leaves it with none,
+        // while a request that omits the member asks nothing of the paths and leaves them
+        // as they were, exactly as omitting `activateDeepInspection` leaves the activation
+        // as it was. Every path reaching here satisfies the modelled `Path` pattern and
+        // the `PathList` length; both are refused at the boundary before this handler
+        // runs.
+        let mut guard = state.lock();
+        if !guard.update_ec2_deep_inspection(
+            &account_id,
+            input.activate_deep_inspection,
+            input.package_paths,
+            now,
+        ) {
+            // The store already tracks as many accounts as this emulator keeps records
+            // for, so there is no room to record a configuration for this one: refused
+            // rather than reported as applied.
+            return Err(UpdateEc2DeepInspectionConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::too_many_accounts_message(),
+                    // No member of this request is at fault: it names none.
+                    reason: "OTHER".to_string(),
+                    fields: None,
+                },
+            )
+            .into());
+        }
+        // Reported from the stored configuration, by the same reader
+        // `GetEc2DeepInspectionConfiguration` uses, so the two can never disagree.
+        let report = guard.ec2_deep_inspection(&account_id, now);
+
+        Ok(UpdateEc2DeepInspectionConfigurationOutput {
+            status: Some(report.status),
+            package_paths: report.package_paths,
+            org_package_paths: report.org_package_paths,
+            // `errorMessage` explains why new custom paths could NOT be added. They were,
+            // so the member is absent rather than carrying an empty explanation.
+            error_message: None,
+        })
     }
 }

@@ -2,19 +2,23 @@
 
 //! Engine state for the com-amazonaws-inspector2-inspector2 service.
 //!
-//! Three resources live here, and every implemented operation computes its answer from
+//! Four resources live here, and every implemented operation computes its answer from
 //! them:
 //!
 //! * `accounts` — per-account Amazon Inspector enablement, written by `Enable` and read
-//!   back by `BatchGetAccountStatus`.
+//!   back by `BatchGetAccountStatus`, plus that account's EC2 deep inspection
+//!   configuration, written by `UpdateEc2DeepInspectionConfiguration` and read back by
+//!   `GetEc2DeepInspectionConfiguration`.
 //! * `filters` — the suppression/other findings filters, keyed by their own ARN so a
 //!   record and its ARN can never diverge. `BTreeMap` iteration is stable, which is what
 //!   makes a `ListFilters` page token meaningful across calls.
 //! * `encryption_keys` — the customer managed KMS key in force per resource type and scan
 //!   type, written by `UpdateEncryptionKey` and read back by `GetEncryptionKey`.
+//! * `org_package_paths` — the organization-wide deep inspection custom paths both deep
+//!   inspection reads report alongside an account's own.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::FilterCriteria;
 
@@ -47,16 +51,46 @@ pub const STATUS_ENABLED: &str = "ENABLED";
 /// Source: `smithy_query(query="shape", shape="Status")`.
 pub const STATUS_DISABLED: &str = "DISABLED";
 
+/// The `Ec2DeepInspectionStatus` token of an account deep inspection is running for.
+/// Source: `smithy_query(query="shape", shape="Ec2DeepInspectionStatus")` —
+/// `ACTIVATED | DEACTIVATED | PENDING | FAILED`.
+pub const DEEP_INSPECTION_ACTIVATED: &str = "ACTIVATED";
+
+/// The `Ec2DeepInspectionStatus` token of an account deep inspection is off for.
+/// Source: `smithy_query(query="shape", shape="Ec2DeepInspectionStatus")`.
+pub const DEEP_INSPECTION_DEACTIVATED: &str = "DEACTIVATED";
+
+/// The `Ec2DeepInspectionStatus` token of an account whose requested activation change is
+/// still being applied.
+/// Source: `smithy_query(query="shape", shape="Ec2DeepInspectionStatus")`.
+pub const DEEP_INSPECTION_PENDING: &str = "PENDING";
+
+/// How long an EC2 deep inspection activation change stays [`DEEP_INSPECTION_PENDING`]
+/// before the clock owes the account its terminal status. The real service applies the
+/// change asynchronously, and no AWS document fixes how long it takes, so this span is
+/// this emulator's own: non-zero, so a caller reading straight after the write still
+/// observes the transient status, and short enough that polling settles quickly.
+pub const DEEP_INSPECTION_TRANSITION: Duration = Duration::from_secs(3);
+
 /// The most filters this emulator stores before refusing to mint another, so a caller
 /// looping `CreateFilter` cannot grow the process heap without bound. `CreateFilter`
 /// models `ServiceQuotaExceededException` precisely because the real service caps filters
 /// per account too; this is the emulator's own bound, of the same order.
 pub const MAX_STORED_FILTERS: usize = 1_000;
 
-/// The most accounts this emulator tracks enablement for. `Enable` refuses to add one
-/// past this, so a caller looping `Enable` with fresh account ids cannot grow the account
+/// The most accounts this emulator tracks enablement for. Every operation that records
+/// something for an account goes through
+/// [`ComAmazonawsInspector2Inspector2State::account_mut`], which refuses to add one past
+/// this, so a caller looping any of them with fresh account ids cannot grow the account
 /// map without bound.
 pub const MAX_ENABLED_ACCOUNTS: usize = 1_000;
+
+/// The refusal text for a request that would take the number of accounts this emulator
+/// tracks past [`MAX_ENABLED_ACCOUNTS`], shared by every operation that writes an account
+/// record so they all refuse the same way.
+pub fn too_many_accounts_message() -> String {
+    format!("Amazon Inspector can be enabled for at most {MAX_ENABLED_ACCOUNTS} accounts.")
+}
 
 /// The most `Enable` idempotency tokens remembered per account. Tokens are caller-chosen
 /// strings, so the record keeps only the most recent ones (oldest dropped first): a
@@ -86,6 +120,33 @@ pub struct StoredFilter {
     pub updated_at: SystemTime,
 }
 
+/// One account's Amazon Inspector deep inspection configuration for Amazon EC2.
+#[derive(Debug, Clone, Default)]
+pub struct Ec2DeepInspection {
+    /// The activation this account last asked for, or `None` while the account has never
+    /// configured deep inspection — in which case the activation follows the account's
+    /// EC2 scanning enablement (see
+    /// [`AccountEnablement::deep_inspection_activated`]), so the absence is kept out of
+    /// the boolean rather than spelled as one of its values.
+    pub activated: Option<bool>,
+    /// The instant the activation change this account asked for stops being
+    /// [`DEEP_INSPECTION_PENDING`] — the transition the CLOCK owes, stored rather than
+    /// slept for, so the status is derived on every read without writing anything.
+    pub pending_until: Option<SystemTime>,
+    /// The account's deep inspection custom paths, exactly as the last update wrote them;
+    /// empty for an account with no custom paths. Bounded by the modelled `PathList`
+    /// length (at most 5), which the boundary validator enforces before any handler runs.
+    pub package_paths: Vec<String>,
+}
+
+impl Ec2DeepInspection {
+    /// Whether the activation change this account asked for is still being applied at
+    /// `now`.
+    pub fn is_pending(&self, now: SystemTime) -> bool {
+        self.pending_until.is_some_and(|due| now < due)
+    }
+}
+
 /// Amazon Inspector enablement for one account.
 #[derive(Debug, Clone, Default)]
 pub struct AccountEnablement {
@@ -103,6 +164,10 @@ pub struct AccountEnablement {
     /// first: at most [`MAX_CLIENT_TOKENS_PER_ACCOUNT`] are kept, so caller-chosen
     /// strings cannot accumulate here. Add through [`AccountEnablement::remember_token`].
     pub client_tokens: VecDeque<String>,
+    /// The account's Amazon Inspector deep inspection configuration for Amazon EC2,
+    /// written by `UpdateEc2DeepInspectionConfiguration` and read back by
+    /// `GetEc2DeepInspectionConfiguration`.
+    pub deep_inspection: Ec2DeepInspection,
 }
 
 impl AccountEnablement {
@@ -120,6 +185,31 @@ impl AccountEnablement {
         self.resource_status
             .get(resource_type)
             .map_or(STATUS_DISABLED, String::as_str)
+    }
+
+    /// Whether Amazon Inspector deep inspection is in force for this account — the
+    /// activation the account last asked for, or, while it has never configured deep
+    /// inspection, the one that follows from its EC2 scanning enablement: Amazon Inspector
+    /// runs deep inspection for an account whose EC2 scanning is on unless that account
+    /// turns it off. While a change is still pending this is the activation being applied,
+    /// which is what another change is measured against.
+    pub fn deep_inspection_activated(&self) -> bool {
+        self.deep_inspection
+            .activated
+            .unwrap_or_else(|| self.status_of("EC2") == STATUS_ENABLED)
+    }
+
+    /// The `Ec2DeepInspectionStatus` this account reports at `now`: the activation change
+    /// it asked for while that change is still being applied, and the activation in force
+    /// once the clock has closed the span.
+    pub fn deep_inspection_status(&self, now: SystemTime) -> &'static str {
+        if self.deep_inspection.is_pending(now) {
+            DEEP_INSPECTION_PENDING
+        } else if self.deep_inspection_activated() {
+            DEEP_INSPECTION_ACTIVATED
+        } else {
+            DEEP_INSPECTION_DEACTIVATED
+        }
     }
 
     /// Whether this account was already enabled under `token`.
@@ -147,7 +237,8 @@ pub struct ComAmazonawsInspector2Inspector2State {
     /// refuses once the map holds that many.
     pub filters: BTreeMap<String, StoredFilter>,
     /// Account enablement, keyed by 12-digit account id. Bounded by
-    /// [`MAX_ENABLED_ACCOUNTS`]: `Enable` refuses to add an account past that.
+    /// [`MAX_ENABLED_ACCOUNTS`], which [`Self::account_mut`] — the only place an entry is
+    /// added — enforces for every operation that writes one.
     pub accounts: BTreeMap<String, AccountEnablement>,
     /// Monotonic source for the id segment of a minted filter ARN.
     pub next_filter_id: u64,
@@ -163,6 +254,33 @@ pub struct ComAmazonawsInspector2Inspector2State {
     /// so the map holds at most `ResourceType` × `ScanType` entries however many requests
     /// arrive. No request-supplied string ever becomes a key here.
     pub encryption_keys: BTreeMap<EncryptionKeyScope, String>,
+    /// The ORGANIZATION's deep inspection custom paths, which apply to every member
+    /// account on top of the account's own: one list for the organization this emulator
+    /// presents, since the operation that sets it carries no organization member. Empty
+    /// until the organization's delegated administrator sets paths through
+    /// `UpdateOrgEc2DeepInspectionConfiguration`, which both deep inspection reads report
+    /// from here. Bounded by the modelled `PathList` length (at most 5).
+    pub org_package_paths: Vec<String>,
+}
+
+/// What both EC2 deep inspection reads report for one account: its activation status at
+/// the instant it was asked, its own custom paths and the organization's.
+#[derive(Debug, Clone)]
+pub struct Ec2DeepInspectionReport {
+    /// An `Ec2DeepInspectionStatus` token.
+    pub status: String,
+    /// The account's custom paths, absent when it has none.
+    pub package_paths: Option<Vec<String>>,
+    /// The organization's custom paths, absent when it has none.
+    pub org_package_paths: Option<Vec<String>>,
+}
+
+/// Render a stored `PathList` for the wire: the paths when any are configured, and the
+/// member left ABSENT when none are, so an account that never set a custom path and one
+/// that cleared its paths report the same thing — having no custom paths — rather than one
+/// of them reporting an empty list.
+pub fn path_list(paths: &[String]) -> Option<Vec<String>> {
+    (!paths.is_empty()).then(|| paths.to_vec())
 }
 
 /// The scope one encryption-key setting belongs to: a `ResourceType` token and a
@@ -209,6 +327,80 @@ impl ComAmazonawsInspector2Inspector2State {
             region,
             &format!("owner/{owner_id}/filter/{id}"),
         )
+    }
+
+    /// The Amazon Inspector deep inspection configuration `account_id` reports at `now`.
+    ///
+    /// A pure read: the status is DERIVED from the stored activation and the instant the
+    /// activation change falls due, so reporting it writes nothing and a later caller sees
+    /// exactly what this one did. An account with no record of its own reports what any
+    /// account with no enablement and no deep inspection configuration reports.
+    pub fn ec2_deep_inspection(
+        &self,
+        account_id: &str,
+        now: SystemTime,
+    ) -> Ec2DeepInspectionReport {
+        let unconfigured = AccountEnablement::default();
+        let account = self.accounts.get(account_id).unwrap_or(&unconfigured);
+        Ec2DeepInspectionReport {
+            status: account.deep_inspection_status(now).to_string(),
+            package_paths: path_list(&account.deep_inspection.package_paths),
+            org_package_paths: path_list(&self.org_package_paths),
+        }
+    }
+
+    /// Apply an `UpdateEc2DeepInspectionConfiguration` to `account_id`: `activate` is the
+    /// activation asked for (absent when the request only touches custom paths), and
+    /// `package_paths` the account's custom paths in full (absent when the request only
+    /// touches the activation).
+    ///
+    /// Only a CHANGE of activation starts a transition: a request asking for the
+    /// activation already in force leaves the status terminal, because the service has
+    /// nothing to apply for it.
+    ///
+    /// Adds at most one entry to [`Self::accounts`], through [`Self::account_mut`], which
+    /// owns the bound on that map — so `false`, meaning the configuration was NOT applied,
+    /// is the answer once [`MAX_ENABLED_ACCOUNTS`] accounts are tracked and `account_id` is
+    /// not one of them. The caller refuses the request with the modelled error rather than
+    /// reporting a configuration it did not store.
+    #[must_use]
+    pub fn update_ec2_deep_inspection(
+        &mut self,
+        account_id: &str,
+        activate: Option<bool>,
+        package_paths: Option<Vec<String>>,
+        now: SystemTime,
+    ) -> bool {
+        let Some(account) = self.account_mut(account_id) else {
+            return false;
+        };
+        if let Some(activate) = activate {
+            if activate != account.deep_inspection_activated() {
+                account.deep_inspection.pending_until = Some(now + DEEP_INSPECTION_TRANSITION);
+            }
+            account.deep_inspection.activated = Some(activate);
+        }
+        if let Some(paths) = package_paths {
+            account.deep_inspection.package_paths = paths;
+        }
+        true
+    }
+
+    /// The enablement record of `account_id` to write through, created when nothing has
+    /// been recorded for that account yet — and `None` once [`MAX_ENABLED_ACCOUNTS`]
+    /// accounts are tracked and `account_id` is not one of them.
+    ///
+    /// The ONLY place an entry is added to [`Self::accounts`], so the bound on that map
+    /// holds however many operations write to it: a caller looping any of them with fresh
+    /// account ids cannot grow the map without bound. A caller that would add several
+    /// accounts at once checks the whole batch against the bound BEFORE its first write,
+    /// so a refused request stores nothing at all.
+    pub fn account_mut(&mut self, account_id: &str) -> Option<&mut AccountEnablement> {
+        if self.accounts.len() >= MAX_ENABLED_ACCOUNTS && !self.accounts.contains_key(account_id)
+        {
+            return None;
+        }
+        Some(self.accounts.entry(account_id.to_string()).or_default())
     }
 
     /// The aggregation rows the findings this service has recorded roll up to, for one

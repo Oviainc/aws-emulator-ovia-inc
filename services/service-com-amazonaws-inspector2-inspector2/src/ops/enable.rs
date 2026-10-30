@@ -113,6 +113,24 @@ impl From<EnableErrorModeled> for EnableError {
     }
 }
 
+/// The modelled refusal for a request that would take the number of accounts this
+/// emulator tracks enablement for past [`crate::state::MAX_ENABLED_ACCOUNTS`]: the
+/// request names a field, so the refusal names it back.
+fn too_many_accounts() -> EnableError {
+    EnableErrorModeled::ValidationException(ValidationException {
+        message: crate::state::too_many_accounts_message(),
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        fields: Some(vec![ValidationExceptionField {
+            name: "accountIds".to_string(),
+            message: format!(
+                "must not take the number of enabled accounts past {}",
+                crate::state::MAX_ENABLED_ACCOUNTS
+            ),
+        }]),
+    })
+    .into()
+}
+
 /// The `Enable` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -180,26 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|account_id| !guard.accounts.contains_key(*account_id))
             .count();
         if guard.accounts.len() + new_accounts > crate::state::MAX_ENABLED_ACCOUNTS {
-            return Err(EnableErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "Amazon Inspector can be enabled for at most {} accounts.",
-                    crate::state::MAX_ENABLED_ACCOUNTS
-                ),
-                reason: "FIELD_VALIDATION_FAILED".to_string(),
-                fields: Some(vec![ValidationExceptionField {
-                    name: "accountIds".to_string(),
-                    message: format!(
-                        "must not take the number of enabled accounts past {}",
-                        crate::state::MAX_ENABLED_ACCOUNTS
-                    ),
-                }]),
-            })
-            .into());
+            return Err(too_many_accounts());
         }
 
         let mut accounts = Vec::with_capacity(requested.len());
         for account_id in requested {
-            let enablement = guard.accounts.entry(account_id.clone()).or_default();
+            // The one place an account entry is added, so the bound checked above is the
+            // same bound every other operation writing an account record observes. It
+            // cannot refuse here: the whole batch was measured against it before this
+            // first write, which is what keeps a refused request from storing anything.
+            let Some(enablement) = guard.account_mut(&account_id) else {
+                return Err(too_many_accounts());
+            };
 
             // `clientToken` is an `@idempotencyToken`: a retry carrying a token this
             // account was already enabled with is a REPLAY, so it reports the stored

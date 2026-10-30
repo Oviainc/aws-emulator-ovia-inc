@@ -37,11 +37,16 @@ fn resource_member(resource_type: &str) -> &'static str {
 /// A router holding only this service, over its own engine, so each test starts from
 /// empty state.
 pub(crate) fn router() -> MultiServiceRouter {
-    let engine = Arc::new(engine::InMemoryEngine::new());
+    router_over(&Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// A router holding only this service, over `engine` — for a test that also reaches the
+/// store the handlers read.
+pub(crate) fn router_over(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
-        service_com_amazonaws_inspector2_inspector2::EmulatedService::new(engine),
+        service_com_amazonaws_inspector2_inspector2::EmulatedService::new(Arc::clone(engine)),
     );
     router
 }
