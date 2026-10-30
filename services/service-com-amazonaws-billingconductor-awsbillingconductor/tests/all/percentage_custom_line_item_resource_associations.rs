@@ -314,7 +314,11 @@ pub(crate) fn period(months: i64) -> String {
 /// The same billing period with its month spelled without a leading zero — the other
 /// spelling the modelled `BillingPeriod` pattern allows. A month from October on has
 /// only the one spelling, so for those this is the value it was given.
-fn one_digit_month(billing_period: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite that varies the SPELLING of a period it writes or
+/// reads names it the one way (see
+/// `tests/all/association_size_is_billing_period_scoped.rs`).
+pub(crate) fn one_digit_month(billing_period: &str) -> String {
     let (year, month) = billing_period
         .split_once('-')
         .expect("a billing period is spelled YYYY-MM");

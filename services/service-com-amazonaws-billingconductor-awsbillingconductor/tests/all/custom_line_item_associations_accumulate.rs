@@ -127,27 +127,38 @@ async fn resource_associations_accumulate_across_calls() {
         );
 
         // `AssociationSize` — "The number of resources that are associated to the
-        // custom line item" — counts the same membership.
+        // custom line item" — counts the same membership. The associations were all made
+        // with no range of their own, so every one of them is in effect in the current
+        // billing period, which the read names none to be scoped to.
         assert_eq!(
-            association_size(&emulator, &target).await,
-            json!(total),
+            association_size(&emulator, &target, None).await,
+            Some(json!(total)),
             "case {case:?}: expected an AssociationSize of {total}"
         );
     }
 }
 
-/// The `AssociationSize` `ListCustomLineItems` reports for one item.
+/// The `AssociationSize` `ListCustomLineItems` reports for one item in `billing_period`
+/// — in the CURRENT billing period, which a read naming none is scoped to, when it is
+/// `None`.
+///
+/// `None` when that read reports no such item at all, which every billing period before
+/// the one the item was created in does: there is no element there to carry a count.
 ///
 /// `pub(crate)` so the sibling suites about the same membership count it rather than
 /// reading the derived member a second way (see
 /// `tests/all/resource_re_association_restores_billing_periods.rs`).
-pub(crate) async fn association_size(emulator: &Emulator, target: &str) -> Value {
+pub(crate) async fn association_size(
+    emulator: &Emulator,
+    target: &str,
+    billing_period: Option<&str>,
+) -> Option<Value> {
+    let mut request = json!({ "MaxResults": 100, "Filters": { "Arns": [target] } });
+    if let Some(billing_period) = billing_period {
+        request["BillingPeriod"] = json!(billing_period);
+    }
     let (status, body) = emulator
-        .send(
-            "POST",
-            "/list-custom-line-items",
-            &json!({ "MaxResults": 100, "Filters": { "Arns": [target] } }),
-        )
+        .send("POST", "/list-custom-line-items", &request)
         .await;
     assert_eq!(
         status, 200,
@@ -158,13 +169,11 @@ pub(crate) async fn association_size(emulator: &Emulator, target: &str) -> Value
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    assert_eq!(
-        items.len(),
-        1,
-        "case the read of {target}: expected exactly the target, got {body}"
+    assert!(
+        items.len() <= 1,
+        "case the read of {target}: expected at most the target, got {body}"
     );
-    items[0]
-        .get("AssociationSize")
-        .cloned()
-        .unwrap_or(Value::Null)
+    items
+        .first()
+        .map(|item| item.get("AssociationSize").cloned().unwrap_or(Value::Null))
 }

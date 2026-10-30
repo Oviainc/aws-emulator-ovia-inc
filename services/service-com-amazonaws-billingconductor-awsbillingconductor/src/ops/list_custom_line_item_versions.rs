@@ -189,11 +189,19 @@ fn in_filter(
 /// Every value comes from the generation the store holds — `CurrencyCode` from the
 /// partition of the item's ARN, exactly as `ListCustomLineItems` derives it — so a
 /// version read reports what the item WAS, and its newest element what the item is.
+///
+/// `AssociationSize` is the one member that is scoped to a billing period rather than to
+/// the generation as a whole, so it is derived for the period the element itself names:
+/// the `StartBillingPeriod` this generation took effect in. A resource is associated to
+/// the item only in the periods its association record covers, so that count is the one
+/// `ListCustomLineItems` and `ListResourcesAssociatedToCustomLineItem` report for that
+/// same period.
 fn element(
     item_arn: &str,
     version: &CustomLineItemVersion,
     end_billing_period: Option<String>,
 ) -> CustomLineItemVersionListElement {
+    let start_billing_period = version.start_billing_period();
     CustomLineItemVersionListElement {
         name: Some(version.name.clone()),
         charge_details: Some(version.charge_details.clone()),
@@ -206,8 +214,8 @@ fn element(
         billing_group_arn: Some(version.billing_group_arn.clone()),
         creation_time: version.creation_time_millis,
         last_modified_time: version.last_modified_time_millis,
-        association_size: version.association_size,
-        start_billing_period: Some(version.start_billing_period()),
+        association_size: version.association_size(&start_billing_period),
+        start_billing_period: Some(start_billing_period),
         end_billing_period,
         arn: Some(item_arn.to_string()),
         start_time: version.start_time_millis,

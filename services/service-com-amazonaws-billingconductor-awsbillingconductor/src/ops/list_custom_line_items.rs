@@ -17,8 +17,9 @@
 //!   filters nothing.
 //!
 //! Every reported member is derived from the stored record: `AssociationSize` from the
-//! item's associations, the charge details from the flat/percentage value the version in
-//! effect carries, and `CurrencyCode` from the partition of its ARN.
+//! associations of the item that are IN EFFECT in the billing period read, the charge
+//! details from the flat/percentage value the version in effect carries, and
+//! `CurrencyCode` from the partition of its ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -198,9 +199,16 @@ fn non_empty(values: Option<&[String]>) -> Option<&[String]> {
 /// rather than stored beside it, so none of them can drift from the item. The members a
 /// write can change come from the version in effect, and the ones no write can change —
 /// the ARN and the creation time — from the record itself, so there is one copy of them.
+///
+/// `AssociationSize` is derived FOR `billing_period`: the resources associated to the
+/// item are the ones whose association is in effect in the period this read reports the
+/// item for, which is the question
+/// [`crate::state::CustomLineItemVersion::association_size`] asks of each association
+/// record and `ListResourcesAssociatedToCustomLineItem` asks of the same records.
 fn element(
     item: &CustomLineItemRecord,
     version: &CustomLineItemVersion,
+    billing_period: &str,
 ) -> CustomLineItemListElement {
     CustomLineItemListElement {
         arn: Some(item.arn.clone()),
@@ -215,7 +223,7 @@ fn element(
         billing_group_arn: Some(version.billing_group_arn.clone()),
         creation_time: item.creation_time_millis,
         last_modified_time: version.last_modified_time_millis,
-        association_size: version.association_size,
+        association_size: version.association_size(billing_period),
         account_id: version.account_id.clone(),
         computation_rule: version.computation_rule.clone(),
         presentation_details: version
@@ -292,7 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             };
             if passes_filters(item, &version, &filters) {
-                selected.push((arn.clone(), element(item, &version)));
+                selected.push((arn.clone(), element(item, &version, &billing_period)));
             }
         }
 

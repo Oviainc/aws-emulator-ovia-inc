@@ -209,7 +209,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let updated = merge(stored, &input)?;
-        let output = render(&updated);
+        // "The billing period range in which the custom line item request will be
+        // applied": the first period the generation this update leaves is in effect in,
+        // and so the period the answer describes the item as of. A request naming no
+        // range is applied from the period the call itself lands in ("If you don't
+        // provide a billing period, the current billing period is used", the fallback
+        // every period-scoped read of this service takes).
+        let applied_from = input
+            .billing_period_range
+            .as_ref()
+            .map(|range| range.inclusive_start_billing_period.clone())
+            .unwrap_or_else(crate::state::current_billing_period);
+        let output = render(&updated, &applied_from);
         // One state method writes the item and keeps the generations a read of an
         // earlier billing period reports: the update takes over the billing period it is
         // applied from and every later one, so the generation it replaces is frozen
@@ -352,10 +363,19 @@ fn merge(
 
 /// The stored item as this operation reports it. `ChargeDetails`, its `Type` and
 /// `AssociationSize` are DERIVED from the record rather than echoed from the request —
-/// through the SAME projection `ListCustomLineItems` reports an item with
-/// ([`crate::state::CustomLineItemRecord::charge_details`]) — so the answer is what a
+/// through the SAME projections `ListCustomLineItems` reports an item with
+/// ([`crate::state::CustomLineItemRecord::charge_details`],
+/// [`crate::state::CustomLineItemRecord::association_size`]) — so the answer is what a
 /// later read of the same item sees.
-fn render(item: &crate::state::CustomLineItemRecord) -> UpdateCustomLineItemOutput {
+///
+/// `AssociationSize` is counted for `billing_period`, the period this update is applied
+/// from: a resource is associated to the item only in the billing periods its
+/// association record covers, so the answer reports the resources in effect in the
+/// period the generation it just left takes effect in.
+fn render(
+    item: &crate::state::CustomLineItemRecord,
+    billing_period: &str,
+) -> UpdateCustomLineItemOutput {
     UpdateCustomLineItemOutput {
         arn: Some(item.arn.clone()),
         billing_group_arn: Some(item.billing_group_arn.clone()),
@@ -363,7 +383,7 @@ fn render(item: &crate::state::CustomLineItemRecord) -> UpdateCustomLineItemOutp
         description: Some(item.description.clone()),
         charge_details: Some(item.charge_details()),
         last_modified_time: item.last_modified_time_millis,
-        association_size: item.association_size(),
+        association_size: item.association_size(billing_period),
     }
 }
 

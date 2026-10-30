@@ -334,17 +334,24 @@ async fn a_re_association_puts_the_billing_periods_it_names_in_effect() {
                  {actual:?}",
                 row.case
             );
-        }
 
-        // One record, so the derived `AssociationSize` — "the number of resources that
-        // are associated to the custom line item" — counts the resource once.
-        let size = association_size(&emulator, &target).await;
-        assert_eq!(
-            size,
-            json!(1),
-            "case {:?}: expected an AssociationSize of 1, got {size}",
-            row.case
-        );
+            // One record, so the derived `AssociationSize` — "the number of resources
+            // that are associated to the custom line item" — counts the resource once in
+            // every billing period its association is in effect in, and not at all in
+            // the periods it is not: the two period-scoped reads of one association
+            // answer for the same period. (A period before the one the item was created
+            // in reports no item at all, so there is no count to compare there.)
+            let expected_size = i64::from(expected.is_some());
+            if let Some(size) = association_size(&emulator, &target, Some(&billing_period)).await {
+                assert_eq!(
+                    size,
+                    json!(expected_size),
+                    "case {:?} ({billing_period}): expected an AssociationSize of \
+                     {expected_size}, got {size}",
+                    row.case
+                );
+            }
+        }
     }
 }
 

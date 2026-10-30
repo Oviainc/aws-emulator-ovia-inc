@@ -166,13 +166,25 @@ impl Emulator {
         );
     }
 
-    /// `BatchAssociateResourcesToCustomLineItem`, which this case requires to succeed.
-    async fn associate_ok(&self, case: &str, target: &str, resources: &[String]) {
+    /// `BatchAssociateResourcesToCustomLineItem`, over the billing period range `range`
+    /// names (every period from the one the call lands in on, when it names none), which
+    /// this case requires to succeed.
+    async fn associate_ok(
+        &self,
+        case: &str,
+        target: &str,
+        resources: &[String],
+        range: Option<Value>,
+    ) {
+        let mut body = json!({ "TargetArn": target, "ResourceArns": resources });
+        if let Some(range) = range {
+            body["BillingPeriodRange"] = range;
+        }
         let (status, response) = self
             .send(
                 "PUT",
                 "/batch-associate-resources-to-custom-line-item",
-                &json!({ "TargetArn": target, "ResourceArns": resources }),
+                &body,
             )
             .await;
         assert_eq!(
@@ -856,6 +868,11 @@ async fn each_version_reports_the_values_that_generation_held() {
 
 /// A frozen generation keeps the `AssociationSize` it had: the history reports what the
 /// item WAS, so associating a resource afterwards changes the newest version only.
+///
+/// The first association is made over the billing period the generation that gets frozen
+/// applies in, because `AssociationSize` counts the resources IN EFFECT in the period the
+/// element it is reported on names — a resource associated only from a later period on is
+/// not one the frozen generation held.
 #[tokio::test]
 async fn a_frozen_version_keeps_the_association_size_it_had() {
     let case = "associations before and after the generation was frozen";
@@ -880,7 +897,12 @@ async fn a_frozen_version_keeps_the_association_size_it_had() {
         .await;
 
     emulator
-        .associate_ok(case, &item, std::slice::from_ref(&first))
+        .associate_ok(
+            case,
+            &item,
+            std::slice::from_ref(&first),
+            Some(period_range(&period(-1), None)),
+        )
         .await;
     emulator
         .update_ok(
@@ -890,7 +912,7 @@ async fn a_frozen_version_keeps_the_association_size_it_had() {
         )
         .await;
     emulator
-        .associate_ok(case, &item, std::slice::from_ref(&second))
+        .associate_ok(case, &item, std::slice::from_ref(&second), None)
         .await;
 
     let reported = emulator.versions_ok(case, &item, json!({})).await;

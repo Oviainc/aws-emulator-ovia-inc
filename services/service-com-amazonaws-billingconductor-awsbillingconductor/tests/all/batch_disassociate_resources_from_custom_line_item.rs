@@ -217,16 +217,29 @@ impl Emulator {
         .await
     }
 
-    /// The `AssociationSize` the target custom line item reports: the number of
-    /// association RECORDS it holds, whatever billing periods each of them is in effect
-    /// in — so this is what says whether a bounded disassociation DROPPED a record,
-    /// which a read scoped to one billing period cannot.
-    async fn association_size(&self, case: &str, target: &str) -> i64 {
+    /// The `AssociationSize` the target custom line item reports for `billing_period`:
+    /// the number of resources whose association is IN EFFECT in that period, which is
+    /// the membership `ListResourcesAssociatedToCustomLineItem` reports for the same
+    /// period — so a record a bounded disassociation only ENDED is still counted in the
+    /// periods it is left in effect in, and one it dropped is counted nowhere.
+    ///
+    /// `None` when the read reports no item for that period at all, which is every
+    /// period before the one the item was created in: there is no element there to carry
+    /// a count.
+    async fn association_size(
+        &self,
+        case: &str,
+        target: &str,
+        billing_period: &str,
+    ) -> Option<i64> {
         let (status, body) = self
             .send(
                 "POST",
                 "/list-custom-line-items",
-                &json!({ "Filters": { "Arns": [target] } }),
+                &json!({
+                    "BillingPeriod": billing_period,
+                    "Filters": { "Arns": [target] },
+                }),
             )
             .await;
         assert_eq!(
@@ -236,10 +249,12 @@ impl Emulator {
         body.get("CustomLineItems")
             .and_then(Value::as_array)
             .and_then(|items| items.first())
-            .and_then(|item| item.get("AssociationSize"))
-            .and_then(Value::as_i64)
-            .unwrap_or_else(|| {
-                panic!("case {case:?}: expected the item's AssociationSize, got {body}")
+            .map(|item| {
+                item.get("AssociationSize")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: expected the item's AssociationSize, got {body}")
+                    })
             })
     }
 
@@ -881,16 +896,24 @@ async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
                  got {end:?}",
                 row.left_in, row.left
             );
-            // `AssociationSize` counts the association RECORDS whatever period each
-            // covers, so it is what says the record was dropped rather than only ended.
-            let size = emulator.association_size(&case, &target).await;
-            assert_eq!(
-                size,
-                i64::from(row.left.is_some()),
-                "case {case:?}: expected the association record to be {}, got AssociationSize \
-                 {size}",
-                if row.left.is_some() { "kept" } else { "dropped" }
-            );
+            // `AssociationSize` counts the resources IN EFFECT in the period it is read
+            // for, so it is read for the period the association is left in: the record
+            // was dropped exactly when nothing is counted there. (A period before the one
+            // the item was created in reports no item at all, so there is no count to
+            // compare.)
+            if let Some(size) = emulator
+                .association_size(&case, &target, &row.left_in)
+                .await
+            {
+                assert_eq!(
+                    size,
+                    i64::from(row.left.is_some()),
+                    "case {case:?}: expected the association record to be {} in {}, got \
+                     AssociationSize {size}",
+                    if row.left.is_some() { "kept" } else { "dropped" },
+                    row.left_in
+                );
+            }
 
             for (billing_period, in_effect) in &row.probes {
                 let reported_back = emulator
@@ -907,6 +930,19 @@ async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
                      {arns:?}",
                     if *in_effect { "in effect" } else { "gone" }
                 );
+                // The two period-scoped reads of one association answer for the same
+                // period: the count is the number of resources the listing reports there.
+                let expected_size = i64::from(*in_effect);
+                if let Some(size) = emulator
+                    .association_size(&case, &target, billing_period)
+                    .await
+                {
+                    assert_eq!(
+                        size, expected_size,
+                        "case {case:?}: expected an AssociationSize of {expected_size} in \
+                         {billing_period}, got {size}"
+                    );
+                }
             }
         }
     }
@@ -942,8 +978,8 @@ struct BoundedRow {
     /// to one billing period, so these say where the association is in effect.
     probes: Vec<(String, Option<Option<String>>)>,
     /// Are the two association RECORDS still there, i.e. is each resource left in effect
-    /// in some billing period? Asserted through `AssociationSize`, which counts the
-    /// records whatever period each covers.
+    /// in some billing period? Asserted through the per-period reads of the associations,
+    /// which answer for a billing period whether or not the ITEM applies in it.
     left: bool,
 }
 
@@ -1178,6 +1214,11 @@ async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
                  named them, got {body}"
             );
 
+            // Whether some probed billing period still reports the resources, which is
+            // what says a record was only ENDED rather than dropped: a read of the
+            // associations is scoped to one period but not to the periods the ITEM
+            // applies in, so it answers for a period before the item was created too.
+            let mut reported_somewhere = false;
             for resource in [&group, &child] {
                 for (billing_period, expected) in &row.probes {
                     let reported_back = emulator
@@ -1188,19 +1229,38 @@ async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
                         "case {case:?} ({resource}) in {billing_period}: expected \
                          {expected:?}, got {reported_back:?}"
                     );
+                    reported_somewhere |= reported_back.is_some();
                 }
             }
-            // `AssociationSize` counts the association RECORDS whatever period each
-            // covers, so it is what says a record was dropped rather than only ended in
-            // some periods.
-            let size = emulator.association_size(&case, &target).await;
             assert_eq!(
-                size,
-                if row.left { 2 } else { 0 },
-                "case {case:?}: expected the two association records to be {}, got \
-                 AssociationSize {size}",
-                if row.left { "kept" } else { "dropped" }
+                reported_somewhere, row.left,
+                "case {case:?}: expected the two association records to be {}, got reads that \
+                 report them in {}",
+                if row.left { "kept" } else { "dropped" },
+                if reported_somewhere {
+                    "some probed period"
+                } else {
+                    "no probed period"
+                }
             );
+            // `AssociationSize` counts the resources whose association is IN EFFECT in
+            // the period it is read for, so every probed period the item applies in
+            // counts both resources or neither: the two period-scoped reads of one
+            // association agree. (A period before the one the item was created in reports
+            // no item at all, so there is no count to compare there.)
+            for (billing_period, expected) in &row.probes {
+                let expected_size = if expected.is_some() { 2 } else { 0 };
+                if let Some(size) = emulator
+                    .association_size(&case, &target, billing_period)
+                    .await
+                {
+                    assert_eq!(
+                        size, expected_size,
+                        "case {case:?}: expected an AssociationSize of {expected_size} in \
+                         {billing_period}, got {size}"
+                    );
+                }
+            }
         }
     }
 }
@@ -1250,8 +1310,8 @@ struct UnboundedRow {
     /// it now ends at, and the current period and every later one do not.
     probes: Vec<(String, Option<Option<String>>)>,
     /// Are the two association RECORDS still there, i.e. is each resource left in effect
-    /// in some billing period? Asserted through `AssociationSize`, which counts the
-    /// records whatever period each covers.
+    /// in some billing period? Asserted through the per-period reads of the associations,
+    /// which answer for a billing period whether or not the ITEM applies in it.
     left: bool,
 }
 
@@ -1378,6 +1438,11 @@ async fn an_unbounded_disassociation_ends_the_association_at_the_current_billing
                 failures(&body, "FailedDisassociatedResources")
             );
 
+            // Whether some probed billing period still reports the resources, which is
+            // what says a record was only ENDED rather than dropped: a read of the
+            // associations is scoped to one period but not to the periods the ITEM
+            // applies in, so it answers for a period before the item was created too.
+            let mut reported_somewhere = false;
             for resource in [&group, &child] {
                 for (billing_period, expected) in &row.probes {
                     let reported_back = emulator
@@ -1388,19 +1453,38 @@ async fn an_unbounded_disassociation_ends_the_association_at_the_current_billing
                         "case {case:?} ({resource}) in {billing_period}: expected \
                          {expected:?}, got {reported_back:?}"
                     );
+                    reported_somewhere |= reported_back.is_some();
                 }
             }
-            // `AssociationSize` counts the association RECORDS whatever period each
-            // covers, so it is what says a record was dropped rather than only ended as
-            // of the current billing period.
-            let size = emulator.association_size(&case, &target).await;
             assert_eq!(
-                size,
-                if row.left { 2 } else { 0 },
-                "case {case:?}: expected the two association records to be {}, got \
-                 AssociationSize {size}",
-                if row.left { "kept" } else { "dropped" }
+                reported_somewhere, row.left,
+                "case {case:?}: expected the two association records to be {}, got reads that \
+                 report them in {}",
+                if row.left { "kept" } else { "dropped" },
+                if reported_somewhere {
+                    "some probed period"
+                } else {
+                    "no probed period"
+                }
             );
+            // `AssociationSize` counts the resources whose association is IN EFFECT in
+            // the period it is read for, so every probed period the item applies in
+            // counts both resources or neither: the two period-scoped reads of one
+            // association agree. (A period before the one the item was created in reports
+            // no item at all, so there is no count to compare there.)
+            for (billing_period, expected) in &row.probes {
+                let expected_size = if expected.is_some() { 2 } else { 0 };
+                if let Some(size) = emulator
+                    .association_size(&case, &target, billing_period)
+                    .await
+                {
+                    assert_eq!(
+                        size, expected_size,
+                        "case {case:?}: expected an AssociationSize of {expected_size} in \
+                         {billing_period}, got {size}"
+                    );
+                }
+            }
         }
     }
 }
