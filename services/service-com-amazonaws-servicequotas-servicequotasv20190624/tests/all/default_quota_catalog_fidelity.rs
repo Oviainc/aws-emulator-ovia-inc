@@ -213,6 +213,21 @@ fn rows() -> Vec<Row> {
             period: None,
             metric: None,
         },
+        // A quota published in BYTES, and not adjustable: the unit is part of what a
+        // row publishes, so a value is never reported under the countable `None`.
+        Row {
+            service_code: "signin",
+            quota_code: "L-42359A23",
+            quota_name: "Maximum Signin resource based policy statement size",
+            value: 10240.0,
+            unit: "Bytes",
+            adjustable: false,
+            description: Some(
+                "The maximum size of individual Resource-Based Policy statements in bytes",
+            ),
+            period: None,
+            metric: None,
+        },
         Row {
             service_code: "kinesis",
             quota_code: "L-0918CF54",

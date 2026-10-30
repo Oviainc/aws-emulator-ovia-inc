@@ -71,6 +71,7 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("lambda", "L-B99A9384"),
     ("lambda", "L-F55076EC"),
     ("s3", "L-DC2B2D3D"),
+    ("signin", "L-42359A23"),
     ("vpc", "L-045E6E9C"),
     ("vpc", "L-085A6257"),
     ("vpc", "L-0EA8095F"),
@@ -111,6 +112,8 @@ const CODES_WITHOUT_A_CITED_DISPLAY_NAME: &[&str] = &[
     "networkinsights",
     "s3files",
     "securityagent",
+    "supportauthz",
+    "ts",
 ];
 
 /// Whether `code` has the shape of a code AWS MINTS: `L-` and eight upper-case hex

@@ -3952,6 +3952,25 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             vec![quota("Signing profiles per account", 100.0)],
         ),
         service(
+            "signin",
+            "AWS IAM Identity Center",
+            // AWS publishes this quota under a code of its own, in bytes, and as not
+            // adjustable. The service's other published quota is not carried here: the
+            // coverage of this table is per PAIR (see `seed_default_quotas`), and a row
+            // whose published name this emulator cannot cite would be a quota AWS never
+            // published.
+            vec![quota(
+                "Maximum Signin resource based policy statement size",
+                10240.0,
+            )
+            .code("L-42359A23")
+            .unit("Bytes")
+            .fixed()
+            .describe(
+                "The maximum size of individual Resource-Based Policy statements in bytes",
+            )],
+        ),
+        service(
             "sns",
             "Amazon Simple Notification Service (Amazon SNS)",
             vec![
@@ -4295,6 +4314,7 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("dataexchange", "AWS Data Exchange"),
     ("datapipeline", "AWS Data Pipeline"),
     ("datasync", "AWS DataSync"),
+    ("datazone", "Amazon DataZone"),
     ("dax", "Amazon DynamoDB Accelerator (DAX)"),
     ("deepracer", "AWS DeepRacer"),
     ("detective", "Amazon Detective"),
@@ -4382,6 +4402,8 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
         "AWS License Manager User Subscriptions",
     ),
     ("logs", "Amazon CloudWatch Logs"),
+    ("lookoutequipment", "Amazon Lookout for Equipment"),
+    ("lookoutmetrics", "Amazon Lookout for Metrics"),
     ("lookoutvision", "Amazon Lookout for Vision"),
     ("m2", "AWS Mainframe Modernization"),
     ("machinelearning", "Amazon Machine Learning"),
@@ -4409,6 +4431,7 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("network-firewall", "AWS Network Firewall"),
     ("networkmanager", "AWS Cloud WAN"),
     ("networkmonitor", "Amazon CloudWatch Network Monitor"),
+    ("notifications", "AWS User Notifications"),
     ("oam", "Amazon CloudWatch Observability Access Manager"),
     (
         "observabilityadmin",
@@ -4428,6 +4451,7 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("pcs", "AWS Parallel Computing Service"),
     ("personalize", "Amazon Personalize"),
     ("pinpoint", "Amazon Pinpoint"),
+    ("pipes", "Amazon EventBridge Pipes"),
     ("polly", "Amazon Polly"),
     ("private-networks", "AWS Private 5G"),
     ("profile", "Amazon Connect Customer Profiles"),
@@ -4444,6 +4468,7 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("refactor-spaces", "AWS Migration Hub Refactor Spaces"),
     ("rekognition", "Amazon Rekognition"),
     ("repostspace", "AWS re:Post Private"),
+    ("resiliencehub", "AWS Resilience Hub"),
     ("resource-explorer-2", "AWS Resource Explorer"),
     ("resource-groups", "AWS Resource Groups"),
     ("robomaker", "AWS RoboMaker"),
@@ -4479,8 +4504,19 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("ses", "Amazon Simple Email Service (Amazon SES)"),
     ("shield", "AWS Shield Advanced"),
     ("signer", "AWS Signer"),
+    // Two codes of AWS's inventory report the same display name, the way `es` and
+    // `opensearch` above do: the sign-in plane's quotas are published under the
+    // product name its recorded default-quota listing carries.
+    ("signin", "AWS IAM Identity Center"),
     ("simspaceweaver", "AWS SimSpace Weaver"),
+    ("sms", "AWS Server Migration Service"),
+    // The messaging planes AWS renamed out of Amazon Pinpoint, listed under the names
+    // its inventory reports them under now.
+    ("sms-voice", "AWS End User Messaging SMS"),
+    ("snow-device-management", "AWS Snow Device Management"),
+    ("snowball", "AWS Snowball"),
     ("sns", "Amazon Simple Notification Service (Amazon SNS)"),
+    ("social-messaging", "AWS End User Messaging Social"),
     ("sqs", "Amazon Simple Queue Service (Amazon SQS)"),
     ("ssm", "AWS Systems Manager"),
     ("ssm-contacts", "AWS Systems Manager Incident Manager Contacts"),
@@ -4492,26 +4528,34 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("states", "AWS Step Functions"),
     ("storagegateway", "AWS Storage Gateway"),
     ("sts", "AWS Security Token Service (AWS STS)"),
+    ("support", "AWS Support"),
     ("supportapp", "AWS Support App in Slack"),
     ("swf", "Amazon Simple Workflow Service"),
     ("synthetics", "Amazon CloudWatch Synthetics"),
     ("textract", "Amazon Textract"),
+    ("thinclient", "Amazon WorkSpaces Thin Client"),
     ("timestream", "Amazon Timestream"),
+    ("timestream-influxdb", "Amazon Timestream for InfluxDB"),
+    ("tnb", "AWS Telco Network Builder"),
     ("transcribe", "Amazon Transcribe"),
     ("transfer", "AWS Transfer Family"),
     ("translate", "Amazon Translate"),
     ("trustedadvisor", "AWS Trusted Advisor"),
     ("verifiedpermissions", "Amazon Verified Permissions"),
+    ("vmimportexport", "VM Import/Export"),
+    ("voiceid", "Amazon Connect Voice ID"),
     ("vpc", "Amazon Virtual Private Cloud (Amazon VPC)"),
     ("vpc-lattice", "Amazon VPC Lattice"),
     ("waf", "AWS WAF Classic"),
     ("waf-regional", "AWS WAF Classic Regional"),
     ("wafv2", "AWS WAF"),
+    ("wam", "Amazon WorkSpaces Application Manager"),
     ("wellarchitected", "AWS Well-Architected Tool"),
     ("wisdom", "Amazon Connect Wisdom"),
     ("workdocs", "Amazon WorkDocs"),
     ("workmail", "Amazon WorkMail"),
     ("workspaces", "Amazon WorkSpaces"),
+    ("workspaces-instances", "Amazon WorkSpaces Instances"),
     ("workspaces-web", "Amazon WorkSpaces Secure Browser"),
     ("xray", "AWS X-Ray"),
     // Recent launches, listed under the display names AWS's own integrated-service
@@ -4538,6 +4582,8 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
     ("networkinsights", "networkinsights"),
     ("s3files", "s3files"),
     ("securityagent", "securityagent"),
+    ("supportauthz", "supportauthz"),
+    ("ts", "ts"),
 ];
 
 /// The seeded service catalog: [`SEED_SERVICE_CATALOG`], keyed by `ServiceCode` so

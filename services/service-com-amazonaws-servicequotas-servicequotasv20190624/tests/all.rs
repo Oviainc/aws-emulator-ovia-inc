@@ -65,6 +65,8 @@ mod requested_change_history;
 mod resource_quota_context;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/service_code_coverage.rs"]
+mod service_code_coverage;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support_case_and_templates.rs"]
