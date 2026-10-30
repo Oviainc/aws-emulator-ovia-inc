@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTheme
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTheme`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTheme::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the theme `CreateTheme` stored under `(AwsAccountId, ThemeId)`, with the
+//! version the request selects: the one `VersionNumber` names, the one `AliasName`
+//! points at, or the latest when the request names neither.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +162,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTheme` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeThemeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTheme"))
+        // A report on stored state: nothing here writes to the store. The version
+        // status it reports is the one the clock has already made due, computed from
+        // the stored due instant.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeThemeErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+        let now = std::time::SystemTime::now();
+        let key = (input.aws_account_id, input.theme_id);
+        let store = state.lock();
+        let Some(record) = store.themes.get(&key) else {
+            return Err(DescribeThemeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Theme with ID {} not found.", key.1)),
+                    // `ExceptionResourceType` declares no member for a theme, so this
+                    // refusal reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // Which version to report: the alias the request names, else the version
+        // number it names, else the theme's latest version.
+        let version = match (input.alias_name.as_deref(), input.version_number) {
+            (Some(crate::state::ALIAS_LATEST), _) => record.latest_version(),
+            (Some(crate::state::ALIAS_PUBLISHED), _) => {
+                // The model documents this keyword as not applying to themes, so it
+                // selects no version rather than resolving to one.
+                return Err(DescribeThemeErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "The keyword {} doesn't apply to themes.",
+                            crate::state::ALIAS_PUBLISHED
+                        )),
+                        request_id: Some(request_id),
+                    },
+                )
+                .into());
+            }
+            // Any other alias is one a caller minted with `CreateThemeAlias`, which
+            // stores the version it points at; the theme holds none under this name.
+            (Some(alias_name), _) => {
+                return Err(DescribeThemeErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Theme with ID {} has no alias {alias_name}.",
+                            record.theme_id
+                        )),
+                        resource_type: None,
+                        request_id: Some(request_id),
+                    },
+                )
+                .into());
+            }
+            (None, Some(version_number)) => record.version(version_number),
+            (None, None) => record.latest_version(),
+        };
+
+        let Some(version) = version else {
+            return Err(DescribeThemeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Theme with ID {} has no version {}.",
+                        record.theme_id,
+                        input.version_number.unwrap_or_default()
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeThemeOutput {
+            theme: Some(record.to_theme(version, now)),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

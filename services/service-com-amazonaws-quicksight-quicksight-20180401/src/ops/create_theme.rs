@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTheme
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTheme`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTheme::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a custom theme under `(AwsAccountId, ThemeId)` and mints its first version
+//! (`VersionNumber` 1), holding the submitted `Configuration` so every later theme read
+//! reports the definition this call was given. The version is created in the
+//! non-terminal `CREATION_IN_PROGRESS` status this response reports, and the clock owes
+//! it `CREATION_SUCCESSFUL` once [`crate::state::THEME_CREATION_SPAN`] has elapsed.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +182,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTheme` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateThemeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTheme"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateThemeErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::theme_arn(&region, &input.aws_account_id, &input.theme_id);
+        let version_number = crate::state::THEME_INITIAL_VERSION_NUMBER;
+        let version_arn = crate::state::theme_version_arn(
+            &region,
+            &input.aws_account_id,
+            &input.theme_id,
+            version_number,
+        );
+        let now = std::time::SystemTime::now();
+        let created_time = crate::state::now_timestamp(now);
+
+        let mut store = state.lock();
+        let key = (input.aws_account_id.clone(), input.theme_id.clone());
+        if store.themes.contains_key(&key) {
+            return Err(CreateThemeErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        "The theme with ID {} already exists.",
+                        input.theme_id
+                    )),
+                    // `ExceptionResourceType` declares no member for a theme, so this
+                    // refusal reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // Both halves of the store key come from the request — the account id is an
+        // `@httpLabel` the caller chooses — so the total-records ceiling is what bounds
+        // this process and the per-account one is the fidelity limit on top of it.
+        if store.themes.len() >= crate::state::MAX_THEMES {
+            return Err(CreateThemeErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This QuickSight emulator holds the maximum of {} themes.",
+                        crate::state::MAX_THEMES
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+        if store.theme_count(&input.aws_account_id) >= crate::state::MAX_THEMES_PER_ACCOUNT {
+            return Err(CreateThemeErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} themes.",
+                        crate::state::MAX_THEMES_PER_ACCOUNT
+                    )),
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // A theme is its version history, and a create starts that history at version
+        // 1: the submitted configuration, description and base theme belong to the
+        // version rather than to the theme, so an update appends another beside it.
+        let version = crate::state::ThemeVersionRecord {
+            version_number,
+            arn: version_arn.clone(),
+            description: input.version_description,
+            base_theme_id: input.base_theme_id,
+            created_time,
+            configuration: input.configuration,
+            creation_settles_at: now + crate::state::THEME_CREATION_SPAN,
+        };
+
+        store.themes.insert(
+            key,
+            crate::state::ThemeRecord {
+                arn: arn.clone(),
+                theme_id: input.theme_id.clone(),
+                name: input.name,
+                created_time,
+                last_updated_time: created_time,
+                versions: vec![version],
+                permissions: input.permissions.unwrap_or_default(),
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateThemeOutput {
+            arn: Some(arn),
+            version_arn: Some(version_arn),
+            theme_id: Some(input.theme_id),
+            // The version this call minted is in flight until the clock owes it its
+            // terminal status, so that is the status this response reports.
+            creation_status: Some(crate::state::RESOURCE_STATUS_CREATION_IN_PROGRESS.to_string()),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

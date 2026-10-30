@@ -19,7 +19,8 @@ use crate::ops::types::{
     DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, InputColumn,
     LogicalTable, OutputColumn, PerformanceConfiguration, PhysicalTable, ResourcePermission,
     RowLevelPermissionDataSet, RowLevelPermissionTagConfiguration, SemanticModelConfiguration,
-    SslProperties, Tag, TopicDetails, VpcConnectionProperties,
+    SslProperties, Tag, Theme, ThemeConfiguration, ThemeVersion, TopicDetails,
+    VpcConnectionProperties,
 };
 
 /// Per-service state for com-amazonaws-quicksight-quicksight-20180401. A handler reaches it through [`service_state`].
@@ -37,6 +38,8 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     pub ingestions: HashMap<(String, String, String), IngestionRecord>,
     /// Q topics by `(AwsAccountId, TopicId)`.
     pub topics: HashMap<(String, String), TopicRecord>,
+    /// Themes by `(AwsAccountId, ThemeId)`.
+    pub themes: HashMap<(String, String), ThemeRecord>,
     /// The sign-up details `CreateAccountSubscription` stored, by `AwsAccountId`.
     ///
     /// An account with no entry here is still a QuickSight account — see
@@ -105,6 +108,15 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
     /// checked against.
     pub fn topic_count(&self, aws_account_id: &str) -> usize {
         self.topics
+            .keys()
+            .filter(|(account, _)| account == aws_account_id)
+            .count()
+    }
+
+    /// How many themes `aws_account_id` holds — what [`MAX_THEMES_PER_ACCOUNT`] is
+    /// checked against.
+    pub fn theme_count(&self, aws_account_id: &str) -> usize {
+        self.themes
             .keys()
             .filter(|(account, _)| account == aws_account_id)
             .count()
@@ -485,6 +497,137 @@ pub const MAX_TOPICS: usize = 10_000;
 /// `com.amazonaws.quicksight#ResourceStatus`).
 pub const RESOURCE_STATUS_CREATION_SUCCESSFUL: &str = "CREATION_SUCCESSFUL";
 
+/// `ResourceStatus` of a resource whose creation is still in flight (same model
+/// enum). A theme version is created in this non-terminal status and leaves it once
+/// [`THEME_CREATION_SPAN`] has elapsed.
+pub const RESOURCE_STATUS_CREATION_IN_PROGRESS: &str = "CREATION_IN_PROGRESS";
+
+/// `ThemeType` of a theme a caller created, as opposed to one of the starting themes
+/// the service itself defines (`QUICKSIGHT`). Model enum
+/// `com.amazonaws.quicksight#ThemeType`.
+pub const THEME_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// The `VersionNumber` of the version a create mints: a theme's versions are numbered
+/// from 1, and every `UpdateTheme` adds the next one.
+pub const THEME_INITIAL_VERSION_NUMBER: i64 = 1;
+
+/// The `AliasName` keyword that names a resource's latest version, whichever version
+/// that is (model shape `com.amazonaws.quicksight#AliasName` admits it beside the
+/// aliases a caller mints).
+pub const ALIAS_LATEST: &str = "$LATEST";
+
+/// The `AliasName` keyword that names a resource's published version. The model
+/// documents it as not applying to themes.
+pub const ALIAS_PUBLISHED: &str = "$PUBLISHED";
+
+/// How long a new theme version stays in `CREATION_IN_PROGRESS` before the clock owes
+/// it its terminal status. Chosen (QuickSight publishes no duration): long enough that
+/// a caller reading the theme straight after the create still observes the non-terminal
+/// status the create reported, short enough to be over by the time anything polls.
+pub const THEME_CREATION_SPAN: Duration = Duration::from_secs(3);
+
+/// How many themes one account may hold before `CreateTheme` refuses with the modelled
+/// `LimitExceededException`. Same standing as [`MAX_DATA_SOURCES_PER_ACCOUNT`]: a
+/// fidelity limit, not the process bound.
+pub const MAX_THEMES_PER_ACCOUNT: usize = 1_000;
+
+/// The TOTAL number of themes this emulator holds, across every account — the process
+/// bound, for the same reason as [`MAX_DATA_SOURCES`].
+pub const MAX_THEMES: usize = 10_000;
+
+/// A stored theme: what `CreateTheme` persisted, which is what every later theme read
+/// reports.
+///
+/// The versions are held in a list because a theme IS its version history — the
+/// numbering starts at 1 and each later update appends — so a read for a particular
+/// `VersionNumber`, and the latest-version read, both answer from this one record.
+#[derive(Debug, Clone)]
+pub struct ThemeRecord {
+    pub arn: String,
+    pub theme_id: String,
+    pub name: String,
+    pub created_time: DateTime,
+    pub last_updated_time: DateTime,
+    /// The theme's versions, in version-number order (so the last is the latest).
+    pub versions: Vec<ThemeVersionRecord>,
+    pub permissions: Vec<ResourcePermission>,
+    pub tags: Vec<Tag>,
+}
+
+impl ThemeRecord {
+    /// The theme's latest version — the one a read that names no version or alias
+    /// reports. A theme always has at least the version its create minted.
+    pub fn latest_version(&self) -> Option<&ThemeVersionRecord> {
+        self.versions.last()
+    }
+
+    /// The theme's version numbered `version_number`, if it has one.
+    pub fn version(&self, version_number: i64) -> Option<&ThemeVersionRecord> {
+        self.versions
+            .iter()
+            .find(|version| version.version_number == version_number)
+    }
+
+    /// The modelled `Theme` structure this record describes, reporting `version` as
+    /// the version member and that version's status as of `now`.
+    pub fn to_theme(&self, version: &ThemeVersionRecord, now: SystemTime) -> Theme {
+        Theme {
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            theme_id: Some(self.theme_id.clone()),
+            version: Some(version.to_theme_version(now)),
+            created_time: Some(self.created_time),
+            last_updated_time: Some(self.last_updated_time),
+            r#type: Some(THEME_TYPE_CUSTOM.to_string()),
+        }
+    }
+}
+
+/// One version of a stored theme: the configuration the create or update was given,
+/// under the version number that create or update minted.
+#[derive(Debug, Clone)]
+pub struct ThemeVersionRecord {
+    pub version_number: i64,
+    pub arn: String,
+    pub description: Option<String>,
+    pub base_theme_id: String,
+    pub created_time: DateTime,
+    pub configuration: ThemeConfiguration,
+    /// When the clock owes this version its move out of `CREATION_IN_PROGRESS`.
+    /// Stored rather than waited on: a reader materialises the transition the clock
+    /// has already made due.
+    pub creation_settles_at: SystemTime,
+}
+
+impl ThemeVersionRecord {
+    /// This version's `ResourceStatus` as of `now`: the non-terminal creation status
+    /// until the transition the clock owes falls due, `CREATION_SUCCESSFUL` from then
+    /// on.
+    pub fn status_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.creation_settles_at {
+            RESOURCE_STATUS_CREATION_SUCCESSFUL
+        } else {
+            RESOURCE_STATUS_CREATION_IN_PROGRESS
+        }
+    }
+
+    /// The modelled `ThemeVersion` structure this record describes, as of `now`.
+    pub fn to_theme_version(&self, now: SystemTime) -> ThemeVersion {
+        ThemeVersion {
+            version_number: Some(self.version_number),
+            arn: Some(self.arn.clone()),
+            description: self.description.clone(),
+            base_theme_id: Some(self.base_theme_id.clone()),
+            created_time: Some(self.created_time),
+            configuration: Some(self.configuration.clone()),
+            // A version whose creation succeeded carries no error; nothing in this
+            // emulator fails a theme creation.
+            errors: None,
+            status: Some(self.status_at(now).to_string()),
+        }
+    }
+}
+
 /// The import mode whose data set QuickSight loads into SPICE, and so the one whose
 /// creation starts an ingestion.
 pub const IMPORT_MODE_SPICE: &str = "SPICE";
@@ -577,6 +720,25 @@ pub fn ingestion_arn(
 /// The ARN of a Q topic: `.../topic/<TopicId>`.
 pub fn topic_arn(region: &str, aws_account_id: &str, topic_id: &str) -> String {
     quicksight_arn(region, aws_account_id, &format!("topic/{topic_id}"))
+}
+
+/// The ARN of a theme: `.../theme/<ThemeId>`.
+pub fn theme_arn(region: &str, aws_account_id: &str, theme_id: &str) -> String {
+    quicksight_arn(region, aws_account_id, &format!("theme/{theme_id}"))
+}
+
+/// The ARN of one version of a theme: `.../theme/<ThemeId>/version/<VersionNumber>`.
+pub fn theme_version_arn(
+    region: &str,
+    aws_account_id: &str,
+    theme_id: &str,
+    version_number: i64,
+) -> String {
+    quicksight_arn(
+        region,
+        aws_account_id,
+        &format!("theme/{theme_id}/version/{version_number}"),
+    )
 }
 
 /// The ARN of one topic's refresh: `.../topic/<TopicId>/refresh/<RefreshId>` — the
