@@ -113,12 +113,13 @@ fn control_mapping(record: &crate::state::ControlMappingRecord) -> ControlMappin
 /// The caller's filter read as the identities the catalog knows its resources by.
 ///
 /// Each ARN dimension is rewritten to the ARN the catalog stores for the resource that
-/// ARN names: neither the partition segment, nor the Region segment of the Control
-/// Tower form of a control ARN, is part of a catalog resource's identity, so the
-/// Control Tower form of a control's ARN and any partition's spelling of a catalog ARN
-/// filter for the same resource. An ARN that names nothing the catalog publishes is
-/// kept as sent, so it matches nothing. Both the match and the fingerprint a
-/// `NextToken` carries are taken from these identities, so the same filter written two
+/// ARN names, by the crate's one rule for reading a caller's ARN — the control
+/// dimension through
+/// [`crate::state::ComAmazonawsControlcatalogControlcatalogState::canonical_control_arn`],
+/// which also accepts the Control Tower form of a control's ARN, and the common control
+/// dimension through [`crate::state::canonical_catalog_arn`]; what each does with an ARN
+/// naming nothing is that rule's, not this handler's. Both the match and the fingerprint
+/// a `NextToken` carries are taken from these identities, so the same filter written two
 /// ways narrows to one sequence.
 #[derive(Debug, Default)]
 struct CanonicalFilter {
@@ -139,11 +140,7 @@ impl CanonicalFilter {
         Self {
             control_arns: filter.control_arns.as_ref().map(|arns| {
                 arns.iter()
-                    .map(|requested| {
-                        state
-                            .resolve_control(requested)
-                            .map_or_else(|| requested.clone(), |control| control.arn.clone())
-                    })
+                    .map(|requested| state.canonical_control_arn(requested))
                     .collect()
             }),
             common_control_arns: filter.common_control_arns.as_ref().map(|arns| {

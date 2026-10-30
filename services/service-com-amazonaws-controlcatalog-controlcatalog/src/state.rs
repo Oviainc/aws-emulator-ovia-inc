@@ -201,6 +201,23 @@ impl ComAmazonawsControlcatalogControlcatalogState {
             }),
         }
     }
+
+    /// The ARN this catalog stores for the control that `requested_arn` names, read by
+    /// the crate's one resolve-or-keep rule (`canonical_arn`).
+    ///
+    /// The control kind is the one kind whose resolution is more than reading a global
+    /// catalog ARN, because a control may also be named by its Control Tower ARN form
+    /// (see [`Self::resolve_control`]); which of the two forms the caller wrote is all
+    /// that is per-kind here, so a filter reading a control ARN names only the dimension
+    /// it is reading. The counterpart for every other kind is
+    /// [`canonical_catalog_arn`].
+    pub fn canonical_control_arn(&self, requested_arn: &str) -> String {
+        canonical_arn(
+            requested_arn,
+            self.resolve_control(requested_arn)
+                .map(|control| control.arn.clone()),
+        )
+    }
 }
 
 /// What an accepted control ARN names: the identifier it carries, in the namespace its
@@ -313,7 +330,23 @@ fn catalog_arn(kind: &str, id: &str) -> String {
     format!("arn:aws:controlcatalog:::{kind}/{id}")
 }
 
-/// The ARN this catalog stores for the resource of `kind` that `requested_arn` names.
+/// The crate's one rule for reading a caller-supplied ARN before it is compared with a
+/// stored one: the ARN the catalog stores for the resource the caller's ARN names, as
+/// `resolved` carries it, and otherwise the ARN exactly as sent.
+///
+/// An ARN that names nothing the catalog publishes is therefore returned unchanged, so
+/// it goes on matching nothing: the modeled pattern on each member that accepts one
+/// refuses such an ARN at the boundary anyway. Every kind reaches this rule through one
+/// of the two resolutions above it —
+/// [`ComAmazonawsControlcatalogControlcatalogState::canonical_control_arn`] for a
+/// control, [`canonical_catalog_arn`] for every other kind — so the rule is stated once
+/// and cannot drift between them.
+fn canonical_arn(requested_arn: &str, resolved: Option<String>) -> String {
+    resolved.unwrap_or_else(|| requested_arn.to_string())
+}
+
+/// The ARN this catalog stores for the resource of `kind` that `requested_arn` names,
+/// read by the crate's one resolve-or-keep rule (`canonical_arn`).
 ///
 /// What names a catalog resource is its kind and the opaque identifier after
 /// `{kind}/`, exactly as it is what names a control (see
@@ -323,14 +356,11 @@ fn catalog_arn(kind: &str, id: &str) -> String {
 /// of that kind the modeled patterns admit — any partition of the `aws` family —
 /// names the same resource, and a caller's ARN is read through here before it is
 /// compared with a stored one.
-///
-/// An ARN that names no resource of `kind` is returned unchanged, so it goes on
-/// matching nothing: the modeled pattern on each member that accepts one refuses such
-/// an ARN at the boundary anyway.
 pub fn canonical_catalog_arn(kind: &str, requested_arn: &str) -> String {
-    catalog_identifier(kind, requested_arn)
-        .map(|identifier| catalog_arn(kind, identifier))
-        .unwrap_or_else(|| requested_arn.to_string())
+    canonical_arn(
+        requested_arn,
+        catalog_identifier(kind, requested_arn).map(|identifier| catalog_arn(kind, identifier)),
+    )
 }
 
 /// The opaque identifier a `controlcatalog` ARN of `kind` carries, or `None` when the
