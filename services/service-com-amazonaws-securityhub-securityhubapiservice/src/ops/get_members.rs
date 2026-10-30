@@ -219,17 +219,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for account_id in &input.account_ids {
             let key = crate::state::member_key(&hub, account_id);
             match store.members.get(&key) {
-                Some(association) => members.push(Member {
-                    account_id: Some(account_id.clone()),
-                    email: association.email.clone(),
-                    // `Member$MasterId` is "replaced by AdministratorId" and carries
-                    // the same account, so both report the administrator.
-                    master_id: Some(administrator_id.to_string()),
-                    administrator_id: Some(administrator_id.to_string()),
-                    member_status: Some(association.member_status.clone()),
-                    invited_at: association.invited_at,
-                    updated_at: Some(association.updated_at),
-                }),
+                // One projection for every read of an association
+                // (`crate::state::member_view`, shared with `ListMembers`).
+                Some(association) => members.push(crate::state::member_view(
+                    account_id,
+                    association,
+                    administrator_id,
+                )),
                 None => unprocessed_accounts.push(Result2 {
                     account_id: Some(account_id.clone()),
                     processing_result: Some(format!(

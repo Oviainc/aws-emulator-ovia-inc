@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the member associations the calling (administrator) account's hub holds,
+//! in member-account-id order, one page at a time. `OnlyAssociated` narrows the
+//! answer to the associations that are still in force; `false` asks for every
+//! association the hub holds, whatever its status.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +118,40 @@ impl From<ListMembersErrorModeled> for ListMembersError {
     }
 }
 
+/// The modelled 400 for an input value outside a documented bound.
+fn invalid_input(message: String) -> ListMembersError {
+    ListMembersError::Modeled(ListMembersErrorModeled::InvalidInputException(
+        InvalidInputException {
+            message: Some(message),
+            code: Some("InvalidInputException".to_string()),
+        },
+    ))
+}
+
+/// `MaxResults`' upper bound (`CrossAccountMaxResults`, range 1..50 —
+/// `smithy_query(query="operation", operation="ListMembers")`), which is also the page
+/// size used when the caller names none.
+const MAX_RESULTS_LIMIT: usize = 50;
+
+/// `OnlyAssociated`'s documented default: "The default value is TRUE"
+/// (`smithy_query(query="doc", shape="ListMembersRequest", member="OnlyAssociated")`).
+const DEFAULT_ONLY_ASSOCIATED: bool = true;
+
+/// Marker the opaque `NextToken` carries, so a token minted for another list — or a
+/// value a caller invented — is rejected rather than read as an offset.
+const NEXT_TOKEN_PREFIX: &str = "securityhub:members:";
+
+/// A `NextToken` resuming at `offset` in the ordered result.
+fn encode_next_token(offset: usize) -> String {
+    crate::state::encode_list_token(NEXT_TOKEN_PREFIX, offset)
+}
+
+/// The offset a `NextToken` resumes at, or `None` when it is not one this operation
+/// minted.
+fn decode_next_token(token: &str) -> Option<usize> {
+    crate::state::decode_list_token(NEXT_TOKEN_PREFIX, token)
+}
+
 /// The `ListMembers` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,18 +188,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMembers"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMembersError::Modeled(ListMembersErrorModeled::InternalException(
+                InternalException {
+                    message: Some(crate::state::STATE_UNAVAILABLE_MESSAGE.to_string()),
+                    code: Some("InternalException".to_string()),
+                },
+            ))
+        })?;
+
+        let hub = crate::state::hub_key(ctx);
+        let administrator_id = hub.0.as_str();
+        let region = hub.1.as_str();
+
+        // Listing an administrator account's members needs that account to be
+        // subscribed, exactly as creating and reading them does. A pure report:
+        // nothing below writes to the store.
+        let store = state.lock();
+        if !store.hubs.contains_key(&hub) {
+            return Err(ListMembersErrorModeled::InvalidAccessException(
+                InvalidAccessException {
+                    message: Some(crate::state::not_subscribed_message(administrator_id, region)),
+                    code: Some("InvalidAccessException".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // "Specifies which member accounts to include in the response based on their
+        // relationship status with the administrator account. The default value is
+        // TRUE": narrowed, the answer is the associations still in force; `false`
+        // "includes all existing member accounts", whatever status they ended in.
+        let only_associated = input.only_associated.unwrap_or(DEFAULT_ONLY_ASSOCIATED);
+        let mut associations: Vec<(&str, &crate::state::MemberAssociation)> = store
+            .members
+            .iter()
+            .filter(|(key, _)| key.account_id == administrator_id && key.region == region)
+            .filter(|(_, association)| {
+                !only_associated
+                    || crate::state::member_status_is_associated(&association.member_status)
+            })
+            .map(|(key, association)| (key.member_account_id.as_str(), association))
+            .collect();
+        // A total order over the member account id — unique within a hub, because it
+        // is part of the key the associations are stored under — is what makes a
+        // `NextToken` mean the same thing on the call that hands it back: two calls
+        // never see the same association in two positions.
+        associations.sort_by_key(|(member_account_id, _)| *member_account_id);
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`, so the boundary
+        // validator already refuses a value outside it; clamping here keeps the page
+        // bounded even if this handler is reached another way.
+        let page_size = input.max_results.map_or(MAX_RESULTS_LIMIT, |requested| {
+            usize::try_from(requested)
+                .unwrap_or(MAX_RESULTS_LIMIT)
+                .clamp(1, MAX_RESULTS_LIMIT)
+        });
+        let offset = match input.next_token.as_deref() {
+            Some(token) => decode_next_token(token).ok_or_else(|| {
+                invalid_input("NextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+        if offset > associations.len() {
+            return Err(invalid_input(
+                "NextToken refers to a position past the end of the result set".to_string(),
+            ));
+        }
+
+        let total = associations.len();
+        // The members this page names, each through the one projection a read reports
+        // an association with (`crate::state::member_view`, shared with `GetMembers`).
+        let members: Vec<Member> = associations
+            .into_iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|(member_account_id, association)| {
+                crate::state::member_view(member_account_id, association, administrator_id)
+            })
+            .collect();
+        let next_offset = offset + members.len();
+        let next_token = (next_offset < total).then(|| encode_next_token(next_offset));
+
+        Ok(ListMembersOutput {
+            // Present and empty when the hub holds no member the call selects: an
+            // empty list is the answer, and a client reads it the same way as a full
+            // one.
+            members: Some(members),
+            next_token,
+        })
     }
 }

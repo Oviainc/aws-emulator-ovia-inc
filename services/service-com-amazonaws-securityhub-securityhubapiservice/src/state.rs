@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::ops::types::{
     AutomationRulesAction, AutomationRulesFindingFieldsUpdate, AutomationRulesFindingFilters,
-    AwsSecurityFinding, BooleanFilter, DateFilter, DateRange, FindingHistoryUpdate, Note,
+    AwsSecurityFinding, BooleanFilter, DateFilter, DateRange, FindingHistoryUpdate, Member, Note,
     NoteUpdate, NumberFilter, Severity, Standard, StandardsManagedBy, StandardsSubscription,
     StringFilter, Workflow,
 };
@@ -894,6 +894,38 @@ pub fn member_status_is_dissolved(status: &str) -> bool {
         status,
         MEMBER_STATUS_REMOVED | MEMBER_STATUS_RESIGNED | MEMBER_STATUS_DELETED
     )
+}
+
+/// Whether a member status means the account is still associated with its
+/// administrator — the complement of [`member_status_is_dissolved`]: `Created`,
+/// `Invited` and `Enabled` all describe a relationship that is in force, while
+/// `Removed`, `Resigned` and `Deleted` describe one the administrator or the member
+/// ended (`smithy_query(query="shape", shape="Member")`, member `MemberStatus`).
+pub fn member_status_is_associated(status: &str) -> bool {
+    !member_status_is_dissolved(status)
+}
+
+/// The one projection a read reports a member association with, so `GetMembers` and
+/// `ListMembers` can never describe the same stored association differently.
+///
+/// `Member$MasterId` "is replaced by `AdministratorId`" and carries "the Amazon Web
+/// Services account ID of the Security Hub CSPM administrator account associated with
+/// this member account" (`smithy_query(query="shape", shape="Member")`), so both
+/// members report the administrator account of the hub the association belongs to.
+pub fn member_view(
+    member_account_id: &str,
+    association: &MemberAssociation,
+    administrator_id: &str,
+) -> Member {
+    Member {
+        account_id: Some(member_account_id.to_string()),
+        email: association.email.clone(),
+        master_id: Some(administrator_id.to_string()),
+        administrator_id: Some(administrator_id.to_string()),
+        member_status: Some(association.member_status.clone()),
+        invited_at: association.invited_at,
+        updated_at: Some(association.updated_at),
+    }
 }
 
 /// The resource prefix a custom action target's ARN carries:
