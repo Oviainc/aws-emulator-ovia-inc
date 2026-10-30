@@ -1459,10 +1459,15 @@ pub struct StoredTrafficPolicyVersion {
     /// GetTrafficPolicy." So the delete is this FLAG rather than the removal of
     /// the record: a flagged version is no longer one of the account's traffic
     /// policy versions — nothing lists it, nothing new is built on it, and
-    /// addressing it is the same 404 as a version that never existed — while
-    /// `GetTrafficPolicy`, the one reader the documentation keeps, still reports
-    /// the document it held. The version number stays taken either way
+    /// addressing that VERSION is the same 404 as a version that never existed —
+    /// while `GetTrafficPolicy`, the one reader the documentation keeps, still
+    /// reports the document it held. The version number stays taken either way
     /// ([`StoredTrafficPolicy::next_version`]).
+    ///
+    /// The flag is per VERSION and never unmakes the POLICY: the record keyed by
+    /// `Id` is what "Route 53 never fully deletes" keeps, so the id stays
+    /// resolvable for every operation addressed at it, with its version set then
+    /// reported as a possibly-empty collection.
     pub deleted: bool,
 }
 
@@ -1552,9 +1557,13 @@ impl StoredTrafficPolicy {
     }
 
     /// Whether every version this policy ever held is flagged deleted, which is
-    /// what makes the POLICY deleted: it is then no longer one of the account's
-    /// traffic policies, so nothing lists it and no further version is built on
-    /// it.
+    /// what keeps the POLICY out of the account's listings and out of its quota:
+    /// a policy with no live version is not one `ListTrafficPolicies` reports
+    /// ("Deleted traffic policies aren't listed").
+    ///
+    /// It does NOT make the id unresolvable: the record itself survives, so an
+    /// operation addressed at the id still finds the policy — this is only about
+    /// which policies the account is reported as HOLDING.
     pub fn is_deleted(&self) -> bool {
         self.live_versions().next().is_none()
     }
@@ -1889,16 +1898,31 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
     /// holds, so its retained record can be released once the store holds too
     /// many of them.
     ///
-    /// The record itself is LEFT IN PLACE — `GetTrafficPolicy` still reports
-    /// every version of it — and the policy is remembered in deletion order;
-    /// past [`MAX_RETAINED_DELETED_TRAFFIC_POLICIES`] the oldest deleted
-    /// policy's record is dropped, so the store cannot grow without end for a
-    /// caller that creates and deletes policies in a loop. Called from the
+    /// The record itself is LEFT IN PLACE — the id stays resolvable, so
+    /// `GetTrafficPolicy` still reports every version of it and a further
+    /// version can still be added to it — and the policy is remembered in
+    /// deletion order; past [`MAX_RETAINED_DELETED_TRAFFIC_POLICIES`] the oldest
+    /// such policy's record is dropped, so the store cannot grow without end for
+    /// a caller that creates and deletes policies in a loop. Called from the
     /// delete that flags the policy's last version, never from a read.
+    ///
+    /// A policy is remembered ONCE however often it reaches this state, and only
+    /// a policy that still holds no live version is ever released: one that took
+    /// a further version after its last was flagged is a policy the account
+    /// holds again, and the live population's own bound
+    /// ([`MAX_TRAFFIC_POLICIES`]) is what caps those.
     pub fn retain_deleted_traffic_policy(&mut self, id: String) {
+        self.deleted_traffic_policy_order.retain(|held| held != &id);
         self.deleted_traffic_policy_order.push_back(id);
         while self.deleted_traffic_policy_order.len() > MAX_RETAINED_DELETED_TRAFFIC_POLICIES {
-            if let Some(released) = self.deleted_traffic_policy_order.pop_front() {
+            let Some(released) = self.deleted_traffic_policy_order.pop_front() else {
+                break;
+            };
+            if self
+                .traffic_policies
+                .get(&released)
+                .is_some_and(StoredTrafficPolicy::is_deleted)
+            {
                 self.traffic_policies.remove(&released);
             }
         }
@@ -1988,23 +2012,6 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
             .flatten()
             .find(|child| !self.health_checks.contains_key(child.as_str()))
             .cloned()
-    }
-
-    /// The traffic policy carrying `name`, if the account holds one.
-    ///
-    /// `TrafficPolicyAlreadyExists`'s own documentation — "A traffic policy that
-    /// has the same value for Name already exists" — is about the POLICY, not
-    /// one of its versions, so the lookup is over the policies, and it is
-    /// searched off the store rather than tracked beside it: a policy that is
-    /// deleted frees its name by itself. A policy every version of which is
-    /// flagged deleted is not one the account holds
-    /// ([`StoredTrafficPolicy::is_deleted`]), so it carries no name a create
-    /// can collide with, even though its record is retained for
-    /// `GetTrafficPolicy`.
-    pub fn traffic_policy_with_name(&self, name: &str) -> Option<&StoredTrafficPolicy> {
-        self.traffic_policies
-            .values()
-            .find(|policy| policy.name == name && !policy.is_deleted())
     }
 
     /// How many traffic policies the account holds right now.

@@ -18,9 +18,10 @@
 //!    traffic policy document format does not define is refused with the
 //!    modelled `InvalidTrafficPolicyDocument` and persists nothing. The second
 //!    table spans one malformation per structural rule of that format.
-//! 3. A `Name` the account already holds is refused with the modelled
-//!    `TrafficPolicyAlreadyExists`, and the policy already holding the name is
-//!    left as it was.
+//! 3. A `Name` is the policy's LABEL, not its identity: a create carrying a
+//!    `Name` another policy already holds is served, minting a policy of its
+//!    own, and leaves the policy already carrying the name as it was. The
+//!    identity rule and its table live in the `traffic_policy_identity` suite.
 //! 4. An `(Id, Version)` pair the store does not hold is the modelled
 //!    `NoSuchTrafficPolicy`, whichever half is missing; a `Version` outside the
 //!    modelled range is refused before the handler.
@@ -540,17 +541,17 @@ async fn a_document_the_format_does_not_define_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// One name, one policy
+// One name, several policies
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_name_the_account_already_holds_is_refused() {
+async fn a_name_another_policy_already_holds_is_served() {
     let router = router();
     let first = create_policy(
         &router,
-        "taken",
+        "shared",
         &document_with_start_endpoint("A", "192.0.2.1"),
-        Some("the policy that holds the name"),
+        Some("the policy that holds the name first"),
     )
     .await;
     assert_eq!(
@@ -558,56 +559,69 @@ async fn a_name_the_account_already_holds_is_refused() {
         "expected 201 from CreateTrafficPolicy, got {} with body {}",
         first.status, first.body
     );
-    let held = policy_of(&first, "the policy that holds the name");
+    let held = policy_of(&first, "the policy that holds the name first");
 
-    // The refusal is about the NAME, so it stands whatever else differs: the
-    // document, its record type and the comment all differ here.
+    // The second create carries the SAME name and differs in everything else:
+    // the document, its record type and the comment.
     let again = create_policy(
         &router,
-        "taken",
+        "shared",
         &document_with_start_rule("CNAME", "a.example.com", "b.example.com"),
         None,
     )
     .await;
     assert_eq!(
-        again.status, 409,
-        "expected HTTP 409 for a name the account already holds, got {} with body {}",
+        again.status, 201,
+        "expected HTTP 201 for a name another policy already holds, got {} with body {}",
         again.status, again.body
     );
+    let second = policy_of(&again, "the second policy carrying the name");
+    assert_ne!(
+        second.id, held.id,
+        "two policies must not share an id, got {:?} twice",
+        second.id
+    );
     assert_eq!(
-        again.error_code(),
-        "TrafficPolicyAlreadyExists",
-        "expected TrafficPolicyAlreadyExists, got body {}",
-        again.body
+        (second.name.as_str(), second.version.as_str()),
+        ("shared", "1"),
+        "the second policy carries the requested name at its own version 1, got {second:?}"
     );
 
-    // The policy already holding the name is untouched, and no second policy
-    // came into being.
+    // The policy already holding the name is untouched, and each of the two
+    // reads back as its own policy.
     let read = get_policy(&router, &held.id, "1").await;
-    let got = policy_of(&read, "after the refusal");
+    let got = policy_of(&read, "the first policy after the second create");
     assert_eq!(
         got, held,
-        "a refused create must leave the policy holding the name exactly as it was, \
+        "a second policy taking the name must leave the first exactly as it was, \
          got {got:?} after {held:?}; body {}",
+        read.body
+    );
+    let read = get_policy(&router, &second.id, "1").await;
+    let got = policy_of(&read, "the second policy read back");
+    assert_eq!(
+        got, second,
+        "the second policy must read back as it was created, got {got:?} after {second:?}; \
+         body {}",
         read.body
     );
     let count = policy_count(&router).await;
     assert_eq!(
-        count, "1",
-        "a refused create must persist nothing, got Count {count:?}"
+        count, "2",
+        "the account holds both policies carrying the name, got Count {count:?}"
     );
 
     // A different name is a different policy, with an id of its own.
     let other = create_policy(
         &router,
-        "not-taken",
+        "not-shared",
         &document_with_start_endpoint("A", "192.0.2.2"),
         None,
     )
     .await;
     assert_eq!(
         other.status, 201,
-        "expected 201 for a name the account does not hold, got {} with body {}",
+        "expected 201 for a name no policy holds, got {} with body {}",
         other.status, other.body
     );
     let other = policy_of(&other, "a second name");

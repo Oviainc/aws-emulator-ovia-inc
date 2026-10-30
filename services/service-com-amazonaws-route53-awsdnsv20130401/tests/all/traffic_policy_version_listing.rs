@@ -28,6 +28,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_route53_awsdnsv20130401::ops::list_traffic_policy_versions::DEFAULT_PAGE_SIZE;
 use service_com_amazonaws_route53_awsdnsv20130401::ops::types::R_R_TYPE_VALUES;
 use service_com_amazonaws_route53_awsdnsv20130401::state::{
     FIRST_TRAFFIC_POLICY_VERSION, MAX_TRAFFIC_POLICY_VERSION, NO_SUCH_TRAFFIC_POLICY_MESSAGE,
@@ -46,7 +47,10 @@ const COMMENT_MAX_LEN: usize = 1024;
 
 /// Send one `ListTrafficPolicyVersions` request for the policy `id` names, with
 /// `query` as its query string.
-async fn list_versions(router: &MultiServiceRouter, id: &str, query: &str) -> Reply {
+///
+/// `pub(crate)` so the suite asserting a policy record outlives its versions
+/// lists them through the SAME request rather than growing a second copy of it.
+pub(crate) async fn list_versions(router: &MultiServiceRouter, id: &str, query: &str) -> Reply {
     call(
         router,
         "GET",
@@ -505,7 +509,9 @@ async fn the_listing_echoes_the_page_size_it_was_asked_for() {
         );
     }
 
-    // With no maxitems at all the whole version set comes back in one page.
+    // With no maxitems at all the whole version set comes back in one page,
+    // and the required `MaxItems` reports the default page size the listing
+    // applied instead of a value the request never sent.
     let case = "no maxitems";
     let whole = listing(&router, case, &id, "").await;
     assert_eq!(
@@ -513,6 +519,20 @@ async fn the_listing_echoes_the_page_size_it_was_asked_for() {
         created.len(),
         "case {case:?}: a request without maxitems must list every version; body {}",
         whole.body
+    );
+    let default_page_size = DEFAULT_PAGE_SIZE.to_string();
+    assert_eq!(
+        whole.first("MaxItems"),
+        Some(default_page_size.as_str()),
+        "case {case:?}: expected the default page size {default_page_size:?} in MaxItems, got \
+         {:?}; body {}",
+        whole.first("MaxItems"),
+        whole.body
+    );
+    assert!(
+        created.len() < DEFAULT_PAGE_SIZE as usize,
+        "case {case:?}: the row assumes a population inside one default page, got {}",
+        created.len()
     );
 }
 

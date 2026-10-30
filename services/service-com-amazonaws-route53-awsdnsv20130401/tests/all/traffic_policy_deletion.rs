@@ -18,9 +18,10 @@
 //! 2. `GetTrafficPolicy` still reports it, exactly as it was created — the one
 //!    reader the documentation keeps;
 //! 3. a policy whose every version is flagged is no longer a policy the account
-//!    holds: it drops out of `ListTrafficPolicies`, its version listing is the
-//!    same 404, it frees both its `Name` and its slot in the account's traffic
-//!    policy quota;
+//!    HOLDS: it drops out of `ListTrafficPolicies` and frees its slot in the
+//!    account's traffic policy quota — while its record, and so its `Id`,
+//!    survives, so its version listing is an empty collection and a further
+//!    version can still be added to it;
 //! 4. the version NUMBER stays taken, so the policy's next version counts from
 //!    the highest it ever reached rather than reusing a flagged one;
 //! 5. a version traffic policy instances were created from cannot be deleted at
@@ -68,7 +69,11 @@ const IN_USE_MESSAGE: &str =
 
 /// Send one `DeleteTrafficPolicy` request, with the `{Id}` and `{Version}`
 /// labels written exactly as the caller spells them.
-async fn delete_policy(router: &MultiServiceRouter, id: &str, version: &str) -> Reply {
+///
+/// `pub(crate)` so the suite asserting a policy record outlives its versions
+/// deletes them through the SAME request rather than growing a second copy of
+/// it.
+pub(crate) async fn delete_policy(router: &MultiServiceRouter, id: &str, version: &str) -> Reply {
     call(
         router,
         "DELETE",
@@ -222,7 +227,10 @@ fn document_for(rr_type: &str, nth: i32) -> String {
 
 /// Create a policy whose versions carry `version_types` in order, and return
 /// what every version reported when it was created — index 0 is version 1.
-async fn policy_with_versions(
+///
+/// `pub(crate)` so the suite asserting a policy record outlives its versions
+/// builds its multi-version policies the SAME way this one does.
+pub(crate) async fn policy_with_versions(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -363,20 +371,15 @@ async fn each_deleted_version_stops_being_one_the_account_holds() {
 
             // The version listing reports the versions the account still
             // holds, in numerical order — and a policy with none of them left
-            // is a policy the account does not hold at all.
-            if live.is_empty() {
-                let listing = list_versions(&router, &id).await;
-                assert_no_such_policy(case, &listing);
-            } else {
-                let expected: Vec<String> =
-                    live.iter().map(|version| version.to_string()).collect();
-                let got = listed_versions(&router, case, &id).await;
-                assert_eq!(
-                    got, expected,
-                    "case {case:?}: after deleting version {version} the listing must report \
-                     {expected:?}, got {got:?}"
-                );
-            }
+            // lists an EMPTY collection: the policy record is still there, so
+            // the listing is not a missing resource.
+            let expected: Vec<String> = live.iter().map(|version| version.to_string()).collect();
+            let got = listed_versions(&router, case, &id).await;
+            assert_eq!(
+                got, expected,
+                "case {case:?}: after deleting version {version} the listing must report \
+                 {expected:?}, got {got:?}"
+            );
 
             // The account listing reports the policy only while it holds a
             // version, summarised by its highest LIVE one.
@@ -430,18 +433,40 @@ async fn each_deleted_version_stops_being_one_the_account_holds() {
             }
         }
 
-        // A policy with no version left is one the account no longer holds: it
-        // takes no further version, and it frees its name for a new policy —
-        // which is a NEW policy, with its own id and its own version 1.
+        // A policy with no version left is one the account no longer LISTS,
+        // while its record — and so its id — survives: it still takes a further
+        // version, numbered one past the highest it ever reached. And because a
+        // `Name` is a label rather than an identity, the name it carries is
+        // still available to a new policy — which is a NEW policy, with its own
+        // id and its own version 1.
         if live.is_empty() {
-            let refused = create_version(
+            let revived = create_version(
                 &router,
                 &id,
                 &document_with_start_endpoint("A", "192.0.2.200"),
                 None,
             )
             .await;
-            assert_no_such_policy(case, &refused);
+            assert_eq!(
+                revived.status, 201,
+                "case {case:?}: a policy whose versions were all deleted must still take a \
+                 further version, got {} with body {}",
+                revived.status, revived.body
+            );
+            let revived = policy_of(&revived, case);
+            let expected_version = (under_test.len() + 1).to_string();
+            assert_eq!(
+                revived.version, expected_version,
+                "case {case:?}: the version after every version was deleted must be \
+                 {expected_version}, got {:?}",
+                revived.version
+            );
+            assert_eq!(
+                (revived.id.as_str(), revived.name.as_str()),
+                (id.as_str(), "under-test"),
+                "case {case:?}: the further version must be a version OF the policy its id \
+                 names, got {revived:?}"
+            );
 
             let reborn = create_policy(
                 &router,
@@ -452,14 +477,15 @@ async fn each_deleted_version_stops_being_one_the_account_holds() {
             .await;
             assert_eq!(
                 reborn.status, 201,
-                "case {case:?}: a deleted policy must free its name, got {} with body {}",
+                "case {case:?}: a name another policy carries must not refuse a create, got {} \
+                 with body {}",
                 reborn.status, reborn.body
             );
             let reborn = policy_of(&reborn, case);
             assert_ne!(
                 reborn.id, id,
-                "case {case:?}: the policy taking the freed name must be a new policy, got the \
-                 deleted policy's id {id:?} again"
+                "case {case:?}: the policy taking the shared name must be a new policy, got the \
+                 earlier policy's id {id:?} again"
             );
             assert_eq!(
                 reborn.version, "1",
@@ -723,10 +749,22 @@ async fn a_version_traffic_policy_instances_were_created_from_cannot_be_deleted(
         deleted.status, deleted.body
     );
 
-    // Both versions are flagged now, so the policy is gone from the account —
-    // while both still read back by their retained id.
+    // Both versions are flagged now, so the policy is gone from the account's
+    // listing — while its id still resolves, to an empty version listing, and
+    // both versions still read back by that retained id.
     let listing = list_versions(&router, &id).await;
-    assert_no_such_policy(case, &listing);
+    assert_eq!(
+        listing.status, 200,
+        "case {case:?}: expected 200 listing the versions of a policy whose versions are all \
+         deleted, got {} with body {}",
+        listing.status, listing.body
+    );
+    let listed = listing.all("TrafficPolicy/Version");
+    assert!(
+        listed.is_empty(),
+        "case {case:?}: a policy with no version left must list none, got {listed:?}; body {}",
+        listing.body
+    );
     let summaries = listed_policies(&router, case).await;
     assert!(
         summaries.is_empty(),

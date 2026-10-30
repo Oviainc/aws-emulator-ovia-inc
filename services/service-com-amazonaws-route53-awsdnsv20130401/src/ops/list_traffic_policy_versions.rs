@@ -105,6 +105,18 @@ use crate::state::{FIRST_TRAFFIC_POLICY_VERSION, MAX_TRAFFIC_POLICY_VERSION};
 /// whatever `maxitems` asks for.
 const MAX_PAGE_SIZE: i32 = MAX_TRAFFIC_POLICY_VERSION;
 
+/// The page size a request that names no `maxitems` is served and answered
+/// with.
+///
+/// `MaxItems` is required in the output while `maxitems` is optional in the
+/// input, so a request naming none is still answered with a `MaxItems`: the
+/// page size the service applied, which is the hundred-item default page every
+/// Route 53 listing is served in when the caller asks for no size of its own.
+///
+/// `pub` so this crate's tests assert against the value the handler serves
+/// rather than a copy of it.
+pub const DEFAULT_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -184,12 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page_size = input
             .max_items
-            .unwrap_or(MAX_PAGE_SIZE)
+            .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
         // Route 53 echoes "the value that you specified for the maxitems
         // parameter"; the clamped `page_size` above only bounds the work and the
-        // response size.
-        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        // response size, and a request that specified no value reads back the
+        // default the service applied to it.
+        let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);
         let marker = input
             .traffic_policy_version_marker
             .as_deref()
@@ -198,16 +211,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read: nothing below writes to the store.
         let store = state.lock();
 
-        // The request addresses ONE policy and lists the versions OF it, so an
-        // `Id` the account holds no policy under has no versions to list —
-        // refused through the ONE place this service words a traffic policy it
-        // does not hold. A policy whose every version a delete has flagged is
-        // not one the account holds either: its record is retained only for
-        // `GetTrafficPolicy`.
+        // The request addresses ONE policy and lists the versions OF it, so the
+        // only `Id` with no versions to list is one the store holds no policy
+        // record under — refused through the ONE place this service words a
+        // traffic policy it does not hold. A policy whose versions have all been
+        // flagged by a delete is still a policy record ("Route 53 never fully
+        // deletes the traffic policy"), so its id keeps resolving and its
+        // listing is an EMPTY collection rather than a missing resource.
         let policy = store
             .traffic_policies
             .get(&input.id)
-            .filter(|policy| !policy.is_deleted())
             .ok_or_else(|| {
                 ListTrafficPolicyVersionsErrorModeled::NoSuchTrafficPolicy(
                     crate::state::no_such_traffic_policy(),

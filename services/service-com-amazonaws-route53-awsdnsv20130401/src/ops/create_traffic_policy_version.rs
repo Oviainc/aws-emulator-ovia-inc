@@ -201,16 +201,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The request addresses ONE existing policy — the new version is a
-        // version OF it — so an `Id` the account holds no policy under names
-        // nothing to add a version to, refused through the ONE place this
-        // service words a traffic policy it does not hold. A policy whose every
-        // version a delete has flagged is not one the account holds either: its
-        // record is retained only for `GetTrafficPolicy`, so no version is added
-        // to it.
+        // version OF it — so the only `Id` with nothing to add a version to is
+        // one the store holds no policy record under, refused through the ONE
+        // place this service words a traffic policy it does not hold. A policy
+        // whose versions have all been flagged by a delete is still a policy
+        // record: "Route 53 never fully deletes the traffic policy … if you
+        // retain the ID of the policy", so its id keeps resolving and the
+        // version this request adds is simply the next one it has not used.
         let policy = store
             .traffic_policies
             .get_mut(&input.id)
-            .filter(|policy| !policy.is_deleted())
             .ok_or_else(|| {
                 CreateTrafficPolicyVersionErrorModeled::NoSuchTrafficPolicy(
                     no_such_traffic_policy(),

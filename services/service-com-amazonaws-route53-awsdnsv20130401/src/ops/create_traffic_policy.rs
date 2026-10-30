@@ -82,18 +82,6 @@ use crate::state::{
     MAX_TRAFFIC_POLICIES,
 };
 
-/// The refusal text a `Name` that already names a traffic policy is answered
-/// with (`TrafficPolicyAlreadyExists`, HTTP 409).
-///
-/// A CONSTANT, naming neither the name nor the policy already carrying it: the
-/// shape's own documentation states the rule without either ("A traffic policy
-/// that has the same value for Name already exists"), and the id of the policy
-/// holding the name is server-generated, so a refusal quoting it would differ
-/// on every run. The policy holding the name is in state, where a
-/// traffic-policy read reports it.
-const TRAFFIC_POLICY_ALREADY_EXISTS_MESSAGE: &str =
-    "A traffic policy with the specified name already exists.";
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -111,6 +99,11 @@ pub enum CreateTrafficPolicyErrorModeled {
     InvalidInput(InvalidInput),
     InvalidTrafficPolicyDocument(InvalidTrafficPolicyDocument),
     TooManyTrafficPolicies(TooManyTrafficPolicies),
+    // Declared for a same-`Name` conflict, which Route 53 does not apply on
+    // this path: the `Name` is a label rather than an identity, so no request
+    // this handler accepts is refused for carrying a name another policy holds
+    // (see `handle`). The quota above is what bounds the policies one account
+    // can create.
     TrafficPolicyAlreadyExists(TrafficPolicyAlreadyExists),
 }
 
@@ -188,8 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // The account's own quota: a caller chooses the name freely, so without
-        // this the store would grow for every distinct one it sends.
+        // The account's own quota: every accepted create mints a policy of its
+        // own, so without this the store would grow for every create a caller
+        // sends.
         if store.traffic_policy_count() >= MAX_TRAFFIC_POLICIES {
             return Err(CreateTrafficPolicyErrorModeled::TooManyTrafficPolicies(
                 TooManyTrafficPolicies {
@@ -202,18 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The name identifies the policy for the caller, so a second policy
-        // cannot take a name the account already holds: a further version of
-        // the existing one is created through CreateTrafficPolicyVersion.
-        if store.traffic_policy_with_name(&input.name).is_some() {
-            return Err(CreateTrafficPolicyErrorModeled::TrafficPolicyAlreadyExists(
-                TrafficPolicyAlreadyExists {
-                    message: Some(TRAFFIC_POLICY_ALREADY_EXISTS_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
-
+        // The `Name` is the policy's LABEL, not its identity: a traffic policy
+        // is addressed only by the id this create mints for it, so a name
+        // another policy already carries names no conflict and this create mints
+        // a policy of its own — two policies may carry one name, each with its
+        // own id, versions and documents.
         let id = store.mint_traffic_policy_id();
         // A listing reports the account's policies in the order they were
         // created in, and a minted id carries no order, so the position this
