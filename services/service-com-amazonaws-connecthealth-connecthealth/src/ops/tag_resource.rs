@@ -263,9 +263,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(|count| {
             TagResourceErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
+                    // The ARN goes out through the one bounded echo every sentence of this
+                    // service names a request value through
+                    // (`crate::service::error_detail::echoed`): the member carries no
+                    // modelled bound, so nothing else keeps the request from sizing the
+                    // response. By here it has resolved to a resource this service holds,
+                    // whose ARN this service minted, so the ceiling does not bite — but
+                    // the sentence does not interpolate a request value raw either way.
                     message: Some(format!(
                         "resource {} would carry {count} tags, more than the maximum of {}",
-                        input.resource_arn,
+                        crate::service::error_detail::echoed(&input.resource_arn),
                         crate::state::MAX_TAGS_PER_RESOURCE
                     )),
                 },

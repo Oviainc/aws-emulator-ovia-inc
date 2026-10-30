@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_resolution_during_domain_deletion.rs"]
 mod arn_resolution_during_domain_deletion;
+#[path = "all/caller_sized_refusal_bound.rs"]
+mod caller_sized_refusal_bound;
 #[path = "all/client_refusal_is_modelled.rs"]
 mod client_refusal_is_modelled;
 #[path = "all/create_domain_idempotent_repeat.rs"]

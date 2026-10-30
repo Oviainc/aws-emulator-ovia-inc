@@ -38,6 +38,17 @@
 //! clamps reads exactly like the bound the boundary validator refuses. The bounds on a
 //! `TagMap`'s entries, which that walk cannot reach at all, are enforced in
 //! [`crate::service::tag_bounds`] by driving the walk itself.
+//!
+//! Every sentence stated here names the value the request addressed, because that is what
+//! tells one refusal from another — and names it through ONE bounded rendering,
+//! [`echoed`], which every handler of this service that interpolates a request value into
+//! a sentence of its own goes through as well. A value read off the request may not size
+//! the response it is answered with, whether or not its member carries a modelled bound:
+//! that is the rule [`crate::service::tag_bounds`] keeps for the entries a tag refusal
+//! names and [`crate::state`] for the cursor it decodes and the credential-scope region it
+//! files a record under, and a refusal built here is held to it in the same way.
+
+use std::borrow::Cow;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
@@ -135,16 +146,58 @@ pub fn range_violation_message(member_path: &str, value: i32, min: i32, max: i32
     }])
 }
 
+/// How much of a value read off the REQUEST one refusal sentence of this service echoes.
+///
+/// A refusal names the value the caller addressed, because that is what tells one refusal
+/// from another — but not every such value carries a modelled bound: `resourceArn` is a
+/// bare `String` and `clientToken` a `NonEmptyString` carrying a `@pattern` and no
+/// `@length`
+/// (`smithy_query(query="operation",operation="ListTagsForResource,StartPatientInsightsJob",model_path="services/service-com-amazonaws-connecthealth-connecthealth/smithy-model/com-amazonaws-connecthealth-connecthealth.json")`),
+/// so a sentence interpolating one of those verbatim would let the request decide how
+/// large the response answering it is — the amplification every other value this service
+/// reads off a request is already held away from ([`crate::service::tag_bounds`] for the
+/// entries a tag refusal names, [`crate::state`] for the cursor it decodes and the
+/// credential-scope region it files a record under).
+///
+/// The number is the ceiling the FRAMEWORK applies to a value it echoes into a
+/// constraint clause (`MAX_ECHOED_VALUE` in
+/// `vendor/smithy-schema-server/src/constraints.rs`), counted in bytes as that ceiling
+/// counts, so one value is echoed at one size whether the walk refused the request or a
+/// handler did.
+pub const MAX_ECHOED_VALUE_LEN: usize = 256;
+
+/// `value` as a refusal sentence of this service echoes it: itself when it is within
+/// [`MAX_ECHOED_VALUE_LEN`], and otherwise a prefix of that many bytes — cut on a
+/// character boundary, never mid-UTF-8 — followed by the length of the whole value, which
+/// is the elision the framework renders for an over-long value it refuses, so a caller
+/// meeting one value in two refusals meets one rendering of it.
+///
+/// RENDERING ONLY. Every caller keeps the value it was given for its own comparisons and
+/// reaches this solely to interpolate: eliding before a comparison would test text the
+/// caller never sent.
+pub fn echoed(value: &str) -> Cow<'_, str> {
+    if value.len() <= MAX_ECHOED_VALUE_LEN {
+        return Cow::Borrowed(value);
+    }
+    let mut end = MAX_ECHOED_VALUE_LEN;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}... [{} bytes]", &value[..end], value.len()))
+}
+
 /// The detail text of the `ResourceNotFoundException` answered when a domain cannot be
 /// resolved — because no domain of that id is held, or because the one held is already
 /// on its way out.
 ///
-/// Built from the REQUEST: the requested `domainId`, verbatim, is what tells one 404
-/// from another. ConnectHealth words it `<resource kind> not found: <identifier>` — the
-/// same form [`subscription_not_found_message`] carries for a subscription — so the
-/// text is stated ONCE here rather than in each of the handlers that resolve a domain.
+/// Built from the REQUEST: the requested `domainId` is what tells one 404 from another,
+/// echoed through the one bounded rendering every sentence of this module echoes a
+/// request value through ([`echoed`]). ConnectHealth words it `<resource kind> not found:
+/// <identifier>` — the same form [`subscription_not_found_message`] carries for a
+/// subscription — so the text is stated ONCE here rather than in each of the handlers
+/// that resolve a domain.
 pub fn domain_not_found_message(domain_id: &str) -> String {
-    format!("Domain not found: {domain_id}")
+    format!("Domain not found: {}", echoed(domain_id))
 }
 
 /// The detail text of the `ResourceNotFoundException` answered when a Medical Scribe
@@ -155,7 +208,10 @@ pub fn domain_not_found_message(domain_id: &str) -> String {
 /// identifier it cannot resolve: the member that could not be resolved and the value
 /// the request gave it.
 pub fn scribe_session_not_found_message(session_id: &str) -> String {
-    format!("Resource not found: sessionId with ID {session_id} does not exist")
+    format!(
+        "Resource not found: sessionId with ID {} does not exist",
+        echoed(session_id)
+    )
 }
 
 /// The detail text of the `ResourceNotFoundException` answered when a patient insights
@@ -165,7 +221,10 @@ pub fn scribe_session_not_found_message(session_id: &str) -> String {
 /// carries for a scoped identifier ConnectHealth cannot resolve: the member that could
 /// not be resolved and the value the request gave it.
 pub fn patient_insights_job_not_found_message(job_id: &str) -> String {
-    format!("Resource not found: jobId with ID {job_id} does not exist")
+    format!(
+        "Resource not found: jobId with ID {} does not exist",
+        echoed(job_id)
+    )
 }
 
 /// The detail text of the `ResourceNotFoundException` answered when a subscription cannot
@@ -177,7 +236,11 @@ pub fn patient_insights_job_not_found_message(job_id: &str) -> String {
 /// every pair of identifiers; stated once here so the operations that resolve a
 /// subscription — the reader and the two status transitions — cannot word it three ways.
 pub fn subscription_not_found_message(domain_id: &str, subscription_id: &str) -> String {
-    format!("Subscription not found: {domain_id}/{subscription_id}")
+    format!(
+        "Subscription not found: {}/{}",
+        echoed(domain_id),
+        echoed(subscription_id)
+    )
 }
 
 /// The detail text of the `ResourceNotFoundException` answered when the ARN a tagging
@@ -186,8 +249,13 @@ pub fn subscription_not_found_message(domain_id: &str, subscription_id: &str) ->
 /// The same `<resource kind> not found: <identifier>` form as the two constructors
 /// above, with the identifier the request used — here a resource ARN, since that is
 /// what the tagging operations address a resource by.
+///
+/// That identifier is the one this service echoes which its model bounds in no way at all
+/// (`resourceArn` is a bare `String`), so it is the one this module's bounded rendering
+/// ([`echoed`]) actually bites on: a caller-sized ARN is named as far as a caller can act
+/// on it and no further.
 pub fn resource_not_found_message(resource_arn: &str) -> String {
-    format!("Resource not found: {resource_arn}")
+    format!("Resource not found: {}", echoed(resource_arn))
 }
 
 /// The operation the generated routing table names for this request.
@@ -350,6 +418,140 @@ mod tests {
             body.as_bytes(),
             "a success body must be byte-identical"
         );
+    }
+
+    /// A value read off the request is echoed whole while it is within the ceiling and
+    /// elided past it, on a character boundary, whatever its content.
+    #[test]
+    fn a_request_value_is_echoed_up_to_the_ceiling_and_elided_past_it() {
+        // One row per size the rule distinguishes, around the ceiling and far past it,
+        // in one-byte and multi-byte characters.
+        let rows: Vec<(&str, String)> = vec![
+            ("empty", String::new()),
+            ("an ordinary ARN-sized value", "a".repeat(64)),
+            ("one byte short of the ceiling", "a".repeat(MAX_ECHOED_VALUE_LEN - 1)),
+            ("exactly the ceiling", "a".repeat(MAX_ECHOED_VALUE_LEN)),
+            ("one byte past the ceiling", "a".repeat(MAX_ECHOED_VALUE_LEN + 1)),
+            ("far past the ceiling", "a".repeat(64 * MAX_ECHOED_VALUE_LEN)),
+            // Multi-byte characters: the ceiling counts bytes, so this is well past it,
+            // and the cut may not land inside a character.
+            ("multi-byte characters", "é".repeat(MAX_ECHOED_VALUE_LEN)),
+            ("a value with no character boundary at the ceiling", format!("{}{}", "a".repeat(MAX_ECHOED_VALUE_LEN - 1), "日".repeat(8))),
+        ];
+        for (case, value) in &rows {
+            let shown = echoed(value);
+            if value.len() <= MAX_ECHOED_VALUE_LEN {
+                assert_eq!(
+                    shown, value.as_str(),
+                    "case {case:?}: a value within the ceiling is echoed whole, got {shown:?}"
+                );
+                continue;
+            }
+            assert!(
+                shown.len() <= MAX_ECHOED_VALUE_LEN + format!("... [{} bytes]", value.len()).len(),
+                "case {case:?}: an over-long value must be elided, got {} bytes",
+                shown.len()
+            );
+            assert!(
+                shown.ends_with(&format!("... [{} bytes]", value.len())),
+                "case {case:?}: the elision must state the whole length, got {shown:?}"
+            );
+            let prefix = shown
+                .strip_suffix(&format!("... [{} bytes]", value.len()))
+                .unwrap_or_else(|| panic!("case {case:?}: an elided rendering, got {shown:?}"));
+            assert!(
+                value.starts_with(prefix) && prefix.len() <= MAX_ECHOED_VALUE_LEN,
+                "case {case:?}: the prefix must be the value's own leading characters, \
+                 got {prefix:?}"
+            );
+        }
+    }
+
+    /// Every sentence this module builds from a request value echoes it through that one
+    /// ceiling — not only the one whose member the model leaves unbounded.
+    #[test]
+    fn every_sentence_bounds_the_request_value_it_names() {
+        let huge = "z".repeat(4 * MAX_ECHOED_VALUE_LEN);
+        // One row per constructor, so a sentence added without the bounded echo fails
+        // here rather than only for the member the issue named.
+        let rows: Vec<(&str, String)> = vec![
+            ("domain_not_found_message", domain_not_found_message(&huge)),
+            (
+                "scribe_session_not_found_message",
+                scribe_session_not_found_message(&huge),
+            ),
+            (
+                "patient_insights_job_not_found_message",
+                patient_insights_job_not_found_message(&huge),
+            ),
+            (
+                "subscription_not_found_message",
+                subscription_not_found_message(&huge, &huge),
+            ),
+            (
+                "resource_not_found_message",
+                resource_not_found_message(&huge),
+            ),
+        ];
+        for (case, sentence) in &rows {
+            assert!(
+                !sentence.contains(huge.as_str()),
+                "case {case:?}: the whole request value must not be echoed, got {} bytes",
+                sentence.len()
+            );
+            assert!(
+                sentence.contains(&format!("... [{} bytes]", huge.len())),
+                "case {case:?}: the sentence must name the value elided, got {sentence:?}"
+            );
+            // Two echoes of one value at most, so the sentence's size is fixed by the
+            // service rather than by the request.
+            assert!(
+                sentence.len() <= 2 * MAX_ECHOED_VALUE_LEN + 256,
+                "case {case:?}: the sentence must not be sized by the request, got {} bytes",
+                sentence.len()
+            );
+        }
+    }
+
+    /// A value of ordinary size is still named in full: the ceiling bounds amplification,
+    /// it does not change what a caller is told about a request it could plausibly make.
+    #[test]
+    fn an_ordinary_identifier_is_still_named_in_full() {
+        let arn = "arn:aws:health-agent:us-west-2:000000000000:domain/dom-0123456789abcdef0123";
+        let domain_id = "dom-0123456789abcdef0123";
+        let subscription_id = "sub-000000000000000000000";
+        for (case, sentence, expected) in [
+            (
+                "resource_not_found_message",
+                resource_not_found_message(arn),
+                format!("Resource not found: {arn}"),
+            ),
+            (
+                "domain_not_found_message",
+                domain_not_found_message(domain_id),
+                format!("Domain not found: {domain_id}"),
+            ),
+            (
+                "subscription_not_found_message",
+                subscription_not_found_message(domain_id, subscription_id),
+                format!("Subscription not found: {domain_id}/{subscription_id}"),
+            ),
+            (
+                "scribe_session_not_found_message",
+                scribe_session_not_found_message(subscription_id),
+                format!("Resource not found: sessionId with ID {subscription_id} does not exist"),
+            ),
+            (
+                "patient_insights_job_not_found_message",
+                patient_insights_job_not_found_message(domain_id),
+                format!("Resource not found: jobId with ID {domain_id} does not exist"),
+            ),
+        ] {
+            assert_eq!(
+                sentence, expected,
+                "case {case:?}: expected {expected:?}, got {sentence:?}"
+            );
+        }
     }
 
     /// The constraint sentence names the offending value, the member path and the bound

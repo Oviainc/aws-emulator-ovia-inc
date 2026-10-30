@@ -194,7 +194,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListDomainsErrorModeled::ValidationException(
                         crate::state::invalid_request(format!(
-                            "status '{value}' is not one of {}",
+                            "status '{}' is not one of {}",
+                            // Through the one bounded echo, like every other sentence of
+                            // this service that names a request value: the walk refuses a
+                            // value outside the enum before this branch is reached, so
+                            // nothing else bounds what would be echoed here.
+                            crate::service::error_detail::echoed(value),
                             DOMAIN_STATUS_VALUES.join(", ")
                         )),
                     )

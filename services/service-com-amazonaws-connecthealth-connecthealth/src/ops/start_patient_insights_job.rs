@@ -250,9 +250,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if existing.spec.fingerprint() != fingerprint {
                     return Err(StartPatientInsightsJobErrorModeled::ConflictException(
                         ConflictException {
+                            // `clientToken` targets `NonEmptyString`, which carries a
+                            // `@pattern` and no `@length`, so the token is named through
+                            // the one bounded echo this service echoes a request value
+                            // through: a caller-sized token cannot size the conflict it is
+                            // answered with. The job id beside it is this service's own.
                             message: Some(format!(
-                                "Idempotent parameter mismatch: clientToken {token} was already \
+                                "Idempotent parameter mismatch: clientToken {} was already \
                                  used to start job {} with different parameters",
+                                crate::service::error_detail::echoed(token),
                                 existing.job_id
                             )),
                         },
