@@ -19,6 +19,8 @@ mod budget;
 mod farm_queue_job;
 #[path = "all/fleet.rs"]
 mod fleet;
+#[path = "all/limit.rs"]
+mod limit;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/storage_profile.rs"]

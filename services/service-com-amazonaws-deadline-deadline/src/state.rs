@@ -93,6 +93,11 @@ pub const RESOURCE_TYPE_FLEET: &str = "fleet";
 pub const RESOURCE_TYPE_JOB: &str = "job";
 /// `resourceType` this service reports for a budget in `ResourceNotFoundException`.
 pub const RESOURCE_TYPE_BUDGET: &str = "budget";
+/// `resourceType` this service reports for a limit in `ResourceNotFoundException`. The
+/// model documents the member only as "the type of the resource that couldn't be found"
+/// and enumerates no values, so a resource type is spelled the way the model spells that
+/// resource everywhere else — the member name `limitId` names it `limit`.
+pub const RESOURCE_TYPE_LIMIT: &str = "limit";
 /// `resourceType` this service reports for a storage profile in
 /// `ResourceNotFoundException`. The model documents the member only as "the type of the
 /// resource that couldn't be found" and enumerates no values, so a resource type is
@@ -132,6 +137,18 @@ pub const MAX_BUDGETS_PER_FARM: usize = 500;
 
 /// How many storage profiles one farm holds at once. See [`MAX_FARMS`].
 pub const MAX_STORAGE_PROFILES_PER_FARM: usize = 500;
+
+/// How many limits one farm holds at once. See [`MAX_FARMS`].
+pub const MAX_LIMITS_PER_FARM: usize = 500;
+
+/// The `maxCount` a limit may not carry.
+///
+/// `smithy_query(query="doc", shape="CreateLimitRequest", member="maxCount")` states it:
+/// "The `maxCount` must not be 0. If the value is -1, there is no restriction on the
+/// number of resources that can be acquired for this limit." The modeled `@range` is
+/// `-1..2147483647`, which spans 0, so the boundary validator passes it and the handler is
+/// what refuses it.
+pub const FORBIDDEN_MAX_COUNT: i32 = 0;
 
 /// How many bytes of job templates this emulator stores at once.
 ///
@@ -174,6 +191,35 @@ pub struct Farm {
     /// (`/2023-10-12/farms/{farmId}/storage-profiles/{storageProfileId}`), so it hangs off
     /// the farm exactly as a queue does.
     pub storage_profiles: HashMap<String, StorageProfile>,
+    /// Every limit of this farm, keyed by `limitId`. A limit is reached only through its
+    /// farm's path (`/2023-10-12/farms/{farmId}/limits/{limitId}`), so it hangs off the
+    /// farm exactly as a queue does.
+    pub limits: HashMap<String, Limit>,
+}
+
+/// A persisted limit, as `CreateLimit` stored it under its farm.
+///
+/// A limit is a counter of shared resources — it is created holding everything it will
+/// ever be and carries no status, so the create answers with a limit that is already
+/// complete and nothing is owed by the clock.
+#[derive(Debug, Clone)]
+pub struct Limit {
+    pub limit_id: String,
+    pub farm_id: String,
+    pub display_name: String,
+    pub description: String,
+    pub amount_requirement_name: String,
+    pub max_count: i32,
+    /// How many of the limit's resources are in use by jobs.
+    ///
+    /// A limit is created with none of its resources acquired, and it stays at none until
+    /// something in this emulator schedules work that holds the limit: nothing assigns a
+    /// session to a step, so no job has acquired a resource from it.
+    pub current_count: i32,
+    pub created_at: SystemTime,
+    pub created_by: String,
+    pub updated_at: Option<SystemTime>,
+    pub updated_by: Option<String>,
 }
 
 /// A persisted storage profile, as `CreateStorageProfile` stored it under its farm.
@@ -579,6 +625,12 @@ impl ComAmazonawsDeadlineDeadlineState {
             .get(farm_id)?
             .storage_profiles
             .get(storage_profile_id)
+    }
+
+    /// The limit `limit_id` names UNDER `farm_id`: a limit of another farm is not found
+    /// here, because the model reaches a limit only through its own farm's path.
+    pub fn limit(&self, farm_id: &str, limit_id: &str) -> Option<&Limit> {
+        self.farms.get(farm_id)?.limits.get(limit_id)
     }
 
     /// The job `job_id` names under `farm_id`/`queue_id`, with any clock-owed lifecycle

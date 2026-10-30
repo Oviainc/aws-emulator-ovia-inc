@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLimit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLimit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLimit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +163,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLimit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLimitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLimit"))
+        // `maxCount` carries a documented value the modeled `@range` does not exclude, so
+        // the boundary validator passes it and this is where it is refused. Nothing is
+        // stored for a refused request.
+        if input.max_count == crate::state::FORBIDDEN_MAX_COUNT {
+            return Err(CreateLimitErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "maxCount",
+                    "The maxCount must not be 0. If the value is -1, there is no \
+                     restriction on the number of resources that can be acquired for this \
+                     limit.",
+                ),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateLimitErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A limit lives under its farm, so an unknown farm is a 404 and nothing is made.
+        if store.farm(&input.farm_id).is_none() {
+            return Err(CreateLimitErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        }
+
+        // `clientToken` is `@idempotencyToken`: a retry of the same create must answer
+        // with the resource the first call made, not make a second one.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, &input.farm_id, token));
+        if let Some(key) = token.as_deref() {
+            if let Some(limit_id) = store.remembered_resource(key).map(str::to_string) {
+                if store.limit(&input.farm_id, &limit_id).is_some() {
+                    return Ok(CreateLimitOutput { limit_id });
+                }
+            }
+        }
+
+        // A farm holds at most this many limits: each one is a caller-driven insert that
+        // only a DeleteLimit (or deleting the farm) releases.
+        if store
+            .farm(&input.farm_id)
+            .is_some_and(|farm| farm.limits.len() >= crate::state::MAX_LIMITS_PER_FARM)
+        {
+            return Err(CreateLimitErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::RESOURCE_TYPE_LIMIT,
+                    "You exceeded the number of limits this emulator stores for one farm. \
+                     Delete a limit and try again.",
+                ),
+            )
+            .into());
+        }
+
+        // The minted id satisfies the modeled `^limit-[0-9a-f]{32}$` label pattern.
+        let limit_id = store.mint_id("limit");
+        let limit = crate::state::Limit {
+            limit_id: limit_id.clone(),
+            farm_id: input.farm_id.clone(),
+            display_name: input.display_name,
+            description: input.description,
+            amount_requirement_name: input.amount_requirement_name,
+            max_count: input.max_count,
+            // Nothing has acquired a resource from a limit that has only just been
+            // created, so none of its count is in use.
+            current_count: 0,
+            created_at: ::std::time::SystemTime::now(),
+            created_by: crate::state::caller_principal(ctx),
+            // Nothing has updated this limit yet, so it reports no update stamp until
+            // something does.
+            updated_at: None,
+            updated_by: None,
+        };
+
+        let Some(farm) = store.farms.get_mut(&input.farm_id) else {
+            return Err(CreateLimitErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_TYPE_FARM, &input.farm_id),
+            )
+            .into());
+        };
+        farm.limits.insert(limit_id.clone(), limit);
+        if let Some(key) = token {
+            store.remember_resource(key, &limit_id);
+        }
+
+        Ok(CreateLimitOutput { limit_id })
     }
 }
