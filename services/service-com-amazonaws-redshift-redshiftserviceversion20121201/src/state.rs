@@ -836,7 +836,7 @@ pub fn check_maintenance_track(name: &str) -> Result<(), String> {
     if PUBLISHED_MAINTENANCE_TRACKS.contains(&name) {
         return Ok(());
     }
-    Err(format!("Invalid cluster track: {name}."))
+    Err(format!("Invalid cluster track: {name}"))
 }
 
 /// The most days a cluster's maintenance may be deferred for — the
@@ -1197,13 +1197,48 @@ pub fn reserved_node_of_offering(
     }
 }
 
-/// What an operation naming a `ReservedNodeId` answers when the account holds no
-/// reservation under it: ONE sentence naming the resource that was not found and
-/// the identifier the request asked for, shared by every operation that looks a
-/// reservation up so a client sees one message for one condition.
+/// What an operation answers when the value a request supplied on an
+/// identifier-bearing member names nothing: the MEMBER the value arrived on,
+/// that value, and the fixed tail ` not found.`.
+///
+/// The whole sentence is fixed apart from the value, and the member name is the
+/// prefix — so the refusal says which parameter of the request it is about
+/// rather than describing the resource in prose.
+///
+/// Which operations word their refusal this way is an attribute of the
+/// OPERATION, exactly as it is for `ClusterNotFoundFault` (see
+/// [`ClusterNotFoundWording`]): recorded refusals of
+/// `DescribeReservedNodeOfferings`, `PurchaseReservedNodeOffering` and
+/// `DescribeReservedNodes` show this sentence, while the reserved-node EXCHANGE
+/// operations are recorded answering the resource-named sentence of
+/// [`reserved_node_not_found_message`] instead. One helper per sentence, so no
+/// operation can quietly inherit another one's.
+pub fn member_value_not_found_message(member: &str, value: &str) -> String {
+    format!("{member} {value} not found.")
+}
+
+/// What a reserved-node EXCHANGE operation naming a `ReservedNodeId` answers
+/// when the account holds no reservation under it: the resource named in prose,
+/// the identifier the request asked for, then ` not found.`.
+///
+/// Shared by every exchange operation that looks a reservation up, so a client
+/// sees one message for one condition across that family. It is NOT the sentence
+/// `DescribeReservedNodes` answers about the same member — see
+/// [`member_value_not_found_message`] for why the two differ.
 pub fn reserved_node_not_found_message(reserved_node_id: &str) -> String {
     format!("Reserved Node {reserved_node_id} not found.")
 }
+
+/// The input member a reservation is named through.
+pub const MEMBER_RESERVED_NODE_ID: &str = "ReservedNodeId";
+
+/// The input member a published offering is named through by the operations that
+/// read or buy one (`DescribeReservedNodeOfferings`,
+/// `PurchaseReservedNodeOffering`).
+pub const MEMBER_RESERVED_NODE_OFFERING_ID: &str = "ReservedNodeOfferingId";
+
+/// The input member an exchange request is named through.
+pub const MEMBER_RESERVED_NODE_EXCHANGE_REQUEST_ID: &str = "ReservedNodeExchangeRequestId";
 
 /// Whether `value` has the FORM of an identifier this service MINTS: five
 /// lowercase-hex groups of 8-4-4-4-12 characters.
@@ -1327,6 +1362,16 @@ pub fn new_reserved_node_exchange_request_id() -> String {
 pub fn reserved_node_exchange_not_found_message(request_id: &str) -> String {
     format!("Reserved Node Exchange Request {request_id} not found.")
 }
+
+/// What the exchange-status read answers a request that names NEITHER of the two
+/// optional filters that say which exchanges to report.
+///
+/// Wholly fixed: nothing of the request appears in it. It states the rule the
+/// operation enforces — either member alone will do, and so will both together,
+/// because each one NARROWS the report — so a caller is not told to pick exactly
+/// one when the service accepts both.
+pub const MISSING_EXCHANGE_STATUS_FILTER: &str = "You must supply one or both of the optional \
+     ReservedNodeId and ReservedNodeExchangeRequestId parameters.";
 
 /// What a reserved-node exchange operation answers a `ClusterIdentifier` that
 /// names no cluster this account holds: this family's own wording from the
@@ -2218,6 +2263,50 @@ pub const EVENT_SOURCE_TYPE_SECURITY_GROUP: &str = "cluster-security-group";
 pub const EVENT_SOURCE_TYPE_SNAPSHOT: &str = "cluster-snapshot";
 /// The source type of events a scheduled action publishes.
 pub const EVENT_SOURCE_TYPE_SCHEDULED_ACTION: &str = "scheduled-action";
+/// The source type of events a reserved compute node publishes.
+///
+/// Amazon Redshift raises events for reserved nodes, and the refusal the event
+/// CATALOG read answers an unrecognised `SourceType` with
+/// ([`invalid_event_source_type_message`]) enumerates this type beside the five
+/// above. The model's `SourceType` enum (`smithy_query(query="shape",
+/// shape="SourceType")`) does NOT list it, so it is not a type a SUBSCRIPTION
+/// can be scoped to: it belongs to the catalog-read vocabulary alone.
+pub const EVENT_SOURCE_TYPE_RESERVED_NODE: &str = "reserved-node";
+
+/// The `SourceType` vocabulary the event CATALOG read admits, in the order its
+/// own refusal enumerates them.
+///
+/// Wider than [`EVENT_SOURCE_TYPES`], the types a subscription can be scoped to,
+/// by [`EVENT_SOURCE_TYPE_RESERVED_NODE`]; the order differs from the model
+/// enum's because the refusal's enumeration fixes it.
+pub const EVENT_CATEGORY_SOURCE_TYPES: [&str; 6] = [
+    EVENT_SOURCE_TYPE_CLUSTER,
+    EVENT_SOURCE_TYPE_SECURITY_GROUP,
+    EVENT_SOURCE_TYPE_SNAPSHOT,
+    EVENT_SOURCE_TYPE_PARAMETER_GROUP,
+    EVENT_SOURCE_TYPE_SCHEDULED_ACTION,
+    EVENT_SOURCE_TYPE_RESERVED_NODE,
+];
+
+/// The admitted spelling of the catalog-read source type `requested` names, or
+/// `None` when it is outside [`EVENT_CATEGORY_SOURCE_TYPES`]. Matched as
+/// [`published_source_type`] matches a source type.
+pub fn admitted_event_source_type(requested: &str) -> Option<&'static str> {
+    published_catalog_value(&EVENT_CATEGORY_SOURCE_TYPES, requested)
+}
+
+/// What the event catalog read answers a `SourceType` outside the vocabulary it
+/// admits: the fixed sentence, then that vocabulary enumerated in single quotes
+/// and in [`EVENT_CATEGORY_SOURCE_TYPES`] order. The offending value is NOT
+/// echoed, and the sentence carries no trailing period.
+pub fn invalid_event_source_type_message() -> String {
+    let valid = EVENT_CATEGORY_SOURCE_TYPES
+        .iter()
+        .map(|source_type| format!("'{source_type}'"))
+        .collect::<Vec<String>>()
+        .join(", ");
+    format!("Invalid event source type. Valid types are {valid}")
+}
 
 /// The event categories a subscription can publish, in the order the model lists
 /// them.

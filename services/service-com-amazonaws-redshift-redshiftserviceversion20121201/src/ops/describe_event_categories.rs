@@ -5,7 +5,9 @@
 //! Reports the event catalog this service publishes: for every source type that
 //! raises Amazon Redshift events — or for the one the request names — the events
 //! of that type, each with its identifier, the categories and the severity it is
-//! published under and the description of what it reports. A pure read of the
+//! published under and the description of what it reports. A `SourceType`
+//! outside the closed vocabulary this read admits is refused on the input,
+//! before the catalog is read. A pure read of the
 //! seeded catalog: it stores nothing and changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
@@ -140,6 +142,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
+        // "Displays a list of event categories for all event source types, or for
+        // a specified source type." A `SourceType` is drawn from a CLOSED
+        // vocabulary, so a value outside it names no selection the service could
+        // make and is refused on the input — ahead of the catalog read, and
+        // naming the whole vocabulary so a caller probing what this service
+        // supports is told. The admitted set is wider than the types a
+        // SUBSCRIPTION can be scoped to, and the refusal is the synthetic
+        // `InvalidParameterValue` channel because the operation models no error of
+        // its own (`smithy_query(query="operation",
+        // operation="DescribeEventCategories")` — an empty errors list).
+        let selection: Option<&'static str> = match input.source_type.as_deref() {
+            None => None,
+            Some(requested) => match st::admitted_event_source_type(requested) {
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                        st::invalid_event_source_type_message(),
+                    ));
+                }
+                Some(admitted) => Some(admitted),
+            },
+        };
+
         let Some(state) = st::service_state(&*self.engine) else {
             return Err(
                 DescribeEventCategoriesErrorModeled::DependentServiceUnavailableFault(
@@ -156,27 +180,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // writes nothing at all.
         let store = state.lock();
 
-        // "Displays a list of event categories for all event source types, or for
-        // a specified source type." The named type is resolved through the SAME
-        // catalog lookup the subscription path resolves a `SourceType` through, so
-        // one spelling of one source type can never select here and not there; a
-        // value this service publishes no source type for selects nothing, and is
-        // reported as the empty catalog rather than refused, because this
-        // operation models no failure at all
-        // (`smithy_query(query="operation", operation="DescribeEventCategories")`
-        // — an empty errors list).
-        let selected: Vec<EventCategoriesMap> = match input.source_type.as_deref() {
-            // A value this service publishes no source type for selects nothing
-            // at all.
-            Some(requested) => match st::published_source_type(requested) {
-                None => Vec::new(),
-                Some(published) => store
-                    .event_catalog
-                    .iter()
-                    .filter(|map| map.source_type.as_deref() == Some(published))
-                    .cloned()
-                    .collect(),
-            },
+        // The named type is resolved through the SAME catalog lookup the
+        // subscription path resolves a `SourceType` through, so one spelling of
+        // one source type can never select here and not there. An admitted type
+        // this service catalogues no event for selects nothing, and is reported
+        // as the empty catalog.
+        let selected: Vec<EventCategoriesMap> = match selection {
+            Some(published) => store
+                .event_catalog
+                .iter()
+                .filter(|map| map.source_type.as_deref() == Some(published))
+                .cloned()
+                .collect(),
             None => store.event_catalog.clone(),
         };
 

@@ -175,14 +175,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a request carrying one reports just that reservation, and an id this
         // account holds no reservation under is refused with the modelled
         // `ReservedNodeNotFoundFault` ("The specified reserved compute node not
-        // found") rather than served as an empty list.
+        // found") rather than served as an empty list. THIS operation words that
+        // refusal with the member the id arrived on; the exchange family words it
+        // its own way (see `state::member_value_not_found_message`).
         let reservations: Vec<ReservedNode> = match input.reserved_node_id.as_deref() {
             Some(reserved_node_id) => match store.reserved_node(reserved_node_id) {
                 Some(stored) => vec![stored.node.clone()],
                 None => {
                     return Err(DescribeReservedNodesErrorModeled::ReservedNodeNotFoundFault(
                         ReservedNodeNotFoundFault {
-                            message: Some(st::reserved_node_not_found_message(reserved_node_id)),
+                            message: Some(st::member_value_not_found_message(
+                                st::MEMBER_RESERVED_NODE_ID,
+                                reserved_node_id,
+                            )),
                         },
                     )
                     .into());

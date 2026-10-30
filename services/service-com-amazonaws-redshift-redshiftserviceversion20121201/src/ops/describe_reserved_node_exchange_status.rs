@@ -160,10 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both filters are optional in the model, but one of them is what says
         // which exchanges are being reported, so a request that names neither
         // cannot be served and is refused on the PARAMETER COMBINATION — decided
-        // on the request alone, before the store is reached.
+        // on the request alone, before the store is reached. The sentence is
+        // wholly fixed and states the rule as the service enforces it: either
+        // member on its own will do, and so will both together (naming both
+        // NARROWS the report rather than being refused).
         if input.reserved_node_id.is_none() && input.reserved_node_exchange_request_id.is_none() {
             return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
-                "You must specify either the ReservedNodeId parameter or the ReservedNodeExchangeRequestId parameter.",
+                st::MISSING_EXCHANGE_STATUS_FILTER,
             ));
         }
 
@@ -191,7 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(request_id) = input.reserved_node_exchange_request_id.as_deref() {
             if !st::is_minted_identifier(request_id) {
                 return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                    st::malformed_identifier_message("ReservedNodeExchangeRequestId", request_id),
+                    st::malformed_identifier_message(
+                        st::MEMBER_RESERVED_NODE_EXCHANGE_REQUEST_ID,
+                        request_id,
+                    ),
                 ));
             }
             if store.reserved_node_exchange(request_id).is_none() {

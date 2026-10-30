@@ -15,9 +15,10 @@
 //!   event it carries is published under a category and a severity this service
 //!   publishes;
 //! * a `SourceType` selects exactly the entry for that type, in the published
-//!   spelling however the request spelled it, and a value no published source
-//!   type matches selects nothing — the read reports an empty catalog rather
-//!   than failing, because the operation models no failure at all;
+//!   spelling however the request spelled it, while a value outside the closed
+//!   vocabulary this read admits is REFUSED on the input — 400
+//!   `InvalidParameterValue`, naming the whole vocabulary and echoing nothing of
+//!   the request;
 //! * the read reports and stores nothing: two calls, before and after a write to
 //!   the same store, answer identically, and so do two calls of the SAME
 //!   selection;
@@ -43,6 +44,31 @@ const PUBLISHED_SOURCE_TYPES: [&str; 5] = [
     "cluster-snapshot",
     "scheduled-action",
 ];
+
+/// The `SourceType` vocabulary this read ADMITS, in the order its own refusal
+/// enumerates them, written out here rather than read off the production helper
+/// so a wrong entry fails this suite.
+///
+/// Wider than [`PUBLISHED_SOURCE_TYPES`] — the types the model's `SourceType`
+/// enum lists, which is what a SUBSCRIPTION can be scoped to — by
+/// `reserved-node`, which the refusal enumerates among the valid types.
+const ADMITTED_SOURCE_TYPES: [&str; 6] = [
+    "cluster",
+    "cluster-security-group",
+    "cluster-snapshot",
+    "cluster-parameter-group",
+    "scheduled-action",
+    "reserved-node",
+];
+
+/// The sentence a `SourceType` outside [`ADMITTED_SOURCE_TYPES`] is refused
+/// with: the fixed text, then that vocabulary in single quotes in its own order,
+/// with no trailing period and nothing of the request in it. Spelled out here
+/// rather than read off the crate under test, so a row cannot pass by restating
+/// whatever the handler happened to build.
+const INVALID_SOURCE_TYPE_MESSAGE: &str = "Invalid event source type. Valid types are 'cluster', \
+     'cluster-security-group', 'cluster-snapshot', 'cluster-parameter-group', 'scheduled-action', \
+     'reserved-node'";
 
 /// The categories an event can be published under.
 ///
@@ -410,37 +436,79 @@ async fn a_source_type_selects_exactly_that_entry_in_the_published_spelling() {
 }
 
 #[tokio::test]
-async fn a_value_no_published_source_type_matches_reports_an_empty_catalog() {
+async fn a_value_outside_the_admitted_vocabulary_is_refused_on_the_input() {
     let emulator = Emulator::new();
 
-    // Spanning the ways a value can name no published source type: another
-    // service's source type, a plural, a prefix of a published value, an
-    // extension of one, the same words with a space instead of a hyphen, and a
-    // value of another shape entirely. The operation models NO error
-    // (`smithy_query(query="operation", operation="DescribeEventCategories")` —
-    // an empty errors list), so each one is a successful, empty catalog.
+    // Spanning the ways a value can fall outside the admitted vocabulary:
+    // another service's source type, a plural, a prefix of an admitted value, an
+    // extension of one, the same words with a space instead of a hyphen, an
+    // empty value and a value of another shape entirely. Each is refused on the
+    // INPUT, with the one sentence that enumerates the vocabulary.
     for requested in [
         "db-instance",
         "clusters",
         "clust",
         "cluster-parameter-groups",
         "cluster parameter group",
+        "reserved-nodes",
         "arn:aws:redshift:us-west-2:000000000000:cluster:c",
     ] {
         let answer = read_catalog(&emulator, Some(requested)).await;
         assert_eq!(
             (answer.status, answer.error_code()),
-            (200, None),
-            "case select unpublished {requested:?}: expected a successful read, got {} / {:?}",
+            (400, Some("InvalidParameterValue".to_string())),
+            "case select unadmitted {requested:?}: expected a 400 refusal, got {} / {:?} with body {}",
             answer.status,
-            answer.error_code()
+            answer.error_code(),
+            answer.body
+        );
+        // Message equality pins both the wording and that the refusal echoes
+        // NOTHING of the request: the sentence has no variable part.
+        assert_eq!(
+            answer.text("Message").as_deref(),
+            Some(INVALID_SOURCE_TYPE_MESSAGE),
+            "case select unadmitted {requested:?}: expected the message {INVALID_SOURCE_TYPE_MESSAGE:?}, got {:?}",
+            answer.text("Message")
         );
         assert_eq!(
             reported_catalog(&answer.body),
             Vec::new(),
-            "case select unpublished {requested:?}: expected an empty catalog, got body {}",
+            "case select unadmitted {requested:?}: expected no catalog in the refusal, got body {}",
             answer.body
         );
+    }
+
+    // Every value the refusal enumerates IS accepted, in each spelling the read
+    // resolves: the enumerated set is the admitted set, not a longer or shorter
+    // list. An admitted type this service catalogues no event for selects
+    // nothing and is reported as an empty catalog, never refused.
+    for admitted in ADMITTED_SOURCE_TYPES {
+        for (case, requested) in [
+            ("the admitted spelling", admitted.to_string()),
+            ("the upper-case spelling", admitted.to_ascii_uppercase()),
+            ("a mixed-case spelling", capitalize_segments(admitted)),
+        ] {
+            let answer = read_catalog(&emulator, Some(&requested)).await;
+            assert_eq!(
+                (answer.status, answer.error_code()),
+                (200, None),
+                "case {case} of admitted {admitted}: expected a successful read, got {} / {:?} with body {}",
+                answer.status,
+                answer.error_code(),
+                answer.body
+            );
+            let expected = if PUBLISHED_SOURCE_TYPES.contains(&admitted) {
+                vec![admitted.to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(
+                reported_source_types(&answer.body),
+                expected,
+                "case {case} of admitted {admitted}: expected {expected:?}, got body {}",
+                answer.body
+            );
+        }
     }
 }
 
@@ -457,17 +525,20 @@ async fn a_selection_filters_the_one_catalog_and_repeats_unchanged() {
     let whole = reported_catalog(&unfiltered.body);
 
     // One row per selection a caller can make: no `SourceType` at all, each
-    // published source type, and a value no published source type matches. A
-    // selection FILTERS the one catalog, so each row's expected answer is read
-    // off the unfiltered body rather than written out a second time.
+    // published source type, and an ADMITTED type this service catalogues no
+    // event for. A selection FILTERS the one catalog, so each row's expected
+    // answer is read off the unfiltered body rather than written out a second
+    // time. (A value outside the admitted vocabulary is not a selection at all:
+    // it is refused on the input, which
+    // [`a_value_outside_the_admitted_vocabulary_is_refused_on_the_input`] pins.)
     let mut selections: Vec<(String, Option<String>)> =
         vec![("the whole catalog".to_string(), None)];
     for source_type in PUBLISHED_SOURCE_TYPES {
         selections.push((format!("select {source_type}"), Some(source_type.to_string())));
     }
     selections.push((
-        "select an unpublished source type".to_string(),
-        Some("db-cluster".to_string()),
+        "select an admitted type with no catalogued event".to_string(),
+        Some("reserved-node".to_string()),
     ));
 
     let mut covered: Vec<CatalogEntry> = Vec::new();

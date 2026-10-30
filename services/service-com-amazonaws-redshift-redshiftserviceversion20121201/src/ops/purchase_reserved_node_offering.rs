@@ -193,9 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PurchaseReservedNodeOfferingErrorModeled::ReservedNodeOfferingNotFoundFault(
                     ReservedNodeOfferingNotFoundFault {
-                        message: Some(format!(
-                            "Reserved node offering not found: '{}'.",
-                            input.reserved_node_offering_id
+                        message: Some(st::member_value_not_found_message(
+                            st::MEMBER_RESERVED_NODE_OFFERING_ID,
+                            &input.reserved_node_offering_id,
                         )),
                     },
                 )

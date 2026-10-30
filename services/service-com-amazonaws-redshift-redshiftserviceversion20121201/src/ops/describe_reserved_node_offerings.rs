@@ -185,7 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a request carrying one reports just that offering, and an id the
         // catalog does not publish is refused with the modelled
         // `ReservedNodeOfferingNotFoundFault` ("Specified offering does not
-        // exist") rather than served as an empty list.
+        // exist") rather than served as an empty list. The refusal names the
+        // MEMBER the id arrived on, by the one rule every reserved-node-family
+        // lookup words its not-found with.
         let offerings: Vec<ReservedNodeOffering> = match input.reserved_node_offering_id.as_deref()
         {
             Some(offering_id) => match store.reserved_node_offering(offering_id) {
@@ -194,8 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         DescribeReservedNodeOfferingsErrorModeled::ReservedNodeOfferingNotFoundFault(
                             ReservedNodeOfferingNotFoundFault {
-                                message: Some(format!(
-                                    "Reserved node offering not found: '{offering_id}'."
+                                message: Some(st::member_value_not_found_message(
+                                    st::MEMBER_RESERVED_NODE_OFFERING_ID,
+                                    offering_id,
                                 )),
                             },
                         )
