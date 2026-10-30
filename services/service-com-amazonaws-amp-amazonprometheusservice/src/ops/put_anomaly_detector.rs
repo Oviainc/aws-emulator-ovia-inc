@@ -276,11 +276,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // started the pending change is that same call, so it is accepted again and
             // answers from the record it already wrote, instead of applying the change
             // twice or pushing the owed settling out. `materialize_due` forgets the token
-            // once the change settles, so a later call reusing it is a new request.
+            // once the change settles, so a later call reusing it is a new request. The
+            // workspace the detector hangs off must still be able to take the change too:
+            // a detector inside a workspace whose removal the clock already owes goes
+            // with it, so answering from it would accept the call and leave nothing
+            // behind.
             if input.client_token.is_some()
                 && detector.update_token == input.client_token
                 && (detector.status_code == crate::state::STATUS_UPDATING
                     || detector.status_code == crate::state::STATUS_CREATING)
+                && workspace_status == crate::state::STATUS_ACTIVE
             {
                 return Ok(response_for(detector));
             }

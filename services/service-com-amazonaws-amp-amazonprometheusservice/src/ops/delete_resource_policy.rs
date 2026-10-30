@@ -299,6 +299,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy.status_code = crate::state::POLICY_STATUS_DELETING.to_string();
             policy.transition_due = Some(now + crate::state::TRANSITION_DELAY);
             policy.delete_token = input.client_token;
+            // The stored put token stood for the put that made this revision what it is;
+            // it does not speak for a policy on its way out, so a replay of that put is a
+            // new request against a policy that is being deleted.
+            policy.client_token = None;
             // This call CHANGED this service's state, so it leaves the audit record
             // every mutating handler of this crate leaves: the operation, the resource
             // it changed and the access-key id the REQUEST presented — see

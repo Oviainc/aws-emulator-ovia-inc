@@ -37,7 +37,7 @@ fn policy_uri(workspace_id: &str) -> String {
 
 /// `PutResourcePolicy`: `policyDocument`, and optionally `revisionId` / `clientToken`,
 /// all in the JSON body.
-async fn put_policy(
+pub(crate) async fn put_policy(
     amp: &Amp,
     region: &str,
     workspace_id: &str,
@@ -47,14 +47,14 @@ async fn put_policy(
         .await
 }
 
-async fn describe_policy(amp: &Amp, region: &str, workspace_id: &str) -> Reply {
+pub(crate) async fn describe_policy(amp: &Amp, region: &str, workspace_id: &str) -> Reply {
     amp.call("GET", &policy_uri(workspace_id), region, "").await
 }
 
 /// `DeleteResourcePolicy`: `revisionId` and `clientToken` ride the query string
 /// (`@httpQuery`), and a revision id this service mints carries only hex and `-`, so it
 /// needs no escaping.
-async fn delete_policy(
+pub(crate) async fn delete_policy(
     amp: &Amp,
     region: &str,
     workspace_id: &str,
@@ -76,7 +76,7 @@ async fn delete_policy(
 /// describes: statements granting Prometheus-compatible actions on the workspace to a
 /// principal. `policyDocument` is modelled as a plain `String`, so the service stores
 /// whatever the caller sent — these rows only differ in the document's size and shape.
-fn policy_document(sid_prefix: &str, statements: usize) -> String {
+pub(crate) fn policy_document(sid_prefix: &str, statements: usize) -> String {
     let statements: Vec<serde_json::Value> = (0..statements)
         .map(|index| {
             serde_json::json!({

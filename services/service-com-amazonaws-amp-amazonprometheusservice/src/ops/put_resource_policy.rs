@@ -225,8 +225,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // produced the current revision answers with THAT revision — read off the
         // stored policy, so the status it reports is the one the policy is in now —
         // instead of minting a second one.
+        //
+        // It is a replay only while the policy is still the one that put left, on a
+        // workspace that could still take a put: a policy whose removal the clock
+        // already owes is about to be dropped, and so is one hanging off a workspace
+        // that is not active, so answering from either would accept the call (202) and
+        // then leave the workspace holding nothing the caller put. Outside that window
+        // the call is a new request and meets the status gate below, which is the same
+        // refusal the identical put WITHOUT a `clientToken` gets.
         if let (Some(token), Some(policy)) = (input.client_token.as_deref(), existing.as_ref()) {
-            if policy.client_token.as_deref() == Some(token) {
+            if policy.client_token.as_deref() == Some(token)
+                && policy.status_code != crate::state::POLICY_STATUS_DELETING
+                && workspace_status == crate::state::STATUS_ACTIVE
+            {
                 return Ok(response_for(policy));
             }
         }

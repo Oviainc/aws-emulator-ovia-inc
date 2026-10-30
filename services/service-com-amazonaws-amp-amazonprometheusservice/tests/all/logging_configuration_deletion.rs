@@ -71,6 +71,29 @@ pub(crate) async fn describe_logging(amp: &Amp, region: &str, workspace_id: &str
         .await
 }
 
+/// `PUT /workspaces/{workspaceId}/logging` — UpdateLoggingConfiguration, beside the
+/// create and the describe above so every suite driving the rules-and-alerting logging
+/// configuration reaches it the same way.
+pub(crate) async fn update_logging(
+    amp: &Amp,
+    region: &str,
+    workspace_id: &str,
+    arn: &str,
+    client_token: Option<&str>,
+) -> Reply {
+    let mut body = serde_json::json!({ "logGroupArn": arn });
+    if let Some(token) = client_token {
+        body["clientToken"] = serde_json::Value::String(token.to_string());
+    }
+    amp.call(
+        "PUT",
+        &format!("/workspaces/{workspace_id}/logging"),
+        region,
+        &body.to_string(),
+    )
+    .await
+}
+
 /// `DELETE /workspaces/{workspaceId}/logging`, with the optional `clientToken` query
 /// member when one is given.
 pub(crate) async fn delete_logging(

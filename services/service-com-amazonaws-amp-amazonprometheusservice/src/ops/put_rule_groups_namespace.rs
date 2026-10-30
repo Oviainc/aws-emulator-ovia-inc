@@ -253,10 +253,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than starting a second one. The match is deliberately narrow — only while
         // that update is in flight, which is the window the token identifies;
         // `materialize_due` forgets the token when the update settles, so a later call
-        // reusing it is a new request and is applied like any other.
+        // reusing it is a new request and is applied like any other. The workspace the
+        // namespace hangs off must still be able to take an update too: a namespace
+        // inside a workspace whose removal the clock already owes goes with it, so
+        // answering from it would accept the call and leave nothing behind.
         let replaying_pending_update = input.client_token.is_some()
             && namespace.status_code == crate::state::NAMESPACE_STATUS_UPDATING
-            && namespace.update_token == input.client_token;
+            && namespace.update_token == input.client_token
+            && workspace_status == crate::state::STATUS_ACTIVE;
         if replaying_pending_update {
             return Ok(response_for(namespace));
         }

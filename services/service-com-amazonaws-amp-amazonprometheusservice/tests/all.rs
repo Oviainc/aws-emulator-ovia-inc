@@ -51,6 +51,8 @@ mod query_logging_configuration;
 mod region_scoping;
 #[path = "all/rejection_codes.rs"]
 mod rejection_codes;
+#[path = "all/replay_while_a_removal_is_owed.rs"]
+mod replay_while_a_removal_is_owed;
 #[path = "all/resource_policy_lifecycle.rs"]
 mod resource_policy_lifecycle;
 #[path = "all/rule_group_name_bound.rs"]

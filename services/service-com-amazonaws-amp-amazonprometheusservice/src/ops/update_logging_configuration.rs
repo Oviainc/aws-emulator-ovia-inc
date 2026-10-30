@@ -218,8 +218,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `clientToken` carries `@idempotencyToken` and the operation is `@idempotent`:
         // replaying the very call that last updated this configuration is that same call,
         // so it answers from the stored record instead of applying the change twice (and
-        // restarting its span).
-        if input.client_token.is_some() && logging.update_token == input.client_token {
+        // restarting its span). It is a replay only while the record is still the one
+        // that update left, on a workspace that could still take an update: a record
+        // hanging off a workspace whose removal the clock already owes goes with it, so
+        // answering from it would accept the call and leave nothing behind — that call is
+        // a new request and meets the status gate below.
+        if input.client_token.is_some()
+            && logging.update_token == input.client_token
+            && workspace_status == crate::state::STATUS_ACTIVE
+        {
             return Ok(UpdateLoggingConfigurationOutput {
                 status: crate::state::logging_configuration_status(logging),
             });
