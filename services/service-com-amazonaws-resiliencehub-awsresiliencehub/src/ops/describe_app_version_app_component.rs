@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DescribeAppVersionAppComponentOutput {
             app_arn: input.app_arn,
             app_version: input.app_version,
-            app_component: Some(app_component.clone()),
+            app_component: Some(crate::state::reported_app_component(app_component)),
         })
     }
 }

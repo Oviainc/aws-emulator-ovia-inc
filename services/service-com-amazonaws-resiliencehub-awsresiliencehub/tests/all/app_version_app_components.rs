@@ -7,13 +7,12 @@
 //!
 //! The rule under test: `CreateAppVersionAppComponent` persists the Application
 //! Component the request describes in the addressed application's DRAFT version,
-//! keyed by its `id` (the caller's, or a server-generated one when the request
+//! keyed by its `id` (the caller's, or the component's own `name` when the request
 //! names none), and reports it with that draft version's id; a later
 //! `DescribeAppVersionAppComponent` of the same `appArn`/`appVersion`/`id` returns
 //! that stored component member-for-member, and refuses with the modelled 404 for
 //! each link of the path that does not resolve.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -231,17 +230,18 @@ fn component_table() -> Vec<Component> {
 }
 
 /// What the response's `appComponent` should be for `request`, once `id` is known:
-/// every member the request carried, unchanged, plus the id.
+/// every member the request carried, unchanged, plus the id, plus the component's
+/// `additionalInfo` map — empty rather than absent when the request gave none.
 fn expected_component(request: &Value, id: &str) -> Value {
-    let mut expected = json!({
+    json!({
         "name": request["name"].clone(),
         "type": request["type"].clone(),
         "id": id,
-    });
-    if let Some(additional_info) = request.get("additionalInfo") {
-        expected["additionalInfo"] = additional_info.clone();
-    }
-    expected
+        "additionalInfo": request
+            .get("additionalInfo")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    })
 }
 
 /// The create/describe round trip, over the whole table: each row's component is
@@ -250,7 +250,6 @@ fn expected_component(request: &Value, id: &str) -> Value {
 async fn each_created_app_component_is_read_back_from_the_draft_version() {
     let router = emulator();
     let app_arn = create_an_app(&router, "avac-roundtrip").await;
-    let mut generated_ids = BTreeSet::new();
 
     for row in component_table() {
         let case = row.label;
@@ -280,16 +279,11 @@ async fn each_created_app_component_is_read_back_from_the_draft_version() {
                 id, asked,
                 "case {case:?}: the caller's id must be kept, got {id:?}"
             ),
-            None => {
-                assert!(
-                    generated_ids.insert(id.clone()),
-                    "case {case:?}: a server-generated id must be unique, got {id:?} twice"
-                );
-                assert!(
-                    !id.is_empty() && id.len() <= 255,
-                    "case {case:?}: a generated id must fit String255's 1..255, got {id:?}"
-                );
-            }
+            None => assert_eq!(
+                json!(id),
+                request["name"],
+                "case {case:?}: a request naming no id is addressable by its name, got {id:?}"
+            ),
         }
 
         assert_eq!(
@@ -557,7 +551,7 @@ async fn a_replayed_client_token_replays_the_first_component() {
         .clone();
     let id = first["appComponent"]["id"]
         .as_str()
-        .expect("a generated id")
+        .expect("the component's id")
         .to_string();
 
     let replay = post(&router, "/create-app-version-app-component", &request).await;

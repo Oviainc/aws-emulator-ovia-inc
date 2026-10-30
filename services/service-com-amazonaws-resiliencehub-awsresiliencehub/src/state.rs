@@ -522,6 +522,24 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsResiliencehubAwsresiliencehubState>)
 }
 
+/// An Application Component as the operations whose OWN output member is the
+/// component report it.
+///
+/// `AppComponent$additionalInfo` is the component's own attribute map, and the
+/// whole component record is what such an operation answers with, so a component
+/// carrying no attributes reports an EMPTY map rather than no member: a client
+/// reading the component back always has a map to merge into. The embedded
+/// component SUMMARIES a `PhysicalResource$appComponents` carries are the stored
+/// records themselves, not this projection.
+pub fn reported_app_component(component: &AppComponent) -> AppComponent {
+    AppComponent {
+        name: component.name.clone(),
+        r#type: component.r#type.clone(),
+        id: component.id.clone(),
+        additional_info: Some(component.additional_info.clone().unwrap_or_default()),
+    }
+}
+
 /// The key [`AppVersionContents::resources`] stores a physical resource under: its
 /// whole `logicalResourceId`, which is what addresses one resource within one app
 /// version.
@@ -604,6 +622,35 @@ pub fn region_matches_modeled_arn(region: &str) -> bool {
     matches_region_tail(rest)
         || rest.strip_prefix("gov-").is_some_and(matches_region_tail)
         || iso_infix_tail(rest).is_some_and(matches_region_tail)
+}
+
+/// Whether `value` satisfies the `EntityName` shape's `@pattern`, transcribed from
+/// the model (`smithy_query query="operation"
+/// operation="CreateAppVersionResource"`, whose `resourceName` targets
+/// `EntityName` with `^[A-Za-z0-9][A-Za-z0-9_\-]{1,59}$`): an alphanumeric head,
+/// then 1..59 more characters out of alphanumerics, `_` and `-`.
+///
+/// `PhysicalResource$resourceName` targets that shape, so a name this answers
+/// `false` for is one the service cannot carry on a resource.
+pub fn matches_modeled_entity_name(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(head) = characters.next() else {
+        return false;
+    };
+    if !head.is_ascii_alphanumeric() {
+        return false;
+    }
+    let mut tail_length = 0usize;
+    for character in characters {
+        if !(character.is_ascii_alphanumeric() || character == '_' || character == '-') {
+            return false;
+        }
+        tail_length += 1;
+        if tail_length > 59 {
+            return false;
+        }
+    }
+    tail_length >= 1
 }
 
 /// Whether `tail` is the pattern's `[a-z]+-[0-9]` ending.
@@ -726,17 +773,6 @@ pub fn mint_app_arn(region: &str) -> String {
         region,
         &format!("app/{}", mint_resource_id()),
     )
-}
-
-/// Mint a fresh Application Component `id`, for a `CreateAppVersionAppComponent`
-/// that named none.
-///
-/// Server-generated and never derived from the request, and shaped to satisfy the
-/// `EntityName255` pattern `AppComponent$id` targets
-/// (`^[A-Za-z0-9][A-Za-z0-9_\-]{0,254}$`, from `smithy_query query="shape"
-/// shape="AppComponent"`): an alphanumeric head, then hyphens and hex digits.
-pub fn mint_app_component_id() -> String {
-    format!("appcomponent-{}", mint_resource_id())
 }
 
 /// Mint a fresh `policyArn`:

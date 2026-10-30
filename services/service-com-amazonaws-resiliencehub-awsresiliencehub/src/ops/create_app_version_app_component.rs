@@ -235,12 +235,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // An `id` the caller did not supply is server-generated, as it is for every
-        // other resource this service mints.
-        let id = input
-            .id
-            .clone()
-            .unwrap_or_else(crate::state::mint_app_component_id);
+        // `id` is OPTIONAL on the request while `name` is required, and the id is
+        // what every later call addresses the component by
+        // (`DescribeAppVersionAppComponent$id`,
+        // `CreateAppVersionResource$appComponents`): a request that names no `id`
+        // is identified by the name the client chose, so that name IS its id. A
+        // client never has to read an identifier back out of this response to
+        // address what it just created.
+        //
+        // The name is taken VERBATIM, with no check against the `EntityName255`
+        // pattern `AppComponent$id` targets: this operation's own `id` input is a
+        // free-form `String255`, so the modelled input surface already admits an
+        // identifier outside that pattern and reports it in the same output
+        // member. An identifier the client chose is never rewritten.
+        let id = input.id.clone().unwrap_or_else(|| input.name.clone());
 
         let draft = store.draft_app_version_mut(&input.app_arn);
 
@@ -295,7 +303,7 @@ fn draft_output(
     CreateAppVersionAppComponentOutput {
         app_arn,
         app_version: crate::state::DRAFT_APP_VERSION.to_string(),
-        app_component: Some(app_component),
+        app_component: Some(crate::state::reported_app_component(&app_component)),
     }
 }
 
@@ -318,8 +326,8 @@ fn component_id_of<'a>(resource: &'a str, app_arn: &str) -> Option<&'a str> {
 /// result, a replayed token with different parameters is a conflict.
 ///
 /// Covers EVERY member this operation stores from the request. The request's `id`
-/// is compared only when it names one: a replay that left the id to the server
-/// cannot disagree with the id the server generated.
+/// is compared only when it names one: a replay that left the id to the component's
+/// name agrees with the stored id as soon as the names agree.
 fn describes_same_component(
     stored: &AppComponent,
     request: &CreateAppVersionAppComponentInput,

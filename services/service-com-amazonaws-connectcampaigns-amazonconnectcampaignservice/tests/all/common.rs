@@ -188,6 +188,9 @@ pub fn register_connect_instance(engine: &engine::InMemoryEngine, region: &str, 
             queues: BTreeMap::new(),
             contact_flows: BTreeMap::new(),
             hours_of_operations: BTreeMap::new(),
+            // A registered instance holds no storage configuration until
+            // `AssociateInstanceStorageConfig` writes one.
+            storage_configs: BTreeMap::new(),
         },
     );
 }

@@ -9,9 +9,11 @@
 //! the request describes in the addressed application's DRAFT version, identified
 //! by the whole `logicalResourceId`, deriving the `physicalResourceId`'s `type`
 //! from the identifier's form (`Arn` for an ARN, `Native` otherwise) and its owning
-//! region/account from the request or, failing that, from the identifier when it is
-//! an ARN, and binding each `appComponents` name to the draft's component of that
-//! name, creating one when the draft holds none; a later
+//! region/account from the request, failing that from the identifier when it is
+//! an ARN, and failing that from the caller's own region and account; naming the
+//! resource by its logical identifier when the request names none; and binding each
+//! `appComponents` name to the draft's component of that name, creating one when the
+//! draft holds none; a later
 //! `DescribeAppVersionResource` of the same `appArn`/`appVersion`, addressed by any
 //! ONE of `resourceName`, `logicalResourceId` or `physicalResourceId`, returns that
 //! stored resource member-for-member, and each link of the path that does not
@@ -139,9 +141,13 @@ struct Resource {
     /// The `PhysicalIdentifierType` the identifier's form implies.
     identifier_type: &'static str,
     /// The `physicalResourceId.awsRegion` / `.awsAccountId` the rule derives.
-    region: Option<&'static str>,
-    account: Option<&'static str>,
+    region: &'static str,
+    account: &'static str,
 }
+
+/// The account every resource below is owned by when neither the request nor an
+/// ARN identifier names one: the account this emulator serves.
+const CALLER_ACCOUNT: &str = "000000000000";
 
 /// A native physical identifier at the top of `PhysicalResourceId$identifier`'s
 /// modelled `length` (1..255, from `smithy_query query="shape"
@@ -166,8 +172,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Native",
-            region: None,
-            account: None,
+            region: REGION,
+            account: CALLER_ACCOUNT,
         },
         Resource {
             label: "an ARN identifier in this region and account",
@@ -182,8 +188,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Arn",
-            region: Some("us-east-1"),
-            account: Some("000000000000"),
+            region: "us-east-1",
+            account: "000000000000",
         },
         Resource {
             label: "an ARN identifier owned by another region and account",
@@ -198,8 +204,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Arn",
-            region: Some("eu-west-3"),
-            account: Some("111122223333"),
+            region: "eu-west-3",
+            account: "111122223333",
         },
         Resource {
             label: "a native identifier whose region and account the request names",
@@ -215,8 +221,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Native",
-            region: Some("us-west-2"),
-            account: Some("444455556666"),
+            region: "us-west-2",
+            account: "444455556666",
         },
         Resource {
             label: "a request's own region and account override the identifier's ARN",
@@ -232,8 +238,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Arn",
-            region: Some("ap-southeast-2"),
-            account: Some("777788889999"),
+            region: "ap-southeast-2",
+            account: "777788889999",
         },
         Resource {
             label: "a logicalResourceId carrying every member it has",
@@ -253,8 +259,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Native",
-            region: None,
-            account: None,
+            region: REGION,
+            account: CALLER_ACCOUNT,
         },
         Resource {
             label: "a resource belonging to three Application Components",
@@ -270,8 +276,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Native",
-            region: None,
-            account: None,
+            region: REGION,
+            account: CALLER_ACCOUNT,
         },
         Resource {
             label: "a resource belonging to no Application Component",
@@ -285,8 +291,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Native",
-            region: None,
-            account: None,
+            region: REGION,
+            account: CALLER_ACCOUNT,
         },
         Resource {
             label: "one additionalInfo entry",
@@ -304,8 +310,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Native",
-            region: None,
-            account: None,
+            region: REGION,
+            account: CALLER_ACCOUNT,
         },
         Resource {
             label: "additionalInfo at the top of AdditionalInfoValueList's 1..10 length",
@@ -323,8 +329,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Native",
-            region: None,
-            account: None,
+            region: REGION,
+            account: CALLER_ACCOUNT,
         },
         Resource {
             label: "a physicalResourceId at the top of the identifier's 1..255 length",
@@ -338,8 +344,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Native",
-            region: None,
-            account: None,
+            region: REGION,
+            account: CALLER_ACCOUNT,
         },
         Resource {
             label: "a physicalResourceId at the bottom of the identifier's 1..255 length",
@@ -353,8 +359,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Native",
-            region: None,
-            account: None,
+            region: REGION,
+            account: CALLER_ACCOUNT,
         },
         Resource {
             label: "two resources may share a logical identifier under different stacks",
@@ -371,8 +377,8 @@ fn resource_table() -> Vec<Resource> {
                 })
             },
             identifier_type: "Native",
-            region: None,
-            account: None,
+            region: REGION,
+            account: CALLER_ACCOUNT,
         },
     ]
 }
@@ -396,7 +402,9 @@ fn assert_resource(case: &str, actual: &Value, request: &Value, row: &Resource) 
         request
             .get("resourceName")
             .cloned()
-            .unwrap_or(Value::Null),
+            // A request that names no resource leaves it named by its logical
+            // identifier.
+            .unwrap_or_else(|| request["logicalResourceId"]["identifier"].clone()),
         "case {case:?}: the resource name must be kept, got {actual:?}"
     );
     assert_eq!(
@@ -411,13 +419,13 @@ fn assert_resource(case: &str, actual: &Value, request: &Value, row: &Resource) 
     );
     assert_eq!(
         actual["physicalResourceId"]["awsRegion"],
-        row.region.map(Value::from).unwrap_or(Value::Null),
+        json!(row.region),
         "case {case:?}: expected awsRegion {:?}, got {actual:?}",
         row.region
     );
     assert_eq!(
         actual["physicalResourceId"]["awsAccountId"],
-        row.account.map(Value::from).unwrap_or(Value::Null),
+        json!(row.account),
         "case {case:?}: expected awsAccountId {:?}, got {actual:?}",
         row.account
     );
@@ -505,9 +513,13 @@ async fn each_created_resource_is_read_back_from_the_draft_version() {
         // whichever of the three selectors addresses it.
         let mut selectors = vec![json!({"logicalResourceId": request["logicalResourceId"]})];
         selectors.push(json!({"physicalResourceId": request["physicalResourceId"]}));
-        if let Some(resource_name) = request.get("resourceName") {
-            selectors.push(json!({"resourceName": resource_name}));
-        }
+        // Every resource has a name: the request's, or its logical identifier.
+        selectors.push(json!({
+            "resourceName": request
+                .get("resourceName")
+                .cloned()
+                .unwrap_or_else(|| request["logicalResourceId"]["identifier"].clone()),
+        }));
         if let (Some(region), Some(account)) =
             (request.get("awsRegion"), request.get("awsAccountId"))
         {
@@ -628,9 +640,13 @@ async fn named_app_components_are_created_once_and_then_reused() {
         &json!({"appArn": app_arn, "appVersion": DRAFT_APP_VERSION, "id": created_id}),
     )
     .await;
+    // The component's OWN read reports its whole record, `additionalInfo` map
+    // included; the summary the resource embeds is the stored record itself.
+    let mut expected = components[1].clone();
+    expected["additionalInfo"] = json!({});
     assert_eq!(
         described.ok("the created component")["appComponent"],
-        components[1],
+        expected,
         "the component this call created must be stored in the draft version, got {:?}",
         described.body
     );

@@ -195,7 +195,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_failure());
         };
@@ -242,9 +241,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(app_not_found(&input.app_arn));
         }
 
-        let physical_resource_id = physical_identifier(&input);
+        let physical_resource_id = physical_identifier(
+            &input,
+            &crate::state::request_region(ctx.parts()),
+            ::engine::emulator_account_id(),
+        );
         let resource_key = crate::state::logical_resource_key(&input.logical_resource_id);
         let draft = store.app_version(&input.app_arn, crate::state::DRAFT_APP_VERSION);
+        let resource_name = resolved_resource_name(&input, draft, &resource_key);
 
         // "If an Application Component is not part of the Resilience Hub
         // application, it will be added" (the model's own documentation for
@@ -264,6 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         if describes_same_resource(
                             first,
                             &input,
+                            resource_name.as_deref(),
                             &physical_resource_id,
                             &bindings,
                         ) =>
@@ -310,7 +315,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `resourceName` is one of the three members `DescribeAppVersionResource`
         // addresses a single resource by, so two resources of one version cannot
-        // share one: the name would no longer resolve to one resource.
+        // share one the CALLER chose: the name would no longer resolve to one
+        // resource. A name this handler derived is already free, by construction.
         if let Some(resource_name) = input.resource_name.as_deref() {
             if draft.is_some_and(|draft| draft.resource_by_name(resource_name).is_some()) {
                 return Err(conflict(
@@ -349,21 +355,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each resolved binding becomes one entry of the stored resource, in the
         // order the request listed it: a name the draft already holds binds to THAT
-        // component, and a name it does not is created here with a server-generated
-        // id, exactly as a `CreateAppVersionAppComponent` that named none gets one.
+        // component, and a name it does not is created here under that name.
         let mut app_components: Vec<AppComponent> = Vec::with_capacity(bindings.len());
         for binding in bindings {
             let component = match binding {
                 ComponentBinding::Held(held) => held,
                 ComponentBinding::New(name) => {
-                    let id = crate::state::mint_app_component_id();
+                    // A component the request named and the draft did not hold is
+                    // created under the name the client chose, exactly as a
+                    // `CreateAppVersionAppComponent` naming no `id` is: the name
+                    // the resource was bound by is the id it is addressable by,
+                    // and so the key it is stored under.
                     let component = AppComponent {
-                        name,
+                        id: Some(name.clone()),
+                        name: name.clone(),
                         r#type: CREATED_APP_COMPONENT_TYPE.to_string(),
-                        id: Some(id.clone()),
                         additional_info: None,
                     };
-                    draft.app_components.insert(id, component.clone());
+                    draft.app_components.insert(name, component.clone());
                     component
                 }
             };
@@ -371,7 +380,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let physical_resource = PhysicalResource {
-            resource_name: input.resource_name.clone(),
+            resource_name,
             logical_resource_id: input.logical_resource_id.clone(),
             physical_resource_id,
             resource_type: input.resource_type.clone(),
@@ -428,25 +437,75 @@ const CREATED_APP_COMPONENT_TYPE: &str = "AWS::ResilienceHub::AppCommonAppCompon
 /// The identifier is the caller's. Its `type` is derived from the identifier
 /// itself, as the model's own doc for `PhysicalResourceId$type` draws the line
 /// (`Arn`: "The resource identifier is an Amazon Resource Name (ARN)"; `Native`:
-/// "an Resilience Hub-native identifier"). The owning region and account are the
-/// caller's when the request names them; otherwise they are the ones the physical
-/// identifier itself carries when it is an ARN, since an ARN names the region and
-/// account its resource lives in.
-fn physical_identifier(input: &CreateAppVersionResourceInput) -> PhysicalResourceId {
+/// "an Resilience Hub-native identifier").
+///
+/// A physical resource identifier is what makes a resource unique ACROSS accounts
+/// and regions, and `DescribeAppVersionResource` narrows a `physicalResourceId`
+/// lookup by `awsAccountId`/`awsRegion`, so both are always resolved rather than
+/// left unanswered: the request's when it names them, else the ones the identifier
+/// itself carries when it is an ARN (an ARN names the region and account its
+/// resource lives in), else the account and region of the caller that added the
+/// resource.
+fn physical_identifier(
+    input: &CreateAppVersionResourceInput,
+    caller_region: &str,
+    caller_account: &str,
+) -> PhysicalResourceId {
     let identifier = input.physical_resource_id.clone();
     let (arn_region, arn_account) = crate::state::arn_region_and_account(&identifier);
     PhysicalResourceId {
-        aws_region: input
-            .aws_region
-            .clone()
-            .or_else(|| arn_region.map(str::to_string)),
-        aws_account_id: input
-            .aws_account_id
-            .clone()
-            .or_else(|| arn_account.map(str::to_string)),
+        aws_region: Some(
+            input
+                .aws_region
+                .clone()
+                .or_else(|| arn_region.map(str::to_string))
+                .unwrap_or_else(|| caller_region.to_string()),
+        ),
+        aws_account_id: Some(
+            input
+                .aws_account_id
+                .clone()
+                .or_else(|| arn_account.map(str::to_string))
+                .unwrap_or_else(|| caller_account.to_string()),
+        ),
         r#type: physical_identifier_type(&identifier).to_string(),
         identifier,
     }
+}
+
+/// The `resourceName` the resource `input` describes is stored under, given the
+/// app version it is being added to and the key it will be stored under.
+///
+/// `resourceName` is OPTIONAL on the request while `logicalResourceId` is
+/// required, and the name is one of the three members
+/// `DescribeAppVersionResource` addresses a single resource by, so a request that
+/// names none leaves the resource named by its logical identifier — the
+/// identifier the client chose for it — rather than nameless.
+///
+/// Such a name is DERIVED rather than chosen, so it is taken only where it is
+/// free: a logical identifier outside the modelled `EntityName` is not a name a
+/// resource can carry, and a name another resource of the version already answers
+/// to stays that resource's. A derived name can therefore never be the reason a
+/// create is refused — two resources that differ only in the stack their one
+/// logical identifier lives in are both stored, the first keeping the name.
+fn resolved_resource_name(
+    input: &CreateAppVersionResourceInput,
+    version: Option<&crate::state::AppVersionContents>,
+    resource_key: &str,
+) -> Option<String> {
+    if let Some(resource_name) = input.resource_name.clone() {
+        return Some(resource_name);
+    }
+    let identifier = input.logical_resource_id.identifier.as_str();
+    if !crate::state::matches_modeled_entity_name(identifier) {
+        return None;
+    }
+    let taken_by_another = version
+        .and_then(|version| version.resource_by_name(identifier))
+        .is_some_and(|holder| {
+            crate::state::logical_resource_key(&holder.logical_resource_id) != resource_key
+        });
+    (!taken_by_another).then(|| identifier.to_string())
 }
 
 /// Whether `identifier` is an ARN or a Resilience Hub-native id — the two values
@@ -494,14 +553,15 @@ fn resource_key_of<'a>(resource: &'a str, app_arn: &str) -> Option<&'a str> {
 /// replayed token with the same parameters replays the first result, a replayed
 /// token with different parameters is a conflict.
 ///
-/// Covers EVERY member this operation stores from the request: the physical
-/// identifier as this request would store it, and the Application Components the
-/// request's names RESOLVE to, compared by the identity a binding and a stored
-/// component share — so a request that repeats a name, or names a component by the
-/// id it is stored under, still replays rather than conflicting.
+/// Covers EVERY member this operation stores from the request: the resource name
+/// and physical identifier as this request would store them, and the Application
+/// Components the request's names RESOLVE to, compared by the identity a binding
+/// and a stored component share — so a request that repeats a name, or names a
+/// component by the id it is stored under, still replays rather than conflicting.
 fn describes_same_resource(
     stored: &PhysicalResource,
     request: &CreateAppVersionResourceInput,
+    resource_name: Option<&str>,
     physical_resource_id: &PhysicalResourceId,
     bindings: &[ComponentBinding],
 ) -> bool {
@@ -515,7 +575,7 @@ fn describes_same_resource(
     let bound_components: Vec<&str> =
         bindings.iter().map(ComponentBinding::identity).collect();
 
-    stored.resource_name == request.resource_name
+    stored.resource_name.as_deref() == resource_name
         && stored.resource_type == request.resource_type
         && stored.additional_info == request.additional_info
         && stored.physical_resource_id.identifier == physical_resource_id.identifier
