@@ -3701,7 +3701,9 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     ///
     /// The charge values are the ones of the GENERATION of the item that applies in that
     /// billing period ([`CustomLineItemRecord::effective_in`]), so a bill of a period a
-    /// later write did not claim is computed from what the item charged then.
+    /// later write did not claim is computed from what the item charged then — and an
+    /// item NO generation of which applies in the period charges nothing there, however
+    /// it is reached, so a percentage item associated to it is lent nothing by it.
     fn custom_line_item_charge<'a>(
         &'a self,
         item: &'a CustomLineItemRecord,
@@ -3722,9 +3724,18 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             if computed.contains_key(current_arn) {
                 continue;
             }
-            let details = current
-                .effective_in(billing_period)
-                .map_or_else(|| current.charge_details(), |version| version.charge_details);
+            let Some(version) = current.effective_in(billing_period) else {
+                // No generation of this item applies in the billing period, so the item
+                // charges nothing there — the same answer a read scoped to that period
+                // gives, which reports no version of it at all. It is reachable here for
+                // an ASSOCIATED item only: the top-level loop admits an item only where
+                // some generation of it applies. The live charge values are the ones of
+                // a generation the period does not hold, so they are no charge of this
+                // period and lend a percentage item associated to this one nothing.
+                computed.insert(current_arn, 0.0);
+                continue;
+            };
+            let details = version.charge_details;
             let Some(percentage) = details.percentage.filter(|_| details.flat.is_none()) else {
                 // A flat item's charge is its own `ChargeValue`, and it lends that
                 // whatever else the store holds. An item carrying neither charge member

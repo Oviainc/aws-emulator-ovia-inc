@@ -49,6 +49,8 @@ mod billing_group_size_one_rule;
 mod billing_transfer_identity;
 #[path = "all/billing_transfer_preference.rs"]
 mod billing_transfer_preference;
+#[path = "all/cost_report_charges_of_the_generation_in_effect.rs"]
+mod cost_report_charges_of_the_generation_in_effect;
 #[path = "all/cost_report_token_breakdown_scope.rs"]
 mod cost_report_token_breakdown_scope;
 #[path = "all/create_custom_line_item_billing_period_window.rs"]
