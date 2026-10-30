@@ -75,6 +75,8 @@ mod resolver_endpoints;
 mod resolver_query_log_config_association_listing;
 #[path = "all/resolver_query_log_config_associations.rs"]
 mod resolver_query_log_config_associations;
+#[path = "all/resolver_query_log_config_deletion.rs"]
+mod resolver_query_log_config_deletion;
 #[path = "all/resolver_query_log_config_disassociation.rs"]
 mod resolver_query_log_config_disassociation;
 #[path = "all/resolver_query_log_config_listing.rs"]

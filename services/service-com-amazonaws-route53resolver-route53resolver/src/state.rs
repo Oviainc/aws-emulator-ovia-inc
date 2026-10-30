@@ -3719,13 +3719,16 @@ impl ResolverConfigRecord {
 /// is what a create answers with, and `CREATED` is "the query logging
 /// configuration was successfully created": the move between them is the one the
 /// clock owes, [`PROVISIONING_DELAY`] after the call that started it. `DELETING`
-/// describes a configuration a delete has been accepted for and `FAILED` one
-/// whose destination Resolver cannot deliver to, neither of which a create
-/// produces.
+/// describes a configuration a delete has been accepted for, which is what that
+/// call answers about the configuration it took out, and `FAILED` one whose
+/// destination Resolver cannot deliver to, which a create never produces.
 pub const QUERY_LOG_CONFIG_STATUS_CREATING: &str = "CREATING";
 
 /// See [`QUERY_LOG_CONFIG_STATUS_CREATING`].
 pub const QUERY_LOG_CONFIG_STATUS_CREATED: &str = "CREATED";
+
+/// See [`QUERY_LOG_CONFIG_STATUS_CREATING`].
+pub const QUERY_LOG_CONFIG_STATUS_DELETING: &str = "DELETING";
 
 /// `ResourceNotFoundException$ResourceType` for a query logging configuration:
 /// the modelled shape name of the resource, as for
@@ -3937,6 +3940,28 @@ pub fn resolver_query_log_config_association_not_found() -> ResourceNotFoundExce
             "The specified query logging configuration association doesn't exist",
         )),
         resource_type: Some(RESOURCE_TYPE_RESOLVER_QUERY_LOG_CONFIG_ASSOCIATION.to_string()),
+    }
+}
+
+/// The `InvalidRequestException` `DeleteResolverQueryLogConfig` answers for a
+/// configuration a VPC is still associated with.
+///
+/// The documented precondition of the delete is the sentence itself — "before
+/// you can delete a query logging configuration, you must first disassociate
+/// all VPCs from the configuration" — so the message states the remedy and
+/// echoes nothing from the request or the store: neither the configuration, nor
+/// a VPC, nor how many associations are still held, exactly as
+/// [`resolver_rule_in_use`] states the same remedy for a rule. No recorded
+/// response available here states a service error code for this fault — as for
+/// [`unknown_resolver_rule_arn`] — so none is invented, and the HTTP status
+/// (400) and the error shape are what the contract fixes.
+pub fn query_log_config_still_associated() -> InvalidRequestException {
+    InvalidRequestException {
+        message: Some(
+            "Before you can delete a query logging configuration, you must first disassociate \
+             all VPCs from the configuration."
+                .to_string(),
+        ),
     }
 }
 
