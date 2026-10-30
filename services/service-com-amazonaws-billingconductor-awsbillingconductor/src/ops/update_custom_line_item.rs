@@ -7,7 +7,8 @@
 //! It REPLACES, on the stored custom line item the `Arn` names, exactly the attributes
 //! the request carries — `Name`, `Description`, the charge value of the item's own
 //! charge kind and the charge details' `LineItemFilters` — keeps every attribute the
-//! request omits, advances `LastModifiedTime`, and reports the item as it now stands.
+//! request omits, advances `LastModifiedTime` when it left the item holding something
+//! other than what it held, and reports the item as it now stands.
 //!
 //! The values it leaves take effect in the billing periods the request's
 //! `BillingPeriodRange` names, as a new VERSION of the item: every billing period before
@@ -208,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let updated = merge(stored, &input)?;
+        let mut updated = merge(&stored, &input)?;
         // "The billing period range in which the custom line item request will be
         // applied": the first period the generation this update leaves is in effect in,
         // and so the period the answer describes the item as of. A request naming no
@@ -220,7 +221,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map(|range| range.inclusive_start_billing_period.clone())
             .unwrap_or_else(crate::state::current_billing_period);
-        let output = render(&updated, &applied_from);
         // One state method writes the item and keeps the generations a read of an
         // earlier billing period reports: the update takes over the billing period it is
         // applied from and every later one, so the generation it replaces is frozen
@@ -231,35 +231,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .billing_period_range
             .as_ref()
             .map(|range| range.inclusive_start_billing_period.clone());
-        let now = updated.last_modified_time_millis;
-        state.put_custom_line_item(updated, now, takes_effect_from.as_deref());
+
+        // `LastModifiedTime` is "the most recent time when the custom line item was
+        // modified", so it moves only when this call actually modified the item: a
+        // request that names no member, or names the values the item already holds,
+        // leaves it where it was — and a call that modified nothing writes no generation
+        // either, since a generation of the item is the item as it stood while it was in
+        // effect and that is still the generation in effect now. It is the rule the rest
+        // of this crate answers a write that changed nothing with, for this very resource
+        // (`DeleteCustomLineItem`'s narrowing delete) and for the sibling resources
+        // (`UpdateBillingGroup`, `UpdatePricingRule`), decided by the state method that
+        // names the members such a write can change
+        // ([`crate::state::CustomLineItemRecord::holds_same_members_as`]).
+        let changed = !updated.holds_same_members_as(&stored);
+        if changed {
+            updated.last_modified_time_millis = crate::state::now_millis();
+        }
+        // The answer describes the item as this call leaves it, so it is rendered before
+        // the write hands the record to the store.
+        let output = render(&updated, &applied_from);
+        if changed {
+            let now = updated.last_modified_time_millis;
+            state.put_custom_line_item(updated, now, takes_effect_from.as_deref());
+        }
 
         // The audit record for a state-changing call: who asked, what it addressed and
-        // that it succeeded. Never a `@sensitive` member — the item's name and its
-        // description are both `@sensitive` — only the access key id the caller
-        // presented and the ARN it addressed.
+        // whether it left the item any different. Never a `@sensitive` member — the
+        // item's name and its description are both `@sensitive` — only the access key id
+        // the caller presented and the ARN it addressed.
         ::tracing::info!(
             operation = Self::NAME,
             akid = %::engine::extract_akid(&ctx.parts().headers),
             custom_line_item_arn = %item_arn,
-            outcome = "updated",
-            "custom line item updated"
+            outcome = if changed { "updated" } else { "unchanged" },
+            "custom line item update served"
         );
         Ok(output)
     }
 }
 
 /// The stored item as this request leaves it: a member the request carries replaces
-/// the stored one, a member it omits keeps what state holds, and `LastModifiedTime`
-/// advances because the record changed ("The most recent time when the custom line
-/// item was modified").
+/// the stored one and a member it omits keeps what state holds.
+///
+/// `LastModifiedTime` is NOT this merge's to set: whether the call modified the item at
+/// all is decided by comparing what this returns against the stored record, which the
+/// caller does.
 fn merge(
-    stored: crate::state::CustomLineItemRecord,
+    stored: &crate::state::CustomLineItemRecord,
     input: &UpdateCustomLineItemInput,
 ) -> Result<crate::state::CustomLineItemRecord, UpdateCustomLineItemError> {
-    // The stored record is taken BY VALUE — the caller's lookup already copied it out
-    // of the map — so merging makes no second copy of it.
-    let mut updated = stored;
+    // The stored record stays with the caller, which compares the merged item against it
+    // to decide whether this request modified anything.
+    let mut updated = stored.clone();
     if let Some(name) = input.name.clone() {
         updated.name = name;
     }
@@ -357,7 +380,6 @@ fn merge(
         )];
     }
 
-    updated.last_modified_time_millis = crate::state::now_millis();
     Ok(updated)
 }
 

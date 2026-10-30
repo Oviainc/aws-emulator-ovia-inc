@@ -289,8 +289,9 @@ pub fn billing_period_precedes(start: Option<i64>, end: Option<i64>) -> bool {
 ///
 /// The bounds are kept as the STRINGS a request carried, because a billing period has
 /// two spellings of one month (`2026-7` and `2026-07`) and a read reports the period
-/// back as the call that set it named it; ordering goes through
-/// [`billing_period_key`], so the two spellings still compare equal.
+/// back as the call that SET it named it — a later call that only restates the same
+/// month in the other spelling sets nothing, so it leaves the spelling alone; ordering
+/// goes through [`billing_period_key`], so the two spellings still compare equal.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BillingPeriodSpan {
     pub inclusive_start: Option<String>,
@@ -337,6 +338,17 @@ impl BillingPeriodSpan {
     /// back in effect in a later period.
     pub fn ending_now() -> Self {
         Self::new(Some(current_billing_period()), None)
+    }
+
+    /// Do this span and `other` cover the SAME billing periods?
+    ///
+    /// A billing period has two spellings of one month (`2026-7` and `2026-07`), so the
+    /// bounds are compared as the month counts [`billing_period_key`] reads them — the
+    /// axis every other ordering here uses — rather than as the strings a request
+    /// carried: two spans a read reports the resource for in the very same periods cover
+    /// the same periods, however the call that set them spelled their bounds.
+    pub fn covers_same_periods_as(&self, other: &Self) -> bool {
+        self.start_key() == other.start_key() && self.end_key() == other.end_key()
     }
 
     /// Is `billing_period` inside this span? See [`billing_period_range_covers`].
@@ -2153,6 +2165,35 @@ impl CustomLineItemRecord {
             last_modified_time_millis: self.last_modified_time_millis,
             start_time_millis: self.version_start_time_millis,
         }
+    }
+
+    /// Do this record and `other` hold the SAME values for every member a write to the
+    /// item can change — its name, its description, the charge value of the charge kind
+    /// it is, the filters its charge applies through and the billing periods its current
+    /// generation applies in?
+    ///
+    /// What decides whether a write modified the item at all: `LastModifiedTime` is the
+    /// instant of the write that left the item as it stands, so a write leaving every one
+    /// of these members where it was neither moves that instant nor opens a generation —
+    /// the rule the sibling resources' updaters apply
+    /// ([`PricingRuleRecord::holds_same_members_as`]). The members no write of this kind
+    /// can change — the ARN, the billing group, the charge `Type`, `CreationTime` and the
+    /// resource associations the association operations own — are not among them, so they
+    /// cannot make a no-op write look like a change.
+    ///
+    /// The billing periods are compared as the PERIODS they are rather than as the
+    /// strings a request spelled them with ([`BillingPeriodSpan::covers_same_periods_as`]),
+    /// because one month has two spellings and a write naming the other one leaves the
+    /// item applying in exactly the periods it already did.
+    pub fn holds_same_members_as(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.description == other.description
+            && self.flat_charge_value == other.flat_charge_value
+            && self.percentage_value == other.percentage_value
+            && self.line_item_filters == other.line_item_filters
+            && self.spans.len() == other.spans.len()
+            && std::iter::zip(&self.spans, &other.spans)
+                .all(|(span, theirs)| span.covers_same_periods_as(theirs))
     }
 
     /// Every generation of this item that is a VERSION of it somewhere, OLDEST FIRST:

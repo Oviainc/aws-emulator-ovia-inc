@@ -94,7 +94,7 @@ pub struct CustomLineItemBillingPeriodRange {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.billingconductor#LineItemFilter")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LineItemFilter {
     pub attribute: String,
     pub match_option: String,

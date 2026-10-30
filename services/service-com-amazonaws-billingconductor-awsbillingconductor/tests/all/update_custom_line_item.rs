@@ -7,7 +7,8 @@
 //! names (in either form the `CustomLineItemArn` pattern admits), exactly the
 //! attributes the request carries — `Name`, `Description`, the charge value of the
 //! item's own charge kind and the charge details' `LineItemFilters` — keeps every
-//! attribute the request omits, advances `LastModifiedTime`, and reports the item as
+//! attribute the request omits, advances `LastModifiedTime` only when the call left the
+//! item holding something other than what it held, and reports the item as
 //! stored. The values it leaves apply in the billing periods its `BillingPeriodRange`
 //! names, as a new VERSION of the item, so every period before the one the update is
 //! applied from still reports the version the item had there. It refuses an `Arn` that
@@ -23,7 +24,8 @@
 //! and how long it is (absent / one filter of either `Attribute` / cleared), how the
 //! billing-period range is ordered
 //! (open end, one month apart, far apart, equal bounds, reversed) and how a billing
-//! period is spelled (`2026-1` / `2026-01`).
+//! period is spelled (`2026-1` / `2026-01`) — and, for the clock, whether the call
+//! leaves the item holding anything other than what it held.
 
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
@@ -190,6 +192,28 @@ impl Emulator {
         self.read_back(case, arn, None)
             .await
             .unwrap_or_else(|| panic!("case {case:?}: expected {arn} to be readable"))
+    }
+
+    /// The versions `ListCustomLineItemVersions` reports for the item, in the order it
+    /// reports them — one per GENERATION of the item, so a write that opened a generation
+    /// is visible here.
+    async fn versions(&self, case: &str, arn: &str) -> Vec<Value> {
+        let (status, body) = self
+            .send(
+                "POST",
+                "/list-custom-line-item-versions",
+                &json!({ "Arn": arn }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the version read to answer HTTP 200, got {status} with \
+             {body}"
+        );
+        body.get("CustomLineItemVersions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -1063,4 +1087,282 @@ async fn a_read_after_an_update_is_stable() {
         "case {case:?}: a read must not change what a later caller sees, got {second} after \
          {first}"
     );
+}
+
+/// Wall-clock millis since the epoch, from the SAME clock the service reads, so a test
+/// can bracket the `LastModifiedTime` a call must report.
+fn now_millis() -> i64 {
+    service_com_amazonaws_billingconductor_awsbillingconductor::state::now_millis()
+}
+
+/// The `Name` every row of the `LastModifiedTime` table creates its item with.
+const CLOCK_ITEM: &str = "clock_item";
+
+/// One row of the `LastModifiedTime` table: the members the create gives the item on top
+/// of the ones every create needs, the members the call under test names beside `Arn`,
+/// and whether that call left the item holding anything different.
+struct ClockCase {
+    label: &'static str,
+    /// What the item IS before the call: the charge kind it was created with and the
+    /// filters it already holds.
+    create: Value,
+    /// The members the call under test names beside `Arn`.
+    patch: Value,
+    /// Does the call under test move `LastModifiedTime`?
+    moves: bool,
+}
+
+/// THE RULE on the clock: `LastModifiedTime` is "the most recent time when the custom
+/// line item was modified", so an update moves it only when the call actually left the
+/// item holding something other than what it held — a request that names no member, or
+/// names the values the item already holds, leaves it where it was and opens no new
+/// version of the item either.
+#[tokio::test]
+async fn last_modified_time_moves_only_when_the_update_changed_the_item() {
+    // The rows differ along what the rule generalises over: which member the request
+    // names (none, each member class — a name, free text, a charge value, a list, a
+    // billing-period range — and all of them at once), the charge kind of the item
+    // (flat / percentage), what the item already holds for that member, and, for the
+    // list, its LENGTH and its contents (restated / emptied / replaced by another entry).
+    // A billing-period range also varies along how the month is spelled, the two forms
+    // the modelled `BillingPeriod` pattern allows.
+    let description = format!("the {CLOCK_ITEM} custom line item");
+    let filter = line_item_filter("SERVICE", "EQUAL", "AWSCostExplorer");
+    // The OTHER `Attribute` the model enumerates, with the value list that attribute
+    // takes (`smithy_query(query="shape",shape="LineItemFilterAttributeName,
+    // LineItemFilter,LineItemFilterValue")`).
+    let other_filter = json!({
+        "Attribute": "LINE_ITEM_TYPE",
+        "MatchOption": "NOT_EQUAL",
+        "Values": ["SAVINGS_PLAN_NEGATION"],
+    });
+    // A flat item, a percentage one and a flat one that already holds a filter.
+    let flat = json!({});
+    let percentage =
+        json!({ "ChargeDetails": { "Type": "FEE", "Percentage": { "PercentageValue": 12.5 } } });
+    let filtered = json!({
+        "ChargeDetails": {
+            "Type": "FEE",
+            "Flat": { "ChargeValue": 1.0 },
+            "LineItemFilters": [filter.clone()],
+        },
+    });
+
+    let cases: Vec<ClockCase> = vec![
+        ClockCase {
+            label: "nothing but the Arn",
+            create: flat.clone(),
+            patch: json!({}),
+            moves: false,
+        },
+        ClockCase {
+            label: "the Name it already holds",
+            create: flat.clone(),
+            patch: json!({ "Name": CLOCK_ITEM }),
+            moves: false,
+        },
+        ClockCase {
+            label: "the Description it already holds",
+            create: flat.clone(),
+            patch: json!({ "Description": description.clone() }),
+            moves: false,
+        },
+        ClockCase {
+            label: "the flat charge value it already holds",
+            create: flat.clone(),
+            patch: json!({ "ChargeDetails": { "Flat": { "ChargeValue": 1.0 } } }),
+            moves: false,
+        },
+        ClockCase {
+            label: "the percentage value it already holds",
+            create: percentage.clone(),
+            patch: json!({ "ChargeDetails": { "Percentage": { "PercentageValue": 12.5 } } }),
+            moves: false,
+        },
+        ClockCase {
+            label: "charge details naming neither a kind nor filters",
+            create: flat.clone(),
+            patch: json!({ "ChargeDetails": {} }),
+            moves: false,
+        },
+        ClockCase {
+            label: "the one LineItemFilter it already holds",
+            create: filtered.clone(),
+            patch: json!({ "ChargeDetails": { "LineItemFilters": [filter.clone()] } }),
+            moves: false,
+        },
+        ClockCase {
+            label: "an empty LineItemFilters on an item that holds none",
+            create: flat.clone(),
+            patch: json!({ "ChargeDetails": { "LineItemFilters": [] } }),
+            moves: false,
+        },
+        ClockCase {
+            label: "the billing periods it already applies in",
+            create: flat.clone(),
+            patch: json!({
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
+            }),
+            moves: false,
+        },
+        ClockCase {
+            // The OTHER spelling the `BillingPeriod` pattern allows for one month: it
+            // names the very periods the item already applies in, so nothing about the
+            // item differs afterwards.
+            label: "the billing period it already applies in, spelled the other way",
+            create: flat.clone(),
+            patch: json!({
+                "BillingPeriodRange": {
+                    "InclusiveStartBillingPeriod": one_digit_month(&period(0)),
+                },
+            }),
+            moves: false,
+        },
+        ClockCase {
+            label: "every member it already holds at once",
+            create: filtered.clone(),
+            patch: json!({
+                "Name": CLOCK_ITEM,
+                "Description": description.clone(),
+                "ChargeDetails": {
+                    "Flat": { "ChargeValue": 1.0 },
+                    "LineItemFilters": [filter.clone()],
+                },
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(0) },
+            }),
+            moves: false,
+        },
+        ClockCase {
+            label: "a new Name",
+            create: flat.clone(),
+            patch: json!({ "Name": "clock_renamed" }),
+            moves: true,
+        },
+        ClockCase {
+            label: "a new Description",
+            create: flat.clone(),
+            patch: json!({ "Description": "moved on" }),
+            moves: true,
+        },
+        ClockCase {
+            label: "a new flat charge value",
+            create: flat.clone(),
+            patch: json!({ "ChargeDetails": { "Flat": { "ChargeValue": 2.0 } } }),
+            moves: true,
+        },
+        ClockCase {
+            label: "a new percentage value",
+            create: percentage.clone(),
+            patch: json!({ "ChargeDetails": { "Percentage": { "PercentageValue": 20.0 } } }),
+            moves: true,
+        },
+        ClockCase {
+            label: "a filter where the item held none",
+            create: flat.clone(),
+            patch: json!({ "ChargeDetails": { "LineItemFilters": [filter.clone()] } }),
+            moves: true,
+        },
+        ClockCase {
+            label: "the filters it holds cleared",
+            create: filtered.clone(),
+            patch: json!({ "ChargeDetails": { "LineItemFilters": [] } }),
+            moves: true,
+        },
+        ClockCase {
+            label: "another filter in place of the one it holds",
+            create: filtered.clone(),
+            patch: json!({ "ChargeDetails": { "LineItemFilters": [other_filter] } }),
+            moves: true,
+        },
+        ClockCase {
+            label: "a billing period range that ends where none did",
+            create: flat.clone(),
+            patch: json!({
+                "BillingPeriodRange": {
+                    "InclusiveStartBillingPeriod": period(0),
+                    "ExclusiveEndBillingPeriod": period(1),
+                },
+            }),
+            moves: true,
+        },
+        ClockCase {
+            label: "the previous billing period as the range start",
+            create: flat.clone(),
+            patch: json!({
+                "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(-1) },
+            }),
+            moves: true,
+        },
+    ];
+
+    for ClockCase {
+        label: case,
+        create,
+        patch,
+        moves,
+    } in cases
+    {
+        let (emulator, _group, item) = fixture(CLOCK_ITEM, create).await;
+        let before = emulator.stored(case, &item).await;
+        let created_at = before
+            .get("CreationTime")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let modified_before = before
+            .get("LastModifiedTime")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let versions_before = emulator.versions(case, &item).await.len();
+        // The clock this emulator reads has millisecond resolution, so a move is
+        // observable as "not earlier than the instant before the call".
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let before_call = now_millis();
+
+        let answer = emulator.update_ok(case, &item, patch).await;
+        let after_call = now_millis();
+        let reported = answer
+            .get("LastModifiedTime")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let read = emulator.stored(case, &item).await;
+        assert_eq!(
+            read.get("LastModifiedTime").and_then(Value::as_i64),
+            Some(reported),
+            "case {case:?}: the answer and a later read must agree on LastModifiedTime, got \
+             {read} after {answer}"
+        );
+
+        if moves {
+            assert!(
+                reported >= before_call && reported <= after_call,
+                "case {case:?}: expected a LastModifiedTime inside [{before_call}, \
+                 {after_call}], got {reported}"
+            );
+        } else {
+            assert_eq!(
+                reported, modified_before,
+                "case {case:?}: a call that modified nothing must leave LastModifiedTime where \
+                 it was ({modified_before}), got {reported}"
+            );
+            // The premise of such a row: nothing else a read reports differs across the
+            // call either, and the item keeps the versions it had — a call that modified
+            // nothing opens no new generation of it.
+            assert_eq!(
+                read, before,
+                "case {case:?}: expected the stored item to be untouched, got {read} instead \
+                 of {before}"
+            );
+            let versions_after = emulator.versions(case, &item).await.len();
+            assert_eq!(
+                versions_after, versions_before,
+                "case {case:?}: expected the item to keep its {versions_before} version(s), got \
+                 {versions_after}"
+            );
+        }
+        assert_eq!(
+            read.get("CreationTime").and_then(Value::as_i64),
+            Some(created_at),
+            "case {case:?}: the creation time is never an update's to change, got {read}"
+        );
+    }
 }
