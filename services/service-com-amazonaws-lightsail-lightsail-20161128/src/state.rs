@@ -73,7 +73,8 @@ use crate::ops::types::{
     ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
     ContactMethod,
-    ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, DestinationInfo,
+    ContainerServiceHealthCheckConfig, ContainerServicePower, ContainerServiceStateDetail,
+    DestinationInfo,
     DistributionBundle, DistributionCustomErrorResponse,
     Domain, DomainEntry, DomainValidationRecord, ExportSnapshotRecord,
     ExportSnapshotRecordSourceInfo,
@@ -8676,6 +8677,48 @@ pub fn container_service_power(power: &str) -> Option<ContainerPowerSpec> {
         .iter()
         .find(|spec| spec.name == power)
         .copied()
+}
+
+impl ContainerPowerSpec {
+    /// This power as the modelled `ContainerServicePower`.
+    ///
+    /// `name` is "The friendly name of the power (`nano`)" and `powerId` "The ID
+    /// of the power (`nano-1`)", so the two are reported from the catalog's own
+    /// columns rather than derived from one another.
+    pub fn view(&self) -> ContainerServicePower {
+        ContainerServicePower {
+            power_id: Some(self.power_id.to_string()),
+            name: Some(self.name.to_string()),
+            price: Some(self.price),
+            cpu_count: Some(self.cpu_count),
+            ram_size_in_gb: Some(self.ram_size_in_gb),
+            // `isActive` is "whether the power is active and can be specified for
+            // container services", which is exactly what
+            // [`container_service_power`] answers: that lookup is the one a
+            // create or an update resolves a requested `power` against, so the
+            // flag is read off it rather than restated as a column nothing
+            // consults. A power this service stopped accepting therefore reports
+            // itself inactive without anything else having to be kept in step.
+            is_active: Some(container_service_power(self.name).is_some()),
+        }
+    }
+}
+
+/// The powers a `GetContainerServicePowers` call reports out of `specs`.
+///
+/// Every entry is reported — the result shape carries no filter and the operation
+/// takes no member, so which powers can be SPECIFIED is said by each entry's
+/// `isActive` rather than by leaving one out — in `specs`' own order, so two reads
+/// answer identically.
+pub fn container_service_powers_from(specs: &[ContainerPowerSpec]) -> Vec<ContainerServicePower> {
+    specs.iter().map(ContainerPowerSpec::view).collect()
+}
+
+/// The container service powers a `GetContainerServicePowers` call reports:
+/// [`container_service_powers_from`] over this service's published catalog,
+/// [`CONTAINER_SERVICE_POWERS`].
+pub fn container_service_powers() -> Vec<ContainerServicePower> {
+    container_service_powers_from(CONTAINER_SERVICE_POWERS)
 }
 
 /// The power names [`container_service_power`] accepts, for a refusal that has to

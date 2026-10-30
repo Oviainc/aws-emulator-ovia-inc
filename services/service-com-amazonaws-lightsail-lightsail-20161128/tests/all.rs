@@ -99,6 +99,8 @@ mod container_service_lifecycle;
 mod container_service_log;
 #[path = "all/container_service_metric_data.rs"]
 mod container_service_metric_data;
+#[path = "all/container_service_powers.rs"]
+mod container_service_powers;
 #[path = "all/container_service_public_domain_certificate.rs"]
 mod container_service_public_domain_certificate;
 #[path = "all/container_service_public_endpoint.rs"]
