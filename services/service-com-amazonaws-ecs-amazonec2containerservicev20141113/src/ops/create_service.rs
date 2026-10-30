@@ -842,6 +842,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version: 0,
             // A created service has replaced no deployment of its own.
             superseded_deployments: Vec::new(),
+            // And nothing has created a task set in it yet, so it has no deployment of
+            // its own to lose.
+            held_task_set: false,
         };
         guard.services.insert(key.clone(), record);
 

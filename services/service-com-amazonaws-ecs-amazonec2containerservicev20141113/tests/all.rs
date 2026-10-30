@@ -145,6 +145,8 @@ mod task_lifecycle;
 mod task_provisioning;
 #[path = "all/task_set_creation.rs"]
 mod task_set_creation;
+#[path = "all/task_set_deletion.rs"]
+mod task_set_deletion;
 #[path = "all/task_sets.rs"]
 mod task_sets;
 #[path = "all/task_state_reports.rs"]

@@ -365,16 +365,14 @@ async fn a_task_sets_counts_follow_the_service_count_its_scale_and_the_tasks_it_
             0,
             "case {case:?}: expected runningCount 0 on a just-created task set, got {created}"
         );
-        let expected_stability = if expected == 0 {
-            "STEADY_STATE"
-        } else {
-            "STABILIZING"
-        };
+        // A task set the create has just placed has not converged on what it wants: the
+        // scheduler confirms its steady state a span later, whatever its counts already
+        // read.
         assert_eq!(
             string(created, "stabilityStatus", case),
-            expected_stability,
-            "case {case:?}: a task set is in STEADY_STATE only when its runningCount \
-             equals its computedDesiredCount and nothing is pending, got {created}"
+            "STABILIZING",
+            "case {case:?}: a task set the scheduler has not confirmed stable yet is \
+             STABILIZING, got {created}"
         );
 
         // The service the task set belongs to reports it, and counts its tasks.
@@ -504,7 +502,9 @@ async fn describe_task_sets_narrows_to_the_references_it_names() {
         );
     }
 
-    // `include` gates the tags, exactly as it does on a service.
+    // `include` gates the CONTENT of the tags list, exactly as it does on a service: the
+    // member itself is reported either way, as the recorded task sets of the real service
+    // carry it.
     let without_tags = describe_task_sets(
         &router,
         cluster,
@@ -515,7 +515,7 @@ async fn describe_task_sets_narrows_to_the_references_it_names() {
     )
     .await;
     assert!(
-        list(&without_tags, "taskSets", case)[0]["tags"].is_null(),
+        list(&list(&without_tags, "taskSets", case)[0], "tags", case).is_empty(),
         "case {case:?}: tags are reported only when include names TAGS, got {without_tags}"
     );
 

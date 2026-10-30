@@ -253,8 +253,9 @@ async fn a_deleted_service_drains_with_its_task_sets_and_settles_on_the_clock() 
             );
             assert_eq!(
                 string(task_set, "serviceArn", case),
-                service_arn,
-                "case {case:?}: the task set belongs to the deleted service, got {task_set}"
+                format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:service/{}", row.name),
+                "case {case:?}: the task set reports the ARN of the service it exists in, \
+                 got {task_set}"
             );
             assert_eq!(
                 string(task_set, "status", case),

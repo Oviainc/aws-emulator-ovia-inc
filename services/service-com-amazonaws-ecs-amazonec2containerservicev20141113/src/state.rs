@@ -1454,9 +1454,35 @@ pub const MAX_SCALE_PERCENT: f64 = 100.0;
 /// ECS service quotas"), where "Task sets per service" is 5.
 pub const MAX_TASK_SETS_PER_SERVICE: usize = 5;
 
-/// The message a `TaskSetNotFoundException` carries. A FIXED sentence naming nothing from
-/// the request, like this service's other not-found sentences.
-pub const TASK_SET_NOT_FOUND_MESSAGE: &str = "The specified task set was not found.";
+/// `TaskSetNotFoundException$message`, BUILT FROM THE REQUEST: Amazon ECS names the task
+/// set the caller asked for and the service it looked for it in, so a client that
+/// addressed the wrong service can tell which of the two was wrong. The id is the one the
+/// reference named ([`task_set_id_from_reference`]), so an ARN reference reads as the id
+/// it carries. Shared by every operation that addresses one task set, so none of them
+/// words the class differently.
+pub fn task_set_not_found_message(reference: &str, service_name: &str) -> String {
+    format!(
+        "Unable to find task set with id {} on service {service_name}.",
+        task_set_id_from_reference(reference)
+    )
+}
+
+/// `InvalidParameterException$message` when `DeleteTaskSet` is asked to delete the task
+/// set that is serving the service's production traffic without saying `force`.
+///
+/// `TaskSet$status` PRIMARY: "The task set is serving production traffic" — taking it away
+/// would leave the service's traffic unserved, so the delete is refused unless the request
+/// insists on it ("If `true`, you can delete a task set even if it hasn't been scaled down
+/// to zero"). The sentence is the one the recorded refusal carries, and it names no
+/// resource from the request.
+pub const PRIMARY_TASK_SET_NOT_DELETABLE_MESSAGE: &str = "Primary TaskSet cannot be deleted";
+
+/// `Task$stoppedReason` of a task the deletion of its task set stopped: the scheduler's
+/// account of why the task was taken away, naming the task set whose deletion took it —
+/// the same shape as the one a deleted service's tasks carry.
+pub fn task_set_deleted_reason(task_set_id: &str) -> String {
+    format!("Task set {task_set_id} was deleted")
+}
 
 /// `TaskSet$startedBy` for a task set CodeDeploy created: "If an CodeDeploy deployment
 /// created the task set, the `startedBy` parameter is `CODE_DEPLOY`. If an external
@@ -3273,6 +3299,15 @@ pub struct ServiceRecord {
     /// rolls out (the member is not in the Smithy model; recorded responses carry `0`
     /// through updates that start no new deployment).
     pub version: i64,
+    /// Whether a task set was ever created in this service, and so whether the service HAS
+    /// a deployment of its own to lose.
+    ///
+    /// Sticky: deleting the task sets is what takes the deployment away, which is the
+    /// condition this answers (see
+    /// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::service_has_outstanding_work`]),
+    /// so it is not taken back with them. A service nothing ever created a task set in has
+    /// no deployment to lose and nothing outstanding for the want of one.
+    pub held_task_set: bool,
     /// The deployments this one REPLACED and whose tasks are still being replaced,
     /// newest first. `Deployment$status`: "ACTIVE: A service deployment that still has
     /// running tasks, but are in the process of being replaced with a new launch type,
@@ -3867,6 +3902,7 @@ pub struct TaskSetRecord {
     pub cluster_name: String,
     pub cluster_arn: String,
     pub service_name: String,
+    /// `TaskSet$serviceArn`, as a task set reports it ([`task_set_service_arn`]).
     pub service_arn: String,
     pub external_id: Option<String>,
     pub status: String,
@@ -3887,11 +3923,37 @@ pub struct TaskSetRecord {
     /// The `clientToken` the create carried, so repeating that create is idempotent
     /// ("An identifier that you provide to ensure the idempotency of the request").
     pub client_token: Option<String>,
+    /// When the scheduler's confirmation that this task set has reached a steady state
+    /// falls due, or `None` once it has been confirmed.
+    ///
+    /// `TaskSet$stabilityStatus` "indicates whether the task set has reached a steady
+    /// state", and the scheduler re-confirms it after every write that touches the task
+    /// set, so a caller that reads a task set straight after creating, scaling or
+    /// promoting it sees `STABILIZING` — a span the CLOCK settles ([`TRANSITION_SPAN`]),
+    /// stored rather than slept on, exactly as a service's deployment stability is
+    /// ([`ServiceRecord::deployment_stable_due_at`]).
+    pub stable_due_at: Option<SystemTime>,
+    /// When the drain a `DeleteTaskSet` started falls due, or `None` for a task set nobody
+    /// has deleted.
+    ///
+    /// `DeleteTaskSet` leaves the task set `DRAINING` — "the tasks in the task set are
+    /// being stopped, and their corresponding targets are being deregistered from their
+    /// target group" — so the task set is still one the service holds while that drain is
+    /// under way, and the CLOCK is what finishes it ([`TRANSITION_SPAN`]): the record is
+    /// gone once this instant passes, whether or not anybody called to look.
+    pub removal_due_at: Option<SystemTime>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
 
 impl TaskSetRecord {
+    /// Whether a `DeleteTaskSet` has already taken this task set: it is draining away and
+    /// the clock will remove it ([`Self::removal_due_at`]), so the delete has had it and
+    /// no write modifies it any more.
+    pub fn is_deleted(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
     /// The key this record is stored under: the cluster, the service and the task set's
     /// own id — the three things every task-set operation addresses one by.
     pub fn key(&self) -> (String, String, String) {
@@ -4585,6 +4647,18 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
             }
         }
+        // The scheduler's confirmation that a task set has reached a steady state, owed at
+        // the instant the write that touched it put on the record: once it is due the task
+        // set is stable whether or not anybody called to look.
+        for task_set in self.task_sets.values_mut() {
+            if task_set.stable_due_at.is_some_and(|due| due <= now) {
+                task_set.stable_due_at = None;
+            }
+        }
+        // The drain a `DeleteTaskSet` started: once it is due the task set it was draining
+        // away is gone, whether or not anybody called to look.
+        self.task_sets
+            .retain(|_, task_set| task_set.removal_due_at.is_none_or(|due| due > now));
         // The rolling deployment an `UpdateExpressGatewayService` started ("performs a
         // rolling deployment to replace existing tasks"): once it is due the revision it
         // rolled out has replaced the one before it, so only the newest configuration is
@@ -6498,17 +6572,30 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
 
     /// Whether the scheduler still has work to do for `service`.
     ///
-    /// A service whose deletion has started still has to let go of the tasks and task sets
-    /// it holds ("if there are still running tasks that require cleanup, the service status
-    /// moves from ACTIVE to DRAINING"), so those are its outstanding work. A live service's
-    /// work is the difference between the task set it wants and the one it has: a task
-    /// still coming up, or a count that is not yet the one it was asked for.
+    /// A service whose deletion has started still has to let go of the TASKS it holds ("if
+    /// there are still running tasks that require cleanup, the service status moves from
+    /// ACTIVE to DRAINING") — and a service that DID deploy through a task set and holds
+    /// none any more has lost the deployment that served its traffic and still owes what
+    /// that deployment held; while one of them is still draining the service holds it yet,
+    /// and reports nothing outstanding beyond it. Recorded behavior, as `Service$runStatus`
+    /// itself is: the recorded teardowns report work outstanding where the service's task
+    /// sets have gone and the terminal steady state where one is still draining away.
+    ///
+    /// A live service's work is the difference between the task set it wants and the one it
+    /// has: a task still coming up, or a count that is not yet the one it was asked for.
     fn service_has_outstanding_work(&self, service: &ServiceRecord) -> bool {
         if service.status != SERVICE_ACTIVE {
+            // The second disjunct reads the opposite way round from the first, and is
+            // meant to: the recorded teardown of a service that still holds a draining
+            // task set reports the terminal steady state, while the recorded teardowns
+            // whose task sets have gone report work outstanding (the replay clusters
+            // `ecs|DeleteService|2xx->2xx|$.service.runStatus` and
+            // `ecs|DeleteService|2xx->2xx|$.service.taskSets[*]` are what fix the pair).
             return self.service_has_active_tasks(&service.cluster_name, &service.name)
-                || !self
-                    .service_task_sets(&service.cluster_name, &service.name)
-                    .is_empty();
+                || (service.held_task_set
+                    && self
+                        .service_task_sets(&service.cluster_name, &service.name)
+                        .is_empty());
         }
         let tally = self.service_tally(&service.cluster_name, &service.name);
         tally.pending > 0 || (service.places_tasks() && tally.running != service.desired_count)
@@ -6895,6 +6982,105 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         })
     }
 
+    /// Hold the task set `key` names at the scale `scale` asks for, and put the scheduler
+    /// to work on it, answering with the record as the update left it.
+    ///
+    /// `UpdateTaskSet$scale` is "A floating-point percentage of the desired number of
+    /// tasks to place and keep running in the task set", so changing it changes the
+    /// `TaskSet$computedDesiredCount` the task set is held at — and the call that changes
+    /// what the task set wants is what places or stops its tasks
+    /// ([`Self::scale_task_set`]), never a later read.
+    ///
+    /// `Err` is [`Self::scale_task_set`]'s: the placement would push this emulator past
+    /// [`MAX_TASKS`], so the task set is left at the scale it was already held at.
+    pub fn rescale_task_set(
+        &mut self,
+        key: &(String, String, String),
+        scale: &Scale,
+        region: &str,
+        now: SystemTime,
+    ) -> Result<Option<TaskSetRecord>, TaskCapacityExceeded> {
+        let Some(previous) = self.task_sets.get(key).cloned() else {
+            return Ok(None);
+        };
+        if let Some(task_set) = self.task_sets.get_mut(key) {
+            task_set.scale = stored_scale(Some(scale));
+            task_set.updated_at = DateTime::from(now);
+        }
+        // The revision the task set places is the one it was created with, as stored: an
+        // update of the scale changes how MANY tasks the task set holds, never which
+        // task definition they run.
+        let definition = self
+            .task_definitions
+            .get(&previous.task_definition)
+            .cloned();
+        if let Some(definition) = definition {
+            if let Err(exceeded) = self.scale_task_set(key, &definition, region, now) {
+                // Nothing was placed, so NOTHING was written: the task set is left exactly
+                // as it stood, down to the instant its steady state was confirmed at.
+                if let Some(task_set) = self.task_sets.get_mut(key) {
+                    task_set.scale = previous.scale.clone();
+                    task_set.updated_at = previous.updated_at;
+                }
+                return Err(exceeded);
+            }
+        }
+        if let Some(task_set) = self.task_sets.get_mut(key) {
+            // The write touched what the task set wants, so its steady state is
+            // re-confirmed from here.
+            task_set.stable_due_at = Some(now + TRANSITION_SPAN);
+        }
+        Ok(self.task_sets.get(key).cloned())
+    }
+
+    /// Delete the task set `key` names, answering with the record as the delete left it.
+    ///
+    /// `DeleteTaskSet` "Deletes a specified task set within a service": the tasks the task
+    /// set placed are asked to stop and the task set is left in the status that says so —
+    /// `TaskSet$status` DRAINING, "the tasks in the task set are being stopped, and their
+    /// corresponding targets are being deregistered from their target group". That drain
+    /// is the work the delete STARTS, so the task set is still one the service holds while
+    /// it is under way, and the CLOCK is what finishes it: once the drain falls due the
+    /// task set is gone ([`Self::advance_clock`]), so a read of it reports it MISSING and
+    /// the service no longer carries it.
+    ///
+    /// Deleting a task set whose drain is already under way changes nothing: the delete is
+    /// `@idempotent` and the task set keeps the instant its own delete put it on.
+    pub fn delete_task_set(
+        &mut self,
+        key: &(String, String, String),
+        now: SystemTime,
+    ) -> Option<TaskSetRecord> {
+        let task_set = self.task_sets.get(key).cloned()?;
+        let mut task_arns: Vec<String> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.cluster_name == task_set.cluster_name
+                    && task.started_by.as_deref() == Some(task_set.id.as_str())
+                    && task.is_active()
+            })
+            .map(|task| task.task_arn.clone())
+            .collect();
+        task_arns.sort();
+        let reason = task_set_deleted_reason(&task_set.id);
+        for arn in &task_arns {
+            self.stop_service_task(arn, now, &reason);
+        }
+        let deleted = self.task_sets.get_mut(key)?;
+        deleted.status = TASK_SET_DRAINING.to_string();
+        // A task set being drained away keeps no tasks, so it wants none either: the
+        // delete takes its scale to zero, the way a deleted service's desired count goes
+        // to zero ([`Self::drain_service`]).
+        deleted.scale = Scale {
+            value: MIN_SCALE_PERCENT,
+            unit: Some(SCALE_UNIT_PERCENT.to_string()),
+        };
+        deleted.updated_at = DateTime::from(now);
+        deleted.removal_due_at = Some(deleted.removal_due_at.unwrap_or(now + TRANSITION_SPAN));
+        Some(deleted.clone())
+    }
+
     /// Make the task set `key` names the one serving production traffic, and hand the
     /// service the parameters it deploys with.
     ///
@@ -6939,6 +7125,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             if task_set.status != TASK_SET_PRIMARY {
                 task_set.status = TASK_SET_PRIMARY.to_string();
                 task_set.updated_at = at;
+                // The promotion is a write that touches the task set, so the scheduler
+                // re-confirms its steady state from here.
+                task_set.stable_due_at = Some(now + TRANSITION_SPAN);
             }
         }
         let service_key = (
@@ -7052,12 +7241,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             service_registries: Some(task_set.service_registries.clone()),
             scale: Some(task_set.scale.clone()),
             // "The task `runningCount` is equal to the `computedDesiredCount`" and "The
-            // `pendingCount` is 0"; otherwise the task set is still stabilizing. A task
-            // set being drained away meets neither reading of a steady state: its tasks
-            // "are being stopped, and their corresponding targets are being deregistered
-            // from their target group", which is work still under way.
+            // `pendingCount` is 0"; otherwise the task set is still stabilizing — and so
+            // is one whose steady state the scheduler has not confirmed yet, however its
+            // counts already read ([`TaskSetRecord::stable_due_at`]). A task set being
+            // drained away meets neither reading of a steady state: its tasks "are being
+            // stopped, and their corresponding targets are being deregistered from their
+            // target group", which is work still under way.
             stability_status: Some(
-                if task_set.status != TASK_SET_DRAINING
+                if task_set.stable_due_at.is_none()
+                    && task_set.status != TASK_SET_DRAINING
                     && tally.running == computed_desired_count
                     && tally.pending == 0
                 {
@@ -7072,14 +7264,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // when the task set was last written, which is the instant it carries.
             stability_status_at: Some(task_set.updated_at),
             // `DescribeTaskSets$include`: "If `TAGS` is specified, the tags are included
-            // in the response. If this field is omitted, tags aren't included" — and an
-            // untagged task set omits the member rather than reporting an empty list, as
-            // a service's projection does.
-            tags: if fields.tags && !task_set.tags.is_empty() {
-                Some(task_set.tags.clone())
+            // in the response. If this field is omitted, tags aren't included" — so the
+            // tags a task set carries are reported only to a caller that asked for them.
+            // The MEMBER itself is always serialized: the recorded task sets of the real
+            // service carry it as an empty list where there are none to report.
+            tags: Some(if fields.tags {
+                task_set.tags.clone()
             } else {
-                None
-            },
+                Vec::new()
+            }),
             // A Fargate ephemeral-storage setting is encrypted with a customer key the
             // caller supplies, and nothing here supplies one.
             fargate_ephemeral_storage: None,
@@ -9251,6 +9444,18 @@ pub fn service_arn(region: &str, cluster_name: &str, service_name: &str) -> Stri
         region,
         &format!("service/{cluster_name}/{service_name}"),
     )
+}
+
+/// The ARN a TASK SET reports for the service it exists in:
+/// `arn:aws:ecs:<region>:<account>:service/<name>`.
+///
+/// Recorded behavior only. `TaskSet$serviceArn` is documented as nothing more than "The
+/// Amazon Resource Name (ARN) of the service the task set exists in", and the recorded
+/// task sets carry the service ARN WITHOUT the cluster qualification their sibling
+/// `taskSetArn` and `clusterArn` carry — which is why a task set stores the ARN it
+/// reports rather than deriving it from the service's own.
+pub fn task_set_service_arn(region: &str, service_name: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("service/{service_name}"))
 }
 
 /// The ARN of a task set:

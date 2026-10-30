@@ -427,7 +427,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .find(|task_set| task_set.client_token.as_deref() == Some(token))
                 .cloned();
             if let Some(existing) = existing {
-                let view = guard.task_set_view(&existing, crate::state::TaskSetFields::all());
+                // The repeat is the SAME create, so it answers the same way.
+                let view = created_view(
+                    guard.task_set_view(&existing, crate::state::TaskSetFields::all()),
+                    &service.arn,
+                );
                 return Ok(CreateTaskSetOutput {
                     task_set: Some(view),
                 });
@@ -480,7 +484,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster_name: cluster_name.clone(),
             cluster_arn,
             service_name: service_name.clone(),
-            service_arn: service.arn.clone(),
+            // The ARN this task set reports for its service, as a task set reports it
+            // (`crate::state::task_set_service_arn`).
+            service_arn: crate::state::task_set_service_arn(&region, &service_name),
             external_id: input.external_id.clone(),
             // A created task set is not serving production traffic yet:
             // `UpdateServicePrimaryTaskSet` is what promotes one to `PRIMARY`.
@@ -501,11 +507,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             scale: crate::state::stored_scale(input.scale.as_ref()),
             tags: input.tags.clone().unwrap_or_default(),
             client_token: input.client_token.clone(),
+            // A task set the create has just placed has not converged on what it wants:
+            // the scheduler confirms its steady state a span later.
+            stable_due_at: Some(now + crate::state::TRANSITION_SPAN),
+            // And nothing has deleted it, so no drain is taking it away.
+            removal_due_at: None,
             created_at,
             updated_at: created_at,
         };
         let key = record.key();
         guard.task_sets.insert(key.clone(), record);
+        // The service now HAS a deployment of its own, which deleting its task sets is
+        // what takes away again.
+        if let Some(stored_service) = guard.services.get_mut(&service_key) {
+            stored_service.held_task_set = true;
+        }
 
         // The scheduler places the task set's tasks now — the call that changes what the
         // task set wants is what runs it.
@@ -527,9 +543,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("the task set was just inserted");
         // `CreateTaskSet` has no `include` member to narrow the response with, so the
         // task set it just created is reported with the tags it was created with.
-        let view = guard.task_set_view(stored, crate::state::TaskSetFields::all());
+        let view = created_view(
+            guard.task_set_view(stored, crate::state::TaskSetFields::all()),
+            &service.arn,
+        );
         Ok(CreateTaskSetOutput {
             task_set: Some(view),
         })
     }
+}
+
+/// The `TaskSet` THIS operation answers with: the stored projection, with the ARN of the
+/// service the task set was placed in as THAT SERVICE carries it
+/// (`Service$serviceArn`).
+///
+/// Recorded behavior only, and the one place it is applied: the recorded create carries
+/// the service's own ARN — the replay cluster `ecs|CreateTaskSet|2xx->2xx|$.taskSet.serviceArn`
+/// matches with this form and diverges without it — while every later read of the same
+/// stored task set carries the ARN a task set stores for its service
+/// ([`crate::state::task_set_service_arn`]), which the projection clusters of the reads
+/// (`ecs|DeleteService|2xx->2xx|$.service.taskSets[*].serviceArn` among them) match only in
+/// that form. That is why the record stores the one and this response alone says otherwise.
+fn created_view(mut view: TaskSet, service_arn: &str) -> TaskSet {
+    view.service_arn = Some(service_arn.to_string());
+    view
 }

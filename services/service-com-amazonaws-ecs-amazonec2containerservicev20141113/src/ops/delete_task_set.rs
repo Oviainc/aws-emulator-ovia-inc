@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTaskSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTaskSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTaskSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes ONE task set of one service of one cluster: the tasks it placed are asked to
+//! stop, the task set is left `DRAINING` with the scale it wants taken to zero, and the
+//! clock finishes that drain — after which neither `DescribeTaskSets` nor the service's
+//! own projection carries it. The task set serving production traffic (`PRIMARY`) is the
+//! one `force` is needed for; the recorded calls of this operation delete a task set that
+//! is still scaled above zero without it, so the scale is not what gates the delete.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +172,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTaskSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTaskSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTaskSet"))
+        // This operation addresses the task set by cluster, service and id alone, so
+        // nothing here reads the request metadata `ctx` carries.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTaskSetErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // A service ARN carries the cluster that hosts it, so it names the cluster as
+        // well as the service; a short name takes the `cluster` member's.
+        let (arn_cluster, service_name) =
+            crate::state::cluster_and_service_from_reference(&input.service);
+        let cluster_name = arn_cluster
+            .unwrap_or_else(|| crate::state::cluster_name_from_reference(Some(&input.cluster)));
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(DeleteTaskSetErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::cluster_refusal_message(
+                        guard.clusters.get(&cluster_name),
+                    )),
+                },
+            )
+            .into());
+        }
+        let Some(service) = guard
+            .services
+            .get(&(cluster_name.clone(), service_name.clone()))
+        else {
+            return Err(DeleteTaskSetErrorModeled::ServiceNotFoundException(
+                ServiceNotFoundException {
+                    message: Some(crate::state::SERVICE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        // "The specified service isn't active. You can't update a service that's
+        // inactive": a service the caller has deleted is being drained away with every
+        // task set it holds, so no call of this one takes one away from it.
+        if !service.is_active() {
+            let status = service.status.clone();
+            return Err(DeleteTaskSetErrorModeled::ServiceNotActiveException(
+                ServiceNotActiveException {
+                    message: Some(format!(
+                        "service {service_name:?} is {status} and cannot be updated"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The task set ID or full Amazon Resource Name (ARN) of the task set to delete" —
+        // either form, and only a task set THIS service holds.
+        let Some(task_set) = guard
+            .resolve_task_set(&cluster_name, &service_name, &input.task_set)
+            .cloned()
+        else {
+            return Err(DeleteTaskSetErrorModeled::TaskSetNotFoundException(
+                TaskSetNotFoundException {
+                    message: Some(crate::state::task_set_not_found_message(
+                        &input.task_set,
+                        &service_name,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `TaskSet$status` PRIMARY: "The task set is serving production traffic", so
+        // taking it away would leave the service's traffic unserved — THAT is the
+        // condition `force` overrides here ("If true, you can delete a task set even if it
+        // hasn't been scaled down to zero"): the recorded calls of this operation delete a
+        // task set still scaled above zero without `force` and are answered 200, and
+        // refuse the primary one without it, so the task set's share of the service is not
+        // what gates the delete and its status is. The refusal carries the FIXED sentence
+        // the recorded one does, which names no resource from the request.
+        let force = input.force.unwrap_or_default();
+        if !force && task_set.status == crate::state::TASK_SET_PRIMARY {
+            return Err(DeleteTaskSetErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::PRIMARY_TASK_SET_NOT_DELETABLE_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let Some(deleted) = guard.delete_task_set(&task_set.key(), now) else {
+            return Err(DeleteTaskSetErrorModeled::TaskSetNotFoundException(
+                TaskSetNotFoundException {
+                    message: Some(crate::state::task_set_not_found_message(
+                        &input.task_set,
+                        &service_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        // This operation carries no `include` member, and `DescribeTaskSets$include` is
+        // what asks for a task set's tags ("If this field is omitted, tags aren't
+        // included"), so the deleted task set is reported without them.
+        let view = guard.task_set_view(&deleted, crate::state::TaskSetFields::default());
+        Ok(DeleteTaskSetOutput {
+            task_set: Some(view),
+        })
     }
 }

@@ -25,10 +25,6 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::ecs_wire::{awsvpc_network_configuration, list, ok, refusal, string};
 use crate::task_sets::{create_external_service, describe_task_sets, register_fargate_definition};
 
-/// The fixed sentence a `TaskSetNotFoundException` carries
-/// (`crate::state::TASK_SET_NOT_FOUND_MESSAGE`).
-const TASK_SET_NOT_FOUND: &str = "The specified task set was not found.";
-
 /// How the request names the task set to promote. The `primaryTaskSet` doc: "The short
 /// name or full Amazon Resource Name (ARN) of the task set to set as the primary task set
 /// in the deployment."
@@ -231,7 +227,7 @@ async fn promoting_a_task_set_leaves_exactly_one_primary_and_the_service_follows
 
 /// One row of the refusal table: what a request that names no task set of the service is
 /// refused with.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Refusal {
     case: &'static str,
     cluster: &'static str,
@@ -241,7 +237,14 @@ struct Refusal {
     /// service of the same cluster.
     task_set: Option<&'static str>,
     code: &'static str,
-    message: &'static str,
+    message: String,
+}
+
+/// The sentence a `TaskSetNotFoundException` carries, which NAMES the task set the
+/// request asked for and the service it was looked for in
+/// (`crate::state::task_set_not_found_message`).
+fn task_set_not_found(reference: &str, service_name: &str) -> String {
+    format!("Unable to find task set with id {reference} on service {service_name}.")
 }
 
 #[tokio::test]
@@ -321,7 +324,7 @@ async fn a_task_set_the_service_does_not_hold_is_refused_and_promotes_nothing() 
             service: None,
             task_set: None,
             code: "ClusterNotFoundException",
-            message: "Cluster not found.",
+            message: "Cluster not found.".to_string(),
         },
         Refusal {
             case: "a service the cluster does not hold",
@@ -329,7 +332,7 @@ async fn a_task_set_the_service_does_not_hold_is_refused_and_promotes_nothing() 
             service: Some("nosuchservice"),
             task_set: None,
             code: "ServiceNotFoundException",
-            message: "Service not found.",
+            message: "Service not found.".to_string(),
         },
         Refusal {
             case: "a task set id nothing was created under",
@@ -337,7 +340,7 @@ async fn a_task_set_the_service_does_not_hold_is_refused_and_promotes_nothing() 
             service: Some(service_name),
             task_set: Some("ecs-svc/0000000000000000099"),
             code: "TaskSetNotFoundException",
-            message: TASK_SET_NOT_FOUND,
+            message: task_set_not_found("ecs-svc/0000000000000000099", service_name),
         },
         Refusal {
             case: "a task set of another service of the same cluster",
@@ -345,7 +348,7 @@ async fn a_task_set_the_service_does_not_hold_is_refused_and_promotes_nothing() 
             service: Some(service_name),
             task_set: None,
             code: "TaskSetNotFoundException",
-            message: TASK_SET_NOT_FOUND,
+            message: task_set_not_found(&elsewhere, service_name),
         },
         Refusal {
             case: "a service whose own scheduler places its tasks",
@@ -353,7 +356,7 @@ async fn a_task_set_the_service_does_not_hold_is_refused_and_promotes_nothing() 
             service: Some("scheduled"),
             task_set: Some("ecs-svc/0000000000000000001"),
             code: "TaskSetNotFoundException",
-            message: TASK_SET_NOT_FOUND,
+            message: task_set_not_found("ecs-svc/0000000000000000001", "scheduled"),
         },
         Refusal {
             case: "a service the caller deleted",
@@ -361,7 +364,7 @@ async fn a_task_set_the_service_does_not_hold_is_refused_and_promotes_nothing() 
             service: Some("deleted"),
             task_set: None,
             code: "ServiceNotActiveException",
-            message: "service \"deleted\" is DRAINING and cannot be updated",
+            message: "service \"deleted\" is DRAINING and cannot be updated".to_string(),
         },
     ];
 
@@ -380,7 +383,7 @@ async fn a_task_set_the_service_does_not_hold_is_refused_and_promotes_nothing() 
         .await;
         assert_eq!(
             (code.as_str(), message.as_str()),
-            (row.code, row.message),
+            (row.code, row.message.as_str()),
             "case {case:?}: expected a {} saying {:?}, got {code:?} with {message:?}",
             row.code,
             row.message

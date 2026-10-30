@@ -480,6 +480,23 @@ async fn a_write_restabilizes_the_deployment_and_only_a_new_revision_advances_th
     );
 }
 
+/// One row of the deleted-service table: what the service held when it was deleted, and
+/// the run status the delete must report for it.
+#[derive(Debug, Clone, Copy)]
+struct Deleted {
+    case: &'static str,
+    service_name: &'static str,
+    /// The service's `desiredCount`.
+    desired: i64,
+    /// The deployment controller, or `None` for the ECS scheduler's own.
+    controller: Option<&'static str>,
+    /// `Scale$value` of the task set an external-controller row creates.
+    scale: i64,
+    /// Whether the row creates a task set in the service at all.
+    task_set: bool,
+    run_status: &'static str,
+}
+
 #[tokio::test]
 async fn a_deleted_service_reports_a_tombstone_and_keeps_no_event_stream() {
     let router = service();
@@ -488,29 +505,79 @@ async fn a_deleted_service_reports_a_tombstone_and_keeps_no_event_stream() {
     let definition_arn = register_definition(&router, "deletedfamily", "setup").await;
 
     // The rows differ along what the service still holds when it is deleted: nothing at
-    // all, tasks the delete has to stop, and (for a controller that is not the ECS
-    // scheduler) a task set the delete has to drain away. What the service held is what
-    // the run status reports as outstanding; the tombstone it settles into reports none.
-    let rows: [(&str, &str, i64, Option<&str>, &str); 4] = [
-        ("a service holding nothing", "idle", 0, None, "SteadyState"),
-        ("a service still running a task", "busy", 1, None, "MoreWork"),
-        (
-            "a service running three tasks",
-            "crowded",
-            3,
-            None,
-            "MoreWork",
-        ),
-        (
-            "an external-controller service holding a task set",
-            "external",
-            0,
-            Some("EXTERNAL"),
-            "MoreWork",
-        ),
+    // all, tasks the delete has to stop, a task set that holds no task of its own, and one
+    // whose tasks the delete has to stop. The TASKS the delete still has to let go of are
+    // what the run status reports as outstanding; the tombstone it settles into reports
+    // none.
+    let rows = [
+        Deleted {
+            case: "a service holding nothing",
+            service_name: "idle",
+            desired: 0,
+            controller: None,
+            scale: 0,
+            task_set: false,
+            run_status: "SteadyState",
+        },
+        Deleted {
+            case: "a service still running a task",
+            service_name: "busy",
+            desired: 1,
+            controller: None,
+            scale: 0,
+            task_set: false,
+            run_status: "MoreWork",
+        },
+        Deleted {
+            case: "a service running three tasks",
+            service_name: "crowded",
+            desired: 3,
+            controller: None,
+            scale: 0,
+            task_set: false,
+            run_status: "MoreWork",
+        },
+        Deleted {
+            case: "an external-controller service holding an empty task set",
+            service_name: "external",
+            desired: 0,
+            controller: Some("EXTERNAL"),
+            scale: 0,
+            task_set: true,
+            run_status: "SteadyState",
+        },
+        Deleted {
+            case: "an external-controller service whose task set holds a task",
+            service_name: "working",
+            desired: 1,
+            controller: Some("EXTERNAL"),
+            scale: 100,
+            task_set: true,
+            run_status: "MoreWork",
+        },
+        // A service nothing ever created a task set in has no deployment of its own to
+        // lose, so it owes no cleanup for the want of one.
+        Deleted {
+            case: "an external-controller service that never held a task set",
+            service_name: "bare",
+            desired: 0,
+            controller: Some("EXTERNAL"),
+            scale: 0,
+            task_set: false,
+            run_status: "SteadyState",
+        },
     ];
 
-    for (case, service_name, desired, controller, expected_run_status) in rows {
+    for row in rows {
+        let Deleted {
+            case,
+            service_name,
+            desired,
+            controller,
+            scale,
+            task_set,
+            run_status: expected_run_status,
+        } = row;
         let mut request = json!({
             "cluster": cluster,
             "serviceName": service_name,
@@ -524,7 +591,7 @@ async fn a_deleted_service_reports_a_tombstone_and_keeps_no_event_stream() {
             None => request["taskDefinition"] = json!(definition_arn),
         }
         ok(&router, "CreateService", request, case).await;
-        if controller.is_some() {
+        if task_set {
             ok(
                 &router,
                 "CreateTaskSet",
@@ -533,6 +600,7 @@ async fn a_deleted_service_reports_a_tombstone_and_keeps_no_event_stream() {
                     "service": service_name,
                     "taskDefinition": definition_arn,
                     "launchType": "EC2",
+                    "scale": { "value": scale, "unit": "PERCENT" },
                 }),
                 case,
             )

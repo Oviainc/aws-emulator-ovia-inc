@@ -229,15 +229,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The short name or full Amazon Resource Name (ARN) of the task set to set as
         // the primary task set in the deployment" — either form, and only a task set THIS
         // service holds. A service whose own scheduler places its tasks holds none, so
-        // that service's request stops here too.
+        // that service's request stops here too, and so does one that names a task set a
+        // `DeleteTaskSet` has already taken: the delete has had it.
         let Some(key) = guard
             .resolve_task_set(&cluster_name, &service_name, &input.primary_task_set)
+            .filter(|task_set| !task_set.is_deleted())
             .map(crate::state::TaskSetRecord::key)
         else {
             return Err(
                 UpdateServicePrimaryTaskSetErrorModeled::TaskSetNotFoundException(
                     TaskSetNotFoundException {
-                        message: Some(crate::state::TASK_SET_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(crate::state::task_set_not_found_message(
+                            &input.primary_task_set,
+                            &service_name,
+                        )),
                     },
                 )
                 .into(),
@@ -250,7 +255,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateServicePrimaryTaskSetErrorModeled::TaskSetNotFoundException(
                     TaskSetNotFoundException {
-                        message: Some(crate::state::TASK_SET_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(crate::state::task_set_not_found_message(
+                            &input.primary_task_set,
+                            &service_name,
+                        )),
                     },
                 )
                 .into(),

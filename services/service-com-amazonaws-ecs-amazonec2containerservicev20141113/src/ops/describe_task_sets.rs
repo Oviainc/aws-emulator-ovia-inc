@@ -258,7 +258,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         }
                     }
                     None => {
-                        // The failure names the task set the reference MEANT, so an ARN
+                        // "The Amazon Resource Name (ARN) of the failed resource": the
+                        // failure names the task set the reference MEANT, so an ARN
                         // reference is resolved to its id first and the ARN rebuilt from
                         // it rather than wrapped in another one.
                         let id = crate::state::task_set_id_from_reference(reference);
