@@ -63,10 +63,10 @@ const REPEATS: [Repeat; 5] = [
         case: "four checks, nearer targets after the furthest",
         source: "OpenSearch_1.0",
         targets: &[
-            "OpenSearch_2.19",
             "OpenSearch_1.3",
+            "OpenSearch_1.2",
             "OpenSearch_1.1",
-            "OpenSearch_2.19",
+            "OpenSearch_1.3",
         ],
     },
     Repeat {

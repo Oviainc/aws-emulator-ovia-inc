@@ -181,6 +181,13 @@ pub fn offers_engine_version(engine_version: &str) -> bool {
     SUPPORTED_ENGINE_VERSIONS.contains(&engine_version)
 }
 
+/// The generation [`upgrade_rank`] ranks a legacy Elasticsearch release at.
+const ENGINE_GENERATION_ELASTICSEARCH: u8 = 0;
+
+/// The generation it ranks an OpenSearch release at: the engine line that SUCCEEDS the
+/// Elasticsearch one.
+const ENGINE_GENERATION_OPENSEARCH: u8 = 1;
+
 /// How far along the upgrade path a version sits: its engine generation (the
 /// OpenSearch line succeeds the Elasticsearch one, OpenSearch 1.0 being the fork of
 /// Elasticsearch 7.10), then its major and minor numbers compared as NUMBERS, so
@@ -194,8 +201,8 @@ pub fn upgrade_rank(engine_version: &str) -> Option<(u8, u32, u32)> {
     // Which engine a version names is [`engine_type_of`]'s answer, not a second
     // reading of the same prefix: the two cannot drift about what `OpenSearch_` means.
     let generation = match engine_type_of(engine_version)? {
-        ENGINE_TYPE_ELASTICSEARCH => 0_u8,
-        ENGINE_TYPE_OPENSEARCH => 1_u8,
+        ENGINE_TYPE_ELASTICSEARCH => ENGINE_GENERATION_ELASTICSEARCH,
+        ENGINE_TYPE_OPENSEARCH => ENGINE_GENERATION_OPENSEARCH,
         // An engine neither constant names has no place in the order rather than
         // sharing the newest line's.
         _ => return None,
@@ -204,58 +211,100 @@ pub fn upgrade_rank(engine_version: &str) -> Option<(u8, u32, u32)> {
     Some((generation, major.parse().ok()?, minor.parse().ok()?))
 }
 
-/// A version's RELEASE LINE: the engine generation it belongs to and its MAJOR release
+/// The major release number of the LAST Elasticsearch line, the one OpenSearch forked
+/// from.
+const ELASTICSEARCH_FORK_MAJOR: u32 = 7;
+
+/// The major release number of the FIRST OpenSearch line, the fork itself.
+const OPENSEARCH_FORK_MAJOR: u32 = 1;
+
+/// A version's UPGRADE LINE: the engine generation it belongs to and its MAJOR release
 /// number — the `(0, 7)` of `Elasticsearch_7.10` — which is the unit an upgrade path is
-/// published along. `None` for a value [`upgrade_rank`] cannot read.
-fn release_line(engine_version: &str) -> Option<(u8, u32)> {
-    upgrade_rank(engine_version).map(|(generation, major, _)| (generation, major))
+/// published along.
+///
+/// The Elasticsearch 7 releases and the OpenSearch 1 releases are ONE such line, because
+/// OpenSearch 1.0 is the fork of Elasticsearch 7.10: a domain moves from one to the other
+/// the way it moves between two minors of one major, without the service treating it as a
+/// major-line change. `None` for a value [`upgrade_rank`] cannot read.
+fn upgrade_line(engine_version: &str) -> Option<(u8, u32)> {
+    let (generation, major, _) = upgrade_rank(engine_version)?;
+    if (generation, major) == (ENGINE_GENERATION_OPENSEARCH, OPENSEARCH_FORK_MAJOR) {
+        return Some((ENGINE_GENERATION_ELASTICSEARCH, ELASTICSEARCH_FORK_MAJOR));
+    }
+    Some((generation, major))
 }
 
-/// Every release line [`SUPPORTED_ENGINE_VERSIONS`] publishes, oldest first and each
+/// Every upgrade line [`SUPPORTED_ENGINE_VERSIONS`] publishes, oldest first and each
 /// once: the Elasticsearch majors, then the OpenSearch ones.
-fn published_release_lines() -> Vec<(u8, u32)> {
+fn published_upgrade_lines() -> Vec<(u8, u32)> {
     let mut lines: Vec<(u8, u32)> = SUPPORTED_ENGINE_VERSIONS
         .iter()
-        .filter_map(|version| release_line(version))
+        .filter_map(|version| upgrade_line(version))
         .collect();
     lines.sort_unstable();
     lines.dedup();
     lines
 }
 
-/// The release line that immediately SUCCEEDS `line` among the published ones, or
+/// The upgrade line that immediately SUCCEEDS `line` among the published ones, or
 /// `None` for the newest line, which nothing succeeds.
-fn succeeding_release_line(line: (u8, u32)) -> Option<(u8, u32)> {
-    published_release_lines()
+fn succeeding_upgrade_line(line: (u8, u32)) -> Option<(u8, u32)> {
+    published_upgrade_lines()
         .into_iter()
         .find(|candidate| *candidate > line)
 }
 
-/// The versions a domain running `source_version` can be upgraded to, oldest first:
-/// every published release of its OWN line (engine and major) strictly later than it,
-/// plus every published release of the line that immediately succeeds its own.
+/// Whether `source_version` is the NEWEST release its upgrade line publishes: the one
+/// release of a line an upgrade INTO the next line is offered from.
 ///
-/// So an upgrade crosses at most ONE line boundary — a domain reaches the next major
-/// line directly, but not the one after it, which it has to make a second upgrade to
-/// reach — and it only ever goes forwards, so a version is never among its own targets
-/// and a release on the newest line with nothing after it has none. The answer is
-/// derived from [`upgrade_rank`]'s comparison rather than from the source being
-/// published, so a domain running a version this emulator does not publish still
-/// reports the published versions ahead of it.
+/// A version the catalog does not publish at all is the newest of its line when nothing
+/// published on that line is later than it, so a domain running an unpublished release
+/// still reports the path ahead of it.
+fn is_newest_of_upgrade_line(source_version: &str) -> bool {
+    let Some(source) = upgrade_rank(source_version) else {
+        return false;
+    };
+    let Some(line) = upgrade_line(source_version) else {
+        return false;
+    };
+    SUPPORTED_ENGINE_VERSIONS.iter().all(|candidate| {
+        upgrade_line(candidate) != Some(line) || upgrade_rank(candidate) <= Some(source)
+    })
+}
+
+/// The versions a domain running `source_version` can be upgraded to, oldest first:
+/// every published release of its OWN upgrade line strictly later than it, plus — from
+/// the NEWEST release of that line only — every published release of the line that
+/// immediately succeeds it.
+///
+/// So an upgrade walks the minors of a line freely and leaves the line only from its end:
+/// a domain in the middle of a line reaches the end of that line but not past it, and the
+/// release at the end reaches the whole of the next line and nothing beyond it. It only
+/// ever goes forwards, so a version is never among its own targets and a release at the
+/// end of the newest line has none. The answer is derived from [`upgrade_rank`]'s
+/// comparison rather than from the source being published, so a domain running a version
+/// this emulator does not publish still reports the published versions ahead of it.
 pub fn compatible_target_versions(source_version: &str) -> Vec<String> {
     let Some(source) = upgrade_rank(source_version) else {
         return Vec::new();
     };
-    let line = (source.0, source.1);
-    let next_line = succeeding_release_line(line);
+    let Some(line) = upgrade_line(source_version) else {
+        return Vec::new();
+    };
+    // The crossing is published from the end of a line, so a source with later releases
+    // of its own line ahead of it reaches those and stops there.
+    let next_line = is_newest_of_upgrade_line(source_version)
+        .then(|| succeeding_upgrade_line(line))
+        .flatten();
     SUPPORTED_ENGINE_VERSIONS
         .iter()
         .filter(|candidate| {
             let Some(rank) = upgrade_rank(candidate) else {
                 return false;
             };
-            let candidate_line = (rank.0, rank.1);
-            (candidate_line == line && rank > source) || Some(candidate_line) == next_line
+            let candidate_line = upgrade_line(candidate);
+            (candidate_line == Some(line) && rank > source)
+                || (next_line.is_some() && candidate_line == next_line)
         })
         .map(|candidate| (*candidate).to_string())
         .collect()
@@ -266,12 +315,12 @@ pub fn compatible_target_versions(source_version: &str) -> Vec<String> {
 /// — [`SUPPORTED_ENGINE_VERSIONS`] publishes it and a domain can be created on it — but
 /// the service publishes no upgrade path out of it.
 ///
-/// Like [`DOMAIN_QUOTA`] and [`SUPPORTED_ENGINE_VERSIONS`] itself this is a PUBLISHED
-/// FIGURE this emulator states rather than a rule derived from something else: the
-/// model carries no record of which releases an upgrade is offered from. What it fixes
-/// is that the table has a floor and that every release at or above it with somewhere
-/// to go is listed.
-pub const UPGRADE_OFFERED_FROM: &str = "Elasticsearch_7.7";
+/// The model carries no record of which releases an upgrade is offered from, so this is
+/// the figure the SERVICE publishes: an in-place upgrade is offered for a domain running
+/// Elasticsearch 5.1 or later, and for an older release the service publishes no upgrade
+/// path at all. What the table then guarantees is that it has a floor and that every
+/// release at or above it with somewhere to go is listed.
+pub const UPGRADE_OFFERED_FROM: &str = "Elasticsearch_5.1";
 
 /// The source versions the published upgrade table lists, oldest first: the published
 /// releases at or after [`UPGRADE_OFFERED_FROM`] that have at least one target, since a
@@ -6212,6 +6261,35 @@ fn reserved_instance_offering(
     })
 }
 
+/// Where one offering sits in the catalog the service PUBLISHES: the instance type it
+/// reserves, in the order the published instance-type catalog lists them
+/// (`OpenSearchPartitionInstanceType`), then the term shortest first, then the payment
+/// option in the order `ReservedInstancePaymentOption` declares them.
+///
+/// A price list is published per instance type, so that is the key a page of it is read
+/// along: a caller walking the catalog sees one instance type's terms and payment options
+/// together, and the same order on every call. The id an entry is STORED under is a digest
+/// of what the entry is, which orders the catalog by nothing a caller can read.
+fn offering_catalog_rank(offering: &ReservedInstanceOffering) -> (usize, i32, usize) {
+    let position = |values: &[&str], value: Option<&str>| {
+        values
+            .iter()
+            .position(|candidate| Some(*candidate) == value)
+            .unwrap_or(values.len())
+    };
+    (
+        position(
+            OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES,
+            offering.instance_type.as_deref(),
+        ),
+        offering.duration,
+        position(
+            RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
+            offering.payment_option.as_deref(),
+        ),
+    )
+}
+
 /// The whole offering catalog, keyed by `ReservedInstanceOfferingId`.
 ///
 /// Reserved Instance offerings are published BY the service for a Region, not created
@@ -6641,30 +6719,83 @@ const DATA_NODES_SUPPORTED_BY_MASTER: [(f64, i32); 4] = [
     (f64::INFINITY, 125),
 ];
 
-/// The IOPS range `sub_type` publishes, and `None` for a sub-type whose performance is
-/// not provisioned per volume: `MinimumIops`/`MaximumIops` "can be empty if not
-/// applicable", and `EBSOptions$Iops` is "applicable only for the gp3 and provisioned
-/// IOPS EBS volume types".
-fn iops_range(sub_type: &str) -> Option<(i64, i64)> {
-    match sub_type {
-        VOLUME_TYPE_GP3 => Some(GP3_IOPS_RANGE),
-        VOLUME_TYPE_IO1 => Some(IO1_IOPS_RANGE),
-        _ => None,
-    }
+/// What ONE instance's EBS attachment carries: the largest volume that attaches to it,
+/// the most IOPS it drives and the most throughput it sustains.
+///
+/// These are bounds of the INSTANCE, not of the volume, and a limit the catalog publishes
+/// for a pairing is the LESSER of the two — a volume sub-type's own ceiling is reported
+/// only where the instance it attaches to can reach it.
+#[derive(Debug, Clone, Copy)]
+struct EbsAttachment {
+    /// The largest volume, in GiB, one instance of the class takes.
+    maximum_volume_size_gib: i64,
+    /// The most IOPS one instance of the class drives.
+    maximum_iops: i64,
+    /// The most throughput, in MiB/s, one instance of the class sustains.
+    maximum_throughput_mib: i64,
 }
 
-/// The throughput range `sub_type` publishes. `EBSOptions$Throughput` is "applicable
-/// only for the gp3 volume type", so every other sub-type publishes none.
-fn throughput_range(sub_type: &str) -> Option<(i64, i64)> {
-    match sub_type {
-        VOLUME_TYPE_GP3 => Some(GP3_THROUGHPUT_RANGE_MIB),
-        _ => None,
-    }
+/// The attachment a BURSTABLE instance publishes.
+///
+/// A burstable instance has no dedicated EBS bandwidth: its attachment bursts from a
+/// credit balance, and the figures AWS publishes for that class — a burst of 11,800 IOPS
+/// and 260 MiB/s, with a 100 GiB volume ceiling — are every one of them below what the
+/// general-purpose volume sub-types publish on their own. That is what makes the
+/// burstable instance, rather than the volume, the binding bound, and why it is the one
+/// row of this table: every other class reaches the sub-type's own ceilings.
+const BURSTABLE_EBS_ATTACHMENT: EbsAttachment = EbsAttachment {
+    maximum_volume_size_gib: 100,
+    maximum_iops: 11_800,
+    maximum_throughput_mib: 260,
+};
+
+/// The EBS attachment `instance_type` publishes, and `None` for a class whose attachment
+/// reaches every ceiling the volume sub-types publish, so nothing of the instance's own
+/// narrows them.
+fn ebs_attachment(instance_type: &str) -> Option<EbsAttachment> {
+    let family = instance_family(instance_type).unwrap_or(instance_type);
+    BURSTABLE_FAMILIES
+        .contains(&family)
+        .then_some(BURSTABLE_EBS_ATTACHMENT)
+}
+
+/// The IOPS range `instance_type` publishes for `sub_type`, and `None` for a sub-type
+/// whose performance is not provisioned per volume: `MinimumIops`/`MaximumIops` "can be
+/// empty if not applicable", and `EBSOptions$Iops` is "applicable only for the gp3 and
+/// provisioned IOPS EBS volume types".
+///
+/// The ceiling is the lesser of the sub-type's own and what the instance drives; the floor
+/// is the sub-type's, and every published attachment drives more than it, so the range
+/// never inverts.
+fn iops_range(instance_type: &str, sub_type: &str) -> Option<(i64, i64)> {
+    let (minimum, maximum) = match sub_type {
+        VOLUME_TYPE_GP3 => GP3_IOPS_RANGE,
+        VOLUME_TYPE_IO1 => IO1_IOPS_RANGE,
+        _ => return None,
+    };
+    let maximum = ebs_attachment(instance_type)
+        .map_or(maximum, |attachment| maximum.min(attachment.maximum_iops));
+    Some((minimum, maximum.max(minimum)))
+}
+
+/// The throughput range `instance_type` publishes for `sub_type`, bounded by the
+/// instance's attachment the same way. `EBSOptions$Throughput` is "applicable only for
+/// the gp3 volume type", so every other sub-type publishes none.
+fn throughput_range(instance_type: &str, sub_type: &str) -> Option<(i64, i64)> {
+    let (minimum, maximum) = match sub_type {
+        VOLUME_TYPE_GP3 => GP3_THROUGHPUT_RANGE_MIB,
+        _ => return None,
+    };
+    let maximum = ebs_attachment(instance_type).map_or(maximum, |attachment| {
+        maximum.min(attachment.maximum_throughput_mib)
+    });
+    Some((minimum, maximum.max(minimum)))
 }
 
 /// The largest EBS volume, in GiB, `instance_type` publishes for `sub_type`: the
 /// instance's size scaled by [`VOLUME_SIZE_GIB_PER_UNIT`], never below
-/// [`SMALLEST_MAXIMUM_VOLUME_SIZE_GIB`], and capped for a magnetic volume at
+/// [`SMALLEST_MAXIMUM_VOLUME_SIZE_GIB`], capped by what the instance's own attachment
+/// takes ([`ebs_attachment`]), and capped for a magnetic volume at
 /// [`MAXIMUM_STANDARD_VOLUME_SIZE_GIB`].
 pub fn maximum_volume_size(instance_type: &str, sub_type: &str) -> i64 {
     let scaled = size_normalization_factor(instance_type)
@@ -6672,6 +6803,9 @@ pub fn maximum_volume_size(instance_type: &str, sub_type: &str) -> i64 {
             (factor * VOLUME_SIZE_GIB_PER_UNIT).round() as i64
         })
         .max(SMALLEST_MAXIMUM_VOLUME_SIZE_GIB);
+    let scaled = ebs_attachment(instance_type).map_or(scaled, |attachment| {
+        scaled.min(attachment.maximum_volume_size_gib)
+    });
     if sub_type == VOLUME_TYPE_STANDARD {
         scaled.min(MAXIMUM_STANDARD_VOLUME_SIZE_GIB)
     } else {
@@ -6715,11 +6849,11 @@ fn ebs_storage_type(instance_type: &str, sub_type: &str) -> StorageType {
         ),
         storage_type_limit(LIMIT_MINIMUM_VOLUME_SIZE, MINIMUM_VOLUME_SIZE_GIB),
     ];
-    if let Some((minimum, maximum)) = iops_range(sub_type) {
+    if let Some((minimum, maximum)) = iops_range(instance_type, sub_type) {
         limits.push(storage_type_limit(LIMIT_MAXIMUM_IOPS, maximum));
         limits.push(storage_type_limit(LIMIT_MINIMUM_IOPS, minimum));
     }
-    if let Some((minimum, maximum)) = throughput_range(sub_type) {
+    if let Some((minimum, maximum)) = throughput_range(instance_type, sub_type) {
         limits.push(storage_type_limit(LIMIT_MAXIMUM_THROUGHPUT, maximum));
         limits.push(storage_type_limit(LIMIT_MINIMUM_THROUGHPUT, minimum));
     }
@@ -6730,14 +6864,52 @@ fn ebs_storage_type(instance_type: &str, sub_type: &str) -> StorageType {
     }
 }
 
+/// The volume sub-types EVERY instance class with an EBS attachment publishes: the
+/// general-purpose SSD types, `VolumeType`'s `gp2` and the `gp3` whose IOPS and
+/// throughput are provisioned on it.
+const GENERAL_PURPOSE_VOLUME_TYPES: [&str; 2] = [VOLUME_TYPE_GP2, VOLUME_TYPE_GP3];
+
+/// The instance families the MAGNETIC sub-type is published for: magnetic storage is
+/// offered for the previous-generation instance types alone, so every later family
+/// publishes none.
+///
+/// Which families are previous generation is published BY the service and carried by no
+/// part of the model, so this is the emulator's statement of it. The families whose data
+/// sits on built-in storage are not among it: they publish no volume at all
+/// ([`INSTANCE_STORAGE_FAMILIES`]).
+const PREVIOUS_GENERATION_EBS_FAMILIES: [&str; 4] = ["c4", "m3", "m4", "r4"];
+
+/// The `VolumeType` sub-types `instance_type` publishes an `ebs` storage type for, in the
+/// order the generated enum lists them.
+///
+/// The general-purpose SSD types attach to every class. A PROVISIONED-IOPS volume
+/// provisions performance the instance itself has to carry, so it is published for every
+/// class whose attachment provisions its own — which a burstable instance's, bursting
+/// from a credit balance ([`BURSTABLE_EBS_ATTACHMENT`]), does not. The magnetic type is
+/// published for the previous-generation families alone.
+fn volume_sub_types(instance_type: &str) -> Vec<&'static str> {
+    let family = instance_family(instance_type).unwrap_or(instance_type);
+    let burstable = BURSTABLE_FAMILIES.contains(&family);
+    let previous_generation = PREVIOUS_GENERATION_EBS_FAMILIES.contains(&family);
+    VOLUME_TYPE_VALUES
+        .iter()
+        .copied()
+        .filter(|sub_type| match *sub_type {
+            VOLUME_TYPE_STANDARD => previous_generation,
+            VOLUME_TYPE_IO1 => !burstable,
+            _ => GENERAL_PURPOSE_VOLUME_TYPES.contains(sub_type),
+        })
+        .collect()
+}
+
 /// The storage types `instance_type` publishes for the role that holds the domain's
 /// DATA.
 ///
 /// A family whose data sits on storage built into the instance publishes that one type
-/// and no volume limits; every other family publishes one `ebs` entry per `VolumeType`
-/// the model declares, in that enum's order. The warm tier's storage is not attached to
-/// the node at all, so an UltraWarm instance type publishes no storage type rather than
-/// an empty list of them.
+/// and no volume limits; every other family publishes one `ebs` entry per volume sub-type
+/// THAT instance type attaches ([`volume_sub_types`]), in the order the enum lists them.
+/// The warm tier's storage is not attached to the node at all, so an UltraWarm instance
+/// type publishes no storage type rather than an empty list of them.
 fn storage_types(instance_type: &str) -> Option<Vec<StorageType>> {
     let family = instance_family(instance_type).unwrap_or(instance_type);
     if family == ULTRAWARM_FAMILY {
@@ -6751,8 +6923,8 @@ fn storage_types(instance_type: &str) -> Option<Vec<StorageType>> {
         }]);
     }
     Some(
-        VOLUME_TYPE_VALUES
-            .iter()
+        volume_sub_types(instance_type)
+            .into_iter()
             .map(|sub_type| ebs_storage_type(instance_type, sub_type))
             .collect(),
     )
@@ -7906,9 +8078,11 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// The Reserved Instance offering catalog this emulator publishes, keyed by
     /// `ReservedInstanceOfferingId`. Seeded by [`seed_reserved_instance_offerings`]
     /// and never written again: an offering is published by the service, so no
-    /// operation creates, changes or removes one, and iterating a `BTreeMap` is
-    /// order-stable, which is what lets a paged read of the catalog resume where the
-    /// previous page stopped.
+    /// operation creates, changes or removes one. The id is the key so a purchase and
+    /// the offering-id filter resolve one entry by it; the ORDER a listing publishes the
+    /// catalog in is
+    /// [`ComAmazonawsOpensearchAmazonopensearchserviceState::published_reserved_instance_offerings`]'s,
+    /// which is what lets a paged read resume where the previous page stopped.
     pub reserved_instance_offerings: BTreeMap<String, ReservedInstanceOffering>,
     /// The default-application setting: the ARN of the application that is the
     /// account's default, or `None` while no default is set.
@@ -8980,6 +9154,21 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
         // Answered from the STORED record, through the projection every read path
         // reports an association with.
         Some(association.to_details(domain_name, package))
+    }
+
+    /// The published offering catalog, in the ORDER the service publishes it
+    /// ([`offering_catalog_rank`]).
+    ///
+    /// The store is keyed by offering id so a purchase and the id filter can resolve one
+    /// entry, and that key orders the catalog by a digest rather than by anything a
+    /// caller reads — so the listing is published along the catalog's own order instead.
+    /// The order is a function of the records alone, so two reads report the same
+    /// offerings in the same order and a page resumes where the previous one stopped.
+    pub fn published_reserved_instance_offerings(&self) -> Vec<&ReservedInstanceOffering> {
+        let mut catalog: Vec<&ReservedInstanceOffering> =
+            self.reserved_instance_offerings.values().collect();
+        catalog.sort_by_key(|offering| offering_catalog_rank(offering));
+        catalog
     }
 
     /// The published offering whose `ReservedInstanceOfferingId` is `offering_id`.

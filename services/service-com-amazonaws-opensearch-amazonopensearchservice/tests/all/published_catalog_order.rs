@@ -16,11 +16,12 @@
 //! * `ListVersions` publishes the supported engine releases NEWEST FIRST: the answer
 //!   descends by engine line, then major, then minor, so the current release leads and
 //!   the oldest Elasticsearch release is last;
-//! * `GetCompatibleVersions` publishes an upgrade path that steps ONE release line at a
-//!   time: a source's targets are the later releases of its own line plus every release
-//!   of the line that immediately succeeds it, and nothing two lines ahead — over a
-//!   table of sources spanning both engines, a line with later minors, a line with
-//!   none, the line crossing and the newest release;
+//! * `GetCompatibleVersions` publishes an upgrade path that walks ONE release line and
+//!   leaves it only from its end: a source's targets are the later releases of its own
+//!   line, plus — from the newest release of that line only — every release of the line
+//!   that immediately succeeds it, and nothing two lines ahead — over a table of sources
+//!   spanning both engines, a line with later minors, a release at the end of its line,
+//!   the engine-line crossing and the newest release;
 //! * `DescribeInstanceTypeLimits` publishes each storage limit PAIR ceiling before
 //!   floor, over a table of volume sub-types and instance sizes, and the ceiling value
 //!   really is the larger of the pair;
@@ -30,7 +31,7 @@
 
 use serde_json::Value;
 
-use super::compatible_versions::{compatible, entries, rank, target_versions};
+use super::compatible_versions::{compatible, entries, line, rank, target_versions};
 use super::domain_lifecycle::{string_member, Emulator, PREFIX};
 use super::instance_type_limits::{describe_limits, limits_by_role};
 use super::reserved_instance_offerings::whole_catalog;
@@ -186,12 +187,15 @@ async fn the_upgrade_path_steps_one_release_line_at_a_time() {
     let catalog = published_versions(&emulator).await;
 
     // The suite's OWN statement of the rule, as the targets each source publishes: a
-    // source reaches the later releases of its own line and every release of the next
-    // line, and nothing beyond that. One row per shape the rule has: a line with later
-    // minors and a successor line (Elasticsearch 7.7), a release at the end of its line
-    // (Elasticsearch 7.10, whose only targets are the next line), a crossing within one
-    // engine (OpenSearch 1.3), a source in the middle of its line (OpenSearch 1.0), and
-    // the newest release, which has nowhere to go.
+    // source reaches the later releases of its own line, and the whole of the next line
+    // only when it is the newest release of its own. One row per shape the rule has: a
+    // source in the middle of a line whose line runs on (Elasticsearch 7.7 and
+    // Elasticsearch 7.10, both of which reach the OpenSearch 1 releases because those
+    // continue the Elasticsearch 7 line), a release at the END of its line, which is
+    // where the path leaves it (OpenSearch 1.3), a source in the middle of a line that
+    // reaches no further line (OpenSearch 1.0), and the newest release, which has nowhere
+    // to go. [`super::reference_catalogs`] holds the rule over a wider table of sources,
+    // including the end of an Elasticsearch line.
     let rows: [(&str, &[&str]); 5] = [
         (
             "Elasticsearch_7.7",
@@ -216,20 +220,7 @@ async fn the_upgrade_path_steps_one_release_line_at_a_time() {
         ),
         (
             "OpenSearch_1.0",
-            &[
-                "OpenSearch_1.1",
-                "OpenSearch_1.2",
-                "OpenSearch_1.3",
-                "OpenSearch_2.3",
-                "OpenSearch_2.5",
-                "OpenSearch_2.7",
-                "OpenSearch_2.9",
-                "OpenSearch_2.11",
-                "OpenSearch_2.13",
-                "OpenSearch_2.15",
-                "OpenSearch_2.17",
-                "OpenSearch_2.19",
-            ],
+            &["OpenSearch_1.1", "OpenSearch_1.2", "OpenSearch_1.3"],
         ),
         (
             "OpenSearch_1.3",
@@ -273,19 +264,15 @@ async fn the_upgrade_path_steps_one_release_line_at_a_time() {
         );
 
         // No target is more than one release line ahead of its source: a domain crosses
-        // one boundary per upgrade.
-        let (generation, major, _) = rank(source);
+        // one line boundary per upgrade, the Elasticsearch 7 and OpenSearch 1 releases
+        // being one line.
+        let source_line = line(source);
         let lines_ahead = |target: &str| -> usize {
-            let (target_generation, target_major, _) = rank(target);
+            let target_line = line(target);
             catalog
                 .iter()
-                .map(|version| {
-                    let (candidate_generation, candidate_major, _) = rank(version);
-                    (candidate_generation, candidate_major)
-                })
-                .filter(|line| {
-                    *line > (generation, major) && *line <= (target_generation, target_major)
-                })
+                .map(|version| line(version))
+                .filter(|candidate| *candidate > source_line && *candidate <= target_line)
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
         };
@@ -345,12 +332,15 @@ async fn storage_limit_pairs_are_published_ceiling_before_floor() {
     ];
 
     // One row per instance size class, so the ordering is not one type's: the smallest
-    // published size, a size the scale differentiates, and the largest.
+    // published size, a size the scale differentiates, the largest, and a
+    // previous-generation family, which is the one that publishes the magnetic and
+    // provisioned-IOPS sub-types too.
     for instance_type in [
         "t3.nano.search",
         "m5.large.search",
         "m5.2xlarge.search",
         "m5.24xlarge.search",
+        "m4.2xlarge.search",
     ] {
         let case = format!("{LIMITS_VERSION} {instance_type}");
         let map = limits_by_role(

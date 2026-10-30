@@ -4,7 +4,10 @@
 //!
 //! Reports the Reserved Instance offerings this Region publishes, from the catalog
 //! the state is seeded with
-//! (`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::reserved_instance_offerings`).
+//! (`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::reserved_instance_offerings`),
+//! in the order the catalog is published in
+//! (`crate::state::ComAmazonawsOpensearchAmazonopensearchserviceState::published_reserved_instance_offerings`):
+//! by instance type, then term, then payment option.
 //!
 //! An offering is published BY the service, never created by a caller, so this is a
 //! pure read: it writes nothing, and the catalog, the ids in it and the prices on it
@@ -221,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         })?;
                     vec![offering]
                 }
-                None => store.reserved_instance_offerings.values().collect(),
+                None => store.published_reserved_instance_offerings(),
             };
 
         // The token names the first offering of the page to answer with, so a caller

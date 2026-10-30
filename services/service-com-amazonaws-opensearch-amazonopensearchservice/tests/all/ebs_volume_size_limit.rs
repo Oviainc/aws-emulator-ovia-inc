@@ -40,9 +40,9 @@ use super::instance_type_limits::published_volume_size_range;
 const ROWS: [(&str, &str, &str); 6] = [
     ("OpenSearch_2.11", "t3.small.search", "gp3"),
     ("OpenSearch_1.0", "m5.large.search", "gp2"),
-    ("OpenSearch_2.19", "m5.2xlarge.search", "io1"),
+    ("OpenSearch_2.19", "m4.2xlarge.search", "io1"),
     ("Elasticsearch_7.10", "m5.xlarge.search", "gp3"),
-    ("Elasticsearch_7.10", "m5.large.search", "standard"),
+    ("Elasticsearch_7.10", "m4.large.search", "standard"),
     ("OpenSearch_2.11", "t3.nano.search", "gp3"),
 ];
 
@@ -206,7 +206,9 @@ async fn the_refusal_names_the_release_the_request_asked_for() {
 async fn a_volume_outside_the_published_range_is_a_service_limit_refusal_on_update() {
     let emulator = Emulator::new();
     let engine_version = "OpenSearch_2.11";
-    let instance_type = "m5.large.search";
+    // A family that publishes every volume sub-type, so each row below is judged against
+    // bounds the service publishes for the pairing it names.
+    let instance_type = "m4.large.search";
     let name = "ebs-limit-resize";
     let (minimum, maximum) =
         published_volume_size_range(&emulator, engine_version, instance_type, "gp3").await;
@@ -384,7 +386,7 @@ async fn a_request_naming_no_instance_type_is_held_to_the_published_floor() {
 /// instance type, sub-type or release.
 const ABSENCE_ROWS: [(&str, &str, &str); 3] = [
     ("OpenSearch_2.19", "r6g.large.search", "gp2"),
-    ("Elasticsearch_7.10", "m5.4xlarge.search", "io1"),
+    ("Elasticsearch_7.10", "m4.4xlarge.search", "io1"),
     ("OpenSearch_2.11", "t3.small.search", "gp3"),
 ];
 

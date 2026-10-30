@@ -512,9 +512,10 @@ async fn an_upgrade_only_ever_goes_to_a_version_the_domain_can_reach() {
 
     // One row per way a target version fails to be one the domain can be upgraded to:
     // the version it already runs, an earlier one of its own line, an earlier line
-    // altogether, the next line reached before the end of its own, a version the
-    // service does not publish (pattern-valid), and the newest published version,
-    // which has nothing ahead of it at all.
+    // altogether, the next line reached from the middle of its own rather than from its
+    // end, a line two ahead of its own, a version the service does not publish
+    // (pattern-valid), and the newest published version, which has nothing ahead of it at
+    // all.
     let refused = [
         (
             "refuse-same",
@@ -542,9 +543,15 @@ async fn an_upgrade_only_ever_goes_to_a_version_the_domain_can_reach() {
         ),
         (
             "refuse-early-cross",
-            "Elasticsearch_6.8",
-            "OpenSearch_1.0",
+            "OpenSearch_2.3",
+            "OpenSearch_3.1",
             "the next line before the end of its own",
+        ),
+        (
+            "refuse-two-lines",
+            "OpenSearch_1.3",
+            "OpenSearch_3.1",
+            "a line two ahead of its own",
         ),
         (
             "refuse-unpublished",

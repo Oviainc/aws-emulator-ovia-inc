@@ -6,8 +6,9 @@
 //! versions a domain running it can be upgraded to.
 //!
 //! The compatibility rule lives in [`crate::state::compatible_target_versions`] —
-//! every published release of the source's own line (its engine and major) that is
-//! later than it, plus every release of the line that immediately succeeds its own —
+//! every published release of the source's own upgrade line that is later than it,
+//! plus, from the newest release of that line only, every release of the line that
+//! immediately succeeds it —
 //! so this handler only chooses WHICH source versions to report it for: the one
 //! version the named domain runs, or, when the request names no domain, the published
 //! upgrade table's own source versions

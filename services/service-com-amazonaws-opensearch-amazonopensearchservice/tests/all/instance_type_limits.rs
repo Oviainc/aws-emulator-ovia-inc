@@ -14,11 +14,13 @@
 //! * the instance-count range is the role's, and a role's range is the same whatever
 //!   the instance type;
 //! * an instance type with attachable volumes publishes, under the DATA role alone,
-//!   one `ebs` storage type per `VolumeType` the model declares, each with the same
-//!   minimum size, a maximum that grows with the instance's size, a flat cap for the
-//!   magnetic sub-type, and the IOPS and throughput ranges only the provisioned
-//!   sub-types carry — over a table of eight sizes from the smallest published to the
-//!   largest;
+//!   one `ebs` storage type per volume sub-type THAT instance type attaches, each with
+//!   the same minimum size, a maximum that grows with the instance's size up to what the
+//!   instance's own EBS attachment takes, a flat cap for the magnetic sub-type, and the
+//!   IOPS and throughput ranges only the provisioned sub-types carry, their ceilings
+//!   bounded by the same attachment — over a table spanning the burstable class, several
+//!   current-generation sizes from the smallest published to the largest, and a
+//!   previous-generation family;
 //! * an instance type whose data sits on built-in storage publishes that one storage
 //!   type with no sub-type and no volume limits, and a warm-tier type publishes none;
 //! * the additional limit is the role's, and the data nodes a master supports grow with
@@ -43,35 +45,140 @@ use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT}
 /// that offers every family named below, so no rule rests on a single version.
 const VERSIONS: [&str; 3] = ["Elasticsearch_7.10", "OpenSearch_1.0", "OpenSearch_2.19"];
 
-/// The `VolumeType` values an `ebs` storage type is published for, in the order the
-/// model's enum declares them. Source: `smithy_query(query="shape",shape="VolumeType")`
-/// — `standard`, `gp2`, `io1`, `gp3` — as the service's generated
-/// `VOLUME_TYPE_VALUES` orders them.
+/// The `VolumeType` values an `ebs` storage type can be published for, in the order the
+/// service's generated `VOLUME_TYPE_VALUES` lists them. Source:
+/// `smithy_query(query="shape",shape="VolumeType")` — `standard`, `gp2`, `io1`, `gp3`.
 const VOLUME_SUB_TYPES: [&str; 4] = ["gp2", "gp3", "io1", "standard"];
+
+/// The sub-types EVERY instance class with an attached volume publishes: the
+/// general-purpose SSD ones, in that same order.
+pub(crate) const GENERAL_PURPOSE_SUB_TYPES: &[&str] = &["gp2", "gp3"];
+
+/// Those plus the provisioned-IOPS one, which attaches to every class whose EBS
+/// attachment provisions its own performance.
+pub(crate) const WITH_PROVISIONED_IOPS: &[&str] = &["gp2", "gp3", "io1"];
+
+/// The sub-types a previous-generation family publishes: the magnetic one beside those.
+pub(crate) const EVERY_SUB_TYPE: &[&str] = &["gp2", "gp3", "io1", "standard"];
 
 /// The suite's OWN expectation of the published volume-size floor, every sub-type and
 /// every instance type: restated here rather than imported from `crate::state`, so
 /// changing it in the handler fails this suite instead of being asserted against
 /// itself.
-const MINIMUM_VOLUME_SIZE: i64 = 10;
+pub(crate) const MINIMUM_VOLUME_SIZE: i64 = 10;
 
 /// The same for the magnetic sub-type's flat maximum.
-const MAXIMUM_STANDARD_VOLUME_SIZE: i64 = 100;
+pub(crate) const MAXIMUM_STANDARD_VOLUME_SIZE: i64 = 100;
 
-/// The instance sizes an EBS maximum is published for, each with the maximum volume
-/// size the published scale gives it: every instance type takes a 512 GiB volume
-/// whatever its size, a `large` is four normalization units and carries exactly that, so
-/// one unit carries 128 GiB and the largest published size, `24xlarge` (192 units),
-/// carries 24 TiB.
-const VOLUME_SIZE_BY_SIZE: [(&str, i64); 8] = [
-    ("t3.nano.search", 512),
-    ("t3.small.search", 512),
-    ("t3.medium.search", 512),
-    ("m5.large.search", 512),
-    ("m5.xlarge.search", 1_024),
-    ("m5.2xlarge.search", 2_048),
-    ("m5.4xlarge.search", 4_096),
-    ("m5.24xlarge.search", 24_576),
+/// One row of the storage table: an instance type, the sub-types it publishes, and the
+/// three ceilings published for it — the volume size in GiB, and the IOPS and the
+/// throughput a `gp3` volume on it is provisioned up to.
+///
+/// Shared with [`super::reference_catalogs`], which holds each row's figures to the
+/// published limit blocks, so [`STORAGE_ROWS`] stays the ONE statement of the table.
+pub(crate) struct StorageRow {
+    /// The instance type the row is asked about.
+    pub(crate) instance_type: &'static str,
+    /// The sub-types its data role publishes an `ebs` storage type for, in order.
+    pub(crate) sub_types: &'static [&'static str],
+    /// The `MaximumVolumeSize`, in GiB, every one of those sub-types publishes (the
+    /// magnetic one excepted, which carries its own flat cap).
+    pub(crate) maximum_volume_size: i64,
+    /// The `MaximumIops` a provisioned sub-type publishes.
+    pub(crate) maximum_iops: i64,
+    /// The `MaximumThroughput` the `gp3` sub-type publishes.
+    pub(crate) maximum_throughput: i64,
+}
+
+/// The storage table every storage assertion below is made over, ordered so the
+/// published maximum never falls along it.
+///
+/// The suite's OWN expectation of the published figures: a volume of 512 GiB attaches to
+/// every instance type whatever its size, a `large` is four normalization units and
+/// carries exactly that, so one unit carries 128 GiB and the largest published size,
+/// `24xlarge` (192 units), carries 24 TiB — except that the burstable class, whose EBS
+/// attachment bursts from a credit balance rather than being provisioned, publishes that
+/// attachment's own ceilings (100 GiB, 11,800 IOPS, 260 MiB/s) at every one of its sizes.
+/// A provisioned `gp3` volume on any other class reaches the sub-type's own ceilings
+/// (16,000 IOPS, 1,000 MiB/s).
+pub(crate) const STORAGE_ROWS: [StorageRow; 11] = [
+    StorageRow {
+        instance_type: "t3.nano.search",
+        sub_types: GENERAL_PURPOSE_SUB_TYPES,
+        maximum_volume_size: 100,
+        maximum_iops: 11_800,
+        maximum_throughput: 260,
+    },
+    StorageRow {
+        instance_type: "t3.small.search",
+        sub_types: GENERAL_PURPOSE_SUB_TYPES,
+        maximum_volume_size: 100,
+        maximum_iops: 11_800,
+        maximum_throughput: 260,
+    },
+    StorageRow {
+        instance_type: "t3.2xlarge.search",
+        sub_types: GENERAL_PURPOSE_SUB_TYPES,
+        maximum_volume_size: 100,
+        maximum_iops: 11_800,
+        maximum_throughput: 260,
+    },
+    StorageRow {
+        instance_type: "t4g.small.search",
+        sub_types: GENERAL_PURPOSE_SUB_TYPES,
+        maximum_volume_size: 100,
+        maximum_iops: 11_800,
+        maximum_throughput: 260,
+    },
+    StorageRow {
+        instance_type: "t4g.medium.search",
+        sub_types: GENERAL_PURPOSE_SUB_TYPES,
+        maximum_volume_size: 100,
+        maximum_iops: 11_800,
+        maximum_throughput: 260,
+    },
+    StorageRow {
+        instance_type: "m5.large.search",
+        sub_types: WITH_PROVISIONED_IOPS,
+        maximum_volume_size: 512,
+        maximum_iops: 16_000,
+        maximum_throughput: 1_000,
+    },
+    StorageRow {
+        instance_type: "m5.xlarge.search",
+        sub_types: WITH_PROVISIONED_IOPS,
+        maximum_volume_size: 1_024,
+        maximum_iops: 16_000,
+        maximum_throughput: 1_000,
+    },
+    StorageRow {
+        instance_type: "m5.2xlarge.search",
+        sub_types: WITH_PROVISIONED_IOPS,
+        maximum_volume_size: 2_048,
+        maximum_iops: 16_000,
+        maximum_throughput: 1_000,
+    },
+    StorageRow {
+        instance_type: "m4.2xlarge.search",
+        sub_types: EVERY_SUB_TYPE,
+        maximum_volume_size: 2_048,
+        maximum_iops: 16_000,
+        maximum_throughput: 1_000,
+    },
+    StorageRow {
+        instance_type: "r6g.4xlarge.search",
+        sub_types: WITH_PROVISIONED_IOPS,
+        maximum_volume_size: 4_096,
+        maximum_iops: 16_000,
+        maximum_throughput: 1_000,
+    },
+    StorageRow {
+        instance_type: "m5.24xlarge.search",
+        sub_types: WITH_PROVISIONED_IOPS,
+        maximum_volume_size: 24_576,
+        maximum_iops: 16_000,
+        maximum_throughput: 1_000,
+    },
 ];
 
 /// `DescribeInstanceTypeLimits`:
@@ -245,11 +352,18 @@ async fn the_instance_count_range_is_the_roles_own() {
 }
 
 #[tokio::test]
-async fn ebs_storage_types_span_the_volume_enum_and_scale_with_the_instance_size() {
+async fn ebs_storage_types_are_the_instance_types_own_sub_types_and_ceilings() {
     let emulator = Emulator::new();
     let version = "OpenSearch_2.19";
 
-    for (instance_type, expected_maximum) in VOLUME_SIZE_BY_SIZE {
+    for row in &STORAGE_ROWS {
+        let StorageRow {
+            instance_type,
+            sub_types: expected_sub_types,
+            maximum_volume_size: expected_maximum,
+            maximum_iops: expected_maximum_iops,
+            maximum_throughput: expected_maximum_throughput,
+        } = *row;
         let case = format!("{version} {instance_type}");
         let map = limits_by_role(
             &describe_limits(&emulator, version, instance_type, "").await,
@@ -282,10 +396,20 @@ async fn ebs_storage_types_span_the_volume_enum_and_scale_with_the_instance_size
                 .collect();
             assert_eq!(
                 sub_types,
-                VOLUME_SUB_TYPES.map(str::to_string).to_vec(),
-                "case {case} role {role}: expected one ebs entry per published volume \
-                 type, got {storage:?}"
+                expected_sub_types
+                    .iter()
+                    .map(|sub_type| (*sub_type).to_string())
+                    .collect::<Vec<_>>(),
+                "case {case} role {role}: expected one ebs entry per volume sub-type this \
+                 instance type attaches, got {storage:?}"
             );
+            for sub_type in &sub_types {
+                assert!(
+                    VOLUME_SUB_TYPES.contains(&sub_type.as_str()),
+                    "case {case} role {role}: expected a modelled volume sub-type, got \
+                     {sub_type}"
+                );
+            }
             for entry in &storage {
                 let sub_type = entry["StorageSubTypeName"].as_str().unwrap_or_default();
                 let case = format!("{case} role {role} {sub_type}");
@@ -345,6 +469,13 @@ async fn ebs_storage_types_span_the_volume_enum_and_scale_with_the_instance_size
                         "case {case}: expected a non-empty IOPS range, got ({floor}, \
                          {ceiling})"
                     );
+                    // The ceiling is what the INSTANCE drives, not what the sub-type
+                    // alone publishes.
+                    assert_eq!(
+                        ceiling, expected_maximum_iops,
+                        "case {case}: expected the IOPS ceiling this instance type \
+                         publishes, got {ceiling}"
+                    );
                 }
                 if sub_type == "gp3" {
                     let floor = storage_limit(entry, "MinimumThroughput").unwrap_or_default();
@@ -354,29 +485,35 @@ async fn ebs_storage_types_span_the_volume_enum_and_scale_with_the_instance_size
                         "case {case}: expected a non-empty throughput range, got \
                          ({floor}, {ceiling})"
                     );
+                    assert_eq!(
+                        ceiling, expected_maximum_throughput,
+                        "case {case}: expected the throughput ceiling this instance type \
+                         publishes, got {ceiling}"
+                    );
                 }
             }
         }
     }
 
-    // A bigger instance takes a bigger volume: the maximum never falls along the size
-    // table, and it grows strictly once the instance is past the size the smallest
-    // published maximum covers.
+    // A bigger instance takes a bigger volume, up to what its own attachment carries:
+    // the maximum never falls along the table, and the largest instance publishes a
+    // bigger maximum than the smallest.
     let mut previous: Option<(&str, i64)> = None;
-    for (instance_type, expected_maximum) in VOLUME_SIZE_BY_SIZE {
+    for row in &STORAGE_ROWS {
         if let Some((smaller, smaller_maximum)) = previous {
             assert!(
-                expected_maximum >= smaller_maximum,
-                "case {smaller} -> {instance_type}: expected the published maximum to \
-                 grow with the instance size, got {smaller_maximum} and \
-                 {expected_maximum}"
+                row.maximum_volume_size >= smaller_maximum,
+                "case {smaller} -> {}: expected the published maximum to grow with the \
+                 instance size, got {smaller_maximum} and {}",
+                row.instance_type,
+                row.maximum_volume_size
             );
         }
-        previous = Some((instance_type, expected_maximum));
+        previous = Some((row.instance_type, row.maximum_volume_size));
     }
     let (smallest, largest) = (
-        VOLUME_SIZE_BY_SIZE[0].1,
-        VOLUME_SIZE_BY_SIZE[VOLUME_SIZE_BY_SIZE.len() - 1].1,
+        STORAGE_ROWS[0].maximum_volume_size,
+        STORAGE_ROWS[STORAGE_ROWS.len() - 1].maximum_volume_size,
     );
     assert!(
         largest > smallest,
@@ -759,8 +896,8 @@ async fn a_volume_outside_the_published_range_is_refused_on_create() {
     for (row, (instance_type, sub_type)) in [
         ("m5.large.search", "gp3"),
         ("m5.2xlarge.search", "gp2"),
-        ("t3.small.search", "io1"),
-        ("m5.large.search", "standard"),
+        ("m4.2xlarge.search", "io1"),
+        ("m4.large.search", "standard"),
         ("t3.nano.search", "gp3"),
     ]    .into_iter()
     .enumerate()

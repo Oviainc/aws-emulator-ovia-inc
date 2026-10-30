@@ -9,10 +9,11 @@
 //!
 //! The tests assert the RULE over sets of inputs rather than one recorded call: the
 //! versions a source version can be upgraded to are the published releases of its own
-//! LINE (its engine and major release) that are later than it, plus every release of
-//! the line that immediately succeeds its own — so an upgrade crosses at most one line
-//! boundary, the Elasticsearch majors preceding the OpenSearch ones, each line ordered
-//! by minor compared as a number. So:
+//! upgrade LINE that are later than it, plus — from the NEWEST release of that line only
+//! — every release of the line that immediately succeeds it. A line is an engine's major
+//! release, except that the Elasticsearch 7 releases and the OpenSearch 1 releases are
+//! one line, OpenSearch 1.0 being the fork of Elasticsearch 7.10. So an upgrade walks the
+//! minors of a line freely and leaves the line only from its end. So:
 //!
 //! * the unfiltered answer is the published upgrade table: a row per release the
 //!   service still offers an upgrade from — those at or after the published floor that
@@ -20,8 +21,10 @@
 //! * an upgrade only goes FORWARDS — no version is among its own targets, every
 //!   target ranks above its source, targets are ascending, and a version's
 //!   same-line targets are exactly the later published releases of that line;
-//! * crossing a line boundary reaches the NEXT line only: no target is two lines ahead
-//!   of its source, and the whole of the succeeding line is reachable;
+//! * crossing a line boundary reaches the NEXT line only, and only from the end of a
+//!   line: a source with later releases of its own line ahead of it reaches those and
+//!   stops, and one at the end of its line reaches the whole of the succeeding line and
+//!   nothing beyond it;
 //! * `DomainName` limits the answer to the one version THAT domain runs, over a
 //!   table of domains spanning both engines, several majors, the newest published
 //!   version (which has no target), the default version a request omitting
@@ -38,7 +41,7 @@ use super::domain_lifecycle::{error_code, string_member, Answer, Emulator, PREFI
 
 /// The oldest release the published upgrade table has a row for — the suite's own
 /// expectation of the floor the service offers an upgrade from.
-const UPGRADE_FLOOR: &str = "Elasticsearch_7.7";
+const UPGRADE_FLOOR: &str = "Elasticsearch_5.1";
 
 /// `GetCompatibleVersions`: `GET /2021-01-01/opensearch/compatibleVersions`, with
 /// `DomainName` as its one `@httpQuery` member.
@@ -112,11 +115,25 @@ pub(crate) fn rank(version: &str) -> (u8, u32, u32) {
     (generation, parse(major, "major"), parse(minor, "minor"))
 }
 
-/// The release LINE of a version: its engine generation and major release number, the
-/// unit an upgrade path is published along.
-fn line(version: &str) -> (u8, u32) {
+/// The upgrade LINE of a version: its engine generation and major release number, the
+/// unit an upgrade path is published along — except that the Elasticsearch 7 releases
+/// and the OpenSearch 1 releases are ONE line, because OpenSearch 1.0 is the fork of
+/// Elasticsearch 7.10.
+pub(crate) fn line(version: &str) -> (u8, u32) {
     let (generation, major, _) = rank(version);
+    if (generation, major) == (1, 1) {
+        return (0, 7);
+    }
     (generation, major)
+}
+
+/// Whether a version is the NEWEST release its line publishes — the one release of a
+/// line the service offers an upgrade INTO the next line from.
+fn is_newest_of_line(version: &str) -> bool {
+    SUPPORTED_ENGINE_VERSIONS
+        .iter()
+        .filter(|candidate| line(candidate) == line(version))
+        .all(|candidate| rank(candidate) <= rank(version))
 }
 
 /// Every release line the published catalog carries, oldest first and each once.
@@ -133,17 +150,22 @@ fn succeeding_line(of: (u8, u32)) -> Option<(u8, u32)> {
 }
 
 /// The rule, applied to one source version: the later published releases of its own
-/// line, plus every release of the line that immediately succeeds it. Oldest first.
+/// line, plus — from the newest release of that line only — every release of the line
+/// that immediately succeeds it. Oldest first.
 fn expected_targets(source_version: &str) -> Vec<String> {
     let source = rank(source_version);
     let source_line = line(source_version);
-    let next_line = succeeding_line(source_line);
+    let next_line = if is_newest_of_line(source_version) {
+        succeeding_line(source_line)
+    } else {
+        None
+    };
     SUPPORTED_ENGINE_VERSIONS
         .iter()
         .filter(|candidate| {
             let candidate_line = line(candidate);
             (candidate_line == source_line && rank(candidate) > source)
-                || Some(candidate_line) == next_line
+                || (next_line.is_some() && Some(candidate_line) == next_line)
         })
         .map(|candidate| (*candidate).to_string())
         .collect()
@@ -314,20 +336,21 @@ async fn targets_only_ever_go_forwards() {
              {same_line:?}"
         );
 
-        // Crossing a line boundary reaches the NEXT line only: the whole of the line
-        // that succeeds the source's, and nothing on any line beyond it.
+        // Crossing a line boundary reaches the NEXT line only, and only from the end of
+        // a line: the whole of the line that succeeds the source's when the source is the
+        // newest release of its own, and nothing at all otherwise.
         let crossed: Vec<String> = targets
             .iter()
             .filter(|target| line(target) != line(&source))
             .cloned()
             .collect();
         let expected_crossed: Vec<String> = match succeeding_line(line(&source)) {
-            None => Vec::new(),
-            Some(next) => published
+            Some(next) if is_newest_of_line(&source) => published
                 .iter()
                 .filter(|candidate| line(candidate) == next)
                 .cloned()
                 .collect(),
+            _ => Vec::new(),
         };
         assert_eq!(
             crossed, expected_crossed,
@@ -337,9 +360,10 @@ async fn targets_only_ever_go_forwards() {
 
         // Within one line, each listed version's targets are the previous one's minus
         // that version itself — the table is one monotone path, not a set of unrelated
-        // answers.
+        // answers. The release at the END of a line is where the path leaves it, so it
+        // is the one source the step does not hold for.
         if let Some((earlier, earlier_targets)) = previous {
-            if line(&earlier) == line(&source) {
+            if line(&earlier) == line(&source) && !is_newest_of_line(&source) {
                 assert_eq!(
                     earlier_targets.first().map(String::as_str),
                     Some(source.as_str()),
