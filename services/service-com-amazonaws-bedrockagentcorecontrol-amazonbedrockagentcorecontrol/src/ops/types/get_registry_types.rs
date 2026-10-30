@@ -17,7 +17,15 @@ pub struct GetRegistryInput {
     pub registry_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#GetRegistryResponse")]
+/// `GetRegistryResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation", operation="GetRegistry")`),
+/// and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetRegistryOutput {
     pub name: String,
@@ -32,4 +40,37 @@ pub struct GetRegistryOutput {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+agentcore_schema_and_codec!(
+    GetRegistryOutput,
+    GET_REGISTRY_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#GetRegistryResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "GetRegistryResponse",
+    (M_NAME, name, "name", 0, req, string),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (M_REGISTRY_ID, registry_id, "registryId", 2, req, string),
+    (M_REGISTRY_ARN, registry_arn, "registryArn", 3, req, string),
+    (M_AUTHORIZER_TYPE, authorizer_type, "authorizerType", 4, opt, string),
+    (
+        M_AUTHORIZER_CONFIGURATION,
+        authorizer_configuration,
+        "authorizerConfiguration",
+        5,
+        opt,
+        union_of(AuthorizerConfiguration)
+    ),
+    (
+        M_APPROVAL_CONFIGURATION,
+        approval_configuration,
+        "approvalConfiguration",
+        6,
+        opt,
+        struct_of(ApprovalConfiguration)
+    ),
+    (M_STATUS, status, "status", 7, req, string),
+    (M_STATUS_REASON, status_reason, "statusReason", 8, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 9, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 10, req, date_time),
+);
 

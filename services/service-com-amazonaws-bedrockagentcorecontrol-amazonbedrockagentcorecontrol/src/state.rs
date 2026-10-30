@@ -18,6 +18,9 @@
 //!   the whole agent-loop configuration `CreateHarness` persisted, so
 //!   `GetHarness` reports exactly that and `DeleteHarness` reports what it
 //!   removed;
+//! * the registry (`/registries/`): one [`RegistryRecord`] per `registryId`,
+//!   holding the catalog's configuration and the status the clock owes it, so
+//!   `GetRegistry` and any later registry read answer from one store;
 //! * the token vault ([`TokenVaults`]): the KMS configuration each vault of the
 //!   account is encrypted under, so `SetTokenVaultCMK` and `GetTokenVault`
 //!   answer from one store.
@@ -33,11 +36,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AgentRuntime, AgentRuntimeArtifact, AgentRuntimeVersionSummary, AuthorizerConfiguration,
+    AgentRuntime, AgentRuntimeArtifact, AgentRuntimeVersionSummary, ApprovalConfiguration,
+    AuthorizerConfiguration,
     CapacityProviderConfiguration, CertificateConfiguration, Code, CreateGatewayOutput,
     CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
     FilesystemConfiguration, GatewayInterceptorConfiguration, GatewayPolicyEngineConfiguration,
     GatewayProtocolConfiguration, GatewaySummary, GetGatewayOutput, GetGatewayTargetOutput,
+    GetRegistryOutput,
     Harness, HarnessAgentCoreRuntimeEnvironment, HarnessAgentCoreRuntimeEnvironmentRequest,
     HarnessEnvironmentArtifact, HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest,
     HarnessHook, HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill,
@@ -1267,6 +1272,114 @@ impl TokenVaults {
     }
 }
 
+/// The resource noun [`resource_not_found`] names for a registry, and the ARN
+/// resource type `RegistryArn` carries (`…:registry/{registryId}`).
+pub const RESOURCE_REGISTRY: &str = "registry";
+
+/// `RegistryStatus` members this service drives. The enum's full value list is
+/// `CREATING | READY | UPDATING | CREATE_FAILED | UPDATE_FAILED | DELETING |
+/// DELETE_FAILED` (`shared_types::REGISTRY_STATUS_VALUES`, from `smithy_query
+/// shape=RegistryStatus`).
+pub const REGISTRY_STATUS_CREATING: &str = "CREATING";
+pub const REGISTRY_STATUS_READY: &str = "READY";
+
+/// How long a freshly created registry stays `CREATING` before the clock owes it
+/// `READY`.
+///
+/// AWS documents no duration for this transition, so the span is chosen: long
+/// enough that a caller acting straight after the call still observes the
+/// transient status, short enough to keep a client script quick.
+pub const REGISTRY_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// How many registries this emulator will hold.
+///
+/// `CreateRegistry` models `ServiceQuotaExceededException` (HTTP 402) for
+/// exceeding the real service's quota; this number is not a fidelity claim about
+/// that quota but the emulator's own ceiling, set generously so no realistic
+/// workflow meets it, so a caller looping on create cannot grow this process's
+/// memory without bound.
+pub const MAX_REGISTRIES: usize = 1_000;
+
+/// How wide a minted `registryId` is: `RegistryId` is `^[a-zA-Z0-9]{12,16}$`
+/// (`smithy_query shape=RegistryId`), so 12 is the shortest id the pattern
+/// admits. Unlike a runtime, gateway or memory id, it carries no name.
+const REGISTRY_ID_LEN: usize = 12;
+
+/// The `registryId` a `RegistryIdentifier` names.
+///
+/// That member accepts either the bare id or the registry's whole ARN
+/// (`^(arn:aws(-[^:]+)?:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:registry/)?[a-zA-Z0-9]{12,16}$`),
+/// and the id itself holds no `/`, so the last path segment IS the id for both
+/// spellings. Shared by every operation that addresses a registry, so two of them
+/// cannot resolve one identifier to two different records.
+pub fn registry_id_from_identifier(identifier: &str) -> &str {
+    identifier.rsplit_once('/').map_or(identifier, |(_, id)| id)
+}
+
+/// One registry: the catalog `CreateRegistry` minted, the configuration the
+/// caller supplied for it, and the `CREATING` -> `READY` transition the clock
+/// owes it.
+///
+/// Every read of the registry reports this record, so a create and a later read
+/// cannot disagree about the registry's name, configuration or status.
+#[derive(Debug, Clone)]
+pub struct RegistryRecord {
+    pub registry_id: String,
+    pub registry_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// As the caller supplied it: `authorizerType` carries no modelled default,
+    /// so a registry created without one reports none.
+    pub authorizer_type: Option<String>,
+    pub authorizer_configuration: Option<AuthorizerConfiguration>,
+    /// The EFFECTIVE approval configuration: the caller's, or the default the
+    /// model documents (`autoApproval` false), so a read reports the rule the
+    /// records of this registry are actually approved under.
+    pub approval_configuration: ApprovalConfiguration,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The status the registry reports until [`Self::settles_at`].
+    pub transient_status: String,
+    /// The status it reports from then on.
+    pub settled_status: String,
+    /// When the clock owes the move from one to the other.
+    pub settles_at: SystemTime,
+    /// Why the registry is in its current status, which the model documents as
+    /// "typically set when the status is a failure state" — so nothing a
+    /// successful create or read sets.
+    pub status_reason: Option<String>,
+}
+
+impl RegistryRecord {
+    /// The status at `now`: the transient one until the clock owes the
+    /// transition, the settled one from then on. No read performs it — it is due
+    /// at that instant whether or not anybody looks.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        if now < self.settles_at {
+            &self.transient_status
+        } else {
+            &self.settled_status
+        }
+    }
+
+    /// What a read of this registry reports.
+    pub fn get_output(&self, now: SystemTime) -> GetRegistryOutput {
+        GetRegistryOutput {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            registry_id: self.registry_id.clone(),
+            registry_arn: self.registry_arn.clone(),
+            authorizer_type: self.authorizer_type.clone(),
+            authorizer_configuration: self.authorizer_configuration.clone(),
+            approval_configuration: Some(self.approval_configuration.clone()),
+            status: self.status_at(now).to_string(),
+            status_reason: self.status_reason.clone(),
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol. A handler reaches it through [`service_state`].
 ///
 /// Every map here is caller-driven growth, so every one is bounded:
@@ -1276,7 +1389,8 @@ impl TokenVaults {
 /// [`MAX_TARGETS_PER_GATEWAY`] the targets one gateway holds, [`MAX_MEMORIES`]
 /// the memories (and with them their 1:1 name index),
 /// [`MAX_STRATEGIES_PER_MEMORY`] the strategies one memory holds,
-/// [`MAX_HARNESSES`] the harnesses (and with them their 1:1 name index) and
+/// [`MAX_HARNESSES`] the harnesses (and with them their 1:1 name index),
+/// [`MAX_REGISTRIES`] the registries (and with them their 1:1 name index) and
 /// [`MAX_WORKLOAD_IDENTITIES`] the workload identities, and the
 /// idempotency records are capped at [`MAX_REMEMBERED_CLIENT_TOKENS`] with
 /// oldest-first eviction plus removal when the resource they name is deleted.
@@ -1361,6 +1475,23 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::harness_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     harness_idempotency_order: VecDeque<String>,
+    /// Every registry, keyed by `registryId` — the identifier every registry
+    /// route addresses it by. The key order is the deterministic list order a
+    /// registry listing pages over.
+    pub registries: BTreeMap<String, RegistryRecord>,
+    /// `name` -> `registryId`, so a duplicate name at create time is a
+    /// `ConflictException` ("The name must be unique within your account").
+    /// One entry per stored registry.
+    pub registry_names: BTreeMap<String, String>,
+    /// `<operation>/<clientToken>` -> the registry that token first produced, so
+    /// a replayed `CreateRegistry` answers with its first result instead of
+    /// minting a second registry. Separate from the maps above because the record
+    /// is validated against a different store; the key carries the operation for
+    /// the same reason as there.
+    registry_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::registry_idempotency`] in the order they were first
+    /// recorded, so the oldest record is the one evicted at the ceiling.
+    registry_idempotency_order: VecDeque<String>,
     /// The account's token vaults, keyed by `tokenVaultId`. Bounded by its own
     /// type: no operation of this service creates a vault, so the map holds the
     /// one default vault [`TokenVaults`] seeds and never grows.
@@ -1761,6 +1892,57 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
             memory_id.to_string(),
         );
     }
+
+    /// Mint a `registryId` no stored registry holds: [`REGISTRY_ID_LEN`]
+    /// alphanumerics, per `RegistryId`'s pattern `^[a-zA-Z0-9]{12,16}$`, which
+    /// — unlike a runtime, gateway or memory id — carries no name. The name is
+    /// still part of what the id is derived from, so two registries created in
+    /// the same instant under different names cannot collide.
+    pub fn mint_registry_id(&mut self, name: &str, at: SystemTime) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = suffix_of_length(name, self.mint_counter, at, REGISTRY_ID_LEN);
+            if !self.registries.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// The registry a previous request to `operation` carrying this `clientToken`
+    /// produced, if the record is still held and the registry still exists.
+    pub fn replayed_registry_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<String> {
+        let registry_id = self
+            .registry_idempotency
+            .get(&token_key(operation, client_token?))?;
+        self.registries
+            .contains_key(registry_id)
+            .then(|| registry_id.clone())
+    }
+
+    /// Record what a `clientToken` produced for `operation`, evicting the oldest
+    /// record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held. An evicted token is
+    /// indistinguishable from one whose idempotency window has passed: the next
+    /// request carrying it is served as a fresh one.
+    pub fn remember_registry_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        registry_id: &str,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        remember_token(
+            &mut self.registry_idempotency,
+            &mut self.registry_idempotency_order,
+            token_key(operation, &token),
+            registry_id.to_string(),
+        );
+    }
 }
 
 /// One idempotency key: the operation the token was presented to, then the
@@ -1794,10 +1976,21 @@ fn remember_token<V>(
     }
 }
 
+/// How many characters the suffix of a NAME-carrying id contributes, in every
+/// `*Id` pattern of this service that ends in one (`-[a-zA-Z0-9]{10}`).
+const ID_SUFFIX_LEN: usize = 10;
+
 /// The 10-character id suffix: SHA-256 over the name, the mint counter and the
 /// creation instant, mapped into `[a-z0-9]` (a subset of the `[a-zA-Z0-9]{10}`
 /// the model's pattern allows).
 fn suffix_for(name: &str, counter: u64, at: SystemTime) -> String {
+    suffix_of_length(name, counter, at, ID_SUFFIX_LEN)
+}
+
+/// `len` characters of the same derivation [`suffix_for`] uses, for an id whose
+/// pattern asks for a different width — a registry id is the whole id rather
+/// than a suffix on a name, so it is longer.
+fn suffix_of_length(name: &str, counter: u64, at: SystemTime, len: usize) -> String {
     use sha2::{Digest, Sha256};
 
     // Lowercase alphanumerics only: the pattern accepts upper case too, but a
@@ -1814,7 +2007,7 @@ fn suffix_for(name: &str, counter: u64, at: SystemTime) -> String {
     hasher
         .finalize()
         .iter()
-        .take(10)
+        .take(len)
         .map(|byte| char::from(ALPHABET[usize::from(*byte) % ALPHABET.len()]))
         .collect()
 }
@@ -1942,6 +2135,16 @@ pub fn gateway_arn(region: &str, gateway_id: &str) -> String {
 /// `MemoryArn`'s pattern.
 pub fn memory_arn(region: &str, memory_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("memory/{memory_id}"))
+}
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:registry/{registryId}` —
+/// `RegistryArn`'s pattern.
+pub fn registry_arn(region: &str, registry_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{RESOURCE_REGISTRY}/{registry_id}"),
+    )
 }
 
 /// The gateway's endpoint, in the form AWS returns for a Bedrock AgentCore

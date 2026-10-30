@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRegistry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRegistry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRegistry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a registry and PERSISTS it in [`crate::state`]: the name it is addressed
+//! by, the authorizer and approval configuration the caller supplied, and the
+//! `CREATING` -> `READY` transition the clock owes it. Every later read of the
+//! registry comes from that record.
+//!
+//! Only the `registryArn` is reported here — it is the one member
+//! `CreateRegistryResponse` declares — so what the registry holds is read back
+//! through `GetRegistry`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +175,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRegistry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRegistryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRegistry"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateRegistryErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the registry store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // registry that token first produced, rather than minting a second one:
+        // "If this token matches a previous request, the service ignores the
+        // request, but doesn't return an error."
+        if let Some(registry_id) =
+            store.replayed_registry_result(Self::NAME, input.client_token.as_deref())
+        {
+            if let Some(record) = store.registries.get(&registry_id) {
+                return Ok(CreateRegistryOutput {
+                    registry_arn: record.registry_arn.clone(),
+                });
+            }
+        }
+
+        // The model states this rule in prose, so the framework's constraint walk
+        // cannot refuse it: "If you specify CUSTOM_JWT as the authorizerType, you
+        // must provide an authorizerConfiguration." The other authorizer type
+        // carries no configuration of its own and the model states nothing about
+        // supplying one with it, so a configuration sent alongside it is stored
+        // and reported rather than refused.
+        if input.authorizer_type.as_deref() == Some(crate::state::AUTHORIZER_TYPE_CUSTOM_JWT)
+            && input.authorizer_configuration.is_none()
+        {
+            return Err(CreateRegistryErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "authorizerConfiguration",
+                    &format!(
+                        "is required when authorizerType is {}",
+                        crate::state::AUTHORIZER_TYPE_CUSTOM_JWT
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // "The name must be unique within your account", so a repeated name is a
+        // conflict, not a second registry that later reads cannot tell apart.
+        if let Some(existing) = store.registry_names.get(&input.name) {
+            return Err(CreateRegistryErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a registry named {} already exists (registryId {existing})",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if store.registries.len() >= crate::state::MAX_REGISTRIES {
+            return Err(CreateRegistryErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} registries",
+                        crate::state::MAX_REGISTRIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let registry_id = store.mint_registry_id(&input.name, now);
+        let record = crate::state::RegistryRecord {
+            registry_arn: crate::state::registry_arn(&region, &registry_id),
+            registry_id: registry_id.clone(),
+            name: input.name,
+            description: input.description,
+            authorizer_type: input.authorizer_type,
+            authorizer_configuration: input.authorizer_configuration,
+            // `autoApproval` carries the model's `false` default, so a registry
+            // created without an approval configuration still reports the rule
+            // its records are approved under.
+            approval_configuration: input.approval_configuration.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+            // A new registry is created, not ready: the transition to READY is
+            // owed by the clock, not by this call.
+            transient_status: crate::state::REGISTRY_STATUS_CREATING.to_string(),
+            settled_status: crate::state::REGISTRY_STATUS_READY.to_string(),
+            settles_at: now + crate::state::REGISTRY_SETTLE_DELAY,
+            // The model documents `statusReason` as "typically set when the
+            // status is a failure state", and nothing here failed.
+            status_reason: None,
+        };
+        let output = CreateRegistryOutput {
+            registry_arn: record.registry_arn.clone(),
+        };
+
+        store
+            .registry_names
+            .insert(record.name.clone(), registry_id.clone());
+        store.remember_registry_client_token(Self::NAME, input.client_token, &registry_id);
+        store.registries.insert(registry_id, record);
+
+        Ok(output)
     }
 }
