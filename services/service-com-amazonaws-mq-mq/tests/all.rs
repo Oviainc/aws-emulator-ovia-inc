@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/bad_request_error_attribute.rs"]
 mod bad_request_error_attribute;
+#[path = "all/broker_instance_options.rs"]
+mod broker_instance_options;
 #[path = "all/broker_lifecycle.rs"]
 mod broker_lifecycle;
 #[path = "all/state_roundtrip.rs"]

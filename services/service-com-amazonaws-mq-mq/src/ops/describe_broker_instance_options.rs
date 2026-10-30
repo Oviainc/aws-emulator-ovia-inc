@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBrokerInstanceOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBrokerInstanceOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBrokerInstanceOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a REPORTING operation. It answers with Amazon MQ's published
+//! instance-option catalog — one entry per (engine type, host instance type, storage
+//! type) combination the service offers, each carrying the deployment modes and engine
+//! versions that combination supports and the Availability Zones of the Region the
+//! caller signed for — narrowed by every filter member the request sets and paged by
+//! `MaxResults` with an opaque round-trippable `NextToken`.
+//!
+//! The catalog describes the SERVICE, not the account: it is computed from the
+//! request's Region and the published option set, so no record is read from the store
+//! and none is written, and two identical calls answer identically.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +81,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +153,246 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBrokerInstanceOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBrokerInstanceOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBrokerInstanceOptions"))
+        // What this operation reports describes what Amazon MQ OFFERS, not what the
+        // account created, so it is computed from the request's Region and the
+        // published option set rather than read from a record — and nothing is
+        // written, so a later caller sees exactly what this one did.
+        let _ = &self.engine;
+
+        // Every filter member targets `__string` on the wire
+        // (`smithy_query(query="operation", operation="DescribeBrokerInstanceOptions")`),
+        // so a filter the request sent empty narrows nothing, exactly like one it
+        // omitted.
+        let engine_type = requested_filter(input.engine_type.as_deref());
+        let host_instance_type = requested_filter(input.host_instance_type.as_deref());
+        let storage_type = requested_filter(input.storage_type.as_deref());
+
+        // `engineType` and `storageType` name values the model enumerates
+        // (`EngineType`, `BrokerStorageType`), so a value outside the set is refused
+        // naming the member at fault rather than quietly matching nothing. Same
+        // sentence as every other operation of this service states it with.
+        if let Some(engine_type) = engine_type {
+            state::validate_enum("engineType", engine_type, ENGINE_TYPE_VALUES)
+                .map_err(bad_request)?;
+        }
+        if let Some(storage_type) = storage_type {
+            state::validate_enum("storageType", storage_type, BROKER_STORAGE_TYPE_VALUES)
+                .map_err(bad_request)?;
+        }
+
+        // `maxResults` carries the modelled `@range(min: 1, max: 100)`, which this
+        // handler enforces rather than the boundary validator, so the refusal names
+        // the member the way Amazon MQ does (`skip_validation` in
+        // `super::types::describe_broker_instance_options_types`).
+        if let Some(max_results) = input.max_results {
+            state::validate_range(
+                "maxResults",
+                max_results,
+                state::MIN_MAX_RESULTS,
+                state::MAX_MAX_RESULTS,
+            )
+            .map_err(bad_request)?;
+        }
+
+        // Only a token this service issued names an offset; anything else is a client
+        // error, not an empty page.
+        let offset = match requested_filter(input.next_token.as_deref()) {
+            None => 0,
+            Some(token) => state::decode_page_token(token).ok_or_else(|| {
+                bad_request(state::Invalid::new(
+                    "nextToken",
+                    state::invalid_page_token_message(token),
+                ))
+            })?,
+        };
+
+        let region = state::request_region(ctx.parts());
+        let options: Vec<BrokerInstanceOption> = published_instance_options(&region)
+            .into_iter()
+            .filter(|option| {
+                selected_by(option.engine_type.as_deref(), engine_type)
+                    && selected_by(option.host_instance_type.as_deref(), host_instance_type)
+                    && selected_by(option.storage_type.as_deref(), storage_type)
+            })
+            .collect();
+
+        let page = state::page_of(options.len(), input.max_results, offset);
+        Ok(DescribeBrokerInstanceOptionsOutput {
+            broker_instance_options: Some(options[page.start..page.end].to_vec()),
+            max_results: Some(input.max_results.unwrap_or(DEFAULT_PAGE_SIZE)),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// A filter the request actually set. A member it omitted and a member it sent empty
+/// both mean "do not narrow by this one".
+fn requested_filter(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.is_empty())
+}
+
+/// Whether a catalog entry's member satisfies a filter: a filter the request did not
+/// set selects every entry, one it did set selects the entries whose member equals it.
+fn selected_by(value: Option<&str>, filter: Option<&str>) -> bool {
+    filter.is_none_or(|filter| value == Some(filter))
+}
+
+/// The page size this operation reports when the request names none, from the output
+/// member's own documentation: "The maximum number of instance options that can be
+/// returned per page (20 by default)" — the same default every listing of this service
+/// uses ([`state::DEFAULT_MAX_RESULTS`]).
+const DEFAULT_PAGE_SIZE: i32 = state::DEFAULT_MAX_RESULTS as i32;
+
+/// The host instance types and engine versions Amazon MQ publishes for ONE engine.
+///
+/// The engine types are the model's own `EngineType` value set
+/// (`ENGINE_TYPE_VALUES`, from `smithy_query(query="shape", shape="EngineType")`); the
+/// instance types and versions are the ones the Amazon MQ Developer Guide publishes per
+/// engine (its "Broker instance types" table, and the engine's version-support page).
+struct PublishedEngineOptions {
+    engine_type: &'static str,
+    /// Smallest first, as the instance-type table lists them.
+    host_instance_types: &'static [&'static str],
+    /// The engine versions a broker on this engine can be created with.
+    engine_versions: &'static [&'static str],
+}
+
+/// Amazon MQ's published instance-option catalog, per engine — see
+/// [`PublishedEngineOptions`] for where each column comes from. The storage types and
+/// deployment modes of one entry are not a column here: they follow from the engine and
+/// the instance type ([`offers_storage_type`], [`supports_deployment_mode`]).
+const PUBLISHED_ENGINE_OPTIONS: &[PublishedEngineOptions] = &[
+    PublishedEngineOptions {
+        engine_type: state::ENGINE_TYPE_ACTIVEMQ,
+        host_instance_types: &[
+            "mq.t2.micro",
+            "mq.t3.micro",
+            "mq.m5.large",
+            "mq.m5.xlarge",
+            "mq.m5.2xlarge",
+            "mq.m5.4xlarge",
+        ],
+        engine_versions: &["5.15.16", "5.16.7", "5.17.6", "5.18.4"],
+    },
+    PublishedEngineOptions {
+        engine_type: state::ENGINE_TYPE_RABBITMQ,
+        host_instance_types: &[
+            "mq.t3.micro",
+            "mq.m5.large",
+            "mq.m5.xlarge",
+            "mq.m5.2xlarge",
+            "mq.m5.4xlarge",
+        ],
+        engine_versions: &["3.11.28", "3.12.13", "3.13.7"],
+    },
+];
+
+/// The instance types Amazon MQ offers for single-instance brokers only: the burstable
+/// micro sizes, which the Developer Guide's instance-type table marks as suitable for
+/// evaluation rather than for a highly available deployment.
+const SINGLE_INSTANCE_ONLY_HOST_INSTANCE_TYPES: &[&str] = &["mq.t2.micro", "mq.t3.micro"];
+
+/// The instance-type family Amazon MQ for ActiveMQ offers EBS storage on — the Developer
+/// Guide's storage-type guidance: EBS is available on the `mq.m5` sizes.
+const EBS_HOST_INSTANCE_TYPE_PREFIX: &str = "mq.m5.";
+
+/// Whether `engine_type` on `host_instance_type` is offered with `storage_type`.
+///
+/// RabbitMQ is EBS-only — `BrokerStorageType`'s own documentation
+/// (`smithy_query(query="shape", shape="BrokerStorageType")`): "EFS is not supported for
+/// RabbitMQ engine type". ActiveMQ is offered on EFS at every size and on EBS on the
+/// `mq.m5` family.
+fn offers_storage_type(engine_type: &str, host_instance_type: &str, storage_type: &str) -> bool {
+    match (engine_type, storage_type) {
+        (state::ENGINE_TYPE_RABBITMQ, storage) => storage == state::STORAGE_TYPE_EBS,
+        (_, state::STORAGE_TYPE_EFS) => true,
+        (_, _) => host_instance_type.starts_with(EBS_HOST_INSTANCE_TYPE_PREFIX),
+    }
+}
+
+/// Whether a catalog entry supports `deployment_mode`.
+///
+/// Every entry supports a single-instance broker. Beyond that the engine decides which
+/// highly available mode it has — ActiveMQ an active/standby pair, RabbitMQ a cluster
+/// (`DeploymentMode`'s documented modes, `DEPLOYMENT_MODE_VALUES`) — ActiveMQ's pair is
+/// offered on its shared EFS storage, and neither is offered on the
+/// single-instance-only sizes.
+fn supports_deployment_mode(
+    engine_type: &str,
+    host_instance_type: &str,
+    storage_type: &str,
+    deployment_mode: &str,
+) -> bool {
+    if deployment_mode == state::DEPLOYMENT_MODE_SINGLE_INSTANCE {
+        return true;
+    }
+    if SINGLE_INSTANCE_ONLY_HOST_INSTANCE_TYPES.contains(&host_instance_type) {
+        return false;
+    }
+    match engine_type {
+        state::ENGINE_TYPE_RABBITMQ => deployment_mode == state::DEPLOYMENT_MODE_CLUSTER_MULTI_AZ,
+        _ => {
+            deployment_mode == state::DEPLOYMENT_MODE_ACTIVE_STANDBY_MULTI_AZ
+                && storage_type == state::STORAGE_TYPE_EFS
+        }
+    }
+}
+
+/// Amazon MQ's whole instance-option catalog for `region`, in a stable order: by engine
+/// type as the model enumerates them, then by instance type as the catalog lists them,
+/// then by storage type. The order is what makes a `NextToken` offset name the same
+/// entry on a later call.
+fn published_instance_options(region: &str) -> Vec<BrokerInstanceOption> {
+    let zones: Vec<AvailabilityZone> = state::availability_zones_in_region(region)
+        .into_iter()
+        .map(|name| AvailabilityZone { name: Some(name) })
+        .collect();
+
+    let mut options = Vec::new();
+    for engine in PUBLISHED_ENGINE_OPTIONS {
+        for host_instance_type in engine.host_instance_types {
+            for storage_type in BROKER_STORAGE_TYPE_VALUES {
+                if !offers_storage_type(engine.engine_type, host_instance_type, storage_type) {
+                    continue;
+                }
+                let supported_deployment_modes: Vec<String> = DEPLOYMENT_MODE_VALUES
+                    .iter()
+                    .filter(|deployment_mode| {
+                        supports_deployment_mode(
+                            engine.engine_type,
+                            host_instance_type,
+                            storage_type,
+                            deployment_mode,
+                        )
+                    })
+                    .map(|deployment_mode| (*deployment_mode).to_string())
+                    .collect();
+                options.push(BrokerInstanceOption {
+                    availability_zones: Some(zones.clone()),
+                    engine_type: Some(engine.engine_type.to_string()),
+                    host_instance_type: Some((*host_instance_type).to_string()),
+                    storage_type: Some((*storage_type).to_string()),
+                    supported_deployment_modes: Some(supported_deployment_modes),
+                    supported_engine_versions: Some(
+                        engine
+                            .engine_versions
+                            .iter()
+                            .map(|version| (*version).to_string())
+                            .collect(),
+                    ),
+                });
+            }
+        }
+    }
+    options
+}
+
+/// Lift a refused value into this operation's modelled `BadRequestException` (HTTP 400).
+fn bad_request(invalid: state::Invalid) -> DescribeBrokerInstanceOptionsError {
+    DescribeBrokerInstanceOptionsErrorModeled::BadRequestException(BadRequestException {
+        error_attribute: invalid.attribute,
+        message: Some(invalid.message),
+        resource_share_errors: None,
+    })
+    .into()
 }

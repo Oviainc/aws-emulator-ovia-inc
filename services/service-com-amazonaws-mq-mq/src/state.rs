@@ -80,6 +80,29 @@ pub const MAX_GROUPS_PER_USER: usize = 20;
 /// `Logs$audit` "does not apply to RabbitMQ brokers". From `ENGINE_TYPE_VALUES`.
 pub const ENGINE_TYPE_RABBITMQ: &str = "RABBITMQ";
 
+/// The other `EngineType` the service supports ("Amazon MQ supports ActiveMQ and
+/// RabbitMQ"). From `ENGINE_TYPE_VALUES`.
+pub const ENGINE_TYPE_ACTIVEMQ: &str = "ACTIVEMQ";
+
+/// `BrokerStorageType`'s block-storage value. From `BROKER_STORAGE_TYPE_VALUES`.
+pub const STORAGE_TYPE_EBS: &str = "EBS";
+
+/// `BrokerStorageType`'s shared-file-system value, the one the model documents as
+/// "not supported for RabbitMQ engine type". From `BROKER_STORAGE_TYPE_VALUES`.
+pub const STORAGE_TYPE_EFS: &str = "EFS";
+
+/// The `DeploymentMode` of a broker that runs as one instance. From
+/// `DEPLOYMENT_MODE_VALUES`.
+pub const DEPLOYMENT_MODE_SINGLE_INSTANCE: &str = "SINGLE_INSTANCE";
+
+/// The `DeploymentMode` of an ActiveMQ broker that runs as a highly available pair
+/// across two Availability Zones. From `DEPLOYMENT_MODE_VALUES`.
+pub const DEPLOYMENT_MODE_ACTIVE_STANDBY_MULTI_AZ: &str = "ACTIVE_STANDBY_MULTI_AZ";
+
+/// The `DeploymentMode` of a RabbitMQ broker that runs as a cluster across
+/// Availability Zones. From `DEPLOYMENT_MODE_VALUES`.
+pub const DEPLOYMENT_MODE_CLUSTER_MULTI_AZ: &str = "CLUSTER_MULTI_AZ";
+
 /// `SecurityGroups`' own documented bound: "The list of rules (1 minimum, 125
 /// maximum) that authorize connections to brokers".
 pub const MAX_SECURITY_GROUPS: usize = 125;
@@ -599,8 +622,8 @@ pub fn validate_subnet_ids(deployment_mode: &str, subnet_ids: &[String]) -> Resu
     }
     validate_list_size(ATTRIBUTE, subnet_ids.len(), 1, MAX_SUBNET_IDS)?;
     let required = match deployment_mode {
-        "SINGLE_INSTANCE" => Some(1),
-        "ACTIVE_STANDBY_MULTI_AZ" => Some(2),
+        DEPLOYMENT_MODE_SINGLE_INSTANCE => Some(1),
+        DEPLOYMENT_MODE_ACTIVE_STANDBY_MULTI_AZ => Some(2),
         // CLUSTER_MULTI_AZ documents no exact count.
         _ => None,
     };
@@ -616,15 +639,17 @@ pub fn validate_subnet_ids(deployment_mode: &str, subnet_ids: &[String]) -> Resu
     }
 }
 
-/// The page size `ListBrokers` uses when the request omits `MaxResults`, from
-/// the member's own documentation: "The maximum number of brokers that Amazon
-/// MQ can return per page (20 by default)". The modelled `@range` (1..100)
-/// bounds an explicit `MaxResults`; it is not the default.
+/// The page size a listing of this service uses when the request omits
+/// `MaxResults`, from the member's own documentation: "The maximum number of
+/// brokers that Amazon MQ can return per page (20 by default)", worded the same
+/// way for every paginated operation of this service. The modelled `@range`
+/// (1..100) bounds an explicit `MaxResults`; it is not the default.
 pub const DEFAULT_MAX_RESULTS: usize = 20;
 
 /// `MaxResults`' modelled `@range`, from
 /// `smithy_query(query="operation", operation="ListBrokers")`:
-/// `MaxResults { range: { min: 1, max: 100 } }`. The handler enforces it (see
+/// `MaxResults { range: { min: 1, max: 100 } }` — the same `MaxResults` shape
+/// every paginated operation of this service binds. The handler enforces it (see
 /// [`validate_range`]) so that the refusal names the member.
 pub const MIN_MAX_RESULTS: i32 = 1;
 
@@ -711,6 +736,25 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// How many Availability Zones this emulator reports a Region as having. AWS
+/// documents "every Region has a minimum of three zones", and the number a given
+/// Region has is not in this service's model, so the emulator reports the
+/// documented minimum for every Region rather than a per-Region table it would
+/// have to invent.
+pub const AVAILABILITY_ZONES_PER_REGION: usize = 3;
+
+/// The Availability Zone names of `region`, in order.
+///
+/// An AWS zone name is its Region's code followed by a letter
+/// (`us-east-1a`), so the names follow from the Region the caller signed for
+/// ([`request_region`]) and the zone count above — never from the request body.
+pub fn availability_zones_in_region(region: &str) -> Vec<String> {
+    (0..AVAILABILITY_ZONES_PER_REGION)
+        .filter_map(|index| u8::try_from(index).ok())
+        .map(|index| format!("{region}{}", char::from(b'a' + index)))
+        .collect()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -11,7 +11,17 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mq-mq.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mq#DescribeBrokerInstanceOptionsRequest")]
+// `maxResults` carries the modelled `@range(min: 1, max: 100)`, and this
+// OPERATION refuses a value outside it rather than letting the framework's
+// boundary validator do it: Amazon MQ names the member at fault in
+// `BadRequestException$errorAttribute`, and a pre-handler refusal is worded
+// through `Refused { code, message }`, which cannot carry a modelled member.
+// See `ops::types::list_brokers_types` for the same reasoning on the other
+// paginated listing.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.mq#DescribeBrokerInstanceOptionsRequest",
+    skip_validation = ["MaxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeBrokerInstanceOptionsInput {
     pub engine_type: Option<String>,
