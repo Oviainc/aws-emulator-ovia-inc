@@ -21,6 +21,8 @@ mod state_roundtrip;
 mod stream_configuration;
 #[path = "all/stream_data_retention.rs"]
 mod stream_data_retention;
+#[path = "all/stream_data_retention_projection.rs"]
+mod stream_data_retention_projection;
 #[path = "all/stream_lifecycle.rs"]
 mod stream_lifecycle;
 #[path = "all/stream_tags.rs"]

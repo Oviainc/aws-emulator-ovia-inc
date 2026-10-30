@@ -11,6 +11,11 @@
 //! retention period by the value that you specify", so the stored retention is
 //! its current value moved by that delta, bounded by the published 0..87600
 //! hours, and only for a caller quoting the stream's current version.
+//!
+//! The harness below, and the helpers around it, are this crate's ONE copy for
+//! the retention rule: the sibling `stream_data_retention_projection` suite —
+//! which covers what the `StreamInfo` readers project once a CHAIN of updates has
+//! been accepted — reuses them rather than carrying a second copy.
 
 use std::sync::Arc;
 
@@ -22,7 +27,7 @@ const ENDPOINT_HOST: &str = "kinesisvideo.us-east-1.amazonaws.com";
 
 /// A router carrying only this service, over its own engine, with request
 /// authentication off so a case can send an unsigned-but-scoped request.
-fn harness() -> MultiServiceRouter {
+pub(crate) fn harness() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -31,7 +36,7 @@ fn harness() -> MultiServiceRouter {
 }
 
 /// POST one restJson1 call and return its status and parsed JSON body.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     path: &str,
     body: serde_json::Value,
@@ -73,7 +78,7 @@ fn error_code(body: &serde_json::Value) -> String {
 }
 
 /// Create `name` with `retention` hours of data retention.
-async fn create_stream(router: &MultiServiceRouter, name: &str, retention: i32) {
+pub(crate) async fn create_stream(router: &MultiServiceRouter, name: &str, retention: i32) {
     let (status, body) = call(
         router,
         "/createStream",
@@ -87,7 +92,7 @@ async fn create_stream(router: &MultiServiceRouter, name: &str, retention: i32) 
 }
 
 /// The stream's `StreamInfo`.
-async fn stream_info(router: &MultiServiceRouter, name: &str) -> serde_json::Value {
+pub(crate) async fn stream_info(router: &MultiServiceRouter, name: &str) -> serde_json::Value {
     let (status, body) = call(
         router,
         "/describeStream",
@@ -104,7 +109,7 @@ async fn stream_info(router: &MultiServiceRouter, name: &str) -> serde_json::Val
 }
 
 /// The stream's current `Version`.
-async fn version(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn version(router: &MultiServiceRouter, name: &str) -> String {
     let info = stream_info(router, name).await;
     info.get("Version")
         .and_then(serde_json::Value::as_str)
@@ -113,7 +118,7 @@ async fn version(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// The stream's stored retention, as `DescribeStream` projects it.
-async fn retention(router: &MultiServiceRouter, name: &str) -> i64 {
+pub(crate) async fn retention(router: &MultiServiceRouter, name: &str) -> i64 {
     let info = stream_info(router, name).await;
     info.get("DataRetentionInHours")
         .and_then(serde_json::Value::as_i64)
