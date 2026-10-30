@@ -33,6 +33,8 @@ mod compatible_versions;
 mod config_change_cancellation;
 #[path = "all/connection_decisions.rs"]
 mod connection_decisions;
+#[path = "all/connection_records_at_rest.rs"]
+mod connection_records_at_rest;
 #[path = "all/cross_cluster_connections.rs"]
 mod cross_cluster_connections;
 #[path = "all/data_source_attachment_authorization.rs"]

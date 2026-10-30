@@ -181,9 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owner's decision: a connection already accepted, being put in place, in use,
         // rejected or on its way out is past the point of deciding, and answering such
         // a call from its current record would report a decision this call did not
-        // take.
-        if connection.status != CONNECTION_STATUS_PENDING_ACCEPTANCE {
-            let status = connection.status.clone();
+        // take. Decided from the status the INBOUND view reports, which is the view
+        // this caller has of the connection.
+        if connection.inbound_status() != CONNECTION_STATUS_PENDING_ACCEPTANCE {
+            let status = connection.inbound_status().to_string();
             return Err(
                 AcceptInboundConnectionErrorModeled::DisabledOperationException(
                     connection_decision_unavailable(&input.connection_id, &status),

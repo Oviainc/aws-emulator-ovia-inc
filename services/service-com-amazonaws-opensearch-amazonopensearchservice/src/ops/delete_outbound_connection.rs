@@ -4,12 +4,13 @@
 //!
 //! The source (local) domain owner's removal of a cross-cluster connection it
 //! created: the stored [`crate::state::Connection`] — the one record both views report
-//! — is put into its deleting status, and the clock owes the store its removal, which
-//! is what releases the slot the connection held against the source domain's quota.
+//! — is put into its deleting status and comes to rest, on the clock alone, in its
+//! deleted one, where it goes on being reported and goes on answering by its id.
 //!
 //! Every stored connection has an outbound view, whatever status it is in, so an id
 //! is refused with the modelled missing-resource error exactly when it addresses no
-//! stored connection.
+//! stored connection — and a connection this caller already deleted is not one of
+//! those: deleting it again is the no-op it reports.
 //!
 //! ## Shape of an operation
 //!
@@ -72,10 +73,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{
-    connection_not_found, OwedStatus, CONNECTION_RETENTION, CONNECTION_STATUS_DELETED,
-    CONNECTION_STATUS_DELETING, PROVISIONING,
-};
+use crate::state::connection_not_found;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,11 +152,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Resolved against the store as it stands at this instant: an id this service
-        // never minted, and one whose removal has already fallen due, both address
-        // nothing. Every status a connection can hold is one
-        // `OutboundConnectionStatusCode` carries, so the source owner — the account
-        // that asked for the connection — has a view of each of its own connections
-        // from the moment the create returns.
+        // never minted addresses nothing, while an id this service minted goes on
+        // addressing its record for as long as the store holds it, deleted or not.
+        // Every status a connection can hold is one `OutboundConnectionStatusCode`
+        // carries, so the source owner — the account that asked for the connection —
+        // has a view of each of its own connections from the moment the create
+        // returns.
         let Some(connection) = store.settled_connection_mut(&input.connection_id, now) else {
             return Err(
                 DeleteOutboundConnectionErrorModeled::ResourceNotFoundException(
@@ -169,21 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Taking the connection down is work the service does, so the record is in its
-        // deleting status when this call returns, the clock owes it the deleted status
-        // it comes to rest in ([`crate::state::connection_successor`]) and then owes
-        // the store the record's removal. A second delete of a connection already on
-        // its way out does not restart either span: the removal the first call asked
-        // for is already owed, and this answer reports the record as it stands.
-        if connection.removal_due.is_none() {
-            connection.status = CONNECTION_STATUS_DELETING.to_string();
-            connection.status_message = None;
-            connection.owed = Some(OwedStatus {
-                status: CONNECTION_STATUS_DELETED.to_string(),
-                message: None,
-                due: now + PROVISIONING,
-            });
-            connection.removal_due = Some(now + CONNECTION_RETENTION);
-        }
+        // deleting status when this call returns and the clock owes it the deleted
+        // status it comes to rest in. A delete of a connection a delete already took
+        // changes nothing and refuses nothing: this answer reports the record as it
+        // stands, which is the deleted connection the caller asked to have deleted.
+        connection.begin_delete(now);
 
         // Answered from the STORED record, through the same projection the outbound
         // report describes it with, so this answer and a later read of the connection

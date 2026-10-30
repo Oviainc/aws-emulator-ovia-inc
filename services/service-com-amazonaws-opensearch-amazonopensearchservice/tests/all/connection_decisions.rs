@@ -22,23 +22,25 @@
 //!   addresses no connection the destination owner has a view of is the modelled
 //!   missing-resource refusal that names the id;
 //! * a delete puts the one record into its deleting status whichever owner asks for
-//!   it, the clock then owes it the deleted status and the store's release of the
-//!   record, and afterwards the id addresses nothing from either side — over a table
-//!   spanning both delete operations and every status a connection can be deleted
-//!   from;
+//!   it and the clock then brings it to rest in its deleted status, where its id goes
+//!   on addressing it — over a table spanning both delete operations and every status
+//!   a connection can be deleted from;
 //! * the destination owner can delete only what it has a view of, while the source
 //!   owner has a view of its connection from the moment the create returns;
-//! * releasing the record releases what it held: the source domain can connect to the
-//!   same destination under the same alias again.
+//! * a deleted connection holds nothing: the source domain can connect to the same
+//!   destination under the same alias again.
+//!
+//! What a deleted connection's id goes on answering — a repeat delete, and the
+//! destination owner's permanent record of a request it refused — is asserted in
+//! [`super::connection_records_at_rest`].
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    CONNECTION_MODE_DIRECT, CONNECTION_MODE_VPC_ENDPOINT, CONNECTION_RETENTION,
-    CONNECTION_STATUS_ACTIVE, CONNECTION_STATUS_DELETED, CONNECTION_STATUS_DELETING,
-    CONNECTION_STATUS_PENDING_ACCEPTANCE, CONNECTION_STATUS_REJECTED, CONNECTION_STATUS_REJECTING,
-    CONNECTION_STATUS_VALIDATING,
+    CONNECTION_MODE_DIRECT, CONNECTION_MODE_VPC_ENDPOINT, CONNECTION_STATUS_ACTIVE,
+    CONNECTION_STATUS_DELETED, CONNECTION_STATUS_DELETING, CONNECTION_STATUS_PENDING_ACCEPTANCE,
+    CONNECTION_STATUS_REJECTED, CONNECTION_STATUS_REJECTING, CONNECTION_STATUS_VALIDATING,
 };
 
 use super::cross_cluster_connections::{
@@ -55,13 +57,11 @@ use super::inbound_connections::describe_inbound;
 /// `REJECTING` — "Inbound connection rejection is in process" — then `REJECTED`.
 const REJECTED_CHAIN: [&str; 2] = [CONNECTION_STATUS_REJECTING, CONNECTION_STATUS_REJECTED];
 
-/// How long the suite polls for a change the clock owes before giving up, and how
-/// long it waits between polls. The longest span owed here is the store's release of
-/// a deleted record, so the budget is well past [`CONNECTION_RETENTION`].
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long the suite waits between polls for a change the clock owes.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// `RejectInboundConnection`: `PUT /opensearch/cc/inboundConnection/{ConnectionId}/reject`.
-async fn reject(emulator: &Emulator, id: &str) -> Answer {
+pub(crate) async fn reject(emulator: &Emulator, id: &str) -> Answer {
     emulator
         .call(
             "PUT",
@@ -73,7 +73,7 @@ async fn reject(emulator: &Emulator, id: &str) -> Answer {
 
 /// `AcceptInboundConnection`, so a case can reach a connection the destination owner
 /// has already decided about.
-async fn accept(emulator: &Emulator, id: &str) -> Answer {
+pub(crate) async fn accept(emulator: &Emulator, id: &str) -> Answer {
     emulator
         .call(
             "PUT",
@@ -84,7 +84,7 @@ async fn accept(emulator: &Emulator, id: &str) -> Answer {
 }
 
 /// `DeleteInboundConnection`: `DELETE /opensearch/cc/inboundConnection/{ConnectionId}`.
-async fn delete_inbound(emulator: &Emulator, id: &str) -> Answer {
+pub(crate) async fn delete_inbound(emulator: &Emulator, id: &str) -> Answer {
     emulator
         .call(
             "DELETE",
@@ -95,7 +95,7 @@ async fn delete_inbound(emulator: &Emulator, id: &str) -> Answer {
 }
 
 /// `DeleteOutboundConnection`: `DELETE /opensearch/cc/outboundConnection/{ConnectionId}`.
-async fn delete_outbound(emulator: &Emulator, id: &str) -> Answer {
+pub(crate) async fn delete_outbound(emulator: &Emulator, id: &str) -> Answer {
     emulator
         .call(
             "DELETE",
@@ -106,12 +106,12 @@ async fn delete_outbound(emulator: &Emulator, id: &str) -> Answer {
 }
 
 /// One filter selecting exactly the connection `id` names.
-fn by_id(id: &str) -> Value {
+pub(crate) fn by_id(id: &str) -> Value {
     json!({ "Filters": [{ "Name": "connection-id", "Values": [id] }] })
 }
 
 /// One reported connection's `ConnectionStatus.StatusCode`.
-fn status_code(connection: &Value, case: &str) -> String {
+pub(crate) fn status_code(connection: &Value, case: &str) -> String {
     connection["ConnectionStatus"]["StatusCode"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected a StatusCode, got {connection:?}"))
@@ -120,7 +120,7 @@ fn status_code(connection: &Value, case: &str) -> String {
 
 /// The status the destination owner's report gives `id`, or `None` where that report
 /// does not carry the connection.
-async fn inbound_status(emulator: &Emulator, case: &str, id: &str) -> Option<String> {
+pub(crate) async fn inbound_status(emulator: &Emulator, case: &str, id: &str) -> Option<String> {
     let answer = describe_inbound(emulator, by_id(id)).await;
     assert_eq!(
         answer.status, 200,
@@ -132,7 +132,7 @@ async fn inbound_status(emulator: &Emulator, case: &str, id: &str) -> Option<Str
 
 /// The status the source owner's report gives `id`, or `None` where that report does
 /// not carry the connection.
-async fn outbound_status(emulator: &Emulator, case: &str, id: &str) -> Option<String> {
+pub(crate) async fn outbound_status(emulator: &Emulator, case: &str, id: &str) -> Option<String> {
     let answer = describe_outbound(emulator, by_id(id)).await;
     assert_eq!(
         answer.status, 200,
@@ -143,12 +143,12 @@ async fn outbound_status(emulator: &Emulator, case: &str, id: &str) -> Option<St
 }
 
 /// A failed answer's `message`.
-fn error_message(answer: &Answer) -> String {
+pub(crate) fn error_message(answer: &Answer) -> String {
     answer.body["message"].as_str().unwrap_or_default().to_owned()
 }
 
 /// Create one connection and answer its `ConnectionId`.
-async fn created_connection(emulator: &Emulator, case: &str, body: Value) -> String {
+pub(crate) async fn created_connection(emulator: &Emulator, case: &str, body: Value) -> String {
     let answer = create_connection(emulator, body).await;
     assert_eq!(
         answer.status, 200,
@@ -168,7 +168,7 @@ async fn created_connection(emulator: &Emulator, case: &str, body: Value) -> Str
 
 /// Create a connection from `source` to `destination` under `alias` and leave it
 /// waiting for the destination owner's decision.
-async fn pending_connection(
+pub(crate) async fn pending_connection(
     emulator: &Emulator,
     case: &str,
     alias: &str,
@@ -196,7 +196,7 @@ async fn pending_connection(
 
 /// Poll the destination owner's report until the refused request has come to rest,
 /// asserting it only ever moves FORWARD along [`REJECTED_CHAIN`].
-async fn walks_to_rejected(emulator: &Emulator, case: &str, id: &str) {
+pub(crate) async fn walks_to_rejected(emulator: &Emulator, case: &str, id: &str) {
     let mut reached = 0usize;
     for _ in 0..60 {
         let status = inbound_status(emulator, case, id)
@@ -226,30 +226,27 @@ async fn walks_to_rejected(emulator: &Emulator, case: &str, id: &str) {
     panic!("case {case}: a refused request must come to rest at {CONNECTION_STATUS_REJECTED}");
 }
 
-/// Poll both reports until neither carries `id` any more, which is the store having
-/// released the record a delete asked it to.
-async fn walks_to_released(emulator: &Emulator, case: &str, id: &str) {
-    let budget = CONNECTION_RETENTION + SETTLE_WAIT + SETTLE_WAIT;
+/// Poll the source owner's report until the deleted connection has come to rest in
+/// its deleted status, which is where the store leaves the record of it.
+pub(crate) async fn rests_at_deleted(emulator: &Emulator, case: &str, id: &str) {
+    let budget = SETTLE_WAIT + SETTLE_WAIT;
     let started = std::time::Instant::now();
     while started.elapsed() < budget {
-        let inbound = inbound_status(emulator, case, id).await;
         let outbound = outbound_status(emulator, case, id).await;
-        if inbound.is_none() && outbound.is_none() {
+        if outbound.as_deref() == Some(CONNECTION_STATUS_DELETED) {
             return;
         }
-        // While the record is still held, the two views of it cannot disagree about
-        // where it is.
-        if let (Some(inbound), Some(outbound)) = (&inbound, &outbound) {
-            assert_eq!(
-                inbound, outbound,
-                "case {case}: the two views of one connection must agree while it is held"
-            );
-        }
+        assert_eq!(
+            outbound.as_deref(),
+            Some(CONNECTION_STATUS_DELETING),
+            "case {case}: a connection being deleted only holds \
+             {CONNECTION_STATUS_DELETING} or {CONNECTION_STATUS_DELETED}"
+        );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
     panic!(
-        "case {case}: a deleted connection must be released by the store within {budget:?}, it is \
-         still reported as {:?}",
+        "case {case}: a deleted connection must come to rest at {CONNECTION_STATUS_DELETED} \
+         within {budget:?}, it is reported as {:?}",
         outbound_status(emulator, case, id).await
     );
 }
@@ -508,18 +505,24 @@ async fn an_id_addressing_no_pending_inbound_request_cannot_be_rejected() {
 
 /// One delete to make: what makes this row differ, the alias to connect under, the
 /// decision to take before deleting (none where `None`), the status the connection is
-/// expected to be deleted FROM, and whether the destination owner or the source owner
-/// asks for the delete.
+/// expected to be deleted FROM, whether the destination owner or the source owner asks
+/// for the delete, and where the DESTINATION owner's view of the connection comes to
+/// rest once the delete has been carried out.
 struct DeleteRow {
     case: &'static str,
     alias: &'static str,
     decide: Option<&'static str>,
     deleted_from: &'static str,
     inbound: bool,
+    inbound_at_rest: &'static str,
 }
 
 /// Both delete operations, over every status a connection can be deleted from: one
 /// waiting for a decision, one in use and one that was refused.
+///
+/// The destination owner's delete of a request it REFUSED is not a row here: that
+/// call is refused rather than served, which [`super::connection_records_at_rest`]
+/// asserts with the error code and message the service answers it with.
 fn delete_rows() -> Vec<DeleteRow> {
     vec![
         DeleteRow {
@@ -528,6 +531,7 @@ fn delete_rows() -> Vec<DeleteRow> {
             decide: None,
             deleted_from: CONNECTION_STATUS_PENDING_ACCEPTANCE,
             inbound: false,
+            inbound_at_rest: CONNECTION_STATUS_DELETED,
         },
         DeleteRow {
             case: "the destination owner deletes a request waiting for its decision",
@@ -535,6 +539,7 @@ fn delete_rows() -> Vec<DeleteRow> {
             decide: None,
             deleted_from: CONNECTION_STATUS_PENDING_ACCEPTANCE,
             inbound: true,
+            inbound_at_rest: CONNECTION_STATUS_DELETED,
         },
         DeleteRow {
             case: "the source owner deletes a connection in use",
@@ -542,6 +547,7 @@ fn delete_rows() -> Vec<DeleteRow> {
             decide: Some("accept"),
             deleted_from: CONNECTION_STATUS_ACTIVE,
             inbound: false,
+            inbound_at_rest: CONNECTION_STATUS_DELETED,
         },
         DeleteRow {
             case: "the destination owner deletes a connection in use",
@@ -549,13 +555,7 @@ fn delete_rows() -> Vec<DeleteRow> {
             decide: Some("accept"),
             deleted_from: CONNECTION_STATUS_ACTIVE,
             inbound: true,
-        },
-        DeleteRow {
-            case: "the destination owner deletes a request it refused",
-            alias: "del-rejected-inbound",
-            decide: Some("reject"),
-            deleted_from: CONNECTION_STATUS_REJECTED,
-            inbound: true,
+            inbound_at_rest: CONNECTION_STATUS_DELETED,
         },
         DeleteRow {
             case: "the source owner deletes a request that was refused",
@@ -563,12 +563,16 @@ fn delete_rows() -> Vec<DeleteRow> {
             decide: Some("reject"),
             deleted_from: CONNECTION_STATUS_REJECTED,
             inbound: false,
+            // A refusal is the destination owner's record of the decision it took, so
+            // the source owner deleting its own view of the connection leaves that
+            // record where it is.
+            inbound_at_rest: CONNECTION_STATUS_REJECTED,
         },
     ]
 }
 
 #[tokio::test]
-async fn a_delete_puts_the_one_record_on_its_way_out_of_the_store() {
+async fn a_delete_brings_the_one_record_both_views_report_to_rest() {
     let emulator = Emulator::new();
     created_domain(&emulator, "del-source").await;
     created_domain(&emulator, "del-destination").await;
@@ -651,46 +655,67 @@ async fn a_delete_puts_the_one_record_on_its_way_out_of_the_store() {
             "case {case}: both views must report the one connection on its way out"
         );
 
-        // The clock owes the record the deleted status it comes to rest in, and then
-        // the store's release of it.
-        tokio::time::sleep(SETTLE_WAIT).await;
+        // The clock brings the record to rest in the deleted status, and that is where
+        // the store leaves it: the connection is gone, its record is not.
+        rests_at_deleted(&emulator, case, &id).await;
         assert_eq!(
             inbound_status(&emulator, case, &id).await.as_deref(),
-            Some(CONNECTION_STATUS_DELETED),
-            "case {case}: a deleted connection is reported at {CONNECTION_STATUS_DELETED} before \
-             the store releases it"
+            Some(row.inbound_at_rest),
+            "case {case}: expected the destination owner's view to rest at {}",
+            row.inbound_at_rest
         );
-        walks_to_released(&emulator, case, &id).await;
 
-        // Once the record is released the id addresses nothing, from either side.
+        // The id goes on addressing the record the delete left: deleting a connection
+        // this account already deleted is a no-op that reports it as it stands, and
+        // does not put it back on its way out.
+        let again = delete_outbound(&emulator, &id).await;
+        assert_eq!(
+            again.status, 200,
+            "case {case}: expected a repeat DeleteOutboundConnection to answer 200, got {} with \
+             {:?}",
+            again.status, again.body
+        );
+        assert_eq!(
+            status_code(&again.body["Connection"], case),
+            CONNECTION_STATUS_DELETED,
+            "case {case}: expected the repeat delete to report the connection at \
+             {CONNECTION_STATUS_DELETED}, got {:?}",
+            again.body
+        );
+
+        // A decision about a connection that is gone is not available: the refusal
+        // names the status the destination owner's view is actually in.
         for (operation, answer) in [
-            ("DeleteInboundConnection", delete_inbound(&emulator, &id).await),
-            (
-                "DeleteOutboundConnection",
-                delete_outbound(&emulator, &id).await,
-            ),
             ("AcceptInboundConnection", accept(&emulator, &id).await),
             ("RejectInboundConnection", reject(&emulator, &id).await),
         ] {
             assert_eq!(
+                answer.status, 409,
+                "case {case}: expected {operation} on a deleted connection to answer 409, got {} \
+                 with {:?}",
+                answer.status, answer.body
+            );
+            assert_eq!(
                 error_code(&answer),
-                "ResourceNotFoundException",
-                "case {case}: expected {operation} on a released connection to answer \
-                 ResourceNotFoundException, got {:?}",
+                "DisabledOperationException",
+                "case {case}: expected {operation} to answer DisabledOperationException, got {:?}",
                 answer.body
             );
             assert_eq!(
                 error_message(&answer),
-                format!("Connection ID {id} does not exist"),
-                "case {case}: expected {operation} to name the id that resolved to nothing, got \
+                format!(
+                    "Connection {id} is in {} state, not {CONNECTION_STATUS_PENDING_ACCEPTANCE}",
+                    row.inbound_at_rest
+                ),
+                "case {case}: expected {operation} to name the status the connection is in, got \
                  {:?}",
                 answer.body
             );
         }
 
-        // Releasing the record releases what it held: the same source domain can
+        // A deleted connection holds nothing it held: the same source domain can
         // connect to the same destination under the same alias again, which it could
-        // not while the record was in the store.
+        // not while the connection was there.
         let again = created_connection(
             &emulator,
             case,
@@ -703,7 +728,7 @@ async fn a_delete_puts_the_one_record_on_its_way_out_of_the_store() {
         .await;
         assert_ne!(
             again, id,
-            "case {case}: a connection created after the release is a new record, not the old id"
+            "case {case}: a connection created after the delete is a new record, not the old id"
         );
         let answer = delete_outbound(&emulator, &again).await;
         assert_eq!(
@@ -778,10 +803,18 @@ async fn each_owner_deletes_only_the_connections_it_has_a_view_of() {
         "case {case}: expected the deletion to be in progress, got {:?}",
         answer.body
     );
-    walks_to_released(&emulator, case, &id).await;
+    rests_at_deleted(&emulator, case, &id).await;
+    // A connection the destination owner never had a view of is not one the delete of
+    // it gives that owner a view of: the deletion is reported to the source owner,
+    // whose request it was.
+    assert!(
+        inbound_status(&emulator, case, &id).await.is_none(),
+        "case {case}: the destination owner has no view of a request deleted before it was \
+         validated"
+    );
 
     // A request whose validation failed is the source owner's alone too, and the
-    // report of the whole set is left empty once it is released.
+    // record of it comes to rest in the deleted status the same way.
     let failed = created_connection(
         &emulator,
         "a request whose validation failed",
@@ -808,12 +841,26 @@ async fn each_owner_deletes_only_the_connections_it_has_a_view_of() {
         "case {case}: expected DeleteOutboundConnection to answer 200, got {} with {:?}",
         answer.status, answer.body
     );
-    walks_to_released(&emulator, case, &failed).await;
-
-    let report = describe_outbound(&emulator, json!({})).await;
+    rests_at_deleted(&emulator, case, &failed).await;
     assert!(
-        connections(&report, case).is_empty(),
-        "case {case}: every connection of this account was released, got {:?}",
+        inbound_status(&emulator, case, &failed).await.is_none(),
+        "case {case}: the destination owner has no view of a request whose validation failed"
+    );
+
+    // Both records are the source owner's own, and both rest where the delete left
+    // them: the report of the whole set carries exactly those two, deleted.
+    let report = describe_outbound(&emulator, json!({})).await;
+    let reported_statuses: Vec<String> = connections(&report, case)
+        .iter()
+        .map(|connection| status_code(connection, case))
+        .collect();
+    assert_eq!(
+        reported_statuses,
+        vec![
+            CONNECTION_STATUS_DELETED.to_owned(),
+            CONNECTION_STATUS_DELETED.to_owned()
+        ],
+        "case {case}: expected the two deleted connections of this account at rest, got {:?}",
         report.body
     );
 }

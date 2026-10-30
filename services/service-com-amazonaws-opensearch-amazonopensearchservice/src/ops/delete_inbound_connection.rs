@@ -4,11 +4,14 @@
 //!
 //! The destination (remote) domain owner's removal of a cross-cluster connection it
 //! has a view of: the stored [`crate::state::Connection`] — the one record both views
-//! report — is put into its deleting status, and the clock owes the store its
-//! removal, which is what releases the slot the connection held.
+//! report — is put into its deleting status and comes to rest, on the clock alone, in
+//! its deleted one, where it goes on being reported and goes on answering by its id.
 //!
 //! An id that addresses no connection the destination owner has a view of is the
-//! modelled missing-resource refusal.
+//! modelled missing-resource refusal, and a request this owner REFUSED is its own
+//! permanent record of that decision: there is nothing to delete, so the call is
+//! refused with the service's `ValidationException` naming the status the connection
+//! is in.
 //!
 //! ## Shape of an operation
 //!
@@ -67,14 +70,13 @@
 //!   access an unsupported operation.
 //! * `ResourceNotFoundException` (HTTP 409) — An exception for accessing or deleting a
 //!   resource that doesn't exist.
+//! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below): a
+//!   change the connection's current status does not allow.
 
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{
-    connection_not_found, OwedStatus, CONNECTION_RETENTION, CONNECTION_STATUS_DELETED,
-    CONNECTION_STATUS_DELETING, PROVISIONING,
-};
+use crate::state::{connection_change_unavailable, connection_not_found, CONNECTION_STATUS_REJECTED};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -87,11 +89,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-opensearch-amazonopense
 // here — hence the `DeleteInboundConnectionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.opensearch#DeleteInboundConnection")]
+// `ValidationException` is widened in through `extra_errors`: this SERVICE models it
+// (`@error("client") @httpError(400)`, and the data-source operations list it) while the
+// model's `errors` list for DeleteInboundConnection does not, and it is what a connection
+// whose status does not allow the change is refused with — see
+// `crate::state::connection_change_unavailable`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.opensearch#DeleteInboundConnection",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum DeleteInboundConnectionErrorModeled {
     DisabledOperationException(DisabledOperationException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not one `InboundConnectionStatusCode` carries has no inbound view at all —
         // it is still being validated, or its validation failed — so to the
         // destination owner the id addresses nothing, exactly as an id this service
-        // never minted, or one whose removal has already fallen due, does.
+        // never minted does.
         let Some(connection) = store
             .settled_connection_mut(&input.connection_id, now)
             .filter(|connection| connection.has_inbound_view())
@@ -167,22 +178,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Taking the connection down is work the service does, so the record is in its
-        // deleting status when this call returns, the clock owes it the deleted status
-        // it comes to rest in ([`crate::state::connection_successor`]) and then owes
-        // the store the record's removal. A second delete of a connection already on
-        // its way out does not restart either span: the removal the first call asked
-        // for is already owed, and this answer reports the record as it stands.
-        if connection.removal_due.is_none() {
-            connection.status = CONNECTION_STATUS_DELETING.to_string();
-            connection.status_message = None;
-            connection.owed = Some(OwedStatus {
-                status: CONNECTION_STATUS_DELETED.to_string(),
-                message: None,
-                due: now + PROVISIONING,
-            });
-            connection.removal_due = Some(now + CONNECTION_RETENTION);
+        // A request this owner refused is its record OF the refusal, and a record of a
+        // decision is not a connection there is anything left to take down: the status
+        // the refusal left the inbound view in is one no change is made from, so the
+        // call is refused rather than moving the record on.
+        if connection.inbound_status() == CONNECTION_STATUS_REJECTED {
+            let status = connection.inbound_status().to_string();
+            return Err(DeleteInboundConnectionErrorModeled::ValidationException(
+                connection_change_unavailable(&status),
+            )
+            .into());
         }
+
+        // Taking the connection down is work the service does, so the record is in its
+        // deleting status when this call returns and the clock owes it the deleted
+        // status it comes to rest in. A delete of a connection a delete already took
+        // changes nothing and refuses nothing: this answer reports the record as it
+        // stands, which is the deleted connection the caller asked to have deleted.
+        connection.begin_delete(now);
 
         // Answered from the STORED record, through the same projection the inbound
         // report describes it with, so this answer and a later read of the connection

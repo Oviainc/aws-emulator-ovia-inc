@@ -2857,21 +2857,23 @@ pub const CONNECTION_STATUS_REJECTED: &str = "REJECTED";
 pub const CONNECTION_STATUS_DELETING: &str = "DELETING";
 
 /// `InboundConnectionStatusCode`'s `DELETED`: "Inbound connection is deleted and can
-/// no longer be used" — where a deleted connection comes to rest, and is still
-/// reported from, until the store releases the record ([`CONNECTION_RETENTION`]).
+/// no longer be used" — where a deleted connection comes to rest, and goes on being
+/// reported from and addressable by its id.
 pub const CONNECTION_STATUS_DELETED: &str = "DELETED";
 
-/// How long a deleted cross-cluster connection is still reported before the store
-/// takes the record out.
+/// How many DELETED cross-cluster connection records the store keeps beside the
+/// connections the account still holds.
 ///
-/// A deletion does not make the connection unreportable the instant it is asked for:
-/// the record rests in [`CONNECTION_STATUS_DELETED`], which is what tells a caller
-/// polling the connection it asked to delete that the deletion finished, rather than
-/// leaving it to tell a finished deletion from an id it got wrong. Longer than
-/// [`PROVISIONING`], so the deleted status is observable, and bounded, so the slot the
-/// record holds against [`CONNECTION_QUOTA`] is released: the span is the emulator's
-/// own choice, as AWS documents no window for it.
-pub const CONNECTION_RETENTION: Duration = Duration::from_secs(5);
+/// A deleted connection comes to rest in [`CONNECTION_STATUS_DELETED`] and its id goes
+/// on answering, so a caller that re-issues a delete after a timeout is told the
+/// connection it deleted is deleted rather than that the id was never its own. Keeping
+/// those records is what makes that true, and this is the bound on keeping them: the
+/// oldest is released once the store holds more
+/// ([`ComAmazonawsOpensearchAmazonopensearchserviceState::trim_connection_history`]),
+/// so the record set cannot grow with the number of deletes a caller makes. Set at
+/// the aggregate bound on held connections, so the whole store stays within twice
+/// [`CONNECTION_STORE_QUOTA`] records.
+pub const CONNECTION_HISTORY: usize = CONNECTION_STORE_QUOTA;
 
 /// How many cross-cluster connections ONE source domain holds before
 /// `CreateOutboundConnection` refuses with the modelled `LimitExceededException`.
@@ -2934,6 +2936,12 @@ pub struct Connection {
     /// `OutboundConnection$ConnectionId`, which is also the inbound view's. Unique
     /// per connection, so it IS the key the store holds the record under.
     pub connection_id: String,
+    /// The order the store minted this record in.
+    ///
+    /// The id is an opaque token, so it does not say which of two records is the
+    /// older one; this does, which is what lets the store release the OLDEST deleted
+    /// record when it keeps more history than [`CONNECTION_HISTORY`].
+    pub sequence: u64,
     /// `OutboundConnection$ConnectionAlias`: the name the create gave the connection.
     pub connection_alias: String,
     /// The source domain this connection is from, as the create's `LocalDomainInfo`
@@ -2958,15 +2966,17 @@ pub struct Connection {
     pub status_message: Option<String>,
     /// The status move the clock owes this connection, if any is outstanding.
     pub owed: Option<OwedStatus>,
-    /// When the clock takes this connection out of the store, for one a delete has
-    /// asked to remove; `None` for one no call has asked to remove.
+    /// The status the DESTINATION owner's view of this connection has come to rest
+    /// in for good, where that is no longer the status the shared lifecycle reports;
+    /// `None` while both views report the one lifecycle.
     ///
-    /// A removal needs its own due instant rather than an [`OwedStatus`], for the same
-    /// reason a package association's does ([`PackageAssociation::removal_due`]): the
-    /// record comes to rest in [`CONNECTION_STATUS_DELETED`] and is then GONE rather
-    /// than resting in a further status, and it is the removal that releases the slot
-    /// it held against [`CONNECTION_QUOTA`].
-    pub removal_due: Option<SystemTime>,
+    /// The two views of a connection share a lifecycle until a decision the
+    /// destination owner took is a record only THAT owner keeps: refusing a request
+    /// is the destination owner's permanent record of the decision, so the source
+    /// owner deleting its own view of the connection leaves that record exactly where
+    /// it was rather than carrying it along to the deleted status
+    /// ([`Connection::begin_delete`]).
+    pub inbound_rest: Option<String>,
 }
 
 impl Connection {
@@ -3000,10 +3010,48 @@ impl Connection {
         }
     }
 
-    /// Whether the clock has taken this connection out of the store by `now`: a
-    /// delete asked for its removal and the span that removal takes has passed.
-    pub fn removed_by(&self, now: SystemTime) -> bool {
-        self.removal_due.is_some_and(|due| now >= due)
+    /// Whether this connection has been deleted: the delete a caller asked for has
+    /// been carried out and the record is the account's record OF the deletion rather
+    /// than a connection it holds.
+    ///
+    /// What a deleted connection no longer holds is everything a live one does — the
+    /// alias its source domain named it by and the slot it counted against
+    /// [`CONNECTION_QUOTA`] — so a source domain can connect to the same destination
+    /// under the same alias again.
+    pub fn deleted(&self) -> bool {
+        self.status == CONNECTION_STATUS_DELETED
+    }
+
+    /// Put this connection on its way out of the store, unless a delete already did.
+    ///
+    /// Taking the connection down is work the service does, so the record is in its
+    /// deleting status when the call that asked for this returns and the clock owes it
+    /// the deleted status it comes to rest in ([`connection_successor`]). A delete of
+    /// a connection a delete already took does not restart that: the record stands as
+    /// it is, which is what makes a repeat delete of an id this caller deleted the
+    /// no-op it reports rather than a second deletion of one connection.
+    ///
+    /// The two views follow the deletion together only where both are views of a LIVE
+    /// connection. Where the destination owner's side has already come to rest on its
+    /// own account — it refused the request, so its record is the record OF that
+    /// refusal — or where it never had a view of the connection at all, the inbound
+    /// view stays exactly where it was ([`Connection::inbound_rest`]): deleting the
+    /// source owner's view of a connection is not the destination owner taking a
+    /// decision back.
+    pub fn begin_delete(&mut self, now: SystemTime) {
+        if self.status == CONNECTION_STATUS_DELETING || self.deleted() {
+            return;
+        }
+        if !self.has_inbound_view() || self.status == CONNECTION_STATUS_REJECTED {
+            self.inbound_rest = Some(self.status.clone());
+        }
+        self.status = CONNECTION_STATUS_DELETING.to_string();
+        self.status_message = None;
+        self.owed = Some(OwedStatus {
+            status: CONNECTION_STATUS_DELETED.to_string(),
+            message: None,
+            due: now + PROVISIONING,
+        });
     }
 
     /// This record as `OutboundConnection` — the element shape
@@ -3026,6 +3074,17 @@ impl Connection {
         }
     }
 
+    /// Where the DESTINATION owner's view of this connection is: the status its own
+    /// side came to rest in for good, where that is no longer the shared lifecycle's
+    /// ([`Connection::inbound_rest`]), and the shared lifecycle's status otherwise.
+    ///
+    /// Every operation on the destination owner's view of a connection decides from
+    /// this rather than from [`Connection::status`], so what that owner is told about
+    /// the connection and what it may do with it come from the same status.
+    pub fn inbound_status(&self) -> &str {
+        self.inbound_rest.as_deref().unwrap_or(&self.status)
+    }
+
     /// Whether this connection has an INBOUND view at all — whether the destination
     /// domain's owner has anything to see or decide about it yet.
     ///
@@ -3038,7 +3097,7 @@ impl Connection {
     /// it is reported to the source owner only, and the status set the inbound shape
     /// models is what says so.
     pub fn has_inbound_view(&self) -> bool {
-        INBOUND_CONNECTION_STATUS_CODE_VALUES.contains(&self.status.as_str())
+        INBOUND_CONNECTION_STATUS_CODE_VALUES.contains(&self.inbound_status())
     }
 
     /// This record as `InboundConnection` — the element shape
@@ -3046,8 +3105,9 @@ impl Connection {
     /// the destination owner's view of a connection answers with.
     ///
     /// The same stored record [`Connection::to_outbound`] projects, so the two views
-    /// of one connection cannot disagree about its id, its endpoints, its mode or
-    /// where it is in its lifecycle. The inbound shape models no `ConnectionAlias`
+    /// of one connection cannot disagree about its id, its endpoints or its mode, and
+    /// they report one lifecycle for as long as the connection has one
+    /// ([`Connection::inbound_status`]). The inbound shape models no `ConnectionAlias`
     /// and no `ConnectionProperties`: the alias is how the SOURCE domain names the
     /// remote cluster, so it is the source owner's view that carries it.
     pub fn to_inbound(&self) -> InboundConnection {
@@ -3056,7 +3116,7 @@ impl Connection {
             remote_domain_info: Some(domain_information(&self.remote_domain)),
             connection_id: Some(self.connection_id.clone()),
             connection_status: Some(InboundConnectionStatus {
-                status_code: Some(self.status.clone()),
+                status_code: Some(self.inbound_status().to_string()),
                 // "Information about the connection": carried only where the status
                 // has something to say the code itself does not.
                 message: self.status_message.clone(),
@@ -8689,13 +8749,37 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     }
 
     /// Materialise the status move the clock owes every stored cross-cluster
-    /// connection, and take out the ones whose removal has fallen due, for a caller
-    /// about to report on all of them.
+    /// connection, for a caller about to report on all of them.
     pub fn settle_connections(&mut self, now: SystemTime) {
-        self.connections.retain(|_, connection| {
+        for connection in self.connections.values_mut() {
             connection.settle(now);
-            !connection.removed_by(now)
-        });
+        }
+    }
+
+    /// Keep the records of deleted connections within [`CONNECTION_HISTORY`],
+    /// releasing the oldest first.
+    ///
+    /// A deleted connection's record stays addressable rather than being taken out on
+    /// a timer, so what bounds the store is a COUNT: past the cap the oldest deleted
+    /// record is released, which is the only thing that releases one. Called where the
+    /// store grows — a create — so the cap is applied before another record is added
+    /// and the set of records cannot grow with the number of creates and deletes a
+    /// caller makes.
+    pub fn trim_connection_history(&mut self) {
+        let mut deleted: Vec<(u64, String)> = self
+            .connections
+            .values()
+            .filter(|connection| connection.deleted())
+            .map(|connection| (connection.sequence, connection.connection_id.clone()))
+            .collect();
+        if deleted.len() <= CONNECTION_HISTORY {
+            return;
+        }
+        deleted.sort_unstable();
+        let over = deleted.len() - CONNECTION_HISTORY;
+        for (_, connection_id) in deleted.into_iter().take(over) {
+            self.connections.remove(&connection_id);
+        }
     }
 
     /// The cross-cluster connection `connection_id` names, with every status move the
@@ -8703,23 +8787,19 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// from the status the record is in at `now`, exactly as a report of the whole set
     /// would have shown it.
     ///
-    /// `None` once a delete's removal span has passed: the record is out of the store
-    /// by then, so the id addresses nothing, exactly as in the report.
+    /// `None` only where the id addresses no record at all: a connection that was
+    /// deleted comes to rest in [`CONNECTION_STATUS_DELETED`] and its id goes on
+    /// resolving to that record, so an id this service minted for this account stops
+    /// resolving only once the store has released the record
+    /// ([`Self::trim_connection_history`]).
     pub fn settled_connection_mut(
         &mut self,
         connection_id: &str,
         now: SystemTime,
     ) -> Option<&mut Connection> {
-        let removed = {
-            let connection = self.connections.get_mut(connection_id)?;
-            connection.settle(now);
-            connection.removed_by(now)
-        };
-        if removed {
-            self.connections.remove(connection_id);
-            return None;
-        }
-        self.connections.get_mut(connection_id)
+        let connection = self.connections.get_mut(connection_id)?;
+        connection.settle(now);
+        Some(connection)
     }
 
     /// Materialise the status move the clock owes every stored package, for a caller
@@ -9569,6 +9649,21 @@ pub fn connection_decision_unavailable(
     DisabledOperationException {
         message: Some(format!(
             "Connection {connection_id} is in {status} state, not {CONNECTION_STATUS_PENDING_ACCEPTANCE}"
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a change asked of a cross-cluster connection
+/// whose current status does not allow it.
+///
+/// A connection the destination owner refused is that owner's record OF the refusal,
+/// and a record of a decision is not something a later call takes back: the refusal
+/// names the status the connection is in, because that status is the whole reason the
+/// change cannot be made.
+pub fn connection_change_unavailable(status: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "existing status is {status}, unable to make necessary change"
         )),
     }
 }

@@ -173,9 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Deciding is available only while the request WAITS for the destination
         // owner's decision: a connection already accepted, in place, in use or
-        // already refused is past the point of deciding.
-        if connection.status != CONNECTION_STATUS_PENDING_ACCEPTANCE {
-            let status = connection.status.clone();
+        // already refused is past the point of deciding. Decided from the status the
+        // INBOUND view reports, which is the view this caller has of the connection.
+        if connection.inbound_status() != CONNECTION_STATUS_PENDING_ACCEPTANCE {
+            let status = connection.inbound_status().to_string();
             return Err(
                 RejectInboundConnectionErrorModeled::DisabledOperationException(
                     connection_decision_unavailable(&input.connection_id, &status),
@@ -196,8 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             due: now + PROVISIONING,
         });
         // A refused request is still a record of the decision: it rests in its refused
-        // status, reported to both owners, and it is a DELETE that takes it out of the
-        // store — a rejection is not one.
+        // status, reported to both owners, and it stays the destination owner's record
+        // of the refusal even after the source owner deletes its own view of the
+        // connection ([`crate::state::Connection::begin_delete`]).
 
         // Answered from the STORED record, through the same projection the inbound
         // report describes it with, so this answer and a later read of the connection

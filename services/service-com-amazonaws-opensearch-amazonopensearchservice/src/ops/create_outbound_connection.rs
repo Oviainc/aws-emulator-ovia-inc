@@ -181,14 +181,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let remote = domain_reference("RemoteDomainInfo", input.remote_domain_info, &region)?;
 
         let mut store = state.lock();
+        // Materialises only what the clock already owed every connection at this
+        // instant had nobody called, so the decisions below are taken against the
+        // statuses the records are in at `now` — which is what decides, for each of
+        // them, whether it is still a connection this account HOLDS.
+        store.settle_connections(now);
+        // The records of deleted connections are kept, so the count of them is what
+        // the store is bounded by: the cap is applied here, where the store grows,
+        // and releases the oldest beyond it.
+        store.trim_connection_history();
 
         // The alias is how the source domain names the remote cluster it is connected
         // to, so one source domain cannot hold two connections under one alias: the
         // existing record stays exactly as it is and the second create is the modelled
-        // already-exists refusal rather than another record. The source domain is the
-        // name, as resolved above: this emulator serves one account's registry.
+        // already-exists refusal rather than another record. A connection this account
+        // deleted holds nothing — the record of it is not a connection under that
+        // alias — so the same source domain connects to the same destination under the
+        // same alias again. The source domain is the name, as resolved above: this
+        // emulator serves one account's registry.
         if store.connections.values().any(|connection| {
-            connection.local_domain.domain_name == local.domain_name
+            !connection.deleted()
+                && connection.local_domain.domain_name == local.domain_name
                 && connection.connection_alias == input.connection_alias
         }) {
             return Err(
@@ -199,14 +212,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The store is BOUNDED in the AGGREGATE: past this cap a create is refused
-        // rather than adding another record, and no request field partitions the
-        // count, so a caller cannot get a fresh allowance by varying what it names.
-        // This is the bound that dominates the growth site below; the per-source-domain
-        // quota after it is the service's own per-resource limit.
+        // The connections this account HOLDS are BOUNDED in the AGGREGATE: past this
+        // cap a create is refused rather than adding another record, and no request
+        // field partitions the count, so a caller cannot get a fresh allowance by
+        // varying what it names. Together with the cap on the records of deleted
+        // connections applied above, this bounds the whole store, and it dominates the
+        // growth site below; the per-source-domain quota after it is the service's own
+        // per-resource limit.
         // `LimitExceededException` is the modelled refusal for "trying to create more
         // than the allowed number of resources or sub-resources".
-        if store.connections.len() >= CONNECTION_STORE_QUOTA {
+        let held = store
+            .connections
+            .values()
+            .filter(|connection| !connection.deleted())
+            .count();
+        if held >= CONNECTION_STORE_QUOTA {
             return Err(CreateOutboundConnectionErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
@@ -219,12 +239,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Past its quota ONE source domain takes no further connection, so a caller
         // looping with fresh aliases on a domain cannot fill the store by itself.
-        let held = store
+        let held_by_domain = store
             .connections
             .values()
-            .filter(|connection| connection.local_domain.domain_name == local.domain_name)
+            .filter(|connection| {
+                !connection.deleted()
+                    && connection.local_domain.domain_name == local.domain_name
+            })
             .count();
-        if held >= CONNECTION_QUOTA {
+        if held_by_domain >= CONNECTION_QUOTA {
             return Err(CreateOutboundConnectionErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
@@ -237,6 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let connection_id = store.mint_connection_id();
+        let sequence = store.connection_seq;
         // A connection request is VALIDATED before it can be accepted, and what it is
         // validated against is the domain registry: a reference that resolves to no
         // domain this service holds names a cluster nothing can be connected to, so
@@ -273,6 +297,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             connection_id.clone(),
             Connection {
                 connection_id: connection_id.clone(),
+                // The order the store minted this record in, so the history it keeps
+                // releases the oldest record first.
+                sequence,
                 connection_alias: input.connection_alias,
                 local_domain: local,
                 remote_domain: remote,
@@ -288,8 +315,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status: CONNECTION_STATUS_VALIDATING.to_string(),
                 status_message: None,
                 owed: Some(owed),
-                // Nothing has asked for this connection to be removed.
-                removal_due: None,
+                // Both views report the one lifecycle: nothing has taken a decision
+                // only one of the two owners keeps a record of.
+                inbound_rest: None,
             },
         );
 
