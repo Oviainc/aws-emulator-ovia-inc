@@ -388,6 +388,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let properties =
             crate::state::resolve_updated_properties(&record.properties, requested_properties)
                 .map_err(invalid_request)?;
+        // "If you remove a property from an asset model, IoT SiteWise deletes all
+        // previous data for that property": a property this request drops takes the
+        // stream of every asset created from the model with it. That stream is
+        // addressable as the time series its `(assetId, propertyId)` pair names, and
+        // a dataset's data segment names exactly such a stream, so the removal
+        // breaks the same dependency `DeleteTimeSeries` refuses on — "You can't
+        // delete a time series until all of its data segments have been deleted from
+        // session datasets" — and is refused with the same terminal request error,
+        // naming the stream and the dataset still holding a segment of it. Asked
+        // against the STORED definition before a single field is written, so a
+        // refused update leaves the model, its assets and their samples as they were.
+        if let Some((blocked_series, holder)) =
+            store.data_segment_of_dropped_model_properties(&id, &properties)
+        {
+            return Err(invalid_request(crate::state::data_segments_remain_message(
+                &blocked_series,
+                &holder,
+            )));
+        }
 
         let mut hierarchies = Vec::with_capacity(requested_hierarchies.len());
         for requested in requested_hierarchies {

@@ -588,7 +588,10 @@ async fn a_property_of_a_composite_model_is_reported_as_a_composite_model_proper
 }
 
 /// Create an asset model of `model_type` carrying `properties`, and return its id.
-async fn create_typed_model(
+///
+/// Shared with the asset-delete suite (`asset_delete_data_segments`), which needs
+/// a `COMPONENT_MODEL` to drive the reuse path, rather than growing a second copy.
+pub(crate) async fn create_typed_model(
     router: &MultiServiceRouter,
     name: &str,
     model_type: &str,
@@ -613,7 +616,9 @@ async fn create_typed_model(
 }
 
 /// Add a composite model described by `request` to `model_id`, and return its id.
-async fn add_composite_model(
+///
+/// Shared with the asset-delete suite, for the reason [`create_typed_model`] is.
+pub(crate) async fn add_composite_model(
     router: &MultiServiceRouter,
     model_id: &str,
     request: Value,
@@ -637,7 +642,9 @@ async fn add_composite_model(
 
 /// `DescribeAssetModelCompositeModel`'s view of one composite model, which is
 /// where the test reads the property ids a composite model contributes.
-async fn describe_model_composite(
+///
+/// Shared with the asset-delete suite, for the reason [`create_typed_model`] is.
+pub(crate) async fn describe_model_composite(
     router: &MultiServiceRouter,
     model_id: &str,
     composite_id: &str,

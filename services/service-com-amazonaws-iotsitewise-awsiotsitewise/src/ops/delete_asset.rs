@@ -242,6 +242,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The streams of the asset's properties are a dependency of the same kind,
+        // and the one `DeleteTimeSeries` refuses on: "You can't delete a time series
+        // until all of its data segments have been deleted from session datasets."
+        // An asset property's stream is addressable as the time series its
+        // `(assetId, propertyId)` pair names, and a dataset's data segment names
+        // exactly such a stream, so removing the asset would leave that segment
+        // covering data nothing holds and naming a stream no read can resolve.
+        // Terminal for the same reason the hierarchy refusals are — the caller has
+        // to delete those segments first — and evaluated BEFORE anything is
+        // removed, so a refused delete leaves the asset, its properties and their
+        // samples exactly as they were.
+        if let Some((blocked_series, holder)) =
+            store.data_segment_of_any_time_series(store.asset_property_time_series_ids(&id))
+        {
+            return Err(DeleteAssetError::Modeled(
+                DeleteAssetErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: crate::state::data_segments_remain_message(&blocked_series, &holder),
+                }),
+            ));
+        }
+
         // The asset and everything keyed off it (its property series, its aliases, its
         // hierarchy associations) go away, so no later read can still see it.
         store.forget_asset(&id);

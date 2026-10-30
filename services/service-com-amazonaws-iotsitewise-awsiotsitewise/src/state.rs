@@ -5118,6 +5118,151 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             })
     }
 
+    /// The stream among `time_series_ids` a dataset still holds a data segment
+    /// of, as `(timeSeriesId, datasetId)`, or `None` when no dataset holds a
+    /// segment of any of them.
+    ///
+    /// [`Self::data_segment_of_time_series`] asked of a GROUP of streams: a
+    /// call that would drop SEVERAL streams at once — every property stream of
+    /// an asset it removes, the streams of the properties a model update takes
+    /// away — breaks the same dependency as a call that drops one, so it is
+    /// refused by the same question rather than by a rule of its own. Answered
+    /// in stream-then-dataset order, so one store answers one way whatever
+    /// order its maps iterate in and whatever order the caller offers the
+    /// streams in.
+    ///
+    /// One pass over the segment index, like the single-stream question: the
+    /// streams offered become a set and each segment is tested against it once,
+    /// so asking about many streams costs the same walk as asking about one
+    /// rather than one walk per stream.
+    pub fn data_segment_of_any_time_series<I>(
+        &self,
+        time_series_ids: I,
+    ) -> Option<(String, String)>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let covered: HashSet<String> = time_series_ids
+            .into_iter()
+            .map(|id| id.as_ref().to_string())
+            .collect();
+        if covered.is_empty() {
+            return None;
+        }
+        self.blocking_data_segment(|time_series_id| covered.contains(time_series_id))
+    }
+
+    /// The first segment, in stream-then-dataset order, whose covered stream
+    /// `covers` accepts, as `(timeSeriesId, datasetId)`.
+    ///
+    /// The single walk of [`Self::dataset_data_segments`] every "is this stream
+    /// still depended on" question takes, so each of them costs one pass over
+    /// the index whatever shape its set of streams has.
+    fn blocking_data_segment(
+        &self,
+        covers: impl Fn(&str) -> bool,
+    ) -> Option<(String, String)> {
+        let mut blocked: Option<(&str, &str)> = None;
+        for (holder, held) in &self.dataset_data_segments {
+            for segment in held {
+                if !covers(&segment.time_series_id) {
+                    continue;
+                }
+                let candidate = (segment.time_series_id.as_str(), holder.as_str());
+                if blocked.is_none_or(|held| candidate < held) {
+                    blocked = Some(candidate);
+                }
+            }
+        }
+        blocked.map(|(series, holder)| (series.to_string(), holder.to_string()))
+    }
+
+    /// The `TimeSeriesId` of every stream asset `asset_id` owns: one per
+    /// property it carries, which is what the `(assetId, propertyId)` pair
+    /// names ([`time_series_id`]).
+    ///
+    /// The streams a call that removes the asset would drop, so the streams it
+    /// has to ask [`Self::data_segment_of_any_time_series`] about. Empty for an
+    /// asset this store does not hold, and derived from the properties rather
+    /// than from the samples written to them: a segment names the pair, which
+    /// resolves through the property, not through the data behind it.
+    pub fn asset_property_time_series_ids(&self, asset_id: &str) -> Vec<String> {
+        self.assets
+            .get(asset_id)
+            .map(|asset| {
+                asset
+                    .properties
+                    .iter()
+                    .map(|property| time_series_id(asset_id, &property.id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The stream a dataset still holds a data segment of among the streams the
+    /// assets of `asset_model_id` would lose were that model's properties to
+    /// become `kept`, as `(timeSeriesId, datasetId)`.
+    ///
+    /// The same dependency, asked of the removal a model update propagates: "If
+    /// you remove a property from an asset model, IoT SiteWise deletes all
+    /// previous data for that property" (`UpdateAssetModel`'s doc), so a
+    /// property the new definition drops takes the stream of every asset of
+    /// that model with it — and a stream a dataset still holds a segment of
+    /// cannot go. `None` when the new definition drops no property, when no
+    /// asset was created from the model, or when nothing holds a segment of the
+    /// streams it would drop; asked BEFORE the new definition is written, which
+    /// is why the kept properties are passed in rather than read back.
+    ///
+    /// Answered from the SEGMENTS rather than from the streams, in the one pass
+    /// [`Self::blocking_data_segment`] makes: a segment names a stream by the
+    /// pair that derives it, so each one is resolved back to its asset and
+    /// property and tested against the dropped set, which never materialises
+    /// the product of the model's assets and its dropped properties.
+    ///
+    /// Every asset the propagation reaches counts, not only those created
+    /// directly from this model: a composite model that reuses this one as a
+    /// component model contributes its definitions, under their own ids, to the
+    /// assets of the model holding it, so a property dropped here takes those
+    /// assets' streams too — the same set of models
+    /// [`Self::models_inheriting_definitions_of`] walks.
+    pub fn data_segment_of_dropped_model_properties(
+        &self,
+        asset_model_id: &str,
+        kept: &[AssetModelProperty],
+    ) -> Option<(String, String)> {
+        let dropped: HashSet<&str> = self
+            .asset_models
+            .get(asset_model_id)?
+            .properties
+            .iter()
+            .filter_map(|property| property.id.as_deref())
+            .filter(|id| !id.is_empty())
+            .filter(|id| !kept.iter().any(|kept| kept.id.as_deref() == Some(*id)))
+            .collect();
+        if dropped.is_empty() {
+            return None;
+        }
+        let inheriting = self.models_inheriting_definitions_of(asset_model_id);
+        self.blocking_data_segment(|time_series_id| {
+            let Some((asset_id, property_id)) =
+                time_series_id.split_once(TIME_SERIES_ID_SEPARATOR)
+            else {
+                return false;
+            };
+            if !dropped.contains(property_id) {
+                return false;
+            }
+            // The stream goes only if the asset really carries that property and
+            // its own model inherits the definition being dropped — which is
+            // exactly when the propagation re-materialises the asset without it.
+            self.assets.get(asset_id).is_some_and(|asset| {
+                inheriting.contains(&asset.asset_model_id)
+                    && asset.property(property_id).is_some()
+            })
+        })
+    }
+
     /// Forget the segment of `dataset_id` that `time_series_id` and the span
     /// `[start, end)` name EXACTLY, answering whether one was held.
     ///
@@ -6163,6 +6308,29 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .collect()
     }
 
+    /// `asset_model_id` together with every asset model whose assets carry a
+    /// definition of it: the transitive closure of [`Self::asset_models_reusing`],
+    /// which is exactly the set of models
+    /// [`Self::propagate_asset_model_definitions`] re-materialises the assets of.
+    ///
+    /// Asked by the dependency question a removal from this model's definitions
+    /// has to answer ([`Self::data_segment_of_dropped_model_properties`]): the
+    /// streams such a removal drops are those of the assets that propagation
+    /// reaches, not only of the assets created directly from the model. Each
+    /// model is answered at most once, so a reuse graph that closes on itself
+    /// still terminates.
+    fn models_inheriting_definitions_of(&self, asset_model_id: &str) -> HashSet<String> {
+        let mut pending = vec![asset_model_id.to_string()];
+        let mut inheriting: HashSet<String> = HashSet::new();
+        while let Some(model_id) = pending.pop() {
+            if !inheriting.insert(model_id.clone()) {
+                continue;
+            }
+            pending.extend(self.asset_models_reusing(&model_id));
+        }
+        inheriting
+    }
+
     /// Re-materialise the assets created from asset model `asset_model_id` ONLY,
     /// which is one step of [`Self::propagate_asset_model_definitions`]: the
     /// models reusing this one are walked there.
@@ -6599,6 +6767,24 @@ pub fn not_found_message(resource: &str, requested: &str) -> String {
 /// refusal differently.
 pub fn empty_span_message() -> String {
     "endTimestamp must be later than startTimestamp.".to_string()
+}
+
+/// The message a call that would drop a data stream a dataset still holds a
+/// data segment of is refused with: the stream that cannot go, and one dataset
+/// that still holds a segment of it.
+///
+/// One wording for every call that removes a stream — the delete of the time
+/// series itself, the delete of the asset whose property owns it, the model
+/// update that takes that property away — so the same dependency cannot be
+/// stated three ways. AWS words the rule as "You can't delete a time series
+/// until all of its data segments have been deleted from session datasets"
+/// (`DeleteTimeSeries`'s doc), so the refusal names the stream and the dataset
+/// whose segments have to go first.
+pub fn data_segments_remain_message(time_series_id: &str, holder: &str) -> String {
+    format!(
+        "The time series {time_series_id} has data segments in the dataset {holder}. \
+         Delete them before deleting it."
+    )
 }
 
 /// The message a uniqueness refusal carries: AWS names the DIMENSION of the

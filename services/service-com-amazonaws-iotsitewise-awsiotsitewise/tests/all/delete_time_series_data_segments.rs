@@ -383,7 +383,10 @@ async fn fixture() -> (MultiServiceRouter, Fixture) {
 
 /// Ingest a DOUBLE sample at each of `seconds` against the `(assetId, propertyId)`
 /// pair, so the property owns a stream of its own.
-async fn ingest_pair(
+///
+/// Shared with the asset-delete suite (`asset_delete_data_segments`), which holds
+/// segments of the same pair-derived streams, rather than growing a second copy.
+pub(crate) async fn ingest_pair(
     router: &MultiServiceRouter,
     asset_id: &str,
     property: &str,
@@ -499,7 +502,9 @@ fn seed_own_segment(fixture: &Fixture, series: &str, start: i64, end: i64) {
 }
 
 /// How many data segments this store holds of `series`, across every dataset.
-fn segments_of(engine: &Arc<engine::InMemoryEngine>, series: &str) -> usize {
+///
+/// Shared with the asset-delete suite, for the reason [`ingest_pair`] is.
+pub(crate) fn segments_of(engine: &Arc<engine::InMemoryEngine>, series: &str) -> usize {
     let state = service_state(&**engine).expect("the IoT SiteWise store");
     let store = state.lock();
     store
@@ -512,7 +517,10 @@ fn segments_of(engine: &Arc<engine::InMemoryEngine>, series: &str) -> usize {
 
 /// The refusal the rule produces, written out by hand: the stream that cannot go
 /// and the dataset that still holds a segment of it.
-fn expected_message(series: &str, holder: &str) -> String {
+///
+/// One hand-written oracle for every call the rule refuses, shared with the
+/// asset-delete suite: the suites never call the handlers' own wording.
+pub(crate) fn expected_message(series: &str, holder: &str) -> String {
     format!(
         "The time series {series} has data segments in the dataset {holder}. \
          Delete them before deleting it."

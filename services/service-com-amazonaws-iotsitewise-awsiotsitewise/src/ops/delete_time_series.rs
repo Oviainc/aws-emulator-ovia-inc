@@ -405,11 +405,12 @@ fn segment_holder(
 /// `ConflictingOperationException` (409), which states a transient conflict
 /// between two operations on one resource; the same rule, and the same mapping,
 /// as `DeleteAsset` and `DeleteDataset` give a delete whose resource is still
-/// depended on.
+/// depended on. The wording is the state's, shared with every other call that
+/// would remove a stream.
 fn segments_remain(time_series_id: &str, holder: &str) -> DeleteTimeSeriesError {
-    invalid_request(format!(
-        "The time series {time_series_id} has data segments in the dataset {holder}. \
-         Delete them before deleting it."
+    invalid_request(crate::state::data_segments_remain_message(
+        time_series_id,
+        holder,
     ))
 }
 

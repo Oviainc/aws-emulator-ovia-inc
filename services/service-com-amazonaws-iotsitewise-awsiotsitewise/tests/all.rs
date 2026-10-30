@@ -94,6 +94,14 @@ mod delete_dataset;
 #[path = "all/delete_time_series_data_segments.rs"]
 mod delete_time_series_data_segments;
 
+// `asset_delete_data_segments` is declared HERE, beside the suite above whose
+// rule it carries to `DeleteAsset`, for the reason that suite's note gives: the
+// sorted list and the END of this file are both where every concurrent
+// iotsitewise change puts a declaration of its own. Fold it into the list once
+// the churn settles.
+#[path = "all/asset_delete_data_segments.rs"]
+mod asset_delete_data_segments;
+
 // `client_token_replay` is declared HERE, at the head of the file, for the reason
 // the note above gives: the sorted list and the END of this file are both where
 // every concurrent iotsitewise change puts a declaration of its own. Fold it into
