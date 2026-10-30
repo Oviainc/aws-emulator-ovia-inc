@@ -20,6 +20,13 @@
 #[path = "all/query_results.rs"]
 mod query_results;
 
+// `component_model_property_inheritance` is declared HERE, beside the suite above,
+// for the reason that note gives: the sorted list and the END of this file are both
+// where every concurrent iotsitewise change puts a declaration of its own. Fold it
+// into the list once the churn settles.
+#[path = "all/component_model_property_inheritance.rs"]
+mod component_model_property_inheritance;
+
 // `pagination_token_binding` is declared HERE, beside the suite above, for the
 // reason the note above gives: the sorted list and the END of this file are both
 // where every concurrent iotsitewise change puts a declaration of its own. Fold it

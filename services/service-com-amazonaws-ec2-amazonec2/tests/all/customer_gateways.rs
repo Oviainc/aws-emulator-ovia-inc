@@ -23,7 +23,9 @@
 //! 3. A DELETE TAKES THE GATEWAY AN ID NAMES OUT OF SERVICE: it keeps being reported, in the
 //!    terminal state of a gateway that is gone, whatever state it was in; an id the account
 //!    holds no gateway for is refused as the describe refuses one, and a gateway a VPN
-//!    connection still uses is refused with `DependencyViolation`.
+//!    connection still uses is refused with `DependencyViolation`. The gateway the id names is
+//!    the ONLY thing that moves: every other member of it, every other gateway of the account
+//!    and every other resource that names one are left exactly as they were.
 //!
 //! Each table row is a distinct input along what those rules generalise over: which member a
 //! gateway carries a value for, which documented filter selects on it, how many values and
@@ -116,7 +118,7 @@ fn stored_count(engine: &engine::InMemoryEngine) -> usize {
 
 /// One reported gateway: its scalar members by the element name ec2Query writes them under,
 /// and the tags of its `tagSet` in the order the response reported them.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Reported {
     /// Every scalar member the response carried for this gateway.
     members: BTreeMap<String, String>,
@@ -1486,4 +1488,175 @@ async fn a_delete_refuses_an_unresolvable_id_a_used_gateway_and_a_dry_run() {
         Some(VPN_STATE_DELETED.to_string()),
         "case {case:?}: expected the gateway reported as {VPN_STATE_DELETED}"
     );
+}
+
+/// Every gateway the account holds right now, by `CustomerGatewayId` — the WHOLE report,
+/// because what a delete must leave untouched is every gateway the request did not name.
+async fn reported_by_id(case: &str, router: &MultiServiceRouter) -> BTreeMap<String, Reported> {
+    let body = describe_ok(case, router, &[]).await;
+    reported(case, &body)
+        .into_iter()
+        .map(|gateway| (gateway.id().to_string(), gateway))
+        .collect()
+}
+
+/// The `(VpnConnectionId, CustomerGatewayId, state)` of every VPN connection the account
+/// holds, in reported order: what a delete of some OTHER gateway must leave alone.
+async fn reported_connections(
+    case: &str,
+    router: &MultiServiceRouter,
+) -> Vec<(String, String, String)> {
+    let body = describe_ok_action(case, router, "DescribeVpnConnections", &[]).await;
+    let parsed = document(case, &body);
+    set_items(parsed.root_element(), "vpnConnectionSet")
+        .into_iter()
+        .map(|item| {
+            (
+                child_text(item, "vpnConnectionId").unwrap_or_default(),
+                child_text(item, "customerGatewayId").unwrap_or_default(),
+                child_text(item, "state").unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// Rule 3, scope: a delete takes out of service EXACTLY the gateway its id names — it moves
+/// that gateway's `CustomerGateway$State` to the terminal `deleted` and changes nothing else.
+///
+/// Every other member the deleted gateway reports stays as the store holds it, the record
+/// itself keeps being reported, every gateway the request did not name stays in the state it
+/// was in — including one whose whole description is the same, so the gateway acted on is
+/// resolved by its id rather than by what it describes — the VPN connection of another gateway
+/// is reported exactly as before, and `deleted` is terminal: the clock owes a gone gateway no
+/// further move.
+///
+/// The rows differ along which members the deleted gateway carries — the certificate form, the
+/// device-and-tags form, the extended-ASN form with an IPv6 outside address — and along the
+/// state it is deleted in, with every earlier row's gateway still gone.
+#[tokio::test]
+async fn a_delete_changes_only_the_named_gateway_and_only_its_state() {
+    let (router, engine) = super::ec2_query::emulator();
+
+    // A device identified by a certificate, still coming up.
+    let mut certificate = gateway(VPN_STATE_PENDING);
+    certificate.ip_address = Some("198.51.100.7".to_string());
+    certificate.bgp_asn = Some("64512".to_string());
+    certificate.certificate_arn = Some(
+        "arn:aws:acm:us-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+            .to_string(),
+    );
+
+    // An IPv4 device in service, with a device name and a tag.
+    let mut device = gateway(VPN_STATE_AVAILABLE);
+    device.ip_address = Some("203.0.113.12".to_string());
+    device.bgp_asn = Some("65000".to_string());
+    device.device_name = Some("branch-office-router".to_string());
+    device.tags = Some(vec![Tag {
+        key: Some("Name".to_string()),
+        value: Some("branch-office".to_string()),
+    }]);
+
+    // The same description under a different device name — the one thing that tells two
+    // otherwise identical gateways apart ("specify a unique device name for each customer
+    // gateway", `CreateCustomerGateway`).
+    let mut twin = device.clone();
+    twin.device_name = Some("branch-office-standby".to_string());
+
+    // An IPv6 outside address with an ASN above what `BgpAsn` carries.
+    let mut extended = gateway(VPN_STATE_AVAILABLE);
+    extended.ip_address = Some("2001:db8::1".to_string());
+    extended.bgp_asn_extended = Some("4200000000".to_string());
+
+    // The gateway a VPN connection uses: no row below deletes it, so its connection must be
+    // reported exactly as it was after every delete.
+    let mut connected = gateway(VPN_STATE_AVAILABLE);
+    connected.ip_address = Some("192.0.2.9".to_string());
+    connected.bgp_asn = Some("65001".to_string());
+
+    let certificate_id = seed(&engine, certificate);
+    let device_id = seed(&engine, device);
+    let twin_id = seed(&engine, twin);
+    let extended_id = seed(&engine, extended);
+    let connected_id = seed(&engine, connected);
+    let connection = seed_connection(&engine, &connected_id);
+
+    let before = reported_by_id("before any delete", &router).await;
+    let connections_before = reported_connections("before any delete", &router).await;
+    let stored_before = stored_count(&engine);
+
+    let mut gone: Vec<String> = Vec::new();
+    for (case, customer_gateway_id) in [
+        ("a gateway identified by a certificate, coming up", &certificate_id),
+        ("a gateway in service with a device name and a tag", &device_id),
+        ("a gateway with an extended ASN and an IPv6 address", &extended_id),
+    ] {
+        let (status, body) = delete(&router, customer_gateway_id, &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from {DELETE}, got {status} with body {body}"
+        );
+        gone.push(customer_gateway_id.clone());
+
+        // The whole report, gateway by gateway: each one already deleted carries the terminal
+        // state, and NOTHING else differs from what the store held before the first delete.
+        let expected: BTreeMap<String, Reported> = before
+            .iter()
+            .map(|(customer_gateway_id, reported)| {
+                let mut reported = reported.clone();
+                if gone.contains(customer_gateway_id) {
+                    reported
+                        .members
+                        .insert("state".to_string(), VPN_STATE_DELETED.to_string());
+                }
+                (customer_gateway_id.clone(), reported)
+            })
+            .collect();
+        let after = reported_by_id(case, &router).await;
+        assert_eq!(
+            after, expected,
+            "case {case:?}: expected only the deleted gateways to differ, and only in their \
+             state, got {after:?}"
+        );
+
+        // A deleted gateway is still a gateway the API reports, so no record left the store,
+        // and no resource naming another gateway moved.
+        let stored = stored_count(&engine);
+        assert_eq!(
+            stored, stored_before,
+            "case {case:?}: expected the store to still hold {stored_before} gateways, got \
+             {stored}"
+        );
+        let connections = reported_connections(case, &router).await;
+        assert_eq!(
+            connections, connections_before,
+            "case {case:?}: expected the connection {connection:?} of {connected_id} reported \
+             as before, got {connections:?}"
+        );
+    }
+
+    // `deleted` is terminal and the gateways left alone are owed nothing either, so the clock
+    // moves none of them once the transition span has passed.
+    tokio::time::sleep(past_the_transition()).await;
+    let case = "once the transition span has passed";
+    let after = reported_by_id(case, &router).await;
+    let state = |customer_gateway_id: &str| -> Option<String> {
+        after
+            .get(customer_gateway_id)
+            .and_then(|reported| reported.members.get("state").cloned())
+    };
+    for customer_gateway_id in &gone {
+        assert_eq!(
+            state(customer_gateway_id),
+            Some(VPN_STATE_DELETED.to_string()),
+            "case {case:?}: expected {customer_gateway_id} still reported as \
+             {VPN_STATE_DELETED}, got {after:?}"
+        );
+    }
+    for customer_gateway_id in [&twin_id, &connected_id] {
+        assert_eq!(
+            state(customer_gateway_id),
+            Some(VPN_STATE_AVAILABLE.to_string()),
+            "case {case:?}: expected {customer_gateway_id} left in service, got {after:?}"
+        );
+    }
 }

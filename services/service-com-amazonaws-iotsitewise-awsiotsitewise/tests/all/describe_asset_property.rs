@@ -27,7 +27,7 @@ use super::asset_property_update::expected_topic;
 const ABSENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 
 /// `DescribeAssetProperty` on `(asset_label, property_label)`.
-async fn describe_property(
+pub(crate) async fn describe_property(
     router: &MultiServiceRouter,
     asset_label: &str,
     property_label: &str,
@@ -589,8 +589,9 @@ async fn a_property_of_a_composite_model_is_reported_as_a_composite_model_proper
 
 /// Create an asset model of `model_type` carrying `properties`, and return its id.
 ///
-/// Shared with the asset-delete suite (`asset_delete_data_segments`), which needs
-/// a `COMPONENT_MODEL` to drive the reuse path, rather than growing a second copy.
+/// Shared with the asset-delete suite (`asset_delete_data_segments`) and the
+/// component-model inheritance suite, which need a `COMPONENT_MODEL` to drive the
+/// reuse path, rather than growing a second copy.
 pub(crate) async fn create_typed_model(
     router: &MultiServiceRouter,
     name: &str,
