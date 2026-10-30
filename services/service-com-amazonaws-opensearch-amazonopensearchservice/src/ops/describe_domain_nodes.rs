@@ -14,9 +14,12 @@
 //! never describe one domain's zones differently.
 //!
 //! What is CONFIGURED (the node's role, instance type, zone and storage) is reported
-//! in whatever state the domain is; whether a node is serving or in standby is
-//! something only a RUNNING cluster has, so `NodeStatus` is the modelled
-//! `NotAvailable` until the provisioning the clock owes the domain has fallen due.
+//! from the record, while whether a node is serving or in standby is something only a
+//! RUNNING cluster has, so `NodeStatus` is the modelled `NotAvailable` for a node
+//! whose zone the configuration does not name. A domain with work in flight has no
+//! census to report at all — its nodes are not up yet, or are being replaced — so
+//! such a request is refused with the modelled `DependencyFailureException` rather
+//! than answered with a node list; see [`crate::state::Domain::work_in_flight`].
 //! A role whose count the record carries no value for contributes no node: an
 //! unknown node is not reported as a node.
 //!
@@ -240,14 +243,13 @@ fn storage(ebs_attached: bool, ebs: Option<&EBSOptions>) -> Storage {
 /// A node's `NodeStatus`: "indicates if the node is active or in standby".
 ///
 /// A node in one of the domain's standby zones is in standby and one in a zone
-/// serving the cluster is active — but only once the cluster is up: before then no
-/// node is running, so which of the two it is is not something the service can
-/// report, which is what `NotAvailable` says. It says the same for a node whose zone
-/// the configuration does not name, since standby is a property of the zone the node
-/// sits in.
-fn node_status(up: bool, zone: Option<usize>, serving_zones: Option<usize>) -> &'static str {
-    match (up, zone, serving_zones) {
-        (true, Some(zone), Some(serving)) => {
+/// serving the cluster is active. A node whose zone the configuration does not name
+/// has neither, since standby is a property of the zone the node sits in, and that is
+/// what `NotAvailable` says. Every node reported here belongs to a domain whose
+/// cluster is up: a domain with work in flight has no census to report at all.
+fn node_status(zone: Option<usize>, serving_zones: Option<usize>) -> &'static str {
+    match (zone, serving_zones) {
+        (Some(zone), Some(serving)) => {
             if zone < serving {
                 NODE_STATUS_ACTIVE
             } else {
@@ -262,7 +264,6 @@ fn node_status(up: bool, zone: Option<usize>, serving_zones: Option<usize>) -> &
 /// the configuration provisions, in zone order within each role.
 fn domain_nodes(domain: &Domain) -> Vec<DomainNodesStatus> {
     let cluster = &domain.cluster_config;
-    let up = domain.cluster_is_up();
     let zones = configured_zone_count(cluster);
     let standby = usize::try_from(standby_zone_count(cluster)).unwrap_or(0);
     // The standby zones are the LAST of the domain's zones, so every zone before this
@@ -280,7 +281,7 @@ fn domain_nodes(domain: &Domain) -> Vec<DomainNodesStatus> {
                 node_type: Some(role.node_type.to_string()),
                 availability_zone: zone.and_then(|zone| zone_name(&domain.region, zone)),
                 instance_type: role.instance_type.clone(),
-                node_status: Some(node_status(up, zone, serving_zones).to_string()),
+                node_status: Some(node_status(zone, serving_zones).to_string()),
                 storage_type: Some(storage.type_name.to_string()),
                 storage_volume_type: storage.volume_type.clone(),
                 storage_size: storage.size.clone(),
@@ -378,6 +379,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::domain_not_found(&input.domain_name),
             )
         })?;
+
+        // A domain with work in flight has no node census to read: the nodes of a
+        // domain being provisioned do not exist yet, and the nodes of one applying a
+        // change, upgrading its engine or deploying service software are being
+        // replaced. Fetching the node details therefore depends on something that
+        // cannot answer, which is the condition `DependencyFailureException` (424)
+        // states — the same in-flight state every operation in this family consults.
+        if domain.work_in_flight() {
+            return Err(DescribeDomainNodesErrorModeled::DependencyFailureException(
+                crate::state::node_information_unavailable(),
+            )
+            .into());
+        }
 
         Ok(DescribeDomainNodesOutput {
             domain_nodes_status_list: Some(domain_nodes(domain)),

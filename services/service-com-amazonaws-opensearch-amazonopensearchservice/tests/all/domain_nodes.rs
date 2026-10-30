@@ -13,8 +13,9 @@
 //! `DedicatedMasterEnabled` is on and a warm node per `WarmCount` while
 //! `WarmEnabled` is — each carrying the instance type of the member that defines its
 //! role, the Availability Zone the domain's zone awareness places it in, the storage
-//! the domain's `EBSOptions` give it, and a status that says whether it is serving or
-//! in standby only once the cluster the clock owes the domain is up.
+//! the domain's `EBSOptions` give it, and whether it is serving or in standby —
+//! while a domain whose nodes are not up, because it still has work in flight, has
+//! no census to read at all and the report is refused.
 //!
 //! So the table below spans the configurations the rule generalises over: the three
 //! roles alone and together, one zone and the two published values of
@@ -29,6 +30,7 @@
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_opensearch_amazonopensearchservice::state::NODE_INFORMATION_UNAVAILABLE;
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
 
@@ -187,9 +189,10 @@ fn reported(nodes: &[Value], case: &str) -> Vec<Node> {
 
 /// The census a case must report, in the same canonical order as [`reported`].
 ///
-/// `up` is whether the cluster the clock owes the domain has come up: before it has,
-/// no node is running, so none of them is active or in standby.
-fn expected(case: &Case, up: bool) -> Vec<Node> {
+/// Every node is reported where it stands: a node of a zone the configuration names
+/// is active, or in standby where that zone is one the domain holds in standby, and
+/// a node whose zone the configuration does not name has no standby state to report.
+fn expected(case: &Case) -> Vec<Node> {
     let mut expected = Vec::new();
     for role in &case.roles {
         let mut push = |zone: Option<usize>, status: &str| {
@@ -207,13 +210,7 @@ fn expected(case: &Case, up: bool) -> Vec<Node> {
             Placement::Zones(per_zone) => {
                 let serving = per_zone.len().saturating_sub(case.standby_zones);
                 for (zone, count) in per_zone.iter().enumerate() {
-                    let status = if !up {
-                        NOT_AVAILABLE
-                    } else if zone < serving {
-                        ACTIVE
-                    } else {
-                        STANDBY
-                    };
+                    let status = if zone < serving { ACTIVE } else { STANDBY };
                     for _ in 0..*count {
                         push(Some(zone), status);
                     }
@@ -572,30 +569,37 @@ async fn every_node_the_cluster_configuration_provisions_is_reported_from_the_st
     let cases = cases();
 
     // Each domain is read straight after its OWN create, while the provisioning the
-    // clock owes it is still outstanding: the nodes are configured, but none of them
-    // is yet serving or in standby.
+    // clock owes it is still outstanding: its nodes do not exist yet, so there is no
+    // census to read and the report is refused rather than answered.
     for case in &cases {
         create(&emulator, case).await;
         let answer = describe_nodes(&emulator, case.domain).await;
-        let list = node_list(&answer, case.case);
-        assert_modelled(case.case, &list);
-        let actual = reported(&list, case.case);
-        let want = expected(case, false);
         assert_eq!(
-            actual, want,
-            "case {} while creating: expected the nodes {want:?}, got {actual:?}",
-            case.case
+            (answer.status, error_code(&answer).as_str()),
+            (424, "DependencyFailureException"),
+            "case {} while creating: expected the modelled dependency failure, got {} with {:?}",
+            case.case,
+            answer.status,
+            answer.body
+        );
+        assert_eq!(
+            answer.body["message"].as_str(),
+            Some(NODE_INFORMATION_UNAVAILABLE),
+            "case {} while creating: expected the service's wording for node information that \
+             cannot be fetched, got {:?}",
+            case.case,
+            answer.body
         );
     }
 
-    // Once the provisioning has fallen due, the same nodes report where they stand.
+    // Once the provisioning has fallen due, the nodes are reported where they stand.
     tokio::time::sleep(SETTLE_WAIT).await;
     for case in &cases {
         let answer = describe_nodes(&emulator, case.domain).await;
         let list = node_list(&answer, case.case);
         assert_modelled(case.case, &list);
         let actual = reported(&list, case.case);
-        let want = expected(case, true);
+        let want = expected(case);
         assert_eq!(
             actual, want,
             "case {} once up: expected the nodes {want:?}, got {actual:?}",

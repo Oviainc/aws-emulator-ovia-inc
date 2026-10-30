@@ -39,10 +39,11 @@ pub(crate) const REGION: &str = "us-east-1";
 /// identity.
 pub(crate) const DEFAULT_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
 
-/// Long enough for the LONGEST span this emulator owes a clock move (the 750 ms a
-/// change to a domain's package associations takes; a domain's own provisioning span is
+/// Long enough for the LONGEST span this emulator owes a clock move (the 3 s work on
+/// a domain takes — its provisioning, a configuration change, an engine version
+/// upgrade or a service software deployment; every other span of this service is
 /// shorter) to have fallen due, so the next read materialises the settled record.
-pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(900);
+pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(3_300);
 
 /// One emulator with this service mounted on a fresh shared engine.
 pub(crate) struct Emulator {
@@ -701,9 +702,17 @@ async fn engine_type_is_derived_from_the_engine_version_prefix() {
 #[tokio::test]
 async fn an_updated_option_replaces_only_itself_and_bumps_only_its_own_revision() {
     let emulator = Emulator::new();
-    for (index, (option, value, _)) in change_rows().into_iter().enumerate() {
+    // The domains are created first so ONE wait settles every one of them: a domain
+    // that is still being provisioned has work in flight, and the update under test
+    // is a further change, which such a domain refuses.
+    let rows = change_rows();
+    for index in 0..rows.len() {
+        create_baseline(&emulator, &format!("merge-{index}")).await;
+    }
+    tokio::time::sleep(SETTLE_WAIT).await;
+
+    for (index, (option, value, _)) in rows.into_iter().enumerate() {
         let name = format!("merge-{index}");
-        create_baseline(&emulator, &name).await;
 
         let case = format!("UpdateDomainConfig({option})");
         let answer = emulator

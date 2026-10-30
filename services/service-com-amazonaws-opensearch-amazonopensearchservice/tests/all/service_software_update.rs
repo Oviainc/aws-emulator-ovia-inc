@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
     PendingUpdate, ServiceSoftware, SoftwareDeployment, DEFAULT_SERVICE_SOFTWARE_VERSION,
-    ROLLBACK_WINDOW,
+    DOMAIN_NOT_AVAILABLE_FOR_UPDATE, ROLLBACK_WINDOW,
 };
 
 use super::domain_lifecycle::{create_baseline, error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -505,10 +505,10 @@ async fn a_domain_with_nothing_to_deploy_is_refused_and_keeps_its_record() {
             answer.body
         );
         let stated = message(&answer, name);
-        assert!(
-            stated.contains(name),
-            "case StartServiceSoftwareUpdate({name:?}): expected the refusal to name the domain \
-             asked about, got {stated:?}"
+        assert_eq!(
+            stated, DOMAIN_NOT_AVAILABLE_FOR_UPDATE,
+            "case StartServiceSoftwareUpdate({name:?}): expected the service's one wording for a \
+             domain that cannot take an update, got {stated:?}"
         );
 
         // A refused start deploys nothing: the record is exactly as it was.

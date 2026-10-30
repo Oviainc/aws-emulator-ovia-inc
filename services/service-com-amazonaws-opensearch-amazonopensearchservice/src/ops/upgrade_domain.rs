@@ -18,7 +18,10 @@
 //!
 //! An upgrade is a configuration change of the domain: it goes
 //! `UpgradingEngineVersion` with its `EngineVersion` option `Processing`, and reports
-//! the version it was upgraded to only once the clock makes the run due.
+//! the version it was upgraded to only once the clock makes the run due. It is also
+//! work the domain has to be free to take on, so a domain with work in flight
+//! ([`crate::state::Domain::work_in_flight`]) is refused with the modelled
+//! `BaseException` rather than having a run queued behind that work.
 //!
 //! ## Shape of an operation
 //!
@@ -207,6 +210,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(UpgradeDomainErrorModeled::ResourceAlreadyExistsException(
                 crate::state::upgrade_already_in_progress(&domain.domain_name, &running),
+            )
+            .into());
+        }
+
+        // An upgrade re-provisions the cluster, so it is work the domain has to be
+        // free to take on: a domain being provisioned, applying a configuration change
+        // or deploying service software already has work in flight, and the upgrade is
+        // refused with the operation's modelled `BaseException` rather than queued
+        // behind it ([`crate::state::Domain::work_in_flight`]). A check performs no
+        // upgrade, but it runs against the same cluster, so it waits for the same
+        // quiet domain.
+        if domain.work_in_flight() {
+            return Err(UpgradeDomainErrorModeled::BaseException(
+                crate::state::upgrade_blocked_by_background_tasks(),
             )
             .into());
         }

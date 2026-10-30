@@ -53,6 +53,8 @@ mod default_application_setting;
 mod direct_query_data_source_inventory;
 #[path = "all/direct_query_data_sources.rs"]
 mod direct_query_data_sources;
+#[path = "all/domain_activity_gates.rs"]
+mod domain_activity_gates;
 #[path = "all/domain_auto_tunes.rs"]
 mod domain_auto_tunes;
 #[path = "all/domain_batch_describe.rs"]

@@ -9,9 +9,11 @@
 //! [`crate::state::ServiceSoftware`], the one copy of a domain's service software
 //! every descriptor of the domain reports, and the eligibility test is that record's
 //! ([`crate::state::ServiceSoftware::begin_update`]): a domain with no release
-//! available to move onto, or one already applying a deployment, has nothing to
-//! deploy, so the request cannot be served as asked and is refused with the modelled
-//! `ValidationException`.
+//! available to move onto, one already applying a deployment, or one with other work
+//! in flight ([`crate::state::Domain::work_in_flight`]) is not available for an
+//! update, so the request cannot be served as asked and is refused with the modelled
+//! `ValidationException` — in the service's one fixed wording for that condition
+//! ([`crate::state::DOMAIN_NOT_AVAILABLE_FOR_UPDATE`]).
 //!
 //! ## Shape of an operation
 //!
@@ -91,8 +93,8 @@ use super::types::*;
 use std::time::SystemTime;
 
 use crate::state::{
-    check_desired_start_time, domain_not_found, no_software_update_available, rescheduled_instant,
-    schedule_at_outside_the_enum, SCHEDULE_AT_NOW, SCHEDULE_AT_TIMESTAMP,
+    check_desired_start_time, domain_not_available_for_update, domain_not_found,
+    rescheduled_instant, schedule_at_outside_the_enum, SCHEDULE_AT_NOW, SCHEDULE_AT_TIMESTAMP,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -226,19 +228,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rescheduled_instant(domain, &schedule_at, input.desired_start_time, now).max(now);
 
         // The eligibility test lives on the record: a release has to be available for
-        // the domain to move onto, and neither a deployment in flight nor an update
-        // already scheduled may be interrupted. Outside it there is no deployment to
-        // schedule, so the call is REFUSED with the operation's modelled
-        // `ValidationException` — naming which part of the rule it failed — and the
-        // record is left exactly as it was. A start the caller put in the future is
-        // recorded as the pending update it is, which the clock begins when it reaches
-        // that instant.
+        // the domain to move onto, neither a deployment in flight nor an update
+        // already scheduled may be interrupted, and the domain has to be free of other
+        // work — being provisioned, applying a configuration change or upgrading its
+        // engine ([`crate::state::Domain::work_in_flight`]). Outside it there is no
+        // deployment to schedule, so the call is REFUSED with the operation's modelled
+        // `ValidationException` and the record is left exactly as it was. A start the
+        // caller put in the future is recorded as the pending update it is, which the
+        // clock begins when it reaches that instant.
+        if domain.work_in_flight() {
+            return Err(StartServiceSoftwareUpdateErrorModeled::ValidationException(
+                domain_not_available_for_update(),
+            )
+            .into());
+        }
         let software = &mut domain.service_software;
-        let deploying = software.deploying();
-        let scheduled = software.pending_update.is_some();
         let options = software.begin_update(now, starts_at).ok_or_else(|| {
             StartServiceSoftwareUpdateErrorModeled::ValidationException(
-                no_software_update_available(&input.domain_name, deploying, scheduled),
+                domain_not_available_for_update(),
             )
         })?;
 

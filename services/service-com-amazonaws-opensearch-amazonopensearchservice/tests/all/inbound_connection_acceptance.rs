@@ -64,8 +64,12 @@ const UNMODELLED_MEMBERS: [&str; 2] = ["ConnectionAlias", "ConnectionProperties"
 /// How long the suite polls for a status the clock owes before giving up, and how
 /// long it waits between polls. Nothing in the emulator sleeps: the span is
 /// materialised by whichever later call reads the record.
+///
+/// Each step of [`ACCEPTED_CHAIN`] is owed one provisioning span of this service
+/// (`crate::state::PROVISIONING`, seconds rather than milliseconds), so the budget
+/// below — the limit times the interval — is several times the whole chain.
 const POLL_LIMIT: u32 = 60;
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// `AcceptInboundConnection`: `PUT /opensearch/cc/inboundConnection/{ConnectionId}/accept`.
 async fn accept(emulator: &Emulator, id: &str) -> Answer {

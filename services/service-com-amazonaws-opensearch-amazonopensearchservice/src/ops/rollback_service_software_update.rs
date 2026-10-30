@@ -8,6 +8,11 @@
 //! [`crate::state::ServiceSoftware`], the one copy of a domain's service software
 //! every descriptor of the domain reports.
 //!
+//! A domain with work in flight ([`crate::state::Domain::work_in_flight`]) is already
+//! applying a change, so a rollback cannot be started on it at all: that request is
+//! REFUSED with the modelled `ValidationException`, where a domain that simply has no
+//! release to return to is answered with `RollbackAvailable` false.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -173,6 +178,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled answer for "whether a service software rollback is available for
         // the domain", so a domain with no release to return to is told so and nothing
         // is deployed.
+        //
+        // A domain with work in flight is a different answer: another change is
+        // already being applied, so this one cannot be started at all and the call is
+        // REFUSED with the operation's modelled `ValidationException`
+        // ([`crate::state::Domain::work_in_flight`]).
+        if domain.work_in_flight() {
+            return Err(
+                RollbackServiceSoftwareUpdateErrorModeled::ValidationException(
+                    crate::state::change_already_in_progress(),
+                )
+                .into(),
+            );
+        }
         let software = &mut domain.service_software;
         let options = match software.begin_rollback(now) {
             Some(started) => started,

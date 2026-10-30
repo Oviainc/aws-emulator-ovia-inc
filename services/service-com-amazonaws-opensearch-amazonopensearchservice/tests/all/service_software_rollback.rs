@@ -15,8 +15,9 @@
 //! assertions span a SET of inputs — three different release pairs and window
 //! remainders on the available side, and on the unavailable side a domain no
 //! deployment has landed on, a window closed at the instant it was set and one closed
-//! by twice its own length, a record with a window but no release behind it, a
-//! deployment already in flight, and a rollback that has itself just landed.
+//! by twice its own length, a record with a window but no release behind it, and a
+//! rollback that has itself just landed. A domain with a change already in progress
+//! is a REFUSAL rather than a decline, which `super::domain_activity_gates` asserts.
 //!
 //! The precondition a landed deployment leaves is written into the store directly
 //! (through [`super::domain_lifecycle::Emulator::store`]), so each row starts from
@@ -27,8 +28,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    ServiceSoftware, SoftwareDeployment, DEFAULT_SERVICE_SOFTWARE_VERSION,
-    NO_ROLLBACK_TARGET_DESCRIPTION, ROLLBACK_WINDOW,
+    ServiceSoftware, DEFAULT_SERVICE_SOFTWARE_VERSION, NO_ROLLBACK_TARGET_DESCRIPTION,
+    ROLLBACK_WINDOW,
 };
 
 use super::domain_lifecycle::{create_baseline, error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
@@ -276,20 +277,9 @@ async fn a_rollback_the_record_does_not_allow_is_declined_and_deploys_nothing() 
             }),
             "R20250101",
         ),
-        // A deployment already in flight, inside an open window: one deployment at a
-        // time.
-        (
-            "already-deploying",
-            Some(ServiceSoftware {
-                deployment: Some(SoftwareDeployment {
-                    target_version: "R20250601".to_string(),
-                    completes_at: SystemTime::now() + Duration::from_secs(60 * 60),
-                    rollback: false,
-                }),
-                ..after_update("R20250101", "R20241001", Duration::from_secs(60 * 60))
-            }),
-            "R20250101",
-        ),
+        // A deployment already in flight is NOT one of these rows: that domain has a
+        // change in progress, which is refused rather than declined — see
+        // `super::domain_activity_gates`.
     ];
 
     for (name, software, current) in rows {
@@ -445,20 +435,9 @@ async fn a_domain_with_no_release_to_return_to_is_declined_with_the_services_own
             Some(after_update("R20250101", "R20241001", Duration::from_secs(0))),
             false,
         ),
-        // A deployment already in flight inside an open window: a different reason
-        // again.
-        (
-            "reason-deploying",
-            Some(ServiceSoftware {
-                deployment: Some(SoftwareDeployment {
-                    target_version: "R20250601".to_string(),
-                    completes_at: SystemTime::now() + Duration::from_secs(60 * 60),
-                    rollback: false,
-                }),
-                ..after_update("R20250101", "R20241001", Duration::from_secs(60 * 60))
-            }),
-            false,
-        ),
+        // A deployment already in flight is NOT one of these rows either: that domain
+        // has a change in progress, which is refused rather than declined — see
+        // `super::domain_activity_gates`.
     ];
 
     for (name, software, no_release_to_return_to) in rows {

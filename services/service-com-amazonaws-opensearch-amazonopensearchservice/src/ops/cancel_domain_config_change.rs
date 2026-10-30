@@ -12,10 +12,13 @@
 //! became of it. The answer names the changes cancelled and, per property they set,
 //! the value that was pending and the value the domain is left with.
 //!
-//! A domain with no such change has nothing to cancel, which is the modelled
-//! not-found refusal rather than an empty success — as is a name no domain is stored
-//! under. The change a create starts and an engine version upgrade are not
-//! cancellable: there is no earlier configuration to go back to
+//! A domain that is not applying a change has nothing to cancel, which is the
+//! operation's modelled `ValidationException` naming the two
+//! `DomainProcessingStatusType` states a change exists in
+//! ([`crate::state::CANCELLABLE_PROCESSING_STATUSES`]) rather than an empty success;
+//! a name no domain is stored under is the modelled not-found. The change a create
+//! starts and an engine version upgrade are not cancellable: there is no earlier
+//! configuration to go back to
 //! ([`crate::state::ConfigChange::cancellable`]).
 //!
 //! `DryRun` "returns the list of change IDs and properties that will be cancelled
@@ -185,6 +188,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::domain_not_found(&input.domain_name),
             )
         })?;
+
+        // A domain has a configuration change to cancel only while it is applying one
+        // — `Modifying` for a change to its options, `UpdatingServiceSoftware` for a
+        // service software deployment. Every other state of
+        // `DomainProcessingStatusType` (being created, deleted, upgraded, or settled
+        // with nothing in flight) has no such change, and the call is refused with
+        // the operation's modelled `ValidationException` naming the two states it is
+        // allowed in. The state read is the one every descriptor of the domain
+        // reports, so a caller that polled `DomainProcessingStatus` and a cancel
+        // cannot disagree about where the domain is.
+        if !crate::state::CANCELLABLE_PROCESSING_STATUSES
+            .contains(&domain.reported_processing_status())
+        {
+            return Err(CancelDomainConfigChangeErrorModeled::ValidationException(
+                crate::state::cancel_outside_cancellable_states(),
+            )
+            .into());
+        }
 
         // The changes this call cancels, and the `DomainConfig` members they set —
         // in the order the changes started, each member once however many of them

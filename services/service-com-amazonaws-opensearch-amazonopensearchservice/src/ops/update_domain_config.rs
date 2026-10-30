@@ -7,6 +7,12 @@
 //! computes the same answer without applying it, and a `Verbose` one records the
 //! analysis `DescribeDryRunProgress` then reports on.
 //!
+//! The service applies one change of a domain at a time, so a domain with work in
+//! flight ([`crate::state::Domain::work_in_flight`]) refuses an update that would
+//! start another — and refuses a VERBOSE dry run, whose additional check runs against
+//! the live domain, with its own modelled error. A basic dry run starts no change and
+//! needs no such check, so it is answered whatever the domain is doing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -161,6 +167,11 @@ use crate::state::{
     OPT_NODE_TO_NODE_ENCRYPTION_OPTIONS, OPT_OFF_PEAK_WINDOW_OPTIONS, OPT_SNAPSHOT_OPTIONS,
     OPT_SOFTWARE_UPDATE_OPTIONS, OPT_USE_CASE, OPT_VPC_OPTIONS, PROCESSING_STATUS_MODIFYING,
 };
+
+/// `DryRunMode`'s `Verbose`: the dry run that "runs an additional check to validate
+/// the changes you're making", as against `Basic`, which "only returns the type of
+/// deployment".
+const DRY_RUN_MODE_VERBOSE: &str = "Verbose";
 
 /// `DryRunResults$DeploymentType` for "the update requires a blue/green deployment".
 const DEPLOYMENT_BLUE_GREEN: &str = "Blue/Green";
@@ -435,6 +446,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // merge below moves it: what `CancelDomainConfigChange` puts back if the
         // change this call starts is cancelled before it lands.
         let before = crate::state::DomainOptions::capture(&merged);
+        // Whether the STORED domain has work in flight, and which dry run the request
+        // asked for — both read here, before `merge` consumes the request and moves
+        // the copy, so the state gates below judge the record the request arrived at.
+        let stored_work_in_flight = merged.work_in_flight();
+        let input_dry_run_mode = input.dry_run_mode.clone();
 
         // The master credential of the internal user database has to meet the
         // published complexity requirement, whichever call sets it. It is checked on
@@ -513,6 +529,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(refusal) = crate::state::cold_storage_refusal(Some(&merged.cluster_config)) {
             return Err(UpdateDomainConfigErrorModeled::BaseException(refusal).into());
+        }
+
+        // The request has been judged on its own terms; what is left is whether the
+        // DOMAIN can take it now.
+        //
+        // "Verbose runs an additional check to validate the changes you're making":
+        // that check is run against the live domain, so a domain with work in flight
+        // — being provisioned, applying a change, upgrading its engine or deploying
+        // service software — cannot have it run, and the request is refused with the
+        // operation's modelled `BaseException`. A `Basic` dry run, which "only returns
+        // the type of deployment", needs no such check and is answered from the record
+        // as ever — as `Undetermined`, the documented value for a domain "in the
+        // middle of an update".
+        if input_dry_run_mode.as_deref() == Some(DRY_RUN_MODE_VERBOSE) && stored_work_in_flight {
+            return Err(UpdateDomainConfigErrorModeled::BaseException(
+                crate::state::verbose_dry_run_during_activity(),
+            )
+            .into());
+        }
+
+        // A change is applied to a SETTLED domain: the service runs one change of a
+        // domain at a time, so a domain with work in flight refuses a call that would
+        // start another, with the service's one sentence for that condition. This is
+        // what serializes a client's own work: it issues a change, is told one is in
+        // progress, and waits. A dry run starts no change at all ("without actually
+        // applying the change"), so it is answered whatever the domain is doing.
+        if !dry_run && stored_work_in_flight {
+            return Err(UpdateDomainConfigErrorModeled::ValidationException(
+                crate::state::change_already_in_progress(),
+            )
+            .into());
         }
 
         if dry_run {

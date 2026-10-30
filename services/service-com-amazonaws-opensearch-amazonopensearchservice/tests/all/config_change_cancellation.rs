@@ -12,15 +12,16 @@
 //! is still in flight — it names that change, reports the properties it was setting,
 //! leaves the domain with the configuration the change was applied on top of and
 //! marks the change cancelled; a dry run computes the same answer and writes
-//! nothing; and a domain with no such change has nothing to cancel, which is the
-//! modelled not-found rather than an empty success.
+//! nothing; and a domain that is not in one of the two states a change exists in
+//! (`Modifying`, `UpdatingServiceSoftware`) has nothing to cancel, which is the
+//! modelled validation refusal naming those states rather than an empty success.
 //!
 //! So the assertions span the inputs the rule generalises over: every option
 //! container in the shared change table (a cluster structure, an EBS structure, a
-//! policy string, two maps, an enum, a software-update structure), a change of one
-//! option and a chain of two, both values of `DryRun`, and four domains with nothing
-//! to cancel (a settled one, one whose change has already landed, one that is still
-//! being created, and a name no domain is stored under).
+//! policy string, two maps, an enum, a software-update structure), both values of
+//! `DryRun`, a second update refused while the first is still in flight, and four
+//! domains with nothing to cancel (a settled one, one whose change has already
+//! landed, one that is still being created, and a name no domain is stored under).
 
 use serde_json::{json, Value};
 
@@ -296,53 +297,63 @@ async fn a_dry_run_reports_the_same_cancellation_and_changes_nothing() {
 }
 
 #[tokio::test]
-async fn a_chain_of_changes_goes_back_to_where_the_chain_started() {
+async fn a_second_change_while_one_is_in_flight_is_refused() {
     let emulator = Emulator::new();
     let name = "chained-cancel";
     create_baseline(&emulator, name).await;
     tokio::time::sleep(SETTLE_WAIT).await;
 
-    // Two updates in flight at once, on two different options: cancelling goes back
-    // to the configuration the FIRST of them was applied on top of, and both changes
-    // are reported as cancelled.
+    // The service applies one change of a domain at a time: the first update starts a
+    // change, and a second while that one is still in flight is refused, so the
+    // cancel below has exactly ONE change to go back from.
     let rows = change_rows();
     let (first_option, first_value, _) = rows[0].clone();
     let (second_option, second_value, _) = rows[2].clone();
     let before_first = stored_option(&emulator, name, first_option).await;
     let before_second = stored_option(&emulator, name, second_option).await;
-    for (option, value) in [
-        (first_option, first_value),
-        (second_option, second_value),
-    ] {
-        let answer = emulator.update_config(name, json!({ option: value })).await;
-        assert_eq!(
-            answer.status, 200,
-            "case UpdateDomainConfig({name}, {option}): expected 200, got {} with {:?}",
-            answer.status, answer.body
-        );
-    }
+    let accepted = emulator
+        .update_config(name, json!({ first_option: first_value }))
+        .await;
+    assert_eq!(
+        accepted.status, 200,
+        "case UpdateDomainConfig({name}, {first_option}): expected 200, got {} with {:?}",
+        accepted.status, accepted.body
+    );
+    let refused = emulator
+        .update_config(name, json!({ second_option: second_value }))
+        .await;
+    assert_eq!(
+        (refused.status, error_code(&refused).as_str()),
+        (400, "ValidationException"),
+        "case UpdateDomainConfig({name}, {second_option}, while the first is in flight): expected \
+         the modelled validation refusal, got {} with {:?}",
+        refused.status,
+        refused.body
+    );
 
     let answer = cancel(&emulator, name, Some(false)).await;
     assert_eq!(
         answer.status, 200,
-        "case a chain of two changes: expected 200, got {} with {:?}",
+        "case a change in flight: expected 200, got {} with {:?}",
         answer.status, answer.body
     );
     assert_eq!(
-        cancelled_ids(&answer, "a chain of two changes").len(),
-        2,
-        "case a chain of two changes: expected both changes, got {:?}",
+        cancelled_ids(&answer, "a change in flight").len(),
+        1,
+        "case a change in flight: expected the one change the domain is applying, got {:?}",
         answer.body
     );
-    let properties: Vec<String> = cancelled_properties(&answer, "a chain of two changes")
+    let properties: Vec<String> = cancelled_properties(&answer, "a change in flight")
         .into_iter()
         .map(|(name, _, _)| name)
         .collect();
     assert_eq!(
         properties,
-        vec![first_option.to_string(), second_option.to_string()],
-        "case a chain of two changes: expected the properties both changes set, got {properties:?}"
+        vec![first_option.to_string()],
+        "case a change in flight: expected the property that change set, got {properties:?}"
     );
+    // Both options are back where they started: the cancelled change went back, and
+    // the refused one never happened.
     for (option, before) in [
         (first_option, before_first),
         (second_option, before_second),
@@ -350,35 +361,23 @@ async fn a_chain_of_changes_goes_back_to_where_the_chain_started() {
         assert_eq!(
             stored_option(&emulator, name, option).await,
             before,
-            "case a chain of two changes: expected {option} back to {before:?}"
+            "case a change in flight: expected {option} back to {before:?}"
         );
     }
 }
 
 #[tokio::test]
-async fn a_domain_with_nothing_to_cancel_is_the_modelled_not_found() {
+async fn a_domain_outside_the_states_a_change_exists_in_is_refused() {
     let emulator = Emulator::new();
 
-    // A domain whose create is still in flight: the change a create starts is not
-    // one there is an earlier configuration to go back to.
+    // A domain whose create is still in flight, and one whose update has already
+    // landed: neither is applying a change of its options nor deploying service
+    // software, so neither is in a state a cancel is allowed in.
     create_baseline(&emulator, "creating-domain").await;
-    let answer = cancel(&emulator, "creating-domain", None).await;
-    assert_eq!(
-        answer.status, 409,
-        "case a domain still being created: expected the modelled not-found's HTTP 409, got {} \
-         with {:?}",
-        answer.status, answer.body
-    );
-    assert_eq!(
-        error_code(&answer),
-        "ResourceNotFoundException",
-        "case a domain still being created: expected ResourceNotFoundException, got {:?}",
-        answer.body
-    );
-
-    // A settled domain, and one whose update has already landed: there is no change
-    // in flight either way.
     create_baseline(&emulator, "settled-domain").await;
+    let answer = cancel(&emulator, "creating-domain", None).await;
+    assert_refused(&answer, "a domain still being created");
+
     tokio::time::sleep(SETTLE_WAIT).await;
     let (option, value, _) = change_rows().remove(4);
     let updated = emulator
@@ -393,30 +392,49 @@ async fn a_domain_with_nothing_to_cancel_is_the_modelled_not_found() {
 
     for (name, dry_run, case) in [
         ("creating-domain", Some(true), "a landed create, dry run"),
+        ("creating-domain", None, "a landed create"),
         ("settled-domain", None, "a landed update"),
         ("settled-domain", Some(true), "a landed update, dry run"),
-        ("absent-domain", None, "a name no domain is stored under"),
     ] {
         let answer = cancel(&emulator, name, dry_run).await;
-        assert_eq!(
-            answer.status, 409,
-            "case {case}: expected the modelled not-found's HTTP 409, got {} with {:?}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            error_code(&answer),
-            "ResourceNotFoundException",
-            "case {case}: expected ResourceNotFoundException, got {:?}",
-            answer.body
-        );
+        assert_refused(&answer, case);
     }
 
-    // A name no domain is stored under says which domain was not found.
+    // A name no domain is stored under is a different answer: the domain itself is
+    // not there, which is the modelled not-found naming it.
     let answer = cancel(&emulator, "absent-domain", None).await;
+    assert_eq!(
+        (answer.status, error_code(&answer).as_str()),
+        (409, "ResourceNotFoundException"),
+        "case an unknown domain: expected the modelled not-found, got {} with {:?}",
+        answer.status,
+        answer.body
+    );
     assert_eq!(
         answer.body["message"].as_str(),
         Some("Domain not found: absent-domain"),
         "case an unknown domain: expected the miss to name the domain asked for, got {:?}",
+        answer.body
+    );
+}
+
+/// Assert `answer` is the refusal a cancel outside the two states a change exists in
+/// gets: the modelled `ValidationException` (HTTP 400) naming those states.
+fn assert_refused(answer: &Answer, case: &str) {
+    assert_eq!(
+        (answer.status, error_code(answer).as_str()),
+        (400, "ValidationException"),
+        "case {case}: expected the modelled validation refusal, got {} with {:?}",
+        answer.status,
+        answer.body
+    );
+    assert_eq!(
+        answer.body["message"].as_str(),
+        Some(
+            "CancelDomainConfigChange only when domain state is in Modifying or \
+             UpdatingServiceSoftware."
+        ),
+        "case {case}: expected the refusal to name the states a cancel is allowed in, got {:?}",
         answer.body
     );
 }

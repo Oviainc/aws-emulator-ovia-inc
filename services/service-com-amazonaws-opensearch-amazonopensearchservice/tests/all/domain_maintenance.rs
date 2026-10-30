@@ -81,7 +81,12 @@ async fn list(emulator: &Emulator, name: &str, query: &str) -> Answer {
         .await
 }
 
-/// `CreateDomain` with `cluster` as its `ClusterConfig`, asserting it was accepted.
+/// `CreateDomain` with `cluster` as its `ClusterConfig`, asserting it was accepted,
+/// and then waiting out the provisioning span.
+///
+/// Every case below reads or acts on a NODE of the domain, and a domain with work in
+/// flight publishes no node census — so each row waits for the create to land before
+/// the call under test, rather than asserting on a domain that is still coming up.
 async fn create(emulator: &Emulator, name: &str, cluster: Value) {
     let answer = emulator
         .create(json!({ "DomainName": name, "ClusterConfig": cluster }))
@@ -91,6 +96,7 @@ async fn create(emulator: &Emulator, name: &str, cluster: Value) {
         "case CreateDomain({name:?}): expected 200, got {} with {:?}",
         answer.status, answer.body
     );
+    tokio::time::sleep(SETTLE_WAIT).await;
 }
 
 /// The nodes of `name`, as `DescribeDomainNodes` publishes them: (NodeId, NodeType)

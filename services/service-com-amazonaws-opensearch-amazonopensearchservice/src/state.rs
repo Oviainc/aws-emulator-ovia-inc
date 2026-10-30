@@ -49,7 +49,8 @@ use crate::ops::types::{
     CognitoOptions, CognitoOptionsStatus, ConflictException, ConnectionProperties,
     DataSource as LinkedDataSource, DataSourceAttachmentSummary, DataSourceDetails, DataSourceType,
     DeploymentStrategyOptions,
-    DeploymentStrategyOptionsStatus, DirectQueryDataSource, DirectQueryDataSourceType,
+    DeploymentStrategyOptionsStatus, DependencyFailureException, DirectQueryDataSource,
+    DirectQueryDataSourceType,
     DisabledOperationException,
     DomainConfig, DomainEndpointOptions,
     DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainMaintenanceDetails,
@@ -417,18 +418,32 @@ pub fn tagged_resource_absent() -> ValidationException {
 }
 
 /// How long work this control plane starts takes before the clock owes its outcome:
-/// a domain stays `Processing` after the call that started it (`CreateDomain`, or an
-/// `UpdateDomainConfig` that changed something) for this long before it owes a
-/// settled, `Active` configuration, an outbound cross-cluster connection stays
-/// `VALIDATING` for this long before it owes the next status of its lifecycle, and a
-/// package stays `COPYING` for this long before it owes the status its copy left it
-/// in.
+/// an outbound cross-cluster connection stays `VALIDATING` for this long before it
+/// owes the next status of its lifecycle, a package stays `COPYING` for this long
+/// before it owes the status its copy left it in, and a VPC endpoint, an application
+/// and a saved-object migration each move along their own lifecycle on it.
 ///
 /// OpenSearch Service takes many minutes; the emulator chooses a span, and it is
 /// deliberately NOT zero so a caller acting straight after the call still observes
 /// the transient state and the states that go with it. The due instant is stored on
 /// the record and materialised by whichever later call reads it — nothing sleeps.
+///
+/// Work on the DOMAIN itself has its own, longer span ([`DOMAIN_WORK`]).
 pub const PROVISIONING: Duration = Duration::from_millis(500);
+
+/// How long work on a DOMAIN takes before the clock owes its outcome: the
+/// provisioning a `CreateDomain` starts, a configuration change an
+/// `UpdateDomainConfig` started, an engine version upgrade, and a service software
+/// deployment.
+///
+/// Longer than [`PROVISIONING`] because of what this window is FOR: a domain with
+/// work in flight ([`Domain::work_in_flight`]) refuses the calls that would report
+/// its nodes or start further work on it, and that refusal is what serializes a
+/// client's own work — it issues a change, is told one is in progress, and waits. The
+/// window therefore has to stay open for as long as a client takes to make its next
+/// call and read the answer, which a span of a few hundred milliseconds does not.
+/// OpenSearch Service takes many minutes.
+pub const DOMAIN_WORK: Duration = Duration::from_secs(3);
 
 /// How long a change to one domain's package associations takes before the clock owes
 /// its outcome: an association stays `ASSOCIATING` for this long before it owes the
@@ -436,8 +451,8 @@ pub const PROVISIONING: Duration = Duration::from_millis(500);
 /// stays `DISSOCIATING` for this long before it owes its removal — or the failure that
 /// keeps it on the domain.
 ///
-/// Longer than [`PROVISIONING`], and the longest span this emulator owes any clock
-/// move, because the window it opens is what SERIALIZES writers: the service runs one
+/// Longer than [`PROVISIONING`], because the window it opens is what SERIALIZES
+/// writers: the service runs one
 /// such change per domain at a time, so a client that issues a second associate or
 /// dissociate for the domain right after the call that started a change — on another
 /// thread, or after building a second client — must still find that change in flight
@@ -3310,7 +3325,7 @@ pub const DRY_RUN_STATUS_COMPLETED: &str = "COMPLETED";
 /// the same merge the real update performs, on a copy of the domain — beside the
 /// deployment kind that change would need. It is [`DRY_RUN_STATUS_PENDING`] from the
 /// call that started it until the span the clock owes the analysis has passed
-/// ([`PROVISIONING`], the same span a configuration change takes), and
+/// ([`PROVISIONING`]), and
 /// [`DRY_RUN_STATUS_COMPLETED`] after — materialised by whichever later call reads
 /// the record ([`Self::settle`]), so nothing sleeps.
 #[derive(Debug, Clone)]
@@ -3410,7 +3425,7 @@ impl DryRun {
 /// domain onto, and when the clock owes it completion.
 ///
 /// A deployment is started by a service-software call and completes when the span the
-/// clock owes it has passed ([`PROVISIONING`], the same span a configuration change
+/// clock owes it has passed ([`DOMAIN_WORK`], the same span a configuration change
 /// takes) — materialised by whichever later call reads the record, so nothing sleeps.
 #[derive(Debug, Clone)]
 pub struct SoftwareDeployment {
@@ -3457,32 +3472,32 @@ fn scheduled_update_sentence(domain: &str) -> String {
     format!("A service software update is already scheduled on {domain}.")
 }
 
-/// The `ValidationException` payload for a service software update a domain's record
-/// has nothing to deploy for: a deployment is already in flight on it, one is already
-/// scheduled, or no release is available for it to be moved onto.
+/// How the service states that a domain cannot take a service software update now:
+/// a deployment is already in flight on it, one is already scheduled, no release is
+/// available for it to be moved onto, or other work is in flight on the domain.
+///
+/// ONE sentence for the whole rule, with no variable part — the service states the
+/// condition, not which part of it the record failed, and not the domain the request
+/// named.
+pub const DOMAIN_NOT_AVAILABLE_FOR_UPDATE: &str = "The domain is not available for update.";
+
+/// The `ValidationException` payload for a service software update a domain is not in
+/// a state to take.
 ///
 /// `StartServiceSoftwareUpdate` models `ValidationException` for a request the
-/// service cannot serve as asked, and a domain whose record has no update available
-/// is exactly that — there is no release to deploy, so nothing is scheduled. The
-/// sentence is the one that record's own `ServiceSoftwareOptions$Description` states
-/// for the condition, naming the domain the request asked about.
-pub fn no_software_update_available(
-    domain_name: &str,
-    deploying: bool,
-    scheduled: bool,
-) -> ValidationException {
-    let named = format!("domain {domain_name}");
-    let message = if deploying {
-        deployment_in_progress_sentence(&named)
-    } else if scheduled {
-        scheduled_update_sentence(&named)
-    } else {
-        no_update_available_sentence(&named)
-    };
+/// service cannot serve as asked, and a domain that is not available for an update is
+/// exactly that — there is no release to deploy, so nothing is scheduled.
+pub fn domain_not_available_for_update() -> ValidationException {
     ValidationException {
-        message: Some(message),
+        message: Some(DOMAIN_NOT_AVAILABLE_FOR_UPDATE.to_string()),
     }
 }
+
+/// How the service states that a domain has no service software update a cancel can
+/// call off: both halves of the answer — that the cancel cannot be done, and why —
+/// in one fixed sentence carrying no variable part.
+pub const NO_PENDING_UPDATE_TO_CANCEL: &str =
+    "The domain update cannot be cancelled. There is no pending update.";
 
 /// The `ValidationException` payload for a service software update a domain has none
 /// of to call off: nothing is scheduled on it, or the deployment it scheduled has
@@ -3491,19 +3506,93 @@ pub fn no_software_update_available(
 /// `CancelServiceSoftwareUpdate` is documented "you can only perform this operation
 /// before the `AutomatedUpdateDate` and when the domain's `UpdateStatus` is
 /// `PENDING_UPDATE`", so outside that state there is nothing to cancel and the call is
-/// refused with the operation's modelled `ValidationException`, naming which part of
-/// the rule the record fails.
-pub fn no_software_update_to_cancel(domain_name: &str, deploying: bool) -> ValidationException {
-    let named = format!("domain {domain_name}");
-    let message = if deploying {
-        deployment_in_progress_sentence(&named)
-    } else {
-        format!("There is no scheduled service software update to cancel on {named}.")
-    };
+/// refused with the operation's modelled `ValidationException`.
+pub fn no_software_update_to_cancel() -> ValidationException {
     ValidationException {
-        message: Some(message),
+        message: Some(NO_PENDING_UPDATE_TO_CANCEL.to_string()),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The refusals a domain with work in flight answers with
+//
+// A domain that is being provisioned, applying a configuration change, upgrading
+// its engine or deploying service software ([`Domain::work_in_flight`]) serves
+// neither a report of its nodes nor a call that would start further work on it.
+// Each operation refuses with the error ITS model declares for the condition and
+// with the service's own fixed sentence for it, which is why the sentences live
+// here beside one another rather than in the handlers.
+// ---------------------------------------------------------------------------
+
+/// How the service states that the node information of a domain cannot be fetched
+/// right now, and that the condition passes.
+pub const NODE_INFORMATION_UNAVAILABLE: &str =
+    "The node information is not available now, please try again later.";
+
+/// The `DependencyFailureException` payload for a report of a domain's nodes the
+/// service cannot answer: the nodes of a domain with work in flight are not up, or
+/// are being replaced, so there is no node census to read.
+///
+/// `DependencyFailureException` is "an exception for when a failure in one of the
+/// dependencies results in the service being unable to fetch details about the
+/// resource" (`@httpError 424`), which is that condition exactly.
+pub fn node_information_unavailable() -> DependencyFailureException {
+    DependencyFailureException {
+        message: Some(NODE_INFORMATION_UNAVAILABLE.to_string()),
+    }
+}
+
+/// The `BaseException` payload for the additional validation check a verbose dry run
+/// runs against the live domain, which cannot run while the domain is busy.
+pub fn verbose_dry_run_during_activity() -> BaseException {
+    BaseException {
+        message: Some(
+            "Verbose Dry Run cannot be performed at this time due to ongoing activities on \
+             the domain"
+                .to_string(),
+        ),
+    }
+}
+
+/// The `BaseException` payload for an engine version upgrade asked for on a domain
+/// that is already busy with work of its own.
+pub fn upgrade_blocked_by_background_tasks() -> BaseException {
+    BaseException {
+        message: Some("Upgrade failed. Domain has background tasks in progress".to_string()),
+    }
+}
+
+/// The `ValidationException` payload for a call that would start another change on a
+/// domain while one is still being applied.
+pub fn change_already_in_progress() -> ValidationException {
+    ValidationException {
+        message: Some(
+            "A change/update is in progress. Please wait for it to complete before \
+             requesting another change."
+                .to_string(),
+        ),
+    }
+}
+
+/// The `ValidationException` payload for a cancel asked for outside the two states a
+/// domain has a change to cancel in, naming them.
+pub fn cancel_outside_cancellable_states() -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "CancelDomainConfigChange only when domain state is in \
+             {PROCESSING_STATUS_MODIFYING} or {PROCESSING_STATUS_UPDATING_SERVICE_SOFTWARE}."
+        )),
+    }
+}
+
+/// The two `DomainProcessingStatusType` values a domain has a configuration change to
+/// cancel in: one applying a change of its options, and one deploying service
+/// software. Every other state — being created, deleted, upgraded, or settled — has
+/// no such change, which is what [`cancel_outside_cancellable_states`] states.
+pub const CANCELLABLE_PROCESSING_STATUSES: [&str; 2] = [
+    PROCESSING_STATUS_MODIFYING,
+    PROCESSING_STATUS_UPDATING_SERVICE_SOFTWARE,
+];
 
 /// A service software update a caller asked to start LATER: the release it will move
 /// the domain onto, and the instant the schedule the caller named puts it at.
@@ -3600,7 +3689,7 @@ impl ServiceSoftware {
                 self.deployment = Some(SoftwareDeployment {
                     completes_at: pending
                         .starts_at
-                        .checked_add(PROVISIONING)
+                        .checked_add(DOMAIN_WORK)
                         .unwrap_or(pending.starts_at),
                     target_version: pending.target_version,
                     rollback: false,
@@ -3664,7 +3753,7 @@ impl ServiceSoftware {
         if starts_at <= now {
             self.deployment = Some(SoftwareDeployment {
                 target_version: target,
-                completes_at: starts_at.checked_add(PROVISIONING).unwrap_or(starts_at),
+                completes_at: starts_at.checked_add(DOMAIN_WORK).unwrap_or(starts_at),
                 rollback: false,
             });
         } else {
@@ -3716,7 +3805,7 @@ impl ServiceSoftware {
         self.rollback_until = None;
         self.deployment = Some(SoftwareDeployment {
             target_version: target.clone(),
-            completes_at: now + PROVISIONING,
+            completes_at: now + DOMAIN_WORK,
             rollback: true,
         });
         Some(RollbackServiceSoftwareOptions {
@@ -3893,7 +3982,7 @@ const STEP_PROGRESS_COMPLETE: u32 = 100;
 /// emulator persists it.
 ///
 /// A run is started by `UpgradeDomain` and completes when the span the clock owes it
-/// has passed ([`PROVISIONING`], the same span a configuration change takes),
+/// has passed ([`DOMAIN_WORK`], the same span a configuration change takes),
 /// materialised by whichever later call reads the record, so nothing sleeps. Its
 /// steps are derived from that span rather than stored, so the step a caller polls
 /// and the overall status beside it cannot disagree.
@@ -3963,7 +4052,7 @@ impl UpgradeRun {
     fn span(&self) -> u128 {
         self.completes_at
             .duration_since(self.started_at)
-            .unwrap_or(PROVISIONING)
+            .unwrap_or(DOMAIN_WORK)
             .as_millis()
             .max(1)
     }
@@ -4570,7 +4659,7 @@ pub struct Domain {
     pub processing: bool,
     /// One of `DomainProcessingStatusType`'s values.
     pub processing_status: String,
-    /// When the clock owes this domain a settled configuration; see [`PROVISIONING`].
+    /// When the clock owes this domain a settled configuration; see [`DOMAIN_WORK`].
     pub processing_until: Option<SystemTime>,
     pub cluster_config: ClusterConfig,
     pub ebs_options: Option<EBSOptions>,
@@ -4714,7 +4803,7 @@ impl Domain {
     pub fn begin_change(&mut self, status: &str, properties: &[&str], now: SystemTime) {
         self.processing = true;
         self.processing_status = status.to_string();
-        self.processing_until = Some(now + PROVISIONING);
+        self.processing_until = Some(now + DOMAIN_WORK);
         let mut properties: Vec<String> =
             properties.iter().map(|option| option.to_string()).collect();
         properties.sort();
@@ -4926,7 +5015,7 @@ impl Domain {
             perform_check_only,
             advanced_options,
             started_at: now,
-            completes_at: now + PROVISIONING,
+            completes_at: now + DOMAIN_WORK,
             applied: false,
         };
         if !perform_check_only {
@@ -5326,11 +5415,7 @@ impl Domain {
             change_progress_details: self.latest_change().map(ConfigChange::to_details),
             off_peak_window_options: self.off_peak_window_options.clone(),
             software_update_options: self.software_update_options.clone(),
-            domain_processing_status: Some(if self.service_software.deploying() {
-                PROCESSING_STATUS_UPDATING_SERVICE_SOFTWARE.to_string()
-            } else {
-                self.processing_status.clone()
-            }),
+            domain_processing_status: Some(self.reported_processing_status().to_string()),
             // Nothing is reported as modifying: this emulator applies an update in
             // one step and then settles it.
             modifying_properties: None,
@@ -5526,7 +5611,7 @@ impl Domain {
     /// elected master, a readable shard allocation and nodes to report.
     ///
     /// A domain is [`PROCESSING_STATUS_CREATING`] from the call that mints it until
-    /// the provisioning the clock owes it ([`PROVISIONING`]) falls due, and no node
+    /// the provisioning the clock owes it ([`DOMAIN_WORK`]) falls due, and no node
     /// exists before then. A later configuration change leaves the running cluster
     /// in place, so a [`PROCESSING_STATUS_MODIFYING`] domain is up.
     pub fn cluster_is_up(&self) -> bool {
@@ -5543,6 +5628,35 @@ impl Domain {
             return None;
         }
         self.processing_until
+    }
+
+    /// `DomainStatus$DomainProcessingStatus`: where this domain is in its own
+    /// lifecycle, one of `DomainProcessingStatusType`'s values.
+    ///
+    /// Derived in ONE place so the status a descriptor reports and the status the
+    /// state gates below read can never disagree: a service software deployment is
+    /// work on the domain that no configuration change records, so a deploying domain
+    /// is [`PROCESSING_STATUS_UPDATING_SERVICE_SOFTWARE`] whatever its last
+    /// configuration change left behind.
+    pub fn reported_processing_status(&self) -> &str {
+        if self.service_software.deploying() {
+            PROCESSING_STATUS_UPDATING_SERVICE_SOFTWARE
+        } else {
+            &self.processing_status
+        }
+    }
+
+    /// Whether this domain has work in flight: it is being provisioned, a
+    /// configuration change of it is being applied, an engine version upgrade is
+    /// running or a service software deployment is being deployed.
+    ///
+    /// Read AFTER [`Self::settle`] has materialised whatever the clock owed the
+    /// record, so work whose span has passed is no longer in flight.
+    pub fn work_in_flight(&self) -> bool {
+        self.processing
+            || self.service_software.deploying()
+            || self.upgrade_in_flight()
+            || self.changes.iter().any(ConfigChange::in_progress)
     }
 }
 
@@ -9451,6 +9565,18 @@ pub fn invalid_node_id() -> ResourceNotFoundException {
         message: Some("The requested node ID is invalid".to_string()),
     }
 }
+
+/// The HTTP status this service answers a maintenance LISTING's not-found refusal
+/// with.
+///
+/// `ResourceNotFoundException` carries `@httpError(409)` in the model, which is the
+/// status the shape renders by default and the one `StartDomainMaintenance` and
+/// `GetDomainMaintenanceStatus` are recorded answering. The wire answer recorded for
+/// `ListDomainMaintenances` is HTTP 404 instead, so that operation states the status
+/// rather than taking the shape's — see
+/// [`crate::scaffolded::Scaffolded::ModeledWithStatus`], which is the only place a
+/// status may differ from the model's and requires exactly this kind of evidence.
+pub const MAINTENANCE_LISTING_NOT_FOUND_STATUS: u16 = 404;
 
 /// The `ValidationException` payload for a maintenance request that names no node:
 /// the action is "the node maintenance process on the data node", so there is no

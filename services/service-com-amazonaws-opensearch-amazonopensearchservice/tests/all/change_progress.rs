@@ -118,11 +118,18 @@ async fn a_change_reports_the_option_it_sets_pending_then_completed() {
     let emulator = Emulator::new();
     // One row per kind of option container the shared change table spans: a cluster
     // structure, an EBS structure, a policy string, a free-form map, a snapshot
-    // structure, an enum, a `LogType`-keyed map and a software-update structure.
-    for (index, (option, value, _)) in change_rows().into_iter().enumerate() {
-        let name = format!("progress-{index}");
-        create_baseline(&emulator, &name).await;
+    // structure, an enum, a `LogType`-keyed map and a software-update structure. The
+    // domains are created first so ONE wait settles every one of them: a domain that
+    // is still being provisioned has work in flight, and the update under test is a
+    // further change, which such a domain refuses.
+    let rows = change_rows();
+    for index in 0..rows.len() {
+        create_baseline(&emulator, &format!("progress-{index}")).await;
+    }
+    tokio::time::sleep(SETTLE_WAIT).await;
 
+    for (index, (option, value, _)) in rows.into_iter().enumerate() {
+        let name = format!("progress-{index}");
         let updated = emulator
             .update_config(&name, json!({ option: value.clone() }))
             .await;
@@ -279,6 +286,10 @@ async fn every_change_keeps_its_own_id_and_the_latest_is_the_implicit_one() {
     for updates in [0usize, 1, 2, 5] {
         let name = format!("history-{updates}");
         create_baseline(&emulator, &name).await;
+        // The service applies one change of a domain at a time, so each change has to
+        // land before the next can be started: the waits below are what let this row
+        // build a HISTORY rather than a queue.
+        tokio::time::sleep(SETTLE_WAIT).await;
 
         // (change id, the properties that change set) in the order they were started.
         let mut history: Vec<(String, Vec<String>)> = vec![(
@@ -304,6 +315,7 @@ async fn every_change_keeps_its_own_id_and_the_latest_is_the_implicit_one() {
                 string_member(&status, "ChangeId", &format!("{name}: {option}")),
                 vec![option.to_string()],
             ));
+            tokio::time::sleep(SETTLE_WAIT).await;
         }
 
         let ids: Vec<&String> = history.iter().map(|(id, _)| id).collect();

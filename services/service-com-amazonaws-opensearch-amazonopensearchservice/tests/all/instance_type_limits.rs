@@ -37,7 +37,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
+use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
 
 /// The engine versions the role and storage tables span: one release of each engine
 /// that offers every family named below, so no rule rests on a single version.
@@ -868,6 +868,9 @@ async fn a_volume_outside_the_published_range_is_refused_on_update() {
         "case create {name}: expected HTTP 200, got {} {:?}",
         created.status, created.body
     );
+    // The service applies one change of a domain at a time, so the change the create
+    // started has to land before an update can start another.
+    tokio::time::sleep(SETTLE_WAIT).await;
 
     // One row per way a merged configuration leaves the published range: a resize below
     // the floor, a resize over the instance's maximum, a magnetic volume over the flat
@@ -982,6 +985,8 @@ async fn a_volume_outside_the_published_range_is_refused_on_update() {
         "case create {wide}: expected HTTP 200, got {} {:?}",
         created.status, created.body
     );
+    // The change the create started has to land before an update can start another.
+    tokio::time::sleep(SETTLE_WAIT).await;
     let shrunk = emulator
         .update_config(
             wide,

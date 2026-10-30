@@ -32,7 +32,9 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 
 use super::domain_configuration_rules::{assert_no_domain, assert_refusal};
-use super::domain_lifecycle::{baseline_create, create_baseline, Answer, Emulator, REGION};
+use super::domain_lifecycle::{
+    baseline_create, create_baseline, Answer, Emulator, REGION, SETTLE_WAIT,
+};
 use super::service_software_update::message;
 
 /// The error every refusal below carries: the operation's modelled 400 for a
@@ -427,6 +429,9 @@ async fn update_domain_config_judges_the_cognito_authentication_it_is_handed() {
     let fixture = Fixture::new().await;
     let name = "cognito-update";
     create_baseline(&fixture.emulator, name).await;
+    // The service applies one change of a domain at a time, so the change the create
+    // started has to land before a row's update can start another.
+    tokio::time::sleep(SETTLE_WAIT).await;
 
     for row in &fixture.rows {
         let case = format!("UpdateDomainConfig({})", row.case);
@@ -452,6 +457,8 @@ async fn update_domain_config_judges_the_cognito_authentication_it_is_handed() {
                 row.options,
                 "case {case}: DescribeDomainConfig expected the sent container"
             );
+            // And this row's change lands before the next row starts another.
+            tokio::time::sleep(SETTLE_WAIT).await;
             continue;
         };
 

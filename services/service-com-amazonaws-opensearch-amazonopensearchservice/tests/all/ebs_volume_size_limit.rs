@@ -30,7 +30,7 @@
 
 use serde_json::{json, Value};
 
-use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
+use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
 use super::instance_type_limits::published_volume_size_range;
 
 /// The pairings the table spans: one row per instance SIZE the published maximum
@@ -219,6 +219,9 @@ async fn a_volume_outside_the_published_range_is_a_service_limit_refusal_on_upda
         "case create {name}: expected HTTP 200, got {} {:?}",
         created.status, created.body
     );
+    // The service applies one change of a domain at a time, so the change the create
+    // started has to land before an update can start another.
+    tokio::time::sleep(SETTLE_WAIT).await;
 
     // The bounds an update is judged against are the ones published for the MERGED
     // record: a resize is judged against the instance type the domain keeps, and a

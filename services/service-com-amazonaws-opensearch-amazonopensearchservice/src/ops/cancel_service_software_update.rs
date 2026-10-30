@@ -168,13 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can only perform this operation before the AutomatedUpdateDate and when
         // the domain's UpdateStatus is PENDING_UPDATE": the eligibility test lives on
         // the record, so outside that state there is no update to call off and the call
-        // is REFUSED with the operation's modelled `ValidationException` — naming which
-        // part of the rule it failed — leaving the record exactly as it was.
-        let software = &mut domain.service_software;
-        let deploying = software.deploying();
-        let options = software.cancel_update().ok_or_else(|| {
+        // is REFUSED with the operation's modelled `ValidationException`, leaving the
+        // record exactly as it was.
+        let options = domain.service_software.cancel_update().ok_or_else(|| {
             CancelServiceSoftwareUpdateErrorModeled::ValidationException(
-                no_software_update_to_cancel(&input.domain_name, deploying),
+                no_software_update_to_cancel(),
             )
         })?;
 

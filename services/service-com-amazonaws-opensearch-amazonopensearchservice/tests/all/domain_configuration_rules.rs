@@ -42,7 +42,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::domain_lifecycle::{
-    baseline_create, create_baseline, error_code, Answer, Emulator, PREFIX,
+    baseline_create, create_baseline, error_code, Answer, Emulator, PREFIX, SETTLE_WAIT,
 };
 use super::service_software_update::{
     message, seed, settled_domain, start, with_update_available,
@@ -187,6 +187,9 @@ async fn a_master_password_must_meet_the_published_complexity_requirement() {
     // control, so a weak password cannot be reached by updating into it.
     let name = "fgac-update";
     create_baseline(&emulator, name).await;
+    // The service applies one change of a domain at a time, so each accepted change
+    // has to land before the next row's update can start another.
+    tokio::time::sleep(SETTLE_WAIT).await;
     for (case, password, accepted) in rows {
         let answer = emulator
             .update_config(
@@ -200,6 +203,7 @@ async fn a_master_password_must_meet_the_published_complexity_requirement() {
                 "case UpdateDomainConfig({case}): expected 200, got {} with {:?}",
                 answer.status, answer.body
             );
+            tokio::time::sleep(SETTLE_WAIT).await;
         } else {
             assert_refusal(&answer, "ValidationException", case);
         }
@@ -317,6 +321,8 @@ async fn each_storage_tier_rests_on_the_one_below_it() {
     // while enabling both tiers in one call is served.
     let name = "tier-update";
     create_baseline(&emulator, name).await;
+    // The change the create started has to land before an update can start another.
+    tokio::time::sleep(SETTLE_WAIT).await;
     let before = described(&emulator, name).await["ClusterConfig"].clone();
     let answer = emulator
         .update_config(
@@ -410,6 +416,8 @@ async fn an_enabled_log_publishing_option_must_name_its_log_group() {
     // and through the call that CHANGES a domain's log publishing.
     let updated = "logs-update";
     create_baseline(&emulator, updated).await;
+    // The change the create started has to land before an update can start another.
+    tokio::time::sleep(SETTLE_WAIT).await;
     let maps: Vec<(&str, Value, Option<&str>)> = vec![
         (
             "both enabled without a group",
@@ -462,11 +470,15 @@ async fn an_enabled_log_publishing_option_must_name_its_log_group() {
             .await;
         match offending {
             Some(_) => assert_refusal(&answer, "ValidationException", case),
-            None => assert_eq!(
-                answer.status, 200,
-                "case UpdateDomainConfig({case}): expected 200, got {} with {:?}",
-                answer.status, answer.body
-            ),
+            None => {
+                assert_eq!(
+                    answer.status, 200,
+                    "case UpdateDomainConfig({case}): expected 200, got {} with {:?}",
+                    answer.status, answer.body
+                );
+                // An accepted change lands before the next row starts another.
+                tokio::time::sleep(SETTLE_WAIT).await;
+            }
         }
     }
 }
@@ -521,6 +533,8 @@ async fn the_off_peak_window_cannot_be_asked_for_disabled() {
         json!({ "Enabled": true, "OffPeakWindow": window.clone() }),
     )
     .await;
+    // The change the create started has to land before an update can start another.
+    tokio::time::sleep(SETTLE_WAIT).await;
     let before = described(&emulator, name).await["OffPeakWindowOptions"].clone();
     let answer = emulator
         .update_config(name, json!({ "OffPeakWindowOptions": { "Enabled": false } }))
@@ -634,8 +648,10 @@ async fn a_domain_that_publishes_no_logs_omits_the_member_and_keeps_the_containe
 
     // And an update that configures the option on a domain created without it makes
     // the member appear, so presence tracks what the domain publishes rather than the
-    // call that read it.
+    // call that read it. The change its create started has to land first: a domain
+    // that is still being provisioned refuses a further change.
     let name = "logs-presence-0";
+    tokio::time::sleep(SETTLE_WAIT).await;
     let answer = emulator
         .update_config(name, json!({ "LogPublishingOptions": configured.clone() }))
         .await;

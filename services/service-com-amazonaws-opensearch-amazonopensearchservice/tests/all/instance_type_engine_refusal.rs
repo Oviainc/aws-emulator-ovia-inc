@@ -26,7 +26,7 @@
 
 use serde_json::{json, Value};
 
-use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
+use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX, SETTLE_WAIT};
 
 /// Pairings the service does not offer: an instance type together with an engine
 /// release that does not run it, one row per family the published instance-type
@@ -431,6 +431,9 @@ async fn an_update_refuses_the_same_pairing_and_keeps_the_stored_cluster() {
             "case CreateDomain({name}, {version}, {created_type}): expected 200, got {} {:?}",
             created.status, created.body
         );
+        // The service applies one change of a domain at a time, so the change the
+        // create started has to land before an update can start another.
+        tokio::time::sleep(SETTLE_WAIT).await;
 
         // An applied update and a dry run are both refused: the dry run reports what
         // applying the change would do, and this change cannot be applied.

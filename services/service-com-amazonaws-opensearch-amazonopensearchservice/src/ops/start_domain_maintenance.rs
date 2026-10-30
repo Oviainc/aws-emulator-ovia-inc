@@ -190,8 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // The node has to be one of this domain's data nodes, and its role has to be
-        // able to lose it; any other id names no node this service can maintain.
-        if !crate::state::maintainable_data_node(domain, node_id) {
+        // able to lose it; any other id names no node this service can maintain. A
+        // domain with work in flight publishes no node census at all — its nodes do
+        // not exist yet, or are being replaced — so every id is outside it and the
+        // same refusal applies ([`crate::state::Domain::work_in_flight`]).
+        if domain.work_in_flight() || !crate::state::maintainable_data_node(domain, node_id) {
             return Err(StartDomainMaintenanceErrorModeled::ResourceNotFoundException(
                 crate::state::invalid_node_id(),
             )

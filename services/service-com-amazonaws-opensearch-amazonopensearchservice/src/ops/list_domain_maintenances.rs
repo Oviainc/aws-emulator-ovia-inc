@@ -13,6 +13,11 @@
 //! clock already owed each action — owed at this instant whether or not anybody
 //! called.
 //!
+//! An action runs on one data node, so the listing depends on the domain's node
+//! census: a domain with work in flight has none, and the request is refused with the
+//! modelled not-found rather than answered with a list
+//! ([`crate::state::Domain::work_in_flight`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -195,6 +200,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::domain_not_found(&input.domain_name),
             )
         })?;
+
+        // A maintenance action runs on ONE data node of the domain, so this listing
+        // reads the same node census `DescribeDomainNodes` does — and a domain with
+        // work in flight has none: its nodes do not exist yet, or are being replaced.
+        // There is then no node whose actions could be listed, which is the same
+        // invalid-node refusal `StartDomainMaintenance` answers an id the census does
+        // not publish with — carried, for THIS operation, under the status the service
+        // was recorded answering it with rather than the shape's own
+        // ([`crate::state::MAINTENANCE_LISTING_NOT_FOUND_STATUS`]).
+        if domain.work_in_flight() {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                ListDomainMaintenancesErrorModeled::ResourceNotFoundException(
+                    crate::state::invalid_node_id(),
+                ),
+                crate::state::MAINTENANCE_LISTING_NOT_FOUND_STATUS,
+            ));
+        }
 
         // `Action` is "the name of the action" and `Status` "the status of the
         // action": each narrows the listing to the actions that carry the value
