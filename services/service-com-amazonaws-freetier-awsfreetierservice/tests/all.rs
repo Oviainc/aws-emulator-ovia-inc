@@ -23,6 +23,8 @@ mod dimension_decode;
 mod free_tier;
 #[path = "all/language_code_subtag_rule.rs"]
 mod language_code_subtag_rule;
+#[path = "all/match_option_cardinality.rs"]
+mod match_option_cardinality;
 #[path = "all/refused_request_media_type.rs"]
 mod refused_request_media_type;
 #[path = "all/resource_not_found_status.rs"]

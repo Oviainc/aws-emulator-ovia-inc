@@ -53,7 +53,11 @@ fn message(payload: &Value) -> String {
 }
 
 /// Assert that one request is refused `400 ValidationException` and report its message.
-async fn refusal_message(
+///
+/// Shared with the suites that assert ONE of these rules over a wider table (see
+/// `tests/all/match_option_cardinality.rs`), so every suite reads a refusal's message the
+/// same way.
+pub(crate) async fn refusal_message(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
