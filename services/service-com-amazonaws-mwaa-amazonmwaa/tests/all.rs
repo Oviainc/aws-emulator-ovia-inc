@@ -51,6 +51,8 @@ mod environment_webserver_access_mode_version_floor;
 mod list_environments_cursor_scope;
 #[path = "all/published_metrics.rs"]
 mod published_metrics;
+#[path = "all/published_metrics_reach_cloudwatch.rs"]
+mod published_metrics_reach_cloudwatch;
 #[path = "all/rejection_contract.rs"]
 mod rejection_contract;
 #[path = "all/reserved_tag_keys.rs"]

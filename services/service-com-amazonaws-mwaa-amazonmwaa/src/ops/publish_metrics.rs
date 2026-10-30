@@ -2,22 +2,28 @@
 
 //! @op PublishMetrics
 //!
-//! Publishes environment health metrics for one environment: every datum of the request is
-//! appended to the metric series it addresses on THAT environment's record
-//! ([`crate::state::EnvironmentMetrics`]), so a datapoint one request published is part of
-//! the series every later one reads.
+//! Publishes environment health metrics for one environment to the destination the
+//! operation documents for them, Amazon CloudWatch: every datum of the request is appended
+//! to the CloudWatch store in the SAME shared engine ([`crate::state::metrics`]), so what a
+//! publish stored is what CloudWatch's own `ListMetrics`, `GetMetricStatistics` and
+//! `GetMetricData` report. Nothing is kept on the environment's own record beside it.
 //!
-//! A metric is identified by its name TOGETHER with its dimension set, and that set is
-//! unordered, so the series key holds the dimensions as a sorted map: two datums that name
-//! the same dimensions in a different order land in one series, and the same metric name
-//! under different dimensions lands in two. A datum states its observations either as one
-//! `Value` or as a `StatisticValues` set; both are stored as the statistics of a set of
-//! observations ([`crate::state::MetricStatistics`]), a single value being one observation
-//! that is its own sum, minimum and maximum, so the aggregation of a series needs no case
-//! for the form each datapoint arrived in.
+//! A metric is identified by its namespace, its name and its dimension set together, and
+//! that set is unordered, so the dimensions travel as a sorted map: two datums that name the
+//! same dimensions in a different order land in one series, and the same metric name under
+//! different dimensions lands in two. The environment a publish names is in the request's
+//! URI rather than in the datum, so the published series carries it as a dimension of its
+//! own ([`crate::state::metrics::ENVIRONMENT_DIMENSION`]) beside what the datum named —
+//! otherwise two environments publishing one metric name would share one series. A datum
+//! states its observations either as one `Value` or as a `StatisticValues` set; both are
+//! published as the statistics of a set of observations
+//! ([`crate::state::MetricStatistics`]), a single value being one observation that is its
+//! own sum, minimum and maximum, so the aggregation a reader computes needs no case for the
+//! form each datapoint arrived in.
 //!
 //! The model marks this operation internal, so nothing it accepts is reported by another
-//! operation of this service: what it answers is the modelled empty output at HTTP 200.
+//! operation of THIS service: what it answers is the modelled empty output at HTTP 200, and
+//! what it published is read through the destination.
 //!
 //! ## Which endpoint hosts it
 //!
@@ -38,14 +44,17 @@
 //! the environment lookup, so a request carrying one datum the service cannot publish stores
 //! none of them:
 //!
+//! * a request carrying more than [`crate::state::MAX_PUBLISHED_DATUMS`] datums, which is
+//!   more than the destination ingests in one request of its own;
 //! * a datum that states both `Value` and `StatisticValues`, or neither;
 //! * a number — a `Value` or any member of a `StatisticValues` set — that is not finite or is
 //!   larger in magnitude than the bound [`crate::state::is_publishable_metric_value`] states;
 //! * a `StatisticValues` set missing a member, counting no sample, or whose minimum exceeds
 //!   its maximum: it summarises no set of observations;
 //! * a blank or over-long `MetricName`, dimension name or dimension value, a datum carrying
-//!   more than [`crate::state::MAX_METRIC_DIMENSIONS`] dimensions, or one naming a dimension
-//!   twice (which would silently collapse into one);
+//!   more than [`crate::state::MAX_DATUM_DIMENSIONS`] dimensions of its own, one naming a
+//!   dimension twice (which would silently collapse into one), and one naming the dimension
+//!   this service sets itself;
 //! * a `Timestamp` so far from the epoch that it is not expressible in epoch milliseconds;
 //! * an `EnvironmentName` this Region holds no environment of, and an environment whose
 //!   teardown has started, which takes no change ([`crate::state::EnvironmentRecord::change_refusal`]);
@@ -56,7 +65,9 @@
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
 //! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back.
+//! [`crate::state::service_state`] and read and write it through the guard it hands back;
+//! the destination store is reached the same way through
+//! [`crate::state::metrics::cloudwatch_state`].
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
@@ -97,9 +108,9 @@ use super::types::*;
 
 use std::collections::BTreeMap;
 
+use crate::state::metrics::{self, MetricRejection};
 use crate::state::{
-    is_publishable_metric_value, MetricDatapoint, MetricRejection, MetricStatistics,
-    PublishedMetric,
+    is_publishable_metric_value, MetricDatapoint, MetricStatistics, PublishedMetric,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -149,6 +160,29 @@ fn validation(message: impl Into<String>) -> PublishMetricsError {
 fn store_unavailable() -> PublishMetricsError {
     PublishMetricsErrorModeled::InternalServerException(InternalServerException {
         message: Some("the Amazon MWAA environment store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The DESTINATION store being unreachable is a server fault too: these metrics are
+/// published to Amazon CloudWatch, so an engine carrying no CloudWatch store has nowhere to
+/// put them — and answering 200 would claim a publish that reached no reader.
+fn destination_unavailable() -> PublishMetricsError {
+    PublishMetricsErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the Amazon CloudWatch metric store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The destination holding no more series is a server-side limit, not a fault in the
+/// request: the same batch would be published by a store with room for it.
+fn destination_at_capacity() -> PublishMetricsError {
+    PublishMetricsErrorModeled::InternalServerException(InternalServerException {
+        message: Some(
+            "the Amazon CloudWatch metric store is at capacity, so these metrics were not \
+             published"
+                .to_string(),
+        ),
     })
     .into()
 }
@@ -243,17 +277,19 @@ fn statistics_of_set(
     })
 }
 
-/// The dimension set one datum names, as the series key holds it, or the refusal naming what
-/// is wrong with it.
+/// The dimension set one datum names, as the published series key holds it, or the refusal
+/// naming what is wrong with it. The dimension this service sets itself is NOT part of it —
+/// [`metrics::series_of`] adds that one — which is why a datum may carry one fewer than a
+/// metric may ([`crate::state::MAX_DATUM_DIMENSIONS`]).
 fn dimensions_of(
     path: &str,
     dimensions: Option<&Vec<Dimension>>,
 ) -> Result<BTreeMap<String, String>, PublishMetricsError> {
     let dimensions = dimensions.map_or(&[][..], Vec::as_slice);
-    if dimensions.len() > crate::state::MAX_METRIC_DIMENSIONS {
+    if dimensions.len() > crate::state::MAX_DATUM_DIMENSIONS {
         return Err(validation(format!(
             "{path}.dimensions must have length less than or equal to {}.",
-            crate::state::MAX_METRIC_DIMENSIONS
+            crate::state::MAX_DATUM_DIMENSIONS
         )));
     }
     let mut resolved: BTreeMap<String, String> = BTreeMap::new();
@@ -261,6 +297,16 @@ fn dimensions_of(
         let member = format!("{path}.dimensions.{}.member", position + 1);
         let name = label(&format!("{member}.name"), &dimension.name)?;
         let value = label(&format!("{member}.value"), &dimension.value)?;
+        // The published series is dimensioned on the environment the REQUEST addresses, so a
+        // datum naming that dimension itself would either be overwritten or claim to describe
+        // another environment.
+        if name == metrics::ENVIRONMENT_DIMENSION {
+            return Err(validation(format!(
+                "{member}.name must not be {}: that dimension names the environment the \
+                 request publishes for.",
+                metrics::ENVIRONMENT_DIMENSION
+            )));
+        }
         // A dimension set is a map from name to value, so a name stated twice would collapse
         // into one and silently discard a value the caller sent.
         if resolved.insert(name.clone(), value).is_some() {
@@ -355,7 +401,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Judged on the request alone, so the whole batch is refused before the store is
         // touched: a request carrying one datum the service cannot publish publishes none of
-        // them.
+        // them. The batch's SIZE is judged first, because it is what sizes everything below
+        // it — the datums this handler builds and the work publishing them owes the
+        // destination while its store is locked.
+        if input.metric_data.len() > crate::state::MAX_PUBLISHED_DATUMS {
+            return Err(validation(format!(
+                "metricData must have length less than or equal to {}.",
+                crate::state::MAX_PUBLISHED_DATUMS
+            )));
+        }
         let batch = input
             .metric_data
             .iter()
@@ -364,38 +418,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect::<Result<Vec<PublishedMetric>, PublishMetricsError>>()?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let mut store = state.lock();
-        store.settle(now);
+        {
+            let mut store = state.lock();
+            store.settle(now);
 
-        // Nothing resolved this name before the request reached here (the operation is
-        // hosted on the `ops.` endpoint, not behind the per-environment front door), so this
-        // layer owns the refusal: the shared sentence for a named environment it holds no
-        // record of, in the only client error this operation models.
-        let stored = store
-            .environment_mut(&region, &input.environment_name)
-            .ok_or_else(|| {
-                validation(crate::state::environment_not_found_message(
-                    &input.environment_name,
-                ))
-            })?;
+            // Nothing resolved this name before the request reached here (the operation is
+            // hosted on the `ops.` endpoint, not behind the per-environment front door), so
+            // this layer owns the refusal: the shared sentence for a named environment it
+            // holds no record of, in the only client error this operation models.
+            let stored = store
+                .environment(&region, &input.environment_name)
+                .ok_or_else(|| {
+                    validation(crate::state::environment_not_found_message(
+                        &input.environment_name,
+                    ))
+                })?;
 
-        // An environment on its way out takes no change: what was published would be applied
-        // to a record the clock is about to remove, so it would vanish with it.
-        if let Some(message) = stored.change_refusal() {
-            return Err(validation(message));
+            // An environment on its way out takes no change: it is about to stop running,
+            // so there is no environment left for a health metric to be about.
+            if let Some(message) = stored.change_refusal() {
+                return Err(validation(message));
+            }
         }
 
-        // All or nothing: the store checks the series ceiling against the whole batch before
-        // it writes any of it.
-        stored
-            .metrics
-            .record_all(&batch)
-            .map_err(|rejection| match rejection {
-                MetricRejection::SeriesLimitExceeded => validation(format!(
-                    "this emulator holds at most {} metric series for one environment",
-                    crate::state::MAX_METRIC_SERIES
-                )),
-            })?;
+        // The destination the operation documents for these metrics: the CloudWatch store in
+        // this same engine, which is what reports them to a reader. This service's own store
+        // is unlocked again by now, so the two are never held at once; a teardown that starts
+        // in that window still leaves this batch published, which is right either way — a
+        // published metric outlives the environment it describes.
+        let destination =
+            metrics::cloudwatch_state(&*self.engine).ok_or_else(destination_unavailable)?;
+        // All or nothing: the destination is checked against the whole batch before any of
+        // it is appended.
+        metrics::record_all(
+            &destination,
+            &input.environment_name,
+            &batch,
+            metrics::epoch_secs(now),
+        )
+        .map_err(|rejection| match rejection {
+            MetricRejection::SeriesLimitExceeded => validation(format!(
+                "this emulator holds at most {} metric series for one environment",
+                crate::state::MAX_METRIC_SERIES
+            )),
+            MetricRejection::DestinationAtCapacity => destination_at_capacity(),
+        })?;
 
         Ok(PublishMetricsOutput {})
     }

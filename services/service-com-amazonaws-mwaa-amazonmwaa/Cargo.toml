@@ -35,6 +35,11 @@ service-common = { path = "../common" }
 # identity `CreateWebLoginToken` reports — so this service reads the state of the service
 # that minted that credential rather than keeping a second copy of the fact.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The CloudWatch store `PublishMetrics` publishes the environment health metrics it accepts
+# to (the `AWS/MWAA` namespace, `state::metrics`): the operation documents Amazon CloudWatch
+# as their destination, and CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
+# namespace, so this writes the very store `ListMetrics`/`GetMetricStatistics` read.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -45,6 +50,10 @@ emulator-core-build-support = { workspace = true }
 # are the ones those services minted.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The published metrics are asserted where a client reads them, so CloudWatch is mounted
+# beside this service on one engine and asked through its own `ListMetrics` and
+# `GetMetricStatistics`.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [lints]
 workspace = true

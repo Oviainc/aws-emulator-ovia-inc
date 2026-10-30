@@ -3,14 +3,15 @@
 //! What `PublishMetrics` does with the environment health metrics it is given, end to end
 //! over HTTP through the router this service mounts in production.
 //!
-//! The rule every case here asserts: a published datum is appended to the metric series its
-//! metric name TOGETHER with its dimension set identifies on the named environment's own
-//! record, as the statistics of the observations it states — one `Value` being a single
-//! observation that is its own sum, minimum and maximum, a `StatisticValues` set carrying its
-//! own — so the series a later read aggregates is everything ever published to it; and a
-//! request whose datum cannot describe observations of a metric, or whose environment this
-//! Region does not hold or cannot take a change, is refused with HTTP 400
-//! `ValidationException` and publishes NOTHING.
+//! The rule every case here asserts: a published datum is appended to the Amazon CloudWatch
+//! series its metric name TOGETHER with its dimension set identifies — the datum's own
+//! dimensions plus the one naming the environment the request addressed — as the statistics
+//! of the observations it states (one `Value` being a single observation that is its own
+//! sum, minimum and maximum, a `StatisticValues` set carrying its own), so the series a
+//! later read aggregates is everything ever published to it; and a request whose datum
+//! cannot describe observations of a metric, or whose environment this Region does not hold
+//! or cannot take a change, is refused with HTTP 400 `ValidationException` and publishes
+//! NOTHING.
 //!
 //! The rows differ along what that rule generalises over: which form a datum states its
 //! observations in, how many datums one request carries, how many dimensions they carry and
@@ -19,18 +20,22 @@
 //! magnitude bound and one past it), and which member of which datum of the batch breaks a
 //! rule.
 //!
-//! `PublishMetrics` is modelled internal, and no operation of this service reports what it
-//! stored, so a published series is read back through the shared engine's own state — the
-//! same store the handler wrote, reached exactly as the router hands it to every handler.
-//! `GetEnvironment` is asserted on too, so a publish is shown to leave the control plane's
-//! view of the environment alone.
+//! `PublishMetrics` is modelled internal and no operation of THIS service reports what it
+//! published, so a series is read back out of the destination the operation documents for
+//! it: the CloudWatch store in the same shared engine, reached exactly as the router hands
+//! it to every CloudWatch handler. What a client reads through CloudWatch's own operations
+//! is asserted by `tests/all/published_metrics_reach_cloudwatch.rs`. `GetEnvironment` is
+//! asserted on too, so a publish is shown to leave the control plane's view of the
+//! environment alone.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
 use service_com_amazonaws_mwaa_amazonmwaa::state;
 
 /// The region every request below is signed for unless it says otherwise.
@@ -42,6 +47,15 @@ const OTHER_REGION: &str = "us-west-2";
 
 /// The canonical emulator account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
+
+/// The namespace the environment health metrics of Amazon MWAA live in, as the Amazon MWAA
+/// metric reference the operation's own documentation points at names it.
+const NAMESPACE: &str = "AWS/MWAA";
+
+/// The dimension those metrics are reported per: the environment they describe. Named here
+/// rather than taken from the service, so these cases pin the series identity a client reads
+/// them under.
+const ENVIRONMENT_DIMENSION: &str = "Environment";
 
 /// A signed-looking request header so the router resolves this service by its SigV4
 /// credential scope, as an SDK request does. Signature verification is off in this harness.
@@ -81,8 +95,9 @@ impl Answer {
     }
 }
 
-/// The emulator, assembled as the router assembles it: one shared engine behind one mounted
-/// service. The engine is kept so a suite can read the store the handlers wrote.
+/// The emulator, assembled as the router assembles it: one shared engine behind the mounted
+/// services — this one, and the CloudWatch service its published metrics are destined for.
+/// The engine is kept so a suite can read the store the handlers wrote.
 struct Harness {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
@@ -95,6 +110,11 @@ impl Harness {
         router.set_request_authentication(false);
         router.register_service(
             service_com_amazonaws_mwaa_amazonmwaa::EmulatedService::new(Arc::clone(&engine)),
+        );
+        router.register_service(
+            service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
         );
         Self { router, engine }
     }
@@ -196,31 +216,40 @@ impl Harness {
             .unwrap_or_else(|| panic!("case {case:?}: GetEnvironment answered without Environment"))
     }
 
-    /// One stored metric series of `name`'s record, reached through the shared engine — the
-    /// store the handler wrote.
+    /// The HTTP status a `GetEnvironment` for `name` answers with.
+    async fn environment_status(&self, name: &str) -> u16 {
+        self.send("GET", &format!("/environments/{name}"), REGION, None)
+            .await
+            .status
+    }
+
+    /// One published series, read out of the destination store through the shared engine —
+    /// the CloudWatch store the handler wrote, and the one CloudWatch's own readers read.
     fn series(
         &self,
         name: &str,
         metric: &str,
         dimensions: &[(String, String)],
-    ) -> Option<state::MetricSeries> {
-        let store = state::service_state(&*self.engine).expect("the shared store");
+    ) -> Option<Vec<cloudwatch::StoredDatum>> {
+        let store = cloudwatch::service_state(&*self.engine).expect("the destination store");
         let store = store.lock();
         store
-            .environment(REGION, name)?
             .metrics
-            .series_of(metric, &dimension_map(dimensions))
+            .get(&published_key(name, metric, dimensions))
             .cloned()
     }
 
-    /// How many series `name`'s record holds, and how many datapoints across them.
+    /// How many series the destination holds for `name`, and how many datapoints across them.
     fn stored_counts(&self, name: &str) -> (usize, usize) {
-        let store = state::service_state(&*self.engine).expect("the shared store");
+        let store = cloudwatch::service_state(&*self.engine).expect("the destination store");
         let store = store.lock();
-        match store.environment(REGION, name) {
-            Some(record) => (record.metrics.series.len(), record.metrics.datapoint_count()),
-            None => (0, 0),
-        }
+        store
+            .metrics
+            .iter()
+            .filter(|(key, _)| published_for(key, name))
+            .fold((0, 0), |(series, datapoints), (_, held)| {
+                (series + 1, datapoints + held.len())
+            })
     }
 }
 
@@ -230,6 +259,31 @@ fn dimension_map(pairs: &[(String, String)]) -> BTreeMap<String, String> {
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
+}
+
+/// The destination series one datum of `environment` lands in: the Amazon MWAA namespace,
+/// the metric's name, and the datum's dimensions together with the environment's own.
+fn published_key(
+    environment: &str,
+    metric: &str,
+    dimensions: &[(String, String)],
+) -> cloudwatch::MetricKey {
+    let mut dimensions = dimension_map(dimensions);
+    dimensions.insert(ENVIRONMENT_DIMENSION.to_string(), environment.to_string());
+    cloudwatch::MetricKey {
+        namespace: NAMESPACE.to_string(),
+        metric_name: metric.to_string(),
+        dimensions,
+    }
+}
+
+/// Whether `key` is a series published for `environment` by this service.
+fn published_for(key: &cloudwatch::MetricKey, environment: &str) -> bool {
+    key.namespace == NAMESPACE
+        && key
+            .dimensions
+            .get(ENVIRONMENT_DIMENSION)
+            .is_some_and(|named| named == environment)
 }
 
 /// A dimension list as a `MetricDatum.Dimensions` member states it, in the order given.
@@ -270,9 +324,14 @@ fn with(datum: Value, member: &str, value: Value) -> Value {
     datum
 }
 
-/// The statistics of a set of observations, as the store holds them.
-fn statistics(sample_count: i64, sum: f64, minimum: f64, maximum: f64) -> state::MetricStatistics {
-    state::MetricStatistics {
+/// The statistics of a set of observations, as the destination holds them.
+fn statistics(
+    sample_count: f64,
+    sum: f64,
+    minimum: f64,
+    maximum: f64,
+) -> cloudwatch::BasicStatistics {
+    cloudwatch::BasicStatistics {
         sample_count,
         sum,
         minimum,
@@ -280,16 +339,18 @@ fn statistics(sample_count: i64, sum: f64, minimum: f64, maximum: f64) -> state:
     }
 }
 
-/// What one stored series must hold after a row's publish.
+/// What one published series must hold after a row's publish.
 struct Expectation {
     metric: &'static str,
+    /// The dimensions the DATUM named; the published series carries the environment's
+    /// beside them.
     dimensions: Vec<(String, String)>,
     /// The instants of the stored datapoints, in the order the series holds them.
     timestamps_millis: Vec<i64>,
     /// The units of those datapoints, in the same order.
     units: Vec<Option<&'static str>>,
     /// The statistics of the whole series, and its mean observation.
-    statistics: state::MetricStatistics,
+    statistics: cloudwatch::BasicStatistics,
     average: f64,
 }
 
@@ -325,7 +386,7 @@ fn accepted() -> Vec<Accepted> {
                 dimensions: Vec::new(),
                 timestamps_millis: vec![1_700_000_000_000],
                 units: vec![None],
-                statistics: statistics(1, 42.5, 42.5, 42.5),
+                statistics: statistics(1.0, 42.5, 42.5, 42.5),
                 average: 42.5,
             }],
         },
@@ -345,7 +406,7 @@ fn accepted() -> Vec<Accepted> {
                 dimensions: dims(&[("Function", "Scheduler")]),
                 timestamps_millis: vec![1_700_000_060_000],
                 units: vec![Some("Count")],
-                statistics: statistics(1, 7.0, 7.0, 7.0),
+                statistics: statistics(1.0, 7.0, 7.0, 7.0),
                 average: 7.0,
             }],
         },
@@ -361,7 +422,7 @@ fn accepted() -> Vec<Accepted> {
                 dimensions: Vec::new(),
                 timestamps_millis: vec![1_700_000_120_000],
                 units: vec![None],
-                statistics: statistics(4, 10.0, 1.0, 5.0),
+                statistics: statistics(4.0, 10.0, 1.0, 5.0),
                 average: 2.5,
             }],
         },
@@ -376,7 +437,7 @@ fn accepted() -> Vec<Accepted> {
                 dimensions: Vec::new(),
                 timestamps_millis: vec![1_700_000_000_000, 1_700_000_060_000],
                 units: vec![None, None],
-                statistics: statistics(2, 6.0, 2.0, 4.0),
+                statistics: statistics(2.0, 6.0, 2.0, 4.0),
                 average: 3.0,
             }],
         },
@@ -391,7 +452,7 @@ fn accepted() -> Vec<Accepted> {
                 dimensions: Vec::new(),
                 timestamps_millis: vec![1_700_000_000_000, 1_700_000_000_000],
                 units: vec![None, None],
-                statistics: statistics(2, 8.0, 2.0, 6.0),
+                statistics: statistics(2.0, 8.0, 2.0, 6.0),
                 average: 4.0,
             }],
         },
@@ -410,7 +471,7 @@ fn accepted() -> Vec<Accepted> {
                 dimensions: Vec::new(),
                 timestamps_millis: vec![1_700_000_000_000, 1_700_000_060_000],
                 units: vec![None, None],
-                statistics: statistics(3, 12.0, 3.0, 5.0),
+                statistics: statistics(3.0, 12.0, 3.0, 5.0),
                 average: 4.0,
             }],
         },
@@ -433,7 +494,7 @@ fn accepted() -> Vec<Accepted> {
                 dimensions: dims(&[("Function", "Worker"), ("Queue", "default")]),
                 timestamps_millis: vec![1_700_000_000_000, 1_700_000_060_000],
                 units: vec![None, None],
-                statistics: statistics(2, 4.0, 1.0, 3.0),
+                statistics: statistics(2.0, 4.0, 1.0, 3.0),
                 average: 2.0,
             }],
         },
@@ -457,7 +518,7 @@ fn accepted() -> Vec<Accepted> {
                     dimensions: dims(&[("Queue", "alpha")]),
                     timestamps_millis: vec![1_700_000_000_000],
                     units: vec![None],
-                    statistics: statistics(1, 1.0, 1.0, 1.0),
+                    statistics: statistics(1.0, 1.0, 1.0, 1.0),
                     average: 1.0,
                 },
                 Expectation {
@@ -465,13 +526,13 @@ fn accepted() -> Vec<Accepted> {
                     dimensions: dims(&[("Queue", "beta")]),
                     timestamps_millis: vec![1_700_000_000_000],
                     units: vec![None],
-                    statistics: statistics(1, 5.0, 5.0, 5.0),
+                    statistics: statistics(1.0, 5.0, 5.0, 5.0),
                     average: 5.0,
                 },
             ],
         },
         Accepted {
-            case: "datums published out of order are held ascending by instant",
+            case: "datums published out of order are each appended as published",
             datums: vec![
                 value_datum("SchedulerHeartbeat", 1_700_000_180, 3.0),
                 value_datum("SchedulerHeartbeat", 1_700_000_000, 1.0),
@@ -481,12 +542,12 @@ fn accepted() -> Vec<Accepted> {
                 metric: "SchedulerHeartbeat",
                 dimensions: Vec::new(),
                 timestamps_millis: vec![
+                    1_700_000_180_000,
                     1_700_000_000_000,
                     1_700_000_060_000,
-                    1_700_000_180_000,
                 ],
                 units: vec![None, None, None],
-                statistics: statistics(3, 6.0, 1.0, 3.0),
+                statistics: statistics(3.0, 6.0, 1.0, 3.0),
                 average: 2.0,
             }],
         },
@@ -498,7 +559,7 @@ fn accepted() -> Vec<Accepted> {
                 dimensions: Vec::new(),
                 timestamps_millis: vec![-86_400_000],
                 units: vec![None],
-                statistics: statistics(1, 0.0, 0.0, 0.0),
+                statistics: statistics(1.0, 0.0, 0.0, 0.0),
                 average: 0.0,
             }],
         },
@@ -513,29 +574,29 @@ fn accepted() -> Vec<Accepted> {
                 dimensions: Vec::new(),
                 timestamps_millis: vec![1_700_000_000_000, 1_700_000_060_000],
                 units: vec![None, None],
-                statistics: statistics(2, 0.0, -bound(), bound()),
+                statistics: statistics(2.0, 0.0, -bound(), bound()),
                 average: 0.0,
             }],
         },
         Accepted {
-            case: "a datum carrying the maximum number of dimensions",
+            case: "a datum carrying the maximum number of dimensions of its own",
             datums: vec![with(
                 value_datum("CpuUtilization", 1_700_000_000, 9.0),
                 "Dimensions",
                 Value::Array(
-                    (1..=state::MAX_METRIC_DIMENSIONS)
+                    (1..=state::MAX_DATUM_DIMENSIONS)
                         .map(|position| json!({"Name": format!("D{position}"), "Value": "v"}))
                         .collect(),
                 ),
             )],
             expect: vec![Expectation {
                 metric: "CpuUtilization",
-                dimensions: (1..=state::MAX_METRIC_DIMENSIONS)
+                dimensions: (1..=state::MAX_DATUM_DIMENSIONS)
                     .map(|position| (format!("D{position}"), "v".to_string()))
                     .collect(),
                 timestamps_millis: vec![1_700_000_000_000],
                 units: vec![None],
-                statistics: statistics(1, 9.0, 9.0, 9.0),
+                statistics: statistics(1.0, 9.0, 9.0, 9.0),
                 average: 9.0,
             }],
         },
@@ -677,19 +738,19 @@ fn refused() -> Vec<Refused> {
             ],
         },
         Refused {
-            case: "one dimension past the maximum number of them",
+            case: "one dimension past the maximum number a datum may carry",
             datums: vec![with(
                 value_datum("CpuUtilization", 1_700_000_000, 1.0),
                 "Dimensions",
                 Value::Array(
-                    (1..=state::MAX_METRIC_DIMENSIONS + 1)
+                    (1..=state::MAX_DATUM_DIMENSIONS + 1)
                         .map(|position| json!({"Name": format!("D{position}"), "Value": "v"}))
                         .collect(),
                 ),
             )],
             mentions: vec![format!(
                 "metricData.1.member.dimensions must have length less than or equal to {}",
-                state::MAX_METRIC_DIMENSIONS
+                state::MAX_DATUM_DIMENSIONS
             )],
         },
         Refused {
@@ -700,6 +761,20 @@ fn refused() -> Vec<Refused> {
                 dimension_members(&[("Queue", "alpha"), ("Queue", "beta")]),
             )],
             mentions: vec!["names the dimension Queue more than once".to_string()],
+        },
+        Refused {
+            // The published series is dimensioned on the environment the REQUEST addresses,
+            // so a datum stating that dimension itself would claim to describe another
+            // environment, or be silently overwritten.
+            case: "a datum naming the dimension the service sets itself",
+            datums: vec![with(
+                value_datum("QueuedTasks", 1_700_000_000, 1.0),
+                "Dimensions",
+                dimension_members(&[("Function", "Worker"), (ENVIRONMENT_DIMENSION, "Other")]),
+            )],
+            mentions: vec![format!(
+                "metricData.1.member.dimensions.2.member.name must not be {ENVIRONMENT_DIMENSION}"
+            )],
         },
         Refused {
             case: "a unit outside the value set the model fixes",
@@ -729,7 +804,7 @@ fn env_name(table: &str, index: usize) -> String {
     format!("{table}Row{index}")
 }
 
-/// Assert one series holds exactly what a row expects of it.
+/// Assert one published series holds exactly what a row expects of it.
 fn assert_series(harness: &Harness, case: &str, name: &str, expect: &Expectation) {
     let stored = harness
         .series(name, expect.metric, &expect.dimensions)
@@ -739,30 +814,22 @@ fn assert_series(harness: &Harness, case: &str, name: &str, expect: &Expectation
                 expect.metric, expect.dimensions
             )
         });
-    assert_eq!(
-        stored.metric_name, expect.metric,
-        "case {case:?}: expected the series of {}, got {:?}",
-        expect.metric, stored.metric_name
-    );
-    assert_eq!(
-        stored.dimensions,
-        dimension_map(&expect.dimensions),
-        "case {case:?}: expected the dimensions {:?}, got {:?}",
-        expect.dimensions,
-        stored.dimensions
-    );
-    let instants: Vec<i64> = stored
-        .datapoints
+    let instants: Vec<f64> = stored
         .iter()
-        .map(|datapoint| datapoint.timestamp_millis)
+        .map(|datapoint| datapoint.timestamp_secs)
+        .collect();
+    // The destination holds a datapoint's instant in SECONDS, so a published instant in
+    // milliseconds is what it is asserted against.
+    let wanted_instants: Vec<f64> = expect
+        .timestamps_millis
+        .iter()
+        .map(|millis| *millis as f64 / 1_000.0)
         .collect();
     assert_eq!(
-        instants, expect.timestamps_millis,
-        "case {case:?}: expected the datapoints at {:?}, got {instants:?}",
-        expect.timestamps_millis
+        instants, wanted_instants,
+        "case {case:?}: expected the datapoints at {wanted_instants:?}, got {instants:?}"
     );
     let units: Vec<Option<String>> = stored
-        .datapoints
         .iter()
         .map(|datapoint| datapoint.unit.clone())
         .collect();
@@ -775,14 +842,30 @@ fn assert_series(harness: &Harness, case: &str, name: &str, expect: &Expectation
         units, wanted,
         "case {case:?}: expected the units {wanted:?}, got {units:?}"
     );
-    let aggregated = stored.statistics();
-    assert_eq!(
-        aggregated,
-        Some(expect.statistics),
-        "case {case:?}: expected the series statistics {:?}, got {aggregated:?}",
-        expect.statistics
+    // Published at regular resolution, so a reader sees each datapoint aggregated in the
+    // minute it was observed in rather than at a finer granularity it never carried.
+    let resolutions: Vec<i32> = stored
+        .iter()
+        .map(|datapoint| datapoint.storage_resolution)
+        .collect();
+    assert!(
+        resolutions.iter().all(|resolution| *resolution == 60),
+        "case {case:?}: expected every datapoint at one-minute resolution, got {resolutions:?}"
     );
-    let average = aggregated.and_then(|statistics| statistics.average());
+    let aggregated = cloudwatch::BasicStatistics::of(&stored);
+    let wanted = &expect.statistics;
+    for (statistic, actual, wanted) in [
+        ("SampleCount", aggregated.sample_count, wanted.sample_count),
+        ("Sum", aggregated.sum, wanted.sum),
+        ("Minimum", aggregated.minimum, wanted.minimum),
+        ("Maximum", aggregated.maximum, wanted.maximum),
+    ] {
+        assert_eq!(
+            actual, wanted,
+            "case {case:?}: expected {statistic} {wanted}, got {actual}"
+        );
+    }
+    let average = aggregated.average();
     assert_eq!(
         average,
         Some(expect.average),
@@ -853,6 +936,11 @@ async fn a_datum_that_describes_no_observation_refuses_the_whole_request() {
             served.status, served.body
         );
         let before = harness.stored_counts(&name);
+        assert_eq!(
+            before,
+            (1, 1),
+            "case {case:?}: the control publish must leave one datapoint, got {before:?}"
+        );
 
         let answer = harness.publish(&name, &row.datums).await;
         assert_eq!(
@@ -992,21 +1080,27 @@ async fn publishing_leaves_the_environment_the_control_plane_reports_alone() {
     assert_eq!(
         harness.stored_counts(name),
         (1, 1),
-        "case {case:?}: the datapoint must still be stored, got {:?}",
+        "case {case:?}: the datapoint must still be published, got {:?}",
         harness.stored_counts(name)
     );
 }
 
 #[tokio::test]
-async fn a_series_keeps_its_most_recent_datapoints() {
+async fn every_datapoint_of_one_series_is_held_by_the_destination() {
     let harness = Harness::new();
-    let case = "retention";
-    let name = "RetainingEnv";
+    let case = "a long series";
+    let name = "LongSeriesEnv";
     harness.create(case, name).await;
 
-    // Five datums past the window, so what ages out is the oldest five.
-    let overflow = 5;
-    let total = state::MAX_METRIC_DATAPOINTS_PER_SERIES + overflow;
+    // A batch at the published bound, and more datapoints than any one environment's record
+    // ever held: the series lives in the destination now, so what bounds its length is the
+    // destination's own window and nothing this service keeps.
+    let total = state::MAX_PUBLISHED_DATUMS;
+    assert!(
+        total < cloudwatch::MAX_DATAPOINTS_PER_SERIES,
+        "case {case:?}: the row must stay inside the destination's window of {}",
+        cloudwatch::MAX_DATAPOINTS_PER_SERIES
+    );
     let datums: Vec<Value> = (0..total)
         .map(|position| {
             value_datum(
@@ -1027,32 +1121,64 @@ async fn a_series_keeps_its_most_recent_datapoints() {
         .series(name, "CpuUtilization", &[])
         .unwrap_or_else(|| panic!("case {case:?}: nothing was published"));
     assert_eq!(
-        stored.datapoints.len(),
-        state::MAX_METRIC_DATAPOINTS_PER_SERIES,
-        "case {case:?}: expected the series to hold {}, got {}",
-        state::MAX_METRIC_DATAPOINTS_PER_SERIES,
-        stored.datapoints.len()
+        stored.len(),
+        total,
+        "case {case:?}: expected every published datapoint to be held, got {}",
+        stored.len()
     );
-    let first = stored.datapoints.first().expect("a datapoint").clone();
+    let aggregated = cloudwatch::BasicStatistics::of(&stored);
     assert_eq!(
-        first.timestamp_millis,
-        (1_700_000_000 + overflow as i64) * 1_000,
-        "case {case:?}: the oldest datapoints must be the ones dropped, got {first:?}"
-    );
-    let aggregated = stored.statistics().expect("a non-empty series");
-    assert_eq!(
-        aggregated.sample_count,
-        state::MAX_METRIC_DATAPOINTS_PER_SERIES as i64,
+        aggregated.sample_count, total as f64,
         "case {case:?}: every held datapoint counts one observation, got {aggregated:?}"
     );
     assert_eq!(
-        aggregated.minimum, overflow as f64,
-        "case {case:?}: the smallest observation still held is {overflow}, got {aggregated:?}"
+        aggregated.minimum, 0.0,
+        "case {case:?}: the smallest observation is the first published, got {aggregated:?}"
     );
     assert_eq!(
         aggregated.maximum,
         (total - 1) as f64,
         "case {case:?}: the largest observation is the last published, got {aggregated:?}"
+    );
+
+    // One datum past the bound: the batch is refused as a whole, and nothing of it is
+    // published.
+    let before = harness.stored_counts(name);
+    let over = harness
+        .publish(
+            name,
+            &(0..=total)
+                .map(|position| {
+                    value_datum("CpuUtilization", 1_800_000_000 + position as i64, 1.0)
+                })
+                .collect::<Vec<Value>>(),
+        )
+        .await;
+    assert_eq!(
+        over.status, 400,
+        "case {case:?}: expected HTTP 400 one datum past the bound, got {} {}",
+        over.status, over.body
+    );
+    assert_eq!(
+        over.error_code(),
+        "ValidationException",
+        "case {case:?}: expected a ValidationException, got {}",
+        over.body
+    );
+    assert_eq!(
+        over.message(),
+        format!(
+            "metricData must have length less than or equal to {}.",
+            state::MAX_PUBLISHED_DATUMS
+        ),
+        "case {case:?}: the refusal must name the bound, got {:?}",
+        over.message()
+    );
+    assert_eq!(
+        harness.stored_counts(name),
+        before,
+        "case {case:?}: the refused batch must publish nothing, got {:?}",
+        harness.stored_counts(name)
     );
 }
 
@@ -1163,6 +1289,32 @@ async fn a_batch_past_the_series_ceiling_publishes_nothing() {
         "case {case:?}: expected one more datapoint and no new series, got {:?}",
         harness.stored_counts(name)
     );
+
+    // The ceiling is per ENVIRONMENT: another environment of the same account still publishes
+    // a series of its own, because the count it is judged against is that environment's.
+    let other = "CeilingNeighbourEnv";
+    harness.create(case, other).await;
+    let neighbour = harness
+        .publish(
+            other,
+            &[with(
+                value_datum("CpuUtilization", 1_700_000_180, 5.0),
+                "Dimensions",
+                dimension_members(&[("Slot", "0")]),
+            )],
+        )
+        .await;
+    assert_eq!(
+        neighbour.status, 200,
+        "case {case:?}: another environment must still publish, got {} {}",
+        neighbour.status, neighbour.body
+    );
+    assert_eq!(
+        harness.stored_counts(other),
+        (1, 1),
+        "case {case:?}: expected the neighbour's own series, got {:?}",
+        harness.stored_counts(other)
+    );
 }
 
 /// The numbers a metric value may carry, judged directly on the rule the handler applies to
@@ -1197,7 +1349,7 @@ fn the_numbers_a_metric_value_may_carry() {
 }
 
 #[tokio::test]
-async fn an_environment_being_torn_down_publishes_nothing() {
+async fn an_environment_being_torn_down_publishes_nothing_and_keeps_what_it_published() {
     let harness = Harness::new();
     let case = "teardown";
     let name = "TornDownEnv";
@@ -1237,6 +1389,21 @@ async fn an_environment_being_torn_down_publishes_nothing() {
         harness.stored_counts(name),
         before,
         "case {case:?}: the refused publish must store nothing, got {:?}",
+        harness.stored_counts(name)
+    );
+
+    // Wait the teardown out, so the record is retired. What was published is a CloudWatch
+    // metric, so it outlives the environment it describes: a reader still finds it.
+    tokio::time::sleep(state::TRANSITION_SPAN + Duration::from_millis(200)).await;
+    let gone = harness.environment_status(name).await;
+    assert_eq!(
+        gone, 404,
+        "case {case:?}: the record must be retired once the teardown is done, got {gone}"
+    );
+    assert_eq!(
+        harness.stored_counts(name),
+        before,
+        "case {case:?}: the published datapoints must outlive the environment, got {:?}",
         harness.stored_counts(name)
     );
 }
