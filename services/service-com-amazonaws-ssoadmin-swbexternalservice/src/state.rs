@@ -628,31 +628,6 @@ fn is_not_older_than_recorded_copy(captured_at: &DateTime, recorded_at: &DateTim
     capture_key(captured_at) >= capture_key(recorded_at)
 }
 
-/// The refusal a `ProvisioningStatus` outside the model's enum earns, as the message of
-/// the caller's own `ValidationException`. BUILT from the member the request got wrong
-/// and the values the model declares for it
-/// ([`crate::ops::types::PROVISIONING_STATUS_VALUES`]), so the caller can fix the request
-/// from this text alone.
-pub fn provisioning_status_unknown_message(provisioning_status: &str) -> String {
-    format!(
-        "ProvisioningStatus must be one of {}, got {provisioning_status}",
-        crate::ops::types::PROVISIONING_STATUS_VALUES.join(", ")
-    )
-}
-
-/// The refusal an operation-status filter value outside the model's `StatusValues` enum
-/// earns, as the message of the caller's own `ValidationException`. BUILT from the member
-/// the request got wrong and the values the model declares for it
-/// ([`crate::ops::types::STATUS_VALUES_VALUES`]), exactly as
-/// [`provisioning_status_unknown_message`] is, so the caller can fix the request from this
-/// text alone.
-pub fn operation_status_unknown_message(status: &str) -> String {
-    format!(
-        "Status must be one of {}, got {status}",
-        crate::ops::types::STATUS_VALUES_VALUES.join(", ")
-    )
-}
-
 /// `ProvisionTargetType::AWS_ACCOUNT` — the one of the model's two provisioning targets
 /// (`ALL_PROVISIONED_ACCOUNTS | AWS_ACCOUNT`) that names ONE Amazon Web Services account,
 /// which is the account `ProvisionPermissionSet$TargetId` carries. The other names every

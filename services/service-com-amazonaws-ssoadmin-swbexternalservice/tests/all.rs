@@ -181,6 +181,8 @@ mod singleton_child_delete;
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/status_filter_enum_membership.rs"]
+mod status_filter_enum_membership;
 #[path = "all/system_tag_mutations.rs"]
 mod system_tag_mutations;
 #[path = "all/tag_resource_resolution.rs"]

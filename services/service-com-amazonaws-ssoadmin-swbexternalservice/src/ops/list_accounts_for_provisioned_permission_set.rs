@@ -182,30 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // The `ProvisioningStatus` the request filters by, as one of the values the
-        // model's enum declares (`PROVISIONING_STATUS_VALUES`, the one source for their
-        // spelling). Reaching this handler means the modelled constraints already hold, so
-        // anything else cannot arrive here; it is still refused rather than answered with
-        // an empty page, which would read as "no account is in that state".
-        let filter = match input.provisioning_status.as_deref() {
-            None => None,
-            Some(status) if PROVISIONING_STATUS_VALUES.contains(&status) => Some(status),
-            Some(status) => {
-                return Err(
-                    ListAccountsForProvisionedPermissionSetErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(crate::state::provisioning_status_unknown_message(
-                                status,
-                            )),
-                            // The model's `ValidationExceptionReason` enum carries only
-                            // KMS key states, none of which this refusal is.
-                            reason: None,
-                        },
-                    )
-                    .into(),
-                );
-            }
-        };
+        // The `ProvisioningStatus` the request filters by. The model declares this input
+        // member as that enum, so a value outside it is refused by the constraint walk
+        // before this handler runs; a value inside it that no provisioned account is in
+        // selects no row, which is an empty page rather than a refusal.
+        let filter = input.provisioning_status.as_deref();
 
         // The cursor is scoped to THIS enumeration: the operation and the whole filter
         // that selected the rows, since the page key (an account id) only distinguishes
