@@ -850,8 +850,9 @@ async fn the_device_flow_runs_end_to_end_from_persisted_state() {
 /// RULE: CreateToken answers every grant from the state the request resolves to —
 /// the grant the request presents is resolved FIRST, so a grant value that resolves
 /// to nothing is an invalid grant whoever presents it, and only a request whose
-/// grant exists is then refused for its credentials; an unsupported grant and a
-/// missing member for the grant each get their own modeled error.
+/// grant exists is then refused for its credentials; a `grantType` outside the three
+/// grants the operation serves is a malformed request, and a missing member for a
+/// served grant gets its own modeled error.
 #[tokio::test]
 async fn create_token_answers_each_grant_from_the_state_it_resolves() {
     let emulator = Emulator::new();
@@ -890,8 +891,8 @@ async fn create_token_answers_each_grant_from_the_state_it_resolves() {
                 "grantType": "client_credentials",
             }),
             400,
-            "UnsupportedGrantTypeException",
-            "unsupported_grant_type",
+            "InvalidRequestException",
+            "invalid_request",
         ),
         (
             "the password grant",
@@ -901,15 +902,15 @@ async fn create_token_answers_each_grant_from_the_state_it_resolves() {
                 "grantType": "password",
             }),
             400,
-            "UnsupportedGrantTypeException",
-            "unsupported_grant_type",
+            "InvalidRequestException",
+            "invalid_request",
         ),
         (
             "an empty grant type",
             json!({"clientId": client_id, "clientSecret": client_secret, "grantType": ""}),
             400,
-            "UnsupportedGrantTypeException",
-            "unsupported_grant_type",
+            "InvalidRequestException",
+            "invalid_request",
         ),
         (
             "the device-code grant with no device code",

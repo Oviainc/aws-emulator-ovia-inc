@@ -180,9 +180,10 @@ fn invalid_client(failure: st::ClientAuthFailure) -> CreateTokenError {
     .into()
 }
 
-/// `InvalidRequestException` (400): a member this grant needs is missing. The
-/// text is the FIXED one of the class, so the parameter is a `&'static str`: a
-/// refusal cannot be handed prose formatted out of the request.
+/// `InvalidRequestException` (400): a member this grant needs is missing, or the
+/// `grantType` names no grant flow this operation has at all. The text is the
+/// FIXED one of the class, so the parameter is a `&'static str`: a refusal cannot
+/// be handed prose formatted out of the request.
 fn invalid_request(description: &'static str) -> CreateTokenError {
     CreateTokenErrorModeled::InvalidRequestException(InvalidRequestException {
         error: Some("invalid_request".to_string()),
@@ -198,16 +199,6 @@ fn invalid_grant(description: &'static str) -> CreateTokenError {
     CreateTokenErrorModeled::InvalidGrantException(InvalidGrantException {
         error: Some("invalid_grant".to_string()),
         error_description: Some(description.to_string()),
-    })
-    .into()
-}
-
-/// `UnsupportedGrantTypeException` (400): the service serves no such grant.
-/// The grant types it does serve are [`st::SUPPORTED_GRANT_TYPES`].
-fn unsupported_grant_type() -> CreateTokenError {
-    CreateTokenErrorModeled::UnsupportedGrantTypeException(UnsupportedGrantTypeException {
-        error: Some("unsupported_grant_type".to_string()),
-        error_description: Some(st::DESCRIPTION_INVALID_GRANT_TYPE.to_string()),
     })
     .into()
 }
@@ -236,9 +227,9 @@ enum PresentedGrant {
 ///
 /// This runs before the `clientId`/`clientSecret` pair is read: the grant a token
 /// request is built on is a record of this service, and whether that record exists is
-/// not a fact about the caller's credentials. A grant type the service does not serve
-/// is settled here too, so nothing further is read for a request no grant of this
-/// service could satisfy.
+/// not a fact about the caller's credentials. A `grantType` outside the ones this
+/// operation serves is settled here too, so nothing further is read for a request no
+/// grant of this service could satisfy.
 fn presented_grant(
     store: &crate::state::ComAmazonawsSsooidcAwsssooidcserviceState,
     input: &CreateTokenInput,
@@ -279,7 +270,16 @@ fn presented_grant(
             // this service.
             Err(invalid_grant(st::DESCRIPTION_INVALID_AUTHORIZATION_CODE))
         }
-        _ => Err(unsupported_grant_type()),
+        // `grantType` is "one of the following values, depending on the grant type
+        // that you want" — the three grants above and no other
+        // (`smithy_query(query="doc",shape="com.amazonaws.ssooidc#CreateTokenRequest",member="grantType")`).
+        // Any other value, an empty one included, names no grant flow of this
+        // endpoint at all, so the request itself is malformed rather than a
+        // well-formed request for a grant that was refused — and it is settled on
+        // the request alone, whatever grants the presenting client registered. The
+        // text is the fixed sentence of the class, so the rejected value is not
+        // echoed back.
+        _ => Err(invalid_request(st::DESCRIPTION_INVALID_REQUEST)),
     }
 }
 
