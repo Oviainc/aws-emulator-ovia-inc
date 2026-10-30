@@ -18,7 +18,11 @@
 //!    CloudFormation;
 //! 4. a deployment records which application, and which version of it, it was made from
 //!    on the change set and so on the stack, and acknowledges `CAPABILITY_IAM` to
-//!    CloudFormation for every deployment it makes.
+//!    CloudFormation for every deployment it makes;
+//! 5. the acknowledgement gate decides between two outcomes and no third: an accepted
+//!    deployment leaves the stack `serverlessrepo-<StackName>` in `REVIEW_IN_PROGRESS`
+//!    with an executable change set, and a refused one leaves no stack at all — asserted
+//!    over versions of ONE application whose derived requirement differs.
 //!
 //! The emulator under test mounts this service and CloudFormation on ONE engine, which
 //! is what the assembled emulator does: the handler creates the change set in
@@ -1667,6 +1671,256 @@ async fn a_deployment_records_the_application_and_version_it_came_from() {
             stack_capabilities, expected_capabilities,
             "case {case:?}: expected the stack to acknowledge {expected_capabilities:?}, got \
              {stack_capabilities:?}"
+        );
+    }
+}
+
+/// The versions of ONE application RULE 5 is asserted over: the same application published
+/// three times, differing only in what raises the acknowledgement bar — an IAM resource
+/// whose name the template leaves to CloudFormation, the same resource with its name pinned
+/// by the template, and a template declaring no IAM-affecting resource at all.
+///
+/// The resource types and the naming rule are the `Capabilities` member's own documentation
+/// (`smithy_query(query="doc", shape="CreateCloudFormationChangeSetRequest",
+/// member="Capabilities")`): the four IAM types require `CAPABILITY_IAM`, and a custom
+/// (pinned) name on one of them raises the requirement to `CAPABILITY_NAMED_IAM`.
+fn gated_versions() -> Vec<(&'static str, Value, Vec<&'static str>)> {
+    vec![
+        (
+            "1.0.0",
+            sam_template(json!({ "Role": { "Type": "AWS::IAM::Role" } })),
+            vec!["CAPABILITY_IAM"],
+        ),
+        (
+            "1.1.0",
+            sam_template(json!({
+                "Role": {
+                    "Type": "AWS::IAM::Role",
+                    "Properties": { "RoleName": "pinned-by-the-template" }
+                }
+            })),
+            vec!["CAPABILITY_NAMED_IAM"],
+        ),
+        ("1.2.0", one_queue(), vec![]),
+    ]
+}
+
+/// One accepted row: the case, the version the request names, and what it acknowledges.
+type AcceptedDeployment<'a> = (&'a str, &'a str, Vec<&'a str>);
+
+/// One refused row: the case, the version the request names, what it acknowledges, the
+/// HTTP status and wire error code it is refused with, and the sentence the refusal carries.
+type RefusedDeployment<'a> = (&'a str, &'a str, Vec<&'a str>, u16, &'a str, String);
+
+/// RULE 5: the acknowledgement gate has exactly two outcomes. An accepted deployment
+/// answers 201 and leaves the stack `serverlessrepo-<StackName>` in `REVIEW_IN_PROGRESS` —
+/// the shell a CREATE change set brings into existence, with the change set itself
+/// `CREATE_COMPLETE` and `AVAILABLE`, so a client can execute it — and a refused one
+/// leaves no stack of that name at all, not even that shell.
+///
+/// Both halves are asserted over versions of ONE application whose derived requirement
+/// differs (`gated_versions`), read back AFTER every publish, so what each version requires
+/// is a function of THAT version's own template and a later publish rewrites no earlier
+/// version's list. The accepted rows differ in which version is deployed and in how the
+/// acknowledgement satisfies the requirement (nothing required and nothing acknowledged,
+/// exactly the requirement, the stronger `CAPABILITY_NAMED_IAM` covering a
+/// `CAPABILITY_IAM` requirement, and more acknowledged than required); the refused rows
+/// differ in why they fail — a version the application never published, no acknowledgement
+/// at all, and the weaker acknowledgement against the named requirement.
+#[tokio::test]
+async fn the_acknowledgement_gate_either_reviews_the_stack_or_creates_nothing() {
+    let deploy = Deploy::new();
+    let versions = gated_versions();
+    let published: Vec<(&str, Value)> = versions
+        .iter()
+        .map(|(semantic_version, template, _)| (*semantic_version, template.clone()))
+        .collect();
+    let application_id = deploy.given_application("deploy-gate-app", &published).await;
+
+    // What each version requires is derived from its own template, and the later publishes
+    // have already happened by the time each one is read back.
+    for (semantic_version, _template, required) in &versions {
+        let version = deploy.get_application(&application_id, semantic_version).await;
+        let reported = version["version"]["requiredCapabilities"].clone();
+        assert_eq!(
+            reported,
+            json!(required),
+            "case {semantic_version:?}: expected requiredCapabilities {required:?}, got \
+             {reported}"
+        );
+    }
+
+    let accepted: Vec<AcceptedDeployment> = vec![
+        (
+            "a template requiring nothing, acknowledging nothing",
+            "1.2.0",
+            vec![],
+        ),
+        (
+            "exactly the requirement",
+            "1.0.0",
+            vec!["CAPABILITY_IAM"],
+        ),
+        (
+            "exactly the requirement, with the name pinned",
+            "1.1.0",
+            vec!["CAPABILITY_NAMED_IAM"],
+        ),
+        (
+            "the stronger acknowledgement covers the weaker requirement",
+            "1.0.0",
+            vec!["CAPABILITY_NAMED_IAM"],
+        ),
+        (
+            "more acknowledged than the template requires",
+            "1.2.0",
+            vec!["CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND"],
+        ),
+    ];
+
+    for (index, (case, semantic_version, acknowledged)) in accepted.iter().enumerate() {
+        let stack_name = format!("deploy-gate-stack-{index}");
+        let (status, answer) = deploy
+            .create_change_set(
+                &application_id,
+                json!({
+                    "stackName": stack_name,
+                    "semanticVersion": semantic_version,
+                    "capabilities": acknowledged
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected 201, got {status} with {answer}"
+        );
+        assert_eq!(
+            text(&answer, "semanticVersion"),
+            *semantic_version,
+            "case {case:?}: expected the deployment to be of {semantic_version}, got {answer}"
+        );
+        let stack_id = text(&answer, "stackId");
+        let change_set_id = text(&answer, "changeSetId");
+
+        // The stack the deployment created, and nothing has executed it: the change set
+        // brought a stack with no template and no resources into existence.
+        let (status, xml) = deploy
+            .cloudformation(
+                "DescribeStacks",
+                &[("StackName", &deployed_stack(&stack_name))],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the deployment's stack must resolve, got {status} {xml}"
+        );
+        assert_eq!(
+            xml_text(&xml, "StackId"),
+            stack_id,
+            "case {case:?}: the stack must be the one the deployment answered with, got {xml}"
+        );
+        let stack_status = xml_text(&xml, "StackStatus");
+        assert_eq!(
+            stack_status, "REVIEW_IN_PROGRESS",
+            "case {case:?}: an unexecuted deployment's stack must be under review, got \
+             {stack_status:?}"
+        );
+
+        // And the change set is executable: the plan settled, so a client can execute it.
+        deploy.settle_cloudformation();
+        let (status, xml) = deploy
+            .cloudformation("DescribeChangeSet", &[("ChangeSetName", &change_set_id)])
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the change set must be describable, got {status} {xml}"
+        );
+        let change_set_status = xml_text(&xml, "Status");
+        assert_eq!(
+            change_set_status, "CREATE_COMPLETE",
+            "case {case:?}: the created change set must have a complete plan, got \
+             {change_set_status:?}"
+        );
+        let execution_status = xml_text(&xml, "ExecutionStatus");
+        assert_eq!(
+            execution_status, "AVAILABLE",
+            "case {case:?}: the created change set must be executable, got \
+             {execution_status:?}"
+        );
+    }
+
+    let refused: Vec<RefusedDeployment> = vec![
+        (
+            "a version the application never published",
+            "9.9.9",
+            vec!["CAPABILITY_NAMED_IAM"],
+            404,
+            "NotFoundException",
+            format!("Application {application_id} does not have a version 9.9.9"),
+        ),
+        (
+            "no acknowledgement at all",
+            "1.0.0",
+            vec![],
+            400,
+            "BadRequestException",
+            "Required capabilities [CAPABILITY_IAM] were not provided.".to_string(),
+        ),
+        (
+            "the weaker acknowledgement against a pinned name",
+            "1.1.0",
+            vec!["CAPABILITY_IAM"],
+            400,
+            "BadRequestException",
+            "Required capabilities [CAPABILITY_NAMED_IAM] were not provided.".to_string(),
+        ),
+    ];
+
+    for (index, (case, semantic_version, acknowledged, expected_status, wire_code, message)) in
+        refused.iter().enumerate()
+    {
+        let stack_name = format!("deploy-gate-refused-{index}");
+        let (status, answer) = deploy
+            .create_change_set(
+                &application_id,
+                json!({
+                    "stackName": stack_name,
+                    "semanticVersion": semantic_version,
+                    "capabilities": acknowledged
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, *expected_status,
+            "case {case:?}: expected {expected_status}, got {status} with {answer}"
+        );
+        assert_eq!(
+            error_code(&answer),
+            *wire_code,
+            "case {case:?}: expected the modelled {wire_code}, got {answer}"
+        );
+        assert_eq!(
+            text(&answer, "message"),
+            *message,
+            "case {case:?}: expected the refusal {message:?}, got {answer}"
+        );
+
+        // Nothing was created for it — not even the REVIEW_IN_PROGRESS shell an accepted
+        // deployment leaves behind.
+        deploy.settle_cloudformation();
+        let (status, xml) = deploy
+            .cloudformation(
+                "DescribeStacks",
+                &[("StackName", &deployed_stack(&stack_name))],
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a refused deployment must leave no stack behind, got {status} {xml}"
+        );
+        assert!(
+            xml.contains("does not exist"),
+            "case {case:?}: expected CloudFormation to report no such stack, got {xml}"
         );
     }
 }
