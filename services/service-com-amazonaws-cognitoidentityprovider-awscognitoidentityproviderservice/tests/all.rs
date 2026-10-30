@@ -199,6 +199,8 @@ mod user_pool_replicas;
 mod verification_code_pipeline;
 #[path = "all/web_authn_credential_registration.rs"]
 mod web_authn_credential_registration;
+#[path = "all/web_authn_refusal_wording.rs"]
+mod web_authn_refusal_wording;
 #[path = "all/web_authn_registration.rs"]
 mod web_authn_registration;
 #[path = "all/zz_probe.rs"]

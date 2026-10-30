@@ -248,16 +248,31 @@ fn listing_key(credential: &crate::state::WebAuthnCredential) -> String {
     )
 }
 
-/// This operation's answer to an `AccessToken` that names no signed-in user.
+/// This operation's answer to an `AccessToken` that names no signed-in user, or
+/// one whose user cannot be served until it sets a new password.
 ///
-/// Every rejection answers `NotAuthorizedException`, which "is thrown when a
-/// user isn't authorized" (this service's model); this operation models no error
-/// for a pool or user that is gone, so a token naming a deleted one is refused
-/// as the token it is. No message names a stored value, so the refusal reports
-/// why the token was not accepted and nothing else.
+/// Every rejection of the token itself answers `NotAuthorizedException`, which
+/// "is thrown when a user isn't authorized" (this service's model); this
+/// operation models no error for a pool or user that is gone, so a token naming
+/// a deleted one is refused as the token it is. A live token whose user is
+/// waiting on a new password answers `PasswordResetRequiredException` instead:
+/// the token is good, the user's state is what the listing is refused for. No
+/// message names a stored value, so the refusal reports why the call was not
+/// served and nothing else.
 fn token_rejected(rejection: crate::state::TokenRejection) -> ListWebAuthnCredentialsError {
     match rejection {
         crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        // The token is live and authorizes this operation, but the user it names
+        // has to set a new password before any self-service call of its own is
+        // served, which this operation declares its own error for.
+        crate::state::TokenRejection::PasswordResetRequired => {
+            ListWebAuthnCredentialsErrorModeled::PasswordResetRequiredException(
+                PasswordResetRequiredException {
+                    message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
         crate::state::TokenRejection::MissingRequiredScopes => {
             not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
         }

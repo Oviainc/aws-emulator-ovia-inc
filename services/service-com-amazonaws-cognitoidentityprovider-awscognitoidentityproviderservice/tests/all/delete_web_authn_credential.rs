@@ -642,7 +642,7 @@ async fn a_credential_id_naming_no_passkey_of_the_user_is_refused() {
         );
         assert_eq!(
             error_message(&payload),
-            "Credential does not exist.",
+            "The credential does not exist",
             "case {case:?}: the refusal reports the credential was not found, got {payload}"
         );
     }

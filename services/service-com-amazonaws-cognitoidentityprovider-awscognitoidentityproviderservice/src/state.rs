@@ -267,15 +267,25 @@ pub const DEVICE_NOT_FOUND_MESSAGE: &str = "Device does not exist.";
 /// new password from carries ([`UserStatus::ResetRequired`]).
 ///
 /// One fixed sentence, naming no username: every operation that reports that
-/// state — the sign-in operations and the refresh-token exchange — reports it
-/// the same way.
+/// state — the sign-in operations, the refresh-token exchange and the
+/// self-service operations a signed-in user's access token authorizes — reports
+/// it the same way.
 pub const PASSWORD_RESET_REQUIRED_MESSAGE: &str = "Password reset required for the user";
 
 /// The message a passkey operation's `ResourceNotFoundException` carries for a
 /// `CredentialId` the signed-in user holds no registered passkey for. Like
 /// [`DEVICE_NOT_FOUND_MESSAGE`] it names nothing the request asked for, so the
-/// refusal is the same sentence for every credential id.
-pub const WEB_AUTHN_CREDENTIAL_NOT_FOUND_MESSAGE: &str = "Credential does not exist.";
+/// refusal is the same sentence for every credential id — and so a credential
+/// REGISTERED TO ANOTHER user is reported exactly as one that was never
+/// registered at all, which is what keeps the refusal from telling a caller
+/// whether somebody else holds that credential.
+pub const WEB_AUTHN_CREDENTIAL_NOT_FOUND_MESSAGE: &str = "The credential does not exist";
+
+/// The message a `WebAuthnNotEnabledException` carries on a pool that does not
+/// admit the passkey factor. One fixed sentence, naming neither the pool nor the
+/// operation that asked: every operation that gates on the feature — the
+/// registration operations — reports it the same way.
+pub const WEB_AUTHN_NOT_ENABLED_MESSAGE: &str = "WebAuthn not enabled for this pool.";
 
 /// The message a device operation's `InvalidUserPoolConfigurationException`
 /// carries on a pool that stores no `DeviceConfiguration`: "When you provide a
@@ -1077,6 +1087,16 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         // no user rather than to a later namesake.
         if user.sub != record.sub {
             return Err(TokenRejection::UserGone);
+        }
+        // A user Amazon Cognito is waiting on a new password from authorizes no
+        // self-service call until that password is set: a live access token
+        // issued before the reset was asked for still resolves to this user, and
+        // the operations that resolve one all declare
+        // `PasswordResetRequiredException` — "thrown when a password reset is
+        // required" (this service's model) — so the stored status is read here,
+        // once, rather than by each of them.
+        if user.status == UserStatus::ResetRequired {
+            return Err(TokenRejection::PasswordResetRequired);
         }
         Ok((pool, user))
     }
@@ -4294,6 +4314,10 @@ pub enum TokenRejection {
     PoolGone,
     /// The token names a user its pool no longer holds.
     UserGone,
+    /// The token names a user Amazon Cognito is waiting on a new password from
+    /// ([`UserStatus::ResetRequired`]), which authorizes no self-service call
+    /// until that password is set.
+    PasswordResetRequired,
 }
 
 /// How ONE group's `Precedence` ranks against another's, lowest first.

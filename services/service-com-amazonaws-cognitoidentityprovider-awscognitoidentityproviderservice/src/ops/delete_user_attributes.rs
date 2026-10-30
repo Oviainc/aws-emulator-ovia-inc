@@ -213,6 +213,17 @@ fn token_rejected(rejection: crate::state::TokenRejection) -> DeleteUserAttribut
     match rejection {
         crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
         crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        // The token is live and authorizes this operation, but the user it names
+        // has to set a new password before any self-service call of its own is
+        // served, which this operation declares its own error for.
+        crate::state::TokenRejection::PasswordResetRequired => {
+            DeleteUserAttributesErrorModeled::PasswordResetRequiredException(
+                PasswordResetRequiredException {
+                    message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
         crate::state::TokenRejection::MissingRequiredScopes => {
             not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
         }

@@ -412,6 +412,17 @@ const INVALID_ACCESS_TOKEN: &str = "Invalid Access Token";
 fn token_rejected(rejection: crate::state::TokenRejection) -> StartWebAuthnRegistrationError {
     match rejection {
         crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        // The token is live and authorizes this operation, but the user it names
+        // has to set a new password before any self-service call of its own is
+        // served, which this operation declares its own error for.
+        crate::state::TokenRejection::PasswordResetRequired => {
+            StartWebAuthnRegistrationErrorModeled::PasswordResetRequiredException(
+                PasswordResetRequiredException {
+                    message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
         crate::state::TokenRejection::MissingRequiredScopes => {
             not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
         }
@@ -435,7 +446,7 @@ fn not_authorized(message: &str) -> StartWebAuthnRegistrationError {
 fn web_authn_not_enabled() -> StartWebAuthnRegistrationError {
     StartWebAuthnRegistrationErrorModeled::WebAuthnNotEnabledException(
         WebAuthnNotEnabledException {
-            message: Some("WebAuthn is not enabled for this user pool.".to_string()),
+            message: Some(crate::state::WEB_AUTHN_NOT_ENABLED_MESSAGE.to_string()),
         },
     )
     .into()

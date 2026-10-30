@@ -235,16 +235,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 registration.clone()
             }
-            Some(_) | None => {
-                // Only a registration the clock has taken past its own window is
-                // an EXPIRED one; one this emulator is not holding, and one held
-                // for another user, were never this caller's to answer.
-                let expired = guard
-                    .web_authn_registrations
-                    .get(&presented.challenge)
-                    .is_some_and(|stored| stored.expires_at <= now);
-                return Err(challenge_not_found(expired));
-            }
+            // A challenge this emulator never handed out, one the clock has
+            // taken past its window, and one held for another user are all
+            // reported the same way: the refusal says the challenge is not one
+            // that can be answered and distinguishes no further.
+            Some(_) | None => return Err(challenge_not_found()),
         };
 
         // "This exception is thrown when the access token is for a different
@@ -376,7 +371,7 @@ impl PresentedCredential {
             // thrown when a user presents passkey credentials from an unsupported
             // device or provider" (this service's model).
             Some(reported) => return Err(credential_not_supported(reported)),
-            None => return Err(missing_member("type")),
+            None => return Err(invalid_credential_data()),
         }
         // `PublicKeyCredential.id` is "the base64url encoding of
         // PublicKeyCredential's rawId" (W3C Web Authentication Level 2 §5.1), so
@@ -385,11 +380,11 @@ impl PresentedCredential {
         let credential_id = text(member(credential, "id"))
             .or_else(|| text(member(credential, "rawId")))
             .filter(|id| !id.is_empty())
-            .ok_or_else(|| missing_member("id"))?
+            .ok_or_else(invalid_credential_data)?
             .to_string();
-        let response = member(credential, "response").ok_or_else(|| missing_member("response"))?;
-        let client_data_json = text(member(response, "clientDataJSON"))
-            .ok_or_else(|| missing_member("response.clientDataJSON"))?;
+        let response = member(credential, "response").ok_or_else(invalid_credential_data)?;
+        let client_data_json =
+            text(member(response, "clientDataJSON")).ok_or_else(invalid_credential_data)?;
         // "Let JSONtext be the result of running UTF-8 decode on the value of
         // response.clientDataJSON" and "let C ... be the result of running an
         // implementation-specific JSON parser on JSONtext" (W3C Web
@@ -397,24 +392,24 @@ impl PresentedCredential {
         // response carries those bytes base64url.
         let client_data = crate::state::base64_url_decode(client_data_json)
             .and_then(|bytes| ::serde_json::from_slice::<::serde_json::Value>(&bytes).ok())
-            .ok_or_else(|| unreadable_member("response.clientDataJSON"))?;
+            .ok_or_else(invalid_credential_data)?;
         match client_data.get("type").and_then(::serde_json::Value::as_str) {
             Some(CLIENT_DATA_CREATE_TYPE) => {}
             // Client data collected for any other ceremony is not a registration
             // response, whatever else it carries.
-            Some(_) | None => return Err(not_a_registration_ceremony()),
+            Some(_) | None => return Err(invalid_credential_data()),
         }
         let challenge = client_data
             .get("challenge")
             .and_then(::serde_json::Value::as_str)
             .filter(|challenge| !challenge.is_empty())
-            .ok_or_else(|| missing_member("response.clientDataJSON.challenge"))?
+            .ok_or_else(invalid_credential_data)?
             .to_string();
         let origin = client_data
             .get("origin")
             .and_then(::serde_json::Value::as_str)
             .filter(|origin| !origin.is_empty())
-            .ok_or_else(|| missing_member("response.clientDataJSON.origin"))?
+            .ok_or_else(invalid_credential_data)?
             .to_string();
         Ok(Self {
             credential_id,
@@ -513,6 +508,17 @@ const INVALID_ACCESS_TOKEN: &str = "Invalid Access Token";
 fn token_rejected(rejection: crate::state::TokenRejection) -> CompleteWebAuthnRegistrationError {
     match rejection {
         crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        // The token is live and authorizes this operation, but the user it names
+        // has to set a new password before any self-service call of its own is
+        // served, which this operation declares its own error for.
+        crate::state::TokenRejection::PasswordResetRequired => {
+            CompleteWebAuthnRegistrationErrorModeled::PasswordResetRequiredException(
+                PasswordResetRequiredException {
+                    message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
         crate::state::TokenRejection::MissingRequiredScopes => {
             not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
         }
@@ -536,26 +542,24 @@ fn not_authorized(message: &str) -> CompleteWebAuthnRegistrationError {
 fn web_authn_not_enabled() -> CompleteWebAuthnRegistrationError {
     CompleteWebAuthnRegistrationErrorModeled::WebAuthnNotEnabledException(
         WebAuthnNotEnabledException {
-            message: Some("WebAuthn is not enabled for this user pool.".to_string()),
+            message: Some(crate::state::WEB_AUTHN_NOT_ENABLED_MESSAGE.to_string()),
         },
     )
     .into()
 }
 
+/// The message a challenge that names no answerable registration is refused
+/// with: one sentence covering both a challenge this emulator is not holding and
+/// one the clock has taken past its window, so the refusal reports neither which
+/// of the two it was nor which operation handed the challenge out.
+const CHALLENGE_NOT_FOUND_MESSAGE: &str = "The challenge does not exist or has expired";
+
 /// The refusal for a response whose challenge names no registration this caller
-/// can complete: `expired` tells a challenge this emulator handed out and the
-/// clock has since taken past its window from one it is not holding at all.
-fn challenge_not_found(expired: bool) -> CompleteWebAuthnRegistrationError {
+/// can answer.
+fn challenge_not_found() -> CompleteWebAuthnRegistrationError {
     CompleteWebAuthnRegistrationErrorModeled::WebAuthnChallengeNotFoundException(
         WebAuthnChallengeNotFoundException {
-            message: Some(
-                if expired {
-                    "The challenge from StartWebAuthnRegistration has expired."
-                } else {
-                    "The challenge from StartWebAuthnRegistration was not found."
-                }
-                .to_string(),
-            ),
+            message: Some(CHALLENGE_NOT_FOUND_MESSAGE.to_string()),
         },
     )
     .into()
@@ -631,28 +635,17 @@ fn limit_exceeded(message: String) -> CompleteWebAuthnRegistrationError {
     .into()
 }
 
-/// The refusal for a `Credential` document missing the member `name`.
-fn missing_member(name: &str) -> CompleteWebAuthnRegistrationError {
-    invalid_parameter(format!(
-        "Credential does not carry the required member {name}."
-    ))
-}
+/// The message a `Credential` this service cannot read as a registration
+/// response is refused with: one sentence for the whole class — a member that is
+/// absent, one that carries no value this service can read, and client data
+/// collected for another ceremony — so the refusal names no member of the
+/// presented credential and nothing else the request carried.
+const INVALID_CREDENTIAL_DATA_MESSAGE: &str = "Credential data is not valid";
 
-/// The refusal for a `Credential` member that carries no value this service can
-/// read.
-fn unreadable_member(name: &str) -> CompleteWebAuthnRegistrationError {
-    invalid_parameter(format!(
-        "Credential member {name} is not base64url-encoded JSON."
-    ))
-}
-
-/// The refusal for client data collected for another ceremony than a passkey
-/// registration.
-fn not_a_registration_ceremony() -> CompleteWebAuthnRegistrationError {
-    invalid_parameter(format!(
-        "Credential member response.clientDataJSON must carry type \
-         {CLIENT_DATA_CREATE_TYPE}."
-    ))
+/// The refusal for a `Credential` document that is no registration response this
+/// service can read.
+fn invalid_credential_data() -> CompleteWebAuthnRegistrationError {
+    invalid_parameter(INVALID_CREDENTIAL_DATA_MESSAGE.to_string())
 }
 
 /// The refusal for a credential id this user already holds a passkey under.

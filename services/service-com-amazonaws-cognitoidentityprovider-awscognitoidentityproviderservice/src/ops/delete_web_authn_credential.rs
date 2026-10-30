@@ -204,6 +204,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn token_rejected(rejection: crate::state::TokenRejection) -> DeleteWebAuthnCredentialError {
     match rejection {
         crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        // The token is live and authorizes this operation, but the user it names
+        // has to set a new password before any self-service call of its own is
+        // served, which this operation declares its own error for.
+        crate::state::TokenRejection::PasswordResetRequired => {
+            DeleteWebAuthnCredentialErrorModeled::PasswordResetRequiredException(
+                PasswordResetRequiredException {
+                    message: Some(crate::state::PASSWORD_RESET_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
         crate::state::TokenRejection::MissingRequiredScopes => {
             not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
         }
@@ -233,7 +244,10 @@ fn not_authorized(message: &str) -> DeleteWebAuthnCredentialError {
 /// This operation's `ResourceNotFoundException` for a `CredentialId` the
 /// signed-in user holds no registered passkey under: the exception "is thrown
 /// when the Amazon Cognito service can't find the requested resource" (this
-/// service's model).
+/// service's model). One sentence for every such id
+/// ([`crate::state::WEB_AUTHN_CREDENTIAL_NOT_FOUND_MESSAGE`]), so a credential
+/// registered to ANOTHER user is reported exactly as one nothing ever
+/// registered.
 fn credential_not_found() -> DeleteWebAuthnCredentialError {
     DeleteWebAuthnCredentialErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(crate::state::WEB_AUTHN_CREDENTIAL_NOT_FOUND_MESSAGE.to_string()),
