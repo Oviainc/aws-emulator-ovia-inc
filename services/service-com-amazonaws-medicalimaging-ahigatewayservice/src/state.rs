@@ -2235,7 +2235,45 @@ pub fn to_date_time(instant: SystemTime) -> ::aws_smithy_types::DateTime {
 // The codec lives here because more than one listing uses it, and a token format
 // spelled twice drifts. Each collection passes its OWN marker, so a token minted for
 // one collection is not a position in another and is refused rather than honoured.
+//
+// A marker names every choice the request makes about WHICH records the walk
+// enumerates: the collection's scope, the order it is walked in where the caller picks
+// one, and the FILTER it was narrowed by. A filter decides which records are in the walk
+// at all, so a position computed under one is not a position under another.
 // ---------------------------------------------------------------------------
+
+/// How a collection marker spells the FILTER the request narrowed the walked records
+/// with: the filter's own text, or [`UNFILTERED_PAGE_TOKEN_SEGMENT`] when the request
+/// named none.
+///
+/// Passing it keeps a token a position in the collection the request actually defined: a
+/// token minted while paging the records one filter selects is neither a position in the
+/// records another selects nor one in the unfiltered whole, so it is refused rather than
+/// honoured — which is what stops a resume under a changed filter from skipping records
+/// the caller never saw or repeating ones already served.
+pub fn page_token_filter_segment(filter: Option<&str>) -> &str {
+    filter.unwrap_or(UNFILTERED_PAGE_TOKEN_SEGMENT)
+}
+
+/// How [`page_token_filter_segment`] spells "this request filtered nothing". Lower-case
+/// letters outside the hexadecimal alphabet, so it is a text no modelled status value and
+/// no [`page_token_filter_digest`] can spell, and the unfiltered collection's marker can
+/// collide with no filtered one's.
+pub const UNFILTERED_PAGE_TOKEN_SEGMENT: &str = "unfiltered";
+
+/// How a collection marker spells a filter whose shape is a STRUCTURE rather than one
+/// value: a fixed-width digest of the filter's canonical text.
+///
+/// A digest rather than the text itself, so the marker's length is the same whatever the
+/// filter holds and a token stays well inside `NextToken`'s `1..8192`; equality is all a
+/// marker needs of it, since the question a resume asks is only whether this request's
+/// filter is the one the token was minted under.
+pub fn page_token_filter_digest(canonical: &str) -> String {
+    use ::sha2::Digest as _;
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(canonical.as_bytes());
+    ::hex::encode(digest.finalize())
+}
 
 /// The total order a listing walks: the record's instant first (seconds, then
 /// nanoseconds), its identifier to break a tie — so a page boundary is stable no matter

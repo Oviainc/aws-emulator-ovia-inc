@@ -23,12 +23,16 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes/decodes the opaque `nextToken` ListDatastores hands out.
 hex = { workspace = true }
+# Digests the canonical text of a search's filters into its page-token marker, so the
+# marker's length does not grow with the filters the request carries.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
+# `sha2` is a regular dependency above (the search page-token marker's filter digest),
+# which the test targets can use too, so it is not repeated here.
 
 [lints]
 workspace = true

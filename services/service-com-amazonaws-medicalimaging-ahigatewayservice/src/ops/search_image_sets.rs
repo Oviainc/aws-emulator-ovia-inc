@@ -40,9 +40,10 @@
 //! response always echoes the sort it was served in. The image set identifier breaks a
 //! tie, so the order is total and a page boundary is stable however the underlying map
 //! iterates. The token carries the FULL sort key the next page starts at (see
-//! [`crate::state::encode_keyed_page_token`]) and is marked with the data store AND the
-//! order it was minted under, so a token honoured under another sort — which would
-//! silently skip or repeat image sets — is refused instead.
+//! [`crate::state::encode_keyed_page_token`]) and is marked with the data store, the
+//! order it was minted under AND the filters it was minted under, so a token honoured
+//! under another sort or another set of filters — which would silently skip or repeat
+//! image sets — is refused instead.
 //!
 //! Only the image sets the data store still HOLDS are searchable: a retired one keeps
 //! nothing but the properties `GetImageSet` reports of a tombstone, so there is no
@@ -198,15 +199,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let sort = EffectiveSort::from_criteria(criteria.and_then(|criteria| criteria.sort.as_ref()))
             .map_err(invalid_request)?;
 
-        // The token is this service's own opaque handle, marked with the data store and
-        // the ORDER the position belongs to; only one this service minted for that pair
-        // can be honoured, and anything else is a client error rather than an empty page.
-        // The refusal is the service's FIXED sentence: it does not vary with the token,
-        // so it reveals nothing about how a real one is built.
+        // The token is this service's own opaque handle, marked with the data store, the
+        // ORDER and the FILTERS the position belongs to; only one this service minted for
+        // that collection can be honoured, and anything else is a client error rather
+        // than an empty page. The refusal is the service's FIXED sentence: it does not
+        // vary with the token, so it reveals nothing about how a real one is built.
+        let filters_marker = page_token_filters_segment(&predicates);
         let resume_from = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                sort.decode_page_token(&input.datastore_id, token)
+                sort.decode_page_token(&input.datastore_id, &filters_marker, token)
                     .ok_or_else(|| {
                         invalid_request(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string())
                     })?,
@@ -294,7 +296,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A token only when a further page exists, so a caller's walk terminates on the
         // page that exhausts the result.
         let next_token = matched.get(end).map(|(key, image_set)| {
-            sort.encode_page_token(&input.datastore_id, key, &image_set.image_set_id)
+            sort.encode_page_token(
+                &input.datastore_id,
+                &filters_marker,
+                key,
+                &image_set.image_set_id,
+            )
         });
 
         Ok(SearchImageSetsOutput {
@@ -461,34 +468,49 @@ impl EffectiveSort {
     }
 
     /// The marker every token this search mints carries: this operation's own prefix, the
-    /// data store the position belongs to, and the ORDER it is a position in.
+    /// data store the position belongs to, the ORDER it is a position in, and the FILTERS
+    /// the result it is a position in was narrowed by (`filters`, as
+    /// [`page_token_filters_segment`] spells them).
     ///
     /// A hex string this service never issued, one minted for another collection, one
-    /// minted against another data store and one minted under another sort are all
-    /// refused rather than honoured as a resume point — a position in one order is not a
-    /// position in another.
-    fn page_token_marker(self, datastore_id: &str) -> String {
+    /// minted against another data store, one minted under another sort and one minted
+    /// under another set of filters are all refused rather than honoured as a resume point
+    /// — a position in one order is not a position in another, and filters decide which
+    /// image sets are in the result at all, so a position among the ones one conjunction
+    /// selects is not a position among the ones another selects.
+    fn page_token_marker(self, datastore_id: &str, filters: &str) -> String {
         format!(
-            "ahi-image-set-search-v1:{datastore_id}:{}:{}:",
+            "ahi-image-set-search-v1:{datastore_id}:{}:{}:{filters}:",
             self.field.as_wire(),
             self.order.as_wire()
         )
     }
 
     /// Encode the sort key the next page starts at as this search's opaque `nextToken`.
-    fn encode_page_token(self, datastore_id: &str, key: &SortKey, image_set_id: &str) -> String {
+    fn encode_page_token(
+        self,
+        datastore_id: &str,
+        filters: &str,
+        key: &SortKey,
+        image_set_id: &str,
+    ) -> String {
         crate::state::encode_keyed_page_token(
-            &self.page_token_marker(datastore_id),
+            &self.page_token_marker(datastore_id, filters),
             &key.as_text(),
             image_set_id,
         )
     }
 
-    /// Decode a token [`EffectiveSort::encode_page_token`] produced for this data store
-    /// and this order, or `None` when it was not one.
-    fn decode_page_token(self, datastore_id: &str, token: &str) -> Option<(SortKey, String)> {
+    /// Decode a token [`EffectiveSort::encode_page_token`] produced for this data store,
+    /// this order and these filters, or `None` when it was not one.
+    fn decode_page_token(
+        self,
+        datastore_id: &str,
+        filters: &str,
+        token: &str,
+    ) -> Option<(SortKey, String)> {
         let (key, image_set_id) = crate::state::decode_keyed_page_token(
-            &self.page_token_marker(datastore_id),
+            &self.page_token_marker(datastore_id, filters),
             token,
         )?;
         Some((SortKey::parse(self.field, &key)?, image_set_id))
@@ -559,6 +581,68 @@ fn date_time_key(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
 }
 
+/// How this search's collection marker spells the FILTERS the criteria narrowed the
+/// result with: a digest of their canonical text
+/// ([`crate::state::page_token_filter_digest`]), or the unfiltered spelling
+/// ([`crate::state::UNFILTERED_PAGE_TOKEN_SEGMENT`]) when the criteria carry none.
+///
+/// Canonical means the text depends only on WHICH image sets the filters select, not on
+/// how the caller wrote them: the filters are ANDed, so they are sorted and de-duplicated
+/// first — two requests stating the same conjunction in another order walk the same
+/// result and must share a marker, while a request stating a different conjunction walks
+/// another result and must not.
+fn page_token_filters_segment(predicates: &[Predicate]) -> String {
+    if predicates.is_empty() {
+        return crate::state::UNFILTERED_PAGE_TOKEN_SEGMENT.to_string();
+    }
+    let mut canonical: Vec<String> = predicates.iter().map(Predicate::canonical).collect();
+    canonical.sort();
+    canonical.dedup();
+    crate::state::page_token_filter_digest(&canonical.join("\n"))
+}
+
+/// One attribute value as canonical text: the member it names, then the length of its
+/// value and the value itself.
+///
+/// Length-prefixed, so no two different values can spell the same text by sliding a
+/// separator into one of them. A timestamp is spelled as the pair it is COMPARED by
+/// ([`date_time_key`]), because two spellings of one instant select the same image sets.
+fn attribute_canonical(value: &SearchByAttributeValue) -> String {
+    let (member, text) = match value {
+        SearchByAttributeValue::DICOMPatientId(wanted) => ("DICOMPatientId", wanted.clone()),
+        SearchByAttributeValue::DICOMAccessionNumber(wanted) => {
+            ("DICOMAccessionNumber", wanted.clone())
+        }
+        SearchByAttributeValue::DICOMStudyId(wanted) => ("DICOMStudyId", wanted.clone()),
+        SearchByAttributeValue::DICOMStudyInstanceUID(wanted) => {
+            ("DICOMStudyInstanceUID", wanted.clone())
+        }
+        SearchByAttributeValue::DICOMSeriesInstanceUID(wanted) => {
+            ("DICOMSeriesInstanceUID", wanted.clone())
+        }
+        SearchByAttributeValue::createdAt(wanted) => {
+            ("createdAt", instant_canonical(date_time_key(wanted)))
+        }
+        SearchByAttributeValue::updatedAt(wanted) => {
+            ("updatedAt", instant_canonical(date_time_key(wanted)))
+        }
+        SearchByAttributeValue::DICOMStudyDateAndTime(wanted) => (
+            "DICOMStudyDateAndTime",
+            study_rank(
+                Some(&wanted.dicom_study_date),
+                wanted.dicom_study_time.as_deref(),
+            ),
+        ),
+        SearchByAttributeValue::isPrimary(wanted) => ("isPrimary", wanted.to_string()),
+    };
+    format!("{member} {} {text}", text.len())
+}
+
+/// An instant's comparison pair as canonical text.
+fn instant_canonical(key: (i64, u32)) -> String {
+    format!("{}.{}", key.0, key.1)
+}
+
 /// One filter, as the comparison it stands for.
 #[derive(Debug, Clone)]
 enum Predicate {
@@ -622,6 +706,16 @@ impl Predicate {
                 Some(other),
                 "Member must satisfy enum value set [EQUAL, BETWEEN]",
             )),
+        }
+    }
+
+    /// This filter as the canonical text its collection marker is digested from: the
+    /// comparison it stands for and the attribute value(s) it compares against, so two
+    /// requests spell the same text exactly when their filters select the same image sets.
+    fn canonical(&self) -> String {
+        match self {
+            Self::Equal(value) => format!("EQUAL {}", attribute_canonical(value)),
+            Self::Between(range) => format!("BETWEEN {}", range.canonical()),
         }
     }
 
@@ -708,6 +802,36 @@ impl RangeFilter {
                 upper: upper.clone(),
             }),
             _ => None,
+        }
+    }
+
+    /// This range as the canonical text its collection marker is digested from: the
+    /// attribute it bounds and each bound, spelled as the value it is COMPARED by and
+    /// length-prefixed where that value is text, so two ranges spell the same text exactly
+    /// when they admit the same image sets.
+    fn canonical(&self) -> String {
+        match self {
+            Self::CreatedAt { lower, upper } => format!(
+                "createdAt {} {}",
+                instant_canonical(*lower),
+                instant_canonical(*upper)
+            ),
+            Self::UpdatedAt { lower, upper } => format!(
+                "updatedAt {} {}",
+                instant_canonical(*lower),
+                instant_canonical(*upper)
+            ),
+            Self::StudyDateAndTime { lower, upper } => {
+                let lower =
+                    study_rank(Some(&lower.dicom_study_date), lower.dicom_study_time.as_deref());
+                let upper =
+                    study_rank(Some(&upper.dicom_study_date), upper.dicom_study_time.as_deref());
+                format!(
+                    "DICOMStudyDateAndTime {} {lower} {} {upper}",
+                    lower.len(),
+                    upper.len()
+                )
+            }
         }
     }
 

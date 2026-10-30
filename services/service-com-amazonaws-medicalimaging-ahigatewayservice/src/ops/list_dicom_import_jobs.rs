@@ -16,9 +16,10 @@
 //! The continuation token is opaque on the wire — hex over a marked encoding of the FULL
 //! sort key the next page starts at, through the service's one codec
 //! ([`crate::state::encode_page_token`]) — so a string this service did not mint is
-//! refused, the marker carries the data store the position belongs to (a token minted
-//! against another data store is not a position in this collection), and paging cannot
-//! skip or repeat a job even when the one the token named is gone.
+//! refused, the marker carries the data store AND the `jobStatus` filter the position
+//! belongs to (a token minted against another data store, or under another status filter,
+//! is not a position in the walk this request makes), and paging cannot skip or repeat a
+//! job even when the one the token named is gone.
 //!
 //! ---
 //!
@@ -178,20 +179,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // The token is this service's own opaque handle, marked with the data store the
-        // position belongs to; only one this service minted against THIS data store can
-        // be honoured, and anything else is a client error rather than an empty page.
-        // The refusal is the service's FIXED sentence: it does not vary with the token,
-        // so it reveals nothing about how a real one is built.
+        // The token is this service's own opaque handle, marked with the data store AND
+        // the status filter the position belongs to; only one this service minted for
+        // THAT collection can be honoured, and anything else is a client error rather
+        // than an empty page. The refusal is the service's FIXED sentence: it does not
+        // vary with the token, so it reveals nothing about how a real one is built.
         let resume_from = match input.next_token.as_deref() {
             None => None,
-            Some(token) => {
-                Some(decode_page_token(&input.datastore_id, token).ok_or_else(|| {
+            Some(token) => Some(
+                decode_page_token(&input.datastore_id, status_filter, token).ok_or_else(|| {
                     ListDICOMImportJobsErrorModeled::ValidationException(ValidationException {
                         message: crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                     })
-                })?)
-            }
+                })?,
+            ),
         };
 
         let page_size = input
@@ -267,7 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let next_token = ordered
             .get(end)
-            .map(|job| encode_page_token(&input.datastore_id, job));
+            .map(|job| encode_page_token(&input.datastore_id, status_filter, job));
 
         Ok(ListDICOMImportJobsOutput {
             job_summaries,
@@ -276,16 +277,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The marker every token this listing mints carries: this operation's own prefix plus
-/// the data store the position belongs to.
+/// The marker every token this listing mints carries: this operation's own prefix, the
+/// data store the position belongs to, and the `jobStatus` the walk it is a position in
+/// was narrowed by ([`crate::state::page_token_filter_segment`]).
 ///
-/// A hex string this service never issued, one minted for another collection, and one
-/// minted against another data store are all refused rather than honoured as a resume
-/// point — the import jobs of two data stores are two collections, so a position in one
-/// is not a position in the other. The codec itself is the service's one
+/// A hex string this service never issued, one minted for another collection, one minted
+/// against another data store and one minted under another status filter are all refused
+/// rather than honoured as a resume point — the import jobs of two data stores are two
+/// collections, and the filter decides which of a data store's jobs are in the walk at
+/// all, so a position in the jobs one status selects is not a position in the jobs another
+/// selects nor in the unfiltered whole. The codec itself is the service's one
 /// ([`crate::state::encode_page_token`]), so every listing's token is built one way.
-fn page_token_marker(datastore_id: &str) -> String {
-    format!("ahi-import-jobs-v1:{datastore_id}:")
+fn page_token_marker(datastore_id: &str, status_filter: Option<JobStatus>) -> String {
+    format!(
+        "ahi-import-jobs-v1:{datastore_id}:{}:",
+        crate::state::page_token_filter_segment(status_filter.map(JobStatus::as_wire))
+    )
 }
 
 /// The total order the listing walks: submission instant first, job id to break a tie —
@@ -295,16 +302,24 @@ fn sort_key(job: &crate::state::ImportJob) -> (u64, u32, &str) {
 }
 
 /// Encode the sort key the next page starts at as this listing's opaque `nextToken`.
-fn encode_page_token(datastore_id: &str, first_of_next_page: &crate::state::ImportJob) -> String {
+fn encode_page_token(
+    datastore_id: &str,
+    status_filter: Option<JobStatus>,
+    first_of_next_page: &crate::state::ImportJob,
+) -> String {
     crate::state::encode_page_token(
-        &page_token_marker(datastore_id),
+        &page_token_marker(datastore_id, status_filter),
         first_of_next_page.submitted_at,
         &first_of_next_page.job_id,
     )
 }
 
-/// Decode a token produced by [`encode_page_token`] against `datastore_id`, or `None`
-/// when it was not one.
-fn decode_page_token(datastore_id: &str, token: &str) -> Option<crate::state::PageCursor> {
-    crate::state::decode_page_token(&page_token_marker(datastore_id), token)
+/// Decode a token produced by [`encode_page_token`] against `datastore_id` and
+/// `status_filter`, or `None` when it was not one.
+fn decode_page_token(
+    datastore_id: &str,
+    status_filter: Option<JobStatus>,
+    token: &str,
+) -> Option<crate::state::PageCursor> {
+    crate::state::decode_page_token(&page_token_marker(datastore_id, status_filter), token)
 }
