@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 crate::state::AuditOutcome::NotFound,
                 &project_arn,
-                project_not_found(&project_arn),
+                project_not_found(),
             ));
         };
         let Some(webhook) = stored.project.webhook.as_ref() else {
@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 crate::state::AuditOutcome::NotFound,
                 &project_arn,
-                project_not_found(&project_arn),
+                project_not_found(),
             ));
         };
         stored.project.webhook = None;
@@ -255,11 +255,13 @@ fn refuse(
     error
 }
 
-/// No project of that name is held, so there is no webhook to remove. The wording is the
-/// one every operation of this service uses for a missing project.
-fn project_not_found(project_arn: &str) -> DeleteWebhookError {
+/// No project of that name is held, so there is no webhook to remove: the project is the
+/// resource this call could not resolve, and it is reported as the absent one. Worded
+/// with [`crate::state::PROJECT_NOT_FOUND_MESSAGE`], the fixed sentence CodeBuild states
+/// for an absent project on the operations that address one by name.
+fn project_not_found() -> DeleteWebhookError {
     DeleteWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Project cannot be found: {project_arn}")),
+        message: Some(crate::state::PROJECT_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

@@ -150,17 +150,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .settled_build_batch(&input.id, now)
             .map(|stored| stored.build_batch.clone())
         else {
-            // A batch build this service holds no record of leaves nothing to delete,
-            // and the operation models no not-found error at all — the same reading
-            // `crate::ops::delete_project` applies to the other deletable resource
-            // whose absence AWS models no error for. Both halves of the partition are
-            // reported empty, and `statusCode` is left out: there was no batch build
-            // for this call to report an outcome for.
-            return Ok(DeleteBuildBatchOutput {
-                status_code: None,
-                builds_deleted: Some(Vec::new()),
-                builds_not_deleted: Some(Vec::new()),
-            });
+            // The id has to denote a batch build of this account before anything is
+            // deleted: one that does not — mistyped, already deleted, or another
+            // account's — is a value this operation cannot act on, so it is refused
+            // with the single error the operation models and nothing is removed. The
+            // sentence is CodeBuild's own fixed one
+            // ([`crate::state::INVALID_BUILD_BATCH_ID_MESSAGE`]), which quotes neither
+            // the id nor an ARN, so a client cannot tell a typo from another account's
+            // batch — and this emulator does not report one id's existence to the other.
+            return Err(DeleteBuildBatchErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::INVALID_BUILD_BATCH_ID_MESSAGE.to_string()),
+                },
+            )
+            .into());
         };
 
         // A batch build is deletable only once it has finished: `BuildBatch$complete`

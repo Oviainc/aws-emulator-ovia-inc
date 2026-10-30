@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (source_type, missing_token) = {
             let guard = state.lock();
             let Some(stored) = guard.projects.get(&input.project_name) else {
-                return Err(not_found(&project_arn));
+                return Err(not_found());
             };
             if stored.project.webhook.is_some() {
                 return Err(already_exists(&project_arn));
@@ -297,7 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // was resolving cannot be written over.
         let mut guard = state.lock();
         let Some(stored) = guard.projects.get_mut(&input.project_name) else {
-            return Err(not_found(&project_arn));
+            return Err(not_found());
         };
         if stored.project.webhook.is_some() {
             return Err(already_exists(&project_arn));
@@ -317,11 +317,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// and is active". One of the model's four `WebhookStatus` values.
 const WEBHOOK_ACTIVE_STATUS: &str = "ACTIVE";
 
-/// No project of that name is held, so there is nothing to attach a webhook to. The
-/// wording is the one every operation of this service uses for a missing project.
-fn not_found(project_arn: &str) -> CreateWebhookError {
+/// No project of that name is held, so there is nothing to attach a webhook to: the
+/// project is the resource this call could not resolve, and it is reported as the absent
+/// one. Worded with [`crate::state::PROJECT_NOT_FOUND_MESSAGE`], the fixed sentence
+/// CodeBuild states for an absent project on the operations that address one by name.
+fn not_found() -> CreateWebhookError {
     CreateWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Project cannot be found: {project_arn}")),
+        message: Some(crate::state::PROJECT_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

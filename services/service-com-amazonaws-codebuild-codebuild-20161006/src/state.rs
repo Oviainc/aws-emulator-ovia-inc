@@ -513,6 +513,16 @@ pub const BATCH_SPEC_NOT_DOWNLOADED_MESSAGE: &str = "this emulator does not run 
 /// `buildBatchesNotFound`.
 pub const BATCH_DELETED_STATUS_CODE: &str = "BATCH_DELETED";
 
+/// What CodeBuild states as the reason a value does not denote a batch build this
+/// account holds, carried by the modelled `InvalidInputException`.
+///
+/// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: it quotes neither the id the
+/// request sent nor an ARN, so the sentence is the same for every rejected id and a
+/// client can key on it. `DeleteBuildBatch` models no not-found error at all — an id it
+/// cannot resolve is a bad input rather than a missing resource — so this is the
+/// sentence that refusal carries.
+pub const INVALID_BUILD_BATCH_ID_MESSAGE: &str = "Invalid BuildBatch ID provided";
+
 
 /// The status a sandbox and its session report between `StartSandbox` and the
 /// transition the clock owes them: CodeBuild queues a sandbox request the same way it
@@ -555,10 +565,10 @@ pub const SANDBOX_NOT_FOUND_MESSAGE: &str = "Sandbox does not exist";
 ///
 /// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: it names neither the
 /// project nor an ARN, so the sentence is the same for every request and a client can
-/// key on it. Recorded behaviour — the model states no message for the error — and it
-/// is the sentence recorded for CodeBuild's absent-project refusals, so the sites that
-/// still compose one naming the project's ARN are the ones to migrate onto this
-/// constant, which is tracked as its own wire-fidelity issue rather than done here.
+/// key on it. Recorded behaviour — the model states no message for the error. It is the
+/// sentence the webhook and project-management operations carry; the build-starting
+/// operations are recorded wording theirs with the absent project's ARN instead, so a
+/// site keeps whichever of the two is recorded for ITS operation.
 pub const PROJECT_NOT_FOUND_MESSAGE: &str = "Project does not exist";
 
 /// What CodeBuild states as the reason a webhook-addressing request names a project that
@@ -2676,6 +2686,39 @@ pub fn build_arn(region: &str, id: &str) -> String {
 /// id's own `<projectName>:<uuid>` colon is recovered intact.
 pub fn build_id_from_arn(arn: &str) -> Option<&str> {
     resource_from_arn(arn, "build/")
+}
+
+/// The project name a per-project resource id names, or `None` when `id` does not have
+/// that form.
+///
+/// Every id this service mints for work that belongs to a project reads
+/// `<projectName>:<uuid>` — a build's ([`build_uuid`]), a batch build's
+/// ([`build_batch_uuid`]), a sandbox's ([`sandbox_uuid`]) — so such an id names a
+/// PROJECT as well as the work itself, and an operation addressed by one resolves that
+/// project as its first precondition: work cannot belong to a project this account does
+/// not hold, so the project is what such a request is answered on.
+///
+/// Answers the SYNTAX question only — whether the value has the form at all — so a
+/// caller still looks the project up in the store. The uuid half is required to BE one
+/// (8-4-4-4-12 hex, which is what [`build_uuid`] produces), so a value that merely
+/// carries a colon — an ARN, a label — names no project here and leaves the request to
+/// be answered on the record it addresses.
+pub fn project_name_from_resource_id(id: &str) -> Option<&str> {
+    let (project_name, uuid) = id.split_once(':')?;
+    (!project_name.is_empty() && is_uuid(uuid)).then_some(project_name)
+}
+
+/// Whether `value` is a UUID in the 8-4-4-4-12 hex form [`derived_uuid`] renders —
+/// the shape of the second half of every per-project resource id this service mints.
+fn is_uuid(value: &str) -> bool {
+    /// The hex-digit count of each dash-separated group of a UUID, in order.
+    const GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+    let mut groups = value.split('-');
+    GROUP_LENGTHS.iter().all(|length| {
+        groups.next().is_some_and(|group| {
+            group.len() == *length && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    }) && groups.next().is_none()
 }
 
 /// The resource `prefix` names inside a `arn:<partition>:codebuild:<region>:<account>:`

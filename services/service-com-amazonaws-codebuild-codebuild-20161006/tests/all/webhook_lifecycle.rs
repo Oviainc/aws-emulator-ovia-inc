@@ -358,12 +358,10 @@ async fn create_webhook_for_an_unknown_project_is_refused() {
         error_type(&body).contains("ResourceNotFoundException"),
         "CreateWebhook on an unknown project: expected ResourceNotFoundException, got {body}"
     );
-    assert!(
-        body["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("no-such-project"),
-        "the refusal must name the project that was not found, got {body}"
+    assert_eq!(
+        body["message"],
+        json!(state::PROJECT_NOT_FOUND_MESSAGE),
+        "the refusal must state that the project is the absent resource, got {body}"
     );
 }
 
@@ -926,12 +924,10 @@ async fn an_update_refuses_what_it_cannot_apply() {
         error_type(&body).contains("ResourceNotFoundException"),
         "UpdateWebhook on an unknown project: expected ResourceNotFoundException, got {body}"
     );
-    assert!(
-        body["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("no-such-project"),
-        "the refusal must name the project that was not found, got {body}"
+    assert_eq!(
+        body["message"],
+        json!(state::PROJECT_NOT_FOUND_MESSAGE),
+        "the refusal must state that the project is the absent resource, got {body}"
     );
 
     // A project that has no webhook has no configuration to rewrite.

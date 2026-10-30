@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 crate::state::AuditOutcome::NotFound,
                 &project_arn,
-                project_not_found(&project_arn),
+                project_not_found(),
             ));
         };
         if !has_webhook {
@@ -309,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ctx,
                 crate::state::AuditOutcome::NotFound,
                 &project_arn,
-                project_not_found(&project_arn),
+                project_not_found(),
             ));
         };
         let Some(webhook) = stored.project.webhook.as_mut() else {
@@ -408,11 +408,13 @@ fn invalid_input(message: String) -> UpdateWebhookError {
     .into()
 }
 
-/// No project of that name is held, so there is no webhook to update. The wording is
-/// the one every operation of this service uses for a missing project.
-fn project_not_found(project_arn: &str) -> UpdateWebhookError {
+/// No project of that name is held, so there is no webhook to update: the project is
+/// the resource this call could not resolve, and it is reported as the absent one.
+/// Worded with [`crate::state::PROJECT_NOT_FOUND_MESSAGE`], the fixed sentence
+/// CodeBuild states for an absent project on the operations that address one by name.
+fn project_not_found() -> UpdateWebhookError {
     UpdateWebhookErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Project cannot be found: {project_arn}")),
+        message: Some(crate::state::PROJECT_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

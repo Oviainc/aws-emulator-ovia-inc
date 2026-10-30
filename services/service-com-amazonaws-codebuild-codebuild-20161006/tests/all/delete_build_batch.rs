@@ -11,7 +11,8 @@
 //! batch is made of with it, reporting their ids in `buildsDeleted`, the ids it held
 //! no build record for in `buildsNotDeleted` with a `statusCode` saying so, and the
 //! batch-level outcome in `statusCode`. A removed batch is gone from every later read,
-//! while an id naming no batch build deletes nothing.
+//! while an id that denotes no batch build of this account deletes nothing and is
+//! refused with that same modelled error.
 
 use std::sync::Arc;
 
@@ -80,10 +81,10 @@ enum Target {
 
 /// RULE: a finished batch build is deleted and answered with the batch-level
 /// `statusCode`; one still running is refused with the modelled
-/// `InvalidInputException` and left in place; an id naming no batch build deletes
-/// nothing and is not an error. Every row reads the result back through
-/// `BatchGetBuildBatches` and `ListBuildBatches`, which are computed from the store
-/// the delete wrote.
+/// `InvalidInputException` and left in place; an id that denotes no batch build of this
+/// account is refused with that same error and deletes nothing. Every row reads the
+/// result back through `BatchGetBuildBatches` and `ListBuildBatches`, which are computed
+/// from the store the delete wrote.
 #[tokio::test]
 async fn delete_build_batch_removes_a_finished_batch_and_refuses_one_still_running() {
     let cases: &[(Target, &str)] = &[
@@ -177,23 +178,25 @@ async fn delete_build_batch_removes_a_finished_batch_and_refuses_one_still_runni
             | Target::AbsentOfUnknownProject
             | Target::Repeated => {
                 assert_eq!(
-                    status, 200,
-                    "case {target:?}: expected 200, got {status} with {body}"
+                    status, 400,
+                    "case {target:?}: expected 400, got {status} with {body}"
+                );
+                assert_eq!(
+                    error_type(&body),
+                    "InvalidInputException",
+                    "case {target:?}: expected InvalidInputException, got {body}"
+                );
+                assert_eq!(
+                    body["message"],
+                    Value::String(state::INVALID_BUILD_BATCH_ID_MESSAGE.to_string()),
+                    "case {target:?}: an id denoting no batch build is refused in \
+                     CodeBuild's own words, got {body}"
                 );
                 assert!(
-                    body["statusCode"].is_null(),
-                    "case {target:?}: there was no batch build to report an outcome for, \
-                     got {body}"
-                );
-                assert_eq!(
-                    body["buildsDeleted"],
-                    json!([]),
-                    "case {target:?}: nothing was held, so buildsDeleted is empty, got {body}"
-                );
-                assert_eq!(
-                    body["buildsNotDeleted"],
-                    json!([]),
-                    "case {target:?}: nothing was left behind, got {body}"
+                    body["statusCode"].is_null()
+                        && body["buildsDeleted"].is_null()
+                        && body["buildsNotDeleted"].is_null(),
+                    "case {target:?}: a refusal reports no delete outcome at all, got {body}"
                 );
             }
         }

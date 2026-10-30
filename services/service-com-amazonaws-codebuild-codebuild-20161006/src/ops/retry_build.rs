@@ -176,6 +176,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller-sized.
         let mut guard = state.lock();
 
+        // A build id is `<projectName>:<uuid>`, so it names the PROJECT the build
+        // belongs to as well as the build: that project is what a retry runs again, and
+        // it is therefore the first precondition this call resolves. A build cannot
+        // belong to a project this account does not hold, so a request naming an absent
+        // project is answered on the project — which is the resource the caller has to
+        // re-create — and the build record is never consulted for it.
+        if let Some(named_project) = crate::state::project_name_from_resource_id(&build_id)
+            .filter(|named_project| !guard.projects.contains_key(*named_project))
+        {
+            return Err(project_not_found(&crate::state::project_arn(
+                &region,
+                named_project,
+            )));
+        }
+
         // The retried build is read through `settled_build`, so the record this
         // retry is derived from is the one the clock already owes — a build whose
         // span has elapsed is reported, and copied, as finished.
@@ -212,17 +227,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // A retry runs the project's build again, so there has to be a project to
-        // run: a build whose project was deleted cannot be restarted.
+        // run. Reached only for a record whose own `projectName` differs from the
+        // project half of the id it is keyed by — the id's project was resolved
+        // above — and it reports the same refusal on the same project ARN.
         if !guard.projects.contains_key(&project_name) {
-            return Err(RetryBuildErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Project cannot be found: {}",
-                        crate::state::project_arn(&region, &project_name)
-                    )),
-                },
-            )
-            .into());
+            return Err(project_not_found(&crate::state::project_arn(
+                &region,
+                &project_name,
+            )));
         }
 
         // The token is resolved and recorded in `RetryBuild`'s OWN store (the
@@ -340,6 +352,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(RetryBuildOutput { build: Some(build) })
     }
+}
+
+/// No project of that name is held, so the build this request names belongs to nothing
+/// that can be built again. The refusal names the project by its ARN, which is the
+/// wording CodeBuild records for the build-starting operations.
+fn project_not_found(project_arn: &str) -> RetryBuildError {
+    RetryBuildErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Project cannot be found: {project_arn}")),
+    })
+    .into()
 }
 
 /// The same idempotency token carrying a changed request, which AWS documents as a
