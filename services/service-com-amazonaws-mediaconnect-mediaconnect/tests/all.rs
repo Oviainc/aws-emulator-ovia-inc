@@ -221,3 +221,5 @@ mod bridge_source_removal_failover_integrity;
 mod bridge_deletion_flow_source_integrity;
 #[path = "all/flow_ndi_discovery_servers.rs"]
 mod flow_ndi_discovery_servers;
+#[path = "all/required_query_parameters.rs"]
+mod required_query_parameters;

@@ -410,10 +410,13 @@ async fn batch_get_holds_the_modelled_arns_bound() {
 
     // (case, how many ARNs the request names, whether the bound accepts it).
     //
-    // The lower end of the bound is the 1-ARN row: `Arns` is required and bound to the
-    // query string, so a request carrying no `arns` parameter at all resolves no route in
-    // the first place and never reaches this operation's bound.
+    // The 0-ARN row is one past the lower end: `Arns` is required and bound to the query
+    // string, so a request carrying no `arns` parameter at all is the only wire form of
+    // "no ARNs" (an empty list serializes to no parameter), and it is refused as a client
+    // error rather than reported as an unimplemented operation — which is what
+    // `tests/all/required_query_parameters.rs` pins for the whole class of such routes.
     let count_cases = [
+        ("one short of the minimum", MIN_ARNS - 1, false),
         ("the minimum", MIN_ARNS, true),
         ("the maximum", MAX_ARNS, true),
         ("one past the maximum", MAX_ARNS + 1, false),
