@@ -171,6 +171,14 @@ pub const MANAGER_FILTER_KEYS: &[&str] = &["Name", "Description"];
 /// `Filter` keys `ListConfigurations` accepts: the string-valued members of
 /// `ConfigurationSummary`, for the same reason as [`MANAGER_FILTER_KEYS`]. The
 /// manager is named by this operation's own `ManagerArn` member instead.
+///
+/// `TypeVersion` IS among them even though the stored spelling of a version carries a
+/// `.`, which that pattern refuses: a configuration version has several spellings (a
+/// major alone numbers the same version as `<major>.0`, and the modelled
+/// [`TYPE_VERSION_LATEST`] alias names the newest), so a filter value the pattern
+/// admits can still name a stored version. Which version it names is resolved the way
+/// every other member naming a version is ([`FilterField::TypeVersion`]) rather than
+/// compared as text.
 pub const CONFIGURATION_FILTER_KEYS: &[&str] = &[
     "Id",
     "ConfigurationDefinitionId",
@@ -1109,12 +1117,13 @@ impl ConfigurationManagerRecord {
     }
 
     /// The value of the `ConfigurationManagerSummary` member a `Filter` key names,
-    /// or `None` when this record carries none. Borrowed, so matching allocates
-    /// nothing.
-    pub fn filter_field(&self, key: &str) -> Option<&str> {
+    /// or `None` when this record carries none. Every filterable member of that shape
+    /// is caller-supplied text, named by exactly what it holds
+    /// ([`FilterField::Text`]). Borrowed, so matching allocates nothing.
+    pub fn filter_field(&self, key: &str) -> Option<FilterField<'_>> {
         match key {
-            "Name" => self.name.as_deref(),
-            "Description" => self.description.as_deref(),
+            "Name" => self.name.as_deref().map(FilterField::Text),
+            "Description" => self.description.as_deref().map(FilterField::Text),
             _ => None,
         }
     }
@@ -1221,16 +1230,26 @@ impl ConfigurationRecord {
         }
     }
 
-    /// The value of the `ConfigurationSummary` member a `Filter` key names. Borrowed,
-    /// so matching allocates nothing.
-    pub fn filter_field(&self, key: &str) -> Option<&str> {
+    /// The value of the `ConfigurationSummary` member a `Filter` key names, and how a
+    /// filter value names it. Every member but the version holds text that is its own
+    /// value; the version this configuration is deployed at has several spellings, so
+    /// it is reported with the type whose published history resolves them
+    /// ([`FilterField::TypeVersion`]). Borrowed, so matching allocates nothing.
+    pub fn filter_field(&self, key: &str) -> Option<FilterField<'_>> {
         match key {
-            "Id" => Some(&self.id),
-            "ConfigurationDefinitionId" => Some(&self.configuration_definition_id),
-            "Type" => Some(&self.type_),
-            "TypeVersion" => self.type_version.as_deref(),
-            "Account" => Some(&self.account),
-            "Region" => Some(&self.region),
+            "Id" => Some(FilterField::Text(&self.id)),
+            "ConfigurationDefinitionId" => {
+                Some(FilterField::Text(&self.configuration_definition_id))
+            }
+            "Type" => Some(FilterField::Text(&self.type_)),
+            "TypeVersion" => self.type_version.as_deref().map(|version| {
+                FilterField::TypeVersion {
+                    type_: &self.type_,
+                    version,
+                }
+            }),
+            "Account" => Some(FilterField::Text(&self.account)),
+            "Region" => Some(FilterField::Text(&self.region)),
             _ => None,
         }
     }
@@ -1671,8 +1690,58 @@ pub fn filter_key_rejection(filters: Option<&[Filter]>, supported: &[&str]) -> O
     ))
 }
 
+/// The value one record holds for the field a `Filter` key names, and HOW a filter
+/// value is compared to it.
+///
+/// A filter selects the records whose value for its key is one the filter NAMES, so
+/// what counts as naming that value is the field's own rule rather than the text the
+/// record reports: a field whose value has one spelling is named by that text, while a
+/// configuration version has several, so every spelling of a version names it. Carrying
+/// the rule beside the value is what keeps the two listings' matching in one place
+/// ([`matches_filters`]) while each field keeps its own notion of equality. Borrowed out
+/// of the record, so matching allocates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterField<'r> {
+    /// A field whose stored text IS its value, named by exactly that text: every
+    /// filterable member of both summary shapes except the configuration version — an
+    /// id, a name, a description, a configuration type, an account, a Region.
+    Text(&'r str),
+    /// The configuration version of a record deploying `type_`: a filter value names
+    /// `version` when it resolves to it against the versions `type_` publishes
+    /// ([`QuickSetupTypeEntry::published_version`]) — the one place the version rule
+    /// lives, so a filter reads a version the way the members that deploy one do, and
+    /// `<major>` and the [`TYPE_VERSION_LATEST`] alias name a published version here too.
+    TypeVersion {
+        type_: &'r str,
+        version: &'r str,
+    },
+}
+
+impl FilterField<'_> {
+    /// Whether a filter value of `wanted` names the value this field holds.
+    ///
+    /// Costs one comparison for a text field and, for a version, a walk of the
+    /// published history of ONE type — a fixed list this service compiles in, so the
+    /// work one listing does stays bounded by the bounds
+    /// [`filter_key_rejection`] and [`paginate`] already apply.
+    pub fn named_by(self, wanted: &str) -> bool {
+        match self {
+            Self::Text(value) => wanted == value,
+            // A stored configuration always names a type the catalog publishes
+            // ([`quick_setup_type_rejection`] refuses any other), so the catalog is
+            // what resolves the requested spelling — the ONE implementation of the
+            // version rule. A type it does not publish has no version history to
+            // resolve against, so no value names a version of it.
+            Self::TypeVersion { type_, version } => quick_setup_type_entry(type_)
+                .and_then(|entry| entry.published_version(wanted))
+                .is_some_and(|published| published == version),
+        }
+    }
+}
+
 /// Whether a record whose fields `field` reports satisfies every supplied filter: a
-/// filter holds when the record's value for its key is one of that filter's `Values`.
+/// filter holds when one of its `Values` names the record's value for its key
+/// ([`FilterField::named_by`]).
 ///
 /// Both factors of the per-record cost are bounded before this runs: the filter list
 /// and each `Values` list by [`filter_key_rejection`], and the records examined by
@@ -1680,12 +1749,12 @@ pub fn filter_key_rejection(filters: Option<&[Filter]>, supported: &[&str]) -> O
 /// record allocates nothing.
 pub fn matches_filters<'r>(
     filters: Option<&[Filter]>,
-    field: impl Fn(&str) -> Option<&'r str>,
+    field: impl Fn(&str) -> Option<FilterField<'r>>,
 ) -> bool {
     filters.is_none_or(|filters| {
         filters.iter().all(|filter| {
             field(&filter.key)
-                .is_some_and(|value| filter.values.iter().any(|wanted| wanted.as_str() == value))
+                .is_some_and(|value| filter.values.iter().any(|wanted| value.named_by(wanted)))
         })
     })
 }
