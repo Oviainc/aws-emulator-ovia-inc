@@ -54,6 +54,7 @@
 //! bundled plan is billed at follows the account's billable entity count across
 //! a band boundary.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
@@ -3891,6 +3892,108 @@ pub fn component_at_path<'a>(
             })
         }
     }
+}
+
+/// ONE LEVEL of an entity's component tree: the composite components the
+/// component `component_path` leads to holds DIRECTLY, or `None` when the entity
+/// holds no component at that path.
+///
+/// Existence is the rule [`component_at_path`] reads a path with, widened by the
+/// one thing a level walk adds: nothing requires the intermediate steps of a
+/// composite component's path to have been created themselves, so a path names a
+/// component when one is stored AT it or anywhere BENEATH it.
+///
+/// The level that path leads to therefore has one entry per DISTINCT next path
+/// segment the entity holds a composite component at or beneath — the stored
+/// record when one stands at that segment, else the step itself, which carries
+/// the component type the declaration its path resolves to names
+/// ([`resolve_composite_component_path`]) and no properties or property groups
+/// of its own, since nothing was ever stored at it. That is what makes the walk
+/// TOTAL: every composite component the entity holds is reachable from its
+/// top-level component one segment per call, so a caller walking a level at a
+/// time reaches exactly the composite components a whole-entity read
+/// ([`Entity::components_at_every_path`]) reports.
+///
+/// Entries come back in segment order, the order the store is keyed in, so two
+/// reads of unchanged state build the same level and a page boundary does not
+/// depend on map iteration order.
+pub fn component_level_at_path<'a>(
+    entity: &'a Entity,
+    component_types: &BTreeMap<String, ComponentType>,
+    component_path: &str,
+) -> Option<Vec<Cow<'a, CompositeComponentRecord>>> {
+    let separator = COMPONENT_PATH_SEPARATOR;
+    let (component_name, below) = match component_path.split_once(separator) {
+        None => (component_path, None),
+        Some((component_name, below)) => (component_name, Some(below)),
+    };
+    let component = entity.components.get(component_name)?;
+    // The key prefix a child of the named component carries inside
+    // [`ComponentRecord::composite_components`]. Empty for a path of one
+    // segment: the children of a top-level component are the composite
+    // components keyed by a single segment inside it.
+    let prefix = match below {
+        None => String::new(),
+        Some(below) => {
+            let nested = format!("{below}{separator}");
+            if component_at_path(entity, component_path).is_none()
+                && !component
+                    .composite_components
+                    .keys()
+                    .any(|key| key.starts_with(&nested))
+            {
+                return None;
+            }
+            nested
+        }
+    };
+    let mut level: BTreeMap<&str, Cow<'a, CompositeComponentRecord>> = BTreeMap::new();
+    for key in component.composite_components.keys() {
+        let Some(below_prefix) = key.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        let segment = match below_prefix.split_once(separator) {
+            None => below_prefix,
+            Some((segment, _)) => segment,
+        };
+        if segment.is_empty() || level.contains_key(segment) {
+            continue;
+        }
+        let child_key = format!("{prefix}{segment}");
+        let entry = match component.composite_components.get(&child_key) {
+            Some(stored) => Cow::Borrowed(stored),
+            // Nothing stands at this step: it is reported as the step it is,
+            // addressed by its own whole path and instantiating the component
+            // type the declarations resolve it to.
+            None => {
+                let child_path = format!("{component_name}{separator}{child_key}");
+                let component_type_id = resolve_composite_component_path(
+                    &entity.components,
+                    component_types,
+                    "componentPath",
+                    &child_path,
+                )
+                // The declarations normally resolve a step a stored record
+                // hangs beneath, since that record's own create resolved
+                // through them. When a later component-type patch has dropped
+                // the declaration, the step keeps no type to report and reports
+                // the empty string — what a component stored with no
+                // `componentTypeId` already reports for a required member,
+                // rather than hiding a step the stored record is reached
+                // through.
+                .map(|resolved| resolved.component_type_id)
+                .unwrap_or_default();
+                Cow::Owned(CompositeComponentRecord {
+                    component_path: child_path,
+                    component_name: segment.to_string(),
+                    component_type_id,
+                    ..CompositeComponentRecord::default()
+                })
+            }
+        };
+        level.insert(segment, entry);
+    }
+    Some(level.into_values().collect())
 }
 
 /// Every INSTANCE of one component type in a workspace, as the entity each sits

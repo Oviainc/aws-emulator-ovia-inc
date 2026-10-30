@@ -29,6 +29,9 @@ mod component_path_resolution;
 #[path = "all/component_refined_definition.rs"]
 mod component_refined_definition;
 
+#[path = "all/component_tree_walk.rs"]
+mod component_tree_walk;
+
 #[path = "all/component_type_create_references.rs"]
 mod component_type_create_references;
 

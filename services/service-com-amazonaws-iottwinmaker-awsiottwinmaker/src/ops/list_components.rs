@@ -8,11 +8,17 @@
 //!
 //! The listed SCOPE is one level of the entity's component tree, which is what
 //! `componentPath` selects: a request that names none lists the entity's TOP-LEVEL
-//! components, and one that names a path lists the composite components stored directly
-//! inside the component that path leads to ("the path to the composite component,
+//! components, and one that names a path lists the composite components directly inside
+//! the component that path leads to ("the path to the composite component,
 //! starting from the top-level component"), so a caller walks a nested component tree one
 //! level per call instead of reading it all back through `GetEntity`, which truncates at
-//! [`crate::state::MAX_COMPONENTS_RETURNED`]. A workspace, an entity or a component path
+//! [`crate::state::MAX_COMPONENTS_RETURNED`]. That walk is TOTAL — every composite
+//! component the entity holds is reachable from its top-level component one segment per
+//! call — so a level has one row per next path segment the entity holds a composite
+//! component at or beneath, which is the one path rule every reader of a `componentPath`
+//! shares ([`crate::state::component_level_at_path`]): a step of a path that was never
+//! created itself is a row of the level it sits in rather than a hole the walk cannot
+//! cross. A workspace, an entity or a component path
 //! this service holds nothing at is refused with the `ResourceNotFoundException`
 //! (HTTP 404) this operation models; a component that holds no composite component is a
 //! page of no rows, not a refusal.
@@ -240,17 +246,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // ONE level of the entity's component tree: its top-level components
-        // when the request names no path, else the composite components stored
-        // directly inside the component the path leads to.
+        // when the request names no path, else the composite components the
+        // component the path leads to holds directly — resolved through the one
+        // path rule every reader of a `componentPath` shares
+        // (`crate::state::component_level_at_path`), so the level this walk
+        // reports and the paths it accepts cannot disagree about which composite
+        // components one component holds.
         let listed: Vec<Listed<'_>> = match input.component_path.as_deref() {
             None => entity.components.values().map(Listed::Component).collect(),
-            Some(component_path) => components_under(entity, component_path).ok_or_else(|| {
+            Some(component_path) => crate::state::component_level_at_path(
+                entity,
+                &workspace.component_types,
+                component_path,
+            )
+            .ok_or_else(|| {
                 not_found(format!(
                     "entity {} of workspace {} has no component at componentPath \
                      {component_path}",
                     input.entity_id, input.workspace_id
                 ))
-            })?,
+            })?
+            .into_iter()
+            .map(Listed::Composite)
+            .collect(),
         };
 
         // A `nextToken` carries the component NAME the page resumes AT
@@ -318,12 +336,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// One component in the listed scope: a TOP-LEVEL component of the entity, or a
-/// COMPOSITE component stored inside one of them. Both are reported as the same
+/// COMPOSITE component inside one of them. Both are reported as the same
 /// modelled `ComponentSummary`, and both are named by their own `Name`, which is
 /// what this listing orders and resumes by.
+///
+/// A composite component is carried as a [`::std::borrow::Cow`] because a level
+/// of the tree may report a path STEP that was never created itself — the walk
+/// reports one entry per next path segment the entity holds a composite
+/// component at or beneath, and only the created ones are records the store can
+/// lend out.
 enum Listed<'a> {
     Component(&'a crate::state::ComponentRecord),
-    Composite(&'a crate::state::CompositeComponentRecord),
+    Composite(::std::borrow::Cow<'a, crate::state::CompositeComponentRecord>),
 }
 
 impl Listed<'_> {
@@ -387,67 +411,12 @@ impl Listed<'_> {
                 )),
                 status: status.clone(),
                 sync_source: None,
-                // The whole path the composite component was created by, which
-                // is what a caller walks one level deeper with.
+                // The whole path that addresses this composite component,
+                // which is what a caller walks one level deeper with.
                 component_path: Some(composite.component_path.clone()),
             },
         }
     }
-}
-
-/// The components stored DIRECTLY inside the component `component_path` leads
-/// to, or `None` when the entity holds no component there.
-///
-/// A path of one segment names a top-level component ("the path to the composite
-/// component, STARTING FROM the top-level component", so the top-level component
-/// is the path's first segment) and a longer one names the composite component
-/// stored under the rest of the path inside it — the key
-/// [`crate::state::ComponentRecord::composite_components`] holds it under, which
-/// is why a child of that path is a key exactly one segment longer.
-fn components_under<'a>(
-    entity: &'a crate::state::Entity,
-    component_path: &str,
-) -> Option<Vec<Listed<'a>>> {
-    let separator = crate::state::COMPONENT_PATH_SEPARATOR;
-    let (component_name, below) = match component_path.split_once(separator) {
-        None => (component_path, None),
-        Some((component_name, below)) => (component_name, Some(below)),
-    };
-    let component = entity.components.get(component_name)?;
-    // The key prefix a child of the named component carries. Empty for a path of
-    // one segment: the children of a top-level component are the composite
-    // components keyed by a single segment inside it.
-    let prefix = match below {
-        None => String::new(),
-        Some(below) => {
-            let nested = format!("{below}{separator}");
-            // The path has to name a composite component of this component.
-            // Nothing requires the intermediate steps of a composite
-            // component's path to have been created themselves, so the path
-            // names one when a composite component is stored AT it or anywhere
-            // BENEATH it.
-            if !component.composite_components.contains_key(below)
-                && !component
-                    .composite_components
-                    .keys()
-                    .any(|key| key.starts_with(&nested))
-            {
-                return None;
-            }
-            nested
-        }
-    };
-    Some(
-        component
-            .composite_components
-            .iter()
-            .filter(|(key, _)| {
-                key.strip_prefix(prefix.as_str())
-                    .is_some_and(|name| !name.is_empty() && !name.contains(separator))
-            })
-            .map(|(_, composite)| Listed::Composite(composite))
-            .collect(),
-    )
 }
 
 /// The property groups one component HAS as the modelled map a summary carries,
