@@ -219,6 +219,8 @@ mod unminted_page_token_refusal;
 mod unpublished_filter_maximum;
 #[path = "all/unresolvable_reference_field_naming.rs"]
 mod unresolvable_reference_field_naming;
+#[path = "all/unsupported_resource_type_refusal.rs"]
+mod unsupported_resource_type_refusal;
 #[path = "all/update_core_network.rs"]
 mod update_core_network;
 #[path = "all/update_device.rs"]

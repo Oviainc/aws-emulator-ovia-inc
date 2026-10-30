@@ -708,6 +708,73 @@ pub fn is_telemetry_resource_type(resource_type: &str) -> bool {
     TELEMETRY_RESOURCE_TYPES.contains(&resource_type)
 }
 
+/// The input member every operation that selects by resource type names in a refusal of the
+/// value it carried: `ResourceType`, as the model spells the member.
+pub const FIELD_RESOURCE_TYPE: &str = "ResourceType";
+
+/// The modelled `ValidationException` (HTTP 400) for a `ResourceType` outside the set the
+/// operation reports on: `scope` says, in the member's own terms, what those values are the
+/// types of and `supported` lists them in the order they are declared.
+///
+/// The ONE construction of that refusal for this service, reached through the two checks
+/// below: an operation's own predicate decides which set applies, but the refusal — its
+/// `Reason`, its `Message` and the single `Fields` entry [`field_rejection`] gives the
+/// member — is built here, so one rule on one member cannot answer two different bodies
+/// depending on which operation refused it.
+fn unsupported_resource_type(
+    resource_type: &str,
+    scope: &str,
+    supported: &[&str],
+) -> ValidationException {
+    field_rejection(
+        FIELD_RESOURCE_TYPE,
+        REASON_FIELD_VALIDATION_FAILED,
+        format!(
+            "ResourceType {resource_type:?} is not one of {scope}: {}",
+            supported.join(", ")
+        ),
+    )
+}
+
+/// Check one `ResourceType` member against the network-resource inventory's own set.
+///
+/// Answers `Ok(())` when the member is absent (no filter: every type is reported) or carries
+/// one of [`NETWORK_RESOURCE_TYPES`], otherwise the modelled `ValidationException`
+/// (HTTP 400) naming the member — a value outside that set names no resource kind this
+/// service holds, so it is refused on the member rather than answered with an empty page or
+/// a zero count. Shared by every operation that reports out of that inventory, so the set,
+/// the predicate and the refusal cannot drift apart between them.
+pub fn check_network_resource_type(resource_type: Option<&str>) -> Result<(), ValidationException> {
+    match resource_type {
+        Some(resource_type) if !is_network_resource_type(resource_type) => Err(
+            unsupported_resource_type(
+                resource_type,
+                "the supported network resource types",
+                &NETWORK_RESOURCE_TYPES,
+            ),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The sibling of [`check_network_resource_type`] for the narrower set TELEMETRY is reported
+/// for ([`TELEMETRY_RESOURCE_TYPES`]): the same rule on the same member over the set that
+/// operation covers, refused through the same construction.
+pub fn check_telemetry_resource_type(
+    resource_type: Option<&str>,
+) -> Result<(), ValidationException> {
+    match resource_type {
+        Some(resource_type) if !is_telemetry_resource_type(resource_type) => Err(
+            unsupported_resource_type(
+                resource_type,
+                "the resource types telemetry is reported for",
+                &TELEMETRY_RESOURCE_TYPES,
+            ),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// The two values `ConnectionHealth$Type` carries (`smithy_query shape=ConnectionType`,
 /// mirrored in `ops::types::CONNECTION_TYPE_VALUES`: BGP, IPSEC) — the PROTOCOL whose
 /// session the reported health belongs to, which is a function of the resource kind: a

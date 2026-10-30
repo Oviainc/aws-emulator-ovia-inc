@@ -186,23 +186,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `ResourceType` outside the set the member's documentation enumerates
         // (`crate::state::NETWORK_RESOURCE_TYPES`) names no resource kind at all, so it is
         // refused on the member rather than answered with an empty page — the same rule
-        // `GetNetworkResourceCounts` applies to the same member. The modelled
-        // `ConstrainedString` only bounds the length, so this is the operation's own check.
-        if let Some(resource_type) = input.resource_type.as_deref() {
-            if !crate::state::is_network_resource_type(resource_type) {
-                return Err(GetNetworkResourcesErrorModeled::ValidationException(
-                    crate::state::field_rejection(
-                        "ResourceType",
-                        crate::state::REASON_FIELD_VALIDATION_FAILED,
-                        format!(
-                            "ResourceType {resource_type:?} is not one of the supported network resource types: {}",
-                            crate::state::NETWORK_RESOURCE_TYPES.join(", ")
-                        ),
-                    ),
-                )
-                .into());
-            }
-        }
+        // `GetNetworkResourceCounts` applies to the same member, which is why the check and
+        // its refusal are the shared `crate::state::check_network_resource_type`. The
+        // modelled `ConstrainedString` only bounds the length, so this is the operation's
+        // own check.
+        crate::state::check_network_resource_type(input.resource_type.as_deref())
+            .map_err(GetNetworkResourcesErrorModeled::ValidationException)?;
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(

@@ -158,25 +158,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // counts, so it is refused on the member rather than silently answered with a
         // zero count. The modelled `ConstrainedString` only bounds the length, so this is
         // the operation's own check; it reaches `handle` because the schema accepts it.
+        // The check and its refusal are `crate::state::check_network_resource_type`, this
+        // crate's single statement of that rule, so the body this operation answers is the
+        // one every other operation reporting out of the same inventory answers.
         let requested_type = input.resource_type.as_deref();
-        if let Some(resource_type) = requested_type {
-            if !crate::state::is_network_resource_type(resource_type) {
-                return Err(GetNetworkResourceCountsErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "ResourceType {resource_type:?} is not one of the supported network resource types: {}",
-                            crate::state::NETWORK_RESOURCE_TYPES.join(", ")
-                        ),
-                        reason: Some("FieldValidationFailed".to_string()),
-                        fields: Some(vec![ValidationExceptionField {
-                            name: "ResourceType".to_string(),
-                            message: "must be a supported network resource type".to_string(),
-                        }]),
-                    },
-                )
-                .into());
-            }
-        }
+        crate::state::check_network_resource_type(requested_type)
+            .map_err(GetNetworkResourceCountsErrorModeled::ValidationException)?;
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(
