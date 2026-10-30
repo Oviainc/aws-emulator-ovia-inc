@@ -100,17 +100,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `PutChannelExpirationSettingsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
-// (`GetChannelMessage` lists it) that this operation's own error list omits: setting the
-// expiry of a channel ARN that names no channel has to say the channel is not there.
-#[smithy_macros::operation_error(
-    "com.amazonaws.chimesdkmessaging#PutChannelExpirationSettings",
-    extra_errors = ["NotFoundException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#PutChannelExpirationSettings")]
 #[derive(Debug)]
 pub enum PutChannelExpirationSettingsErrorModeled {
     BadRequestException(BadRequestException),
-    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -191,22 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_millis();
         let mut store = state.lock();
-        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
-            PutChannelExpirationSettingsErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!("channel {} not found", input.channel_arn)),
-            })
-        })?;
+        let channel = store
+            .resolve_channel_mut(&input.channel_arn)
+            .map_err(forbidden)?;
         // When a channel expires is part of the channel's own configuration, so it is a
         // moderator's to set, exactly as `UpdateChannel`'s members are.
         if !channel.is_moderator(bearer) {
-            return Err(
-                PutChannelExpirationSettingsErrorModeled::ForbiddenException(ForbiddenException {
-                    code: Some("Forbidden".to_string()),
-                    message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
-                })
-                .into(),
-            );
+            return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }
 
         // A PUT of the expiry sub-resource REPLACES it: the settings the request carries
@@ -227,6 +211,17 @@ fn bad_request(message: String) -> PutChannelExpirationSettingsError {
     PutChannelExpirationSettingsErrorModeled::BadRequestException(BadRequestException {
         code: Some("BadRequest".to_string()),
         message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the request with the modelled 403 and the sentence the refusal owes: a channel
+/// ARN this service cannot resolve names a channel scope the caller cannot reach, which is
+/// the only terminal client error this operation declares for a channel it will not write.
+fn forbidden(message: &str) -> PutChannelExpirationSettingsError {
+    PutChannelExpirationSettingsErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(message.to_string()),
     })
     .into()
 }

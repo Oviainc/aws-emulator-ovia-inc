@@ -30,28 +30,35 @@ use bytes::Bytes;
 use crate::channel_messaging::encode;
 
 /// The `AppInstanceArn` every channel below is created under.
-const APP_INSTANCE: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai1";
+pub(crate) const APP_INSTANCE: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai1";
 
 /// The identity that creates the channels: its first member and first moderator.
-const CREATOR: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai1/user/alice";
+pub(crate) const CREATOR: &str =
+    "arn:aws:chime:us-east-1:111122223333:app-instance/ai1/user/alice";
 /// An identity the creator adds to a channel.
-const MEMBER: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai1/user/bob";
+pub(crate) const MEMBER: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai1/user/bob";
 /// A second identity the creator adds, so a membership set has more than one entry.
 const OTHER_MEMBER: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai1/user/carol";
 /// An identity that belongs to no channel.
-const OUTSIDER: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai1/user/dave";
+pub(crate) const OUTSIDER: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai1/user/dave";
 
-/// One response, reduced to the two things the wire contract pins: the HTTP status and
-/// the JSON body.
+/// One response, reduced to the three things the wire contract pins: the HTTP status, the
+/// `x-amzn-errortype` header and the JSON body.
+///
+/// `pub(crate)` because the sibling suites in this ONE test binary (`tests/all.rs`) share
+/// this bearer-aware harness rather than copying it, the way they share
+/// [`crate::channel_messaging::encode`].
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    /// The `x-amzn-errortype` header, empty when the answer carries none.
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The modelled error code, from the restJson1 `__type` discriminator.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -59,7 +66,7 @@ impl Reply {
     }
 
     /// The `Message` the refusal carries.
-    fn error_message(&self) -> &str {
+    pub(crate) fn error_message(&self) -> &str {
         self.body
             .get("Message")
             .and_then(Value::as_str)
@@ -69,13 +76,14 @@ impl Reply {
 
 /// The emulator under test: this one service mounted in the production router. Unlike
 /// `channel_messaging.rs`'s harness, every call here carries the bearer the case names,
-/// because the rules under test are about WHO is calling.
-struct Emulator {
+/// because the rules under test are about WHO is calling — so it is `pub(crate)` and the
+/// refusal suite drives it too.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         // ONE shared engine, exactly as `router/src/lib.rs` builds it, so every request
         // in a case observes the same store.
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -86,7 +94,13 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, bearer: &str, method: &str, uri: &str, body: Option<&Value>) -> Reply {
+    pub(crate) async fn call(
+        &self,
+        bearer: &str,
+        method: &str,
+        uri: &str,
+        body: Option<&Value>,
+    ) -> Reply {
         let bytes = match body {
             Some(value) => Bytes::from(serde_json::to_vec(value).expect("serialize the request")),
             None => Bytes::new(),
@@ -107,16 +121,32 @@ impl Emulator {
             .expect("build the request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let body = if response.body().is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(response.body()).unwrap_or(Value::Null)
         };
-        Reply { status, body }
+        Reply {
+            status,
+            error_type,
+            body,
+        }
     }
 
     /// Create a channel as [`CREATOR`] and return its ARN.
-    async fn channel(&self, label: &str, token: &str, mode: &str, privacy: &str) -> String {
+    pub(crate) async fn channel(
+        &self,
+        label: &str,
+        token: &str,
+        mode: &str,
+        privacy: &str,
+    ) -> String {
         let reply = self
             .call(
                 CREATOR,
@@ -398,10 +428,14 @@ impl Emulator {
     }
 }
 
-/// The `Message` every authorization refusal of this service carries.
-const INSUFFICIENT_ACCESS: &str = "You do not have sufficient access to perform this action.";
+/// The `Message` every authorization refusal of this service carries, as AWS words it.
+///
+/// `pub(crate)` for the reason the harness above is: the sibling suites in this ONE test
+/// binary assert AWS's sentence from one copy rather than each restating it.
+pub(crate) const INSUFFICIENT_ACCESS: &str =
+    "You do not have sufficient access to perform this action.";
 /// The `Message` a refusal caused by a BAN carries instead.
-const BANNED: &str = "App instance user is banned from Channel.";
+pub(crate) const BANNED: &str = "App instance user is banned from Channel.";
 
 /// The member ARNs a membership listing reports, sorted.
 fn listed_members(reply: &Reply) -> Vec<String> {
@@ -558,9 +592,15 @@ async fn a_membership_is_readable_through_every_reader_that_reports_it() {
         );
         let after = emulator.describe_membership(CREATOR, &channel, MEMBER).await;
         assert_eq!(
-            after.status, 404,
+            after.status, 403,
             "case {label:?}: a removed membership must not be readable, got {} {:?}",
             after.status, after.body
+        );
+        assert_eq!(
+            after.error_code(),
+            "ForbiddenException",
+            "case {label:?}: a removed membership is refused as forbidden, body {:?}",
+            after.body
         );
     }
 }
@@ -687,7 +727,7 @@ async fn the_channel_mode_decides_who_may_add_a_member() {
                 .describe_membership(CREATOR, &channel, OTHER_MEMBER)
                 .await;
             assert_eq!(
-                described.status, 404,
+                described.status, 403,
                 "case {:?}: the refused member must not be in the channel, got {} {:?}",
                 case.label, described.status, described.body
             );
@@ -756,7 +796,7 @@ async fn a_ban_keeps_a_member_out_until_it_is_deleted() {
         // The ban took the membership with it.
         let membership = emulator.describe_membership(CREATOR, &channel, MEMBER).await;
         assert_eq!(
-            membership.status, 404,
+            membership.status, 403,
             "case {label:?}: a banned identity must not be a member, got {} {:?}",
             membership.status, membership.body
         );

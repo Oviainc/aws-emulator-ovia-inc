@@ -138,18 +138,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `SendChannelMessageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
-// (`GetChannelMessage` lists it) that this operation's own error list omits: a send to a
-// channel ARN that names no channel has to say the channel is not there, and answering
-// 400 would tell the caller its REQUEST was malformed when it was not.
-#[smithy_macros::operation_error(
-    "com.amazonaws.chimesdkmessaging#SendChannelMessage",
-    extra_errors = ["NotFoundException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#SendChannelMessage")]
 #[derive(Debug)]
 pub enum SendChannelMessageErrorModeled {
     BadRequestException(BadRequestException),
-    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -276,12 +268,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Minted before the channel is borrowed, because the counter it draws lives on
         // the store itself.
         let minted_id = store.mint_id(&input.channel_arn);
-        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
-            SendChannelMessageErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!("channel {} not found", input.channel_arn)),
-            })
-        })?;
+        // A channel ARN this service cannot resolve names a channel scope the caller
+        // cannot reach, which is the modelled `ForbiddenException` — the only terminal
+        // client error this operation declares for a channel it will not send to.
+        let channel = store
+            .resolve_channel_mut(&input.channel_arn)
+            .map_err(forbidden)?;
 
         // Sending is a MEMBER's action on both a public and a private channel — the rule
         // the model states on `CreateChannelMembership` — and a moderator of the channel
@@ -289,14 +281,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if channel.is_banned(&input.chime_bearer) {
             // A banned member is out of the channel, so it cannot send to it either, and
             // the refusal names the ban.
-            return Err(SendChannelMessageErrorModeled::ForbiddenException(ForbiddenException {
-                code: Some("Forbidden".to_string()),
-                message: Some(crate::state::BANNED_MESSAGE.to_string()),
-            })
-            .into());
+            return Err(forbidden(crate::state::BANNED_MESSAGE));
         }
         if !channel.is_member(&input.chime_bearer) && !channel.is_moderator(&input.chime_bearer) {
-            return Err(forbidden());
+            return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }
 
         // A replayed @idempotencyToken answers with the message the first send appended,
@@ -376,12 +364,13 @@ fn bad_request(message: String) -> SendChannelMessageError {
     .into()
 }
 
-/// Refuse the caller with the modelled 403 for an action its role on the channel does
-/// not carry.
-fn forbidden() -> SendChannelMessageError {
+/// Refuse the caller with the modelled 403 and the sentence the refusal owes: a channel
+/// it cannot resolve, an action its role on the channel does not carry, or the ban that
+/// put it outside the channel.
+fn forbidden(message: &str) -> SendChannelMessageError {
     SendChannelMessageErrorModeled::ForbiddenException(ForbiddenException {
         code: Some("Forbidden".to_string()),
-        message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+        message: Some(message.to_string()),
     })
     .into()
 }

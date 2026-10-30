@@ -105,18 +105,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `CreateChannelBanError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
-// (`DescribeChannelBan` lists it) that this operation's own error list omits: a ban on a
-// channel ARN that names no channel has to say the channel is not there, and answering
-// 400 would tell the caller its REQUEST was malformed when it was not.
-#[smithy_macros::operation_error(
-    "com.amazonaws.chimesdkmessaging#CreateChannelBan",
-    extra_errors = ["NotFoundException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#CreateChannelBan")]
 #[derive(Debug)]
 pub enum CreateChannelBanErrorModeled {
     BadRequestException(BadRequestException),
-    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ResourceLimitExceededException(ResourceLimitExceededException),
@@ -186,19 +178,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_millis();
         let mut store = state.lock();
-        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
-            CreateChannelBanErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!("channel {} not found", input.channel_arn)),
-            })
-        })?;
+        // A channel ARN this service cannot resolve names a channel scope the caller
+        // cannot reach, which is the modelled `ForbiddenException` — the only terminal
+        // client error this operation declares for a channel it will not act on.
+        let channel = store
+            .resolve_channel_mut(&input.channel_arn)
+            .map_err(forbidden)?;
 
         if !channel.is_moderator(&input.chime_bearer) {
-            return Err(CreateChannelBanErrorModeled::ForbiddenException(ForbiddenException {
-                code: Some("Forbidden".to_string()),
-                message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
-            })
-            .into());
+            return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }
 
         // The ban is a SET: banning a member the channel already bans answers with the
@@ -230,4 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             member: Some(crate::state::identity_of(&input.member_arn)),
         })
     }
+}
+
+/// Refuse the request with the modelled 403 and the sentence the refusal owes.
+fn forbidden(message: &str) -> CreateChannelBanError {
+    CreateChannelBanErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(message.to_string()),
+    })
+    .into()
 }

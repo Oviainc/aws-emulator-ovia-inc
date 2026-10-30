@@ -102,18 +102,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `UpdateChannelError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
-// (`GetChannelMessage` lists it) that this operation's own error list omits: updating a
-// channel ARN that names no channel has to say the channel is not there, which is how
-// every other operation in this crate answers an ARN it holds no channel for.
-#[smithy_macros::operation_error(
-    "com.amazonaws.chimesdkmessaging#UpdateChannel",
-    extra_errors = ["NotFoundException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#UpdateChannel")]
 #[derive(Debug)]
 pub enum UpdateChannelErrorModeled {
     BadRequestException(BadRequestException),
-    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -185,21 +177,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // runs, so reaching here means every member is one the channel can hold.
         let now = crate::state::now_millis();
         let mut store = state.lock();
-        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
-            UpdateChannelErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!("channel {} not found", input.channel_arn)),
-            })
-        })?;
+        let channel = store
+            .resolve_channel_mut(&input.channel_arn)
+            .map_err(forbidden)?;
         // Editing the channel itself is a moderator's action, as creating a ban or
         // promoting a moderator is: the channel's own configuration is not a plain
         // member's to rewrite.
         if !channel.is_moderator(&input.chime_bearer) {
-            return Err(UpdateChannelErrorModeled::ForbiddenException(ForbiddenException {
-                code: Some("Forbidden".to_string()),
-                message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
-            })
-            .into());
+            return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }
 
         // Each member the request SUPPLIES replaces the stored value; an omitted member
@@ -223,4 +208,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             channel_arn: Some(channel.arn.clone()),
         })
     }
+}
+
+/// Refuse the request with the modelled 403 and the sentence the refusal owes: a channel
+/// ARN this service cannot resolve names a channel scope the caller cannot reach, which is
+/// the only terminal client error this operation declares for a channel it will not write.
+fn forbidden(message: &str) -> UpdateChannelError {
+    UpdateChannelErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(message.to_string()),
+    })
+    .into()
 }

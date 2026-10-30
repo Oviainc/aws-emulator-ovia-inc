@@ -110,17 +110,10 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteChannelOutput {
 // here — hence the `DeleteChannelError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
-// (`GetChannelMessage` lists it) that this operation's own error list omits: deleting a
-// channel ARN that names no channel has to say the channel is not there.
-#[smithy_macros::operation_error(
-    "com.amazonaws.chimesdkmessaging#DeleteChannel",
-    extra_errors = ["NotFoundException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#DeleteChannel")]
 #[derive(Debug)]
 pub enum DeleteChannelErrorModeled {
     BadRequestException(BadRequestException),
-    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -196,21 +189,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
+        // A channel ARN this service cannot resolve names a channel scope the caller
+        // cannot reach, which is the modelled `ForbiddenException` — the only terminal
+        // client error this operation declares for a channel it will not delete. The gate
+        // is the crate's one channel-resolution call, so the refusal cannot drift.
+        store
+            .resolve_channel(&input.channel_arn)
+            .map_err(forbidden)?;
         // The channel owns its messages, so removing the record removes them with it.
         // The `CreateChannel` idempotency records are deliberately left alone: each one
         // is the recorded outcome of a request, not a property of the live channel, so a
         // replay of that request keeps answering with what it first returned. Those
         // records carry their own bound — see
         // `crate::state::MAX_CREATE_CHANNEL_IDEMPOTENCY_RECORDS`.
-        if store.channels.remove(&input.channel_arn).is_none() {
-            return Err(DeleteChannelErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!("channel {} not found", input.channel_arn)),
-            })
-            .into());
-        }
+        store.channels.remove(&input.channel_arn);
         tag_directory.lock().forget(&input.channel_arn);
 
         Ok(DeleteChannelOutput)
     }
+}
+
+/// Refuse the request with the modelled 403 and the sentence the refusal owes.
+fn forbidden(message: &str) -> DeleteChannelError {
+    DeleteChannelErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(message.to_string()),
+    })
+    .into()
 }

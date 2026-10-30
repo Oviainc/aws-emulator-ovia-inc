@@ -164,27 +164,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
+        // One gate: a channel ARN this service cannot resolve, a PRIVATE channel the
+        // caller is not in and a caller BANNED from it are all the modelled
+        // `ForbiddenException`.
         let channel = store
-            .channels
-            .get(&input.channel_arn)
-            .ok_or_else(|| not_found(format!("channel {} not found", input.channel_arn)))?;
-        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
-            return Err(DescribeChannelModeratorErrorModeled::ForbiddenException(
-                ForbiddenException {
-                    code: Some("Forbidden".to_string()),
-                    message: Some(reason.to_string()),
-                },
-            )
-            .into());
-        }
+            .readable_channel(&input.channel_arn, &input.chime_bearer)
+            .map_err(forbidden)?;
+        // A moderator a RESOLVED channel does not hold is reported absent to a reader that
+        // may read the channel, with this service's own sentence for it — which names
+        // neither the user nor the channel.
         let moderator = channel
             .moderator(&input.channel_moderator_arn)
-            .ok_or_else(|| {
-                not_found(format!(
-                    "{} does not moderate channel {}",
-                    input.channel_moderator_arn, channel.arn
-                ))
-            })?;
+            .ok_or_else(|| not_found(crate::state::NOT_A_MODERATOR_MESSAGE))?;
 
         Ok(DescribeChannelModeratorOutput {
             channel_moderator: Some(moderator.to_channel_moderator(&channel.arn)),
@@ -192,11 +183,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled 404 for a channel or a moderator this service does not hold.
-fn not_found(message: String) -> DescribeChannelModeratorError {
+/// The modelled 404 for a moderator the channel does not hold.
+fn not_found(message: &str) -> DescribeChannelModeratorError {
     DescribeChannelModeratorErrorModeled::NotFoundException(NotFoundException {
         code: Some("NotFound".to_string()),
-        message: Some(message),
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// Refuse the read with the modelled 403 and the sentence the refusal owes.
+fn forbidden(message: &str) -> DescribeChannelModeratorError {
+    DescribeChannelModeratorErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(message.to_string()),
     })
     .into()
 }

@@ -500,7 +500,9 @@ async fn update_channel_applies_the_members_it_supplies() {
 
 /// RULE: an `UpdateChannel` the service refuses changes nothing about the stored channel
 /// — a caller that does not moderate it may not edit it, a `Mode` outside the enum's
-/// catalog is refused as invalid, and an ARN naming no channel is not found.
+/// catalog is refused as invalid, and an ARN naming no channel is a channel scope the
+/// caller cannot reach, so it is refused with the modelled `ForbiddenException` (this
+/// operation declares no `NotFoundException`).
 #[tokio::test]
 async fn a_refused_update_channel_leaves_the_stored_channel_alone() {
     let emulator = Emulator::new();
@@ -551,8 +553,8 @@ async fn a_refused_update_channel_leaves_the_stored_channel_alone() {
                     &edit,
                 )
                 .await,
-            404,
-            Some("NotFoundException"),
+            403,
+            Some("ForbiddenException"),
         ),
     ];
 
@@ -703,7 +705,9 @@ async fn put_channel_expiration_settings_is_reported_by_describe_channel() {
 /// RULE: a `PutChannelExpirationSettings` the service refuses leaves the settings in
 /// force untouched — a day count outside the modelled range and a criterion outside the
 /// enum's catalog are refused as invalid, a caller that does not moderate the channel may
-/// not set its expiry, and an ARN naming no channel is not found.
+/// not set its expiry, and an ARN naming no channel is a channel scope the caller cannot
+/// reach, so it is refused with the modelled `ForbiddenException` (this operation declares
+/// no `NotFoundException`).
 #[tokio::test]
 async fn a_refused_put_channel_expiration_settings_leaves_the_settings_alone() {
     let emulator = Emulator::new();
@@ -799,8 +803,8 @@ async fn a_refused_put_channel_expiration_settings_leaves_the_settings_alone() {
                 &accepted,
             )
             .await,
-        404,
-        Some("NotFoundException"),
+        403,
+        Some("ForbiddenException"),
     ));
 
     for (label, reply, expected_status, expected_code) in &refusals {

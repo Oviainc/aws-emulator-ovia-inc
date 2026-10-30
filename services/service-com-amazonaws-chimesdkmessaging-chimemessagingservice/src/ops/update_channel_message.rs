@@ -109,18 +109,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `UpdateChannelMessageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
-// (`GetChannelMessage` lists it) that this operation's own error list omits: an update for
-// a channel ARN that names no channel has to say the channel is not there, and answering
-// 400 would tell the caller its REQUEST was malformed when it was not.
-#[smithy_macros::operation_error(
-    "com.amazonaws.chimesdkmessaging#UpdateChannelMessage",
-    extra_errors = ["NotFoundException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#UpdateChannelMessage")]
 #[derive(Debug)]
 pub enum UpdateChannelMessageErrorModeled {
     BadRequestException(BadRequestException),
-    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -223,12 +215,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = crate::state::now_millis();
         let mut store = state.lock();
-        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
-            UpdateChannelMessageErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!("channel {} not found", input.channel_arn)),
-            })
-        })?;
+        // A channel ARN this service cannot resolve names a channel scope the caller
+        // cannot reach, which is the modelled `ForbiddenException` — the only terminal
+        // client error this operation declares for a resource it will not act on.
+        let channel = store
+            .resolve_channel_mut(&input.channel_arn)
+            .map_err(forbidden)?;
         let channel_arn = channel.arn.clone();
         let message = channel
             .messages
@@ -238,12 +230,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // This operation models no `NotFoundException`, and a message the channel
                 // does not hold is refused at the message level with the modelled
                 // `ForbiddenException`.
-                forbidden()
+                forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE)
             })?;
 
         // Editing is the SENDER's own capability: nobody else rewrites a member's words.
         if message.sender.arn.as_deref() != Some(input.chime_bearer.as_str()) {
-            return Err(forbidden());
+            return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }
         // A redacted message has no content left to edit, and restoring content the
         // redaction removed would undo it.
@@ -275,11 +267,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Refuse the request with the modelled 403 for a message this caller may not edit.
-fn forbidden() -> UpdateChannelMessageError {
+/// Refuse the request with the modelled 403 and the sentence the refusal owes: a channel
+/// the caller cannot resolve, or a message it may not edit.
+fn forbidden(message: &str) -> UpdateChannelMessageError {
     UpdateChannelMessageErrorModeled::ForbiddenException(ForbiddenException {
         code: Some("Forbidden".to_string()),
-        message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+        message: Some(message.to_string()),
     })
     .into()
 }

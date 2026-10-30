@@ -182,25 +182,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let store = state.lock();
+        // One gate: a channel ARN this service cannot resolve, a PRIVATE channel the
+        // caller is not in and a caller BANNED from it are all the modelled
+        // `ForbiddenException`.
         let channel = store
-            .channels
-            .get(&input.channel_arn)
-            .ok_or_else(|| not_found(format!("channel {} not found", input.channel_arn)))?;
-        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
-            return Err(DescribeChannelMembershipErrorModeled::ForbiddenException(
-                ForbiddenException {
-                    code: Some("Forbidden".to_string()),
-                    message: Some(reason.to_string()),
-                },
-            )
-            .into());
-        }
-        let membership = channel.membership(&input.member_arn).ok_or_else(|| {
-            not_found(format!(
-                "{} is not a member of channel {}",
-                input.member_arn, channel.arn
-            ))
-        })?;
+            .readable_channel(&input.channel_arn, &input.chime_bearer)
+            .map_err(forbidden)?;
+        // The membership is what the access decision resolves, so a membership this
+        // channel does not hold is refused as forbidden rather than reported as absent:
+        // a membership that is not the caller's to see is not disclosed either way.
+        let membership = channel
+            .membership(&input.member_arn)
+            .ok_or_else(|| forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE))?;
 
         Ok(DescribeChannelMembershipOutput {
             channel_membership: Some(membership.to_channel_membership(&channel.arn)),
@@ -208,11 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled 404 for a channel or a membership this service does not hold.
-fn not_found(message: String) -> DescribeChannelMembershipError {
-    DescribeChannelMembershipErrorModeled::NotFoundException(NotFoundException {
-        code: Some("NotFound".to_string()),
-        message: Some(message),
+/// Refuse the read with the modelled 403 and the sentence the refusal owes.
+fn forbidden(message: &str) -> DescribeChannelMembershipError {
+    DescribeChannelMembershipErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(message.to_string()),
     })
     .into()
 }

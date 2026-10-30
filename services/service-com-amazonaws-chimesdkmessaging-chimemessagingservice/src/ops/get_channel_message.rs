@@ -174,31 +174,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let store = state.lock();
+        // One gate: a channel ARN this service cannot resolve, a PRIVATE channel the
+        // caller is not in and a caller BANNED from it are all the modelled
+        // `ForbiddenException`. A PUBLIC channel's messages can be read without a
+        // membership, a PRIVATE channel's only by its members — the rule the model states
+        // on `CreateChannelMembership`; a moderator of the channel reads it the same way.
         let channel = store
-            .channels
-            .get(&input.channel_arn)
-            .ok_or_else(|| not_found(format!("channel {} not found", input.channel_arn)))?;
-        // A PUBLIC channel's messages can be read without a membership; a PRIVATE
-        // channel's only by its members — the rule the model states on
-        // `CreateChannelMembership`. A moderator of the channel reads it the same way.
-        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
-            // A ban puts a member outside the channel altogether, and a PRIVATE channel's
-            // messages are its members' to read.
-            return Err(GetChannelMessageErrorModeled::ForbiddenException(ForbiddenException {
-                code: Some("Forbidden".to_string()),
-                message: Some(reason.to_string()),
-            })
-            .into());
-        }
+            .readable_channel(&input.channel_arn, &input.chime_bearer)
+            .map_err(forbidden)?;
         let message = channel.message(&input.message_id).ok_or_else(|| {
             // A message the channel does not hold — one never persisted, or one this
             // emulator's retention cap dropped — is not readable, and the modelled
             // message-level refusal is `ForbiddenException`: it is the ONLY one the
             // model gives the message operations, since `RedactChannelMessage`,
             // `UpdateChannelMessage` and `DeleteChannelMessage` declare no
-            // `NotFoundException` at all. The 404 stays for a CHANNEL this service does
-            // not hold.
-            forbidden()
+            // `NotFoundException` at all.
+            forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE)
         })?;
 
         Ok(GetChannelMessageOutput {
@@ -207,21 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled 404 for a channel this service does not hold.
-fn not_found(message: String) -> GetChannelMessageError {
-    GetChannelMessageErrorModeled::NotFoundException(NotFoundException {
-        code: Some("NotFound".to_string()),
-        message: Some(message),
-    })
-    .into()
-}
-
-/// Refuse the read with the modelled 403: the caller may not read this channel, or the
-/// channel holds no such message.
-fn forbidden() -> GetChannelMessageError {
+/// Refuse the read with the modelled 403 and the sentence the refusal owes: the caller
+/// may not read this channel, or the channel holds no such message.
+fn forbidden(message: &str) -> GetChannelMessageError {
     GetChannelMessageErrorModeled::ForbiddenException(ForbiddenException {
         code: Some("Forbidden".to_string()),
-        message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+        message: Some(message.to_string()),
     })
     .into()
 }

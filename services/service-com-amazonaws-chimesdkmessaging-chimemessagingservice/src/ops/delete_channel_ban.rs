@@ -111,18 +111,10 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteChannelBanOutput {
 // here — hence the `DeleteChannelBanError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
-// (`DescribeChannelBan` lists it) that this operation's own error list omits: a delete for
-// a channel or a ban this service does not hold has to say the resource is not there, and
-// answering 400 would tell the caller its REQUEST was malformed when it was not.
-#[smithy_macros::operation_error(
-    "com.amazonaws.chimesdkmessaging#DeleteChannelBan",
-    extra_errors = ["NotFoundException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#DeleteChannelBan")]
 #[derive(Debug)]
 pub enum DeleteChannelBanErrorModeled {
     BadRequestException(BadRequestException),
-    NotFoundException(NotFoundException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -189,36 +181,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
+        // A channel ARN this service cannot resolve names a channel scope the caller
+        // cannot reach, which is the modelled `ForbiddenException` — the only terminal
+        // client error this operation declares for a resource it will not act on.
         let channel = store
-            .channels
-            .get_mut(&input.channel_arn)
-            .ok_or_else(|| not_found(format!("channel {} not found", input.channel_arn)))?;
+            .resolve_channel_mut(&input.channel_arn)
+            .map_err(forbidden)?;
 
         if !channel.is_moderator(&input.chime_bearer) {
-            return Err(DeleteChannelBanErrorModeled::ForbiddenException(ForbiddenException {
-                code: Some("Forbidden".to_string()),
-                message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
-            })
-            .into());
+            return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }
         let before = channel.bans.len();
         channel.bans.retain(|b| b.member_arn != input.member_arn);
         if channel.bans.len() == before {
-            return Err(not_found(format!(
-                "{} is not banned from channel {}",
-                input.member_arn, channel.arn
-            )));
+            // Nor is a ban this channel does not hold a resource this operation can
+            // report absent: it models no `NotFoundException` either.
+            return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }
 
         Ok(DeleteChannelBanOutput)
     }
 }
 
-/// The modelled 404 for a channel or a ban this service does not hold.
-fn not_found(message: String) -> DeleteChannelBanError {
-    DeleteChannelBanErrorModeled::NotFoundException(NotFoundException {
-        code: Some("NotFound".to_string()),
-        message: Some(message),
+/// Refuse the request with the modelled 403 and the sentence the refusal owes.
+fn forbidden(message: &str) -> DeleteChannelBanError {
+    DeleteChannelBanErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(message.to_string()),
     })
     .into()
 }

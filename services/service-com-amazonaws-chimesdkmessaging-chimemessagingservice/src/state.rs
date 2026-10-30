@@ -319,6 +319,54 @@ impl ComAmazonawsChimesdkmessagingChimemessagingserviceState {
             .remember(key, channel_flow_arn);
     }
 
+    /// The channel `channel_arn` names, or the `Message` the refusal owes when this
+    /// service holds no channel for it.
+    ///
+    /// Resolving a channel ARN for the caller is an ACCESS decision, not a lookup that
+    /// reports absence: an ARN this service holds no channel for names a channel scope it
+    /// cannot resolve, so the REQUIREMENT is the modelled `ForbiddenException` — HTTP 403
+    /// with `Code` `Forbidden` — carrying [`INSUFFICIENT_ACCESS_MESSAGE`]. That is also
+    /// the only terminal client error most of the operations that resolve a channel
+    /// model: all but one of them declare no `NotFoundException` at all, so a 404 is an
+    /// error they cannot raise. The same rule already governs this service's other
+    /// ARN-addressed resource ([`UNRESOLVABLE_APP_INSTANCE`]).
+    pub fn resolve_channel(&self, channel_arn: &str) -> Result<&ChannelRecord, &'static str> {
+        self.channels
+            .get(channel_arn)
+            .ok_or(INSUFFICIENT_ACCESS_MESSAGE)
+    }
+
+    /// [`Self::resolve_channel`] for a caller that goes on to WRITE the channel it
+    /// resolves, so the unresolvable case is worded by the one rule either way.
+    pub fn resolve_channel_mut(
+        &mut self,
+        channel_arn: &str,
+    ) -> Result<&mut ChannelRecord, &'static str> {
+        self.channels
+            .get_mut(channel_arn)
+            .ok_or(INSUFFICIENT_ACCESS_MESSAGE)
+    }
+
+    /// The channel `channel_arn` names when `caller` may READ it, or the `Message` the
+    /// refusal owes.
+    ///
+    /// One function for the whole gate a read passes, because the three ways it can fail
+    /// are one refusal: a channel this service cannot resolve ([`Self::resolve_channel`]),
+    /// a PRIVATE channel the caller is not in, and a caller BANNED from it
+    /// ([`ChannelRecord::read_refusal`], which words the ban for its reason). Every one of
+    /// them is the modelled `ForbiddenException`.
+    pub fn readable_channel(
+        &self,
+        channel_arn: &str,
+        caller: &str,
+    ) -> Result<&ChannelRecord, &'static str> {
+        let channel = self.resolve_channel(channel_arn)?;
+        match channel.read_refusal(caller) {
+            Some(reason) => Err(reason),
+            None => Ok(channel),
+        }
+    }
+
     /// True when `arn` still names a live resource of this service.
     pub fn resource_exists(&self, arn: &str) -> bool {
         self.channels.contains_key(arn) || self.channel_flows.contains_key(arn)
@@ -800,6 +848,23 @@ pub const INSUFFICIENT_ACCESS_MESSAGE: &str =
 /// operation on it — sending a message as much as reading one — tells them the ban is
 /// why.
 pub const BANNED_MESSAGE: &str = "App instance user is banned from Channel.";
+
+/// The `Message` a read of a BAN the channel does not hold is refused with, beside the
+/// modelled `NotFoundException` that `DescribeChannelBan` declares.
+///
+/// The counterpart of [`BANNED_MESSAGE`], which the operations a banned member is refused
+/// on carry: this service names the ban in both answers rather than describing the
+/// request, so neither sentence carries a value from it.
+pub const NOT_BANNED_MESSAGE: &str = "App instance user is not banned from the specified Channel.";
+
+/// The `Message` a read of a MODERATOR the channel does not hold is refused with, beside
+/// the modelled `NotFoundException` that `DescribeChannelModerator` declares.
+///
+/// Like [`NOT_BANNED_MESSAGE`], the sentence Amazon Chime SDK Messaging itself returns for
+/// it (observed in the AWS wire recording this behaviour was implemented against): it
+/// names neither the user nor the channel, so it is the same sentence for every caller.
+pub const NOT_A_MODERATOR_MESSAGE: &str =
+    "App instance user is not a moderator of the specified Channel.";
 
 /// The `Message` a request whose `@idempotencyToken` was already used for a DIFFERENT
 /// request is refused with, beside the modelled `ConflictException`.

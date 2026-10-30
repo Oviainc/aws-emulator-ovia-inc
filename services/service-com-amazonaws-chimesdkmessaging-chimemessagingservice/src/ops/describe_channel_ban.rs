@@ -163,21 +163,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
+        // One gate: a channel ARN this service cannot resolve, a PRIVATE channel the
+        // caller is not in and a caller BANNED from it are all the modelled
+        // `ForbiddenException`.
         let channel = store
-            .channels
-            .get(&input.channel_arn)
-            .ok_or_else(|| not_found(format!("channel {} not found", input.channel_arn)))?;
-        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
-            return Err(DescribeChannelBanErrorModeled::ForbiddenException(ForbiddenException {
-                code: Some("Forbidden".to_string()),
-                message: Some(reason.to_string()),
-            })
-            .into());
-        }
+            .readable_channel(&input.channel_arn, &input.chime_bearer)
+            .map_err(forbidden)?;
         let ban = channel.ban(&input.member_arn).ok_or_else(|| {
-            // The service words a ban this channel does not hold for its reason, the way
-            // it words a ban it does hold on the operations a banned member is refused.
-            not_found(NOT_BANNED_MESSAGE.to_string())
+            // A ban a RESOLVED channel does not hold is reported absent to a reader that
+            // may read the channel, the way the service words a ban it DOES hold on the
+            // operations a banned member is refused.
+            not_found(crate::state::NOT_BANNED_MESSAGE)
         })?;
 
         Ok(DescribeChannelBanOutput {
@@ -186,18 +182,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The `Message` a read of a ban this channel does not hold is refused with.
-///
-/// The counterpart of `crate::state::BANNED_MESSAGE`, which the operations a BANNED
-/// member is refused on carry: this service names the ban in both answers rather than
-/// describing the request.
-const NOT_BANNED_MESSAGE: &str = "App instance user is not banned from the specified Channel.";
-
-/// The modelled 404 for a channel or a ban this service does not hold.
-fn not_found(message: String) -> DescribeChannelBanError {
+/// The modelled 404 for a ban the channel does not hold.
+fn not_found(message: &str) -> DescribeChannelBanError {
     DescribeChannelBanErrorModeled::NotFoundException(NotFoundException {
         code: Some("NotFound".to_string()),
-        message: Some(message),
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// Refuse the read with the modelled 403 and the sentence the refusal owes.
+fn forbidden(message: &str) -> DescribeChannelBanError {
+    DescribeChannelBanErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(message.to_string()),
     })
     .into()
 }

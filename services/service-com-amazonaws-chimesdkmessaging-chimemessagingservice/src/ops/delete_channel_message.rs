@@ -122,18 +122,10 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteChannelMessageOutp
 // here — hence the `DeleteChannelMessageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
-// (`GetChannelMessage` lists it) that this operation's own error list omits: a delete for
-// a channel ARN that names no channel has to say the channel is not there, and answering
-// 400 would tell the caller its REQUEST was malformed when it was not.
-#[smithy_macros::operation_error(
-    "com.amazonaws.chimesdkmessaging#DeleteChannelMessage",
-    extra_errors = ["NotFoundException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#DeleteChannelMessage")]
 #[derive(Debug)]
 pub enum DeleteChannelMessageErrorModeled {
     BadRequestException(BadRequestException),
-    NotFoundException(NotFoundException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -219,12 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
-            DeleteChannelMessageErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!("channel {} not found", input.channel_arn)),
-            })
-        })?;
+        // A channel ARN this service cannot resolve names a channel scope the caller
+        // cannot reach, which is the modelled `ForbiddenException` — the only terminal
+        // client error this operation declares for a resource it will not act on.
+        let channel = store
+            .resolve_channel_mut(&input.channel_arn)
+            .map_err(forbidden)?;
 
         // Only an administrator of the channel's app instance deletes a message: the
         // caller's role on the CHANNEL — sender, member or moderator — does not carry the
@@ -233,13 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .lock()
             .administers(&channel.app_instance_arn, &input.chime_bearer);
         if !administers {
-            return Err(DeleteChannelMessageErrorModeled::ForbiddenException(
-                ForbiddenException {
-                    code: Some("Forbidden".to_string()),
-                    message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
-                },
-            )
-            .into());
+            return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }
 
         // Deletion makes the message inaccessible immediately, so the record and the
@@ -253,13 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This operation models no `NotFoundException` for a message, so a message
             // the channel does not hold is refused at the message level with the
             // modelled `ForbiddenException`, as the other message operations do.
-            return Err(DeleteChannelMessageErrorModeled::ForbiddenException(
-                ForbiddenException {
-                    code: Some("Forbidden".to_string()),
-                    message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
-                },
-            )
-            .into());
+            return Err(forbidden(crate::state::INSUFFICIENT_ACCESS_MESSAGE));
         }
         channel
             .message_idempotency
@@ -267,4 +247,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DeleteChannelMessageOutput)
     }
+}
+
+/// Refuse the request with the modelled 403 and the sentence the refusal owes.
+fn forbidden(message: &str) -> DeleteChannelMessageError {
+    DeleteChannelMessageErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(message.to_string()),
+    })
+    .into()
 }

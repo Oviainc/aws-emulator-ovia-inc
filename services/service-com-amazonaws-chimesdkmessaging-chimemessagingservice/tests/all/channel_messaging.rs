@@ -38,6 +38,9 @@ const APP_INSTANCE: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai
 const OTHER_APP_INSTANCE: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai2";
 /// The `x-amz-chime-bearer` identity every request is made as.
 const BEARER: &str = "arn:aws:chime:us-east-1:111122223333:app-instance/ai1/user/alice";
+// The `Message` this service answers an authorization refusal with is stated ONCE for
+// this test binary, in `channel_membership.rs`, and read from there.
+use crate::channel_membership::INSUFFICIENT_ACCESS;
 
 /// One response, reduced to the two things the wire contract pins: the HTTP status and
 /// the JSON body.
@@ -1355,8 +1358,11 @@ async fn list_channels_filters_by_app_instance_and_privacy_and_pages() {
 // ---------------------------------------------------------------------------
 
 /// RULE: a deleted channel is gone for every later reader — `DescribeChannel`,
-/// `GetChannelMessage` and `ListChannelMessages` answer 404 and `ListChannels` no longer
-/// lists it — and its messages go with it.
+/// `GetChannelMessage` and `ListChannelMessages` refuse it and `ListChannels` no longer
+/// lists it — and its messages go with it. A channel ARN this service cannot resolve is an
+/// ACCESS decision, so each of those refusals is the modelled 403 `ForbiddenException`
+/// carrying the service's fixed insufficient-access sentence, which is also the only
+/// terminal client error those operations model.
 #[tokio::test]
 async fn deleting_a_channel_is_observable_to_every_later_read() {
     let emulator = Emulator::new();
@@ -1398,14 +1404,20 @@ async fn deleting_a_channel_is_observable_to_every_later_read() {
         ("DeleteChannel again", emulator.delete_channel(&doomed).await),
     ] {
         assert_eq!(
-            reply.status, 404,
-            "case {label:?}: a deleted channel must answer 404, got {} {:?}",
+            reply.status, 403,
+            "case {label:?}: a deleted channel must answer 403, got {} {:?}",
             reply.status, reply.body
         );
         assert_eq!(
             reply.error_code(),
-            "NotFoundException",
+            "ForbiddenException",
             "case {label:?}: wrong error code, body {:?}",
+            reply.body
+        );
+        assert_eq!(
+            reply.body["Message"].as_str(),
+            Some(INSUFFICIENT_ACCESS),
+            "case {label:?}: wrong refusal message, body {:?}",
             reply.body
         );
     }
@@ -1430,12 +1442,12 @@ async fn deleting_a_channel_is_observable_to_every_later_read() {
 // Refusals
 // ---------------------------------------------------------------------------
 
-/// RULE: a read of a CHANNEL this service does not hold is a modelled 404
-/// `NotFoundException`, never an empty success; a read of a MESSAGE the channel does not
-/// hold is the modelled 403 `ForbiddenException`, which is the only message-level refusal
-/// the model gives the message operations (`RedactChannelMessage`,
-/// `UpdateChannelMessage` and `DeleteChannelMessage` declare no `NotFoundException` at
-/// all).
+/// RULE: a request naming a channel resource this service cannot resolve is refused with
+/// an error the operation's own model declares, and the one it declares for a resource the
+/// caller cannot reach is `ForbiddenException` (HTTP 403, `Code` `Forbidden`) carrying the
+/// service's fixed insufficient-access sentence — for the CHANNEL (none of these
+/// operations models `NotFoundException`) as much as for a MESSAGE the channel does not
+/// hold, and never an empty success.
 #[tokio::test]
 async fn reads_of_a_resource_that_does_not_exist_are_refused() {
     let emulator = Emulator::new();
@@ -1471,14 +1483,20 @@ async fn reads_of_a_resource_that_does_not_exist_are_refused() {
 
     for (label, reply) in absent_channel {
         assert_eq!(
-            reply.status, 404,
-            "case {label:?}: must answer 404, got {} {:?}",
+            reply.status, 403,
+            "case {label:?}: must answer 403, got {} {:?}",
             reply.status, reply.body
         );
         assert_eq!(
             reply.error_code(),
-            "NotFoundException",
+            "ForbiddenException",
             "case {label:?}: wrong error code, body {:?}",
+            reply.body
+        );
+        assert_eq!(
+            reply.body["Message"].as_str(),
+            Some(INSUFFICIENT_ACCESS),
+            "case {label:?}: wrong refusal message, body {:?}",
             reply.body
         );
     }

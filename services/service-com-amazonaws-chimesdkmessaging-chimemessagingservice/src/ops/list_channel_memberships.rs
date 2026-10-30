@@ -107,18 +107,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `ListChannelMembershipsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
-// (`DescribeChannelMembership` lists it) that this operation's own error list omits: a
-// list for a channel ARN that names no channel has to say the channel is not there, and
-// answering 400 would tell the caller its REQUEST was malformed when it was not.
-#[smithy_macros::operation_error(
-    "com.amazonaws.chimesdkmessaging#ListChannelMemberships",
-    extra_errors = ["NotFoundException"]
-)]
+#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#ListChannelMemberships")]
 #[derive(Debug)]
 pub enum ListChannelMembershipsErrorModeled {
     BadRequestException(BadRequestException),
-    NotFoundException(NotFoundException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -208,21 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = usize::try_from(requested).unwrap_or(0);
 
         let store = state.lock();
-        let channel = store.channels.get(&input.channel_arn).ok_or_else(|| {
-            ListChannelMembershipsErrorModeled::NotFoundException(NotFoundException {
-                code: Some("NotFound".to_string()),
-                message: Some(format!("channel {} not found", input.channel_arn)),
-            })
-        })?;
-        if let Some(reason) = channel.read_refusal(&input.chime_bearer) {
-            return Err(ListChannelMembershipsErrorModeled::ForbiddenException(
-                ForbiddenException {
-                    code: Some("Forbidden".to_string()),
-                    message: Some(reason.to_string()),
-                },
-            )
-            .into());
-        }
+        // One gate: a channel ARN this service cannot resolve, a PRIVATE channel the
+        // caller is not in and a caller BANNED from it are all the modelled
+        // `ForbiddenException` — the only terminal client error this operation declares
+        // for a channel it will not list.
+        let channel = store
+            .readable_channel(&input.channel_arn, &input.chime_bearer)
+            .map_err(forbidden)?;
 
         // HIDDEN memberships are listed ONLY when the filter names them; every other
         // request lists the DEFAULT ones.
@@ -281,6 +265,15 @@ fn bad_request(message: String) -> ListChannelMembershipsError {
     ListChannelMembershipsErrorModeled::BadRequestException(BadRequestException {
         code: Some("BadRequest".to_string()),
         message: Some(message),
+    })
+    .into()
+}
+
+/// Refuse the read with the modelled 403 and the sentence the refusal owes.
+fn forbidden(message: &str) -> ListChannelMembershipsError {
+    ListChannelMembershipsErrorModeled::ForbiddenException(ForbiddenException {
+        code: Some("Forbidden".to_string()),
+        message: Some(message.to_string()),
     })
     .into()
 }
