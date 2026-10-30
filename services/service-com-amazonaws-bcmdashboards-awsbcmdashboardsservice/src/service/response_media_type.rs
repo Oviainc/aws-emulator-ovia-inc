@@ -28,7 +28,9 @@
 //! what it announces: the boundary validator refuses what the model's constraints express,
 //! and a handler re-applies the ones it cannot (a `@pattern` the boundary's regular
 //! expression engine will not compile — see `crate::state::text_pattern_refusal`), so the
-//! predicate below reads the refusal the client sees rather than the seam that produced it.
+//! question below is asked of the refusal the client sees rather than of the seam that
+//! produced it. It is [`service_common::response_media_type::not_a_validation_refusal`],
+//! because it is not this service's own question.
 //!
 //! The two lists are therefore read on different things, and each on what the wire record
 //! shows: the tagging family is a fact of the OPERATION, so it is read off the routing key
@@ -72,12 +74,6 @@ pub const DISPATCHER_RESPONSE_MEDIA_TYPE: ResponseMediaType =
 /// tagging operation). Their responses are not the dispatcher's.
 const TAGGING_OPERATIONS: [&str; 3] = ["ListTagsForResource", "TagResource", "UntagResource"];
 
-/// The error code of the refusal the request validator answers with, which the awsJson
-/// envelope carries as `__type` (source: `smithy_query(query="operation")` — every operation
-/// of this service declares `ValidationException` for an input that does not satisfy its
-/// requirements).
-const VALIDATION_EXCEPTION: &str = "ValidationException";
-
 /// Whether `routing_key` — the operation name the protocol reads out of `X-Amz-Target` —
 /// names an operation the dashboard and scheduled-report dispatcher fronts, as opposed to a
 /// resource-tagging one.
@@ -88,33 +84,11 @@ pub fn fronted_by_the_dispatcher(routing_key: &str) -> bool {
 /// Whether `resp` is a response the dispatcher produced, rather than one the request
 /// validator in front of it answered.
 ///
-/// The validator's refusal is the modelled `ValidationException`: the awsJson error envelope
-/// carries its code as `__type`, which is read here from the body the client receives, so a
-/// refusal of a modelled constraint is recognised wherever the emulator rendered it. A
-/// response whose body is not that envelope — a success, an error about stored state, a
-/// streaming body that cannot be read back — is the dispatcher's.
+/// The validator's refusal is the modelled `ValidationException`, recognised from the body
+/// the client receives wherever the emulator rendered it; the question is
+/// `service_common`'s, so this service and every other one on that wire ask it the same way.
 pub fn produced_by_the_dispatcher(resp: &RtResponse) -> bool {
-    !is_validation_refusal(resp)
-}
-
-/// Whether `resp` is the modelled `ValidationException` refusal, read as a client reads it:
-/// a client error whose awsJson envelope names that shape in `__type`.
-fn is_validation_refusal(resp: &RtResponse) -> bool {
-    if !resp.status().is_client_error() {
-        return false;
-    }
-    let Some(body) = resp.body().bytes() else {
-        return false;
-    };
-    let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    envelope
-        .get("__type")
-        .and_then(serde_json::Value::as_str)
-        // `__type` carries the shape name, optionally qualified by its namespace or by the
-        // `<version>#` prefix the awsJson protocols allow; the shape is the last segment.
-        .is_some_and(|code| code.split(['#', '/']).next_back() == Some(VALIDATION_EXCEPTION))
+    service_common::response_media_type::not_a_validation_refusal(resp)
 }
 
 #[cfg(test)]

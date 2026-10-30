@@ -35,8 +35,8 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //! - `override_protocol` — the codec the dispatch sequence reads and answers one
-//!   request with. The default returns `None`, keeping the model-derived protocol;
-//!   THIS service overrides it, for the media type it announces (see below).
+//!   request with. The default returns `None`, keeping the model-derived protocol,
+//!   which is what this service serves.
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -59,39 +59,25 @@
 //!
 //! ## The media type this service announces
 //!
-//! Every recorded response of this service — a success, a modelled exception, a refusal —
-//! carries `content-type: application/x-amz-json-1.1`, while the media type the model's
-//! `aws.protocols#awsJson1_0` trait implies, and which the framework's serializers and
-//! pre-dispatch renderers stamp, is `application/x-amz-json-1.0`. A client (or a recording
-//! proxy) picks its JSON-protocol decoder off that header, so the value the service
-//! announces is part of its wire contract. The rule, and the one function that applies it,
-//! live in [`service_common::response_media_type`]; [`RESPONSE_MEDIA_TYPE`] is this
-//! service's pair.
+//! TWO media types, because the recorded wire shows two announcers: the dispatcher that
+//! fronts the workload-estimate and bill-planning operations announces
+//! `application/x-amz-json-1.1` on what it returns, while a refusal reporting the REQUEST
+//! as invalid, every response of a resource-tagging operation and everything rendered in
+//! front of the service announce the `application/x-amz-json-1.0` the model's
+//! `aws.protocols#awsJson1_0` trait implies — which is what the framework's serializers and
+//! pre-dispatch renderers already stamp. Which announcer owns which responses, and the pair
+//! itself, are stated in [`response_media_type`]; the rule and its mechanism live in
+//! [`service_common::response_media_type`].
 //!
-//! The REQUEST side is untouched and matches throughout: requests still route by
-//! `X-Amz-Target: AWSBCMPricingCalculator.<Operation>` and are read by the same
-//! `JsonCodec`, whichever awsJson media type they are sent under.
-//!
-//! Four seams carry it, because one cannot reach every response:
-//!
-//! - `override_protocol` serves the awsJson `1.1` codec, which is what the centralized
-//!   walk serializes this service's OWN responses with — every success and every error a
-//!   handler raises, including the scaffold's 501;
-//! - [`ModelledValidation`] (reached through `override_operation`, which this service
-//!   already takes for its modelled refusals) re-announces whatever the walk it delegates
-//!   to answered, which is what reaches the framework's refusal tail INSIDE that walk;
-//! - `override_routing_error` and `override_framework_error` re-announce the two responses
-//!   rendered in front of the service: an unroutable request and a transport failure.
-//!
-//! Routing, status, codes, messages and bodies all stay with the framework. One response is
-//! still announced by the framework alone, because no author seam reaches it: the
-//! authentication refusal, which the router renders through
-//! `definition().refusal_response(..)` before this service is asked anything
-//! (`vendor/smithy-server-runtime/src/multi_service_router.rs`). It is pinned by
-//! `tests/all/response_media_type.rs` so the gap is recorded rather than hidden. The
-//! `override_framework_error` seam below reaches every error the router raises there today
-//! (it has one call site and one variant); its own note says what a future variant of that
-//! open enum would mean.
+//! ONE seam carries it, and only for the dispatcher's half: [`ModelledValidation`] (reached
+//! through `override_operation`, which this service already takes for its modelled
+//! refusals) serves a dispatcher-fronted request through the shared
+//! [`ResponseMediaTypeOperation`], which runs the same routing-table operation and
+//! re-announces the responses that dispatcher produced. The modelled refusal this file
+//! serializes itself, every response of a tagging operation, and the unroutable request,
+//! transport failure and authentication refusal the router renders are left exactly as
+//! their own renderer wrote them. Routing, status, codes, messages and bodies all stay with
+//! the framework.
 //!
 //! STILL TO MIGRATE, carrying the note `services/common/src/validation.rs` asks every
 //! new copy to carry: the requirement half, the no-value subject half and the
@@ -120,16 +106,20 @@
 //! two halves of the body cannot state one violation two ways and the wording above is
 //! unchanged. A request the model accepts is handed to the generated walk untouched.
 
+pub mod response_media_type;
+
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use service_common::response_media_type::{not_a_validation_refusal, ResponseMediaTypeOperation};
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, Refused,
     ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 
 use crate::ops::types::{ValidationException, ValidationExceptionField};
+use response_media_type::{fronted_by_the_dispatcher, DISPATCHER_RESPONSE_MEDIA_TYPE};
 
 /// The error code this service answers an input-constraint violation with: the modeled
 /// `ValidationException`, which this service declares as a common error on EVERY
@@ -162,15 +152,17 @@ const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 /// alike.
 const MAX_VIOLATIONS: usize = service_common::validation::MAX_VIOLATIONS;
 
-/// The media type pair this service's responses are re-announced across: the
-/// `application/x-amz-json-1.0` the model's `awsJson1_0` protocol trait implies, replaced
-/// by the `application/x-amz-json-1.1` every recorded response of this service carries.
-/// See the module header, and [`service_common::response_media_type`] for the rule.
-const RESPONSE_MEDIA_TYPE: service_common::response_media_type::ResponseMediaType =
-    service_common::response_media_type::ResponseMediaType::new(
-        service_common::response_media_type::AWS_JSON_1_0,
-        service_common::response_media_type::AWS_JSON_1_1,
-    );
+/// The wrapper a request for a DISPATCHER-FRONTED operation is served through once the
+/// model has accepted it: it runs the same routing-table operation the generated table
+/// holds and announces the dispatcher's media type on the responses that dispatcher
+/// produced (see [`response_media_type`], and
+/// [`service_common::response_media_type`] for the rule and the mechanism).
+///
+/// A `const` rather than a field: the wrapper is zero-sized state (a media-type pair and a
+/// function pointer) and `Copy`, so each [`ModelledValidation`] carries its own copy and
+/// nothing has to be borrowed from the service.
+const DISPATCHER: ResponseMediaTypeOperation =
+    ResponseMediaTypeOperation::announcing(DISPATCHER_RESPONSE_MEDIA_TYPE, not_a_validation_refusal);
 
 /// Render one constraint violation the way this service states it: the member path and
 /// the violated constraint, and NOTHING of the value that was rejected.
@@ -334,11 +326,13 @@ fn field_validation_failed(violations: &[Violation]) -> Option<ValidationExcepti
                 name: violation.path.clone(),
                 // The SAME clause the envelope states for this member, so the two halves
                 // of the body cannot word one violation two ways. The recorded entry
-                // carries a SCRUBBED text here — the corpus replaced the part of the
-                // clause naming the rejected value with a literal `[redacted]`, which no
-                // rule of this service produces, and this service echoes no submitted
-                // value at all — so the clause is what the rule gives rather than what
-                // that one body holds.
+                // carries a SCRUBBED text here — the corpus replaced the subject span of
+                // the clause with a literal `[redacted]`, which no rule of this service
+                // produces. What that span held is settled by the SAME recorded response:
+                // its `message` carries this very sentence unredacted, with the member
+                // path and no submitted value, and the emulator answers it byte for byte.
+                // So the clause is what the rule gives, and the scrubbed copy is read as
+                // the one it is a copy of.
                 message: constraint_clause(violation)?,
             })
         })
@@ -354,19 +348,25 @@ fn field_validation_failed(violations: &[Violation]) -> Option<ValidationExcepti
 /// answered in the modelled `ValidationException` — with `reason` and `fieldList` — rather
 /// than in the framework's generic refusal body, which carries `message` alone.
 ///
-/// Zero-sized: the wrapper holds no engine and no operation instance. It carries the
-/// operation TYPE, which is all it needs — the input shape to read the request into and
-/// the input `Schema` to validate it against — and hands a request the model accepts to
-/// the one operation instance the generated routing table built from the shared engine.
-/// There is therefore no second instance of any operation and no second store.
+/// Holds no engine and no operation instance. It carries the operation TYPE, which is all
+/// it needs — the input shape to read the request into and the input `Schema` to validate
+/// it against — and hands a request the model accepts to the one operation instance the
+/// generated routing table built from the shared engine. There is therefore no second
+/// instance of any operation and no second store.
 struct ModelledValidation<Op> {
     operation: PhantomData<fn() -> Op>,
+    /// `Some` for an operation the dispatcher fronts, and then the request the model
+    /// accepts is served through [`DISPATCHER`], which announces that dispatcher's media
+    /// type on the responses it produced; `None` for a resource-tagging operation, whose
+    /// responses keep the media type the framework stamps. See [`response_media_type`].
+    dispatcher: Option<ResponseMediaTypeOperation>,
 }
 
 impl<Op> ModelledValidation<Op> {
-    const fn new() -> Self {
+    const fn new(dispatcher: Option<ResponseMediaTypeOperation>) -> Self {
         Self {
             operation: PhantomData,
+            dispatcher,
         }
     }
 }
@@ -419,7 +419,10 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
                 // The row the framework sequence would have recorded for this request,
                 // so a refused one is not a hole in the telemetry series.
                 record_refusal::<Op>(ctx, started.elapsed());
-                return RESPONSE_MEDIA_TYPE.announce(response);
+                // Answered by the request validator in front of the dispatcher, so it
+                // keeps the protocol-implied media type the serializer above stamped —
+                // whichever operation it refuses. See [`response_media_type`].
+                return response;
             }
             // Nothing to state: the request is served by the generated operation, which
             // runs the whole framework sequence (deserialize, validate, handle,
@@ -428,20 +431,21 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
             // straight back here. A refusal this wrapper declined — a violation class
             // `constraint_clause` has no wording for, or an error that would not
             // serialize — is refused there instead, in the framework's own envelope.
-            let response = match svc.definition().routing_table().get(Op::NAME) {
-                Some(operation) => operation.run(svc, req, ctx).await,
-                // Unreachable in practice: this wrapper is only reachable under the key
-                // the generated table registered. Answer the framework's own
-                // no-such-operation response rather than inventing one.
-                None => svc.definition().routing_error_response(req),
-            };
-            // The response of a routed request, as this service announces it. Whatever
-            // the walk serialized itself already carries the announced media type (the
-            // codec `override_protocol` serves chose it), so what this reaches is the
-            // framework's refusal tail INSIDE that walk, which renders in the
-            // model-derived envelope `override_protocol` does not reach. See the module
-            // header.
-            RESPONSE_MEDIA_TYPE.announce(response)
+            //
+            // A dispatcher-fronted operation goes through [`DISPATCHER`], which runs that
+            // same routing-table entry and then announces the dispatcher's media type on
+            // what it produced; a tagging operation is run directly, so its responses keep
+            // what the framework stamped.
+            match &self.dispatcher {
+                Some(dispatcher) => dispatcher.run(svc, req, ctx).await,
+                None => match svc.definition().routing_table().get(Op::NAME) {
+                    Some(operation) => operation.run(svc, req, ctx).await,
+                    // Unreachable in practice: this wrapper is only reachable under the key
+                    // the generated table registered. Answer the framework's own
+                    // no-such-operation response rather than inventing one.
+                    None => svc.definition().routing_error_response(req),
+                },
+            }
         })
     }
 }
@@ -489,17 +493,26 @@ fn record_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time:
 /// still scaffolded. A stub answers the modelled 400 for a request no operation could
 /// serve and its 501 for one it could, which is the order the real service evaluates
 /// them in.
+///
+/// Each wrapper also carries which announcer answers for its operation
+/// ([`fronted_by_the_dispatcher`], read off the model's own operation name), so one table
+/// states both halves of what `override_operation` serves.
 fn modelled_validation_table<Eng: Send + Sync + 'static>(
 ) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
     let mut refusals: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
     macro_rules! register {
         ($($module:ident :: $operation:ident),+ $(,)?) => {
             $(
-                refusals.insert(
-                    <crate::ops::$module::$operation<Eng> as Operation>::NAME,
-                    Box::new(ModelledValidation::<crate::ops::$module::$operation<Eng>>::new())
-                        as Box<dyn ErasedOperation>,
-                );
+                {
+                    let name = <crate::ops::$module::$operation<Eng> as Operation>::NAME;
+                    let dispatcher = fronted_by_the_dispatcher(name).then_some(DISPATCHER);
+                    refusals.insert(
+                        name,
+                        Box::new(ModelledValidation::<
+                            crate::ops::$module::$operation<Eng>,
+                        >::new(dispatcher)) as Box<dyn ErasedOperation>,
+                    );
+                }
             )+
         };
     }
@@ -555,15 +568,6 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// routing key the model names that operation by; see [`ModelledValidation`]. Built
     /// once here because [`Service::override_operation`] hands back a borrow of it.
     refusals: HashMap<&'static str, Box<dyn ErasedOperation>>,
-    /// The codec this service's own responses are serialized in: the awsJson `1.1` one,
-    /// which announces the media type every recorded response of this service carries
-    /// (see the module header). The same `JsonCodec` over the same `X-Amz-Target` routing
-    /// key as the `awsJson1_0` the model declares, so only the announced media type
-    /// differs. Built once here because [`Service::override_protocol`] hands back a
-    /// borrow of it.
-    protocol: aws_smithy_schema_server::rpc::HttpRpcServerProtocol<
-        aws_smithy_schema_server::json::JsonCodec,
-    >,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -574,7 +578,6 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             refusals: modelled_validation_table::<Eng>(),
-            protocol: aws_smithy_schema_server::rpc::AwsJson11(),
         }
     }
 }
@@ -618,16 +621,6 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             .map(|wrapper| wrapper.as_ref())
     }
 
-    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
-        // The codec the centralized walk serializes this service's own responses with —
-        // every success and every error a handler raises, the scaffold's 501 included.
-        // This is the one place the media type such a response announces is decided, and
-        // `AwsJson11()` differs from the model's `awsJson1_0` in that value alone: the
-        // same `JsonCodec`, the same `X-Amz-Target` routing key, the same bodies. See the
-        // module header for why this service announces `1.1`.
-        Some(&self.protocol)
-    }
-
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
@@ -656,51 +649,6 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                     &violations[..violations.len().min(MAX_VIOLATIONS)],
                 )?,
             }),
-            _ => None,
-        }
-    }
-
-    fn override_routing_error(
-        &self,
-        req: &aws_smithy_runtime_api::http::Request,
-    ) -> Option<aws_smithy_runtime_api::http::Response> {
-        // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. The framework's protocol-correct default for this
-        // service's envelope is kept word for word, status, code and body alike; only the
-        // media type is re-announced, so an unroutable request is answered under the same
-        // media type as a routed one (see the module header).
-        Some(RESPONSE_MEDIA_TYPE.announce(self.entry.routing_error_response(req)))
-    }
-
-    fn override_framework_error(
-        &self,
-        error: &aws_smithy_schema_server::ProtocolError,
-    ) -> Option<aws_smithy_runtime_api::http::Response> {
-        // The router calls this on a transport-level failure it detects up front —
-        // before (or instead of) naming an operation. The entry's protocol-correct
-        // rendering is kept word for word; only the media type is re-announced (see the
-        // module header).
-        //
-        // The error is borrowed and `ProtocolError` is neither `Clone` nor reconstructable
-        // in general, so the default renderer is reached by rebuilding the error. The match
-        // is TOTAL over what this seam is ever handed, not a partial application of the
-        // rule: the router raises this seam from exactly ONE call site, with exactly one
-        // variant — `ProtocolError::Malformed(..)`, from the `aws-chunked` decode it runs
-        // before naming an operation (`vendor/smithy-server-runtime/src/multi_service_router.rs`,
-        // the `aws_chunked::decode_request` arm). `ProtocolError` is an open enum this crate
-        // does not own, so the remaining arm exists for a variant a future framework may
-        // route here: it declines to `None`, which keeps the framework's own rendering of an
-        // error this service cannot rebuild rather than losing what that error said. Should
-        // such a variant ever arrive, the response it renders is the one case of this
-        // service announcing the protocol-implied media type besides the authentication
-        // refusal the module header names.
-        match error {
-            aws_smithy_schema_server::ProtocolError::Malformed(message) => {
-                let rebuilt =
-                    aws_smithy_schema_server::ProtocolError::Malformed(message.clone());
-                Some(RESPONSE_MEDIA_TYPE.announce(self.entry.framework_error_response(rebuilt)))
-            }
             _ => None,
         }
     }

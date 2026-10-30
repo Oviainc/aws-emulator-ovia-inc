@@ -23,7 +23,10 @@
 //! responses one announcer produced ([`AnnouncedResponses`], reading the response a client
 //! receives, because which internal seam rendered it is the emulator's business and not the
 //! service's wire) and the rest keep the media type their own producer stamped. Which
-//! announcer owns which responses is a fact of the recorded wire, never a guess.
+//! announcer owns which responses is a fact of the recorded wire, never a guess. The one
+//! such split that is not a single service's question lives here too: a refusal reporting
+//! the REQUEST as invalid is the validator's and everything else is the front door's
+//! ([`not_a_validation_refusal`]).
 //!
 //! The REQUEST side is untouched: the media type a caller sends is not re-read, routing
 //! still follows the model's protocol, and the awsJson `1.0` and `1.1` codecs are the same
@@ -198,6 +201,51 @@ pub struct ResponseMediaTypeOperation {
 /// service says which responses belong to the layer it is re-announcing for; the rest are
 /// handed back as their producer wrote them.
 pub type AnnouncedResponses = fn(&RtResponse) -> bool;
+
+/// The error code of the refusal a request validator answers with, which the awsJson
+/// envelope carries as `__type`: the modelled `ValidationException` every emulated service
+/// on a JSON protocol declares for an input that does not satisfy its requirements.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// Whether `resp` is the modelled `ValidationException` refusal, read as a CLIENT reads it:
+/// a client error whose awsJson envelope names that shape in `__type`.
+///
+/// Read off the response rather than off the seam that rendered it, because which seam
+/// refuses a constraint is the emulator's business: a boundary validator refuses what the
+/// model's constraints express and a handler refuses what they cannot, and both are the one
+/// refusal to the client.
+#[must_use]
+pub fn is_validation_refusal(resp: &RtResponse) -> bool {
+    if !resp.status().is_client_error() {
+        return false;
+    }
+    let Some(body) = resp.body().bytes() else {
+        return false;
+    };
+    let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    envelope
+        .get("__type")
+        .and_then(serde_json::Value::as_str)
+        // `__type` carries the shape name, optionally qualified by its namespace or by the
+        // `<version>#` prefix the awsJson protocols allow; the shape is the last segment.
+        .is_some_and(|code| code.split(['#', '/']).next_back() == Some(VALIDATION_EXCEPTION))
+}
+
+/// The [`AnnouncedResponses`] predicate for a service whose front door announces its own
+/// media type on what its handlers produce while the REQUEST VALIDATOR in front of it
+/// answers under the protocol-implied one: every response but the modelled
+/// `ValidationException` refusal is the front door's ([`is_validation_refusal`]).
+///
+/// Stated here because it is not one service's question — a success, an error about stored
+/// state and a body the codec cannot read are the front door's, a refusal reporting the
+/// request as invalid is the validator's — so two services on that wire cannot disagree
+/// about which announcer answered.
+#[must_use]
+pub fn not_a_validation_refusal(resp: &RtResponse) -> bool {
+    !is_validation_refusal(resp)
+}
 
 impl ResponseMediaTypeOperation {
     /// The wrapper that re-announces EVERY response of the walk across `media_type`. A
@@ -397,6 +445,78 @@ mod tests {
                 Some(expected),
                 "case {case:?} (HTTP {status}): expected content-type {expected}, got \
                  {actual:?}"
+            );
+        }
+    }
+
+    /// A refusal naming the modelled `ValidationException` is the request validator's; every
+    /// other response is the front door's.
+    ///
+    /// The rows span the envelopes a client can receive: the validation refusal qualified and
+    /// unqualified, another client error of the same status, a client error the framework
+    /// renders before the operation, a success, a server error, and a body that is not the
+    /// JSON envelope at all.
+    #[test]
+    fn only_the_validation_refusal_is_the_validators() {
+        /// A response carrying `body` under `status`, as a layer of the walk renders one.
+        fn answered(status: u16, body: &str) -> RtResponse {
+            RtResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(status).expect("a status"),
+                SdkBody::from(body.as_bytes().to_vec()),
+            )
+        }
+
+        let cases: [(&str, RtResponse, bool); 7] = [
+            (
+                "the validation refusal",
+                answered(
+                    400,
+                    r#"{"__type":"ValidationException","message":"1 validation error detected"}"#,
+                ),
+                true,
+            ),
+            (
+                "the validation refusal, namespace-qualified",
+                answered(
+                    400,
+                    r#"{"__type":"com.amazonaws.example#ValidationException","message":"x"}"#,
+                ),
+                true,
+            ),
+            (
+                "a refusal about stored state, same status",
+                answered(400, r#"{"__type":"ResourceNotFoundException","message":"x"}"#),
+                false,
+            ),
+            (
+                "a client error the framework renders before the operation",
+                answered(400, r#"{"__type":"SerializationException","message":"x"}"#),
+                false,
+            ),
+            ("a success", answered(200, r#"{"items":[]}"#), false),
+            (
+                "a server error",
+                answered(500, r#"{"__type":"InternalServerException","message":"x"}"#),
+                false,
+            ),
+            (
+                "a body that is not the JSON envelope",
+                answered(400, "not json"),
+                false,
+            ),
+        ];
+
+        for (case, resp, expected) in cases {
+            let actual = is_validation_refusal(&resp);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected is_validation_refusal {expected}, got {actual}"
+            );
+            assert_eq!(
+                not_a_validation_refusal(&resp),
+                !expected,
+                "case {case:?}: the announcer predicate must be the inverse of the refusal \
+                 question"
             );
         }
     }
