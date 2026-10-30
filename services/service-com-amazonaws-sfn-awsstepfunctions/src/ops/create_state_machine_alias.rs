@@ -281,10 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `UpdateStateMachineAlias` is for.
             return Err(CreateStateMachineAliasErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(crate::state::resource_error_message(
-                        crate::state::STATE_MACHINE_ALIAS_ALREADY_EXISTS,
-                        &existing.arn,
-                    )),
+                    message: Some(crate::state::ALIAS_ROUTING_CONFLICT.to_string()),
                 },
             )
             .into());

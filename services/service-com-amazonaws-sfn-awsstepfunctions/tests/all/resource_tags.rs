@@ -17,7 +17,7 @@
 //! `InvalidArn` (400) for all three calls. Past that, the READ reports the tag set
 //! recorded under the ARN and never asserts the resource is there — an ARN nothing
 //! is tagged under answers 200 with an empty `TagList` — while the WRITES need the
-//! resource, so they are `ResourceNotFound` (404) when the store holds none. A merge
+//! resource, so they are `ResourceNotFound` (400) when the store holds none. A merge
 //! that would take a resource past the per-resource tag limit is `TooManyTags`
 //! (400), carrying the service's fixed text, with nothing written.
 //!
@@ -378,7 +378,7 @@ struct ArnCase {
 /// that validation the two calls differ, because one reports and the other writes: a
 /// well-formed, in-region taggable ARN the store holds nothing under reads as 200
 /// with an empty `TagList` (the tag set of an ARN nothing is tagged under is empty),
-/// while tagging it is `ResourceNotFound` (404), since a write needs the resource.
+/// while tagging it is `ResourceNotFound` (400), since a write needs the resource.
 #[tokio::test]
 async fn both_tagging_operations_read_the_same_arn_rule() {
     let emulator = Emulator::new();
@@ -442,14 +442,14 @@ async fn both_tagging_operations_read_the_same_arn_rule() {
             case: "a state machine that was never created",
             arn: format!("{prefix}:stateMachine:never-created"),
             read: None,
-            write: (404, "ResourceNotFound"),
+            write: (400, "ResourceNotFound"),
         },
         ArnCase {
             // A second never-created name: the answer follows the rule, not the name.
             case: "another state machine that was never created",
             arn: format!("{prefix}:stateMachine:also-never-created-0123456789"),
             read: None,
-            write: (404, "ResourceNotFound"),
+            write: (400, "ResourceNotFound"),
         },
         ArnCase {
             // Versions and aliases are not implemented, so no qualified resource
@@ -457,7 +457,7 @@ async fn both_tagging_operations_read_the_same_arn_rule() {
             case: "a qualified state machine ARN",
             arn: format!("{prefix}:stateMachine:tag-arn-rule:1"),
             read: None,
-            write: (404, "ResourceNotFound"),
+            write: (400, "ResourceNotFound"),
         },
         ArnCase {
             // `CreateActivity` still answers 501, so no activity can exist: nothing
@@ -465,7 +465,7 @@ async fn both_tagging_operations_read_the_same_arn_rule() {
             case: "an activity ARN",
             arn: format!("{prefix}:activity:an-activity"),
             read: None,
-            write: (404, "ResourceNotFound"),
+            write: (400, "ResourceNotFound"),
         },
     ];
 
@@ -676,8 +676,8 @@ async fn tagging_a_removed_state_machine_is_resource_not_found() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "ResourceNotFound"),
-        "case \"TagResource after the deletion settled\": expected 404 ResourceNotFound, got \
+        (400, "ResourceNotFound"),
+        "case \"TagResource after the deletion settled\": expected 400 ResourceNotFound, got \
          {status} {code} ({message})"
     );
 

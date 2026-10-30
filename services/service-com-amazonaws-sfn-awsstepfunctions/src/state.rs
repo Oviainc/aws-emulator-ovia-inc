@@ -4843,10 +4843,20 @@ pub fn read_activity_arn(arn: &str, endpoint_region: &str) -> Result<String, Str
     activity_resource(resource, &mut parts)
 }
 
-/// What the modelled `ResourceNotFound` says about a taggable ARN the store holds no
+/// `ResourceNotFound`'s condition, as its message spells it, for
+/// [`resource_error_message`]. RECORDED text: the service states this condition in
+/// SENTENCE case (`Resource not found: '<arn>'`) rather than in the spaced Title
+/// Case its sibling conditions use.
+pub const RESOURCE_NOT_FOUND: &str = "Resource not found";
+
+/// What the modelled `ResourceNotFound` says about an ARN the store holds no
 /// resource under, so every operation words that refusal the same way.
+///
+/// The same rule as every other refusal that reports one value of the request —
+/// the condition, then that value quoted ([`resource_error_message`]) — with the
+/// ARN the request named as the quoted value.
 pub fn resource_not_found_message(resource_arn: &str) -> String {
-    format!("could not find the resource {resource_arn}")
+    resource_error_message(RESOURCE_NOT_FOUND, resource_arn)
 }
 
 /// What the modelled `ResourceNotFound` says when a routing configuration names a
@@ -4992,16 +5002,36 @@ pub const EXECUTION_ALREADY_EXISTS: &str = "Execution Already Exists";
 /// `StateMachineAlreadyExists`'s, for [`resource_error_message`]. RECORDED text.
 pub const STATE_MACHINE_ALREADY_EXISTS: &str = "State Machine Already Exists";
 
-/// The condition a second `CreateStateMachineAlias` of an alias that already exists
-/// with DIFFERENT parameters reports, for [`resource_error_message`].
+/// What the modelled `ConflictException` says when a `CreateStateMachineAlias`
+/// names an alias that already exists under other parameters.
 ///
-/// The error's own condition name under the rule above, not a recorded message: the
-/// operation is idempotent only for "requests that contain the same values for these
-/// parameters", so a create naming an alias that exists under another description or
-/// routing configuration is the modelled `ConflictException` — "updating or deleting
-/// a resource can cause an inconsistent state" — against the alias that exists, and
-/// the value it quotes is that alias's ARN.
-pub const STATE_MACHINE_ALIAS_ALREADY_EXISTS: &str = "State Machine Alias Already Exists";
+/// RECORDED text, and a FIXED sentence: the create is idempotent only for
+/// "requests that contain the same values for these parameters", so a create
+/// naming an alias that exists under another description or routing configuration
+/// is this conflict — against an alias clients may already be running executions
+/// through, which `UpdateStateMachineAlias` is the operation for. The sentence
+/// carries no value of the request: the shape has nothing but `message`, and the
+/// name the caller sent is the one it sent.
+pub const ALIAS_ROUTING_CONFLICT: &str = "Failed to create alias because an alias with the same \
+                                          name and a different routing configuration already \
+                                          exists.";
+
+/// What the modelled `ConflictException` says when a `DeleteStateMachineVersion`
+/// names a version one or more aliases still route to.
+///
+/// RECORDED text: the service states the rule — "you can't delete a state machine
+/// version currently referenced by one or more aliases" — and then lists, in
+/// brackets, the aliases that reference it so the caller knows which ones to
+/// delete or repoint. The listed values are the aliases' NAMES as the store holds
+/// them, not their ARNs, and `alias_names` is read from the store rather than from
+/// the request.
+pub fn version_referenced_by_aliases_message(alias_names: &[String]) -> String {
+    format!(
+        "Version to be deleted must not be referenced by an alias. Current list of aliases \
+         referencing this version: [{}]",
+        alias_names.join(", ")
+    )
+}
 
 /// `ActivityDoesNotExist`'s, for [`resource_error_message`]. The error's own name
 /// under the rule above — the condition in spaced Title Case, then the ARN the

@@ -122,7 +122,7 @@ async fn expect_invalid_arn(
 
 /// Every ARN member of every implemented operation (15 pairs) refuses an ARN whose region is
 /// not the endpoint's, with `InvalidArn` and the region-mismatch message — not with
-/// the resource-absent error, and not with a 404.
+/// the resource-absent error, and not with a routing failure.
 #[tokio::test]
 async fn every_arn_member_refuses_an_arn_from_another_region() {
     let emulator = Emulator::new();

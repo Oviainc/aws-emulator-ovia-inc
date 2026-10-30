@@ -23,6 +23,10 @@
 //! `service.rs` hands the dispatch sequence through `override_protocol`, so
 //! EVERY operation's response passes through it and no handler and no shape
 //! declaration mentions the discriminator at all.
+//!
+//! The same seam owns the STATUS a refused request is answered with, for the
+//! same reason — it is a property of this service's wire protocol rather than
+//! of any one operation. See [`error_status`].
 
 use aws_smithy_runtime_api::http::{Request, Response};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
@@ -76,6 +80,30 @@ pub const DISCRIMINATED_MEMBERS: &[(&str, &str)] = &[
 /// namespace.
 pub fn discriminator(shape_name: &str) -> String {
     format!("{SWF_BASE_MODEL_NAMESPACE}#{shape_name}")
+}
+
+/// The HTTP status every CLIENT error of this service is answered with.
+///
+/// `awsJson1_0` names the error in the body's `__type` rather than in the status
+/// line, and this service answers one status for the whole client-error class:
+/// the recordings of its refusals show HTTP 400 for error shapes whose
+/// `@httpError` is 404 (the `ResourceNotFound` family) and 409 (the
+/// `ConflictException` family) alike. See [`error_status`].
+pub const CLIENT_ERROR_STATUS: u16 = 400;
+
+/// The status a modelled error is answered with, from the status its shape
+/// declares.
+///
+/// A client error (`4xx`) is answered with [`CLIENT_ERROR_STATUS`] whatever
+/// `@httpError` the shape carries, so a caller reads WHICH refusal it was from
+/// the error code in the body — the only place this service reports it. A
+/// server error keeps its own status: nothing recorded contradicts it, and a
+/// `5xx` is what tells a client the call may be retried as sent.
+pub fn error_status(modelled_status: u16) -> u16 {
+    match modelled_status {
+        400..=499 => CLIENT_ERROR_STATUS,
+        other => other,
+    }
 }
 
 /// The discriminator the structure about to be written at `schema` carries, or
@@ -312,8 +340,16 @@ impl ServerProtocol for SwfJsonProtocol {
         error_code: &str,
         http_status: u16,
     ) -> Result<Self::Response, ProtocolError> {
-        self.inner
-            .serialize_error(error, error_schema, error_code, http_status)
+        // The envelope is the framework's own `awsJson1_0`; what this service
+        // decides is the STATUS, which is one value for the whole client-error
+        // class rather than the one each error shape's `@httpError` declares.
+        // See [`error_status`].
+        self.inner.serialize_error(
+            error,
+            error_schema,
+            error_code,
+            error_status(http_status),
+        )
     }
 
     fn serialize_event_stream_message(

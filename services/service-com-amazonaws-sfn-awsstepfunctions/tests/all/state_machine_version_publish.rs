@@ -405,7 +405,7 @@ async fn publishing_is_idempotent_for_one_revision() {
 // ---------------------------------------------------------------------------
 
 /// `revisionId` publishes only when it names the state machine's CURRENT revision —
-/// `INITIAL` while it has none — and is otherwise `ConflictException` (HTTP 409) that
+/// `INITIAL` while it has none — and is otherwise `ConflictException` (HTTP 400) that
 /// stores nothing.
 #[tokio::test]
 async fn revision_id_must_name_the_current_revision() {
@@ -452,8 +452,8 @@ async fn revision_id_must_name_the_current_revision() {
         let code = error_code(&body);
         assert_eq!(
             (status, code.as_str()),
-            (409, "ConflictException"),
-            "case {case:?}: expected 409 ConflictException, got {status} {code} with body {body:?}"
+            (400, "ConflictException"),
+            "case {case:?}: expected 400 ConflictException, got {status} {code} with body {body:?}"
         );
         let listed = listed_versions(&emulator, arn).await;
         assert_eq!(
@@ -624,8 +624,8 @@ async fn a_stale_revision_pin_reports_the_requested_and_the_current_revision() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (409, "ConflictException"),
-            "case {case:?}: expected 409 ConflictException, got {status} {code} with message \
+            (400, "ConflictException"),
+            "case {case:?}: expected 400 ConflictException, got {status} {code} with message \
              {message:?}"
         );
 

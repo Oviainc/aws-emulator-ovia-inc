@@ -608,7 +608,7 @@ async fn update_map_run_refuses_what_it_cannot_serve() {
         (
             "a well-formed Map Run ARN this store never held",
             format!("arn:aws:states:{REGION}:{ACCOUNT}:mapRun:update-refusals/M:never"),
-            404,
+            400,
             "ResourceNotFound",
         ),
     ];

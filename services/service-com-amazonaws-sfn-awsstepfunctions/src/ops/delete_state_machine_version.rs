@@ -199,20 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // more aliases. Before you delete a version, you must either delete the
         // aliases or update them to point to another state machine version." The
         // aliases come from the store, so what a create or an update of an alias
-        // wrote is what decides this.
+        // wrote is what decides this — and what the refusal lists.
         let referencing: Vec<String> = store
             .aliases_routing_to(&state_machine_arn, &input.state_machine_version_arn)
             .into_iter()
-            .map(|alias| alias.arn.clone())
+            .map(|alias| alias.name.clone())
             .collect();
         if !referencing.is_empty() {
             return Err(
                 DeleteStateMachineVersionErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "'{}' is referenced by the state machine alias(es) {}, which must be \
-                         deleted or pointed at another version before it can be deleted",
-                        input.state_machine_version_arn,
-                        referencing.join(", ")
+                    message: Some(crate::state::version_referenced_by_aliases_message(
+                        &referencing,
                     )),
                 })
                 .into(),

@@ -1596,7 +1596,7 @@ async fn execution_operations_refuse_what_was_never_stored() {
         );
     }
 
-    // A Map Run ARN the store holds no record for is a 404.
+    // A Map Run ARN the store holds no record for is a `ResourceNotFound`.
     let (status, code) = emulator
         .err(
             "ListExecutions",
@@ -1605,8 +1605,8 @@ async fn execution_operations_refuse_what_was_never_stored() {
         .await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "ResourceNotFound"),
-        "a map run that does not exist is a 404, got {status} {code}"
+        (400, "ResourceNotFound"),
+        "a map run that does not exist is a ResourceNotFound, got {status} {code}"
     );
 }
 

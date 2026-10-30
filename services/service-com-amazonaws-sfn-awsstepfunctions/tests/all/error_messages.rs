@@ -592,7 +592,7 @@ async fn a_refused_value_renders_in_the_members_modelled_type() {
             None => {
                 let (status, code, message) = failure(&emulator, case, operation, &body).await;
                 assert_eq!(
-                    status, 404,
+                    status, 400,
                     "case {case:?}: expected the boundary to accept the value and the operation \
                      to refuse the absent Map Run, got {status} with message {message:?}"
                 );

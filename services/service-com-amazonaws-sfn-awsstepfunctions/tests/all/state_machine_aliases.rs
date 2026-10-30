@@ -40,7 +40,10 @@ use crate::state_machine_lifecycle::{
 use crate::state_machine_versions::machine_with_versions;
 
 /// One entry of a routing configuration.
-fn route(version_arn: &str, weight: i64) -> Value {
+///
+/// `pub(crate)`, not private: `tests/all/client_refusal_status.rs` points aliases at
+/// versions through the same helper rather than carrying a second copy.
+pub(crate) fn route(version_arn: &str, weight: i64) -> Value {
     json!({ "stateMachineVersionArn": version_arn, "weight": weight })
 }
 
@@ -59,7 +62,9 @@ type RepeatCase<'a> = (&'a str, &'a str, Option<&'a str>, Vec<Value>);
 
 /// The `CreateStateMachineAlias` request body for `name`, `description` and
 /// `routing`.
-fn create_request(name: &str, description: Option<&str>, routing: &[Value]) -> Value {
+///
+/// `pub(crate)` for the same reason as [`route`].
+pub(crate) fn create_request(name: &str, description: Option<&str>, routing: &[Value]) -> Value {
     let mut request = json!({ "name": name, "routingConfiguration": routing });
     if let Some(description) = description {
         request["description"] = json!(description);
@@ -68,7 +73,9 @@ fn create_request(name: &str, description: Option<&str>, routing: &[Value]) -> V
 }
 
 /// Create an alias that must succeed, and return the response body.
-async fn create_alias(
+///
+/// `pub(crate)` for the same reason as [`route`].
+pub(crate) async fn create_alias(
     emulator: &Emulator,
     name: &str,
     description: Option<&str>,
@@ -368,14 +375,14 @@ async fn a_routing_configuration_that_cannot_be_pointed_at_is_refused() {
         (
             "a version number that was never published",
             vec![route(&format!("{machine}:9"), 100)],
-            404,
+            400,
             "ResourceNotFound",
             None,
         ),
         (
             "a version of a state machine that does not exist",
             vec![route(&format!("{absent}:1"), 100)],
-            404,
+            400,
             "ResourceNotFound",
             None,
         ),
@@ -449,7 +456,7 @@ async fn a_routing_configuration_that_cannot_be_pointed_at_is_refused() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFound"),
+        (400, "ResourceNotFound"),
         "a refused create must store nothing, got {status} with body {body:?}"
     );
 }
@@ -531,7 +538,7 @@ async fn an_alias_of_a_deleting_state_machine_is_refused() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFound"),
+        (400, "ResourceNotFound"),
         "once the deletion is due the versions are gone, got {status} with body {body:?}"
     );
 }
@@ -557,7 +564,7 @@ async fn the_alias_quota_is_per_state_machine() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (402, "ServiceQuotaExceededException"),
+        (400, "ServiceQuotaExceededException"),
         "the {MAX_ALIASES_PER_STATE_MACHINE}th alias must be the last one, got {status} with body \
          {body:?}"
     );
@@ -681,8 +688,8 @@ async fn a_repeat_of_the_same_parameters_is_the_first_response() {
         let code = error_code(&body);
         assert_eq!(
             (status, code.as_str()),
-            (409, "ConflictException"),
-            "case {case:?}: expected 409 ConflictException, got {status} {code} with body {body:?}"
+            (400, "ConflictException"),
+            "case {case:?}: expected 400 ConflictException, got {status} {code} with body {body:?}"
         );
     }
     let after = describe_alias(&emulator, &format!("{machine}:PROD")).await;
@@ -757,7 +764,7 @@ async fn an_arn_that_names_no_alias_is_refused() {
         // The last row is a WELL-FORMED alias ARN, so it is the one case here that
         // reaches the lookup and answers `ResourceNotFound` instead.
         let expected = if case.starts_with("a qualifier at the modelled name length") {
-            (404, "ResourceNotFound")
+            (400, "ResourceNotFound")
         } else {
             (400, "InvalidArn")
         };
@@ -782,8 +789,8 @@ async fn an_arn_that_names_no_alias_is_refused() {
         let code = error_code(&body);
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFound"),
-            "case {case:?}: expected 404 ResourceNotFound, got {status} {code} with body {body:?}"
+            (400, "ResourceNotFound"),
+            "case {case:?}: expected 400 ResourceNotFound, got {status} {code} with body {body:?}"
         );
     }
 }
@@ -830,7 +837,7 @@ async fn describing_an_alias_changes_nothing_and_it_dies_with_its_state_machine(
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFound"),
+        (400, "ResourceNotFound"),
         "an alias does not outlive its state machine, got {status} with body {body:?}"
     );
 }

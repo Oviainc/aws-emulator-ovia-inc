@@ -591,7 +591,7 @@ async fn list_state_machine_aliases_reports_the_aliases_of_the_arn_it_names() {
         (
             "a version that was never published",
             format!("{machine}:9"),
-            404,
+            400,
             "ResourceNotFound",
         ),
         (
@@ -724,8 +724,8 @@ async fn a_routing_configuration_naming_an_absent_version_states_the_routing_rul
         let code = error_code(&body);
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFound"),
-            "case {case:?}: expected 404 ResourceNotFound, got {status} {code} with body {body:?}"
+            (400, "ResourceNotFound"),
+            "case {case:?}: expected 400 ResourceNotFound, got {status} {code} with body {body:?}"
         );
         assert_eq!(
             optional(&body, "message")

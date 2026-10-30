@@ -18,7 +18,7 @@
 //!    published and a version of a state machine that is gone each answer 200;
 //! 3. "You can't delete a state machine version currently referenced by one or more
 //!    aliases": a version an alias' routing configuration still names is
-//!    `ConflictException` (HTTP 409) and nothing is removed, while a version of the
+//!    `ConflictException` (HTTP 400) and nothing is removed, while a version of the
 //!    same state machine that no alias names still deletes;
 //! 4. the ARN is judged BEFORE the lookup: text that is not a state machine VERSION
 //!    ARN of this service in the endpoint's region — malformed, another service's,
@@ -294,7 +294,7 @@ async fn deleting_a_version_the_store_does_not_hold_is_a_success() {
 // ---------------------------------------------------------------------------
 
 /// "You can't delete a state machine version currently referenced by one or more
-/// aliases": the delete is `ConflictException` (HTTP 409) and the version stays.
+/// aliases": the delete is `ConflictException` (HTTP 400) and the version stays.
 ///
 /// The rows vary along HOW the alias names the version — the only entry of a routing
 /// configuration, one entry of two, at a weight of zero, and named by two aliases at
@@ -332,8 +332,8 @@ async fn a_version_an_alias_routes_to_cannot_be_deleted() {
         let code = error_code(&body);
         assert_eq!(
             (status, code.as_str()),
-            (409, "ConflictException"),
-            "case {case:?}: expected 409 ConflictException for {version_arn}, got {status} {code} \
+            (400, "ConflictException"),
+            "case {case:?}: expected 400 ConflictException for {version_arn}, got {status} {code} \
              with body {body:?}"
         );
         // Nothing was removed.
@@ -363,7 +363,7 @@ async fn an_alias_only_blocks_the_versions_of_its_own_state_machine() {
     let code = error_code(&body);
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
+        (400, "ConflictException"),
         "the referenced version must be refused, got {status} {code} with body {body:?}"
     );
 

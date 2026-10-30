@@ -983,7 +983,7 @@ async fn describe_map_run_refuses_what_it_cannot_serve() {
         (
             "a well-formed Map Run ARN this store never held",
             format!("arn:aws:states:{REGION}:{ACCOUNT}:mapRun:describe-refusals/M:never"),
-            404,
+            400,
             "ResourceNotFound",
         ),
     ];
@@ -1125,8 +1125,8 @@ async fn redriving_the_execution_re_runs_the_map_run_it_already_started() {
 
 /// `ListExecutions` on a Map Run ARN answers for the record the store holds: the
 /// child workflow executions of a Map Run that EXISTS — one per item of its
-/// Distributed Map state — and a 404 only for an ARN no record answers for. A token
-/// this service never issued is still refused on that branch.
+/// Distributed Map state — and `ResourceNotFound` only for an ARN no record answers
+/// for. A token this service never issued is still refused on that branch.
 #[tokio::test]
 async fn list_executions_answers_for_the_map_run_the_store_holds() {
     let emulator = Emulator::new();
@@ -1182,8 +1182,8 @@ async fn list_executions_answers_for_the_map_run_the_store_holds() {
         .await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "ResourceNotFound"),
-        "a Map Run ARN no record answers for is a 404, got {status} {code}"
+        (400, "ResourceNotFound"),
+        "a Map Run ARN no record answers for is a ResourceNotFound, got {status} {code}"
     );
 }
 

@@ -598,8 +598,8 @@ async fn an_activity_carries_the_tags_written_against_its_arn() {
         let (status, code) = emulator.err(operation, &request).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFound"),
-            "case {operation}: expected a 404 ResourceNotFound for an absent activity, got \
+            (400, "ResourceNotFound"),
+            "case {operation}: expected a 400 ResourceNotFound for an absent activity, got \
              {status} {code}"
         );
     }

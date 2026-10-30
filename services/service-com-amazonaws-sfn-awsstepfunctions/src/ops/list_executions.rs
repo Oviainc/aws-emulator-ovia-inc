@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !store.map_runs.contains_key(map_run) {
                     return Err(ListExecutionsErrorModeled::ResourceNotFound(
                         ResourceNotFound {
-                            message: Some(format!("map run {map_run} does not exist")),
+                            message: Some(crate::state::resource_not_found_message(map_run)),
                             resource_name: Some(map_run.to_string()),
                         },
                     )

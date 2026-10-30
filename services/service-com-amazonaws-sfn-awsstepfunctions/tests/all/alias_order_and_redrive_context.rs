@@ -418,7 +418,7 @@ async fn an_update_refuses_what_no_record_can_answer_for() {
         (
             "an alias that was never created",
             json!({ "stateMachineAliasArn": format!("{machine}:QA"), "description": "x" }),
-            404,
+            400,
             "ResourceNotFound",
         ),
         (
@@ -427,7 +427,7 @@ async fn an_update_refuses_what_no_record_can_answer_for() {
                 "stateMachineAliasArn": &alias,
                 "routingConfiguration": [route(&format!("{machine}:9"), 100)],
             }),
-            404,
+            400,
             "ResourceNotFound",
         ),
         (
