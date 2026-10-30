@@ -69,7 +69,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{STORE_UNAVAILABLE, TAGGED_RESOURCE_NOT_FOUND};
+use crate::state::{to_tag_map, STORE_UNAVAILABLE, TAGGED_RESOURCE_NOT_FOUND};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,14 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(not_found)?;
 
         Ok(ListTagsForResourceOutput {
-            // `TagMap` is modelled `length 1..50`, so a resource carrying no tags is
-            // reported with no map at all rather than an empty one — the same projection
-            // `Canary$Tags` and `Group$Tags` use for the very same stored field.
-            tags: (!tags.is_empty()).then(|| {
-                tags.iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+            // Always a map, `{}` for a resource that carries no tags: one projection
+            // (`state::to_tag_map`) for the very same stored field `Canary$Tags` and
+            // `Group$Tags` report.
+            tags: Some(to_tag_map(tags)),
         })
     }
 }

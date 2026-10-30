@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the tags a request carries to the canary or group its `ResourceArn` names.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +74,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
+
+use crate::state::{
+    request_caller, AUDIT_TARGET, MAX_TAGS_PER_RESOURCE, STORE_UNAVAILABLE,
+    TAGGED_RESOURCE_NOT_FOUND,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +153,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_error)?;
+        let now = SystemTime::now();
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        let mut guard = state.lock();
+        // Only what the clock already owed on the canary records (a canary that finished
+        // provisioning, a run whose outcome came due); the tags are this call's own write.
+        guard.settle(now);
+
+        // Resolved, merged and written under ONE lock, so two concurrent calls cannot both
+        // read the same pre-merge map and one of them lose its pairs. Only the tag map
+        // changes: a tag says nothing about the canary's configuration or the group's
+        // membership, so no other member of the stored record is touched.
+        let tags = guard
+            .tags_of_resource_mut(&input.resource_arn)
+            .ok_or_else(not_found)?;
+
+        // "If you specify a new tag key for the resource, this tag is appended to the list
+        // of tags associated with the resource. If you specify a tag key that is already
+        // associated with the resource, the new tag value that you specify replaces the
+        // previous value for that tag": tagging MERGES, so a key the request does not name
+        // keeps the value it had.
+        let mut merged = tags.clone();
+        for (key, value) in input.tags {
+            merged.insert(key, value);
+        }
+        // "You can associate as many as 50 tags with a canary or group." Checked on the
+        // MERGED set, since re-valuing a key the resource already carries adds none, and
+        // before anything is stored, so a refused call leaves the tags exactly as they were.
+        if merged.len() > MAX_TAGS_PER_RESOURCE {
+            drop(guard);
+            audit(ctx, &region, "rejected_too_many_tags");
+            return Err(too_many_tags());
+        }
+        *tags = merged;
+        drop(guard);
+        audit(ctx, &region, "tagged");
+        Ok(TagResourceOutput {})
     }
+}
+
+/// The access record for this state-changing operation: who, where, what and the outcome.
+///
+/// Metadata only — no ARN, no tag key or value — so nothing a caller supplied can reach
+/// the trail, and `Debug`-escaped values cannot split a record.
+fn audit(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: AUDIT_TARGET,
+        operation = "TagResource",
+        caller = ?request_caller(ctx.parts()),
+        region = ?region,
+        outcome = outcome,
+        "synthetics resource tag write",
+    );
+}
+
+/// The modelled 404 for an ARN this store holds no canary or group for.
+///
+/// One fixed sentence, naming neither the resource kind nor the ARN from the request
+/// (`state::TAGGED_RESOURCE_NOT_FOUND`) — the same sentence the tag READ answers that miss
+/// with, because both resolve the same ARN against the same store.
+fn not_found() -> TagResourceError {
+    TagResourceErrorModeled::NotFoundException(NotFoundException {
+        message: Some(TAGGED_RESOURCE_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 400 for a request that would take the resource past the documented tag
+/// count. The sentence is the documented rule itself and carries nothing from the request.
+fn too_many_tags() -> TagResourceError {
+    TagResourceErrorModeled::BadRequestException(BadRequestException {
+        message: Some(format!(
+            "You can associate as many as {MAX_TAGS_PER_RESOURCE} tags with a canary or group"
+        )),
+    })
+    .into()
+}
+
+/// The modelled 500 for a store that cannot be reached. Never a fresh engine: a private
+/// store would accept the write and drop it when the request returns.
+fn internal_error() -> TagResourceError {
+    TagResourceErrorModeled::InternalFailureException(InternalFailureException {
+        message: Some(STORE_UNAVAILABLE.to_string()),
+    })
+    .into()
 }

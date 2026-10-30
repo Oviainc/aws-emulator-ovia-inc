@@ -225,20 +225,14 @@ async fn create_group_persists_every_input_class_and_get_group_reads_it_back() {
              got {created_time:?} and {last_modified:?}"
         );
 
-        // Tags round-trip exactly, and an untagged group reports no map at all
-        // (`TagMap` is modelled `length 1..50`, so an empty map is not a legal value).
-        match row.tags.as_ref() {
-            Some(tags) => assert_eq!(
-                &group["Tags"], tags,
-                "case {case}: expected the supplied tags, got {:?}",
-                group["Tags"]
-            ),
-            None => assert!(
-                group["Tags"].is_null(),
-                "case {case}: expected no Tags on an untagged group, got {:?}",
-                group["Tags"]
-            ),
-        }
+        // Tags round-trip exactly, and an untagged group reports an EMPTY map: the tag
+        // map is a member of every response that reports the group.
+        let expected_tags = row.tags.clone().unwrap_or_else(|| json!({}));
+        assert_eq!(
+            group["Tags"], expected_tags,
+            "case {case}: expected the supplied tags, got {:?}",
+            group["Tags"]
+        );
 
         // "You can specify the group name, the ARN, or the group ID as the
         // GroupIdentifier": every form resolves to the same stored record, and the

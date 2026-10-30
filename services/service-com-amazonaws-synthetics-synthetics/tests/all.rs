@@ -35,3 +35,5 @@ mod runtime_versions;
 mod server_side_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_write_path.rs"]
+mod tag_write_path;

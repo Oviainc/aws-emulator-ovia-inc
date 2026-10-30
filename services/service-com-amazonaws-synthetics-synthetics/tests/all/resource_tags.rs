@@ -4,9 +4,9 @@
 //!
 //! The rule asserted here, one row per input class rather than one recorded request:
 //! `ListTagsForResource` reports the tags PERSISTED on the canary or group whose whole
-//! ARN the request names — every key and value as stored, and no `Tags` member at all
-//! when the resource carries none (`TagMap` is modelled `length 1..50`, so an empty map
-//! is not a legal value) — and refuses any other well-formed `ResourceArn` with the
+//! ARN the request names — every key and value as stored, and an EMPTY map when the
+//! resource carries none, since the tag map is a member of every response that reports
+//! the resource — and refuses any other well-formed `ResourceArn` with the
 //! modelled `NotFoundException`, 404, carrying one fixed sentence that names neither the
 //! resource kind nor the ARN from the request.
 //!
@@ -220,7 +220,7 @@ async fn tags_on_the_resource(aws: &Synthetics, row: &Row, arn: &str) -> Value {
 }
 
 /// Every input class: the tags reported are the tags persisted, an untagged resource
-/// reports no map at all, and the read is repeatable — the same ARN answers the same
+/// reports an empty map, and the read is repeatable — the same ARN answers the same
 /// thing twice, because listing tags changes nothing.
 #[tokio::test]
 async fn list_tags_for_resource_reports_the_tags_each_resource_was_created_with() {
@@ -251,10 +251,12 @@ async fn list_tags_for_resource_reports_the_tags_each_resource_was_created_with(
                      ({reported:?})"
                 );
             }
-            // `TagMap` is modelled `length 1..50`, so there is no empty map to report.
-            None => assert!(
-                reported.is_null(),
-                "case {case}: expected no Tags on an untagged resource, got {reported:?}"
+            // A resource with no tags reports an empty map, not a missing member.
+            None => assert_eq!(
+                reported,
+                json!({}),
+                "case {case}: expected an empty Tags map on an untagged resource, got \
+                 {reported:?}"
             ),
         }
 

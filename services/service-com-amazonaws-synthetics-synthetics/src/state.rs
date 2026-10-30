@@ -11,7 +11,7 @@
 //! ([`StoredCanary::to_canary`]); no handler builds a `Canary` from its own request.
 
 use std::collections::hash_map::RandomState;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -710,12 +710,7 @@ impl StoredCanary {
                     })
                     .collect()
             }),
-            tags: (!self.tags.is_empty()).then(|| {
-                self.tags
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            }),
+            tags: Some(to_tag_map(&self.tags)),
             artifact_config: self.artifact_config.as_ref().map(|cfg| ArtifactConfigOutput {
                 s3_encryption: Some(S3EncryptionConfig {
                     encryption_mode: cfg.encryption_mode.clone(),
@@ -770,14 +765,7 @@ impl StoredGroup {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
             arn: Some(self.arn()),
-            // `TagMap` is modelled `length 1..50`, so an untagged group reports no map
-            // rather than an empty one.
-            tags: (!self.tags.is_empty()).then(|| {
-                self.tags
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+            tags: Some(to_tag_map(&self.tags)),
             created_time: Some(self.created.into()),
             last_modified_time: Some(self.last_modified.into()),
         }
@@ -892,7 +880,50 @@ impl ComAmazonawsSyntheticsSyntheticsState {
             TaggedResourceKind::Group => self.group_by_arn(resource_arn).map(|group| &group.tags),
         }
     }
+
+    /// [`Self::tags_of_resource`], for a caller that has to CHANGE the tags: the very same
+    /// stored field, resolved by the very same rule, so a tag write lands on the record a
+    /// tag read reports and on the `Tags` member the resource's own reader projects.
+    pub fn tags_of_resource_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        match arn_resource_kind(resource_arn)? {
+            TaggedResourceKind::Canary => {
+                // The key is read off the matching record, so the mutable lookup below
+                // cannot address a different canary than the immutable one.
+                let name = self.canary_by_arn(resource_arn)?.name.clone();
+                self.canaries.get_mut(&name).map(|canary| &mut canary.tags)
+            }
+            TaggedResourceKind::Group => {
+                let name = self.group_by_arn(resource_arn)?.name.clone();
+                self.groups.get_mut(&name).map(|group| &mut group.tags)
+            }
+        }
+    }
 }
+
+/// Project a stored tag map onto the modelled `TagMap`.
+///
+/// ALWAYS a map, including for a resource that carries no tags: an output tag map is a
+/// member the service reports whenever it reports the resource, and "no tags" is expressed
+/// as an EMPTY map rather than as a missing member, so a client reading the member finds a
+/// map it can read, write back and compare either way. The modelled `length 1..50` bounds
+/// a tag map a CALLER sends — how many tags one call may carry and that it may not be
+/// empty — and is not a bound on this projection.
+///
+/// The one place a `TagMap` is built from stored tags, so `Canary$Tags`, `Group$Tags` and
+/// `ListTagsForResource` cannot disagree about the same stored field.
+pub fn to_tag_map(tags: &BTreeMap<String, String>) -> HashMap<String, String> {
+    tags.iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// How many tags one canary or group carries at once: "You can associate as many as 50
+/// tags with a canary or group" (`TagResource`'s own documentation), which is also the
+/// upper bound the model puts on a `TagMap`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// Which kind of resource a `ResourceArn` names. Its pattern admits exactly these two
 /// (`…:\d{12}:(canary|group):[0-9a-z_\-]+$`).

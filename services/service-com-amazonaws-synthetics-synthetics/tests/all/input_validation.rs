@@ -256,10 +256,10 @@ async fn a_refused_request_carries_the_modelled_validation_exception_message() {
                 &max_value_requirement(1000),
             )]),
         },
-        // An operation that is still scaffolded: a constraint belongs to the INPUT SHAPE,
-        // so the refusal does not wait for a handler to exist.
+        // A tag operation's ARN: a constraint belongs to the INPUT SHAPE, so the refusal
+        // comes before the handler and before any lookup in the store.
         Refused {
-            case: "tag-resource-arn-pattern-on-a-stub",
+            case: "tag-resource-arn-pattern",
             method: "POST",
             path: "/tags/not-an-arn".to_string(),
             body: Some(json!({ "Tags": { "team": "synthetics" } })),
@@ -337,14 +337,9 @@ async fn a_request_the_model_accepts_reaches_its_operation() {
     );
 
     // A model-valid request to an operation that has no implementation yet must still
-    // reach the scaffold channel rather than being refused as invalid.
-    let stub = aws
-        .call(
-            "POST",
-            "/tags/arn:aws:synthetics:us-east-1:123456789012:canary:gate-transparent",
-            Some(json!({ "Tags": { "team": "synthetics" } })),
-        )
-        .await;
+    // reach the scaffold channel rather than being refused as invalid. `ListGroups` is
+    // one of the operations still carrying the scaffold marker.
+    let stub = aws.call("POST", "/groups", Some(json!({}))).await;
     assert_eq!(
         stub.status, 501,
         "case valid-request-to-a-stub: expected the scaffold's 501, got {} ({:?})",
