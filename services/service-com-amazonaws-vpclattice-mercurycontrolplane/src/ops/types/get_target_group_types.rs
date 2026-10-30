@@ -17,7 +17,13 @@ pub struct GetTargetGroupInput {
     pub target_group_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#GetTargetGroupResponse")]
+/// `GetTargetGroupResponse`, with its schema written out instead of derived because
+/// `createdAt` and `lastUpdatedAt` are `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape: same ids, same order, same indices.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape
+/// is an operation OUTPUT, which the server only ever serializes.
 #[derive(Debug, Clone, Default)]
 pub struct GetTargetGroupOutput {
     pub id: Option<String>,
@@ -33,3 +39,102 @@ pub struct GetTargetGroupOutput {
     pub failure_code: Option<String>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetTargetGroupOutput {
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetTargetGroupResponse", "id", String, 0);
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetTargetGroupResponse", "arn", String, 1);
+    const M_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetTargetGroupResponse", "name", String, 2);
+    // `TargetGroupType` and `TargetGroupStatus` are enum shapes, which the generator
+    // writes as `ShapeType::String`.
+    const M_TYPE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetTargetGroupResponse", "type", String, 3);
+    const M_CONFIG: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetTargetGroupResponse", "config", Structure, 4);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetTargetGroupResponse", "createdAt", 5);
+    const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetTargetGroupResponse", "lastUpdatedAt", 6);
+    const M_STATUS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetTargetGroupResponse", "status", String, 7);
+    const M_SERVICE_ARNS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetTargetGroupResponse", "serviceArns", List, 8);
+    const M_FAILURE_MESSAGE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetTargetGroupResponse", "failureMessage", String, 9);
+    const M_FAILURE_CODE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetTargetGroupResponse", "failureCode", String, 10);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#GetTargetGroupResponse",
+            shared_types::NAMESPACE,
+            "GetTargetGroupResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_ARN,
+            &Self::M_NAME,
+            &Self::M_TYPE,
+            &Self::M_CONFIG,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_UPDATED_AT,
+            &Self::M_STATUS,
+            &Self::M_SERVICE_ARNS,
+            &Self::M_FAILURE_MESSAGE,
+            &Self::M_FAILURE_CODE,
+        ],
+    );
+}
+
+pub static GET_TARGET_GROUP_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetTargetGroupOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetTargetGroupOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.name.as_ref() {
+            serializer.write_string(&Self::M_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.r#type.as_ref() {
+            serializer.write_string(&Self::M_TYPE, value.as_str())?;
+        }
+        if let Some(value) = self.config.as_ref() {
+            serializer.write_struct(&Self::M_CONFIG, value)?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.last_updated_at.as_ref() {
+            serializer.write_timestamp(&Self::M_LAST_UPDATED_AT, value)?;
+        }
+        if let Some(value) = self.status.as_ref() {
+            serializer.write_string(&Self::M_STATUS, value.as_str())?;
+        }
+        if let Some(value) = self.service_arns.as_ref() {
+            serializer.write_list(&Self::M_SERVICE_ARNS, &|elements| {
+                for arn in value.iter() {
+                    elements.write_string(&Self::M_SERVICE_ARNS, arn.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.failure_message.as_ref() {
+            serializer.write_string(&Self::M_FAILURE_MESSAGE, value.as_str())?;
+        }
+        if let Some(value) = self.failure_code.as_ref() {
+            serializer.write_string(&Self::M_FAILURE_CODE, value.as_str())?;
+        }
+        Ok(())
+    }
+}

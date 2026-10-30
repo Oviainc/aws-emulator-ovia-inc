@@ -31,5 +31,7 @@ mod rules;
 mod service_network_update_and_timestamps;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/target_groups.rs"]
+mod target_groups;
 #[path = "all/vpclattice_service_slice.rs"]
 mod vpclattice_service_slice;

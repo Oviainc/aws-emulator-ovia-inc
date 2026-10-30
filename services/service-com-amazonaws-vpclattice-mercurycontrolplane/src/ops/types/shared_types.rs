@@ -215,7 +215,10 @@ pub struct DnsOptions {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#TargetGroupConfig")]
-#[derive(Debug, Clone, Default)]
+// `PartialEq` so a `clientToken` replay can compare the config it would persist against
+// the one the first call stored, which `CreateTargetGroup`'s `clientToken` documentation
+// requires ("If the parameters aren't identical, the retry fails.").
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TargetGroupConfig {
     pub port: Option<i32>,
     pub protocol: Option<String>,
@@ -227,7 +230,8 @@ pub struct TargetGroupConfig {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#HealthCheckConfig")]
-#[derive(Debug, Clone, Default)]
+// `PartialEq` for the same reason as [`TargetGroupConfig`]'s: it is part of one.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct HealthCheckConfig {
     pub enabled: Option<bool>,
     pub protocol: Option<String>,
@@ -243,7 +247,8 @@ pub struct HealthCheckConfig {
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.vpclattice#Matcher")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+// `PartialEq` for the same reason as [`TargetGroupConfig`]'s: it is part of one.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Matcher {
     httpCode(String),
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTargetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTargetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTargetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a target group and persists it: the record it mints is what `GetTargetGroup`
+//! reads back, and its status follows the clock-owed `CREATE_IN_PROGRESS -> ACTIVE`
+//! transition this service's other creates follow.
 //!
 //! ## Shape of an operation
 //!
@@ -145,6 +139,43 @@ impl From<CreateTargetGroupErrorModeled> for CreateTargetGroupError {
     }
 }
 
+/// The response for a stored target group — every member read back out of state, with
+/// the status the clock owes it at `now`.
+fn output_of(
+    group: &crate::state::TargetGroup,
+    now: std::time::SystemTime,
+) -> CreateTargetGroupOutput {
+    CreateTargetGroupOutput {
+        id: Some(group.id.clone()),
+        arn: Some(group.arn.clone()),
+        name: Some(group.name.clone()),
+        r#type: Some(group.group_type.clone()),
+        config: Some(group.config.clone()),
+        status: Some(group.status(now).to_string()),
+    }
+}
+
+/// HTTP 400 for input outside a constraint the model or the member's documentation
+/// states, in AWS's validation-error construction
+/// ([`crate::state::validation_exception`]).
+fn invalid(violation: crate::state::FieldViolation) -> CreateTargetGroupError {
+    CreateTargetGroupErrorModeled::ValidationException(crate::state::validation_exception(&[
+        violation,
+    ]))
+    .into()
+}
+
+/// HTTP 400 for a value a documented SERVICE RULE refuses — one the model carries no
+/// constraint trait for — in the construction AWS reports those with
+/// ([`crate::state::service_rule_exception`]): the rule's own sentence over the bare
+/// member it constrains.
+fn refused_by_rule(violation: &crate::state::ServiceRuleViolation) -> CreateTargetGroupError {
+    CreateTargetGroupErrorModeled::ValidationException(crate::state::service_rule_exception(
+        violation,
+    ))
+    .into()
+}
+
 /// The `CreateTargetGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -181,18 +212,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTargetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTargetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTargetGroup"))
+        // The modelled constraints the boundary CAN check (`@length`, the
+        // `TargetGroupType` / `TargetGroupProtocol` / `IpAddressType` enums, the `port`
+        // and health-check `@range`s, the `vpcIdentifier` pattern) are refused before
+        // this handler runs; `name`'s pattern is written with negative lookahead the
+        // boundary's regex engine cannot compile, and the documented rules below carry
+        // no modelled trait at all.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTargetGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let region = crate::state::region_of(ctx.parts());
+        let now = std::time::SystemTime::now();
+
+        if let Err(violation) = crate::state::check_resource_name(
+            crate::state::ResourceKind::TargetGroup,
+            "name",
+            &input.name,
+        ) {
+            return Err(invalid(violation));
+        }
+        if let Err(violation) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(invalid(violation));
+        }
+
+        // A config member is supported only for the target-group types its own
+        // documentation names, and a health check's numeric members have documented
+        // ranges narrower than the modelled ones.
+        if let Some(config) = input.config.as_ref() {
+            if let Err(violation) = crate::state::check_target_group_config(&input.r#type, config)
+            {
+                return Err(refused_by_rule(&violation));
+            }
+            if let Some(health_check) = config.health_check.as_ref() {
+                if let Err(violation) =
+                    crate::state::check_health_check("config.healthCheck", health_check)
+                {
+                    return Err(invalid(violation));
+                }
+            }
+        }
+
+        // What this create would PERSIST: the config with its documented defaults filled
+        // in, and the tags as a map. Built before the idempotency check, because that is
+        // what a replayed token's parameters are compared against.
+        let config =
+            crate::state::normalized_target_group_config(&input.r#type, input.config.as_ref());
+        let tags = input.tags.clone().unwrap_or_default();
+
+        // Nothing above this line reads or writes the store, so the lock is taken only
+        // for the idempotency, name and ceiling guards and the insert they protect.
+        let mut store = state.lock();
+
+        // `clientToken` is an @idempotencyToken: a retry carrying the token of a
+        // completed create answers with that same target group, while the same token
+        // with different parameters fails (the member's own documentation: "If the
+        // parameters aren't identical, the retry fails.").
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::token_key(Self::NAME, token));
+        if let Some(existing) = token
+            .as_ref()
+            .and_then(|key| store.idempotency_tokens.get(key))
+            .and_then(|id| store.target_groups.get(id))
+        {
+            // Every member of this request, compared against what the first call stored:
+            // the config is compared as PERSISTED, so a retry that spells a documented
+            // default out explicitly is still the same request.
+            if existing.name != input.name
+                || existing.group_type != input.r#type
+                || existing.config != config
+                || existing.tags != tags
+            {
+                // No recording covers a clientToken replayed with different parameters,
+                // so this message keeps its own wording; the identifier of the
+                // conflicting target group is in it and the resourceType token comes
+                // from the shared path.
+                return Err(CreateTargetGroupErrorModeled::ConflictException(
+                    crate::state::conflict(
+                        crate::state::ResourceKind::TargetGroup,
+                        &existing.id,
+                        format!(
+                            "TargetGroup {} was already created with this clientToken and different parameters.",
+                            existing.id
+                        ),
+                    ),
+                )
+                .into());
+            }
+            return Ok(output_of(existing, now));
+        }
+
+        // "The name must be unique within the account" (the `name` member's own
+        // documentation), so the key is the account-scoped one.
+        let name_key = crate::state::name_key(crate::state::KIND_TARGET_GROUP, &input.name);
+        if let Some(taken_by) = store.name_index.get(&name_key) {
+            return Err(CreateTargetGroupErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::ResourceKind::TargetGroup,
+                    taken_by,
+                    crate::state::duplicate_name_in_account_message(&input.name),
+                ),
+            )
+            .into());
+        }
+
+        // The emulator's own ceiling on stored target groups, answered with the modelled
+        // 402 so a caller looping on create cannot grow this process without bound.
+        if store.target_groups.len() >= crate::state::MAX_TARGET_GROUPS {
+            return Err(CreateTargetGroupErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} target groups",
+                        crate::state::MAX_TARGET_GROUPS
+                    ),
+                    resource_id: None,
+                    resource_type: crate::state::ResourceKind::TargetGroup
+                        .wire_type()
+                        .to_string(),
+                    service_code: crate::state::ARN_SERVICE.to_string(),
+                    quota_code: "target-groups-per-account".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = crate::state::mint_id(crate::state::PREFIX_TARGET_GROUP);
+        let sequence = store.next_sequence();
+        let record = crate::state::TargetGroup {
+            arn: crate::state::arn_for(&region, crate::state::KIND_TARGET_GROUP, &id),
+            id: id.clone(),
+            name: input.name.clone(),
+            group_type: input.r#type.clone(),
+            // Stored with every value its members document a default for filled in, so
+            // every later read reports the same configuration.
+            config,
+            tags,
+            created_at: now,
+            last_updated_at: now,
+            // Creation is asynchronous: the target group reports CREATE_IN_PROGRESS
+            // until this stored due instant passes, then ACTIVE.
+            active_at: now + crate::state::CREATE_TRANSITION,
+            sequence,
+        };
+
+        // The answer is read off the record that is being stored, so the response and
+        // what a later `GetTargetGroup` reports are the same thing.
+        let created = output_of(&record, now);
+        store.name_index.insert(name_key, id.clone());
+        if let Some(key) = token {
+            store.idempotency_tokens.record(key, id.clone());
+        }
+        store.target_groups.insert(id, record);
+        Ok(created)
     }
 }

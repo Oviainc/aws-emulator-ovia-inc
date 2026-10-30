@@ -36,6 +36,9 @@ pub const KIND_LISTENER: &str = "listener";
 /// The ARN resource kind of a listener rule. A rule ARN nests under its listener's:
 /// `…:service/svc-…/listener/listener-…/rule/rule-…` (`RuleArn`'s modelled pattern).
 pub const KIND_RULE: &str = "rule";
+/// The ARN resource kind of a target group: `.../targetgroup/tg-…`
+/// (`TargetGroupArn`'s modelled pattern).
+pub const KIND_TARGET_GROUP: &str = "targetgroup";
 
 /// The id prefix of a service network (`^sn-[0-9a-z]{17}$`).
 pub const PREFIX_SERVICE_NETWORK: &str = "sn-";
@@ -47,6 +50,8 @@ pub const PREFIX_SERVICE_ASSOCIATION: &str = "snsa-";
 pub const PREFIX_LISTENER: &str = "listener-";
 /// The id prefix of a listener rule (`^rule-[0-9a-z]{17}$`).
 pub const PREFIX_RULE: &str = "rule-";
+/// The id prefix of a target group (`^tg-[0-9a-z]{17}$`).
+pub const PREFIX_TARGET_GROUP: &str = "tg-";
 
 /// Every modelled id of this service is its prefix plus 17 `[0-9a-z]` characters.
 const ID_SUFFIX_LEN: usize = 17;
@@ -71,11 +76,13 @@ pub enum ResourceKind {
     Listener,
     /// A rule of a listener (`rule-…`).
     Rule,
+    /// A target group (`tg-…`).
+    TargetGroup,
 }
 
 impl ResourceKind {
     /// How many kinds there are, so a per-kind cache can hold one slot each.
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 
     /// This kind's slot in a per-kind array ([`Self::COUNT`] wide).
     pub const fn slot(self) -> usize {
@@ -85,6 +92,7 @@ impl ResourceKind {
             Self::ServiceAssociation => 2,
             Self::Listener => 3,
             Self::Rule => 4,
+            Self::TargetGroup => 5,
         }
     }
 
@@ -97,6 +105,7 @@ impl ResourceKind {
             Self::ServiceAssociation => KIND_SERVICE_ASSOCIATION,
             Self::Listener => KIND_LISTENER,
             Self::Rule => KIND_RULE,
+            Self::TargetGroup => KIND_TARGET_GROUP,
         }
     }
 
@@ -108,6 +117,7 @@ impl ResourceKind {
             Self::ServiceAssociation => PREFIX_SERVICE_ASSOCIATION,
             Self::Listener => PREFIX_LISTENER,
             Self::Rule => PREFIX_RULE,
+            Self::TargetGroup => PREFIX_TARGET_GROUP,
         }
     }
 
@@ -128,6 +138,7 @@ impl ResourceKind {
             Self::ServiceAssociation => "SERVICE_NETWORK_SERVICE_ASSOCIATION",
             Self::Listener => "LISTENER",
             Self::Rule => "RULE",
+            Self::TargetGroup => "TARGET_GROUP",
         }
     }
 
@@ -149,6 +160,7 @@ impl ResourceKind {
             Self::ServiceAssociation => "Association",
             Self::Listener => "Listener",
             Self::Rule => "Rule",
+            Self::TargetGroup => "TargetGroup",
         }
     }
 
@@ -163,6 +175,7 @@ impl ResourceKind {
             Self::ServiceAssociation => "association",
             Self::Listener => "listener",
             Self::Rule => "rule",
+            Self::TargetGroup => "target group",
         }
     }
 
@@ -189,6 +202,7 @@ impl ResourceKind {
             Self::Service => Some(SERVICE_NAME_PATTERN),
             Self::Listener => Some(LISTENER_NAME_PATTERN),
             Self::Rule => Some(RULE_NAME_PATTERN),
+            Self::TargetGroup => Some(TARGET_GROUP_NAME_PATTERN),
             Self::ServiceAssociation => None,
         }
     }
@@ -253,6 +267,11 @@ pub const MAX_LISTENERS_PER_SERVICE: usize = 100;
 /// emulator's own ceiling, so a caller looping on create cannot grow this process's
 /// memory without bound.
 pub const MAX_RULES_PER_LISTENER: usize = 100;
+
+/// How many target groups this emulator will hold for the account. Same reasoning as
+/// the ceilings above, and `CreateTargetGroup` models the same
+/// `ServiceQuotaExceededException`.
+pub const MAX_TARGET_GROUPS: usize = 1_000;
 
 /// The listener port a create gets when it omits `port`, by protocol.
 ///
@@ -461,6 +480,296 @@ pub struct Rule {
     pub sequence: u64,
 }
 
+/// A target group: a collection of targets a service routes traffic to.
+///
+/// `TargetGroupStatus` is non-terminal right after a create (`CREATE_IN_PROGRESS`), so
+/// the clock owes this record its `ACTIVE` status the way it owes a service one; the due
+/// instant is stored and compared on read ([`Self::status`]).
+#[derive(Debug, Clone)]
+pub struct TargetGroup {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    /// `TargetGroupType`, exactly as the create sent it (the model constrains it to the
+    /// enum's value set, so the boundary refuses anything else before a handler runs).
+    pub group_type: String,
+    /// The configuration as PERSISTED: the caller's config with every value its
+    /// documentation defaults filled in ([`normalized_target_group_config`]), so every
+    /// later read reports the same configuration.
+    pub config: crate::ops::types::TargetGroupConfig,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub last_updated_at: SystemTime,
+    /// The instant the clock owes this target group its `ACTIVE` status.
+    pub active_at: SystemTime,
+    /// Creation order, so a listing pages deterministically. See [`encode_cursor`].
+    pub sequence: u64,
+}
+
+impl TargetGroup {
+    /// `TargetGroupStatus` at `now`: the transient create status until the stored due
+    /// instant passes, `ACTIVE` from then on. A pure function of stored state and the
+    /// clock, so reading it changes nothing a later caller sees.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now >= self.active_at {
+            "ACTIVE"
+        } else {
+            "CREATE_IN_PROGRESS"
+        }
+    }
+}
+
+/// The `TargetGroupType` values the model enumerates
+/// (`smithy_query(query="shape",shape="TargetGroupType")`).
+pub const TYPE_IP: &str = "IP";
+/// See [`TYPE_IP`].
+pub const TYPE_LAMBDA: &str = "LAMBDA";
+/// See [`TYPE_IP`].
+pub const TYPE_INSTANCE: &str = "INSTANCE";
+/// See [`TYPE_IP`].
+pub const TYPE_ALB: &str = "ALB";
+
+/// Every `TargetGroupConfig` member, with the target-group types its OWN documentation
+/// says it is supported for.
+///
+/// SOURCE: `smithy_query(query="shape",shape="TargetGroupConfig")`, where each member
+/// states either which type it is "Not supported" for (`port`, `protocol`,
+/// `protocolVersion`, `vpcIdentifier`: not `LAMBDA`; `healthCheck`: not `LAMBDA` or
+/// `ALB`) or the single type it is "Supported only if" (`ipAddressType`: `IP`;
+/// `lambdaEventStructureVersion`: `LAMBDA`). A member sent for any other type is
+/// refused ([`check_target_group_config`]) and a documented default is filled in only
+/// for a type that supports the member ([`normalized_target_group_config`]).
+pub const CONFIG_MEMBER_SUPPORT: &[(&str, &[&str])] = &[
+    ("port", &[TYPE_IP, TYPE_INSTANCE, TYPE_ALB]),
+    ("protocol", &[TYPE_IP, TYPE_INSTANCE, TYPE_ALB]),
+    ("protocolVersion", &[TYPE_IP, TYPE_INSTANCE, TYPE_ALB]),
+    ("vpcIdentifier", &[TYPE_IP, TYPE_INSTANCE, TYPE_ALB]),
+    ("ipAddressType", &[TYPE_IP]),
+    ("healthCheck", &[TYPE_IP, TYPE_INSTANCE]),
+    ("lambdaEventStructureVersion", &[TYPE_LAMBDA]),
+];
+
+/// The `protocolVersion` a target group gets when its create omits the member: "The
+/// protocol version. The default is `HTTP1`." Filled in only for a type that supports
+/// the member at all (see [`CONFIG_MEMBER_SUPPORT`]).
+pub const DEFAULT_TARGET_GROUP_PROTOCOL_VERSION: &str = "HTTP1";
+
+/// The `ipAddressType` an `IP` target group gets when its create omits the member:
+/// "Supported only if the target group type is `IP`. The default is `IPV4`."
+pub const DEFAULT_IP_ADDRESS_TYPE: &str = "IPV4";
+
+/// The `lambdaEventStructureVersion` a `LAMBDA` target group gets when its create omits
+/// the member: "Supported only if the target group type is `LAMBDA`. The default is
+/// `V1`."
+pub const DEFAULT_LAMBDA_EVENT_STRUCTURE_VERSION: &str = "V1";
+
+/// The health-check `protocol` a config gets when it omits the member: "The possible
+/// protocols are `HTTP` and `HTTPS`. The default is `HTTP`."
+pub const DEFAULT_HEALTH_CHECK_PROTOCOL: &str = "HTTP";
+
+/// The health-check `path` a config gets when it omits the member: "The default path is
+/// `/`."
+pub const DEFAULT_HEALTH_CHECK_PATH: &str = "/";
+
+/// The ranges `HealthCheckConfig`'s own documentation states for its numeric members,
+/// each NARROWER than the member's modelled `@range`, as (member, minimum, maximum,
+/// default).
+///
+/// SOURCE: `smithy_query(query="shape",shape="HealthCheckConfig")` —
+/// `healthCheckIntervalSeconds` "The range is 5–300 seconds. The default is 30
+/// seconds.", `healthCheckTimeoutSeconds` "The range is 1–120 seconds. The default is 5
+/// seconds.", `healthyThresholdCount` "The range is 2–10. The default is 5.",
+/// `unhealthyThresholdCount` "The range is 2–10. The default is 2." The modelled traits
+/// admit 0 for all four, so the documented bounds are enforced in the handlers
+/// ([`check_health_check`]) and the documented defaults filled in
+/// ([`normalized_health_check`]).
+pub const HEALTH_CHECK_RANGES: &[(&str, i32, i32, i32)] = &[
+    ("healthCheckIntervalSeconds", 5, 300, 30),
+    ("healthCheckTimeoutSeconds", 1, 120, 5),
+    ("healthyThresholdCount", 2, 10, 5),
+    ("unhealthyThresholdCount", 2, 10, 2),
+];
+
+/// Each [`HEALTH_CHECK_RANGES`] member's value in `health_check`, in that table's
+/// order, so a bound, a default and the value they constrain cannot drift apart.
+fn ranged_health_check_members(
+    health_check: &crate::ops::types::HealthCheckConfig,
+) -> [Option<i32>; 4] {
+    [
+        health_check.health_check_interval_seconds,
+        health_check.health_check_timeout_seconds,
+        health_check.healthy_threshold_count,
+        health_check.unhealthy_threshold_count,
+    ]
+}
+
+/// Refuse a health-check member outside the range its own documentation states, as the
+/// violation the boundary reports for the same trait at the same path; `Ok(())` when
+/// every sent member is inside its documented range.
+///
+/// `path_prefix` is where the health check sits in the request being checked
+/// (`config.healthCheck` under `CreateTargetGroup`), so the reported member path is the
+/// one the caller sent the value at.
+pub fn check_health_check(
+    path_prefix: &str,
+    health_check: &crate::ops::types::HealthCheckConfig,
+) -> Result<(), FieldViolation> {
+    for (sent, &(member, min, max, _)) in ranged_health_check_members(health_check)
+        .iter()
+        .zip(HEALTH_CHECK_RANGES)
+    {
+        let Some(value) = sent else {
+            continue;
+        };
+        let kind = if *value < min {
+            ViolationKind::MinValue(min.to_string())
+        } else if *value > max {
+            ViolationKind::MaxValue(max.to_string())
+        } else {
+            continue;
+        };
+        return Err(Violation {
+            path: format!("{path_prefix}.{member}"),
+            kind,
+            value: Some(value.to_string()),
+        });
+    }
+    Ok(())
+}
+
+/// Whether `config` sends `member`, named as the model names the member.
+fn config_member_sent(config: &crate::ops::types::TargetGroupConfig, member: &str) -> bool {
+    match member {
+        "port" => config.port.is_some(),
+        "protocol" => config.protocol.is_some(),
+        "protocolVersion" => config.protocol_version.is_some(),
+        "vpcIdentifier" => config.vpc_identifier.is_some(),
+        "ipAddressType" => config.ip_address_type.is_some(),
+        "healthCheck" => config.health_check.is_some(),
+        "lambdaEventStructureVersion" => config.lambda_event_structure_version.is_some(),
+        _ => false,
+    }
+}
+
+/// Whether a target group of `group_type` supports `member` at all; see
+/// [`CONFIG_MEMBER_SUPPORT`].
+fn config_member_supported(group_type: &str, member: &str) -> bool {
+    CONFIG_MEMBER_SUPPORT
+        .iter()
+        .find(|(name, _)| *name == member)
+        .is_none_or(|(_, types)| types.contains(&group_type))
+}
+
+/// Refuse a config that sends a member the target group's TYPE does not support, as the
+/// service-rule violation it is; `Ok(())` when every sent member is supported.
+///
+/// The rule is each member's own documentation ([`CONFIG_MEMBER_SUPPORT`]), which the
+/// model carries no constraint trait for — so it is reported over the bare member the
+/// rule constrains ([`service_rule_exception`]) rather than as a constraint report.
+pub fn check_target_group_config(
+    group_type: &str,
+    config: &crate::ops::types::TargetGroupConfig,
+) -> Result<(), ServiceRuleViolation> {
+    for (member, _) in CONFIG_MEMBER_SUPPORT {
+        if config_member_sent(config, member) && !config_member_supported(group_type, member) {
+            return Err(ServiceRuleViolation {
+                member: (*member).to_string(),
+                message: unsupported_config_member_message(member, group_type),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// How the service refuses a `TargetGroupConfig` member the target group's type does
+/// not support.
+///
+/// The construction — the member the rule constrains and the type that does not support
+/// it, both taken from the request — is the requirement; the sentence is this service's
+/// wording of it, since the model states no text for the refusal.
+pub fn unsupported_config_member_message(member: &str, group_type: &str) -> String {
+    format!("{member} is not supported for target group type {group_type}.")
+}
+
+/// The health check as it is PERSISTED: the caller's health check with every value its
+/// documentation defaults filled in (the last column of [`HEALTH_CHECK_RANGES`],
+/// [`DEFAULT_HEALTH_CHECK_PROTOCOL`] and [`DEFAULT_HEALTH_CHECK_PATH`]).
+///
+/// A member whose documentation states no default is left exactly as sent: `enabled`,
+/// `protocolVersion`, `matcher`, and `port`, whose documented default is "the port that
+/// a target receives traffic on" — a property of the target, not a value this service
+/// can fix at create time.
+pub fn normalized_health_check(
+    health_check: &crate::ops::types::HealthCheckConfig,
+) -> crate::ops::types::HealthCheckConfig {
+    let mut normalized = health_check.clone();
+    normalized.protocol = Some(
+        normalized
+            .protocol
+            .unwrap_or_else(|| DEFAULT_HEALTH_CHECK_PROTOCOL.to_string()),
+    );
+    normalized.path = Some(
+        normalized
+            .path
+            .unwrap_or_else(|| DEFAULT_HEALTH_CHECK_PATH.to_string()),
+    );
+    let defaults = HEALTH_CHECK_RANGES.iter().map(|(_, _, _, default)| *default);
+    let mut filled = [0_i32; 4];
+    for ((slot, sent), default) in filled
+        .iter_mut()
+        .zip(ranged_health_check_members(&normalized))
+        .zip(defaults)
+    {
+        *slot = sent.unwrap_or(default);
+    }
+    normalized.health_check_interval_seconds = Some(filled[0]);
+    normalized.health_check_timeout_seconds = Some(filled[1]);
+    normalized.healthy_threshold_count = Some(filled[2]);
+    normalized.unhealthy_threshold_count = Some(filled[3]);
+    normalized
+}
+
+/// The target-group config as it is PERSISTED: the caller's config with every value its
+/// documentation defaults filled in, for the members this `group_type` supports.
+///
+/// A default is NEVER filled in for a member the type does not support (see
+/// [`CONFIG_MEMBER_SUPPORT`]), so a `LAMBDA` target group reports no protocol version
+/// and an `INSTANCE` one no Lambda event-structure version. `port` takes the default its
+/// member documents for the protocol the targets are reached over
+/// ([`default_port_for`]), which is derivable only once a protocol is known.
+pub fn normalized_target_group_config(
+    group_type: &str,
+    config: Option<&crate::ops::types::TargetGroupConfig>,
+) -> crate::ops::types::TargetGroupConfig {
+    let mut config = config.cloned().unwrap_or_default();
+    if config_member_supported(group_type, "protocolVersion") {
+        config.protocol_version = Some(
+            config
+                .protocol_version
+                .unwrap_or_else(|| DEFAULT_TARGET_GROUP_PROTOCOL_VERSION.to_string()),
+        );
+    }
+    if config_member_supported(group_type, "ipAddressType") {
+        config.ip_address_type = Some(
+            config
+                .ip_address_type
+                .unwrap_or_else(|| DEFAULT_IP_ADDRESS_TYPE.to_string()),
+        );
+    }
+    if config_member_supported(group_type, "lambdaEventStructureVersion") {
+        config.lambda_event_structure_version = Some(
+            config
+                .lambda_event_structure_version
+                .unwrap_or_else(|| DEFAULT_LAMBDA_EVENT_STRUCTURE_VERSION.to_string()),
+        );
+    }
+    if let Some(protocol) = config.protocol.clone() {
+        config.port = config.port.or_else(|| default_port_for(&protocol));
+    }
+    config.health_check = config.health_check.as_ref().map(normalized_health_check);
+    config
+}
+
 /// The default port of a listener speaking `protocol`, or `None` where the `port`
 /// member documents no default for it.
 pub fn default_port_for(protocol: &str) -> Option<i32> {
@@ -617,6 +926,8 @@ pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
     /// and every rule of a deleted listener goes with it
     /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::remove_rules_of`]).
     pub rules: HashMap<String, Rule>,
+    /// Keyed by `tg-…` id. At most [`MAX_TARGET_GROUPS`] entries.
+    pub target_groups: HashMap<String, TargetGroup>,
     /// `<ARN resource kind>/<name>` -> id. A name must be unique to the account, so a
     /// second create under a taken name is a `ConflictException`. One key per stored
     /// resource, so the resource ceilings bound this map too.
@@ -755,6 +1066,31 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
         }
     }
 
+    /// The ARNs of the services that route traffic to `target_group_id`, derived from
+    /// the listener and rule records at read time rather than from a stored list.
+    ///
+    /// A forward action naming this target group — a listener's default action or a
+    /// rule's action — makes the service that holds it one of them. Sorted and
+    /// deduplicated, so two reads of an unchanged store report the same list.
+    pub fn service_arns_using(&self, target_group_id: &str) -> Vec<String> {
+        let mut arns: Vec<String> = self
+            .listeners
+            .values()
+            .filter(|listener| action_forwards_to(&listener.default_action, target_group_id))
+            .map(|listener| listener.service_arn.clone())
+            .chain(
+                self.rules
+                    .values()
+                    .filter(|rule| action_forwards_to(&rule.action, target_group_id))
+                    .filter_map(|rule| self.services.get(&rule.service_id))
+                    .map(|service| service.arn.clone()),
+            )
+            .collect();
+        arns.sort();
+        arns.dedup();
+        arns
+    }
+
     /// The association of this exact (service network, service) pair, if there is one.
     pub fn association_of(
         &self,
@@ -764,6 +1100,20 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
         self.service_associations.values().find(|assoc| {
             assoc.service_network_id == service_network_id && assoc.service_id == service_id
         })
+    }
+}
+
+/// Whether `action` forwards to the target group `target_group_id`, under either
+/// modelled form of a `targetGroupIdentifier` (the bare id or the target group's ARN).
+fn action_forwards_to(action: &crate::ops::types::RuleAction, target_group_id: &str) -> bool {
+    match action {
+        crate::ops::types::RuleAction::Forward(forward) => {
+            forward.target_groups.iter().any(|weighted| {
+                id_from_identifier(&weighted.target_group_identifier, PREFIX_TARGET_GROUP)
+                    .is_some_and(|id| id == target_group_id)
+            })
+        }
+        crate::ops::types::RuleAction::fixedResponse(_) => false,
     }
 }
 
@@ -970,6 +1320,11 @@ pub const LISTENER_NAME_PATTERN: &str =
 /// SOURCE: `smithy_query(query="shape",shape="RuleName")`.
 pub const RULE_NAME_PATTERN: &str = r"^(?!rule-)(?![-])(?!.*[-]$)(?!.*[-]{2})[a-z0-9-]+$";
 
+/// The `@pattern` the model declares on `TargetGroupName`, which
+/// `CreateTargetGroup.name` targets.
+/// SOURCE: `smithy_query(query="shape",shape="TargetGroupName")`.
+pub const TARGET_GROUP_NAME_PATTERN: &str = r"^(?!tg-)(?![-])(?!.*[-]$)(?!.*[-]{2})[a-z0-9-]+$";
+
 /// The `@pattern`, with the anchors stripped, as a validation error reports it.
 ///
 /// The recorded vpc-lattice validation messages quote the pattern's BODY —
@@ -1106,6 +1461,7 @@ pub fn check_resource_name(
 /// one slot per kind.
 fn compiled_pattern(kind: ResourceKind) -> Option<&'static ::fancy_regex::Regex> {
     static COMPILED: [::std::sync::OnceLock<::fancy_regex::Regex>; ResourceKind::COUNT] = [
+        ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
         ::std::sync::OnceLock::new(),
