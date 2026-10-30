@@ -252,6 +252,13 @@ impl Harness {
         &self.engine
     }
 
+    /// The mounted router, cloned (every clone serves the same service set), so a
+    /// sibling suite can build the `OperationContext` the framework hands a handler and
+    /// call that handler directly — the only place a refusal's own TYPE is observable.
+    pub(crate) fn router(&self) -> MultiServiceRouter {
+        self.router.clone()
+    }
+
     /// What one group holds right now: (retained profiles, retained profile bytes,
     /// remembered profile tokens).
     fn retained(&self, name: &str) -> (usize, usize, usize) {

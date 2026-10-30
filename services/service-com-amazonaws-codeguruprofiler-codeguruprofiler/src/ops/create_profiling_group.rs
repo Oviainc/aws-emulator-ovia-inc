@@ -119,6 +119,16 @@ impl From<CreateProfilingGroupErrorModeled> for CreateProfilingGroupError {
     }
 }
 
+/// This operation's modelled 400, for a request it refuses on its input.
+///
+/// The model lists `ValidationException` among THIS operation's errors, so every input
+/// refusal it answers is that shape — the one a client can read members off — rather
+/// than the service-wide synthetic stand-in `crate::scaffolded` keeps for the
+/// operations whose model declares no client-input error at all.
+fn validation(message: String) -> CreateProfilingGroupError {
+    CreateProfilingGroupErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
 /// The `CreateProfilingGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => crate::state::DEFAULT_COMPUTE_PLATFORM.to_string(),
             Some(value) if COMPUTE_PLATFORM_VALUES.contains(&value) => value.to_string(),
             Some(value) => {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                return Err(validation(format!(
                     "computePlatform must be one of {}, got {value}",
                     COMPUTE_PLATFORM_VALUES.join(", ")
                 )));
@@ -180,11 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no path into this store can leave a resource past AWS's published tagging
         // limits (count, key length, value length), and a refused create stores nothing.
         if let Some(tags) = input.tags.as_ref() {
-            crate::state::validate_tags("tags", tags).map_err(|message| {
-                CreateProfilingGroupErrorModeled::ValidationException(ValidationException {
-                    message,
-                })
-            })?;
+            crate::state::validate_tags("tags", tags).map_err(validation)?;
         }
 
         let mut guard = state.lock();

@@ -35,6 +35,8 @@ mod get_profile_interval;
 mod get_profile_window_companion;
 #[path = "all/get_profile_window_length.rs"]
 mod get_profile_window_length;
+#[path = "all/input_refusal_is_modelled.rs"]
+mod input_refusal_is_modelled;
 #[path = "all/instant_comparison_resolution.rs"]
 mod instant_comparison_resolution;
 #[path = "all/interval_resolution.rs"]

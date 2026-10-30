@@ -147,6 +147,16 @@ const MAX_TIME_RANGE_TEXT: &str = "P7D";
 /// refusal.
 const TIME_RANGE_SUBJECT: &str = "the time range for the requested aggregated profile";
 
+/// This operation's modelled 400, for a request it refuses on its input.
+///
+/// The model lists `ValidationException` among THIS operation's errors, so every
+/// input refusal it answers is that shape — the one a client can read members off —
+/// rather than the service-wide synthetic stand-in `crate::scaffolded` keeps for the
+/// operations whose model declares no client-input error at all.
+fn validation(message: String) -> GetProfileError {
+    GetProfileErrorModeled::ValidationException(ValidationException { message }).into()
+}
+
 /// What this operation says when a request names ONE of the two bounds of the window and
 /// none of the companions the model allows beside it: `named` is the bound the request
 /// carried and `companion` the other one, so the sentence tells the caller which member it
@@ -198,14 +208,14 @@ fn requested_window(
     // window: it is about which members were named, not about the instants they name.
     match (input.start_time, input.end_time, input.period.as_deref()) {
         (Some(_), None, None) => {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                companion_required_message("startTime", "endTime"),
-            ));
+            return Err(validation(companion_required_message(
+                "startTime", "endTime",
+            )));
         }
         (None, Some(_), None) => {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                companion_required_message("endTime", "startTime"),
-            ));
+            return Err(validation(companion_required_message(
+                "endTime", "startTime",
+            )));
         }
         _ => {}
     }
@@ -215,7 +225,7 @@ fn requested_window(
         input.end_time,
         input.period.as_deref(),
     )
-    .map_err(crate::scaffolded::Scaffolded::validation)?;
+    .map_err(validation)?;
     crate::state::validate_window_length(
         &window,
         input.period.as_deref(),
@@ -223,7 +233,7 @@ fn requested_window(
         MAX_TIME_RANGE_TEXT,
         TIME_RANGE_SUBJECT,
     )
-    .map_err(crate::scaffolded::Scaffolded::validation)?;
+    .map_err(validation)?;
     Ok((window.start, window.end))
 }
 
