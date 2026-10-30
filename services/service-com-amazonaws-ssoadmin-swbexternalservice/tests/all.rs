@@ -191,6 +191,8 @@ mod trusted_token_issuer_update;
 mod trusted_token_issuers;
 #[path = "all/unknown_application_provider_message.rs"]
 mod unknown_application_provider_message;
+#[path = "all/unknown_instance_channel.rs"]
+mod unknown_instance_channel;
 #[path = "all/unknown_instance_message.rs"]
 mod unknown_instance_message;
 #[path = "all/validation_message_wording.rs"]

@@ -8,9 +8,10 @@
 //! detail text for that condition — the text naming the ARN the request sent — whichever
 //! operation a client called. WHICH error shape carries it is each operation's own
 //! modelled business (`ResourceNotFoundException` where the operation declares one,
-//! otherwise the client-input channel it does declare, which
+//! otherwise the `AccessDeniedException` every operation of this service declares, which
 //! `smithy_query(query="operation",operation="DescribeInstance,AddRegion,ListRegions,ListApplications,ListTrustedTokenIssuers,CreateTrustedTokenIssuer")`
-//! shows for those); the TEXT is one. A client that branches on the detail text — the only
+//! shows for those, and which `unknown_instance_channel.rs` asserts row by row); the TEXT
+//! is one. A client that branches on the detail text — the only
 //! member these error shapes carry — therefore reads one ARN the same way everywhere.
 //!
 //! The table spans what the rule generalises over: EVERY operation of this service that
@@ -37,7 +38,7 @@ use crate::ssoadmin_permission_sets::{
 /// the rows span the optional `sso` prefix of the id, a partition suffix the pattern
 /// admits, and an id built from the whole `[a-zA-Z0-9-.]` class. None of them is held by
 /// this account, and none is the id the store seeds (`state::SEED_INSTANCE_ID`).
-const UNKNOWN_INSTANCE_ARNS: [&str; 4] = [
+pub(crate) const UNKNOWN_INSTANCE_ARNS: [&str; 4] = [
     // The recorded shape of the request.
     UNKNOWN_INSTANCE_ARN,
     "arn:aws:sso:::instance/ins-1111111111111111",
@@ -50,14 +51,14 @@ const UNKNOWN_INSTANCE_ARNS: [&str; 4] = [
 const UNISSUED_REQUEST_ID: &str = "11111111-2222-4333-8444-555555555555";
 
 /// A `PrincipalId` the model's pattern admits.
-const PRINCIPAL_ID: &str = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+pub(crate) const PRINCIPAL_ID: &str = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
 
 /// A 12-digit account id (`^\d{12}$`).
 const ACCOUNT_ID: &str = "123456789012";
 
 /// An `ApplicationProviderArn` this service holds a provider for, so a row of
 /// `CreateApplication` fails on the instance rather than on its provider.
-const PROVIDER_ARN: &str = "arn:aws:sso::aws:applicationProvider/custom";
+pub(crate) const PROVIDER_ARN: &str = "arn:aws:sso::aws:applicationProvider/custom";
 
 /// One call that names an `InstanceArn`: the operation and the body it takes.
 struct Call {

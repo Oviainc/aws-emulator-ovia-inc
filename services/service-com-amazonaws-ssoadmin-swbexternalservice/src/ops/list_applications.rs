@@ -223,12 +223,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             // Applications are enumerated UNDER an instance, so an `InstanceArn` this
             // account holds no instance for is refused rather than answered with an empty
-            // page that would read as "this instance has no applications". This operation
-            // models no `ResourceNotFoundException`, so the refusal goes on the
-            // client-input channel it does model, naming the ARN that resolved to nothing.
+            // page that would read as "this instance has no applications". The ARN itself
+            // is well formed — the boundary validator already accepted it — so this is not
+            // a syntax refusal: this operation models no `ResourceNotFoundException`, and
+            // an instance this account does not hold is one the caller may not act on, so
+            // the refusal goes on the modelled `AccessDeniedException` channel — the same
+            // channel, with the same wording, every instance-scoped operation of this
+            // service that declares no `ResourceNotFoundException` answers an unheld
+            // `InstanceArn` with.
             if store.instance(&input.instance_arn).is_none() {
-                return Err(ListApplicationsErrorModeled::ValidationException(
-                    ValidationException {
+                return Err(ListApplicationsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
                         message: Some(crate::state::instance_not_found_message(
                             &input.instance_arn,
                         )),

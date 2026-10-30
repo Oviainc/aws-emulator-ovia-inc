@@ -24,8 +24,10 @@
 //!    stored application exactly once in that same order, no page carries more than the
 //!    page size asked for nor more than the modelled `ApplicationList` holds, and the last
 //!    page carries no `NextToken`;
-//! 6. an `InstanceArn` this account holds no instance for is refused on the modelled
-//!    client-input channel — never an empty list and never the scaffold's HTTP 501;
+//! 6. an `InstanceArn` this account holds no instance for is refused on the not-found
+//!    channel this operation models — `AccessDeniedException` (HTTP 403), since it
+//!    declares no `ResourceNotFoundException` — never an empty list, never the
+//!    client-input channel and never the scaffold's HTTP 501;
 //! 7. the `NextToken` is this service's own cursor: one it did not issue for THIS
 //!    enumeration (including one issued for the same enumeration under another filter) is
 //!    refused `ValidationException`, and resuming from one it did issue yields exactly the
@@ -727,13 +729,13 @@ async fn the_list_tracks_the_store_and_its_own_instance() {
     hold_deletion(&doomed_engine, SystemTime::now() - Duration::from_secs(60));
     let (status, body) = list_page(&doomed_router, &doomed_instance, None, None, None).await;
     assert_eq!(
-        status, 400,
-        "case \"after the deletion fell due\": the list must be refused 400, got {status} {body}"
+        status, 403,
+        "case \"after the deletion fell due\": the list must be refused 403, got {status} {body}"
     );
     assert_eq!(
         error_code(&body),
-        "ValidationException",
-        "case \"after the deletion fell due\": expected ValidationException, got {body}"
+        "AccessDeniedException",
+        "case \"after the deletion fell due\": expected AccessDeniedException, got {body}"
     );
 }
 
@@ -799,9 +801,10 @@ async fn every_page_size_the_model_admits_walks_the_whole_store_once() {
     }
 }
 
-/// RULE 6 — an `InstanceArn` this account holds no instance for is refused on the modelled
-/// client-input channel, never answered with an empty list and never with the scaffold's
-/// HTTP 501.
+/// RULE 6 — an `InstanceArn` this account holds no instance for is refused on the
+/// not-found channel this operation models: it declares no `ResourceNotFoundException`, so
+/// the refusal is the modelled `AccessDeniedException` (HTTP 403) — never an empty list,
+/// never the client-input channel and never the scaffold's HTTP 501.
 #[tokio::test]
 async fn an_instance_arn_this_account_holds_no_instance_for_is_refused() {
     let (router, instance_arn, _second) = two_instance_router().await;
@@ -833,14 +836,14 @@ async fn an_instance_arn_this_account_holds_no_instance_for_is_refused() {
         );
         let (status, body) = list_page(&router, &arn, None, None, None).await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: a list under an instance nothing holds must be refused 400, got \
+            status, 403,
+            "case {case:?}: a list under an instance nothing holds must be refused 403, got \
              {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {body}"
+            "AccessDeniedException",
+            "case {case:?}: expected AccessDeniedException, got {body}"
         );
     }
 
