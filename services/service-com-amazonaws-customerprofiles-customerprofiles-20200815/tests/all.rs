@@ -15,5 +15,9 @@
 mod batch_get_profile;
 #[path = "all/domain_profile_lifecycle.rs"]
 mod domain_profile_lifecycle;
+#[path = "all/merge_profiles.rs"]
+mod merge_profiles;
+#[path = "all/profile_object_types.rs"]
+mod profile_object_types;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

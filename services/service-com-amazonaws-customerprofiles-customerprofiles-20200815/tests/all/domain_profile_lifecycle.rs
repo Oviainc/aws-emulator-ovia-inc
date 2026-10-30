@@ -124,7 +124,7 @@ impl Emulator {
     }
 
     /// `SearchProfiles` for one key, with optional query parameters.
-    async fn search(&self, domain: &str, body: Value, query: &str) -> (u16, Value) {
+    pub(crate) async fn search(&self, domain: &str, body: Value, query: &str) -> (u16, Value) {
         self.post(&format!("/domains/{domain}/profiles/search{query}"), body)
             .await
     }
@@ -136,7 +136,7 @@ pub(crate) fn error_code(body: &Value) -> &str {
 }
 
 /// The `ProfileId`s of a `SearchProfiles` response's `Items`.
-fn item_ids(body: &Value) -> Vec<String> {
+pub(crate) fn item_ids(body: &Value) -> Vec<String> {
     body.get("Items")
         .and_then(Value::as_array)
         .map(|items| {

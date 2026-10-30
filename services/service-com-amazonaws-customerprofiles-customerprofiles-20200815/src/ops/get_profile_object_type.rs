@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProfileObjectType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProfileObjectType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProfileObjectType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one profile object type of a domain out of the definition
+//! `PutProfileObjectType` stored for it. A name the domain does not hold is
+//! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +171,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProfileObjectType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProfileObjectTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProfileObjectType"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // A read: it answers out of the stored definition and writes nothing.
+        let store = state.lock();
+        let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
+            not_found(format!("The domain {} does not exist", input.domain_name))
+        })?;
+        let stored = domain
+            .object_types
+            .get(&input.object_type_name)
+            .ok_or_else(|| {
+                not_found(format!(
+                    "The object type {} does not exist in domain {}",
+                    input.object_type_name, input.domain_name
+                ))
+            })?;
+
+        Ok(GetProfileObjectTypeOutput {
+            object_type_name: stored.name.clone(),
+            description: stored.description.clone(),
+            template_id: stored.template_id.clone(),
+            expiration_days: stored.expiration_days,
+            encryption_key: stored.encryption_key.clone(),
+            allow_profile_creation: stored.allow_profile_creation,
+            source_last_updated_timestamp_format: stored
+                .source_last_updated_timestamp_format
+                .clone(),
+            // No operation stores profile objects yet, so none of the count assigned to
+            // this type is consumed.
+            max_available_profile_object_count: stored.max_available_profile_object_count(0),
+            max_profile_object_count: stored.max_profile_object_count,
+            source_priority: stored.source_priority,
+            fields: stored.fields.clone(),
+            keys: stored.keys.clone(),
+            created_at: Some(crate::state::to_date_time(stored.created_at)),
+            last_updated_at: Some(crate::state::to_date_time(stored.last_updated_at)),
+            tags: stored.tags.clone(),
+        })
     }
+}
+
+/// A domain or object type the request names is not stored.
+fn not_found(message: String) -> GetProfileObjectTypeError {
+    GetProfileObjectTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> GetProfileObjectTypeError {
+    GetProfileObjectTypeErrorModeled::InternalServerException(crate::state::store_unavailable())
+        .into()
 }

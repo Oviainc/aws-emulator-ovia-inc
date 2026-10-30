@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op MergeProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `MergeProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Folds the profiles named by `ProfileIdsToBeMerged` into `MainProfileId` and deletes
+//! them, taking each standard field from the profile `FieldSourceProfileIds` names for
+//! it and otherwise from the first profile that carries it, main profile first.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`MergeProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A merge that names the same profile twice — the main profile inside the list, or the
+//! list repeating an entry — is refused before anything is written, because one profile
+//! cannot be both a side of the merge and the other side of it.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +158,240 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `MergeProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(MergeProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("MergeProfiles"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+            not_found(format!("The domain {} does not exist", input.domain_name))
+        })?;
+
+        // Every profile the merge names, main profile first. An id that appears twice —
+        // the main profile named inside the list, or the list repeating an entry — is
+        // the degenerate merge the service refuses, and it is refused HERE, ahead of
+        // every write below: one profile cannot be both the profile taken and a profile
+        // merged into it.
+        let mut merge_order: Vec<&str> =
+            Vec::with_capacity(input.profile_ids_to_be_merged.len() + 1);
+        merge_order.push(input.main_profile_id.as_str());
+        for id in &input.profile_ids_to_be_merged {
+            if merge_order.contains(&id.as_str()) {
+                return Err(bad_request(DUPLICATE_PROFILE_ID.to_string()));
+            }
+            merge_order.push(id.as_str());
+        }
+
+        // The profiles themselves, in that order. Every one of them must be stored in
+        // this domain before any of them is written.
+        let mut participants: Vec<(String, Profile)> = Vec::with_capacity(merge_order.len());
+        for id in &merge_order {
+            let stored = domain.profiles.get(*id).ok_or_else(|| {
+                not_found(format!(
+                    "The profile {} does not exist in domain {}",
+                    id, input.domain_name
+                ))
+            })?;
+            participants.push(((*id).to_string(), stored.profile.clone()));
+        }
+        // The merged profile IS the main profile, so it keeps the instant that one was
+        // created at.
+        let created_at = domain
+            .profiles
+            .get(&input.main_profile_id)
+            .map_or(now, |stored| stored.created_at);
+
+        // Standard fields are union-ed; a field more than one profile carries is taken
+        // from the profile `FieldSourceProfileIds` names for it, and otherwise from the
+        // main profile. A named source that is not part of the merge names no profile
+        // the merge could take a value from, so the request is refused rather than
+        // silently reinterpreted.
+        let sources = input.field_source_profile_ids.clone().unwrap_or_default();
+        let merged = Profile {
+            profile_id: Some(input.main_profile_id.clone()),
+            account_number: resolve(&participants, sources.account_number.as_ref(), |p| {
+                p.account_number.clone()
+            })?,
+            additional_information: resolve(
+                &participants,
+                sources.additional_information.as_ref(),
+                |p| p.additional_information.clone(),
+            )?,
+            party_type: resolve(&participants, sources.party_type.as_ref(), |p| {
+                p.party_type.clone()
+            })?,
+            business_name: resolve(&participants, sources.business_name.as_ref(), |p| {
+                p.business_name.clone()
+            })?,
+            first_name: resolve(&participants, sources.first_name.as_ref(), |p| {
+                p.first_name.clone()
+            })?,
+            middle_name: resolve(&participants, sources.middle_name.as_ref(), |p| {
+                p.middle_name.clone()
+            })?,
+            last_name: resolve(&participants, sources.last_name.as_ref(), |p| {
+                p.last_name.clone()
+            })?,
+            birth_date: resolve(&participants, sources.birth_date.as_ref(), |p| {
+                p.birth_date.clone()
+            })?,
+            gender: resolve(&participants, sources.gender.as_ref(), |p| p.gender.clone())?,
+            phone_number: resolve(&participants, sources.phone_number.as_ref(), |p| {
+                p.phone_number.clone()
+            })?,
+            mobile_phone_number: resolve(
+                &participants,
+                sources.mobile_phone_number.as_ref(),
+                |p| p.mobile_phone_number.clone(),
+            )?,
+            home_phone_number: resolve(&participants, sources.home_phone_number.as_ref(), |p| {
+                p.home_phone_number.clone()
+            })?,
+            business_phone_number: resolve(
+                &participants,
+                sources.business_phone_number.as_ref(),
+                |p| p.business_phone_number.clone(),
+            )?,
+            email_address: resolve(&participants, sources.email_address.as_ref(), |p| {
+                p.email_address.clone()
+            })?,
+            personal_email_address: resolve(
+                &participants,
+                sources.personal_email_address.as_ref(),
+                |p| p.personal_email_address.clone(),
+            )?,
+            business_email_address: resolve(
+                &participants,
+                sources.business_email_address.as_ref(),
+                |p| p.business_email_address.clone(),
+            )?,
+            address: resolve(&participants, sources.address.as_ref(), |p| p.address.clone())?,
+            shipping_address: resolve(&participants, sources.shipping_address.as_ref(), |p| {
+                p.shipping_address.clone()
+            })?,
+            mailing_address: resolve(&participants, sources.mailing_address.as_ref(), |p| {
+                p.mailing_address.clone()
+            })?,
+            billing_address: resolve(&participants, sources.billing_address.as_ref(), |p| {
+                p.billing_address.clone()
+            })?,
+            attributes: merge_attributes(&participants, sources.attributes.as_ref())?,
+            // `FoundByItems` describes which search keys matched one `SearchProfiles`
+            // response, so it belongs to that response and not to a stored profile.
+            found_by_items: None,
+            // `FieldSourceProfileIds` models no source for the string alternatives of
+            // `PartyType` and `Gender`, so each of those is union-ed with no override.
+            party_type_string: resolve(&participants, None, |p| p.party_type_string.clone())?,
+            gender_string: resolve(&participants, None, |p| p.gender_string.clone())?,
+            profile_type: resolve(&participants, sources.profile_type.as_ref(), |p| {
+                p.profile_type.clone()
+            })?,
+            engagement_preferences: resolve(
+                &participants,
+                sources.engagement_preferences.as_ref(),
+                |p| p.engagement_preferences.clone(),
+            )?,
+        };
+
+        // Only now is anything written: every refusal above left the store as it was.
+        // "All the ProfileToBeMerged will be deleted at the end", and the main profile
+        // is replaced by the merged one — re-indexed, so a search finds it under the
+        // keys it just inherited.
+        for (id, _) in participants.iter().skip(1) {
+            domain.remove_profile(id);
+        }
+        domain.put_profile(crate::state::StoredProfile {
+            profile: merged,
+            created_at,
+            last_updated_at: now,
+        });
+
+        Ok(MergeProfilesOutput {
+            message: Some(MERGE_COMPLETE.to_string()),
+        })
     }
+}
+
+/// The refusal for a merge that names one profile twice.
+///
+/// Fixed text for this error class: it names no member and interpolates no value out of
+/// the request.
+const DUPLICATE_PROFILE_ID: &str = "Request contains duplicated profile ID";
+
+/// `MergeProfilesResponse$Message` — the member is documented only as "a message that
+/// indicates the merge request is complete", so this is the completion it reports.
+const MERGE_COMPLETE: &str = "Merge completed successfully";
+
+/// One standard field of the merged profile.
+///
+/// With no source named for it the field is the union: the first value any profile in
+/// the merge carries, main profile first, so a conflict resolves to the main profile's
+/// value. With a source named the value is that profile's, "even if it is a NULL value"
+/// — and a source that is not part of the merge refuses the request.
+fn resolve<T>(
+    participants: &[(String, Profile)],
+    source: Option<&String>,
+    read: impl Fn(&Profile) -> Option<T>,
+) -> Result<Option<T>, MergeProfilesError> {
+    let Some(source) = source else {
+        return Ok(participants.iter().find_map(|(_, profile)| read(profile)));
+    };
+    let (_, profile) = participants
+        .iter()
+        .find(|(id, _)| id == source)
+        .ok_or_else(|| {
+            bad_request(format!(
+                "The profile {source} named by FieldSourceProfileIds is not part of this merge"
+            ))
+        })?;
+    Ok(read(profile))
+}
+
+/// `Attributes` merged key by key: the keys of every profile in the merge, each taken by
+/// the same rule [`resolve`] applies to a standard field, with
+/// `FieldSourceProfileIds$Attributes` naming the source per attribute key.
+fn merge_attributes(
+    participants: &[(String, Profile)],
+    sources: Option<&::std::collections::HashMap<String, String>>,
+) -> Result<Option<::std::collections::HashMap<String, String>>, MergeProfilesError> {
+    let keys: ::std::collections::BTreeSet<&String> = participants
+        .iter()
+        .filter_map(|(_, profile)| profile.attributes.as_ref())
+        .flat_map(::std::collections::HashMap::keys)
+        .collect();
+    let mut merged = ::std::collections::HashMap::new();
+    for key in keys {
+        let source = sources.and_then(|sources| sources.get(key));
+        let value = resolve(participants, source, |profile| {
+            profile
+                .attributes
+                .as_ref()
+                .and_then(|attributes| attributes.get(key).cloned())
+        })?;
+        if let Some(value) = value {
+            merged.insert(key.clone(), value);
+        }
+    }
+    Ok((!merged.is_empty()).then_some(merged))
+}
+
+/// The request is invalid — HTTP 400, the error code a client branches on.
+fn bad_request(message: String) -> MergeProfilesError {
+    MergeProfilesErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A domain or profile the request names is not stored.
+fn not_found(message: String) -> MergeProfilesError {
+    MergeProfilesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> MergeProfilesError {
+    MergeProfilesErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

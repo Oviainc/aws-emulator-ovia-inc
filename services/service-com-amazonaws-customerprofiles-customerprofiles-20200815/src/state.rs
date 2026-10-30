@@ -17,7 +17,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DataStoreResponse, MatchingResponse, Profile, Readiness, RuleBasedMatchingResponse,
+    DataStoreResponse, MatchingResponse, ObjectTypeField, ObjectTypeKey, Profile, Readiness,
+    RuleBasedMatchingResponse,
 };
 
 /// How long after `CreateDomain` the asynchronous work a new domain kicks off is treated
@@ -67,6 +68,12 @@ pub const MAX_DOMAINS: usize = 100;
 /// profile limit): the most profiles this emulator stores for one domain. Set well above
 /// any realistic emulator workload.
 pub const MAX_PROFILES_PER_DOMAIN: usize = 10_000;
+
+/// Emulator resource guard, NOT an AWS quota: the most profile object types this
+/// emulator stores for one domain. Set well above any realistic emulator workload, and
+/// checked before the insert so repeated `PutProfileObjectType` calls cannot grow the
+/// store without bound.
+pub const MAX_OBJECT_TYPES_PER_DOMAIN: usize = 1_000;
 
 /// `RuleBasedMatchingStatus` while the rule is being built. Its documentation: "The
 /// system is creating the rule-based matching rule." A domain created with rule-based
@@ -131,12 +138,71 @@ pub struct Domain {
     pub ready_at: SystemTime,
     /// The domain's profiles, keyed by `ProfileId`.
     pub profiles: BTreeMap<String, StoredProfile>,
+    /// The domain's profile object types, keyed by `ObjectTypeName` — the name is the
+    /// object type's identity (`@httpLabel` on every object-type operation).
+    pub object_types: BTreeMap<String, StoredObjectType>,
     /// `KeyName` -> `Value` -> the ids of the profiles indexed under that pair. This is
     /// what `SearchProfiles` reads; [`Domain::put_profile`] fills it and
     /// [`Domain::remove_profile`] empties it. Nested rather than keyed by a
     /// `(KeyName, Value)` tuple so a lookup probes it with borrowed strings and
     /// allocates nothing per probe.
     pub key_index: HashMap<String, HashMap<String, BTreeSet<String>>>,
+}
+
+/// One stored profile object type: the configuration `PutProfileObjectType` persisted
+/// and the timestamps the service keeps for it.
+///
+/// `MaxAvailableProfileObjectCount` is NOT stored: it is the unused part of the count
+/// assigned to the type, so it is computed on every read by
+/// [`StoredObjectType::max_available_profile_object_count`].
+#[derive(Debug, Clone)]
+pub struct StoredObjectType {
+    /// `ObjectTypeName`, as stored (also this record's key in
+    /// [`Domain::object_types`]).
+    pub name: String,
+    /// `Description`, as stored.
+    pub description: String,
+    /// `TemplateId`, as stored. When it is set the template supplies the members
+    /// `PutProfileObjectType` refuses beside it, so those stay unset here.
+    pub template_id: Option<String>,
+    /// `ExpirationDays`, as stored.
+    pub expiration_days: Option<i32>,
+    /// `EncryptionKey`, as stored.
+    pub encryption_key: Option<String>,
+    /// `AllowProfileCreation`, as stored. The member is modelled with a default of
+    /// `false`, so an absent one is stored as `false`.
+    pub allow_profile_creation: bool,
+    /// `SourceLastUpdatedTimestampFormat`, as stored.
+    pub source_last_updated_timestamp_format: Option<String>,
+    /// `MaxProfileObjectCount`, as stored.
+    pub max_profile_object_count: Option<i32>,
+    /// `SourcePriority`, as stored.
+    pub source_priority: Option<i32>,
+    /// `Fields`, as stored.
+    pub fields: Option<HashMap<String, ObjectTypeField>>,
+    /// `Keys`, as stored.
+    pub keys: Option<HashMap<String, Vec<ObjectTypeKey>>>,
+    /// `Tags`, as stored.
+    pub tags: Option<HashMap<String, String>>,
+    /// `CreatedAt`: generated when the object type was first defined, and kept when a
+    /// later put redefines it.
+    pub created_at: SystemTime,
+    /// `LastUpdatedAt`: the last time the definition was written.
+    pub last_updated_at: SystemTime,
+}
+
+impl StoredObjectType {
+    /// `MaxAvailableProfileObjectCount` — "the amount of provisioned profile object max
+    /// count available": the count assigned to this type less the profile objects held
+    /// under it. A type with no assigned count reports none.
+    ///
+    /// `objects_held` is the number of profile objects stored for this type, which the
+    /// caller counts: no operation stores profile objects yet, so every caller passes 0
+    /// today and the whole assignment is available.
+    pub fn max_available_profile_object_count(&self, objects_held: i32) -> Option<i32> {
+        self.max_profile_object_count
+            .map(|assigned| assigned.saturating_sub(objects_held).max(0))
+    }
 }
 
 /// One stored profile: the modelled shape plus the timestamps the service keeps for it.
@@ -171,6 +237,7 @@ impl Domain {
             last_updated_at: now,
             ready_at: now + ASYNC_WORK_SPAN,
             profiles: BTreeMap::new(),
+            object_types: BTreeMap::new(),
             key_index: HashMap::new(),
         }
     }

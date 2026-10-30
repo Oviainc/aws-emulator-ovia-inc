@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutProfileObjectType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutProfileObjectType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Defines a profile object type under its domain: it persists the definition the
+//! request carries and answers from the record it stored, so a later
+//! `GetProfileObjectType` reports the same definition.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutProfileObjectType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `TemplateId` is mutually exclusive with the members the template itself supplies —
+//! its own documentation names `AllowProfileCreation`,
+//! `SourceLastUpdatedTimestampFormat`, `Fields` and `Keys` — so a request carrying both
+//! forms of configuration is refused before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -210,18 +209,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutProfileObjectType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutProfileObjectTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutProfileObjectType"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+            not_found(format!("The domain {} does not exist", input.domain_name))
+        })?;
+
+        // A template supplies the members named below, so naming a template AND any of
+        // them is two definitions of the same thing. Refused HERE, before the write:
+        // the object type must not exist afterwards.
+        if input.template_id.is_some() {
+            let conflicting = template_supplied_members(&input);
+            if !conflicting.is_empty() {
+                return Err(bad_request(format!(
+                    "The following attributes cannot be present when TemplateId is specified: {}",
+                    conflicting.join(", ")
+                )));
+            }
+        }
+
+        // The definition either replaces one the domain already holds — keeping the
+        // instant that one was created at — or is a new record, which is what the cap
+        // below bounds.
+        let held = domain.object_types.get(&input.object_type_name);
+        if held.is_none() && domain.object_types.len() >= crate::state::MAX_OBJECT_TYPES_PER_DOMAIN
+        {
+            return Err(bad_request(format!(
+                "The maximum number of object types for domain {} has been reached: {}",
+                input.domain_name,
+                crate::state::MAX_OBJECT_TYPES_PER_DOMAIN
+            )));
+        }
+        let created_at = held.map_or(now, |stored| stored.created_at);
+
+        let stored = crate::state::StoredObjectType {
+            name: input.object_type_name.clone(),
+            description: input.description,
+            template_id: input.template_id,
+            expiration_days: input.expiration_days,
+            encryption_key: input.encryption_key,
+            allow_profile_creation: input.allow_profile_creation,
+            source_last_updated_timestamp_format: input.source_last_updated_timestamp_format,
+            max_profile_object_count: input.max_profile_object_count,
+            source_priority: input.source_priority,
+            fields: input.fields,
+            keys: input.keys,
+            tags: input.tags,
+            created_at,
+            last_updated_at: now,
+        };
+
+        // The response is the record that was just stored, so it is the same definition
+        // `GetProfileObjectType` serves.
+        let output = PutProfileObjectTypeOutput {
+            object_type_name: stored.name.clone(),
+            description: stored.description.clone(),
+            template_id: stored.template_id.clone(),
+            expiration_days: stored.expiration_days,
+            encryption_key: stored.encryption_key.clone(),
+            allow_profile_creation: stored.allow_profile_creation,
+            source_last_updated_timestamp_format: stored
+                .source_last_updated_timestamp_format
+                .clone(),
+            max_profile_object_count: stored.max_profile_object_count,
+            // No operation stores profile objects yet, so none of the count assigned
+            // to this type is consumed.
+            max_available_profile_object_count: stored.max_available_profile_object_count(0),
+            source_priority: stored.source_priority,
+            fields: stored.fields.clone(),
+            keys: stored.keys.clone(),
+            created_at: Some(crate::state::to_date_time(stored.created_at)),
+            last_updated_at: Some(crate::state::to_date_time(stored.last_updated_at)),
+            tags: stored.tags.clone(),
+        };
+
+        domain
+            .object_types
+            .insert(input.object_type_name, stored);
+        Ok(output)
     }
+}
+
+/// The members `PutProfileObjectTypeRequest$TemplateId`'s own documentation names as the
+/// ones a template supplies — "AllowProfileCreation, SourceLastUpdatedTimestampFormat,
+/// Fields, and Keys" — that THIS request also carries, in that order.
+///
+/// `AllowProfileCreation` is modelled with a default of `false`, so a request that
+/// leaves it out is indistinguishable on the wire from one that sends `false`: only the
+/// `true` the documentation's own example gives ("if AllowProfileCreation is set to true
+/// when TemplateId is set, the service may return a BadRequestException") is a value the
+/// request can be said to carry.
+fn template_supplied_members(input: &PutProfileObjectTypeInput) -> Vec<&'static str> {
+    let carried = [
+        ("AllowProfileCreation", input.allow_profile_creation),
+        (
+            "SourceLastUpdatedTimestampFormat",
+            input.source_last_updated_timestamp_format.is_some(),
+        ),
+        ("Fields", input.fields.is_some()),
+        ("Keys", input.keys.is_some()),
+    ];
+    carried
+        .into_iter()
+        .filter_map(|(member, present)| present.then_some(member))
+        .collect()
+}
+
+/// The request is invalid — HTTP 400, the error code a client branches on.
+fn bad_request(message: String) -> PutProfileObjectTypeError {
+    PutProfileObjectTypeErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A domain the request names is not stored.
+fn not_found(message: String) -> PutProfileObjectTypeError {
+    PutProfileObjectTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> PutProfileObjectTypeError {
+    PutProfileObjectTypeErrorModeled::InternalServerException(crate::state::store_unavailable())
+        .into()
 }
