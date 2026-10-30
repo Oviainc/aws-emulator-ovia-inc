@@ -355,7 +355,7 @@ async fn an_incomplete_delete_record_is_refused_by_both_deletes() {
                 .state::<ComAmazonawsDsqlDsqlState>()
                 .lock()
                 .tokens(which.scope())
-                .record(token.to_string(), target.fingerprint(), seeded);
+                .record(REGION, token.to_string(), target.fingerprint(), seeded);
 
             let answer = delete(&dsql, &target, token).await;
             match missing {

@@ -430,7 +430,12 @@ async fn an_incomplete_replay_record_is_refused_by_every_replay_path() {
                 .state::<ComAmazonawsDsqlDsqlState>()
                 .lock()
                 .tokens(which.scope())
-                .record(TOKEN.to_string(), fingerprint(which, &target), seeded);
+                .record(
+                    REGION,
+                    TOKEN.to_string(),
+                    fingerprint(which, &target),
+                    seeded,
+                );
 
             let answer = retry(which, &dsql, &target).await;
             if complete {

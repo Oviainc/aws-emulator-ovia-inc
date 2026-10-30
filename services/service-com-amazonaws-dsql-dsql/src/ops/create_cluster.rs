@@ -12,7 +12,11 @@
 //! parameters mints no second cluster and answers with the RESULT the first call
 //! produced — the status it reported and the configuration it reported, not the
 //! ones the clock and a later `UpdateCluster` have left on the cluster since;
-//! the same token with different parameters is refused as a conflict.
+//! the same token with different parameters is refused as a conflict. A token is
+//! recognised only at the endpoint that recorded it
+//! (`crate::state::TokenLedger`), so the same token presented to another
+//! Region's endpoint names no earlier request there and mints a cluster of that
+//! endpoint's own Region.
 //! A `multiRegionProperties.witnessRegion` naming the request's OWN Region — the
 //! Region the minted cluster belongs to — is refused with `ValidationException`
 //! (400) and nothing is created, as is a `multiRegionProperties.clusters` naming
@@ -295,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             match state
                 .tokens_of(crate::state::TokenScope::CreateCluster)
-                .verdict(token, &fingerprint)
+                .verdict(&region, token, &fingerprint)
             {
                 crate::state::TokenVerdict::Replay(recorded) => {
                     if let Some(existing) = state.clusters.get(&recorded.resource) {
@@ -419,7 +423,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             state
                 .tokens(crate::state::TokenScope::CreateCluster)
-                .record(token, fingerprint, answered.into_record(&identifier));
+                .record(
+                    &region,
+                    token,
+                    fingerprint,
+                    answered.into_record(&identifier),
+                );
         }
         Ok(created)
     }
@@ -432,6 +441,13 @@ const QUOTA_CODE_CLUSTERS_PER_ACCOUNT: &str = "clusters-per-account";
 /// The parameters a `CreateCluster` `clientToken` is bound to: every member of
 /// the request except the token itself, so a retry carrying the same token is
 /// recognised only when it asks for the same cluster.
+///
+/// The Region the answer's identity is minted in is NOT one of them: it is not a
+/// member of the request but a property of the endpoint the request reached, and
+/// the ledger a token is looked up in is keyed by that endpoint's Region
+/// already (`crate::state::TokenLedger`) — so a token first used at another
+/// Region's endpoint is not this request's token at all, rather than this
+/// request's token carrying different parameters.
 fn create_fingerprint(input: &CreateClusterInput) -> String {
     crate::state::request_fingerprint(&[
         input.deletion_protection_enabled.to_string(),

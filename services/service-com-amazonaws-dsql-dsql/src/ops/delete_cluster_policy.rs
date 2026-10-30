@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             match state
                 .tokens_of(crate::state::TokenScope::DeleteClusterPolicy)
-                .verdict(token, &fingerprint)
+                .verdict(&region, token, &fingerprint)
             {
                 crate::state::TokenVerdict::Replay(recorded) => {
                     // The version the FIRST delete removed, kept with the
@@ -265,6 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state
                 .tokens(crate::state::TokenScope::DeleteClusterPolicy)
                 .record(
+                    &region,
                     token,
                     fingerprint,
                     crate::state::RecordedPolicyWrite {

@@ -270,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             match state
                 .tokens_of(crate::state::TokenScope::UpdateCluster)
-                .verdict(token, &fingerprint)
+                .verdict(&region, token, &fingerprint)
             {
                 crate::state::TokenVerdict::Replay(recorded) => {
                     if let Some(existing) = state.clusters.get(&recorded.resource) {
@@ -423,6 +423,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state
                 .tokens(crate::state::TokenScope::UpdateCluster)
                 .record(
+                    &region,
                     token,
                     fingerprint,
                     crate::state::RecordedCall::new(&input.identifier)

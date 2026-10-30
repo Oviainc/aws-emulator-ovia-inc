@@ -295,11 +295,15 @@ async fn every_served_delete_is_recorded_under_its_own_token() {
 fn a_delete_record_outlives_its_cluster_and_the_ledger_stays_bounded() {
     let mut state = ComAmazonawsDsqlDsqlState::default();
     let already_due = SystemTime::now() - Duration::from_secs(1);
+    // The endpoint every record below is recorded at: a ledger entry is keyed by
+    // the token together with the Region of the endpoint that served the call.
+    let region = "us-east-1";
 
     // One retirement: the delete's own record stands, the create's goes.
     let identifier = cluster_id_for(0);
     for scope in [TokenScope::CreateCluster, TokenScope::DeleteCluster] {
         state.tokens(scope).record(
+            region,
             "tok".to_string(),
             "fingerprint".to_string(),
             RecordedCall::new(&identifier),
@@ -330,6 +334,7 @@ fn a_delete_record_outlives_its_cluster_and_the_ledger_stays_bounded() {
     // even though nothing forgets them with their clusters.
     for n in 0..(MAX_CLIENT_TOKENS * 2) {
         state.tokens(TokenScope::DeleteCluster).record(
+            region,
             format!("delete-token-{n}"),
             format!("fingerprint-{n}"),
             RecordedCall::new(&cluster_id_for(n)),

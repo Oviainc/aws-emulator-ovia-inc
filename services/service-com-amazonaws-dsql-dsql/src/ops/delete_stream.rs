@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             match state
                 .tokens_of(crate::state::TokenScope::DeleteStream)
-                .verdict(token, &fingerprint)
+                .verdict(&region, token, &fingerprint)
             {
                 crate::state::TokenVerdict::Replay(recorded) => {
                     return recorded_delete_output(&input.cluster_identifier, &recorded)
@@ -286,6 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Every member of the answer is kept, because the stream this record
             // describes is on its way out of the store.
             state.tokens(crate::state::TokenScope::DeleteStream).record(
+                &region,
                 token,
                 fingerprint,
                 crate::state::RecordedDelete {

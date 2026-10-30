@@ -953,9 +953,13 @@ async fn the_cluster_store_is_bounded_by_its_ceiling() {
 #[test]
 fn the_bookkeeping_stores_stay_bounded() {
     let mut state = ComAmazonawsDsqlDsqlState::default();
+    // The endpoint the records below are recorded at: a ledger entry is keyed by
+    // the token together with the Region of the endpoint that served the call.
+    let region = "us-east-1";
 
     for n in 0..(MAX_CREATE_TOKENS * 2) {
         state.tokens(TokenScope::CreateCluster).record(
+            region,
             format!("token-{n}"),
             format!("fingerprint-{n}"),
             RecordedCall::new(&cluster_id_for(n)),

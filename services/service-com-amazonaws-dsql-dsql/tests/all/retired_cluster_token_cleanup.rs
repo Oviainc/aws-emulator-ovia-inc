@@ -116,7 +116,7 @@ fn retiring_a_cluster_drops_every_token_keyed_by_what_it_removes() {
             let token = token_for(scope, resource);
             state
                 .tokens(scope)
-                .record(token.clone(), token, RecordedCall::new(resource));
+                .record(region, token.clone(), token, RecordedCall::new(resource));
         }
     }
 
@@ -140,7 +140,7 @@ fn retiring_a_cluster_drops_every_token_keyed_by_what_it_removes() {
         let outlives = matches!(scope, TokenScope::DeleteCluster | TokenScope::DeleteStream);
         for resource in &removed {
             let token = token_for(scope, resource);
-            let verdict = state.tokens_of(scope).verdict(&token, &token);
+            let verdict = state.tokens_of(scope).verdict(region, &token, &token);
             let case = format!("{scope:?} keyed by the removed {resource}");
             if outlives {
                 assert_eq!(
@@ -158,7 +158,7 @@ fn retiring_a_cluster_drops_every_token_keyed_by_what_it_removes() {
         }
         for resource in &kept {
             let token = token_for(scope, resource);
-            let verdict = state.tokens_of(scope).verdict(&token, &token);
+            let verdict = state.tokens_of(scope).verdict(region, &token, &token);
             let case = format!("{scope:?} keyed by the surviving {resource}");
             assert_eq!(
                 verdict,

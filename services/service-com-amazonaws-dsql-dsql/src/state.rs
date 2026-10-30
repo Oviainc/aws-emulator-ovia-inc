@@ -7,7 +7,9 @@
 //! bookkeeping maps the cluster lifecycle needs: the retired (deleted) clusters
 //! whose identifiers must never be minted again, and the
 //! `clientToken` ledgers that make every `@idempotencyToken`-carrying operation
-//! idempotent.
+//! idempotent — each record keyed by the token together with the region of the
+//! endpoint that served the call, because a token names a request
+//! made at ONE regional endpoint.
 //!
 //! A change data capture (CDC) stream belongs to exactly one cluster — every
 //! stream operation is reached at `/stream/{clusterIdentifier}/...` and a
@@ -619,20 +621,59 @@ struct TokenEntry {
     call: RecordedCall,
 }
 
-/// The `clientToken`s one operation has already served, bounded by
+/// What one recorded use of a `clientToken` is keyed by: the token itself, and
+/// the region of the endpoint the call carrying it was made at.
+///
+/// A `clientToken` names a request made AT one regional endpoint, and this
+/// service is regional: every endpoint serves only the resources minted for its
+/// own region ([`ArnResource::is_scoped_to`]), so the earlier requests a token
+/// can name are the ones that endpoint served. The same string presented at
+/// another region's endpoint names no request there — it is free, exactly as it
+/// is before any call carries it — and nothing one region recorded can be
+/// replayed as the answer of a call made at another, whose answer would be
+/// derived from a region of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TokenKey {
+    /// The region of the endpoint the call was made at ([`request_region`]).
+    region: String,
+    /// The `clientToken` the call carried, exactly as it carried it:
+    /// `ClientToken` is documented case-sensitive.
+    token: String,
+}
+
+impl TokenKey {
+    /// The key a call carrying `token` at `endpoint_region`'s endpoint records
+    /// and looks itself up under.
+    fn new(endpoint_region: &str, token: &str) -> Self {
+        Self {
+            region: endpoint_region.to_string(),
+            token: token.to_string(),
+        }
+    }
+}
+
+/// The `clientToken`s one operation has already served, each keyed by the token
+/// together with the region of the endpoint that served it, and bounded by
 /// [`MAX_CLIENT_TOKENS`].
 #[derive(Debug, Default)]
 pub struct TokenLedger {
-    entries: HashMap<String, TokenEntry>,
+    entries: HashMap<TokenKey, TokenEntry>,
     /// Insertion order, so the cap evicts the oldest token rather than an
     /// arbitrary one.
-    order: VecDeque<String>,
+    order: VecDeque<TokenKey>,
 }
 
 impl TokenLedger {
-    /// What `token` means for a call carrying `fingerprint`.
-    pub fn verdict(&self, token: &str, fingerprint: &str) -> TokenVerdict {
-        match self.entries.get(token) {
+    /// What `token` means for a call made at `endpoint_region`'s endpoint
+    /// carrying `fingerprint`: a token this ledger holds for ANOTHER region is
+    /// not this call's token at all, so it answers [`TokenVerdict::Unused`].
+    pub fn verdict(
+        &self,
+        endpoint_region: &str,
+        token: &str,
+        fingerprint: &str,
+    ) -> TokenVerdict {
+        match self.entries.get(&TokenKey::new(endpoint_region, token)) {
             None => TokenVerdict::Unused,
             Some(entry) if entry.fingerprint == fingerprint => {
                 TokenVerdict::Replay(entry.call.clone())
@@ -641,10 +682,17 @@ impl TokenLedger {
         }
     }
 
-    /// Record that `token` served the request `fingerprint` describes, as `call`
-    /// describes what it did and answered, evicting the oldest token first if
-    /// that would push the ledger past [`MAX_CLIENT_TOKENS`].
-    pub fn record(&mut self, token: String, fingerprint: String, call: RecordedCall) {
+    /// Record that `token`, at `endpoint_region`'s endpoint, served the request
+    /// `fingerprint` describes, as `call` describes what it did and answered,
+    /// evicting the oldest token first if that would push the ledger past
+    /// [`MAX_CLIENT_TOKENS`].
+    pub fn record(
+        &mut self,
+        endpoint_region: &str,
+        token: String,
+        fingerprint: String,
+        call: RecordedCall,
+    ) {
         while self.entries.len() >= MAX_CLIENT_TOKENS {
             match self.order.pop_front() {
                 Some(oldest) => {
@@ -659,9 +707,15 @@ impl TokenLedger {
                 }
             }
         }
+        // The token is MOVED into its key: the key is the token qualified with
+        // the endpoint's region, not a copy of it.
+        let key = TokenKey {
+            region: endpoint_region.to_string(),
+            token,
+        };
         let entry = TokenEntry { fingerprint, call };
-        if self.entries.insert(token.clone(), entry).is_none() {
-            self.order.push_back(token);
+        if self.entries.insert(key.clone(), entry).is_none() {
+            self.order.push_back(key);
         }
     }
 
@@ -676,11 +730,12 @@ impl TokenLedger {
     }
 
     /// Drop every token recorded against `resource`, so a token never outlives
-    /// the resource it names.
+    /// the resource it names. Keyed by the resource rather than by the region,
+    /// so the record goes whichever endpoint recorded it.
     pub fn forget(&mut self, resource: &str) {
         self.entries.retain(|_, entry| entry.call.resource != resource);
         let live = &self.entries;
-        self.order.retain(|token| live.contains_key(token));
+        self.order.retain(|key| live.contains_key(key));
     }
 }
 

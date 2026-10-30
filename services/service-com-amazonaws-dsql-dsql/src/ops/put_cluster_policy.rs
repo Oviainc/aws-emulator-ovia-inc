@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             match state
                 .tokens_of(crate::state::TokenScope::PutClusterPolicy)
-                .verdict(token, &fingerprint)
+                .verdict(&region, token, &fingerprint)
             {
                 crate::state::TokenVerdict::Replay(recorded) => {
                     // The first call's own answer, whatever has happened to the
@@ -301,6 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(token) = input.client_token {
             state.tokens(crate::state::TokenScope::PutClusterPolicy).record(
+                &region,
                 token,
                 fingerprint,
                 crate::state::RecordedPolicyWrite {
