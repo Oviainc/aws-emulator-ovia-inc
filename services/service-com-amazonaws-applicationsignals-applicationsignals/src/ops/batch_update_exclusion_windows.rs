@@ -195,8 +195,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         for id in &input.slo_ids {
             // Either id form the modelled `ServiceLevelObjectiveId` admits resolves to one
-            // record, so a request naming the same SLO by name AND by ARN names it once.
-            if !seen.insert(crate::state::slo_name_of(id).to_string()) {
+            // record, so a request naming the same SLO by name AND by ARN names it once; an
+            // id whose ARN names another account names no record here and is its own entry.
+            if !seen.insert(
+                crate::state::slo_name_of(id)
+                    .unwrap_or(id)
+                    .to_string(),
+            ) {
                 continue;
             }
             match store.update_exclusion_windows(id, &add, remove) {

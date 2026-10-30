@@ -109,13 +109,18 @@ async fn create_slo(router: &MultiServiceRouter, case: &str, body: Value) -> Str
 
 /// One audit target, in the shape the request carries it: the target kind and the entity
 /// union member that names what to audit.
-fn target(kind: &str, data: Value) -> Value {
+///
+/// `pub(crate)` so a sibling suite asserting a rule over this read drives it through the same
+/// request shape rather than spelling a target of its own.
+pub(crate) fn target(kind: &str, data: Value) -> Value {
     json!({ "Type": kind, "Data": data })
 }
 
 /// Ask for the audit findings of `targets` over `window`, with the rest of the request's
 /// members as `extra` supplies them.
-async fn audit(
+///
+/// `pub(crate)` for the reason [`target`] is.
+pub(crate) async fn audit(
     router: &MultiServiceRouter,
     window: &str,
     targets: Vec<Value>,

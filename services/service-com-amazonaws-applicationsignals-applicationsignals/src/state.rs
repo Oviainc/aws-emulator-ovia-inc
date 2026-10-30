@@ -243,7 +243,9 @@ pub const SERVICE_STATES_TOKEN_TAG: &str = "service-states/1/";
 /// `engine::emulator_account_id()`, and `ListServiceLevelObjectives` reports nothing for any
 /// other account. The region in a minted ARN is therefore a rendering of the caller's SigV4
 /// scope rather than part of an SLO's identity, which is also why [`slo_name_of`] resolves
-/// an ARN by its name segment and ignores the rest.
+/// an ARN by its name segment and ignores the region and partition around it. The ACCOUNT
+/// field is NOT such a rendering: it says which account's resource an ARN names, so an ARN
+/// naming any other account names no record here ([`names_other_account`]).
 #[derive(Debug, Default)]
 pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// Every SLO created in this emulator, keyed by `ServiceLevelObjective::name`. Bounded
@@ -345,19 +347,21 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
 impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// The stored SLO an `Id` names, accepting either form the modelled
     /// `ServiceLevelObjectiveId` pattern allows: a bare name or a full `slo/<name>` ARN.
+    /// Which record each form names is [`slo_name_of`]'s rule, so an `Id` naming another
+    /// account names nothing here.
     pub fn resolve(&self, id: &str) -> Option<&ServiceLevelObjective> {
-        self.slos.get(slo_name_of(id))
+        self.slos.get(slo_name_of(id)?)
     }
 
     /// [`Self::resolve`] for a mutating caller.
     pub fn resolve_mut(&mut self, id: &str) -> Option<&mut ServiceLevelObjective> {
-        self.slos.get_mut(slo_name_of(id))
+        self.slos.get_mut(slo_name_of(id)?)
     }
 
     /// Remove the SLO an `Id` names, along with its tags, and hand back the removed
-    /// record. `None` when no SLO is stored under that name.
+    /// record. `None` when the `Id` names no SLO this store holds.
     pub fn remove(&mut self, id: &str) -> Option<ServiceLevelObjective> {
-        let removed = self.slos.remove(slo_name_of(id));
+        let removed = self.slos.remove(slo_name_of(id)?);
         if let Some(slo) = removed.as_ref() {
             self.tags.remove(&slo.arn);
             // The window set belongs to the SLO, so it goes with it: a later SLO created
@@ -643,26 +647,53 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 ///
 /// Every reader that takes an account id — a list's own `AwsAccountId`, an SLO list's
 /// `SloOwnerAwsAccountId`, the account an audited entity names, the account an entity MAP
-/// states as one of its attributes ([`entity_account_id`]), and the account field of a
-/// `ResourceArn` (always present, so `Some`) — reads it through here, so the reads that must
-/// agree about which account a request names cannot drift apart.
+/// states as one of its attributes ([`entity_account_id`]), and the account field of an ARN
+/// a request supplies, whether the member is a `ResourceArn` or the ARN form of a
+/// `ServiceLevelObjectiveId` (always present, so `Some`) — reads it through here, so the
+/// reads that must agree about which account a request names cannot drift apart.
 pub fn names_other_account(account: Option<&str>) -> bool {
     account.is_some_and(|account| account != ::engine::emulator_account_id())
 }
 
-/// The SLO name an `Id` denotes. The modelled `ServiceLevelObjectiveId` pattern is an
-/// alternation of the bare `ServiceLevelObjectiveName` and the full
-/// `ServiceLevelObjectiveArn`, so both forms name one record and every operation that
-/// takes an `Id` must resolve them identically.
-pub fn slo_name_of(id: &str) -> &str {
+/// The SLO name an `Id` NAMES A RECORD UNDER, or `None` when it names no resource of this
+/// account at all. The modelled `ServiceLevelObjectiveId` pattern is an alternation of the
+/// bare `ServiceLevelObjectiveName` and the full `ServiceLevelObjectiveArn`, so both forms
+/// name one record and every operation that takes an `Id` must resolve them identically.
+///
+/// An `Id` given as an ARN is a caller-supplied ARN, so it is held to the same narrowing as
+/// every other one this service resolves ([`tagged_resource_field`]): the VENDOR field must
+/// be this service's namespace and the ACCOUNT field the account this store holds
+/// ([`names_other_account`]). The modelled pattern does not make that check redundant — it
+/// fixes the namespace, but spells the account field `[^:]*`, so nothing before a handler
+/// constrains which account an `Id` names — and the account is part of what an ARN
+/// identifies here, which is why an `Id` naming another account resolves to nothing exactly
+/// as a `ResourceArn` naming another account does.
+///
+/// The REGION and PARTITION fields are not compared, for the reason
+/// [`tagged_resource_field`] gives.
+pub fn slo_name_of(id: &str) -> Option<&str> {
+    match slo_name_in_arn(id) {
+        Some(name) => tagged_resource_field(id).map(|_| name),
+        None => Some(id),
+    }
+}
+
+/// The SLO name an `Id` SPELLS, whichever form it takes: the name an ARN's resource field
+/// carries, else the bare name itself.
+///
+/// This is what a refusal reports an `Id` by — the identity the REQUEST named, which exists
+/// whether or not it names a record this store holds — while [`slo_name_of`] is the
+/// resolution, which also decides whose account an ARN names.
+pub fn slo_name_in_id(id: &str) -> &str {
     slo_name_in_arn(id).unwrap_or(id)
 }
 
 /// The SLO name an ARN names, or `None` when the string is not an SLO ARN at all.
 ///
 /// The ARN form of the modelled `ServiceLevelObjectiveArn`: a well-formed resource ARN
-/// whose resource field is `<SLO_ARN_RESOURCE>/<name>`. This is [`slo_name_of`] WITHOUT its
-/// bare-name fallback, for a member the model types as an ARN rather than as a
+/// whose resource field is `<SLO_ARN_RESOURCE>/<name>`. This is [`slo_name_in_id`] WITHOUT
+/// its bare-name fallback, and [`slo_name_of`] without its account narrowing: it reads what
+/// an ARN SPELLS, for a member the model types as an ARN rather than as a
 /// `ServiceLevelObjectiveId`.
 ///
 /// Read through `service_common::arn` — the workspace's ONE resource-ARN parse — so the name
@@ -683,8 +714,9 @@ pub fn slo_name_in_arn(arn: &str) -> Option<&str> {
 /// (`arn:aws:s3:::slo/x`) names no resource here. That narrowing — the VENDOR field is this
 /// service's namespace and the ACCOUNT field the one this store holds — is
 /// [`tagged_resource_field`]'s, the one every caller-supplied `ResourceArn` of this service
-/// passes through. A `ServiceLevelObjectiveId` needs neither check: its modelled pattern
-/// already fixes the namespace before a handler runs.
+/// passes through. An `Id` in ARN form passes through it too ([`slo_name_of`]): its modelled
+/// pattern fixes the namespace before a handler runs, but leaves the account field `[^:]*`,
+/// so the account an `Id` names is no more constrained than a `ResourceArn`'s.
 ///
 /// The REGION field is not compared, for the reason [`tagged_resource_field`] gives: this
 /// process holds one account's and one Region's records, and the region in a minted ARN is a
@@ -742,10 +774,11 @@ pub fn slo_arn(region: &str, name: &str) -> String {
 /// store is one account's — see [`slo_name_of`]).
 ///
 /// This is how an error identifies an SLO that is not stored: there is no record to read an
-/// ARN off, so the ARN is derived from the identity the request named.
+/// ARN off, so the ARN is derived from the identity the request named — including an `Id`
+/// whose ARN form names another account, which is reported back as the request spelled it.
 ///
 /// Which ids are already in ARN form is [`slo_name_in_arn`]'s rule — the one ARN reader in
-/// this module, so the ARN this renders and the name [`slo_name_of`] resolves cannot
+/// this module, so the ARN this renders and the name [`slo_name_in_id`] reports cannot
 /// disagree about the same id.
 pub fn slo_arn_of(region: &str, id: &str) -> String {
     if slo_name_in_arn(id).is_some() {
@@ -805,7 +838,7 @@ const WORK_ITEM_DISCRIMINATOR_DIGITS: u32 = 12;
 /// reports them ([`slo_not_found`]): they are what a client branches on to learn which
 /// resource it asked about, and that is the SLO either way.
 pub fn slo_work_item_not_found(region: &str, id: &str) -> ResourceNotFoundException {
-    let name = slo_name_of(id);
+    let name = slo_name_in_id(id);
     let account = ::engine::emulator_account_id();
     ResourceNotFoundException {
         message: format!(
@@ -2478,7 +2511,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         token: Option<&str>,
         page_size: usize,
     ) -> Result<(Vec<ExclusionWindow>, Option<String>), String> {
-        let stored = self.exclusion_windows.get(slo_name_of(id));
+        let stored = slo_name_of(id).and_then(|name| self.exclusion_windows.get(name));
         // The ordinal of the LAST window this SLO holds, and so the one position past which
         // this paging can have minted no boundary over the set being read. An SLO holding no
         // windows has minted none at all.
@@ -2540,10 +2573,9 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         add: &[ExclusionWindow],
         remove: &[ExclusionWindow],
     ) -> Result<(), ExclusionWindowFailure> {
-        let name = slo_name_of(id);
-        if !self.slos.contains_key(name) {
+        let Some(name) = slo_name_of(id).filter(|name| self.slos.contains_key(*name)) else {
             return Err(ExclusionWindowFailure::NoSuchSlo);
-        }
+        };
 
         let mut windows = self.exclusion_windows.get(name).cloned().unwrap_or_default();
         for window in remove {
@@ -3870,7 +3902,9 @@ fn audit_target_kind(target: &AuditTargetEntity) -> &'static str {
 ///
 /// An objective target is fingerprinted on the NAME its identity resolves to
 /// ([`slo_name_of`]), not on the spelling the request used, so a token handed back for a target
-/// naming an objective by name resumes a read naming the same objective by ARN. The targets are
+/// naming an objective by name resumes a read naming the same objective by ARN. An identity
+/// that resolves to no objective of this account is fingerprinted on the spelling itself,
+/// since it selects a different set from the name it spells. The targets are
 /// fingerprinted as a SET — each one rendered, then the renderings sorted and deduplicated —
 /// and the auditor names likewise, because neither the order the request listed them in nor a
 /// target or an auditor it named twice changes which findings are reported or in what order:
@@ -3899,7 +3933,7 @@ pub fn audit_findings_token_tag(
                 let mut names: Vec<&str> = [entity.slo_name.as_deref(), entity.slo_arn.as_deref()]
                     .into_iter()
                     .flatten()
-                    .map(slo_name_of)
+                    .map(|id| slo_name_of(id).unwrap_or(id))
                     .collect();
                 names.sort_unstable();
                 names.dedup();

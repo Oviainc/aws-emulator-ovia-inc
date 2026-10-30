@@ -4,14 +4,16 @@
 //! them: `BatchGetServiceLevelObjectiveBudgetReport` (POST `/budget-report`) and
 //! `BatchUpdateExclusionWindows` (PATCH `/exclusion-windows`).
 //!
-//! The rule under test: an SLO is identified by the NAME its id denotes — the partition,
-//! Region and account fields of an SLO ARN are no part of that identity — so every entry of
-//! one request that denotes the same SLO is answered ONCE, whichever id form and ARN scope
-//! fields each entry is spelled with.
+//! The rule under test: an SLO of this account is identified by the NAME its id denotes —
+//! the partition and Region fields of an SLO ARN are no part of that identity — so every
+//! entry of one request that denotes the same SLO is answered ONCE, whichever id form and
+//! whichever of those scope fields each entry is spelled with. The ACCOUNT field is part of
+//! what an ARN identifies, so it is held out of these rows; `slo_id_account_scope` is the
+//! suite that owns it.
 //!
 //! Each rule is asserted over a TABLE spanning the class: the rows differ along the id forms
 //! paired (a bare name with an ARN, two ARNs), the ARN field they disagree on (Region,
-//! account, partition), the number of spellings one SLO is named by, and the characters the
+//! partition, both), the number of spellings one SLO is named by, and the characters the
 //! SLO's own name carries.
 
 use serde_json::{json, Value};
@@ -84,11 +86,11 @@ fn cases() -> Vec<Case> {
             ],
         },
         Case {
-            label: "two ARNs differing only in their account field",
-            name: "two-accounts",
+            label: "two ARNs differing in their Region AND their partition",
+            name: "two-scopes",
             ids: vec![
-                signed_arn("two-accounts"),
-                slo_arn_in("aws", REGION, "999999999999", "two-accounts"),
+                slo_arn_in("aws", "ap-south-1", ACCOUNT, "two-scopes"),
+                slo_arn_in("aws-us-gov", "us-gov-west-1", ACCOUNT, "two-scopes"),
             ],
         },
         Case {
@@ -100,23 +102,23 @@ fn cases() -> Vec<Case> {
             ],
         },
         Case {
-            // The pattern's `[^:]*` admits an EMPTY Region and account field, one step past
-            // the values a real credential scope renders.
-            label: "a bare name and an ARN whose Region and account fields are empty",
-            name: "empty-scope-fields",
+            // The pattern's `[^:]*` admits an EMPTY Region field, one step past the values a
+            // real credential scope renders.
+            label: "a bare name and an ARN whose Region field is empty",
+            name: "empty-region-field",
             ids: vec![
-                "empty-scope-fields".to_string(),
-                slo_arn_in("aws", "", "", "empty-scope-fields"),
+                "empty-region-field".to_string(),
+                slo_arn_in("aws", "", ACCOUNT, "empty-region-field"),
             ],
         },
         Case {
             label: "four spellings of one SLO in one request",
             name: "four-spellings",
             ids: vec![
-                slo_arn_in("aws-us-gov", "eu-central-1", "111122223333", "four-spellings"),
+                slo_arn_in("aws-us-gov", "eu-central-1", ACCOUNT, "four-spellings"),
                 "four-spellings".to_string(),
                 signed_arn("four-spellings"),
-                slo_arn_in("aws-us-gov", "eu-central-1", "111122223333", "four-spellings"),
+                slo_arn_in("aws-us-gov", "eu-central-1", ACCOUNT, "four-spellings"),
             ],
         },
         Case {
@@ -126,7 +128,7 @@ fn cases() -> Vec<Case> {
             name: "a.b-c_d e",
             ids: vec![
                 "a.b-c_d e".to_string(),
-                slo_arn_in("aws", "us-west-2", "999999999999", "a.b-c_d e"),
+                slo_arn_in("aws", "us-west-2", ACCOUNT, "a.b-c_d e"),
             ],
         },
     ]

@@ -180,12 +180,10 @@ fn well_formed_slo_name(name: &str) -> bool {
 /// an id this accepts is one the store resolves identically.
 ///
 /// The ACCOUNT and REGION fields are not compared, because the modelled pattern admits any
-/// (`:[^:]*:[^:]*:`) and because they are no part of an SLO's identity in this store: this
-/// process holds ONE account's and one Region's records and the region in a minted ARN is a
-/// rendering of the writer's credential scope (the store's own rule, which
-/// [`crate::state::slo_name_of`] resolves every id by). So such an ARN resolves to the
-/// record of that name exactly as a `GetServiceLevelObjective` by the same ARN does, and
-/// earns an `Errors` entry only when no record of that name is stored.
+/// (`:[^:]*:[^:]*:`): this check is about the FORM of an id, not about which resource it
+/// names. Which resource that is — and so whether such an ARN resolves to a stored record or
+/// earns an `Errors` entry — is [`crate::state::slo_name_of`]'s rule, the store's one id
+/// resolution.
 fn is_slo_id(id: &str) -> bool {
     if !id.starts_with("arn:") {
         return well_formed_slo_name(id);
@@ -316,12 +314,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
         let mut reports: Vec<ServiceLevelObjectiveBudgetReport> = Vec::new();
         let mut errors: Vec<ServiceLevelObjectiveBudgetReportError> = Vec::new();
-        // The resources already answered for, each by the SLO NAME its id denotes
-        // ([`crate::state::slo_name_of`], the one id resolution of this crate): that name is
-        // the whole identity of an SLO here, so every id form the modelled
+        // The resources already answered for, each by the identity its id names
+        // ([`crate::state::slo_name_of`], the one id resolution of this crate): the SLO NAME
+        // when the id names a resource of this account, so every id form the modelled
         // `ServiceLevelObjectiveId` admits for one SLO — a bare name, or an ARN whatever its
-        // partition, region or account field renders — keys the same entry, whether or not a
-        // record of that name is stored.
+        // partition or region field renders — keys the same entry, whether or not a record of
+        // that name is stored. An id whose ARN names ANOTHER account names no resource here,
+        // so it keys an entry of its own and is answered on its own.
         let mut answered: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
 
         let store = state.lock();
@@ -329,7 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Either id form the modelled `ServiceLevelObjectiveId` admits resolves to one
             // record, so a request naming the same SLO by name AND by ARN names it once and
             // is answered with one report for it.
-            if !answered.insert(crate::state::slo_name_of(id)) {
+            if !answered.insert(crate::state::slo_name_of(id).unwrap_or(id)) {
                 continue;
             }
             match store.resolve(id) {
@@ -339,7 +338,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // it: by the name the id denotes and the ARN it would carry in this
                     // region, since there is no stored record to read an ARN off.
                     errors.push(ServiceLevelObjectiveBudgetReportError {
-                        name: crate::state::slo_name_of(id).to_string(),
+                        name: crate::state::slo_name_in_id(id).to_string(),
                         arn: crate::state::slo_arn_of(&region, id),
                         error_code: NOT_FOUND_ERROR_CODE.to_string(),
                         error_message: crate::state::slo_not_found(&region, id).message,
