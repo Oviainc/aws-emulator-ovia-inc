@@ -4,7 +4,8 @@
 //! IMPLEMENTED: replays the processing job `CreateProcessingJob` stored under this
 //! `ProcessingJobName`, materialising first the move out of a non-terminal status the
 //! clock already owed (`crate::state::ProcessingJob::settle_status`), and refusing an
-//! unknown name with the modelled `ResourceNotFound`. This is the ONLY file to touch for
+//! unknown name with HTTP 400 `ValidationException` in the service's recorded wording for
+//! an unresolvable read target. This is the ONLY file to touch for
 //! this operation.
 //!
 //! Reporting only: the one write it makes is the status transition that was due at the
@@ -186,12 +187,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(job) = store.processing_jobs.get_mut(&input.processing_job_name) else {
-            return Err(DescribeProcessingJobErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::processing_job_not_found(
-                    &input.processing_job_name,
-                )),
-            })
-            .into());
+            // Nothing is stored under the name, so there is nothing to report. The service
+            // answers that with HTTP 400 `ValidationException` carrying its read template
+            // and the name the request presented — the code and the sentence a client
+            // matches on — rather than with the `ResourceNotFound` the model lists.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::processing_job_not_found_for_read(&input.processing_job_name),
+            ));
         };
 
         // The only write a reporting call makes: the move out of `InProgress` the clock

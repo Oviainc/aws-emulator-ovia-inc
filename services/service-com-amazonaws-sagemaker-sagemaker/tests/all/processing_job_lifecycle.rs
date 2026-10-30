@@ -464,10 +464,11 @@ async fn a_name_already_in_use_is_refused_and_changes_nothing() {
     }
 }
 
-/// RULE: `DescribeProcessingJob` for a name no create stored is refused with the modelled
-/// `ResourceNotFound`.
+/// RULE: `DescribeProcessingJob` for a name no create stored resolves to no job, so it is
+/// refused with HTTP 400 `ValidationException` carrying the service's read template and
+/// the name the request presented.
 #[tokio::test]
-async fn an_unknown_job_name_is_refused_with_resource_not_found() {
+async fn an_unknown_job_name_is_refused_as_a_validation_exception() {
     let emulator = Emulator::new();
     emulator.ok("CreateProcessingJob", &minimal_create("stored")).await;
 
@@ -481,13 +482,14 @@ async fn an_unknown_job_name_is_refused_with_resource_not_found() {
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFound",
-            "case {name}: expected ResourceNotFound, got {body:?}"
+            "ValidationException",
+            "case {name}: expected ValidationException, got {body:?}"
         );
-        assert!(
-            message(&body).contains(name),
-            "case {name}: the refusal must name what was looked up, got {:?}",
-            message(&body)
+        let expected = format!("Could not find requested job with name: {name}");
+        assert_eq!(
+            message(&body),
+            expected,
+            "case {name}: expected the refusal to read {expected:?}, got {body:?}"
         );
     }
 }
@@ -724,7 +726,7 @@ async fn request_shapes_the_model_rules_out_are_refused_and_persist_nothing() {
         );
         assert_eq!(
             error_code(&described),
-            "ResourceNotFound",
+            "ValidationException",
             "case {case}: a refused create must store nothing, got {described:?}"
         );
     }

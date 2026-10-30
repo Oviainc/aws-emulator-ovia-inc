@@ -167,6 +167,8 @@ mod pipeline_lifecycle;
 mod presigned_notebook_instance_url;
 #[path = "all/processing_job_lifecycle.rs"]
 mod processing_job_lifecycle;
+#[path = "all/processing_job_not_found_refusals.rs"]
+mod processing_job_not_found_refusals;
 #[path = "all/processing_job_stop.rs"]
 mod processing_job_stop;
 #[path = "all/rejection_fidelity.rs"]

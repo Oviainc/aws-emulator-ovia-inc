@@ -11,8 +11,8 @@
 //! `Stopping` status, whatever its name, Region or optional members; the clock — not the
 //! read — owes it `Stopped`, with no failure reason beside a status the caller asked for;
 //! a stop already in flight is not restarted; a job whose run is over has nothing to
-//! stop; a name nothing created is refused with the modelled `ResourceNotFound`; and a
-//! stop moves the one job it names and no other.
+//! stop; a name nothing created resolves to no stop target and is refused with HTTP 400
+//! `ValidationException`; and a stop moves the one job it names and no other.
 
 use std::time::Duration;
 
@@ -415,11 +415,11 @@ async fn a_job_whose_run_is_over_has_nothing_to_stop() {
     }
 }
 
-/// RULE: a stop of a processing job this account holds no record of is refused with the
-/// modelled `ResourceNotFound`, worded as the read words a name it cannot resolve, and
-/// creates nothing.
+/// RULE: a stop of a processing job this account holds no record of resolves to no stop
+/// target: it is refused with HTTP 400 `ValidationException` carrying the service's
+/// stop-target template and the name the request presented, and creates nothing.
 #[tokio::test]
-async fn a_name_that_names_no_job_is_refused_with_resource_not_found() {
+async fn a_name_that_names_no_job_is_refused_as_a_validation_exception() {
     // Rows differ along the ways a name can miss: never created, a prefix and a suffix of
     // a name that exists, a different case of it, and a name created in ANOTHER Region.
     let emulator = Emulator::new();
@@ -446,12 +446,12 @@ async fn a_name_that_names_no_job_is_refused_with_resource_not_found() {
         );
         assert_eq!(
             error_code(&refused),
-            "ResourceNotFound",
-            "case {case:?}: expected the modelled ResourceNotFound, got {refused:?}"
+            "ValidationException",
+            "case {case:?}: expected a ValidationException for a stop target that does \
+             not resolve, got {refused:?}"
         );
-        // The same sentence the read refuses an unresolvable name with, quoting the name
-        // the request presented.
-        let expected_message = format!("Could not find processing job \"{name}\".");
+        // The service's stop-target template, carrying the name the request presented.
+        let expected_message = format!("Could not find job to update with name: {name}");
         assert_eq!(
             message(&refused),
             expected_message,

@@ -399,11 +399,26 @@ pub const PROCESSING_STATUS_STOPPED: &str = "Stopped";
 /// one that waits observes `Stopped`, so a waiter terminates.
 pub const PROCESSING_JOB_STOPS_AFTER: Duration = Duration::from_millis(300);
 
-/// Why a reader or the stop could not resolve a processing job, named once here so
-/// `DescribeProcessingJob` and `StopProcessingJob` refuse an unknown name with the same
-/// sentence, quoting the name the request presented.
-pub fn processing_job_not_found(name: &str) -> String {
-    format!("Could not find processing job \"{name}\".")
+/// How the processing-job API words a `ProcessingJobName` that resolves to no job for a
+/// call that only REPORTS the job: fixed text, then the name the request presented.
+///
+/// Recorded wire behaviour: the service answers this one with the error code
+/// `ValidationException` and HTTP 400, not with the `ResourceNotFound` the model lists, so
+/// the handler returns it through the validation channel. Named once here so the reader
+/// cannot word the fact differently from the template below.
+pub fn processing_job_not_found_for_read(name: &str) -> String {
+    format!("Could not find requested job with name: {name}")
+}
+
+/// How the processing-job API words a `ProcessingJobName` that resolves to no job for a
+/// call that would CHANGE the job — the stop: fixed text, then the name the request
+/// presented.
+///
+/// A separate template from [`processing_job_not_found_for_read`] because the service
+/// words the two differently, and carried on the same `ValidationException` / HTTP 400
+/// envelope for the same reason.
+pub fn processing_job_not_found_for_update(name: &str) -> String {
+    format!("Could not find job to update with name: {name}")
 }
 
 /// Why stopping a job whose run is already over is refused, naming the job and the status

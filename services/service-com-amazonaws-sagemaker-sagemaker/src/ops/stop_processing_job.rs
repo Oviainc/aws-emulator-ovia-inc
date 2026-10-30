@@ -4,9 +4,10 @@
 //! IMPLEMENTED: moves the processing job `ProcessingJobName` names into `Stopping` in
 //! `crate::state`, with the instant the clock owes it `Stopped`, so a caller that
 //! describes it straight after observes the transient status and one that waits observes
-//! the terminal one. A name this account holds no job under is the modelled
-//! `ResourceNotFound`, and a job whose run has already ended has nothing to stop. This is
-//! the ONLY file to touch for this operation.
+//! the terminal one. A name this account holds no job under is refused with HTTP 400
+//! `ValidationException` in the service's recorded wording for an unresolvable stop
+//! target, and a job whose run has already ended has nothing to stop. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,15 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(job) = store.processing_jobs.get_mut(&input.processing_job_name) else {
-            // A name nothing created names no job, so the stop is refused with the
-            // not-found failure this operation models, worded as the read words it: there
-            // is no stored record to report anything but the name the request presented.
-            return Err(StopProcessingJobErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::processing_job_not_found(
-                    &input.processing_job_name,
-                )),
-            })
-            .into());
+            // A name nothing created names no job, so the stop target does not resolve and
+            // nothing is mutated. The service answers that with HTTP 400
+            // `ValidationException` carrying its stop-target template and the name the
+            // request presented — the code and the sentence a client matches on — rather
+            // than with the `ResourceNotFound` the model lists.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::processing_job_not_found_for_update(&input.processing_job_name),
+            ));
         };
 
         // Whatever the clock already owed this job is materialised FIRST, so the stop is
