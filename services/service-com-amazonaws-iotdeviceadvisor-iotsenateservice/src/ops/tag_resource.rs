@@ -194,11 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(trail.refused(
                 TagResourceErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
+                    // The ARN is request-supplied and as long as a whole message may be, so
+                    // the refusal states it through the crate's one bounded-message rule.
+                    message: Some(crate::state::bounded_message(format!(
                         "Cannot attach {would_hold} tags to {}: a resource holds at most {} tags",
-                        input.resource_arn,
+                        crate::state::echoed_value(&input.resource_arn),
                         crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
+                    ))),
                 })
                 .into(),
             ));

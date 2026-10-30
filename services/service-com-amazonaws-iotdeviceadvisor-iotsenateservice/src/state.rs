@@ -204,12 +204,14 @@ pub enum TaggedResource {
 /// error — a value that is not one of this service's ARNs is a bad request, never a
 /// missing resource, so it is refused before anything is looked up.
 pub fn parse_resource_arn(arn: &str) -> Result<TaggedResource, String> {
-    // The value is request-supplied and goes into the refusal text: `{arn:?}` quotes and
-    // escapes it, so no newline inside it can forge a second line of the message.
+    // The value is request-supplied and goes into the refusal text, so it is stated through
+    // [`quoted_value`]: quoted, so no newline inside it can forge a second line of the
+    // message, and bounded, so it cannot carry the message past what `Message` allows.
     let malformed = || {
-        format!(
-            "resourceArn {arn:?} is not an IoT Device Advisor suite definition or suite run ARN"
-        )
+        let shown = quoted_value(arn);
+        bounded_message(format!(
+            "resourceArn {shown} is not an IoT Device Advisor suite definition or suite run ARN"
+        ))
     };
     // `splitn(6, ..)` so a `:` inside the resource portion stays in it.
     let mut fields = arn.splitn(6, ':');
@@ -761,6 +763,94 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
     }
 }
 
+/// The longest `message` any error this service answers with may carry.
+///
+/// Every error shape in this service's model holds its text in a `message` member targeting
+/// `Message`, which is `len 1..2048` (`smithy_query(query="shape",shape="Message")`), so a
+/// longer one is a body the model says cannot exist. Nothing downstream checks it: the
+/// framework validates a request's INPUT against the model and serializes an error's members
+/// as they are given, so the bound holds where the message is BUILT — here and in
+/// [`bounded_message`], which every refusal text in this crate goes through.
+pub const MAX_MESSAGE_LENGTH: usize = 2048;
+
+/// How many characters of a request-supplied value a refusal states.
+///
+/// A refusal names the value it refused so the caller can see what was wrong with it, which a
+/// leading run of characters serves; every ARN-typed member here is itself as long as a whole
+/// message may be (`AmazonResourceName` is `len 20..2048`), so stating one WHOLE would leave
+/// no room for the sentence around it. The ceiling is well past the longest ARN this service
+/// mints — a suite run's, whose resource portion carries two ids — so a value of a form this
+/// service itself produces is always stated in full, and only a longer one is cut.
+const MAX_ECHOED_VALUE: usize = 256;
+
+/// What marks a value a refusal stated only the leading characters of.
+const ELISION: &str = "...";
+
+/// `value` as a refusal message states it PLAINLY: itself when short, its leading
+/// [`MAX_ECHOED_VALUE`] characters followed by [`ELISION`] when longer.
+///
+/// Rendering only — every caller keeps the ORIGINAL value for its own checks and reaches here
+/// solely to interpolate, because a value cut down before a check is not the value the caller
+/// sent. The cut falls between characters, so a multi-byte character is never split.
+pub fn echoed_value(value: &str) -> String {
+    let mut shown: String = value.chars().take(MAX_ECHOED_VALUE).collect();
+    if shown.len() < value.len() {
+        shown.push_str(ELISION);
+    }
+    shown
+}
+
+/// `value` as a refusal message states it QUOTED: the same bounded rendering as
+/// [`echoed_value`], wrapped in quotes with anything unprintable inside it escaped, so a
+/// value carrying a newline cannot forge a second line of the message.
+///
+/// The bound is on the QUOTED rendering rather than on the value: an escape stands for one
+/// character with several, so a value of [`MAX_ECHOED_VALUE`] characters can quote to many
+/// times that, and it is what goes on the wire that has to fit. A character is therefore
+/// stated whole or not at all — never cut in the middle of its escape — and [`ELISION`] goes
+/// INSIDE the quotes, so a cut rendering cannot read as a value that ended there.
+pub fn quoted_value(value: &str) -> String {
+    let mut shown = String::with_capacity(MAX_ECHOED_VALUE);
+    shown.push('"');
+    let mut room = MAX_ECHOED_VALUE;
+    let mut cut = false;
+    for character in value.chars() {
+        let escaped: String = character.escape_debug().collect();
+        let taken = escaped.chars().count();
+        if taken > room {
+            cut = true;
+            break;
+        }
+        room -= taken;
+        shown.push_str(&escaped);
+    }
+    if cut {
+        shown.push_str(ELISION);
+    }
+    shown.push('"');
+    shown
+}
+
+/// `message` as it goes on the wire: itself when it already fits [`MAX_MESSAGE_LENGTH`]
+/// characters — the maximum the member every error of this service carries its text in
+/// declares — else its longest prefix that leaves room for [`ELISION`], cut between
+/// characters, followed by that marker.
+///
+/// The ceiling on a stated value is what keeps a refusal both readable and WHOLE — every
+/// sentence this crate builds from one is far inside the bound, so no fixed text is ever
+/// lost. This is where the bound itself holds, for any message however its parts render, and
+/// the marker is what keeps a message that did have to be cut from reading as a complete
+/// sentence that ended mid-word.
+pub fn bounded_message(message: String) -> String {
+    if message.chars().count() <= MAX_MESSAGE_LENGTH {
+        return message;
+    }
+    let kept = MAX_MESSAGE_LENGTH - ELISION.chars().count();
+    let mut bounded: String = message.chars().take(kept).collect();
+    bounded.push_str(ELISION);
+    bounded
+}
+
 /// The message a refusal carries when the resource the request NAMED does not exist.
 ///
 /// Device Advisor builds this text from the request: the template is
@@ -769,7 +859,10 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
 /// definition for the whole service, so every lookup that cannot find what it was asked
 /// for words it the same way, whichever error shape the operation models for it.
 pub fn not_found_message(member: &str, value: &str) -> String {
-    format!("Unable to find resource with {member}: {value}")
+    bounded_message(format!(
+        "Unable to find resource with {member}: {}",
+        echoed_value(value)
+    ))
 }
 
 /// The message a `SuiteDefinitionConfiguration` with an empty `rootGroup` is refused with
@@ -1263,13 +1356,17 @@ impl DeviceNaming {
 ///
 /// The modelled length bounds (`AmazonResourceName` is `len 20..2048`) are enforced before
 /// a handler runs; the ARN FORM is not modelled, so it is checked here and refused with the
-/// operation's own client-input error.
+/// operation's own client-input error. A legal value is as long as a legal `message`, so what
+/// the refusal STATES of it is bounded on the way out too ([`bounded_message`]).
 pub fn arn_member_violation(member: &str, value: &str, service: &str) -> Option<String> {
     (!is_arn_of_service(value, service)).then(|| {
-        format!(
+        // The CHECK is on the value the caller sent; only what the message STATES of it is
+        // bounded ([`quoted_value`]), so the refusal cannot run past what `Message` allows.
+        let shown = quoted_value(value);
+        bounded_message(format!(
             "{member} must be an Amazon Resource Name of the form \
-             arn:<partition>:{service}:<region>:<account>:<resource>, got {value:?}"
-        )
+             arn:<partition>:{service}:<region>:<account>:<resource>, got {shown}"
+        ))
     })
 }
 

@@ -32,6 +32,9 @@ mod endpoint;
 #[path = "all/parallel_runs.rs"]
 mod parallel_runs;
 
+#[path = "all/refusal_message_bounds.rs"]
+mod refusal_message_bounds;
+
 #[path = "all/report_url_endpoint.rs"]
 mod report_url_endpoint;
 
