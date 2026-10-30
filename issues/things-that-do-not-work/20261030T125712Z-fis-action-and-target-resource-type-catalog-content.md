@@ -1,0 +1,75 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: fis-action-pagination-single-page-boundary
+Issue-Step: task#1
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: fis-action-pagination-single-page-boundary fis-catalog-list-actions fis-get-action-not-found-error fis-catalog-list-target-resource-types fis-list-and-get-action fis-list-and-get-target-resource-type
+Issue-Shape-Id: com.amazonaws.fis#FaultInjectionSimulator
+Issue-Key: fis|ListActions|2xx->2xx|$.actions[arn="arn
+Issue-Key: fis|ListTargetResourceTypes|2xx->2xx|$.targetResourceTypes[*]
+Issue-Key: fis|GetAction|2xx->2xx|$.action.description
+Issue-Key: fis|GetAction|2xx->2xx|$.action.parameters.availabilityZoneIdentifier.description
+Issue-Key: fis|GetAction|2xx->2xx|$.action.parameters.duration.description
+Issue-Key: fis|GetTargetResourceType|2xx->2xx|$.targetResourceType.parameters.managedResourceTypes.description
+Issue-Key: fis|GetTargetResourceType|2xx->2xx|$.targetResourceType.parameters.zonalAutoshiftStatus.description
+Issue-Commit: 232d6cb39af83c8f3e5d0960e0729eaeb270e0f7
+
+# FIS action and target-resource-type catalog content diverges from AWS's published catalog
+
+> _Note: this issue was identified against the code base at commit `232d6cb39af83c8f3e5d0960e0729eaeb270e0f7`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ListActions, GetAction, ListTargetResourceTypes, GetTargetResourceType
+
+## Description
+The four catalog read operations all answer 200, so the shapes are right, but the CONTENT the emulator serves is its own seed catalog rather than the catalog FIS publishes: action and parameter descriptions are paraphrased, and the target-resource-type listing is a different set in a different order. All four causes share one root: the FIS catalog seed data (the static action catalog and target-resource-type catalog the ListActions/GetAction/ListTargetResourceTypes/GetTargetResourceType handlers read from) was written from paraphrase instead of transcribed from FIS's published catalog, so every reader of the catalog diverges in the same way. None of the existing open FIS issues cover catalog CONTENT: 20261029T185634Z-fis-catalog-experiment-and-validation-errors-use-wrong.md covers the error status/wording of these same operations (unknown-id and maxResults paths) and does not touch the 200-response descriptions or the resource-type set. 4 causes.
+
+Cause 1 of 4 (ListActions: action descriptions are paraphrases of FIS's published action descriptions).
+AWS: Smithy: ListActions GET /actions -> ListActionsResponse.actions: ActionSummaryList; the model defines the shape, not the catalog text, so the catalog content is recorded behavior only. Recorded: each ActionSummary.description carries FIS's own published wording for that action, e.g. for arn .../action/aws:arc:start-zonal-autoshift the description is 'Shift application traffic away from, and back to, an Availability Zone.' The description is fixed text per actionId (catalog data), with no request-derived or per-run parts; the ARN's account and region are environment values and are not part of the requirement.
+Emulator: serves its own paraphrase for the same actionId: 'Start a zonal autoshift for the specified managed resources.' (recorded: $.actions[arn="...action/aws:arc:start-zonal-autoshift"].description value_mismatch, expected 'Shift application traffic away from, and back to, an Availability Zone.', got 'Start a zonal autoshift for the specified managed resources.'). 4 steps affected across the pagination and catalog-listing fixtures.
+Why: the action catalog is how a client (or the FIS console/CLI) tells a user what an action does and how experiment authors pick actions; a client that renders, snapshots or asserts the catalog text sees different documentation than AWS serves, and catalog-diffing tooling reports spurious drift against the real service.
+Fix: the FIS action catalog seed data behind the ListActions handler — the per-action description strings must be the published FIS text, not a restatement.
+Traces: fis-action-pagination-single-page-boundary#task#1 (also #task#2, fis-catalog-list-actions#task#1, fis-get-action-not-found-error#task#2).
+
+Cause 2 of 4 (ListTargetResourceTypes: the target-resource-type set, its order and its descriptions all differ).
+AWS: Smithy: ListTargetResourceTypes GET /targetResourceTypes -> targetResourceTypes: TargetResourceTypeSummaryList (paginated, items=targetResourceTypes); catalog content is recorded behavior only. Recorded: the list is FIS's published set of target resource types, in FIS's order, each with FIS's own description text — e.g. aws:directconnect:virtual-interface described as 'A Direct Connect Virtual Interface (VIF).', aws:dynamodb:global-table as 'An Amazon DynamoDB global table' (no trailing period), aws:ec2:ebs-volume as 'An Amazon Elastic Block Store volume', aws:eks:nodegroup as 'An Amazon EKS node group.'. Both the membership of the list and the per-entry description are fixed catalog data.
+Emulator: serves a different catalog: descriptions are paraphrased and differ in trailing punctuation ('An AWS Direct Connect virtual interface.', 'An Amazon DynamoDB global table.', 'An Amazon EBS volume.', 'An Amazon EKS managed node group.'), and the list contains at least one entry FIS does not publish at that position (aws:ec2:spot-instance appears where AWS has aws:ec2:subnet), which shifts every later index so the tail of the list no longer lines up (recorded: positional mismatches at $.targetResourceTypes[1], [3], [4], [5], [7], [8], [9], [10], [14], [15], [16], [18], [19], [20], [21], [23]).
+Why: a client that enumerates target resource types to build a picker, validate an experiment template's targets, or paginate by index gets a different set and a different ordering than AWS; code that indexes the page or depends on a type being present/absent behaves differently against the emulator than against FIS.
+Fix: the FIS target-resource-type catalog seed data behind the ListTargetResourceTypes handler — its membership, ordering and description strings must match FIS's published catalog.
+Traces: fis-catalog-list-target-resource-types#task#1.
+
+Cause 3 of 4 (GetAction: the single-action view repeats the paraphrased action description and paraphrases the action's parameter descriptions too).
+AWS: Smithy: GetAction GET /actions/{id} -> GetActionResponse.action: Action, with action.parameters a map of parameter name to its description; catalog content is recorded behavior only. Recorded for aws:arc:start-zonal-autoshift: action.description 'Shift application traffic away from, and back to, an Availability Zone.', parameters.availabilityZoneIdentifier.description 'Traffic moves away from this Availability Zone.', parameters.duration.description 'The length of time to shift away from the Availability Zone (ISO 8601 duration).' — all fixed per-action catalog text.
+Emulator: returns its own wording for the action and for each parameter ('Start a zonal autoshift for the specified managed resources.', 'The Availability Zone to shift traffic away from.', 'The duration of the action, in ISO 8601 format.'), so the divergence is not confined to the list view: the detail view carries it as well, including parameter-level text the list view never shows.
+Why: the parameter descriptions are what a client shows when prompting for an action's parameters; a user is given different guidance than AWS gives, and any assertion or snapshot of GetAction's documentation diverges.
+Fix: the same FIS action catalog seed data, including each action's per-parameter description map, as read by the GetAction handler.
+Traces: fis-get-action-not-found-error#task#3 (also fis-list-and-get-action#task#2).
+
+Cause 4 of 4 (GetTargetResourceType: the resource type's parameter descriptions are paraphrased).
+AWS: Smithy: GetTargetResourceType GET /targetResourceTypes/{resourceType} -> targetResourceType: TargetResourceType, whose parameters map each parameter name to its description; catalog content is recorded behavior only. Recorded for the zonal-autoshift managed-resource type: parameters.managedResourceTypes.description 'The resource types that will use zonal autoshift.' and parameters.zonalAutoshiftStatus.description 'The zonalAutoshiftStatus of the resources you want to target. The default is enabled.' — fixed catalog text, including the default it documents.
+Emulator: 'The types of the managed resources, separated by commas.' and 'The zonal autoshift status of the managed resources.' (recorded: both $.targetResourceType.parameters.*.description value_mismatch). The emulator's text also drops the documented default ('The default is enabled.') and invents a serialization rule ('separated by commas') that FIS's own description does not state.
+Why: these parameter descriptions are the contract a client reads to fill in a target's parameters; losing the documented default and gaining an unstated formatting rule misleads an experiment author about what a valid parameter value is.
+Fix: the FIS target-resource-type catalog seed data behind the GetTargetResourceType handler — the per-parameter description strings must be the published FIS text.
+Traces: fis-list-and-get-target-resource-type#task#2.
+
+## Evidence
+All four clusters are 200 -> 200 content mismatches (no status or error-class divergence); every value below is quoted from the replay output.
+
+Cause 1 — fis-action-pagination-single-page-boundary#task#1, ListActions, expected 200 got 200: $.actions[arn="arn:aws:fis:us-west-2:000000000000:action/aws:arc:start-zonal-autoshift"].description value_mismatch — expected 'Shift application traffic away from, and back to, an Availability Zone.', got 'Start a zonal autoshift for the specified managed resources.'. 4 steps affected: fis-action-pagination-single-page-boundary#task#1, fis-action-pagination-single-page-boundary#task#2, fis-catalog-list-actions#task#1, fis-get-action-not-found-error#task#2. (The ARN's account 000000000000 and region us-west-2 are environment values used only to identify the entry; the requirement is the description text keyed by actionId.)
+
+Cause 2 — fis-catalog-list-target-resource-types#task#1, ListTargetResourceTypes, expected 200 got 200: positional mismatches at $.targetResourceTypes[1] (expected description 'A Direct Connect Virtual Interface (VIF).' for aws:directconnect:virtual-interface, got 'An AWS Direct Connect virtual interface.'), [3] (aws:dynamodb:global-table: expected 'An Amazon DynamoDB global table', got 'An Amazon DynamoDB global table.'), [4] (aws:ec2:autoscaling-group: expected 'An Amazon EC2 Auto Scaling group', got 'An Amazon EC2 Auto Scaling group.'), [5] (aws:ec2:ebs-volume: expected 'An Amazon Elastic Block Store volume', got 'An Amazon EBS volume.'), [8] (expected aws:ec2:subnet 'An Amazon EC2 subnet.', got aws:ec2:spot-instance 'An Amazon EC2 Spot Instance.'), [9] (expected aws:ec2:transit-gateway, got aws:ec2:subnet 'A subnet of an Amazon VPC.'), [10] (expected aws:ec2:vpc-endpoint, got aws:ec2:transit-gateway 'A transit gateway.'), [14] (aws:eks:nodegroup: expected 'An Amazon EKS node group.', got 'An Amazon EKS managed node group.'), and further mismatches at [7], [15], [16], [18], [19], [20], [21], [23] per the cluster's divergence_key. From index 8 onward the entries are off by one, i.e. the emulator's catalog carries an entry (aws:ec2:spot-instance) the recording does not have at that position.
+
+Cause 3 — fis-get-action-not-found-error#task#3, GetAction, expected 200 got 200: $.action.description expected 'Shift application traffic away from, and back to, an Availability Zone.', got 'Start a zonal autoshift for the specified managed resources.'; $.action.parameters.availabilityZoneIdentifier.description expected 'Traffic moves away from this Availability Zone.', got 'The Availability Zone to shift traffic away from.'; $.action.parameters.duration.description expected 'The length of time to shift away from the Availability Zone (ISO 8601 duration).', got 'The duration of the action, in ISO 8601 format.'. 2 steps affected (also fis-list-and-get-action#task#2).
+
+Cause 4 — fis-list-and-get-target-resource-type#task#2, GetTargetResourceType, expected 200 got 200: $.targetResourceType.parameters.managedResourceTypes.description expected 'The resource types that will use zonal autoshift.', got 'The types of the managed resources, separated by commas.'; $.targetResourceType.parameters.zonalAutoshiftStatus.description expected 'The zonalAutoshiftStatus of the resources you want to target. The default is enabled.', got 'The zonal autoshift status of the managed resources.'.
+
+Smithy cited (services/service-com-amazonaws-fis-faultinjectionsimulator/smithy-model/com-amazonaws-fis-faultinjectionsimulator.json): ListActions GET /actions, output actions: ActionSummaryList, paginated items=actions, only ValidationException(400) modeled; GetAction GET /actions/{id}, output action: Action, errors ResourceNotFoundException(404)/ValidationException(400); ListTargetResourceTypes GET /targetResourceTypes, output targetResourceTypes: TargetResourceTypeSummaryList, paginated items=targetResourceTypes; GetTargetResourceType GET /targetResourceTypes/{resourceType}, output targetResourceType: TargetResourceType. The model constrains the shapes only — the description strings and the catalog membership are not modeled, so the requirement for all four causes is the recorded FIS catalog.
+
+## Steps to Reproduce
+1. Replay the wire corpus against the emulator (replay_wire_corpus); all four causes are 200/200 content mismatches, so they reproduce on a freshly booted emulator with no setup.
+2. Cause 1: GET /actions and read the description of the entry whose arn ends in action/aws:arc:start-zonal-autoshift — expect FIS's published description, observe the emulator's paraphrase (fis-action-pagination-single-page-boundary#task#1).
+3. Cause 2: GET /targetResourceTypes and compare the returned list element-by-element with the recording — expect FIS's set, order and description text; observe paraphrased descriptions, differing trailing punctuation and an extra entry (aws:ec2:spot-instance) at index 8 that shifts every later index (fis-catalog-list-target-resource-types#task#1).
+4. Cause 3: GET /actions/aws:arc:start-zonal-autoshift and read $.action.description plus $.action.parameters.availabilityZoneIdentifier.description and $.action.parameters.duration.description (fis-get-action-not-found-error#task#3).
+5. Cause 4: GET /targetResourceTypes/<the zonal-autoshift managed-resource type> and read $.targetResourceType.parameters.managedResourceTypes.description and .zonalAutoshiftStatus.description (fis-list-and-get-target-resource-type#task#2).
+6. All four must match the recorded catalog text before the issue is closed; re-replay the four fixtures named in Issue-Trace/Issue-Trace-Ids to confirm.
