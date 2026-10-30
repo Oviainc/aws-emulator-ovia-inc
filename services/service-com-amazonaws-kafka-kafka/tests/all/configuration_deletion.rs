@@ -8,8 +8,9 @@
 //! description, the Kafka versions named, the size and byte content of the
 //! `server.properties` blob, how many revisions the configuration holds, how
 //! many clusters use it, what makes an `Arn` resolve to nothing, and the signing
-//! region). Where the rule is an invariant — a deleted configuration is gone
-//! from every reader and its name is free again, a refused delete leaves the
+//! region). Where the rule is an invariant — a delete is accepted, reported
+//! `DELETING` and completed by the clock, after which the configuration is gone
+//! from every reader and its name is free again; a refused delete leaves the
 //! registry exactly as it found it — the rows walk the whole space the rule
 //! names.
 
@@ -22,11 +23,12 @@ use service_com_amazonaws_kafka_kafka::state::{
 };
 
 // The router harness, the signing region, the account id, the URI encoder and
-// the configuration family's shared refusal assertion every suite of this crate
+// the configuration family's shared refusal assertions every suite of this crate
 // shares, so this one adds only its own rule and its configuration-shaped
 // requests.
 use super::kafka_harness::{
-    assert_configuration_arn_resolves_to_nothing, configuration_rows, pct, sleep_past_activation,
+    assert_configuration_arn_resolves_to_nothing, assert_configuration_state_refusal,
+    configuration_rows, pct, sleep_past_activation, sleep_past_configuration_deletion,
     ClusterRequest, ConfigurationRequest, Emulator, Reply, ACCOUNT, REGION,
 };
 
@@ -91,8 +93,9 @@ async fn list_in(emulator: &Emulator, region: &str) -> Reply {
         .await
 }
 
-/// Whether `ListConfigurations` reported `arn` at `region`'s endpoint.
-async fn is_listed(emulator: &Emulator, region: &str, arn: &str) -> bool {
+/// Whether `ListConfigurations` reported `arn` at `region`'s endpoint, and with
+/// which `State` — `None` when the listing does not report it at all.
+async fn listed_state(emulator: &Emulator, region: &str, arn: &str) -> Option<String> {
     let listed = list_in(emulator, region).await;
     assert_eq!(
         listed.status, 200,
@@ -100,19 +103,32 @@ async fn is_listed(emulator: &Emulator, region: &str, arn: &str) -> bool {
         listed.status, listed.body
     );
     listed.body["configurations"]
-        .as_array()
-        .is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry.get("arn").and_then(Value::as_str) == Some(arn))
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("arn").and_then(Value::as_str) == Some(arn))
+        .map(|entry| {
+            entry
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
         })
 }
 
-/// RULE: deleting a configuration takes it out of the service's registry and
-/// reports it in the `DELETING` state under its own ARN, so no later reader
-/// resolves or lists it and the name it held can be taken again.
+/// Whether `ListConfigurations` reported `arn` at `region`'s endpoint.
+async fn is_listed(emulator: &Emulator, region: &str, arn: &str) -> bool {
+    listed_state(emulator, region, arn).await.is_some()
+}
+
+/// RULE: a configuration delete is ASYNCHRONOUS. It is accepted on the record:
+/// the response reports the configuration's own ARN in state `DELETING`, the
+/// configuration stays a resource every reader resolves and the listing
+/// enumerates in that state, and a call that would CHANGE it while it is in that
+/// state is refused with the state-machine refusal and changes nothing. Once the
+/// clock owes the removal the configuration is gone from every reader and the
+/// name it held can be taken again.
 #[tokio::test]
-async fn a_deleted_configuration_is_gone_from_every_reader() {
+async fn a_delete_is_accepted_as_deleting_and_completed_by_the_clock() {
     let emulator = Emulator::new();
     let rows = rows();
 
@@ -133,6 +149,11 @@ async fn a_deleted_configuration_is_gone_from_every_reader() {
             before.status,
             before.body
         );
+        let revisions_before = emulator
+            .describe_configuration(arn)
+            .await
+            .at("/latestRevision/revision")
+            .as_i64();
 
         let deleted = delete(&emulator, arn).await;
         assert_eq!(
@@ -155,6 +176,55 @@ async fn a_deleted_configuration_is_gone_from_every_reader() {
             deleted.body
         );
 
+        // The delete is in flight, so the configuration is STILL a resource of
+        // this endpoint: both readers resolve it, in state DELETING.
+        let described = describe_in(&emulator, REGION, arn).await;
+        assert_eq!(
+            (described.status, described.body["state"].as_str()),
+            (200, Some(CONFIGURATION_STATE_DELETING)),
+            "case {row:?}: a configuration whose delete is in flight is readable and \
+             DELETING, got {} {}",
+            described.status,
+            described.body
+        );
+        assert_eq!(
+            listed_state(&emulator, REGION, arn).await.as_deref(),
+            Some(CONFIGURATION_STATE_DELETING),
+            "case {row:?}: {arn} must still be listed, with state DELETING"
+        );
+        // Its revisions are still readable too: the record is still there.
+        let revision = emulator.describe_configuration_revision(arn, 1).await;
+        assert_eq!(
+            revision.status, 200,
+            "case {row:?}: revision 1 of a DELETING configuration is still readable, got {} {}",
+            revision.status, revision.body
+        );
+
+        // A call that CHANGES it is refused on the state, not reported as a
+        // lookup miss — and writes no revision.
+        let refused = emulator
+            .update_configuration(arn, None, b"num.partitions=9\n")
+            .await;
+        assert_configuration_state_refusal(&refused, &format!("{row:?} update-while-deleting"));
+        let second_delete = delete(&emulator, arn).await;
+        assert_configuration_state_refusal(
+            &second_delete,
+            &format!("{row:?} delete-while-deleting"),
+        );
+        assert_eq!(
+            describe_in(&emulator, REGION, arn)
+                .await
+                .at("/latestRevision/revision")
+                .as_i64(),
+            revisions_before,
+            "case {row:?}: a refused update must write no revision"
+        );
+    }
+
+    // The clock owes every one of those deletions its completion by now.
+    sleep_past_configuration_deletion();
+
+    for (row, arn) in &created {
         // Gone from the single-resource reader, from the listing, and from the
         // revision reader: one removal, every reader. A reader that cannot
         // resolve the ARN answers the configuration family's
@@ -168,7 +238,7 @@ async fn a_deleted_configuration_is_gone_from_every_reader() {
         );
         assert!(
             !is_listed(&emulator, REGION, arn).await,
-            "case {row:?}: {arn} must not be listed after its delete"
+            "case {row:?}: {arn} must not be listed once its delete has completed"
         );
         let revision = emulator.describe_configuration_revision(arn, 1).await;
         assert_configuration_arn_resolves_to_nothing(
@@ -210,6 +280,62 @@ async fn a_deleted_configuration_is_gone_from_every_reader() {
     }
 }
 
+/// RULE: while a configuration's delete is in flight its NAME is still taken —
+/// it is still a configuration of this region — and only once the clock has
+/// completed the removal may a create take that name again.
+#[tokio::test]
+async fn a_deleting_configuration_still_holds_its_name() {
+    let emulator = Emulator::new();
+
+    // The rows differ along the request the name is re-created from: the same
+    // row, and a row carrying different members under that one name.
+    let rows: Vec<(&str, ConfigurationRequest)> = vec![
+        ("same-request", ConfigurationRequest::named("contested-1")),
+        (
+            "different-members",
+            ConfigurationRequest {
+                description: Some("a second take on the name".to_string()),
+                kafka_versions: vec!["3.6.0".to_string()],
+                server_properties: b"num.partitions=3\n".to_vec(),
+                ..ConfigurationRequest::named("contested-2")
+            },
+        ),
+    ];
+
+    for (case, row) in &rows {
+        let arn = create_ok_in(&emulator, REGION, row).await;
+        let deleted = delete(&emulator, &arn).await;
+        assert_eq!(
+            (deleted.status, deleted.body["state"].as_str()),
+            (200, Some(CONFIGURATION_STATE_DELETING)),
+            "case {case}: expected the delete to be accepted, got {} {}",
+            deleted.status,
+            deleted.body
+        );
+
+        // The delete is in flight, so the name is still in use.
+        let contested = emulator
+            .call_in(REGION, "POST", "/v1/configurations", Some(row.to_json()))
+            .await;
+        assert_eq!(
+            (contested.status, contested.error_code()),
+            (409, "ConflictException"),
+            "case {case}: a DELETING configuration still holds its name, got {} {}",
+            contested.status,
+            contested.body
+        );
+
+        sleep_past_configuration_deletion();
+
+        // The removal is done, so the name is free and the create succeeds.
+        let remade = create_ok_in(&emulator, REGION, row).await;
+        assert_ne!(
+            remade, arn,
+            "case {case}: the re-created configuration must get its own ARN"
+        );
+    }
+}
+
 /// RULE: an `Arn` an endpoint resolves to no configuration of its own region is
 /// refused HTTP 400 `BadRequestException` and deletes nothing — whether it is
 /// not a configuration ARN at all, names a configuration another region holds,
@@ -244,6 +370,10 @@ async fn an_arn_that_names_no_configuration_is_refused() {
         "expected the first delete to succeed, got {} {}",
         first.status, first.body
     );
+    // The delete is asynchronous, so the row below means "deleted AND gone":
+    // waited out here, since a configuration still being deleted is a resource
+    // this endpoint holds and is refused on its state instead.
+    sleep_past_configuration_deletion();
 
     // A well-formed configuration ARN of this region that was never minted, and
     // the ARNs of other MSK resource kinds, which name no configuration however
@@ -414,7 +544,10 @@ async fn a_configuration_a_cluster_uses_cannot_be_deleted() {
             );
         }
 
-        // No cluster uses it any more, so the same call now succeeds.
+        // No cluster uses it any more, so the same call now succeeds: the
+        // delete is accepted and the configuration is reported DELETING while
+        // the removal is in flight, then leaves the listing once the clock owes
+        // it.
         let reply = delete(&emulator, &configuration).await;
         assert_eq!(
             (reply.status, reply.body["state"].as_str()),
@@ -423,9 +556,18 @@ async fn a_configuration_a_cluster_uses_cannot_be_deleted() {
             reply.status,
             reply.body
         );
+        assert_eq!(
+            listed_state(&emulator, REGION, &configuration)
+                .await
+                .as_deref(),
+            Some(CONFIGURATION_STATE_DELETING),
+            "case users={users}: the accepted delete leaves it listed as DELETING"
+        );
+        sleep_past_configuration_deletion();
         assert!(
             !is_listed(&emulator, REGION, &configuration).await,
-            "case users={users}: the deleted configuration must not be listed"
+            "case users={users}: the deleted configuration must not be listed once the \
+             removal has come due"
         );
     }
 }

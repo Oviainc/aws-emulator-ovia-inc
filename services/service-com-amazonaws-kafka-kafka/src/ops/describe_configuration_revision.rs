@@ -169,23 +169,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
 
-        // Reporting only: nothing here writes. A configuration is stored
-        // `ACTIVE` and its revisions never change once stored, so the clock owes
-        // this read no transition to materialise.
+        // Reporting only: nothing here writes. A stored revision never changes,
+        // and a configuration whose delete is in flight still holds the
+        // revisions it stored, so this read reports them until the clock owes
+        // the configuration's removal.
         let state = state.lock();
         // ONE condition, one refusal: the `Arn` and `Revision` this request
         // carries name one stored revision or they name nothing, and naming
         // nothing is the configuration family's unresolvable-reference bad
         // request. It covers every way the pair fails to resolve — an `Arn` that
-        // is malformed, absent, already deleted or another region's, and a
-        // revision number an existing configuration never issued, whether it is
+        // is malformed, never minted, deleted and gone or another region's, and
+        // a revision number an existing configuration never issued, whether it
+        // is
         // past its history or below the 1 a create stores — so no caller can
         // tell which half of the reference was wrong, and a revision this
         // endpoint does not hold is never reported as the missing resource the
         // other resource families answer with.
         let revision = state
-            .configuration_in(&region, &input.arn)
+            .configuration_in(&region, &input.arn, now)
             .and_then(|configuration| configuration.revision(input.revision));
         let Some(revision) = revision else {
             return Err(DescribeConfigurationRevisionErrorModeled::BadRequestException(
@@ -196,7 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DescribeConfigurationRevisionOutput {
             arn: Some(input.arn),
             creation_time: Some(::aws_smithy_types::DateTime::from(revision.creation_time)),
-            description: Some(revision.description.clone()),
+            // `Description` is OPTIONAL on this output shape, so a revision
+            // with no description is reported by omitting the member rather
+            // than by an empty string the caller never sees stored.
+            description: revision.description.clone(),
             revision: Some(revision.revision),
             server_properties: Some(revision.server_properties.clone()),
         })

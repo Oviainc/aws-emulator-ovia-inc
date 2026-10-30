@@ -5,6 +5,17 @@
 //! `server.properties` body becomes the revision one past the configuration's
 //! current latest, and no revision an earlier call stored is rewritten.
 //!
+//! An update CHANGES the configuration, so it is accepted only from the states a
+//! change is accepted from
+//! ([`crate::state::CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM`]) — gated
+//! BEFORE anything is appended, and before the configuration's absence is
+//! reported, so a configuration whose asynchronous delete is in flight answers
+//! the state-machine `BadRequestException` naming that set
+//! ([`crate::state::configuration_not_in_accepted_state`]) and writes no
+//! revision, while only an `Arn` this endpoint resolves to NO configuration at
+//! all answers [`crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE`]. The two
+//! messages are what tell a state-machine refusal apart from a lookup miss.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -156,19 +167,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
 
         let mut state = state.lock();
         // ONE condition, one refusal: an `Arn` that resolves to no configuration
-        // of this endpoint's region — malformed, absent, already deleted, or
-        // another region's — is the configuration family's unresolvable-
+        // of this endpoint's region — malformed, never minted, deleted and gone,
+        // or another region's — is the configuration family's unresolvable-
         // reference bad request, resolved before anything is appended so a
         // refused update stores nothing.
-        let Some(configuration) = state.configuration_in_mut(&region, &input.arn) else {
+        let Some(configuration) = state.settled_configuration_in_mut(&region, &input.arn, now)
+        else {
             return Err(UpdateConfigurationErrorModeled::BadRequestException(
                 crate::state::configuration_arn_not_found(),
             )
             .into());
         };
+
+        // The configuration resolved, so whether this call may change it is the
+        // state it is in: one the service is already taking out is refused with
+        // the states a change IS accepted from, and nothing is appended. A
+        // resource that is still there is never reported as a reference nothing
+        // resolves.
+        let accepted = crate::state::CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM;
+        if !accepted.contains(&configuration.state.as_str()) {
+            return Err(UpdateConfigurationErrorModeled::BadRequestException(
+                crate::state::configuration_not_in_accepted_state(&accepted),
+            )
+            .into());
+        }
 
         // The one append path on the record: the submitted body is stored as the
         // next revision, so the revision number reported here is computed from
@@ -178,12 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stores nothing and evicts nothing — a stored revision is immutable.
         //
         // `Description` is the description of the revision this call adds, as
-        // the modelled member documents it, and is empty when the request named
-        // none; the configuration's own description is the one it was created
-        // with.
+        // the modelled member documents it, and a revision has none where the
+        // request named none or named an empty one; the configuration's own
+        // description is the one it was created with.
         let appended = configuration.append_revision(
-            std::time::SystemTime::now(),
-            input.description.unwrap_or_default(),
+            now,
+            input.description,
             input.server_properties,
         );
         let latest = match appended {

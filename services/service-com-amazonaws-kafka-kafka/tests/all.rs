@@ -49,6 +49,8 @@ mod configuration_revision_properties;
 mod configuration_revision_refusal;
 #[path = "all/configuration_revisions.rs"]
 mod configuration_revisions;
+#[path = "all/configuration_state_reporting.rs"]
+mod configuration_state_reporting;
 #[path = "all/connectivity_update.rs"]
 mod connectivity_update;
 #[path = "all/create_cluster_v2.rs"]

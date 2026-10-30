@@ -9,9 +9,12 @@
 //! `BadRequestException`), and `NextToken` is an opaque encoding of the last
 //! ARN returned, resolved against the live registry — absent from the last page.
 //!
-//! A reporting operation: it only reads the registry. A configuration is created
-//! `ACTIVE`, so the clock owes none of them a transition for this reader to
-//! materialise.
+//! A reporting operation: it only reads the registry. A configuration a delete
+//! has accepted is still one of this endpoint's configurations, reported with
+//! State `DELETING`, until the clock owes its removal; past that instant the
+//! listing no longer reports it, which is what a caller polling a deletion to
+//! completion observes. Nothing here prunes the record — the lookups that write
+//! do that — so this listing leaves the registry exactly as it found it.
 //!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
@@ -181,6 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
 
         // `MaxResults` outside the modelled 1..100 range never reaches here: the
         // boundary refuses it with this service's own `BadRequestException` (see
@@ -231,7 +235,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .configurations
             .range::<str, _>((resume_from, Bound::Unbounded))
         {
-            if configuration.region != region {
+            // Another region's configurations are not this endpoint's, and one
+            // whose removal the clock already owes has left the registry
+            // whether or not anything pruned the record yet.
+            if configuration.region != region || !configuration.is_live(now) {
                 continue;
             }
             if page.len() == page_size {

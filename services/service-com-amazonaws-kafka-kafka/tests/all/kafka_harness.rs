@@ -19,6 +19,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_kafka_kafka::state::{
     CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY, CONFIGURATION_ARN_NOT_FOUND_MESSAGE,
+    CONFIGURATION_DELETION_DELAY, CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM,
     VPC_CONNECTION_ACTIVATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -527,6 +528,41 @@ pub fn assert_configuration_arn_resolves_to_nothing(
     }
 }
 
+/// Assert `reply` is the refusal a call that CHANGES an MSK configuration
+/// answers when the configuration is not in a state that call is accepted from:
+/// HTTP 400 `BadRequestException`, naming `Arn` as the parameter at fault, and
+/// carrying the one sentence that names the set of states it IS accepted from —
+/// which is what tells this refusal apart from an `Arn` the endpoint resolves to
+/// nothing (`assert_configuration_arn_resolves_to_nothing`).
+///
+/// The expected sentence is built from the service's own accepted-state set, so
+/// a suite cannot assert a set the handlers do not gate on.
+pub fn assert_configuration_state_refusal(reply: &Reply, case: &str) {
+    assert_eq!(
+        (reply.status, reply.error_code()),
+        (400, "BadRequestException"),
+        "case {case}: expected 400 BadRequestException, got {} {}",
+        reply.status,
+        reply.body
+    );
+    let expected = format!(
+        "This operation is only valid for resources that are in one of the following states :[{}]",
+        CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM.join(", ")
+    );
+    assert_eq!(
+        reply.error_message(),
+        expected,
+        "case {case}: expected the state-machine wording {expected:?}, got {:?}",
+        reply.error_message()
+    );
+    assert_eq!(
+        reply.at("/invalidParameter").as_str(),
+        Some("Arn"),
+        "case {case}: the refusal must name Arn as the parameter at fault, got {}",
+        reply.body
+    );
+}
+
 /// The resource URI of one MSK VPC connection, with the ARN percent-encoded into
 /// the single `@httpLabel` path segment the model declares.
 pub fn vpc_connection_uri(arn: &str) -> String {
@@ -730,9 +766,20 @@ impl ConfigurationRequest {
     }
 
     /// What `Configuration$Description` must report: the description as given,
-    /// and the empty string when the request named none.
+    /// and the empty string when the request named none, because that member is
+    /// `@required` on the `Configuration` shape the listing reports and is
+    /// therefore always written.
     pub fn expected_description(&self) -> String {
         self.description.clone().unwrap_or_default()
+    }
+
+    /// What the OPTIONAL `Description` members report: the description as given,
+    /// and NOTHING at all when the request named none or named an empty one — an
+    /// empty description is no description, so the member is left out.
+    pub fn expected_optional_description(&self) -> Option<&str> {
+        self.description
+            .as_deref()
+            .filter(|description| !description.is_empty())
     }
 }
 
@@ -835,4 +882,11 @@ pub fn sleep_past_vpc_connection_activation() {
 /// waits through one helper.
 pub fn sleep_past_update() {
     std::thread::sleep(CLUSTER_UPDATE_DELAY + Duration::from_millis(250));
+}
+
+/// Sleep past the emulator's own configuration-deletion span, so a later call
+/// sees the removal the clock now owes a `DELETING` configuration — what a
+/// caller polling a configuration deletion to completion waits for.
+pub fn sleep_past_configuration_deletion() {
+    std::thread::sleep(CONFIGURATION_DELETION_DELAY + Duration::from_millis(250));
 }

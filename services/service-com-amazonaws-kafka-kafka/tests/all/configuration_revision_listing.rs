@@ -75,9 +75,11 @@ struct UpdateRow {
 
 impl UpdateRow {
     /// What `ConfigurationRevision$Description` must report: the description as
-    /// given, and the empty string when the request named none.
-    fn expected_description(&self) -> &str {
-        self.description.unwrap_or_default()
+    /// given, and NOTHING at all when the request named none or named an empty
+    /// one, since the member is optional and an empty description is no
+    /// description.
+    fn expected_description(&self) -> Option<&'static str> {
+        self.description.filter(|description| !description.is_empty())
     }
 }
 
@@ -130,7 +132,7 @@ async fn configuration_with_updates_in(
     region: &str,
     name: &str,
     updates: usize,
-) -> (String, Vec<String>) {
+) -> (String, Vec<Option<&'static str>>) {
     let reply = emulator
         .call_in(
             region,
@@ -153,7 +155,7 @@ async fn configuration_with_updates_in(
         .unwrap_or_else(|| panic!("case name={name:?}: CreateConfiguration returned no arn"))
         .to_string();
 
-    let mut descriptions = vec![CREATED_DESCRIPTION.to_string()];
+    let mut descriptions = vec![Some(CREATED_DESCRIPTION)];
     for row in update_rows().iter().take(updates) {
         let updated = emulator
             .update_configuration_in(region, &arn, row.description, &row.server_properties)
@@ -163,7 +165,7 @@ async fn configuration_with_updates_in(
             "case {}: expected UpdateConfiguration to succeed, got {} {}",
             row.case, updated.status, updated.body
         );
-        descriptions.push(row.expected_description().to_string());
+        descriptions.push(row.expected_description());
     }
     (arn, descriptions)
 }
@@ -173,7 +175,7 @@ async fn configuration_with_updates(
     emulator: &Emulator,
     name: &str,
     updates: usize,
-) -> (String, Vec<String>) {
+) -> (String, Vec<Option<&'static str>>) {
     configuration_with_updates_in(emulator, REGION, name, updates).await
 }
 
@@ -216,7 +218,7 @@ async fn the_listing_reports_every_stored_revision_in_revision_order() {
             );
             assert_eq!(
                 entry["description"].as_str(),
-                Some(description.as_str()),
+                *description,
                 "case {case} revision {expected_revision}: expected description \
                  {description:?}, got {entry}"
             );

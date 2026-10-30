@@ -289,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // readers answer, so the two cannot drift apart.
         if let Some(configuration_info) = input.configuration_info.as_ref() {
             let resolved = state
-                .configuration_in(&region, &configuration_info.arn)
+                .configuration_in(&region, &configuration_info.arn, now)
                 .and_then(|configuration| configuration.revision(configuration_info.revision));
             if resolved.is_none() {
                 return Err(UpdateClusterKafkaVersionErrorModeled::BadRequestException(

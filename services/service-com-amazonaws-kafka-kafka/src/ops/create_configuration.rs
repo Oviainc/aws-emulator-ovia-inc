@@ -13,6 +13,10 @@
 //! version this service publishes is refused with the modelled
 //! `BadRequestException`, before anything is stored.
 //!
+//! `Description` is optional, and an EMPTY description is no description: a
+//! request that names none and a request that names `""` store the same thing, so
+//! the readers whose own member is optional report both by omitting the member.
+//!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
 //! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
@@ -239,11 +243,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut state = state.lock();
+        let now = std::time::SystemTime::now();
 
         // A configuration name identifies it within an account and region, so a
         // name already in use IN THIS REGION is a conflict; the same name in
-        // another region is a different configuration.
-        if let Some(existing) = state.configuration_arn_for_name(&region, &input.name) {
+        // another region is a different configuration. A configuration whose
+        // asynchronous delete has not completed yet still holds its name — it is
+        // still a configuration of this region — while one the clock has taken
+        // out holds it no longer.
+        if let Some(existing) = state.configuration_arn_for_name(&region, &input.name, now) {
             return Err(
                 CreateConfigurationErrorModeled::ConflictException(ConflictException {
                     invalid_parameter: Some("name".to_string()),
@@ -261,12 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // repeats an earlier one.
         let suffix = state.next_configuration_suffix;
         state.next_configuration_suffix += 1;
-        let configuration = crate::state::ConfigurationRecord::created(
-            &region,
-            suffix,
-            std::time::SystemTime::now(),
-            input,
-        );
+        let configuration = crate::state::ConfigurationRecord::created(&region, suffix, now, input);
 
         let latest = configuration.latest_revision();
         let output = CreateConfigurationOutput {
@@ -286,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // more call. A refused create registers nothing, so the ordinal it
         // reserved goes back: the counter counts configurations ever registered,
         // not calls ever made.
-        if let Err(rejected) = state.register_configuration(configuration) {
+        if let Err(rejected) = state.register_configuration(configuration, now) {
             state.next_configuration_suffix = suffix;
             return Err(match rejected {
                 crate::state::RegisterRejected::RegionQuota => {

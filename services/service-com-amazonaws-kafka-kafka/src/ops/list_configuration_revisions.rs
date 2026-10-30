@@ -221,6 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
 
         // Reporting only: nothing here writes.
         let state = state.lock();
@@ -231,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // page. Resolved before the token and the page size are judged, so a
         // request naming no configuration is told that, whatever else it
         // carries.
-        let Some(configuration) = state.configuration_in(&region, &input.arn) else {
+        let Some(configuration) = state.configuration_in(&region, &input.arn, now) else {
             return Err(ListConfigurationRevisionsErrorModeled::BadRequestException(
                 crate::state::configuration_arn_not_found(),
             )

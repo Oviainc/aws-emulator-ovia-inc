@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteConfiguration
-//! Deletes a stored MSK configuration. The configuration leaves the registry, so the
-//! next reader no longer sees it and its name is free for a later create; the response
-//! reports the `DELETING` state the delete put it in, the same way
+//! Accepts the deletion of a stored MSK configuration. The delete is
+//! ASYNCHRONOUS: the response reports the `DELETING` state it put the configuration
+//! in, the configuration stays a resource every reader resolves and
+//! [`crate::ops::list_configurations`] enumerates in that state, and it leaves the
+//! registry — freeing its name for a later create — once the clock owes its removal
+//! ([`crate::state::CONFIGURATION_DELETION_DELAY`]), the same way
 //! [`crate::ops::delete_cluster`] reports a deleted cluster.
+//!
+//! Deleting a configuration CHANGES it, so it is accepted only from the states a
+//! change is accepted from ([`crate::state::CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM`]):
+//! a configuration whose delete is already in flight is refused with the
+//! state-machine `BadRequestException` naming that set
+//! ([`crate::state::configuration_not_in_accepted_state`]), which is what tells such
+//! a refusal apart from an ARN this endpoint cannot resolve at all.
 //!
 //! A configuration a cluster was created with is still being used by that cluster, so
 //! deleting it is refused with a `BadRequestException` and the configuration stays
@@ -13,7 +23,7 @@
 //! stops holding the configuration down once those clusters are gone.
 //!
 //! An `Arn` this endpoint's region holds no configuration for — not shaped like an MSK
-//! configuration ARN, absent, already deleted, or belonging to another region — is a
+//! configuration ARN, absent, deleted and gone, or belonging to another region — is a
 //! `BadRequestException` carrying
 //! [`crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE`], and NOT the
 //! `NotFoundException` the other resource families answer: every operation of the
@@ -167,25 +177,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
 
         let mut state = state.lock();
         // One condition, one refusal: an `Arn` that resolves to no configuration
         // of this region is a bad request, whether it is malformed, names a
-        // configuration another region holds, or named one a delete already
-        // took. Resolved before anything is removed, through the same regional
-        // lookup the readers use, so a delete and a describe agree on which
-        // configurations this endpoint holds.
-        if state.configuration_in(&region, &input.arn).is_none() {
+        // configuration another region holds, or named one whose asynchronous
+        // delete has already completed. Resolved before anything is written,
+        // through the same regional lookup the readers use, so a delete and a
+        // describe agree on which configurations this endpoint holds.
+        let Some(configuration) = state.configuration_in(&region, &input.arn, now) else {
             return Err(DeleteConfigurationErrorModeled::BadRequestException(
                 crate::state::configuration_arn_not_found(),
+            )
+            .into());
+        };
+
+        // A delete CHANGES the configuration, so it is gated on the state the
+        // configuration is in: one whose delete is already in flight is
+        // reported as the state-machine refusal rather than as a reference
+        // nothing resolves, since the resource is still right there.
+        let accepted = crate::state::CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM;
+        if !accepted.contains(&configuration.state.as_str()) {
+            return Err(DeleteConfigurationErrorModeled::BadRequestException(
+                crate::state::configuration_not_in_accepted_state(&accepted),
             )
             .into());
         }
 
         // A cluster created with this configuration still uses it, so the
         // configuration cannot go: deleting it would leave that cluster naming a
-        // configuration nothing holds. Refused before the removal, so a refused
-        // delete leaves the configuration exactly as it was.
+        // configuration nothing holds. Refused before the deletion is accepted,
+        // so a refused delete leaves the configuration exactly as it was.
         let holders = state.clusters_using_configuration(&region, &input.arn);
         if !holders.is_empty() {
             return Err(
@@ -197,10 +220,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        state.unregister_configuration(&region, &input.arn);
+        // The one path that accepts a configuration's deletion: it moves the
+        // record to `DELETING` and records the instant the clock owes its
+        // removal, so the state this response reports is the state the registry
+        // is now in rather than a word about a record that is already gone.
+        let Some(deleting) = state.begin_configuration_deletion(&region, &input.arn, now) else {
+            return Err(DeleteConfigurationErrorModeled::BadRequestException(
+                crate::state::configuration_arn_not_found(),
+            )
+            .into());
+        };
         Ok(DeleteConfigurationOutput {
-            arn: Some(input.arn),
-            state: Some(crate::state::CONFIGURATION_STATE_DELETING.to_string()),
+            arn: Some(deleting.arn.clone()),
+            state: Some(deleting.state.clone()),
         })
     }
 }

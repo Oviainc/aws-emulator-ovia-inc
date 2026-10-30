@@ -259,7 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // revision of the number given: the same refusal the configuration
         // readers answer, so the two cannot drift apart.
         let resolved = state
-            .configuration_in(&region, &input.configuration_info.arn)
+            .configuration_in(&region, &input.configuration_info.arn, now)
             .and_then(|configuration| {
                 configuration.revision(input.configuration_info.revision)
             });

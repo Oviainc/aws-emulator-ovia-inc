@@ -23,8 +23,8 @@ use serde_json::{json, Value};
 // shares — the assertion lives there so this suite and the deletion suite cannot
 // drift apart on what that refusal is.
 use super::kafka_harness::{
-    assert_configuration_arn_resolves_to_nothing, pct, ConfigurationRequest, Emulator, Reply,
-    ACCOUNT, REGION,
+    assert_configuration_arn_resolves_to_nothing, assert_configuration_state_refusal, pct,
+    sleep_past_configuration_deletion, ConfigurationRequest, Emulator, Reply, ACCOUNT, REGION,
 };
 
 /// Every operation that takes a configuration `Arn`, as
@@ -107,6 +107,10 @@ async fn every_configuration_operation_refuses_an_unresolvable_arn_alike() {
         "expected the delete that sets the already-deleted row up to succeed, got {} {}",
         gone.status, gone.body
     );
+    // The delete is asynchronous, so the configuration resolves until the clock
+    // owes its removal: waited out here, because the row below is about an ARN
+    // that resolves to NOTHING, not one whose delete is still in flight.
+    sleep_past_configuration_deletion();
 
     // Each way an `Arn` can resolve to no configuration of this endpoint.
     let rows: Vec<(&str, String)> = vec![
@@ -174,12 +178,26 @@ async fn every_configuration_operation_refuses_an_unresolvable_arn_alike() {
     );
 }
 
-/// RULE: a configuration delete is reported through the state the registry is
-/// left in, so the read that cannot resolve the ARN is the ONLY way to observe
-/// that the configuration is gone — and it answers the same terminal refusal
-/// however many times it is polled, whichever reader polls it.
+/// What one operation of the family must answer against a configuration whose
+/// delete is in flight: a call that CHANGES the configuration is refused on the
+/// state it is in, a reader that resolves a reference it holds answers it, and a
+/// reader naming a revision the configuration never issued is still the
+/// unresolvable-reference refusal (the reference, not the state, is what fails).
+enum InFlight {
+    StateRefusal,
+    Served,
+    ReferenceRefusal,
+}
+
+/// RULE: the two refusals of the configuration family discriminate a
+/// state-machine refusal from a lookup miss. While a delete is in flight the
+/// configuration is still a resource this endpoint holds: every reader resolves
+/// it `DELETING` and every call that would CHANGE it is refused on its state.
+/// Only once the clock has completed the removal does the SAME call become the
+/// unresolvable-reference refusal — and it answers that same terminal refusal
+/// however many times it is polled, whichever operation polls it.
 #[tokio::test]
-async fn the_read_after_a_delete_is_the_terminal_refusal_every_time() {
+async fn a_delete_in_flight_refuses_on_state_and_only_then_on_the_lookup() {
     let emulator = Emulator::new();
     let arn = emulator
         .create_configuration_row_ok_in(REGION, &ConfigurationRequest::named("polled"))
@@ -208,8 +226,39 @@ async fn the_read_after_a_delete_is_the_terminal_refusal_every_time() {
         deleted.status, deleted.body
     );
 
-    // A poll loop reads it again and again: every attempt, from every reader,
-    // is the same refusal — no attempt resolves it and none changes the answer.
+    // A poll loop drives every operation of the family again and again while the
+    // delete is in flight: the readers resolve it, and the calls that would
+    // change it are refused on the state it is in — never reported as an ARN
+    // that names nothing.
+    for attempt in 1..=3 {
+        for operation in operations() {
+            let expected = match operation.0 {
+                "UpdateConfiguration" | "DeleteConfiguration" => InFlight::StateRefusal,
+                "DescribeConfigurationRevision/illegal-revision" => InFlight::ReferenceRefusal,
+                _ => InFlight::Served,
+            };
+            let case = format!("in-flight attempt {attempt}/{}", operation.0);
+            let reply = call(&emulator, REGION, &operation, &arn).await;
+            match expected {
+                InFlight::StateRefusal => assert_configuration_state_refusal(&reply, &case),
+                InFlight::ReferenceRefusal => {
+                    assert_configuration_arn_resolves_to_nothing(&reply, &case, &arn, REGION)
+                }
+                InFlight::Served => assert_eq!(
+                    reply.status, 200,
+                    "case {case}: a reader must still resolve a configuration whose delete \
+                     is in flight, got {} {}",
+                    reply.status, reply.body
+                ),
+            }
+        }
+    }
+
+    sleep_past_configuration_deletion();
+
+    // The removal has come due, so the same calls are now the one terminal
+    // refusal — every attempt, from every operation, and no attempt changes the
+    // answer.
     for attempt in 1..=3 {
         for operation in operations() {
             let reply = call(&emulator, REGION, &operation, &arn).await;

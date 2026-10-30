@@ -84,9 +84,11 @@ struct RevisionRow {
 
 impl RevisionRow {
     /// What `ConfigurationRevision$Description` must report: the description as
-    /// given, and the empty string when the request named none.
-    fn expected_description(&self) -> &str {
-        self.description.unwrap_or_default()
+    /// given, and NOTHING at all when the request named none or named an empty
+    /// one — the member is optional and an empty description is no description,
+    /// so it is left out.
+    fn expected_description(&self) -> Option<&'static str> {
+        self.description.filter(|description| !description.is_empty())
     }
 }
 
@@ -160,10 +162,10 @@ async fn each_update_appends_the_next_revision_and_leaves_earlier_ones_untouched
     let arn = create_ok(&emulator, "appended", &created_body).await;
 
     // Revision 1 is the body the create stored, with the description it gave.
-    let mut stored: Vec<(String, i64, String, Vec<u8>)> = vec![(
+    let mut stored: Vec<(String, i64, Option<&'static str>, Vec<u8>)> = vec![(
         CREATED_DESCRIPTION.to_string(),
         1,
-        CREATED_DESCRIPTION.to_string(),
+        Some(CREATED_DESCRIPTION),
         created_body,
     )];
 
@@ -193,7 +195,7 @@ async fn each_update_appends_the_next_revision_and_leaves_earlier_ones_untouched
         );
         assert_eq!(
             reply.at("/latestRevision/description").as_str(),
-            Some(row.expected_description()),
+            row.expected_description(),
             "case {}: expected description {:?}, got {}",
             row.case,
             row.expected_description(),
@@ -211,7 +213,7 @@ async fn each_update_appends_the_next_revision_and_leaves_earlier_ones_untouched
         stored.push((
             row.case.to_string(),
             expected_revision,
-            row.expected_description().to_string(),
+            row.expected_description(),
             row.server_properties.clone(),
         ));
 
@@ -232,7 +234,7 @@ async fn each_update_appends_the_next_revision_and_leaves_earlier_ones_untouched
         );
         assert_eq!(
             described.at("/latestRevision/description").as_str(),
-            Some(row.expected_description()),
+            row.expected_description(),
             "case {}: DescribeConfiguration must report the latest revision's description, got {}",
             row.case,
             described.body
@@ -261,7 +263,7 @@ async fn each_update_appends_the_next_revision_and_leaves_earlier_ones_untouched
             );
             assert_eq!(
                 read.at("/description").as_str(),
-                Some(description.as_str()),
+                *description,
                 "case {case} revision {revision}: expected description {description:?}, got {}",
                 read.body
             );

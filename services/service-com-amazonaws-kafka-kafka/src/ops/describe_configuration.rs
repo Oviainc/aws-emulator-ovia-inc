@@ -3,13 +3,20 @@
 //! @op DescribeConfiguration
 //! Reports the stored MSK configuration an ARN names, rendering the same record
 //! `ListConfigurations` pages through ([`crate::state::ConfigurationRecord::to_configuration`]),
-//! so the two readers cannot disagree about one configuration.
+//! so the two readers cannot disagree about one configuration — including the
+//! `DELETING` state of one whose asynchronous delete is still in flight, which is
+//! a configuration this endpoint still holds.
+//!
+//! `Description` is OPTIONAL on this operation's output, so a configuration with
+//! no description — one created without the member, or with an empty one, which
+//! is the same thing — is reported with the member ABSENT rather than with an
+//! empty string.
 //!
 //! A configuration ARN belongs to one region, so a regional endpoint resolves
 //! only its own. ONE condition, one refusal: an `Arn` this endpoint resolves to
-//! no configuration — not shaped like an MSK configuration ARN, absent, already
-//! deleted, or belonging to another region — is a `BadRequestException` (400)
-//! carrying [`crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE`], the one
+//! no configuration — not shaped like an MSK configuration ARN, never minted,
+//! deleted and gone, or belonging to another region — is a `BadRequestException`
+//! (400) carrying [`crate::state::CONFIGURATION_ARN_NOT_FOUND_MESSAGE`], the one
 //! envelope every operation of the configuration family reports an unresolvable
 //! configuration reference with
 //! ([`crate::state::configuration_arn_not_found`]), and NOT the
@@ -175,17 +182,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
 
-        // Reporting only: nothing here writes. A configuration is stored
-        // `ACTIVE`, so the clock owes it no transition for this read to
-        // materialise.
+        // Reporting only: nothing here writes. A configuration a delete has
+        // accepted is still a resource of this endpoint until the clock owes its
+        // removal, which the lookup below applies without pruning anything, so
+        // this read leaves the registry exactly as it found it.
         let state = state.lock();
         // ONE condition, one refusal: an `Arn` that resolves to no configuration
         // of this endpoint's region is the configuration family's
-        // unresolvable-reference bad request, whether it is malformed, absent,
-        // already deleted, or another region's. Since only an ARN the registry
-        // minted can resolve at all, one lookup decides it.
-        let Some(configuration) = state.configuration_in(&region, &input.arn) else {
+        // unresolvable-reference bad request, whether it is malformed, never
+        // minted, deleted and gone, or another region's. Since only an ARN the
+        // registry minted can resolve at all, one lookup decides it.
+        let Some(configuration) = state.configuration_in(&region, &input.arn, now) else {
             return Err(DescribeConfigurationErrorModeled::BadRequestException(
                 crate::state::configuration_arn_not_found(),
             )
@@ -193,12 +202,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Rendered through the ONE rendering of a stored configuration, so this
         // reader and `ListConfigurations` report the same configuration the same
-        // way.
+        // way — including the `DELETING` state a configuration whose delete is
+        // in flight is in.
         let reported = configuration.to_configuration();
         Ok(DescribeConfigurationOutput {
             arn: Some(reported.arn),
             creation_time: Some(reported.creation_time),
-            description: Some(reported.description),
+            // `Description` is OPTIONAL on this output shape, so a configuration
+            // with no description is reported by omitting the member rather
+            // than by the empty string the required member on `Configuration`
+            // forces.
+            description: configuration.description.clone(),
             kafka_versions: Some(reported.kafka_versions),
             latest_revision: Some(reported.latest_revision),
             name: Some(reported.name),

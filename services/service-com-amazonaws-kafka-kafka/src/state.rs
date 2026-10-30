@@ -32,6 +32,19 @@
 //! [`ConfigurationRecord::revision`], so no update rewrites a revision an
 //! earlier call already stored.
 //!
+//! A configuration's deletion is ASYNCHRONOUS, so it is accepted on the record
+//! rather than applied to the registry: `DeleteConfiguration` moves it to
+//! `DELETING` through [`ComAmazonawsKafkaKafkaState::begin_configuration_deletion`],
+//! which records the instant the clock owes its removal, and the configuration
+//! stays a resource every reader resolves and lists in that state until then.
+//! The lookups ([`ComAmazonawsKafkaKafkaState::configuration_in`] for a read and
+//! [`ComAmazonawsKafkaKafkaState::settled_configuration_in_mut`] for a call that
+//! writes) are what materialise that removal, so every reader agrees about when
+//! a deleted configuration is gone, and a call that CHANGES a configuration is
+//! gated on the state it is in
+//! ([`CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM`]) rather than reporting a
+//! resource it still holds as a reference it cannot resolve.
+//!
 //! The topic registry lives beside it, keyed by (cluster ARN, topic name): a topic
 //! belongs to exactly one cluster, so `CreateTopic`, `DescribeTopic`, `ListTopics`
 //! and `DeleteTopic` all resolve the cluster first and then the topic, through
@@ -1319,16 +1332,24 @@ pub struct ConfigurationRecord {
     /// that created it, and the region segment of its ARN. A configuration name
     /// is unique per account and region, so this is half of its registry key.
     pub region: String,
-    /// The description as the request gave it — empty when it gave none, since
-    /// `Configuration$Description` is a required member of the reported shape.
-    pub description: String,
+    /// The description this configuration has, or `None` when it has none — the
+    /// request either omitted `Description` or carried an empty one, which is
+    /// the same thing ([`stored_description`]). Every reader whose own
+    /// `Description` member is optional reports no description by OMITTING the
+    /// member.
+    pub description: Option<String>,
     /// The Apache Kafka versions the configuration may be used with, as
     /// submitted; empty when the request named none.
     pub kafka_versions: Vec<String>,
     pub creation_time: SystemTime,
     /// A `ConfigurationState` value. A configuration AWS accepts is usable at
-    /// once, so it is created `ACTIVE` and no clock transition is owed to it.
+    /// once, so it is created `ACTIVE`; a delete moves it to `DELETING` through
+    /// [`Self::begin_deletion`].
     pub state: String,
+    /// Set by `DeleteConfiguration`: the instant the clock owes this
+    /// configuration's removal from the registry. `None` for a configuration
+    /// nobody has deleted. Stored, never slept on.
+    pub removal_due: Option<SystemTime>,
     /// Every revision in revision order, so the first is revision 1 and the last
     /// is the latest. Never empty: a configuration exists only once its first
     /// revision has been stored.
@@ -1342,7 +1363,11 @@ pub struct ConfigurationRevisionRecord {
     /// 1-based revision number, as `ConfigurationRevision$Revision` reports it.
     pub revision: i64,
     pub creation_time: SystemTime,
-    pub description: String,
+    /// The description the call that stored this revision gave it, or `None`
+    /// when it gave none ([`stored_description`]) —
+    /// `ConfigurationRevision$Description` is optional, so a revision with no
+    /// description is reported by omitting the member.
+    pub description: Option<String>,
     /// The `server.properties` contents exactly as submitted, kept as bytes
     /// because the member is a blob and may hold any byte string.
     pub server_properties: Vec<u8>,
@@ -1354,12 +1379,69 @@ pub struct ConfigurationRevisionRecord {
 /// clock owes it no transition.
 pub const CONFIGURATION_STATE_ACTIVE: &str = "ACTIVE";
 
-/// The `ConfigurationState` a configuration a delete accepted is reported in: the
-/// delete is what starts it, so no configuration is ever stored in this state —
-/// it is what [`ComAmazonawsKafkaKafkaState::unregister_configuration`] leaves
-/// behind for the response to report, the same way a deleted cluster is reported
-/// `DELETING`.
+/// The `ConfigurationState` a configuration a delete accepted is reported in,
+/// the same way a deleted cluster is reported `DELETING`. The delete is
+/// asynchronous, so this state is STORED on the record
+/// ([`ConfigurationRecord::begin_deletion`]) and reported by every reader until
+/// the clock owes the removal: a configuration on its way out is still a
+/// resource of this endpoint, not an unresolvable reference.
 pub const CONFIGURATION_STATE_DELETING: &str = "DELETING";
+
+/// How long after `DeleteConfiguration` a configuration marked `DELETING` is
+/// actually gone from the registry.
+///
+/// CHOSEN, not documented: Amazon MSK answers the delete with the non-terminal
+/// `DELETING` state and completes the removal on its own, which takes as long as
+/// it takes. The span is never zero, so a caller that retries its update right
+/// after the delete still meets the configuration in `DELETING` — and short
+/// enough that a caller polling the deletion to completion sees it leave the
+/// registry.
+pub const CONFIGURATION_DELETION_DELAY: Duration = Duration::from_secs(3);
+
+/// The description a configuration or one of its revisions stores for the
+/// `Description` a request submitted: the value where the request carried one,
+/// and NONE where it omitted the member or carried an empty string.
+///
+/// An empty description is no description: Amazon MSK describes a configuration
+/// created with `Description: ""` back with the member ABSENT, exactly as it
+/// describes one created without the member at all, so the two requests store
+/// the same thing and no reader has to decide between them. Applied on the two
+/// paths that store a description (a create and an append), so the record holds
+/// one normalised value whichever call wrote it.
+pub fn stored_description(submitted: Option<String>) -> Option<String> {
+    submitted.filter(|description| !description.is_empty())
+}
+
+/// The `ConfigurationState` values a call that CHANGES a configuration is
+/// accepted from: a configuration is only ever changed while it is `ACTIVE`,
+/// since the other two states (`DELETING`, `DELETE_FAILED`) are a configuration
+/// the service is taking out. Named here so the update and the delete gate on
+/// one set and report the one refusal
+/// ([`configuration_not_in_accepted_state`]) built from it.
+pub const CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM: [&str; 1] =
+    [CONFIGURATION_STATE_ACTIVE];
+
+/// How Amazon MSK refuses a call against a resource whose current state that
+/// call is not accepted from: one fixed sentence that names the set of states it
+/// IS accepted from, which is what tells such a refusal apart from a reference
+/// the service cannot resolve at all
+/// ([`CONFIGURATION_ARN_NOT_FOUND_MESSAGE`]).
+///
+/// `accepted` is that set, in the spelling the `ConfigurationState` enum
+/// declares — so the sentence is built from the gate the handler applied rather
+/// than written out beside it, and a gate that admits more than one state says
+/// so.
+pub fn configuration_not_in_accepted_state(accepted: &[&str]) -> BadRequestException {
+    BadRequestException {
+        // The configuration the `Arn` names is what the call was refused on, as
+        // the cluster refusals name the cluster's own ARN member.
+        invalid_parameter: Some("Arn".to_string()),
+        message: Some(format!(
+            "This operation is only valid for resources that are in one of the following states :[{}]",
+            accepted.join(", ")
+        )),
+    }
+}
 
 /// What Amazon MSK answers any configuration operation whose configuration
 /// reference — its `Arn`, or that `Arn` together with the `Revision` of it being
@@ -2693,9 +2775,24 @@ impl ComAmazonawsKafkaKafkaState {
 
     /// The ARN registered for the configuration `name` in `region`, if any. This
     /// is the lookup that makes a repeated `CreateConfiguration` a conflict.
-    pub fn configuration_arn_for_name(&self, region: &str, name: &str) -> Option<&String> {
-        self.configuration_arn_by_name
-            .get(&(region.to_string(), name.to_string()))
+    ///
+    /// A configuration whose removal the clock already owes holds its name no
+    /// longer, so the name is free again even before anything pruned the record;
+    /// one that is `DELETING` with its removal still ahead DOES still hold it,
+    /// because it is still a configuration of this region.
+    pub fn configuration_arn_for_name(
+        &self,
+        region: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&String> {
+        let arn = self
+            .configuration_arn_by_name
+            .get(&(region.to_string(), name.to_string()))?;
+        self.configurations
+            .get(arn)
+            .filter(|configuration| configuration.is_live(now))
+            .map(|_| arn)
     }
 
     /// How many configurations `region` currently holds — what the per-region
@@ -2708,31 +2805,90 @@ impl ComAmazonawsKafkaKafkaState {
             .unwrap_or(0)
     }
 
-    /// The configuration `arn` names, as an endpoint for `region` sees it.
+    /// The configuration `arn` names, as an endpoint for `region` sees it at
+    /// `now`.
     ///
     /// A regional endpoint serves only its own region's configurations, so a
     /// well-formed ARN belonging to another region resolves to `None` exactly as
     /// an absent one does — the same rule [`Self::cluster_in`] follows, so the
     /// readers and `ListConfigurations` agree on which configurations this
-    /// endpoint holds.
-    pub fn configuration_in(&self, region: &str, arn: &str) -> Option<&ConfigurationRecord> {
+    /// endpoint holds. A configuration whose removal the clock already owes is
+    /// gone for the same reason, whether or not the record has been pruned yet;
+    /// a `DELETING` one whose removal is still ahead resolves, since the
+    /// asynchronous delete has not taken it yet.
+    pub fn configuration_in(
+        &self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&ConfigurationRecord> {
         self.configurations
             .get(arn)
-            .filter(|configuration| configuration.region == region)
+            .filter(|configuration| configuration.region == region && configuration.is_live(now))
     }
 
-    /// The configuration `arn` names, mutably, as an endpoint for `region` sees
-    /// it — the write counterpart of [`Self::configuration_in`], following the
-    /// same regional rule, so an update and a read resolve a configuration
-    /// identically.
-    pub fn configuration_in_mut(
+    /// The same lookup for a call that WRITES, with the removal the clock
+    /// already owed THIS configuration materialised: a configuration whose
+    /// removal is due leaves the registry here (so this answers `None` and its
+    /// name is free again), and any other resolves mutably.
+    ///
+    /// Scoped to the one configuration being addressed, for the same reason
+    /// [`Self::settled_cluster_in`] is: no other configuration's removal is this
+    /// request's business.
+    pub fn settled_configuration_in_mut(
         &mut self,
         region: &str,
         arn: &str,
+        now: SystemTime,
     ) -> Option<&mut ConfigurationRecord> {
-        self.configurations
-            .get_mut(arn)
-            .filter(|configuration| configuration.region == region)
+        let configuration = self.configurations.get(arn)?;
+        if configuration.region != region {
+            return None;
+        }
+        if !configuration.is_live(now) {
+            self.unregister_configuration(region, arn);
+            return None;
+        }
+        self.configurations.get_mut(arn)
+    }
+
+    /// Accept the deletion of the configuration `arn` names, as an endpoint for
+    /// `region` sees it, handing back the record as the caller must now see it:
+    /// `DELETING`, with the instant the clock owes its removal set.
+    ///
+    /// Answers `None` when this region holds no such configuration — including
+    /// one whose removal the clock already owed, which the settling lookup
+    /// materialises first, so a configuration is never deleted twice. Idempotent
+    /// through [`ConfigurationRecord::begin_deletion`].
+    pub fn begin_configuration_deletion(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&ConfigurationRecord> {
+        let configuration = self.settled_configuration_in_mut(region, arn, now)?;
+        configuration.begin_deletion(now);
+        Some(configuration)
+    }
+
+    /// Drop the configurations of `region` whose removal the clock owed by
+    /// `now`.
+    ///
+    /// Every one of them was due at that same instant whether or not anybody
+    /// addressed it, so this materialises nothing a scoped lookup would not:
+    /// it is what lets the registry's ceilings bound the records actually held,
+    /// rather than letting a caller looping create-and-delete under fresh names
+    /// grow it past them.
+    fn prune_removed_configurations(&mut self, region: &str, now: SystemTime) {
+        let removed: Vec<String> = self
+            .configurations
+            .values()
+            .filter(|configuration| configuration.region == region && !configuration.is_live(now))
+            .map(|configuration| configuration.arn.clone())
+            .collect();
+        for arn in removed {
+            self.unregister_configuration(region, &arn);
+        }
     }
 
     /// Add `configuration` to every index that must know about it: the one
@@ -2746,7 +2902,12 @@ impl ComAmazonawsKafkaKafkaState {
     pub fn register_configuration(
         &mut self,
         configuration: ConfigurationRecord,
+        now: SystemTime,
     ) -> Result<(), RegisterRejected> {
+        // Materialise every removal this region's configurations are already
+        // owed before the ceilings are checked, so they bound the records the
+        // registry really holds.
+        self.prune_removed_configurations(&configuration.region, now);
         if self.configurations.contains_key(&configuration.arn) {
             return Err(RegisterRejected::DuplicateArn);
         }
@@ -2775,7 +2936,8 @@ impl ComAmazonawsKafkaKafkaState {
     /// Remove the configuration `arn` names from every index, as an endpoint for
     /// `region` sees it, handing the record back. The one removal path, so the
     /// ARN registry, the (region, name) index and the per-region count cannot
-    /// drift apart — the counterpart of [`Self::register_configuration`].
+    /// drift apart — the counterpart of [`Self::register_configuration`], and
+    /// what the settling lookups call once the clock owes a removal.
     ///
     /// Follows the same regional rule as [`Self::configuration_in`]: a
     /// well-formed ARN belonging to another region removes nothing and resolves
@@ -2787,7 +2949,13 @@ impl ComAmazonawsKafkaKafkaState {
         region: &str,
         arn: &str,
     ) -> Option<ConfigurationRecord> {
-        self.configuration_in(region, arn)?;
+        if self
+            .configurations
+            .get(arn)
+            .is_none_or(|configuration| configuration.region != region)
+        {
+            return None;
+        }
         let configuration = self.configurations.remove(arn)?;
         self.configuration_arn_by_name
             .remove(&(configuration.region.clone(), configuration.name.clone()));
@@ -4165,10 +4333,10 @@ impl ConfigurationRecord {
                 uuid_v4_shaped_from_digest(&digest)
             ),
         );
-        // `Configuration$Description` is a required member of the reported
-        // shape, so a request that named none stores the empty description
-        // rather than leaving the reader with nothing to report.
-        let description = input.description.unwrap_or_default();
+        // `Description` is optional on the request and on the readers that
+        // report it, and an empty description is no description, so the one
+        // normalisation decides what is stored.
+        let description = stored_description(input.description);
         Self {
             arn,
             name,
@@ -4176,6 +4344,7 @@ impl ConfigurationRecord {
             kafka_versions: input.kafka_versions.unwrap_or_default(),
             creation_time: now,
             state: CONFIGURATION_STATE_ACTIVE.to_string(),
+            removal_due: None,
             revisions: vec![ConfigurationRevisionRecord {
                 revision: 1,
                 creation_time: now,
@@ -4184,6 +4353,26 @@ impl ConfigurationRecord {
             }],
             description,
         }
+    }
+
+    /// Whether this configuration is still part of the registry a caller at
+    /// `now` sees: one whose removal the clock already owes is gone, whether or
+    /// not the record has been pruned yet.
+    pub fn is_live(&self, now: SystemTime) -> bool {
+        self.removal_due.is_none_or(|due| now < due)
+    }
+
+    /// Accept this configuration's deletion at `now`: move it to `DELETING` and
+    /// record the instant the clock owes its removal from the registry.
+    ///
+    /// Idempotent — a configuration already `DELETING` keeps the removal instant
+    /// it was given, so repeating the call cannot postpone the removal.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.removal_due.is_some() {
+            return;
+        }
+        self.state = CONFIGURATION_STATE_DELETING.to_string();
+        self.removal_due = Some(now + CONFIGURATION_DELETION_DELAY);
     }
 
     /// The newest stored revision. Infallible on a registered configuration:
@@ -4201,8 +4390,11 @@ impl ConfigurationRecord {
     /// becomes the revision one past the current latest and no stored revision
     /// is ever rewritten, which is what lets a reader of an earlier revision see
     /// the body that revision was created with. `description` is that revision's
-    /// own description — empty when the request named none, since
-    /// `ConfigurationRevision$Description` reports it.
+    /// own description, normalised through [`stored_description`] — `None` when
+    /// the request named none or named an empty one, since
+    /// `ConfigurationRevision$Description` is optional and reports a revision
+    /// with no description by omitting the member. The configuration's own
+    /// description is the one it was created with.
     ///
     /// This is the one append path, so it is also the one place the history's
     /// ceilings are enforced: it refuses, storing nothing, a body past
@@ -4211,7 +4403,7 @@ impl ConfigurationRecord {
     pub fn append_revision(
         &mut self,
         now: SystemTime,
-        description: String,
+        description: Option<String>,
         server_properties: Vec<u8>,
     ) -> Result<&ConfigurationRevisionRecord, RevisionRejected> {
         if server_properties_too_large(&server_properties) {
@@ -4224,7 +4416,7 @@ impl ConfigurationRecord {
         self.revisions.push(ConfigurationRevisionRecord {
             revision,
             creation_time: now,
-            description,
+            description: stored_description(description),
             server_properties,
         });
         Ok(self.latest_revision())
@@ -4247,7 +4439,14 @@ impl ConfigurationRecord {
         Configuration {
             arn: self.arn.clone(),
             creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
-            description: self.description.clone(),
+            // `Configuration$Description` is `@required` on this shape, so the
+            // member is always written and a configuration that has no
+            // description can only be rendered with the empty string here. The
+            // readers whose own member is OPTIONAL
+            // (`DescribeConfigurationResponse$Description`) omit it instead —
+            // which is also why the empty string a request may submit is stored
+            // as no description at all.
+            description: self.description.clone().unwrap_or_default(),
             kafka_versions: self.kafka_versions.clone(),
             latest_revision: latest.to_configuration_revision(),
             name: self.name.clone(),
@@ -4262,7 +4461,9 @@ impl ConfigurationRevisionRecord {
     pub fn to_configuration_revision(&self) -> ConfigurationRevision {
         ConfigurationRevision {
             creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
-            description: Some(self.description.clone()),
+            // Optional on the shape, so a revision that has no description is
+            // reported by leaving the member out.
+            description: self.description.clone(),
             revision: self.revision,
         }
     }

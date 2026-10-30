@@ -130,9 +130,12 @@ fn entry_for<'a>(listed: &'a Value, arn: &str) -> Option<&'a Value> {
 }
 
 /// RULE: a created configuration is stored and every later `ListConfigurations`
-/// reports it from that record — its own name, the description it was given (the
-/// empty string when it was given none), the Kafka versions it named, revision 1
-/// and state `ACTIVE` — with a distinct ARN of the modelled form.
+/// reports it from that record — its own name, the description it was given, the
+/// Kafka versions it named, revision 1 and state `ACTIVE` — with a distinct ARN
+/// of the modelled form. A description the request did NOT give is reported by
+/// omitting every member the model leaves optional
+/// (`ConfigurationRevision$Description`), while `Configuration$Description`, which
+/// the model marks `@required`, can only carry the empty string.
 #[tokio::test]
 async fn a_created_configuration_is_reported_by_every_later_list() {
     let emulator = Emulator::new();
@@ -171,8 +174,9 @@ async fn a_created_configuration_is_reported_by_every_later_list() {
         );
         assert_eq!(
             reply.body["latestRevision"]["description"].as_str(),
-            Some(row.expected_description().as_str()),
-            "case {row:?}: the revision carries the request's description: {}",
+            row.expected_optional_description(),
+            "case {row:?}: the revision carries the request's description, and no member \
+             at all when it named none: {}",
             reply.body
         );
         let created_at = &reply.body["creationTime"];
@@ -250,7 +254,7 @@ async fn a_created_configuration_is_reported_by_every_later_list() {
         );
         assert_eq!(
             entry["latestRevision"]["description"].as_str(),
-            Some(row.expected_description().as_str()),
+            row.expected_optional_description(),
             "case {row:?}: listed the wrong revision description: {entry}"
         );
         assert_eq!(
@@ -272,7 +276,11 @@ async fn a_created_configuration_is_reported_by_every_later_list() {
         "ListConfigurations must not change what a later caller sees"
     );
 
-    // The two readers of one stored configuration must agree member for member.
+    // The two readers of one stored configuration must agree member for member,
+    // save for the one member the two shapes model differently: `Description` is
+    // `@required` on the `Configuration` the listing reports and OPTIONAL on
+    // `DescribeConfigurationResponse`, so a configuration with no description is
+    // the empty string in the listing and absent from the describe.
     for (row, create_body) in &created {
         let arn = create_body["arn"].as_str().expect("a created arn");
         let described = describe(&emulator, arn).await;
@@ -286,7 +294,6 @@ async fn a_created_configuration_is_reported_by_every_later_list() {
         for member in [
             "arn",
             "name",
-            "description",
             "kafkaVersions",
             "state",
             "creationTime",
@@ -299,6 +306,19 @@ async fn a_created_configuration_is_reported_by_every_later_list() {
                 described.body
             );
         }
+        assert_eq!(
+            described.body["description"].as_str(),
+            row.expected_optional_description(),
+            "case {row:?}: DescribeConfiguration reports an optional Description, so a \
+             configuration created without one carries no member: {}",
+            described.body
+        );
+        assert_eq!(
+            listed_entry["description"].as_str(),
+            Some(row.expected_description().as_str()),
+            "case {row:?}: Configuration$Description is @required, so the listing always \
+             writes it: {listed_entry}"
+        );
     }
 }
 
