@@ -9,13 +9,18 @@
 //!
 //! The locale slice (`CreateBotLocale`, `DescribeBotLocale`) is served the same way out
 //! of `bot_locales`, keyed by the bot, bot version and locale the request names.
+//!
+//! The slot type slice (`CreateSlotType`, `DescribeSlotType`) is served out of
+//! `slot_types`: a custom slot type is defined inside one locale of one bot version, so
+//! every record carries that triple and every read is scoped by it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AudioFillerSettings, BotMember, BotSummary, DataPrivacy, ErrorLogSettings,
-    GenerativeAISettings, SpeakerDiarizationSettings, SpeechRecognitionSettings,
+    AudioFillerSettings, BotMember, BotSummary, CompositeSlotTypeSetting, DataPrivacy,
+    ErrorLogSettings, ExternalSourceSetting, GenerativeAISettings, SlotTypeValue,
+    SlotValueSelectionSetting, SpeakerDiarizationSettings, SpeechRecognitionSettings,
     UnifiedSpeechSettings, VoiceSettings,
 };
 
@@ -130,6 +135,17 @@ pub const CREATION_SETTLES_AFTER: Duration = Duration::from_millis(500);
 /// can grow.
 pub const BOTS_PER_ACCOUNT_QUOTA: usize = 100;
 
+/// How many slot types one bot locale may hold: the AWS Lex V2 model-building quota on
+/// the slot types of a bot locale, which is adjustable on request, at the default this
+/// emulator enforces.
+///
+/// `CreateSlotType` answers the modelled `ServiceQuotaExceededException` ("You have
+/// reached a quota for your bot", HTTP 402) once the locale holds this many, which is
+/// what bounds the stored slot types: at most [`BOTS_PER_ACCOUNT_QUOTA`] bots times the
+/// locale ids of [`SUPPORTED_LOCALES`] times this many records, so a caller cannot grow
+/// that map past it.
+pub const SLOT_TYPES_PER_LOCALE_QUOTA: usize = 1_000;
+
 /// The largest page `ListBots` returns, which is the modelled `MaxResults` maximum
 /// (`smithy_query(query="operation",operation="ListBots")`: range 1..1000). It also
 /// caps a listing that asks for no page size, so no single response is unbounded; the
@@ -222,6 +238,20 @@ fn settle_status(status: &mut String, pending: &mut Option<(String, Instant)>) {
     }
 }
 
+/// The `resolutionStrategy` a slot type resolves values under when a create names no
+/// `valueSelectionSetting`: the member's own documentation
+/// (`smithy_query(query="doc",shape="SlotValueSelectionSetting",member="resolutionStrategy")`)
+/// says the default is the original value the user entered. The constant is the member of
+/// the modelled `SlotValueResolutionStrategy` enum
+/// (`smithy_query(query="shape",shape="SlotValueResolutionStrategy")`:
+/// OriginalValue | TopResolution | Concatenation) that names that strategy.
+pub const DEFAULT_RESOLUTION_STRATEGY: &str = "OriginalValue";
+
+/// The only built-in slot type a custom slot type may extend. The modelled
+/// `parentSlotTypeSignature` member documents the restriction: "The built-in slot type
+/// used as a parent of this slot type. [...] Only AMAZON.AlphaNumeric is supported."
+pub const SUPPORTED_PARENT_SLOT_TYPE_SIGNATURE: &str = "AMAZON.AlphaNumeric";
+
 /// A bot locale, as `CreateBotLocale` stored it and `DescribeBotLocale` reads it back.
 #[derive(Debug, Clone)]
 pub struct BotLocale {
@@ -275,6 +305,40 @@ pub fn bot_locale_key(bot_id: &str, bot_version: &str, locale_id: &str) -> BotLo
     )
 }
 
+/// A custom slot type, as `CreateSlotType` stored it and `DescribeSlotType` reads it
+/// back.
+#[derive(Debug, Clone)]
+pub struct SlotType {
+    pub slot_type_id: String,
+    pub slot_type_name: String,
+    pub bot_id: String,
+    pub bot_version: String,
+    pub locale_id: String,
+    pub description: Option<String>,
+    pub slot_type_values: Vec<SlotTypeValue>,
+    pub value_selection_setting: Option<SlotValueSelectionSetting>,
+    pub parent_slot_type_signature: Option<String>,
+    pub external_source_setting: Option<ExternalSourceSetting>,
+    pub composite_slot_type_setting: Option<CompositeSlotTypeSetting>,
+    pub creation_date_time: SystemTime,
+    pub last_updated_date_time: SystemTime,
+}
+
+impl SlotType {
+    /// Is this slot type the one that triple names? A slot type is defined inside one
+    /// locale of one bot version, so every read is scoped by the same triple the
+    /// operation's URI carries.
+    pub fn is_in_locale(&self, bot_id: &str, bot_version: &str, locale_id: &str) -> bool {
+        self.bot_id == bot_id && self.bot_version == bot_version && self.locale_id == locale_id
+    }
+
+    /// The stored values, as the wire shape renders them: absent rather than an empty
+    /// list, since the modelled `SlotTypeValues` list has a minimum length of 1.
+    pub fn wire_slot_type_values(&self) -> Option<Vec<SlotTypeValue>> {
+        (!self.slot_type_values.is_empty()).then(|| self.slot_type_values.clone())
+    }
+}
+
 /// Per-service state for com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
@@ -285,8 +349,16 @@ pub struct ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
     /// may hold ([`BOTS_PER_ACCOUNT_QUOTA`]) times the locale ids a bot version can
     /// carry ([`SUPPORTED_LOCALES`]): a caller cannot grow it past that.
     pub bot_locales: HashMap<BotLocaleKey, BotLocale>,
+    /// Every custom slot type this emulator holds, keyed by the `slotTypeId` it minted.
+    /// The record carries the bot, bot version and locale it was created in, which is
+    /// what scopes every read of it. A slot type belongs to one locale of one bot
+    /// version, so this map is bounded by the bots the store may hold
+    /// ([`BOTS_PER_ACCOUNT_QUOTA`]) times the locale ids a bot version can carry
+    /// ([`SUPPORTED_LOCALES`]) times [`SLOT_TYPES_PER_LOCALE_QUOTA`]: a caller cannot
+    /// grow it past that.
+    pub slot_types: HashMap<String, SlotType>,
     /// The monotonic source the minted ids are derived from.
-    bot_id_seq: u64,
+    id_seq: u64,
 }
 
 impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
@@ -297,9 +369,22 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
     /// result is checked against the stored bots before it is handed out.
     pub fn mint_bot_id(&mut self) -> String {
         loop {
-            self.bot_id_seq += 1;
-            let candidate = render_id(self.bot_id_seq);
+            self.id_seq += 1;
+            let candidate = render_id(self.id_seq);
             if !self.bots.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint an unused `slotTypeId`, from the same counter and in the same
+    /// `[0-9a-zA-Z]{10}` space [`mint_bot_id`] draws from, and checked against the
+    /// stored slot types before it is handed out.
+    pub fn mint_slot_type_id(&mut self) -> String {
+        loop {
+            self.id_seq += 1;
+            let candidate = render_id(self.id_seq);
+            if !self.slot_types.contains_key(&candidate) {
                 return candidate;
             }
         }
@@ -361,6 +446,54 @@ impl ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State {
         let before = self.bot_locales.len();
         self.bot_locales.retain(|(bot, _, _), _| bot != bot_id);
         before - self.bot_locales.len()
+    }
+
+    /// Every slot type defined in one locale of one bot version.
+    pub fn slot_types_in_locale<'a>(
+        &'a self,
+        bot_id: &'a str,
+        bot_version: &'a str,
+        locale_id: &'a str,
+    ) -> impl Iterator<Item = &'a SlotType> + 'a {
+        self.slot_types
+            .values()
+            .filter(move |slot_type| slot_type.is_in_locale(bot_id, bot_version, locale_id))
+    }
+
+    /// Is `name` already the name of a slot type in that locale? `CreateSlotType`
+    /// refuses a duplicate: "A slot type name must be unique" where it is defined.
+    pub fn slot_type_name_taken(
+        &self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+        name: &str,
+    ) -> bool {
+        self.slot_types_in_locale(bot_id, bot_version, locale_id)
+            .any(|slot_type| slot_type.slot_type_name == name)
+    }
+
+    /// The stored slot type the id names, but only when it is defined in the locale the
+    /// read scopes it to; `None` otherwise, which is what a read reports as not found.
+    pub fn slot_type(
+        &self,
+        bot_id: &str,
+        bot_version: &str,
+        locale_id: &str,
+        slot_type_id: &str,
+    ) -> Option<&SlotType> {
+        self.slot_types
+            .get(slot_type_id)
+            .filter(|slot_type| slot_type.is_in_locale(bot_id, bot_version, locale_id))
+    }
+
+    /// Drop every slot type of `bot_id`, whatever version or locale holds it, and answer
+    /// how many went: a slot type cannot outlive the bot it is defined in.
+    pub fn remove_slot_types_of_bot(&mut self, bot_id: &str) -> usize {
+        let before = self.slot_types.len();
+        self.slot_types
+            .retain(|_, slot_type| slot_type.bot_id != bot_id);
+        before - self.slot_types.len()
     }
 }
 

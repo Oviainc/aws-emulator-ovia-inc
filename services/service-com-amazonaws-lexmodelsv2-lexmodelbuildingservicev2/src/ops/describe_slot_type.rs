@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSlotType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSlotType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSlotType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a read answers off the slot type `CreateSlotType` stored, scoped to the
+//! bot, bot version and locale the URI names, and reports `ResourceNotFoundException`
+//! when no slot type of that id is defined there. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +173,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSlotType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSlotTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSlotType"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeSlotTypeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        // A slot type is reachable only under the locale of the bot version it was
+        // created in, so a read scoped to any other triple finds nothing.
+        let Some(slot_type) = store.slot_type(
+            &input.bot_id,
+            &input.bot_version,
+            &input.locale_id,
+            &input.slot_type_id,
+        ) else {
+            return Err(DescribeSlotTypeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Slot type {} does not exist in locale {} of bot {} version {}; check the slotTypeId, botId, botVersion and localeId and try again",
+                        input.slot_type_id, input.locale_id, input.bot_id, input.bot_version
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeSlotTypeOutput {
+            slot_type_id: Some(slot_type.slot_type_id.clone()),
+            slot_type_name: Some(slot_type.slot_type_name.clone()),
+            description: slot_type.description.clone(),
+            slot_type_values: slot_type.wire_slot_type_values(),
+            value_selection_setting: slot_type.value_selection_setting.clone(),
+            parent_slot_type_signature: slot_type.parent_slot_type_signature.clone(),
+            bot_id: Some(slot_type.bot_id.clone()),
+            bot_version: Some(slot_type.bot_version.clone()),
+            locale_id: Some(slot_type.locale_id.clone()),
+            creation_date_time: Some(crate::state::to_date_time(slot_type.creation_date_time)),
+            last_updated_date_time: Some(crate::state::to_date_time(
+                slot_type.last_updated_date_time,
+            )),
+            external_source_setting: slot_type.external_source_setting.clone(),
+            composite_slot_type_setting: slot_type.composite_slot_type_setting.clone(),
+        })
     }
 }

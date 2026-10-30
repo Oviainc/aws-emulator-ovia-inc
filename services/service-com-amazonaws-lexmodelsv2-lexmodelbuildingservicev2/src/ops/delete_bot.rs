@@ -218,6 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A locale is defined inside a bot, so the bot's locales go with it; otherwise a
         // later create of the same locale would conflict with a record no bot backs.
         store.remove_bot_locales(&input.bot_id);
+        // A slot type is defined inside one of those locales, so it cannot outlive the
+        // bot either.
+        store.remove_slot_types_of_bot(&input.bot_id);
         // The record is gone, so a later `DescribeBot` cannot find it and `ListBots`
         // cannot list it; the status reported is the one the delete call itself puts the
         // bot into.

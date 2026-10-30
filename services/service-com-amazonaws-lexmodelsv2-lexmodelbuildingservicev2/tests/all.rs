@@ -17,5 +17,7 @@ mod bot_lifecycle;
 mod bot_locale;
 #[path = "all/service_claim.rs"]
 mod service_claim;
+#[path = "all/slot_type.rs"]
+mod slot_type;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

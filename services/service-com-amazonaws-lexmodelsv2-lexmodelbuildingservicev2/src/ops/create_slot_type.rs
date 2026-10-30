@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSlotType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSlotType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSlotType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a create mints a `slotTypeId`, stores the slot type under the bot, bot
+//! version and locale the URI names, and builds its response off the stored record, so
+//! `DescribeSlotType` reads back the same definition. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +198,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSlotType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSlotTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSlotType"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSlotTypeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Lex Models V2 store is unavailable".to_string()),
+            })
+        })?;
+
+        // `parentSlotTypeSignature` is a plain string in the model, so the single
+        // built-in signature its documentation supports is checked here rather than by
+        // the boundary validator.
+        if let Some(parent) = input.parent_slot_type_signature.as_deref() {
+            if parent != crate::state::SUPPORTED_PARENT_SLOT_TYPE_SIGNATURE {
+                return Err(CreateSlotTypeErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "parentSlotTypeSignature must be {}; received {parent}",
+                            crate::state::SUPPORTED_PARENT_SLOT_TYPE_SIGNATURE
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        // A slot type is defined inside a bot, so the bot has to exist first.
+        if !store.bots.contains_key(&input.bot_id) {
+            return Err(CreateSlotTypeErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    message: Some(format!(
+                        "Bot {} does not exist; check the botId and try again",
+                        input.bot_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "You must add a locale to a bot before you can add intents and slot types to
+        // the bot": the locale the slot type is defined in has to be there too.
+        if !store.bot_locale_exists(&input.bot_id, &input.bot_version, &input.locale_id) {
+            return Err(CreateSlotTypeErrorModeled::PreconditionFailedException(
+                PreconditionFailedException {
+                    message: Some(format!(
+                        "Locale {} does not exist for bot {} version {}; create the locale before adding slot types to it",
+                        input.locale_id, input.bot_id, input.bot_version
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The per-bot-locale slot type quota bounds the store: past it the service
+        // answers its modelled quota error rather than growing forever.
+        if store
+            .slot_types_in_locale(&input.bot_id, &input.bot_version, &input.locale_id)
+            .count()
+            >= crate::state::SLOT_TYPES_PER_LOCALE_QUOTA
+        {
+            return Err(CreateSlotTypeErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "You have reached the quota of {} slot types for locale {} of bot {} version {}; delete a slot type or request a quota increase",
+                        crate::state::SLOT_TYPES_PER_LOCALE_QUOTA,
+                        input.locale_id,
+                        input.bot_id,
+                        input.bot_version
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A slot type name must be unique" where it is defined, so a create under a
+        // name the locale already carries is refused rather than stored beside it. The
+        // refusal is the modelled `ValidationException` — the name in the request is the
+        // parameter that isn't valid — not a conflicting resource state.
+        if store.slot_type_name_taken(
+            &input.bot_id,
+            &input.bot_version,
+            &input.locale_id,
+            &input.slot_type_name,
+        ) {
+            return Err(CreateSlotTypeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "A slot type with the name {} already exists in locale {} of bot {} version {}. Choose a different name and try again.",
+                        input.slot_type_name, input.locale_id, input.bot_id, input.bot_version
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let slot_type_id = store.mint_slot_type_id();
+        let slot_type = crate::state::SlotType {
+            slot_type_id: slot_type_id.clone(),
+            slot_type_name: input.slot_type_name,
+            bot_id: input.bot_id,
+            bot_version: input.bot_version,
+            locale_id: input.locale_id,
+            description: input.description,
+            slot_type_values: input.slot_type_values.unwrap_or_default(),
+            // A create that names no selection setting resolves values under the
+            // documented default strategy, and that is the setting a read reports.
+            value_selection_setting: Some(input.value_selection_setting.unwrap_or_else(|| {
+                SlotValueSelectionSetting {
+                    resolution_strategy: crate::state::DEFAULT_RESOLUTION_STRATEGY.to_string(),
+                    regex_filter: None,
+                    advanced_recognition_setting: None,
+                }
+            })),
+            parent_slot_type_signature: input.parent_slot_type_signature,
+            external_source_setting: input.external_source_setting,
+            composite_slot_type_setting: input.composite_slot_type_setting,
+            creation_date_time: now,
+            last_updated_date_time: now,
+        };
+
+        // The response is read back off the record that was just stored, so a
+        // `slotTypeId` this operation hands out always has a backing slot type.
+        let stored = store.slot_types.entry(slot_type_id).or_insert(slot_type);
+        Ok(CreateSlotTypeOutput {
+            slot_type_id: Some(stored.slot_type_id.clone()),
+            slot_type_name: Some(stored.slot_type_name.clone()),
+            description: stored.description.clone(),
+            slot_type_values: stored.wire_slot_type_values(),
+            value_selection_setting: stored.value_selection_setting.clone(),
+            parent_slot_type_signature: stored.parent_slot_type_signature.clone(),
+            bot_id: Some(stored.bot_id.clone()),
+            bot_version: Some(stored.bot_version.clone()),
+            locale_id: Some(stored.locale_id.clone()),
+            creation_date_time: Some(crate::state::to_date_time(stored.creation_date_time)),
+            external_source_setting: stored.external_source_setting.clone(),
+            composite_slot_type_setting: stored.composite_slot_type_setting.clone(),
+        })
     }
 }
+

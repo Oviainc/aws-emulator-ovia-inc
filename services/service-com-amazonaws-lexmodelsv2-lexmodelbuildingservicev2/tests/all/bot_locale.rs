@@ -53,18 +53,18 @@ const FOUNDATION_MODEL_ARN: &str =
     "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-sonic-v1:0";
 
 /// `CreateBotLocale`'s URI: `PUT /bots/{botId}/botversions/{botVersion}/botlocales`.
-fn locales_uri(bot_id: &str, bot_version: &str) -> String {
+pub(crate) fn locales_uri(bot_id: &str, bot_version: &str) -> String {
     format!("/bots/{bot_id}/botversions/{bot_version}/botlocales")
 }
 
 /// `DescribeBotLocale`'s URI:
 /// `GET /bots/{botId}/botversions/{botVersion}/botlocales/{localeId}`.
-fn locale_uri(bot_id: &str, bot_version: &str, locale_id: &str) -> String {
+pub(crate) fn locale_uri(bot_id: &str, bot_version: &str, locale_id: &str) -> String {
     format!("/bots/{bot_id}/botversions/{bot_version}/botlocales/{locale_id}")
 }
 
 /// A `CreateBotLocale` request body carrying the required members plus `extra`.
-fn locale_body(locale_id: &str, threshold: f64, extra: Value) -> Value {
+pub(crate) fn locale_body(locale_id: &str, threshold: f64, extra: Value) -> Value {
     let mut body = json!({
         "localeId": locale_id,
         "nluIntentConfidenceThreshold": threshold,
@@ -82,7 +82,7 @@ fn number(body: &Value, name: &str) -> f64 {
 }
 
 /// Create a bot to hang locales off, and return its minted id.
-async fn host_bot(router: &smithy_server_runtime::MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn host_bot(router: &smithy_server_runtime::MultiServiceRouter, name: &str) -> String {
     create_bot(router, &create_body(name, 300, json!({}))).await
 }
 
