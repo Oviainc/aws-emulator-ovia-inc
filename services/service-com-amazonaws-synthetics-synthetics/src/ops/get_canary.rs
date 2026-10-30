@@ -66,7 +66,7 @@
 use super::types::*;
 use std::time::SystemTime;
 
-use crate::state::{CANARY_NOT_FOUND, STORE_UNAVAILABLE};
+use crate::state::{CANARY_NOT_FOUND, DRY_RUN_NOT_FOUND, STORE_UNAVAILABLE};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,24 +150,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        if input.dry_run_id.is_some() {
-            // A dry run is a canary execution, which this emulator cannot perform, so
-            // there is no dry-run snapshot of the canary to report.
-            return Err(GetCanaryErrorModeled::ValidationException(ValidationException {
-                message: Some(
-                    "DryRunId is not supported: this emulator does not execute canary dry runs"
-                        .to_string(),
-                ),
-            })
-            .into());
-        }
-
         let mut guard = state.lock();
         // Materialise only what the clock already owed at this instant (a canary that
         // finished provisioning, a run whose outcome came due); reading changes nothing
         // else about what a later caller sees.
         guard.settle(SystemTime::now());
-        let canary = guard
+        let stored = guard
             .canaries
             .get(&input.name)
             .ok_or_else(|| {
@@ -178,8 +166,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(CANARY_NOT_FOUND.to_string()),
                     },
                 ))
-            })?
-            .to_canary();
+            })?;
+        // `GetCanaryRequest$DryRunId`: "The DryRunId associated with an existing canary's
+        // dry run. You can use this DryRunId to retrieve information about the dry run." So
+        // an id names one of this canary's dry runs and the canary is reported as that dry
+        // run configures it; an id naming no dry run of this canary resolves to nothing.
+        let canary = match input.dry_run_id.as_deref() {
+            None => stored.to_canary(),
+            Some(dry_run_id) => {
+                let dry_run = stored.dry_run(dry_run_id).ok_or_else(|| {
+                    GetCanaryError::from(GetCanaryErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            // Same rule as the missing canary: the message names the kind
+                            // of resource that was not found, never the identifier the
+                            // request asked for.
+                            message: Some(DRY_RUN_NOT_FOUND.to_string()),
+                        },
+                    ))
+                })?;
+                stored.to_dry_run_canary(dry_run)
+            }
+        };
         Ok(GetCanaryOutput {
             canary: Some(canary),
         })

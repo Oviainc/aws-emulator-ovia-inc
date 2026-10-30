@@ -235,47 +235,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        if input.dry_run_id.is_some() {
-            // This emulator performs no dry runs, so it has minted no dry run id and any
-            // id a caller presents names a dry run that does not exist. Same rule as the
+        if let Some(dry_run_id) = input.dry_run_id.as_deref() {
+            // An id this canary has no dry run for names nothing. Same rule as the
             // missing canary above: the message names the kind of resource that was not
             // found, never the identifier the request asked for.
-            return Err(GetCanaryRunsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(DRY_RUN_NOT_FOUND.to_string()),
-                },
-            )
-            .into());
-        }
-        if run_type == "DRY_RUN" {
-            // Same reason: there are no dry runs to report, which is an empty page rather
-            // than a failure.
-            return Ok(GetCanaryRunsOutput {
-                canary_runs: Some(Vec::new()),
-                next_token: None,
-            });
+            if canary.dry_run(dry_run_id).is_none() {
+                return Err(GetCanaryRunsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(DRY_RUN_NOT_FOUND.to_string()),
+                    },
+                )
+                .into());
+            }
         }
 
-        // The history is kept newest first, the order this operation reports.
+        // `GetCanaryRunsRequest$RunType`: "When CANARY_RUN is provided, all canary runs
+        // excluding dry runs are returned[;] When DRY_RUN is provided, all dry runs
+        // excluding canary runs are returned"; a `DryRunId` narrows that to the runs of
+        // the one dry run it names. The history is kept newest first, the order this
+        // operation reports, and filtering preserves it.
+        let want_dry_runs = run_type == "DRY_RUN";
+        let runs: Vec<_> = canary
+            .runs
+            .iter()
+            .filter(|run| match (run.dry_run_id.as_deref(), input.dry_run_id.as_deref()) {
+                (Some(id), Some(requested)) => id == requested,
+                (Some(_), None) => want_dry_runs,
+                (None, _) => !want_dry_runs,
+            })
+            .collect();
+
         let from = match start {
             None => 0,
             // A well-formed token whose run is no longer in the history is answered with
             // the last, empty page rather than a failure: the run it named was dropped by
             // the canary's retention period or by the retained-run bound between the two
             // calls, so there is genuinely nothing after it left to report.
-            Some(run_id) => canary
-                .runs
+            Some(run_id) => runs
                 .iter()
                 .position(|run| run.id == run_id)
-                .unwrap_or(canary.runs.len()),
+                .unwrap_or(runs.len()),
         };
-        let until = from.saturating_add(page_size).min(canary.runs.len());
-        let canary_runs: Vec<CanaryRun> = canary.runs[from..until]
+        let until = from.saturating_add(page_size).min(runs.len());
+        let canary_runs: Vec<CanaryRun> = runs[from..until]
             .iter()
             .map(|run| run.to_canary_run())
             .collect();
-        let next_token = canary
-            .runs
+        let next_token = runs
             .get(until)
             .map(|next| format!("{TOKEN_RUN_PREFIX}{}", next.id));
 

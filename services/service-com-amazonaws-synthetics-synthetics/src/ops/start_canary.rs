@@ -192,6 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The run's outcome is owed by the clock, not by another call.
             outcome_due: Some(now + RUN_SETTLE),
             artifact_s3_location: canary.artifact_s3_location.clone(),
+            // A run of the canary itself, not of one of its dry-run configurations.
+            dry_run_id: None,
         };
         canary.begin_run(run);
 

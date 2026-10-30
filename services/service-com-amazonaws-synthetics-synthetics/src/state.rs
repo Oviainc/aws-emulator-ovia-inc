@@ -18,10 +18,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ArtifactConfigOutput, BrowserConfig, Canary, CanaryCodeOutput, CanaryRun,
-    CanaryRunConfigOutput, CanaryRunStatus, CanaryRunTimeline, CanaryScheduleOutput, CanaryStatus,
-    CanaryTimeline, Dependency, Group, RetryConfigOutput, RuntimeVersion, S3EncryptionConfig,
-    VpcConfigOutput,
+    ArtifactConfigOutput, BrowserConfig, Canary, CanaryCodeOutput, CanaryDryRunConfigOutput,
+    CanaryRun, CanaryRunConfigOutput, CanaryRunStatus, CanaryRunTimeline, CanaryScheduleOutput,
+    CanaryStatus, CanaryTimeline, Dependency, DryRunConfigOutput, Group, RetryConfigOutput,
+    RuntimeVersion, S3EncryptionConfig, VpcConfigOutput,
 };
 
 /// Mint a fresh identifier for a canary or a canary run.
@@ -409,6 +409,13 @@ pub struct StoredRun {
     /// The instant at which the clock owes this run's outcome, while it is `RUNNING`.
     pub outcome_due: Option<SystemTime>,
     pub artifact_s3_location: String,
+    /// The dry run this run belongs to, when it is one.
+    ///
+    /// `GetCanaryRunsRequest$RunType`: "When CANARY_RUN is provided, all canary runs
+    /// excluding dry runs are returned[;] When DRY_RUN is provided, all dry runs excluding
+    /// canary runs are returned" — so whether a run is a dry run is a property of the run
+    /// itself, and `None` here is a scheduled or manually started canary run.
+    pub dry_run_id: Option<String>,
 }
 
 impl StoredRun {
@@ -429,9 +436,28 @@ impl StoredRun {
                 metric_timestamp_for_run_and_retries: None,
             }),
             artifact_s3_location: Some(self.artifact_s3_location.clone()),
+            dry_run_config: self.dry_run_id.as_ref().map(|id| CanaryDryRunConfigOutput {
+                dry_run_id: Some(id.clone()),
+            }),
             ..Default::default()
         }
     }
+}
+
+/// One dry run of a canary: the identity the API addresses it by, and the configuration it
+/// exercises.
+///
+/// `StartCanaryDryRun` runs a canary that already exists with a configuration that may
+/// differ from the canary's own, without changing the canary. The configuration is
+/// therefore SNAPSHOT here when the dry run starts, so a later change to the canary cannot
+/// rewrite what the dry run was given; the snapshot carries no run history and no nested
+/// dry runs of its own, because those belong to the canary record rather than to one of
+/// its configurations.
+#[derive(Debug, Clone)]
+pub struct StoredDryRun {
+    /// `DryRunConfigOutput$DryRunId`, a minted [`new_uuid`].
+    pub id: String,
+    pub config: Box<StoredCanary>,
 }
 
 /// One canary, as this emulator persists it. Every reported field is read from here.
@@ -467,6 +493,8 @@ pub struct StoredCanary {
     pub browser_types: Vec<String>,
     /// Newest run first, the order `GetCanaryRuns` reports.
     pub runs: Vec<StoredRun>,
+    /// The dry runs started for this canary, newest first.
+    pub dry_runs: Vec<StoredDryRun>,
 }
 
 impl StoredCanary {
@@ -547,10 +575,62 @@ impl StoredCanary {
         self.runs.truncate(MAX_RETAINED_RUNS_PER_CANARY);
     }
 
+    /// Record a dry run of this canary and the run it starts, keeping both histories
+    /// within [`MAX_RETAINED_RUNS_PER_CANARY`] so a dry-run loop cannot grow them without
+    /// limit.
+    ///
+    /// Nothing about the canary itself changes: a dry run exercises its own configuration
+    /// and is not a run of the canary's schedule, so the canary's state, its last-started
+    /// instant and its configuration are left exactly as they were.
+    pub fn begin_dry_run(&mut self, dry_run: StoredDryRun, run: StoredRun) {
+        self.dry_runs.insert(0, dry_run);
+        self.dry_runs.truncate(MAX_RETAINED_RUNS_PER_CANARY);
+        self.begin_run(run);
+    }
+
+    /// The dry run `dry_run_id` names, if this canary has one.
+    pub fn dry_run(&self, dry_run_id: &str) -> Option<&StoredDryRun> {
+        self.dry_runs.iter().find(|dry_run| dry_run.id == dry_run_id)
+    }
+
+    /// `DryRunConfigOutput` for one of this canary's dry runs: its id, and
+    /// `LastDryRunExecutionStatus` — "the last execution status for a canary's dry run" —
+    /// read from the newest run that dry run started, so the status reported is the state
+    /// of a run this store holds rather than a value chosen when the dry run began.
+    pub fn dry_run_config_output(&self, dry_run: &StoredDryRun) -> DryRunConfigOutput {
+        DryRunConfigOutput {
+            dry_run_id: Some(dry_run.id.clone()),
+            // The history is newest first, so the first match is the latest run.
+            last_dry_run_execution_status: self
+                .runs
+                .iter()
+                .find(|run| run.dry_run_id.as_deref() == Some(dry_run.id.as_str()))
+                .map(|run| run.state.as_wire().to_string()),
+        }
+    }
+
+    /// Project this canary as one of its dry runs configures it: every configuration
+    /// member comes from the dry run's snapshot, while identity, status and timeline come
+    /// from the live record — a dry run carries a configuration, it is not a second canary.
+    pub fn to_dry_run_canary(&self, dry_run: &StoredDryRun) -> Canary {
+        let live = self.to_canary();
+        let mut canary = dry_run.config.to_canary();
+        canary.id = live.id;
+        canary.name = live.name;
+        canary.status = live.status;
+        canary.timeline = live.timeline;
+        canary.tags = live.tags;
+        canary.dry_run_config = Some(self.dry_run_config_output(dry_run));
+        canary
+    }
+
     /// Finish whichever run is still open, because the canary was stopped.
+    ///
+    /// A dry run is left alone: it runs its own configuration independently of the
+    /// canary's schedule, so stopping the canary does not stop it.
     pub fn close_open_run(&mut self, now: SystemTime) {
         for run in &mut self.runs {
-            if run.state == CanaryRunState::Running {
+            if run.state == CanaryRunState::Running && run.dry_run_id.is_none() {
                 run.state = CanaryRunState::Failed;
                 run.state_reason = Some(RUN_NOT_EXECUTED_REASON.to_string());
                 run.state_reason_code = Some(RUN_NOT_EXECUTED_REASON_CODE.to_string());

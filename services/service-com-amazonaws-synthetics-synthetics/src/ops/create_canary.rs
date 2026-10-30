@@ -390,6 +390,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter_map(|cfg| cfg.browser_type)
                 .collect(),
             runs: Vec::new(),
+            dry_runs: Vec::new(),
             id,
             name: input.name,
             region,

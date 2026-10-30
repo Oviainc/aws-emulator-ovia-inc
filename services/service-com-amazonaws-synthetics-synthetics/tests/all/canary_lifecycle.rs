@@ -1339,7 +1339,7 @@ async fn a_page_boundary_at_a_very_long_name_still_resumes_exactly() {
 /// Written here rather than imported from the crate under test on purpose: an assertion
 /// that shared the production predicate would pass vacuously if that predicate were
 /// wrong. This reads the modelled pattern group by group.
-fn is_uuid(value: &str) -> bool {
+pub(crate) fn is_uuid(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == 5
         && groups

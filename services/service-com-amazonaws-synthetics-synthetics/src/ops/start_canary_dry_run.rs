@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCanaryDryRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCanaryDryRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCanaryDryRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts one dry run of a canary that already exists: a run of the canary's script with
+//! the configuration this request supplies, recorded against a freshly minted `DryRunId`
+//! and leaving the canary itself untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +126,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
+
+use crate::state::{
+    is_published_runtime_version, is_s3_artifact_location, new_uuid, source_location_arn,
+    unknown_runtime_version, CanaryRunState, StoredArtifactConfig, StoredCode, StoredDependency,
+    StoredDryRun, StoredRun, StoredRunConfig, StoredVpcConfig, ARTIFACT_S3_LOCATION_MALFORMED,
+    CANARY_NOT_FOUND, RUN_SETTLE, STORE_UNAVAILABLE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -205,18 +207,218 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCanaryDryRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCanaryDryRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCanaryDryRun"))
+        // The canary's own record carries the Region its resources live in, so nothing
+        // about this request's metadata is read here.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_error)?;
+        let now = SystemTime::now();
+
+        // The configuration this dry run overrides the canary's with is held to the same
+        // prose rules the canary's own configuration is: rules the model states but cannot
+        // express as a constraint, so they are refused here rather than at the boundary.
+        if let Some(location) = input.artifact_s3_location.as_deref() {
+            if !is_s3_artifact_location(location) {
+                return Err(validation(ARTIFACT_S3_LOCATION_MALFORMED));
+            }
+        }
+        if let Some(requested) = input.runtime_version.as_deref() {
+            // The model constrains only the value's LENGTH, so the set of values the
+            // service accepts is its own runtime catalogue (what `DescribeRuntimeVersions`
+            // reports). A version outside it names no runtime a dry run could ever be
+            // provisioned on.
+            if !is_published_runtime_version(requested) {
+                return Err(validation(unknown_runtime_version(requested)));
+            }
+        }
+        if let Some(memory) = input.run_config.as_ref().and_then(|rc| rc.memory_in_mb) {
+            // `CanaryRunConfigInput$MemoryInMB`: "This value must be a multiple of 64."
+            if memory % 64 != 0 {
+                return Err(validation(format!(
+                    "RunConfig.MemoryInMB must be a multiple of 64, got {memory}"
+                )));
+            }
+        }
+        if input.visual_reference.is_some() || input.visual_references.is_some() {
+            // Visual monitoring compares the screenshots a run took against a baseline
+            // run's. This emulator runs no canary script and so holds no screenshot to
+            // compare, so the request is refused rather than accepted and dropped.
+            return Err(validation(VISUAL_MONITORING_UNSUPPORTED));
+        }
+
+        let mut guard = state.lock();
+        // Only what the clock already owed at this instant (a canary that finished
+        // provisioning, a run whose outcome came due).
+        guard.settle(now);
+        let canary = guard.canaries.get_mut(&input.name).ok_or_else(|| {
+            StartCanaryDryRunError::from(StartCanaryDryRunErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The missing-canary message is a fixed sentence, not built from the
+                    // lookup key: see `state::CANARY_NOT_FOUND`.
+                    message: Some(CANARY_NOT_FOUND.to_string()),
+                },
+            ))
+        })?;
+
+        // A canary with an operation still in flight (it is being provisioned, started,
+        // stopped, updated or deleted) has no settled configuration to dry run against,
+        // which is exactly `ConflictException`'s documented "a conflicting operation is
+        // already in progress". A canary that is merely RUNNING is NOT a conflict: a dry
+        // run exercises its own configuration independently of the canary's schedule.
+        if canary.state.operation_in_progress() {
+            return Err(StartCanaryDryRunErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Canary {} cannot be dry run while it is in state {}",
+                    canary.name,
+                    canary.state.as_wire()
+                )),
+            })
+            .into());
+        }
+
+        let dry_run_id = new_uuid();
+        // The dry run's configuration is the canary's with this request's overrides
+        // applied: an omitted member means "dry run with what the canary already has".
+        let mut config = canary.clone();
+        // A configuration carries no history: the runs and the dry runs belong to the
+        // canary record, not to one of the configurations it has been run with.
+        config.runs.clear();
+        config.dry_runs.clear();
+        if let Some(code) = input.code {
+            config.code = StoredCode {
+                // `Handler` carries `@default: ""`, so an omitted handler arrives as the
+                // empty string; report it absent rather than as an empty entry point.
+                handler: code.handler.filter(|handler| !handler.is_empty()),
+                blueprint_types: code.blueprint_types.unwrap_or_default(),
+                dependencies: code
+                    .dependencies
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|dep| StoredDependency {
+                        r#type: dep.r#type,
+                        reference: dep.reference,
+                    })
+                    .collect(),
+                // This code is not the canary's, so it is not stored in the canary's
+                // layer: the dry run's script gets its own source location.
+                source_location_arn: source_location_arn(&config.region, &config.name, &dry_run_id),
+                s3_bucket: code.s3_bucket,
+                s3_key: code.s3_key,
+                s3_version: code.s3_version,
+            };
+        }
+        if let Some(execution_role_arn) = input.execution_role_arn {
+            config.execution_role_arn = execution_role_arn;
+        }
+        if let Some(run_config) = input.run_config {
+            // Member-wise: a run-configuration member the request omits keeps the value
+            // the canary itself runs with.
+            config.run_config = StoredRunConfig {
+                timeout_in_seconds: run_config
+                    .timeout_in_seconds
+                    .unwrap_or(config.run_config.timeout_in_seconds),
+                memory_in_mb: run_config.memory_in_mb.or(config.run_config.memory_in_mb),
+                active_tracing: run_config
+                    .active_tracing
+                    .or(config.run_config.active_tracing),
+                ephemeral_storage: run_config
+                    .ephemeral_storage
+                    .or(config.run_config.ephemeral_storage),
+                environment_variables: run_config
+                    .environment_variables
+                    .map(|vars| vars.into_iter().collect())
+                    .unwrap_or(config.run_config.environment_variables),
+            };
+        }
+        if let Some(days) = input.success_retention_period_in_days {
+            config.success_retention_period_in_days = days;
+        }
+        if let Some(days) = input.failure_retention_period_in_days {
+            config.failure_retention_period_in_days = days;
+        }
+        if let Some(location) = input.artifact_s3_location {
+            config.artifact_s3_location = location;
+        }
+        if let Some(artifact_config) = input.artifact_config {
+            config.artifact_config = Some(StoredArtifactConfig {
+                encryption_mode: artifact_config
+                    .s3_encryption
+                    .as_ref()
+                    .and_then(|enc| enc.encryption_mode.clone()),
+                kms_key_arn: artifact_config
+                    .s3_encryption
+                    .as_ref()
+                    .and_then(|enc| enc.kms_key_arn.clone()),
+            });
+        }
+        if let Some(runtime_version) = input.runtime_version {
+            config.runtime_version = runtime_version;
+        }
+        if let Some(vpc_config) = input.vpc_config {
+            config.vpc_config = Some(StoredVpcConfig {
+                subnet_ids: vpc_config.subnet_ids.unwrap_or_default(),
+                security_group_ids: vpc_config.security_group_ids.unwrap_or_default(),
+                ipv6_allowed_for_dual_stack: vpc_config.ipv6_allowed_for_dual_stack,
+            });
+        }
+        if let Some(cleanup) = input.provisioned_resource_cleanup {
+            config.provisioned_resource_cleanup = cleanup;
+        }
+        if let Some(browser_configs) = input.browser_configs {
+            config.browser_types = browser_configs
+                .into_iter()
+                .filter_map(|cfg| cfg.browser_type)
+                .collect();
+        }
+
+        // The run this dry run starts, against the dry run's own artifact location. Its
+        // outcome is owed by the clock, not by another call, exactly as a canary run's is.
+        let run = StoredRun {
+            id: new_uuid(),
+            name: config.name.clone(),
+            state: CanaryRunState::Running,
+            state_reason: None,
+            state_reason_code: None,
+            started: now,
+            completed: None,
+            outcome_due: Some(now + RUN_SETTLE),
+            artifact_s3_location: config.artifact_s3_location.clone(),
+            dry_run_id: Some(dry_run_id.clone()),
+        };
+        canary.begin_dry_run(
+            StoredDryRun {
+                id: dry_run_id.clone(),
+                config: Box::new(config),
+            },
+            run,
+        );
+
+        // Read the answer back out of the stored record, under the same lock as the write,
+        // so the response can never describe anything other than what was persisted.
+        let dry_run = canary.dry_run(&dry_run_id).ok_or_else(internal_error)?;
+        Ok(StartCanaryDryRunOutput {
+            dry_run_config: Some(canary.dry_run_config_output(dry_run)),
+        })
     }
+}
+
+/// `ValidationException$Message` for the two visual-reference members: this emulator
+/// executes no canary script, so it holds no screenshot a baseline could be compared with.
+const VISUAL_MONITORING_UNSUPPORTED: &str =
+    "VisualReference is not supported: this emulator does not perform visual monitoring";
+
+/// The modelled 400 this operation refuses a bad request with.
+fn validation(message: impl Into<String>) -> StartCanaryDryRunError {
+    StartCanaryDryRunErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled 500 for a store that cannot be reached. Never a fresh engine: a private
+/// store would accept the write and drop it when the request returns.
+fn internal_error() -> StartCanaryDryRunError {
+    StartCanaryDryRunErrorModeled::InternalServerException(InternalServerException {
+        message: Some(STORE_UNAVAILABLE.to_string()),
+    })
+    .into()
 }
