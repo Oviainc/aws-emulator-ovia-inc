@@ -5,7 +5,7 @@
 //! Reports one `ComponentSummary` per component of the registered applications in the
 //! request's Region, computed from state: the components a registration described
 //! (`RegisterApplication$ComponentsInfo`), narrowed to one application when the request
-//! names one, in `<ApplicationId>/<ComponentId>` order, with `MaxResults` bounding the
+//! names one, in (`ApplicationId`, `ComponentId`) order, with `MaxResults` bounding the
 //! page and `NextToken` resuming after the last item of the previous one.
 //!
 //! ## Shape of an operation
@@ -209,14 +209,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         candidates.extend(applications.iter().flat_map(|application| {
             application.components.iter().map(move |component| {
                 (
-                    format!("{}/{}", application.id, component.id),
+                    component.page_key(&application.id),
                     (application.id.as_str(), component),
                 )
             })
         }));
         // The order a token resumes from has to be the same for the call that handed it
-        // out and the call that resumes from it; components are stored in the order
-        // their registration declared them, so the listing orders them by that key.
+        // out and the call that resumes from it, so the listing is ordered by that key —
+        // which orders it by (application id, component id), the order this operation
+        // reports and the order its sibling listings of the same Region use, rather than
+        // by the order the registrations declared their components in.
         candidates.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         let page = crate::state::page(

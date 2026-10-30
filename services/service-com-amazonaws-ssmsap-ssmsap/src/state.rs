@@ -1234,6 +1234,17 @@ impl StoredComponent {
             arn: Some(arn.to_string()),
         }
     }
+
+    /// The key a component listing is ordered and paged by: the id of the application
+    /// this component belongs to and its own id, in that order ([`composite_page_key`],
+    /// which is what makes ordering these keys as strings the same as ordering by
+    /// (application id, component id)).
+    ///
+    /// `application_id` is passed in because a `ComponentId` is unique only within its
+    /// application, so a component record does not name the application on its own.
+    pub fn page_key(&self, application_id: &str) -> String {
+        composite_page_key(application_id, &self.id)
+    }
 }
 
 /// A SAP HANA database of a registered application: the record `DatabaseSummary` is
@@ -1277,22 +1288,13 @@ impl ApplicationDatabase {
     }
 
     /// The key a database listing is ordered and paged by: this database's application
-    /// id and its own id, in that order.
-    ///
-    /// The two are joined by a byte lower than any the modelled `ApplicationId`
-    /// (`^[\w\d\.-]+$`) and `DatabaseId` (`[\w\d]+$`) patterns admit, so ordering these
-    /// keys as strings is the same as ordering by (application id, database id) — which
-    /// is what makes a `NextToken` resume at the database the previous page stopped at.
+    /// id and its own id, in that order ([`composite_page_key`], which is what makes
+    /// ordering these keys as strings the same as ordering by (application id, database
+    /// id)).
     pub fn page_key(&self) -> String {
-        format!(
-            "{}{DATABASE_PAGE_KEY_SEPARATOR}{}",
-            self.application_id, self.database_id
-        )
+        composite_page_key(&self.application_id, &self.database_id)
     }
 }
-
-/// Joins the two parts of a database listing key; see [`ApplicationDatabase::page_key`].
-const DATABASE_PAGE_KEY_SEPARATOR: char = '\u{1}';
 
 /// A persisted asynchronous operation: the record `GetOperation` reads.
 #[derive(Debug, Clone)]
@@ -4653,9 +4655,11 @@ pub enum PageError {
 pub enum Listing {
     /// `ListApplications`, whose keys are `ApplicationId`s.
     Applications,
-    /// `ListComponents`, whose keys are `<ApplicationId>/<ComponentId>`.
+    /// `ListComponents`, whose keys are (`ApplicationId`, `ComponentId`) pairs
+    /// ([`StoredComponent::page_key`]).
     Components,
-    /// `ListDatabases`, whose keys are `<ApplicationId>/<DatabaseId>`.
+    /// `ListDatabases`, whose keys are (`ApplicationId`, `DatabaseId`) pairs
+    /// ([`ApplicationDatabase::page_key`]).
     Databases,
     /// `ListOperations`, whose keys are `OperationId`s.
     Operations,
@@ -4689,6 +4693,29 @@ impl Listing {
             Self::SubCheckRuleResults => "ssmsap:rule-results:v1:",
         }
     }
+}
+
+/// Joins the two parts of a composite listing key; see [`composite_page_key`].
+///
+/// U+0001 is BELOW every byte the modelled id patterns of this service admit: the lowest
+/// character any of them allows is `-` (0x2D), in `ApplicationId` (`^[\w\d\.-]+$`) and
+/// `ComponentId` (`^[\w\d-]+$`), and `DatabaseId` (`[\w\d]+$`) allows nothing below a
+/// digit.
+const PAGE_KEY_SEPARATOR: char = '\u{1}';
+
+/// The key a listing ordered by a PAIR of ids is ordered and paged by: the id of the
+/// resource the items belong to, then the id of the item within it.
+///
+/// The two are joined by [`PAGE_KEY_SEPARATOR`], a byte lower than any the modelled id
+/// patterns admit, so ordering these keys as strings is the same as ordering by (outer
+/// id, inner id) for every pair of ids the model accepts. A separator a pattern DOES
+/// admit would not be: with one, an id another is a prefix of sorts AFTER that longer id
+/// whenever the longer one continues with a lower character, and the listing would then
+/// report the pairs in neither the order it documents nor the order its sibling listings
+/// use. That equality is also what makes a `NextToken` resume at the item the previous
+/// page stopped at.
+pub fn composite_page_key(outer: &str, inner: &str) -> String {
+    format!("{outer}{PAGE_KEY_SEPARATOR}{inner}")
 }
 
 /// Take one page out of an id-ordered listing.

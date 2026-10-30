@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_ssmsap_ssmsap::ops::types::COMPONENT_TYPE_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::{
     conditionally_required_members, ConditionalMember, MAX_COMPONENTS_PER_APPLICATION,
-    MAX_DECLARED_COMPONENTS, MAX_PAGE_SIZE,
+    MAX_COMPONENTS_PER_REGION, MAX_DECLARED_COMPONENTS, MAX_PAGE_SIZE,
 };
 
 use crate::application_lifecycle::{conditional_value, valid_registration, Emulator, Reply};
@@ -307,25 +307,42 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// The summaries `ListComponents` must report for an application of `app_type`
+/// registered in `region` as `application_id` declaring `declared`, in no particular
+/// order: one per DISTINCT `(Sid, ComponentType)` declared, plus the SAP HANA component
+/// of the application's own SAP system, which a registration naming a System ID
+/// describes without declaring it.
+fn expected_summaries(
+    region: &str,
+    application_id: &str,
+    app_type: &str,
+    declared: &[(&str, &str)],
+) -> Vec<Summary> {
+    let mut expected: Vec<Summary> = Vec::new();
+    for (component_type, sid) in declared {
+        let summary = expected_summary(region, application_id, component_type, sid);
+        if !expected.contains(&summary) {
+            expected.push(summary);
+        }
+    }
+    if let Some(sid) = registration_sid(app_type) {
+        let summary = expected_summary(region, application_id, HANA, &sid);
+        if !expected.contains(&summary) {
+            expected.push(summary);
+        }
+    }
+    expected
+}
+
 impl Case {
     /// The summaries `ListComponents` must report for this registration, in the order a
     /// listing reports them (by `ComponentId`, within the one application).
+    ///
+    /// `Summary` compares by `ApplicationId` and then `ComponentId` (the order its
+    /// members are declared in), so sorting the summaries IS the order the listing
+    /// documents — it does not re-derive whatever key the handler pages by.
     fn expected(&self, region: &str) -> Vec<Summary> {
-        let mut expected: Vec<Summary> = Vec::new();
-        for (component_type, sid) in self.declared {
-            let summary = expected_summary(region, self.id, component_type, sid);
-            if !expected.contains(&summary) {
-                expected.push(summary);
-            }
-        }
-        // The SAP HANA component of the application's own SAP system, which a
-        // registration naming a System ID describes without declaring it.
-        if let Some(sid) = registration_sid(self.app_type) {
-            let summary = expected_summary(region, self.id, HANA, &sid);
-            if !expected.contains(&summary) {
-                expected.push(summary);
-            }
-        }
+        let mut expected = expected_summaries(region, self.id, self.app_type, self.declared);
         expected.sort();
         expected
     }
@@ -460,20 +477,12 @@ async fn the_listing_is_scoped_to_the_named_application_and_to_its_region() {
     }
 
     // Unnamed: every component of the Region, ordered by application and then component.
-    let mut all: Vec<(String, Summary)> = CASES
+    let mut expected_all: Vec<Summary> = CASES
         .iter()
         .filter(|case| !case.declared.is_empty())
-        .flat_map(|case| {
-            case.expected(REGION).into_iter().map(|summary| {
-                (
-                    format!("{}/{}", summary.application_id, summary.component_id),
-                    summary,
-                )
-            })
-        })
+        .flat_map(|case| case.expected(REGION))
         .collect();
-    all.sort();
-    let expected_all: Vec<Summary> = all.into_iter().map(|(_, summary)| summary).collect();
+    expected_all.sort();
     let reply = emulator
         .send_in_region(REGION, "/list-components", json!({}))
         .await;
@@ -721,7 +730,7 @@ fn paging_id(index: usize) -> String {
 async fn paging_walks_every_component_exactly_once() {
     let emulator = Emulator::new();
 
-    let mut expected_all: Vec<(String, Summary)> = Vec::new();
+    let mut expected_all: Vec<Summary> = Vec::new();
     for (index, count) in PAGING_SHAPE.iter().enumerate() {
         let id = paging_id(index);
         // Types taken from the model's own catalogue, so a type added to it widens these
@@ -740,15 +749,10 @@ async fn paging_walks_every_component_exactly_once() {
         );
         register(&emulator, REGION, &id, "SAP_ABAP", &declared, &[]).await;
         for (component_type, sid) in &declared {
-            let summary = expected_summary(REGION, &id, component_type, sid);
-            expected_all.push((
-                format!("{}/{}", summary.application_id, summary.component_id),
-                summary,
-            ));
+            expected_all.push(expected_summary(REGION, &id, component_type, sid));
         }
     }
     expected_all.sort();
-    let expected_all: Vec<Summary> = expected_all.into_iter().map(|(_, s)| s).collect();
     let total = expected_all.len();
 
     // Page sizes across the modelled `MaxResults` range (1..50): the smallest, two that
@@ -837,4 +841,164 @@ async fn paging_walks_every_component_exactly_once() {
         stated, expected,
         "case {forged:?}: expected {expected:?}, got {stated:?}"
     );
+}
+
+/// The longest `ApplicationId` the model admits: `@length(min: 1, max: 60)`
+/// (`smithy_query(query="shape", shape="ApplicationId")`).
+const MAX_APPLICATION_ID_LENGTH: usize = 60;
+
+/// The `ApplicationType` the ordering rows register: one whose registration describes
+/// both a component (the SAP HANA component of its own System ID) and a database, so the
+/// same two applications are reported by the component listing AND by the sibling
+/// database listing.
+const ORDERING_APP_TYPE: &str = "HANA";
+
+/// What each ordering row declares, as `(ComponentType, Sid)` pairs from the model's own
+/// `ComponentType` catalogue: two components whose DECLARATION order is the reverse of
+/// their `ComponentId` order (`<Sid>-<ComponentType>`), so the order the listing reports
+/// cannot have come from the order the registration declared them in.
+const ORDERING_DECLARED: &[(&str, &str)] = &[("HANA_NODE", "ZZ9"), ("ABAP", "AAA")];
+
+/// Pairs of `ApplicationId`s in the order a listing must report them, spanning what the
+/// ordering rule generalises over: the character the longer id of a prefix pair continues
+/// with, the id length, and a pair where neither id is a prefix of the other.
+///
+/// The continuations are one per character class the modelled `ApplicationId` pattern
+/// admits (`^[\w\d\.-]+$`, `smithy_query(query="shape", shape="ApplicationId")`): the `-`
+/// and `.` it admits BELOW the `/` of a path, and the `_`, the digit and the letters of
+/// either case it admits above it. A prefix pair's shorter id comes first whichever
+/// character the longer one continues with, so a listing keyed on anything but the ids
+/// themselves gets the `-` and `.` rows the wrong way round.
+fn ordering_id_pairs() -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = ['-', '.', '_', '9', 'Z', 'a']
+        .into_iter()
+        .map(|continuation| ("app".to_string(), format!("app{continuation}")))
+        .collect();
+    // The shortest id the modelled length admits, and a prefix pair at the longest.
+    pairs.push(("a".to_string(), "a-".to_string()));
+    let longest_prefix = "L".repeat(MAX_APPLICATION_ID_LENGTH - 1);
+    pairs.push((longest_prefix.clone(), format!("{longest_prefix}-")));
+    // Neither id a prefix of the other: they differ at a character, `-` before `.`.
+    pairs.push(("app-1".to_string(), "app.2".to_string()));
+    pairs
+}
+
+/// Every component the Region reports, in the order reported, following the continuation
+/// tokens to exhaustion at `max_results` items per page.
+async fn every_component_of_the_region(
+    emulator: &Emulator,
+    max_results: Option<i32>,
+    case: &str,
+) -> Vec<Summary> {
+    let mut seen: Vec<Summary> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let mut body = serde_json::Map::new();
+        if let Some(max_results) = max_results {
+            body.insert("MaxResults".to_string(), json!(max_results));
+        }
+        if let Some(token) = &token {
+            body.insert("NextToken".to_string(), json!(token));
+        }
+        let reply = emulator
+            .send_in_region(REGION, "/list-components", Value::Object(body))
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case} page {pages}: expected 200 from ListComponents, got {reply:?}"
+        );
+        seen.extend(listed(&reply));
+        pages += 1;
+        token = next_token(&reply);
+        if token.is_none() {
+            return seen;
+        }
+        assert!(
+            pages <= MAX_COMPONENTS_PER_REGION,
+            "case {case}: paging must terminate, got {pages} pages holding {} components",
+            seen.len()
+        );
+    }
+}
+
+/// The `ApplicationId`s the Region's database listing reports, in the order reported and
+/// with repeats collapsed: which application that sibling listing puts first.
+async fn application_order_of_the_database_listing(emulator: &Emulator, case: &str) -> Vec<String> {
+    let reply = emulator
+        .send_in_region(REGION, "/list-databases", json!({}))
+        .await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case}: expected 200 from ListDatabases, got {reply:?}"
+    );
+    let mut order: Vec<String> = Vec::new();
+    for database in reply
+        .member("Databases")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let application_id = database
+            .get("ApplicationId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if order.last() != Some(&application_id) {
+            order.push(application_id);
+        }
+    }
+    order
+}
+
+/// RULE: a listing keyed by a pair of ids is ordered by those ids themselves — here by
+/// (`ApplicationId`, `ComponentId`) — so an id another id is a prefix of is reported
+/// first whichever character the longer id continues with, the pages are the successive
+/// runs of that one order, and the Region's other listings of the same applications agree
+/// about which application comes first.
+#[tokio::test]
+async fn the_listing_is_ordered_by_application_id_then_component_id() {
+    for (first, second) in ordering_id_pairs() {
+        let case = format!("{first:?} before {second:?}");
+        let emulator = Emulator::new();
+        // The id that must be reported SECOND is registered FIRST, so neither the order
+        // of the listing nor its grouping into pages can come from the order the
+        // applications were registered in.
+        for id in [&second, &first] {
+            register(&emulator, REGION, id, ORDERING_APP_TYPE, ORDERING_DECLARED, &[]).await;
+        }
+
+        let mut expected: Vec<Summary> = [&first, &second]
+            .into_iter()
+            .flat_map(|id| expected_summaries(REGION, id, ORDERING_APP_TYPE, ORDERING_DECLARED))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            expected.first().map(|summary| summary.application_id.clone()),
+            Some(first.clone()),
+            "case {case}: the row expects {first:?} to be reported first, got {expected:?}"
+        );
+
+        // Every page size from one component per page to more than the listing holds,
+        // plus the request that names none: each reports the same components, once each,
+        // in that one order.
+        for max_results in [Some(1), Some(2), Some(3), Some(MAX_PAGE_SIZE), None] {
+            let reported = every_component_of_the_region(&emulator, max_results, &case).await;
+            assert_eq!(
+                reported, expected,
+                "case {case} at {max_results:?} per page: expected {expected:?}, got \
+                 {reported:?}"
+            );
+        }
+
+        // The sibling listing of the same Region, keyed by (ApplicationId, DatabaseId),
+        // puts the same application first.
+        let databases = application_order_of_the_database_listing(&emulator, &case).await;
+        assert_eq!(
+            databases,
+            vec![first.clone(), second.clone()],
+            "case {case}: the component and database listings of one Region must agree \
+             about which application comes first, got {databases:?}"
+        );
+    }
 }
