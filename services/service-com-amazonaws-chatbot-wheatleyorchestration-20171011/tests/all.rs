@@ -19,6 +19,8 @@ mod chime_webhook_configuration;
 mod custom_action;
 #[path = "all/custom_action_fail_closed.rs"]
 mod custom_action_fail_closed;
+#[path = "all/custom_action_update.rs"]
+mod custom_action_update;
 #[path = "all/input_constraint_refusals.rs"]
 mod input_constraint_refusals;
 #[path = "all/microsoft_teams_configured_teams.rs"]
