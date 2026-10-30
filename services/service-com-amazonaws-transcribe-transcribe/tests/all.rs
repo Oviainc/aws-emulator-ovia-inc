@@ -71,6 +71,8 @@ mod language_model_quota;
 mod language_model_training_data;
 #[path = "all/language_models.rs"]
 mod language_models;
+#[path = "all/list_cursor_name_rule.rs"]
+mod list_cursor_name_rule;
 #[path = "all/list_cursor_rule.rs"]
 mod list_cursor_rule;
 #[path = "all/list_cursor_scope_rule.rs"]

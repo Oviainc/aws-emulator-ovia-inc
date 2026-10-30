@@ -351,7 +351,12 @@ async fn the_listing_reports_what_the_read_reports_and_changes_nothing() {
 /// `NextToken` values this listing never handed out, one per form a client might send:
 /// a bare word, the sequence cursor the job and vocabulary listings hand out, this
 /// listing's own scope with no name behind it, a category name with no scope, the scope
-/// of this listing in another Region, and a token at the modelled `NextToken` ceiling.
+/// of this listing in another Region, a token at the modelled `NextToken` ceiling, and
+/// this listing's own scope carrying a name no `CategoryName` could be — one holding a
+/// character its `@pattern(^[0-9a-zA-Z._-]+$)` forbids, and one past its
+/// `@length(min: 1, max: 200)` ceiling — which no cursor minted from a stored name can
+/// carry. The whole class of forged POSITIONS is swept, over every listing of this
+/// service and both of its cursor formats, in `crate::list_cursor_name_rule`.
 ///
 /// A cursor of this listing carries the scope it was minted in — the listing and the
 /// Region its endpoint serves — ahead of the name it resumes after
@@ -390,6 +395,18 @@ fn foreign_tokens() -> Vec<(String, String)> {
         (
             format!("a token at the modelled ceiling of {NEXT_TOKEN_CEILING}"),
             "t".repeat(NEXT_TOKEN_CEILING),
+        ),
+        (
+            "this listing's scope with a name CategoryName's pattern forbids".to_string(),
+            format!("ListCallAnalyticsCategories|{DEFAULT_REGION}|cat!!"),
+        ),
+        (
+            "this listing's scope with a name past CategoryName's length ceiling"
+                .to_string(),
+            format!(
+                "ListCallAnalyticsCategories|{DEFAULT_REGION}|{}",
+                "z".repeat(500)
+            ),
         ),
     ]
 }

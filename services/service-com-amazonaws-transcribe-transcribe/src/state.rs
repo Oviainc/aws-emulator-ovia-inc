@@ -3272,6 +3272,32 @@ pub fn content_bytes(terms: &[String]) -> usize {
 /// nothing).
 const CURSOR_SEPARATOR: char = '|';
 
+/// The longest name this service keys a record by.
+///
+/// Every one of those names is modelled `@length(min: 1, max: 200)`: `CategoryName`,
+/// `VocabularyName`, `VocabularyFilterName`, `TranscriptionJobName`,
+/// `CallAnalyticsJobName` and `ModelName` alike (`smithy_query(query="shape",
+/// shape="CategoryName")`), so the boundary validator has already held every name a
+/// request established a record under to this bound.
+pub const MAX_RECORD_NAME_LENGTH: usize = 200;
+
+/// Whether `name` could be a name this service keys a record by: no longer than
+/// [`MAX_RECORD_NAME_LENGTH`] and spelled out of the characters alone that every one of
+/// those name shapes is modelled `@pattern "^[0-9a-zA-Z._-]+$"` with.
+///
+/// This is what makes the POSITION a page cursor carries decidable the way its scope
+/// and its sequence already are ([`parse_page_cursor`], [`parse_name_page_cursor`]):
+/// every cursor of this service carries the NAME of the record it resumes after, minted
+/// from a stored name and so from a name within those constraints, so a token whose
+/// name part is outside them names a record no Region of this store could ever hold and
+/// is a token this service never wrote — whatever else about it parses.
+pub fn is_record_name(name: &str) -> bool {
+    (1..=MAX_RECORD_NAME_LENGTH).contains(&name.chars().count())
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+}
+
 /// The listing a page cursor was minted by and is valid for: ONE operation over ONE
 /// Region's records.
 ///
@@ -3345,10 +3371,10 @@ pub fn page_cursor(scope: CursorScope<'_>, sequence: u64, name: &str) -> String 
 /// restarting from the top or answering an empty page.
 ///
 /// A token this listing wrote carries the WHOLE of what [`page_cursor`] hands out: the
-/// scope that listing mints in, a creation sequence, the separator, and the non-empty
-/// name the cursor was minted with (every name this service keys a record by is
-/// modelled `@length(min: 1, ..)`), so neither a bare number carrying no name nor a
-/// cursor another listing (or another Region's endpoint) handed out is one of this
+/// scope that listing mints in, a creation sequence, the separator, and a name this
+/// service could key a record by ([`is_record_name`]), so neither a bare number
+/// carrying no name, nor a name no record of this store could be called, nor a cursor
+/// another listing (or another Region's endpoint) handed out is one of this
 /// listing's. Creation sequences are minted from 1 upwards, per family, by
 /// [`ComAmazonawsTranscribeTranscribeState::next_sequence`], so a cursor is only one
 /// this listing could have handed out when its sequence has actually been minted for
@@ -3371,7 +3397,7 @@ pub fn parse_page_cursor(
     let (sequence, name) = token
         .strip_prefix(scope.prefix().as_str())?
         .split_once(CURSOR_SEPARATOR)?;
-    if name.is_empty() {
+    if !is_record_name(name) {
         return None;
     }
     sequence
@@ -3403,13 +3429,21 @@ pub fn name_page_cursor(scope: CursorScope<'_>, name: &str) -> String {
 /// `scope` never handed out — which that listing refuses rather than silently
 /// restarting from the top.
 ///
-/// Every name this service keys a record by is non-empty (`CategoryName` is modelled
-/// `@length(min: 1, max: 200)`), so a scope prefix with nothing behind it is a token
-/// this service never wrote.
+/// A token this listing wrote carries the WHOLE of what [`name_page_cursor`] hands out:
+/// the scope that listing mints in, and behind it a name this service could key a record
+/// by ([`is_record_name`] — `CategoryName` is modelled `@length(min: 1, max: 200)` and
+/// `@pattern "^[0-9a-zA-Z._-]+$"`, and this codec only ever mints from a stored name).
+/// So a scope prefix with nothing behind it, one carrying a name longer than that
+/// `@length` allows, and one carrying characters that `@pattern` forbids are all tokens
+/// this service never wrote, and are refused rather than honoured as a resume point —
+/// just as the sequence codec refuses a position its family never minted
+/// ([`parse_page_cursor`]). The name is bounded by the constraint rather than by the
+/// names the Region holds right now, because resuming strictly past a name is what keeps
+/// paging stable when the record that name belongs to is deleted between two pages.
 pub fn parse_name_page_cursor<'t>(token: &'t str, scope: CursorScope<'_>) -> Option<&'t str> {
     token
         .strip_prefix(scope.prefix().as_str())
-        .filter(|name| !name.is_empty())
+        .filter(|name| is_record_name(name))
 }
 
 /// What a listing refuses a `NextToken` this service never handed out with, naming
