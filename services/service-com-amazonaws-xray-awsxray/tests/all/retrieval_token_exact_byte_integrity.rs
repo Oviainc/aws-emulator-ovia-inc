@@ -39,7 +39,7 @@ fn now() -> f64 {
 /// (`smithy_query(query="operation",operation="CancelTraceRetrieval,
 /// ListRetrievedTraces,GetRetrievedTracesGraph")`), each with the name its own
 /// refusal gives the member.
-const TOKEN_READERS: [(&str, &str, &str); 3] = [
+pub(crate) const TOKEN_READERS: [(&str, &str, &str); 3] = [
     ("CancelTraceRetrieval", "/CancelTraceRetrieval", "retrieval token"),
     ("ListRetrievedTraces", "/ListRetrievedTraces", "execution id"),
     (
@@ -64,7 +64,7 @@ const UNDECODABLE_CLAUSE: &str = "Invalid execution id provided: ";
 
 /// The request body a reader needs to reach its token check: `TraceFormat` is a
 /// member of `ListRetrievedTraces` alone, and that operation judges it first.
-fn body(path: &str, token: &str) -> Value {
+pub(crate) fn body(path: &str, token: &str) -> Value {
     let mut body = json!({ "RetrievalToken": token });
     if path == "/ListRetrievedTraces" {
         body["TraceFormat"] = json!("XRAY");
@@ -75,7 +75,7 @@ fn body(path: &str, token: &str) -> Value {
 /// What a value of the issued form whose integrity check does not verify is
 /// refused with: the submitted value in the outer clause and again in the
 /// decoder's.
-fn undecodable_message(member: &str, token: &str) -> String {
+pub(crate) fn undecodable_message(member: &str, token: &str) -> String {
     format!("Invalid {member} {token} passed: {UNDECODABLE_CLAUSE}{token}")
 }
 
@@ -124,7 +124,7 @@ fn replace(token: &str, index: usize, mutation: char) -> String {
 
 /// A genuine `RetrievalToken`, issued by this emulator: one segment ingested,
 /// then a retrieval started over the window it falls in.
-async fn genuine_token(xray: &Xray, n: u32) -> String {
+pub(crate) async fn genuine_token(xray: &Xray, n: u32) -> String {
     let start = (now() - 600.0).trunc();
     let trace = trace_id(n);
     let ingested = xray

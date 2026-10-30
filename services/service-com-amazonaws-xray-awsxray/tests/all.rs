@@ -56,6 +56,9 @@ mod request_validation_before_resolution;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
+#[path = "all/retrieval_token_case_sensitivity.rs"]
+mod retrieval_token_case_sensitivity;
+
 #[path = "all/retrieval_token_exact_byte_integrity.rs"]
 mod retrieval_token_exact_byte_integrity;
 
