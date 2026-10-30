@@ -206,11 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(invalid_parameter(crate::state::constraint_report(
-                        "nextToken",
-                        "Member must be a token returned by a previous \
-                         ListAutomationEvents call",
-                    )));
+                    return Err(unissued_token());
                 };
                 if cursor.filter_fingerprint != query_fingerprint {
                     return Err(invalid_parameter(crate::state::constraint_report(
@@ -252,8 +248,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.events.settle_due(now);
         // The events inside the window that match the filters are what gets
         // paged, and the page walk is the one every paginated listing of this
-        // service performs: `crate::state::serve_page`.
-        let (page, next_token): (Vec<AutomationEvent>, Option<String>) = crate::state::serve_page(
+        // service performs, entered the way a cursor enters it:
+        // `crate::state::resume_page` answers nothing for a cursor naming a
+        // position this sequence does not reach, which is a token this listing
+        // never minted and so the same refusal as one that does not decode at
+        // all.
+        let served: Option<(Vec<AutomationEvent>, Option<String>)> = crate::state::resume_page(
             guard
                 .events
                 .iter_in_order()
@@ -270,6 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             page_size,
             query_fingerprint,
         );
+        let Some((page, next_token)) = served else {
+            return Err(unissued_token());
+        };
 
         Ok(ListAutomationEventsOutput {
             automation_events: Some(page),
@@ -285,4 +288,14 @@ fn invalid_parameter(message: String) -> ListAutomationEventsError {
         },
     )
     .into()
+}
+
+/// The modelled 400 for a `nextToken` this operation did not issue: one that
+/// decodes to no cursor at all, or one naming a position the sequence this
+/// listing pages does not reach.
+fn unissued_token() -> ListAutomationEventsError {
+    invalid_parameter(crate::state::constraint_report(
+        "nextToken",
+        "Member must be a token returned by a previous ListAutomationEvents call",
+    ))
 }

@@ -67,6 +67,8 @@ mod membership_page_token_spellings;
 mod not_found_wording;
 #[path = "all/organization_rule_scope_gate.rs"]
 mod organization_rule_scope_gate;
+#[path = "all/page_cursor_spellings.rs"]
+mod page_cursor_spellings;
 #[path = "all/page_size_rule.rs"]
 mod page_size_rule;
 #[path = "all/page_token_refusals.rs"]

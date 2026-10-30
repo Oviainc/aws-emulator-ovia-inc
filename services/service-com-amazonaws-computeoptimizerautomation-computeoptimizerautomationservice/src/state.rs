@@ -3747,16 +3747,44 @@ pub fn encode_page_token(cursor: &PageCursor) -> String {
 }
 
 /// Decode a `nextToken` produced by [`encode_page_token`]. `None` when the token
-/// was not produced by this service. What a decoded cursor may resume is the
-/// caller's own check: it compares the cursor's fingerprint against the one it
-/// would have issued for this request.
+/// was not produced by this service.
+///
+/// A token this service produced is EXACTLY what the encoder writes for some
+/// cursor, both halves of the spelling included: the lowercase hex `hex::encode`
+/// emits, of `<offset>:<fingerprint>` whose offset is the single decimal
+/// `usize`'s `Display` renders. The readers underneath accept more than that —
+/// `hex::decode` reads the same bytes spelled with uppercase digits, and
+/// `usize::from_str` reads a leading `+` and leading zeros — so each is pinned to
+/// the spelling the encoder emits, else a cursor this service never minted would
+/// decode and resume a walk on nothing but its fingerprint.
+///
+/// What a decoded cursor may resume is the caller's own check: it compares the
+/// cursor's fingerprint against the one it would have issued for this request,
+/// and serves the page through [`resume_page`], which refuses a cursor naming a
+/// position its sequence does not reach.
 pub fn decode_page_token(token: &str) -> Option<PageCursor> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let bytes = hex::decode(token).ok()?;
+    // The hex half: a decoding is this service's token only when it re-encodes
+    // to the very string presented.
+    if hex::encode(&bytes) != token {
+        return None;
+    }
+    let decoded = String::from_utf8(bytes).ok()?;
     let (offset, fingerprint) = decoded.split_once(':')?;
     Some(PageCursor {
-        offset: offset.parse().ok()?,
+        offset: canonical_offset(offset)?,
         filter_fingerprint: fingerprint.to_string(),
     })
+}
+
+/// The offset `spelling` names, when it is the ONE spelling
+/// [`encode_page_token`] writes for that offset: the bare decimal `usize`'s
+/// `Display` renders, which carries no sign and no leading zero beyond the single
+/// digit of zero itself. `None` for every other spelling of the same number, so
+/// it is accepted only when the value renders back to it.
+fn canonical_offset(spelling: &str) -> Option<usize> {
+    let offset: usize = spelling.parse().ok()?;
+    (offset.to_string() == spelling).then_some(offset)
 }
 
 /// How many items one page of a paginated listing serves, from the caller's
@@ -3790,6 +3818,9 @@ pub fn page_size(max_results: Option<i32>) -> usize {
 /// `selected` is the sequence the caller's filters already narrowed, in the order
 /// the operation reports it; `filter_fingerprint` is the one that selection would
 /// be issued under, so a token can only resume the query it was minted for.
+///
+/// A handler reaches this through [`resume_page`], which adds the one thing a
+/// caller-supplied cursor has to satisfy and a first page does not.
 pub fn serve_page<T, I>(
     selected: I,
     offset: usize,
@@ -3799,11 +3830,55 @@ pub fn serve_page<T, I>(
 where
     I: IntoIterator<Item = T>,
 {
-    let mut page: Vec<T> = selected
-        .into_iter()
-        .skip(offset)
-        .take(page_size.saturating_add(1))
-        .collect();
+    let (page, next_token, _) = walk_page(selected, offset, page_size, filter_fingerprint);
+    (page, next_token)
+}
+
+/// Serve the page a CURSOR asks for, or refuse a cursor the sequence cannot be
+/// resumed at.
+///
+/// The walk of [`serve_page`], plus the one thing that separates a resumed page
+/// from a first one: a cursor resumes a suffix of the sequence it was taken over,
+/// so that sequence has to REACH the position the cursor names. A page token is
+/// minted only while the walk still had an item to resume at
+/// ([`serve_page`] mints `offset + page.len()` with a further item present), so a
+/// sequence that ENDS BEFORE `offset` is one no page of this listing ever stopped
+/// that far into: `None` is answered and the caller refuses the token it did not
+/// issue, instead of reporting an empty page and no `nextToken`, which a client
+/// reads as the authoritative end of the sequence. The end itself is reachable —
+/// `offset` equal to the sequence's length serves its empty remainder — because
+/// that is where a walk whose tail was removed after the token was minted
+/// resumes.
+pub fn resume_page<T, I>(
+    selected: I,
+    offset: usize,
+    page_size: usize,
+    filter_fingerprint: String,
+) -> Option<(Vec<T>, Option<String>)>
+where
+    I: IntoIterator<Item = T>,
+{
+    let (page, next_token, reached) = walk_page(selected, offset, page_size, filter_fingerprint);
+    reached.then_some((page, next_token))
+}
+
+/// The walk both entry points above perform, answering additionally whether the
+/// sequence reached `offset` at all — which is what tells a resumed walk apart
+/// from one asked to start past the end of its sequence.
+fn walk_page<T, I>(
+    selected: I,
+    offset: usize,
+    page_size: usize,
+    filter_fingerprint: String,
+) -> (Vec<T>, Option<String>, bool)
+where
+    I: IntoIterator<Item = T>,
+{
+    let mut items = selected.into_iter();
+    // What the page resumes after, COUNTED rather than discarded, so the walk
+    // knows whether the sequence holds the position it was asked to resume at.
+    let before = items.by_ref().take(offset).count();
+    let mut page: Vec<T> = items.take(page_size.saturating_add(1)).collect();
     let has_more = page.len() > page_size;
     page.truncate(page_size);
     let next_token = has_more.then(|| {
@@ -3812,7 +3887,7 @@ where
             filter_fingerprint,
         })
     });
-    (page, next_token)
+    (page, next_token, before == offset)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

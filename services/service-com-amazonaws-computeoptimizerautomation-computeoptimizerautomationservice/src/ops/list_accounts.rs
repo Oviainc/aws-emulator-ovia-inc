@@ -181,11 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => match crate::state::decode_page_token(token) {
-                // A token this listing never issued, whether it decodes to no
-                // cursor at all or to one taken for another walk: one refusal,
-                // worded once.
+                // A token this listing never issued, whichever way it fails to be
+                // one: it decodes to no cursor at all (every spelling but the one
+                // `crate::state::encode_page_token` writes), it carries a cursor
+                // taken for another walk, or — below, where the sequence is known
+                // — it names a position no page of this listing ever stopped at.
+                // One refusal, worded once.
                 Some(cursor) if cursor.filter_fingerprint == query_fingerprint => cursor.offset,
-                _ => return Err(foreign_token()),
+                _ => return Err(unissued_token()),
             },
         };
 
@@ -216,9 +219,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let accounts = guard.accounts_in_order(at);
         // The page walk is the one every paginated listing of this service
-        // performs: `crate::state::serve_page`.
-        let (page, next_token): (Vec<AccountInfo>, Option<String>) =
-            crate::state::serve_page(accounts, offset, page_size, query_fingerprint);
+        // performs, entered the way a cursor enters it: `crate::state::resume_page`
+        // answers nothing for a cursor naming a position this sequence does not
+        // reach, which is a token this listing never minted and so the same
+        // refusal as one that does not decode at all.
+        let served: Option<(Vec<AccountInfo>, Option<String>)> =
+            crate::state::resume_page(accounts, offset, page_size, query_fingerprint);
+        let Some((page, next_token)) = served else {
+            return Err(unissued_token());
+        };
 
         Ok(ListAccountsOutput {
             accounts: page,
@@ -230,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The modelled 400 (`InvalidParameterValueException`), for a `nextToken` this
 /// operation did not issue. The model's `NextToken` pattern cannot express "a
 /// token of mine", so the check is in the handler rather than at the boundary.
-fn foreign_token() -> ListAccountsError {
+fn unissued_token() -> ListAccountsError {
     ListAccountsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
         message: Some(crate::state::constraint_report(
             "nextToken",

@@ -197,11 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(invalid_parameter(crate::state::constraint_report(
-                        "nextToken",
-                        "Member must be a token returned by a previous \
-                         ListRecommendedActions call",
-                    )));
+                    return Err(unissued_token());
                 };
                 if cursor.filter_fingerprint != filter_fingerprint {
                     return Err(invalid_parameter(crate::state::constraint_report(
@@ -235,20 +231,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller may RETRIEVE — its own account's, and each currently
         // associated member account's, judged per call:
         // `crate::state::…::retrievable_actions`. The page walk is the one
-        // every paginated listing of this service performs:
-        // `crate::state::serve_page`.
-        let (page, next_token): (Vec<RecommendedAction>, Option<String>) =
-            crate::state::serve_page(
-                guard
-                    .retrievable_actions()
-                    .filter(|action| {
-                        crate::state::recommended_action_matches_filters(action, &filters)
-                    })
-                    .cloned(),
-                offset,
-                page_size,
-                filter_fingerprint,
-            );
+        // every paginated listing of this service performs, entered the way a
+        // cursor enters it: `crate::state::resume_page` answers nothing for a
+        // cursor naming a position this sequence does not reach, which is a token
+        // this listing never minted and so the same refusal as one that does not
+        // decode at all.
+        let served: Option<(Vec<RecommendedAction>, Option<String>)> = crate::state::resume_page(
+            guard
+                .retrievable_actions()
+                .filter(|action| crate::state::recommended_action_matches_filters(action, &filters))
+                .cloned(),
+            offset,
+            page_size,
+            filter_fingerprint,
+        );
+        let Some((page, next_token)) = served else {
+            return Err(unissued_token());
+        };
 
         Ok(ListRecommendedActionsOutput {
             recommended_actions: Some(page),
@@ -264,4 +263,14 @@ fn invalid_parameter(message: String) -> ListRecommendedActionsError {
         },
     )
     .into()
+}
+
+/// The modelled 400 for a `nextToken` this operation did not issue: one that
+/// decodes to no cursor at all, or one naming a position the sequence this
+/// listing pages does not reach.
+fn unissued_token() -> ListRecommendedActionsError {
+    invalid_parameter(crate::state::constraint_report(
+        "nextToken",
+        "Member must be a token returned by a previous ListRecommendedActions call",
+    ))
 }

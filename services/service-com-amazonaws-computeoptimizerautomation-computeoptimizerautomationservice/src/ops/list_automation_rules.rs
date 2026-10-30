@@ -185,10 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(invalid_parameter(crate::state::constraint_report(
-                        "nextToken",
-                        "Member must be a token returned by a previous ListAutomationRules call",
-                    )));
+                    return Err(unissued_token());
                 };
                 if cursor.filter_fingerprint != filter_fingerprint {
                     return Err(invalid_parameter(crate::state::constraint_report(
@@ -215,9 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListAutomationRulesErrorModeled::OptInRequiredException(refusal).into());
         }
         // The matching rules are what gets paged, and the page walk is the one
-        // every paginated listing of this service performs:
-        // `crate::state::serve_page`.
-        let (page, next_token): (Vec<AutomationRule>, Option<String>) = crate::state::serve_page(
+        // every paginated listing of this service performs, entered the way a
+        // cursor enters it: `crate::state::resume_page` answers nothing for a
+        // cursor naming a position this sequence does not reach, which is a token
+        // this listing never minted and so the same refusal as one that does not
+        // decode at all.
+        let served: Option<(Vec<AutomationRule>, Option<String>)> = crate::state::resume_page(
             guard
                 .rules
                 .iter_in_order()
@@ -227,6 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             page_size,
             filter_fingerprint,
         );
+        let Some((page, next_token)) = served else {
+            return Err(unissued_token());
+        };
 
         Ok(ListAutomationRulesOutput {
             automation_rules: Some(page),
@@ -242,4 +245,14 @@ fn invalid_parameter(message: String) -> ListAutomationRulesError {
         },
     )
     .into()
+}
+
+/// The modelled 400 for a `nextToken` this operation did not issue: one that
+/// decodes to no cursor at all, or one naming a position the sequence this
+/// listing pages does not reach.
+fn unissued_token() -> ListAutomationRulesError {
+    invalid_parameter(crate::state::constraint_report(
+        "nextToken",
+        "Member must be a token returned by a previous ListAutomationRules call",
+    ))
 }

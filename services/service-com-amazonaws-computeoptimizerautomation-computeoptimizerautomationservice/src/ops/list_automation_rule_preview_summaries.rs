@@ -238,11 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(invalid_parameter(crate::state::constraint_report(
-                        "nextToken",
-                        "Member must be a token returned by a previous \
-                         ListAutomationRulePreviewSummaries call",
-                    )));
+                    return Err(unissued_token());
                 };
                 if cursor.filter_fingerprint != selection_fingerprint {
                     return Err(invalid_parameter(crate::state::constraint_report(
@@ -290,11 +286,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // The groups are what gets paged, and the page walk is the one every
-        // paginated listing of this service performs:
-        // `crate::state::serve_page`. Each group is projected into the modelled
-        // summary afterwards, so the projection runs only for the page served.
-        let (groups, next_token): (Vec<crate::state::ActionGroup>, Option<String>) =
-            crate::state::serve_page(grouped, offset, page_size, selection_fingerprint);
+        // paginated listing of this service performs, entered the way a cursor
+        // enters it: `crate::state::resume_page` answers nothing for a cursor
+        // naming a position this sequence of groups does not reach, which is a
+        // token this listing never minted. Each group is projected into the
+        // modelled summary afterwards, so the projection runs only for the page
+        // served.
+        let served: Option<(Vec<crate::state::ActionGroup>, Option<String>)> =
+            crate::state::resume_page(grouped, offset, page_size, selection_fingerprint);
+        let Some((groups, next_token)) = served else {
+            return Err(unissued_token());
+        };
         let page: Vec<PreviewResultSummary> = groups
             .into_iter()
             .map(|group| PreviewResultSummary {
@@ -320,4 +322,14 @@ fn invalid_parameter(message: String) -> ListAutomationRulePreviewSummariesError
         },
     )
     .into()
+}
+
+/// The modelled 400 for a `nextToken` this operation did not issue: one that
+/// decodes to no cursor at all, or one naming a position the sequence of groups
+/// this listing pages does not reach.
+fn unissued_token() -> ListAutomationRulePreviewSummariesError {
+    invalid_parameter(crate::state::constraint_report(
+        "nextToken",
+        "Member must be a token returned by a previous ListAutomationRulePreviewSummaries call",
+    ))
 }

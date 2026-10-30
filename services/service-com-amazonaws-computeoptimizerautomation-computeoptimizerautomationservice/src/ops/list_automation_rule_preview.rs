@@ -233,11 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(invalid_parameter(crate::state::constraint_report(
-                        "nextToken",
-                        "Member must be a token returned by a previous ListAutomationRulePreview \
-                         call",
-                    )));
+                    return Err(unissued_token());
                 };
                 if cursor.filter_fingerprint != selection_fingerprint {
                     return Err(invalid_parameter(crate::state::constraint_report(
@@ -271,9 +267,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::previewed_actions`, so this operation and
         // `ListAutomationRulePreviewSummaries` report over exactly the same set
         // of actions for the same request. Paging it is the one page walk every
-        // paginated listing of this service performs:
-        // `crate::state::serve_page`.
-        let (page, next_token): (Vec<PreviewResult>, Option<String>) = crate::state::serve_page(
+        // paginated listing of this service performs, entered the way a cursor
+        // enters it: `crate::state::resume_page` answers nothing for a cursor
+        // naming a position this selection does not reach, which is a token this
+        // listing never minted and so the same refusal as one that does not
+        // decode at all.
+        let served: Option<(Vec<PreviewResult>, Option<String>)> = crate::state::resume_page(
             crate::state::previewed_actions(
                 &guard,
                 scope.as_deref(),
@@ -285,6 +284,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             page_size,
             selection_fingerprint,
         );
+        let Some((page, next_token)) = served else {
+            return Err(unissued_token());
+        };
 
         Ok(ListAutomationRulePreviewOutput {
             preview_results: Some(page),
@@ -300,4 +302,14 @@ fn invalid_parameter(message: String) -> ListAutomationRulePreviewError {
         },
     )
     .into()
+}
+
+/// The modelled 400 for a `nextToken` this operation did not issue: one that
+/// decodes to no cursor at all, or one naming a position the selection this
+/// listing pages does not reach.
+fn unissued_token() -> ListAutomationRulePreviewError {
+    invalid_parameter(crate::state::constraint_report(
+        "nextToken",
+        "Member must be a token returned by a previous ListAutomationRulePreview call",
+    ))
 }

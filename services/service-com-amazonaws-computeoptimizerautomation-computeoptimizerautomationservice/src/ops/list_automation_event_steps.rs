@@ -183,11 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(invalid_parameter(crate::state::constraint_report(
-                        "nextToken",
-                        "Member must be a token returned by a previous \
-                         ListAutomationEventSteps call",
-                    )));
+                    return Err(unissued_token());
                 };
                 if cursor.filter_fingerprint != query_fingerprint {
                     return Err(invalid_parameter(crate::state::constraint_report(
@@ -237,17 +233,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         event.settle(now);
 
         // The page walk is the one every paginated listing of this service
-        // performs: `crate::state::serve_page`.
-        let (page, next_token): (Vec<AutomationEventStep>, Option<String>) =
-            crate::state::serve_page(
-                event
-                    .steps
-                    .iter()
-                    .map(|step| step.to_automation_event_step(&event.event_id)),
-                offset,
-                page_size,
-                query_fingerprint,
-            );
+        // performs, entered the way a cursor enters it:
+        // `crate::state::resume_page` answers nothing for a cursor naming a
+        // position this event's steps do not reach, which is a token this
+        // listing never minted and so the same refusal as one that does not
+        // decode at all.
+        let served: Option<(Vec<AutomationEventStep>, Option<String>)> = crate::state::resume_page(
+            event
+                .steps
+                .iter()
+                .map(|step| step.to_automation_event_step(&event.event_id)),
+            offset,
+            page_size,
+            query_fingerprint,
+        );
+        let Some((page, next_token)) = served else {
+            return Err(unissued_token());
+        };
 
         Ok(ListAutomationEventStepsOutput {
             automation_event_steps: Some(page),
@@ -268,6 +270,16 @@ fn invalid_parameter(message: String) -> ListAutomationEventStepsError {
         },
     )
     .into()
+}
+
+/// The modelled 400 for a `nextToken` this operation did not issue: one that
+/// decodes to no cursor at all, or one naming a position the steps this listing
+/// pages do not reach.
+fn unissued_token() -> ListAutomationEventStepsError {
+    invalid_parameter(crate::state::constraint_report(
+        "nextToken",
+        "Member must be a token returned by a previous ListAutomationEventSteps call",
+    ))
 }
 
 /// The modelled 404 (`ResourceNotFoundException`). The message is this service's
