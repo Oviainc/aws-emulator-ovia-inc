@@ -3334,16 +3334,20 @@ fn supplied_member_text(member: &::serde_json::Value) -> String {
 /// of the SOURCE queue's own type.
 ///
 /// A redrive moves a message from the source queue to the target queue, and the two queue
-/// types order and deliver messages differently, so a message cannot cross between them.
-/// The sentence is the rule as this service's own model states it, in the model's words:
-/// "The dead-letter queue of a FIFO queue must also be a FIFO queue. Similarly, the
+/// types order and deliver messages differently, so a message cannot cross between them —
+/// "the dead-letter queue of a FIFO queue must also be a FIFO queue. Similarly, the
 /// dead-letter queue of a standard queue must also be a standard queue"
 /// (`smithy_query(query="doc", shape="SetQueueAttributesRequest", member="Attributes",
-/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`),
-/// which is what a caller has to change the request against.
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`).
+///
+/// That is the model's PROSE about the constraint; what the refusal carries on the wire is
+/// the one sentence Amazon SQS answers this rule with, which is what a caller branching on
+/// the `Reason` clause matches. BOTH terminal periods belong to that sentence as the service
+/// words it, and the second one is deliberate: the clause really does end in two, as the
+/// recorded 400 response of this refusal shows. [`invalid_parameter_message`] appends
+/// nothing, so neither comes from the template — do not "correct" the pair away.
 pub const DEAD_LETTER_TARGET_TYPE_REASON: &str =
-    "The dead-letter queue of a FIFO queue must also be a FIFO queue. Similarly, the \
-     dead-letter queue of a standard queue must also be a standard queue.";
+    "Dead-letter queue must be same type of queue as the source..";
 
 /// The reason a refusal gives for a `RedrivePolicy` whose dead-letter target is not a queue
 /// this store holds.

@@ -210,7 +210,8 @@ async fn a_created_queue_reports_its_url_arn_supplied_attributes_and_documented_
 }
 
 /// `AttributeNames` selects: absent or empty returns no `Attributes` member at all,
-/// `All` returns every attribute the queue has, and a name list returns just those.
+/// `All` returns every attribute the queue has, a name list returns just those, and a
+/// list naming only attributes the queue has no value for returns no member either.
 #[tokio::test]
 async fn get_queue_attributes_returns_only_the_attribute_names_the_request_asks_for() {
     let router = emulator();
@@ -249,6 +250,11 @@ async fn get_queue_attributes_returns_only_the_attribute_names_the_request_asks_
                 ("VisibilityTimeout", "45".to_string()),
             ],
         ),
+        (
+            "an attribute the queue has a value for beside one it has not",
+            vec!["VisibilityTimeout", "RedrivePolicy"],
+            vec![("VisibilityTimeout", "45".to_string())],
+        ),
     ] {
         let reported = ok(
             &router,
@@ -264,6 +270,30 @@ async fn get_queue_attributes_returns_only_the_attribute_names_the_request_asks_
         assert_eq!(
             reported, expected,
             "case {case}: asking for {requested:?} reported {reported:?}"
+        );
+    }
+
+    // A selection the queue has no value for ANY name of is the same empty result as a
+    // request that selected nothing: no `Attributes` member at all, so a client cannot read
+    // a configuration into a queue that carries none. A queue has a `RedrivePolicy` or a
+    // `Policy` only once a write gave it one, and this one never did.
+    for (case, requested) in [
+        ("one name the queue has no value for", vec!["RedrivePolicy"]),
+        (
+            "two names the queue has no value for",
+            vec!["RedrivePolicy", "Policy"],
+        ),
+    ] {
+        let reported = ok(
+            &router,
+            "GetQueueAttributes",
+            json!({"QueueUrl": url, "AttributeNames": requested}),
+        )
+        .await;
+        assert!(
+            reported.get("Attributes").is_none(),
+            "case {case}: asking for {requested:?} expected no Attributes member at all, got \
+             {reported}"
         );
     }
 

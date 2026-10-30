@@ -73,13 +73,13 @@ fn out_of_range(supplied: &str, count: &str) -> String {
     )
 }
 
-/// The refusal of a pair of queues of different types, stating the rule the model's own
-/// documentation gives for a dead-letter target.
+/// The refusal of a pair of queues of different types, in the sentence Amazon SQS states
+/// that rule in. Spelled out here rather than imported from the crate under test, so a
+/// wrong constant cannot make a row pass; the sentence really does end in two periods.
 fn type_mismatch(supplied: &str) -> String {
     refusal(
         supplied,
-        "The dead-letter queue of a FIFO queue must also be a FIFO queue. Similarly, the \
-         dead-letter queue of a standard queue must also be a standard queue.",
+        "Dead-letter queue must be same type of queue as the source..",
     )
 }
 

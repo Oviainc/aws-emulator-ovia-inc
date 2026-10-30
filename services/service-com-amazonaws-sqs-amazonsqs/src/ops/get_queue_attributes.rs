@@ -254,8 +254,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         };
 
+        // "A map of attributes to their respective values" is an OPTIONAL member, and a
+        // selection the queue has no value for ANY name of is the same empty result as a
+        // request that selected nothing: no map at all rather than an empty one, so a
+        // client cannot read a configuration into a queue that carries none.
         Ok(GetQueueAttributesOutput {
-            attributes: Some(attributes.into_iter().collect()),
+            attributes: (!attributes.is_empty()).then(|| attributes.into_iter().collect()),
         })
     }
 }
