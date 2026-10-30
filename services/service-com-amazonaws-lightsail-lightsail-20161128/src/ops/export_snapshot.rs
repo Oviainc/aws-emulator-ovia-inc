@@ -178,9 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `sourceSnapshotName` is a modelled `@required` member carrying a
         // modelled pattern, so the centralized walk refused anything outside it
         // before this body ran. What is left is what the model cannot express:
-        // the name has to be a snapshot this account holds, and the store has to
-        // have room for the record the export appends. Both are checked BEFORE
-        // the first write, so a refused request records nothing.
+        // the name has to be a snapshot this account holds, that snapshot's
+        // capture has to be finished, and the store has to have room for the
+        // record the export appends. All of them are checked BEFORE the first
+        // write, so a refused request records nothing.
         let source_snapshot_name = input.source_snapshot_name;
         let now = crate::state::now_ms();
 
@@ -202,9 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // disk or an instance's system volume, and an instance snapshot
             // (`CreateInstanceSnapshot`), whose source is an instance — which is
             // what `fromResourceName`/`fromResourceArn` report, "the snapshot's
-            // source instance or disk". A name that is neither is refused.
-            let exported = export_source(store, &source_snapshot_name)
-                .ok_or_else(|| not_found(&source_snapshot_name))?;
+            // source instance or disk". A name that is neither is refused, and
+            // so is a snapshot of either kind whose capture is not finished.
+            let exported = export_source(store, &source_snapshot_name)?;
             let Exported {
                 source_info,
                 location,
@@ -269,25 +270,46 @@ struct Exported {
 }
 
 /// The stored snapshot `name` names — a disk snapshot or an instance snapshot —
-/// as the export describes it, or `None` when the account holds neither.
+/// as the export describes it, or the refusal that name earns against this
+/// store's own state.
 ///
 /// The two kinds differ in exactly what the model says they do: a disk snapshot
 /// describes the snapshotted volume's size and "appear[s] in Amazon EC2 as Amazon
 /// EBS volumes", while an instance snapshot describes the blueprint and bundle
 /// its source instance was created from together with the disks that were
 /// attached to it, and "appear[s] in Amazon EC2 as Amazon Machine Images (AMIs)".
+///
+/// Both kinds answer the same two questions: does this account hold the snapshot
+/// the name addresses, and has the service finished taking it. The second is the
+/// rule every operation of this service that consumes a snapshot applies — a
+/// snapshot holds a complete copy of what it captured only once every block it
+/// captures is captured, so until then there is nothing complete to export to
+/// Amazon EC2 either. That is a well-formed request the resources' state does
+/// not allow, which is what the modelled `OperationFailureException` is for.
 fn export_source(
     store: &crate::state::ComAmazonawsLightsailLightsail20161128State,
     name: &str,
-) -> Option<Exported> {
+) -> Result<Exported, ExportSnapshotError> {
     if let Some(snapshot) = store.disk_snapshot(name) {
+        // While Lightsail is still taking a disk snapshot it reports `pending`
+        // (`DiskSnapshot$state`, "the status of the disk snapshot operation"),
+        // and a capture that ended any other way than `completed` holds no
+        // usable copy either.
+        if snapshot.state != crate::state::DISK_SNAPSHOT_STATE_COMPLETED {
+            return Err(operation_failure(format!(
+                "The disk snapshot {} is {}: a snapshot can be exported only when it is {}.",
+                snapshot.name,
+                snapshot.state,
+                crate::state::DISK_SNAPSHOT_STATE_COMPLETED
+            )));
+        }
         let (from_resource_name, from_resource_arn) = match &snapshot.source {
             crate::state::DiskSnapshotSource::Disk { name, arn }
             | crate::state::DiskSnapshotSource::Instance { name, arn } => {
                 (name.clone(), arn.clone())
             }
         };
-        return Some(Exported {
+        return Ok(Exported {
             source_info: ExportSnapshotRecordSourceInfo {
                 // The modelled `ExportSnapshotRecordSourceType` value of a disk
                 // snapshot, the same `DiskSnapshot` the snapshot's own
@@ -310,8 +332,21 @@ fn export_source(
             destination_id_prefix: crate::state::EC2_VOLUME_ID_PREFIX,
         });
     }
-    let snapshot = store.instance_snapshot(name)?;
-    Some(Exported {
+    let snapshot = store
+        .instance_snapshot(name)
+        .ok_or_else(|| not_found(name))?;
+    // The same rule for the other kind: an instance snapshot the service is
+    // still taking reports `pending` (`InstanceSnapshot$state`, "the state the
+    // snapshot is in") and only `available` says the capture is done.
+    if snapshot.state != crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE {
+        return Err(operation_failure(format!(
+            "The instance snapshot {} is {}: a snapshot can be exported only when it is {}.",
+            snapshot.name,
+            snapshot.state,
+            crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE
+        )));
+    }
+    Ok(Exported {
         source_info: ExportSnapshotRecordSourceInfo {
             // The other modelled `ExportSnapshotRecordSourceType` value, the
             // same `InstanceSnapshot` the snapshot's own `resourceType` carries.
@@ -358,6 +393,18 @@ fn instance_snapshot_disk_info(
             is_system_disk: Some(false),
         }))
         .collect()
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// snapshot that is in the way and the state it is in.
+fn operation_failure(message: String) -> ExportSnapshotError {
+    ExportSnapshotErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// This operation's 400 refusal for a request the model admits but the service

@@ -175,6 +175,8 @@ mod domain_listing;
 mod domain_region_restriction;
 #[path = "all/domain_zone.rs"]
 mod domain_zone;
+#[path = "all/export_snapshot_completeness.rs"]
+mod export_snapshot_completeness;
 #[path = "all/export_snapshot_records.rs"]
 mod export_snapshot_records;
 #[path = "all/export_snapshot_source_kinds.rs"]

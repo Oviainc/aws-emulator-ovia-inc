@@ -45,6 +45,7 @@ use service_com_amazonaws_lightsail_lightsail_20161128::state::{
 
 use crate::instance_lifecycle::{error_code, Emulator};
 use crate::paging::{expected_page_sizes, names, walk_pages};
+use crate::snapshot_copy::{wait_for_snapshot_state, Kind};
 
 /// A walk that collects the pages `crate::paging::walk_pages` cannot read cannot
 /// need more pages than this: anything past it means the walk is not advancing.
@@ -328,7 +329,9 @@ async fn create_disk(emulator: &Emulator, name: &str) {
         .await;
 }
 
-/// Create the disk snapshot a row's exports and stacks are made from.
+/// Create the disk snapshot a row's exports and stacks are made from, and wait
+/// until the service has finished taking it — which is when it can be exported
+/// (the refusal before that is pinned in `export_snapshot_completeness.rs`).
 async fn create_source_snapshot(emulator: &Emulator) {
     create_disk(emulator, SOURCE_DISK).await;
     emulator
@@ -337,6 +340,13 @@ async fn create_source_snapshot(emulator: &Emulator) {
             json!({"diskName": SOURCE_DISK, "diskSnapshotName": SOURCE_SNAPSHOT}),
         )
         .await;
+    wait_for_snapshot_state(
+        emulator,
+        Kind::DiskSnapshot,
+        SOURCE_SNAPSHOT,
+        Kind::DiskSnapshot.settled(),
+    )
+    .await;
 }
 
 /// Every record `operation` reports, walking its pages without asserting

@@ -1037,7 +1037,9 @@ async fn an_instance_snapshot_is_exportable() {
         tags: &[],
     };
     create_row(&emulator, row).await;
-    let snapshot = listed(&emulator, row.snapshot_name).await;
+    // Only a snapshot the service has finished taking can be exported; the
+    // refusal before that is pinned in `export_snapshot_completeness.rs`.
+    let snapshot = wait_for_state(&emulator, row.snapshot_name, "available").await;
 
     let exported = emulator
         .ok(

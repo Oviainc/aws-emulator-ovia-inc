@@ -35,6 +35,7 @@ use service_com_amazonaws_lightsail_lightsail_20161128::state;
 
 use crate::instance_lifecycle::Emulator;
 use crate::paging::expected_page_sizes;
+use crate::snapshot_copy::{wait_for_snapshot_state, Kind as SnapshotKind};
 
 /// How many names one `GetActiveNames` page carries — the handler's OWN
 /// constant, so the paging rows keep straddling the page boundary whatever it is
@@ -625,7 +626,17 @@ async fn a_record_whose_name_the_service_mints_is_an_active_name() {
         .await;
 
     // The export snapshot record: the service mints its name, so it is read back
-    // from that record's own reader.
+    // from that record's own reader. Only a snapshot the service has finished
+    // taking can be exported — [`REGION`] is the Region an unscoped read is
+    // served in, so the shared wait reads this very snapshot (the refusal before
+    // the capture is finished is pinned in `export_snapshot_completeness.rs`).
+    wait_for_snapshot_state(
+        &emulator,
+        SnapshotKind::DiskSnapshot,
+        snapshot,
+        SnapshotKind::DiskSnapshot.settled(),
+    )
+    .await;
     emulator
         .ok_at(
             None,

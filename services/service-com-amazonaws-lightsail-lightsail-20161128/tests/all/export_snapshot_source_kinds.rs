@@ -43,6 +43,7 @@ use crate::export_snapshot_records::is_ec2_resource_id;
 use crate::instance_lifecycle::Emulator;
 use crate::instance_snapshot_create::{single_operation, wait_for_terminal_operation};
 use crate::operations_for_resource::{answered_entries, operation_types};
+use crate::snapshot_copy::{wait_for_snapshot_state, Kind};
 
 /// The device path an instance's system volume is exposed at
 /// (`crate::state::SYSTEM_DISK_PATH`).
@@ -174,6 +175,11 @@ fn destination_prefix(row: &Row) -> &'static str {
 
 /// Stand `row`'s snapshot up, answering the snapshot as the service reports it
 /// and the name and ARN of the resource it was taken of.
+///
+/// Only a snapshot the service has finished taking can be exported, so the
+/// snapshot is handed back once the capture the clock owes it has arrived; the
+/// refusal of an export before that is pinned in
+/// `export_snapshot_completeness.rs`.
 async fn create_snapshot(emulator: &Emulator, row: &Row) -> (Value, String, String) {
     match &row.snapshot {
         Snapshot::Instance {
@@ -219,13 +225,13 @@ async fn create_snapshot(emulator: &Emulator, row: &Row) -> (Value, String, Stri
                     }),
                 )
                 .await;
-            let snapshot = emulator
-                .ok(
-                    "GetInstanceSnapshot",
-                    json!({"instanceSnapshotName": row.snapshot_name}),
-                )
-                .await["instanceSnapshot"]
-                .clone();
+            let snapshot = wait_for_snapshot_state(
+                emulator,
+                Kind::InstanceSnapshot,
+                row.snapshot_name,
+                Kind::InstanceSnapshot.settled(),
+            )
+            .await;
             (
                 snapshot,
                 row.source_name.to_string(),
@@ -247,13 +253,13 @@ async fn create_snapshot(emulator: &Emulator, row: &Row) -> (Value, String, Stri
                     }),
                 )
                 .await;
-            let snapshot = emulator
-                .ok(
-                    "GetDiskSnapshot",
-                    json!({"diskSnapshotName": row.snapshot_name}),
-                )
-                .await["diskSnapshot"]
-                .clone();
+            let snapshot = wait_for_snapshot_state(
+                emulator,
+                Kind::DiskSnapshot,
+                row.snapshot_name,
+                Kind::DiskSnapshot.settled(),
+            )
+            .await;
             (
                 snapshot,
                 row.source_name.to_string(),

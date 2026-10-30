@@ -87,7 +87,10 @@ impl Kind {
 
     /// The state a snapshot of this kind is in while it is being taken, from the
     /// modelled `DiskSnapshotState` and `InstanceSnapshotState` enums.
-    fn being_taken(self) -> &'static str {
+    ///
+    /// `pub(crate)` so a sibling suite names the state a capture the service has
+    /// not finished reports the same way rather than spelling it a second time.
+    pub(crate) fn being_taken(self) -> &'static str {
         "pending"
     }
 

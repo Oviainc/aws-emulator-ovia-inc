@@ -319,7 +319,11 @@ async fn an_unqualified_snapshot_name_exports_the_snapshot_that_holds_it() {
         let case = format!("{mint:?} holds '{name}'");
         let (operation, body) = mint.request(&name);
         emulator.ok(operation, body).await;
-
+        // An export reads the complete copy the snapshot holds, so it is served
+        // only once the service has finished taking it — the transition the
+        // clock owes it (`export_snapshot_completeness.rs`).
+        let kind = mint.kind();
+        wait_for_snapshot_state(&emulator, kind, &name, kind.settled()).await;
         emulator
             .ok("ExportSnapshot", json!({"sourceSnapshotName": name}))
             .await;

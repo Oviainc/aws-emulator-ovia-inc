@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 // already exposes: a sibling suite drives the service through the same front door
 // rather than standing up a second one.
 use crate::instance_lifecycle::{error_code, is_uuid_shaped, Emulator};
+use crate::snapshot_copy::{wait_for_snapshot_state, Kind};
 
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`) every ARN
 /// carries.
@@ -370,7 +371,9 @@ async fn create_source(emulator: &Emulator, row: &Row) {
     }
 }
 
-/// Create one row's snapshot, from the resource it is taken of.
+/// Create one row's snapshot, from the resource it is taken of, and wait until
+/// the service has finished taking it — which is when it can be exported (the
+/// refusal before that is pinned in `export_snapshot_completeness.rs`).
 async fn create_snapshot(emulator: &Emulator, row: &Row) {
     create_source(emulator, row).await;
     let mut body = json!({"diskSnapshotName": row.snapshot_name});
@@ -379,6 +382,13 @@ async fn create_snapshot(emulator: &Emulator, row: &Row) {
         Source::Instance { .. } => body["instanceName"] = json!(row.source_name),
     }
     emulator.ok("CreateDiskSnapshot", body).await;
+    wait_for_snapshot_state(
+        emulator,
+        Kind::DiskSnapshot,
+        row.snapshot_name,
+        Kind::DiskSnapshot.settled(),
+    )
+    .await;
 }
 
 /// Export `snapshot_name` and answer the one export snapshot record that export
