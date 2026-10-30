@@ -279,13 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region: region.clone(),
             target_id: input.id.clone(),
         };
-        if let Some(existing) = store.action_targets.get(&key) {
+        if store.action_targets.contains_key(&key) {
             return Err(CreateActionTargetErrorModeled::ResourceConflictException(
                 ResourceConflictException {
-                    message: Some(format!(
-                        "Custom action target {} already exists",
-                        existing.action_target_arn
-                    )),
+                    message: Some(crate::state::action_target_id_conflict_message(&input.id)),
                     code: Some("ResourceConflictException".to_string()),
                 },
             )

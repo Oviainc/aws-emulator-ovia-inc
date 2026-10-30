@@ -328,6 +328,42 @@ pub fn not_subscribed_message(account_id: &str, region: &str) -> String {
     format!("Account {account_id} is not subscribed to Security Hub CSPM in Region {region}")
 }
 
+/// The whole message `EnableSecurityHub` refuses a second enable of an already
+/// subscribed account/Region with. Security Hub states the precondition that failed
+/// and nothing else: the message interpolates no account id and no Region, so a
+/// caller that enables-if-not-enabled can match it as a constant.
+pub const ALREADY_SUBSCRIBED_MESSAGE: &str = "Account is already subscribed to Security Hub";
+
+/// The message an operation addressed by an ARN refuses with when that ARN names no
+/// resource of the caller's hub: the ARN the request carried, quoted back as it
+/// arrived, and the bare statement that nothing answers to it.
+pub fn arn_does_not_exist_message(arn: &str) -> String {
+    format!("Given Arn: {arn} does not exist")
+}
+
+/// The message `CreateActionTarget` refuses a duplicate with: the conflict is keyed on
+/// the `Id` the client chose, which is the only name it holds at that point, not on
+/// the ARN the first create derived from it.
+pub fn action_target_id_conflict_message(id: &str) -> String {
+    format!("Action with Id: {id} already exists")
+}
+
+/// The message `BatchEnableStandards` refuses a batch with when one or more of its
+/// `StandardsSubscriptionRequests` name a standard that cannot be enabled: the fixed
+/// text followed by the rejected requests as a JSON array, each entry carrying the
+/// lower-camel `standardsArn` member with the value the request supplied. Every
+/// rejected entry of the batch is listed, in request order, so a caller can retry
+/// with the entries that were not rejected.
+pub fn invalid_standards_subscription_requests_message(standards_arns: &[String]) -> String {
+    let rejected = ::serde_json::Value::Array(
+        standards_arns
+            .iter()
+            .map(|arn| ::serde_json::json!({ "standardsArn": arn }))
+            .collect(),
+    );
+    format!("Invalid StandardsSubscriptionRequest(s): {rejected}")
+}
+
 /// How many custom action targets one hub (`(account, Region)`) may hold. The AWS
 /// Security Hub quotas table publishes 100 custom actions per account per Region, and
 /// `CreateActionTarget` models `LimitExceededException` for a create "beyond the

@@ -184,18 +184,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Whether the request is valid is decided before any state is read, so a
         // `StandardsArn` no published standard carries is refused identically on
-        // every hub, subscribed or not.
+        // every hub, subscribed or not. Every entry the catalog cannot resolve is
+        // collected first, so one refusal names them all and a caller can retry the
+        // batch with the entries that were not rejected.
+        let rejected: Vec<String> = input
+            .standards_subscription_requests
+            .iter()
+            .filter(|request| {
+                crate::state::standard_by_arn(&key.1, &request.standards_arn).is_none()
+            })
+            .map(|request| request.standards_arn.clone())
+            .collect();
+        if !rejected.is_empty() {
+            return Err(invalid_input(
+                crate::state::invalid_standards_subscription_requests_message(&rejected),
+            ));
+        }
+
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut requested: Vec<(crate::state::StandardDefinition, HashMap<String, String>)> =
             Vec::with_capacity(input.standards_subscription_requests.len());
         for request in &input.standards_subscription_requests {
-            let definition = crate::state::standard_by_arn(&key.1, &request.standards_arn)
-                .ok_or_else(|| {
-                    invalid_input(format!(
-                        "StandardsArn: {} is not the ARN of a standard available in Region {}",
-                        request.standards_arn, key.1
-                    ))
-                })?;
+            // Every entry resolved above, or the batch was already refused.
+            let Some(definition) = crate::state::standard_by_arn(&key.1, &request.standards_arn)
+            else {
+                continue;
+            };
             let standards_input = request.standards_input.clone().unwrap_or_default();
             if standards_input.len() > MAX_STANDARDS_INPUT_ENTRIES {
                 return Err(invalid_input(format!(

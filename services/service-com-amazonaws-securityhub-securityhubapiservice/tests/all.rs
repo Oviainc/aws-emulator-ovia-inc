@@ -36,6 +36,8 @@ mod finding_history;
 mod finding_ingest_lifecycle;
 #[path = "all/member_lifecycle.rs"]
 mod member_lifecycle;
+#[path = "all/refusal_messages.rs"]
+mod refusal_messages;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/security_hub_core_loop.rs"]

@@ -182,9 +182,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(key) = found else {
             return Err(DeleteActionTargetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Custom action target {} does not exist",
-                        input.action_target_arn
+                    message: Some(crate::state::arn_does_not_exist_message(
+                        &input.action_target_arn,
                     )),
                     code: Some("ResourceNotFoundException".to_string()),
                 },

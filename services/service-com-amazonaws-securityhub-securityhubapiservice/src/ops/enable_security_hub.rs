@@ -177,10 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.hubs.contains_key(&key) {
             return Err(EnableSecurityHubErrorModeled::ResourceConflictException(
                 ResourceConflictException {
-                    message: Some(format!(
-                        "Security Hub CSPM is already enabled for account {} in Region {}",
-                        key.0, key.1
-                    )),
+                    message: Some(crate::state::ALREADY_SUBSCRIBED_MESSAGE.to_string()),
                     code: Some("ResourceConflictException".to_string()),
                 },
             )
