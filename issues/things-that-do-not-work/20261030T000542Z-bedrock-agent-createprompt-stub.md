@@ -1,0 +1,34 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: bedrock-agent.prompt-empty-vs-absent-field-preserved bedrock-agent.prompt-update-on-published-version-rejected bedrock-agent.prompt-version-lifecycle bedrock-agent.prompt-version-monotonic-numbering bedrock-agent.prompt-version-snapshots-draft-immutably bedrock-agent.tag-propagation-server-side bedrock-agent.update-prompt-version-qualified-identifier-redirects-to-draft
+Issue-Shape-Id: com.amazonaws.bedrockagent#AmazonBedrockAgentBuildTimeLambda
+Issue-Key: bedrock-agent|CreatePrompt|NotImplemented
+Issue-Commit: 1a47241ce710b76442b5b44523250151eb6a7fef
+
+# Implement bedrock-agent CreatePrompt: unimplemented scaffold stub
+
+> _Note: this issue was identified against the code base at commit `1a47241ce710b76442b5b44523250151eb6a7fef`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreatePrompt
+
+## Description
+`CreatePrompt` is an unmodified scaffold stub, so it answers HTTP 501 and persists nothing. Implement it in `services/service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda/src/ops/create_prompt.rs`: replace the `Err(crate::scaffolded::Scaffolded::not_implemented(..))` with a real handler that reads and writes the service's state, then DELETE that file's `//! SCAFFOLDED, NOT IMPLEMENTED:` header line.
+
+That header line is the stub census — the one record of which operations are still scaffolds. Deleting it without implementing the handler, or leaving it in place on a handler you did implement, corrupts that record rather than closing this issue. A stub's 501 is also CORRECT for a stub: this issue asks you to implement the operation, never to change the error it returns while unimplemented.
+
+7 recorded unit(s) fail on their `CreatePrompt` call, so each one unblocks only when `CreatePrompt` works: `bedrock-agent.prompt-empty-vs-absent-field-preserved`, `bedrock-agent.prompt-update-on-published-version-rejected`, `bedrock-agent.prompt-version-lifecycle`, `bedrock-agent.prompt-version-monotonic-numbering`, `bedrock-agent.prompt-version-snapshots-draft-immutably`, `bedrock-agent.tag-propagation-server-side`, `bedrock-agent.update-prompt-version-qualified-identifier-redirects-to-draft`.
+
+## Evidence
+The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at the top of `services/service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda/src/ops/create_prompt.rs`. Replaying the corpus, the emulator refused the `CreatePrompt` call: File "context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the CreatePrompt operation: operation CreatePrompt is scaffolded but not implemented in this emulator
+
+## Steps to Reproduce
+Boot the bedrock-agent emulator
+Call CreatePrompt and observe HTTP 501 with no state persisted
+Replay any of the blocked units above and observe it fail on that refusal
