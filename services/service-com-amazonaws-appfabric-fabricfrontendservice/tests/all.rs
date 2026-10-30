@@ -43,6 +43,8 @@ mod create_app_authorization_credential_idempotency;
 mod created_resource_tag_set;
 #[path = "all/idempotent_replay_before_preconditions.rs"]
 mod idempotent_replay_before_preconditions;
+#[path = "all/identifier_resolution_rule.rs"]
+mod identifier_resolution_rule;
 #[path = "all/ingestion_authorization_refusal_wording.rs"]
 mod ingestion_authorization_refusal_wording;
 #[path = "all/ingestion_deletion.rs"]

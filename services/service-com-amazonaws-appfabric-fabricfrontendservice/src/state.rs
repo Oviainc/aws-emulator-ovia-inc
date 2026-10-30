@@ -848,22 +848,11 @@ impl ComAmazonawsAppfabricFabricfrontendserviceState {
         }
     }
 
-    /// The store key of the app bundle `identifier` names.
-    ///
-    /// The model's `Identifier` shape accepts either form
-    /// (`^arn:.+$|^[a-f0-9]{8}-…$`), and both name the same resource: an ARN
-    /// matches the record that owns it, anything else is the bare UUID key.
+    /// The store key of the app bundle `identifier` names, by either modelled
+    /// `Identifier` form — the one rule [`identifier_key`] holds, over the app
+    /// bundles this store keeps.
     pub fn bundle_key(&self, identifier: &str) -> Option<String> {
-        if is_arn(identifier) {
-            self.app_bundles
-                .values()
-                .find(|bundle| bundle.arn == identifier)
-                .map(|bundle| bundle.id.clone())
-        } else {
-            self.app_bundles
-                .contains_key(identifier)
-                .then(|| identifier.to_string())
-        }
+        identifier_key(&self.app_bundles, identifier)
     }
 
     /// Remember what one spent idempotency token created.
@@ -1156,57 +1145,99 @@ pub fn tag_set(tags: Option<&[Tag]>) -> Vec<Tag> {
     merge_tags(&[], tags.unwrap_or_default())
 }
 
-/// The store key of the ingestion `identifier` names inside `bundle`, by ARN or
-/// bare UUID — the same two forms [`ComAmazonawsAppfabricFabricfrontendserviceState::bundle_key`] accepts.
-pub fn ingestion_key(bundle: &AppBundleRecord, identifier: &str) -> Option<String> {
+/// A stored record an `Identifier` member can name: it carries the bare UUID it
+/// is keyed by and the ARN minted for it, which are exactly the two forms the
+/// model's `Identifier` shape accepts.
+pub trait IdentifiedRecord {
+    /// The record's bare UUID — the key it is stored under.
+    fn id(&self) -> &str;
+    /// The ARN the create call minted for it.
+    fn arn(&self) -> &str;
+}
+
+impl IdentifiedRecord for AppBundleRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn arn(&self) -> &str {
+        &self.arn
+    }
+}
+
+impl IdentifiedRecord for IngestionRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn arn(&self) -> &str {
+        &self.arn
+    }
+}
+
+impl IdentifiedRecord for IngestionDestinationRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn arn(&self) -> &str {
+        &self.arn
+    }
+}
+
+impl IdentifiedRecord for AppAuthorizationRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn arn(&self) -> &str {
+        &self.arn
+    }
+}
+
+/// The key `records` holds the record `identifier` names, for ANY level of this
+/// service's resource chain.
+///
+/// Resolving one of the two forms the model's `Identifier` shape accepts
+/// (`^arn:.+$|^[a-f0-9]{8}-…$`) is ONE rule, so it is written once here and the
+/// per-level functions below call it: an identifier in its ARN form answers the
+/// key of the record whose own ARN it is, and any other identifier IS the key,
+/// answered only when `records` holds it. Either way the answer is a key
+/// `records` contains, or `None` when the collection holds no such record.
+pub fn identifier_key<R: IdentifiedRecord>(
+    records: &HashMap<String, R>,
+    identifier: &str,
+) -> Option<String> {
     if is_arn(identifier) {
-        bundle
-            .ingestions
+        records
             .values()
-            .find(|ingestion| ingestion.arn == identifier)
-            .map(|ingestion| ingestion.id.clone())
+            .find(|record| record.arn() == identifier)
+            .map(|record| record.id().to_string())
     } else {
-        bundle
-            .ingestions
+        records
             .contains_key(identifier)
             .then(|| identifier.to_string())
     }
+}
+
+/// The store key of the ingestion `identifier` names inside `bundle` — the one
+/// rule [`identifier_key`] holds, over that bundle's ingestions.
+pub fn ingestion_key(bundle: &AppBundleRecord, identifier: &str) -> Option<String> {
+    identifier_key(&bundle.ingestions, identifier)
 }
 
 /// The store key of the ingestion destination `identifier` names inside
-/// `ingestion`, by ARN or bare UUID — the same two forms every other
-/// `Identifier` in this service accepts.
+/// `ingestion` — the one rule [`identifier_key`] holds, over that ingestion's
+/// destinations.
 pub fn destination_key(ingestion: &IngestionRecord, identifier: &str) -> Option<String> {
-    if is_arn(identifier) {
-        ingestion
-            .destinations
-            .values()
-            .find(|destination| destination.arn == identifier)
-            .map(|destination| destination.id.clone())
-    } else {
-        ingestion
-            .destinations
-            .contains_key(identifier)
-            .then(|| identifier.to_string())
-    }
+    identifier_key(&ingestion.destinations, identifier)
 }
 
-/// The store key of the app authorization `identifier` names inside `bundle`,
-/// by ARN or bare UUID — the same two forms every other `Identifier` in this
-/// service accepts.
+/// The store key of the app authorization `identifier` names inside `bundle` —
+/// the one rule [`identifier_key`] holds, over that bundle's app
+/// authorizations.
 pub fn app_authorization_key(bundle: &AppBundleRecord, identifier: &str) -> Option<String> {
-    if is_arn(identifier) {
-        bundle
-            .app_authorizations
-            .values()
-            .find(|authorization| authorization.arn == identifier)
-            .map(|authorization| authorization.id.clone())
-    } else {
-        bundle
-            .app_authorizations
-            .contains_key(identifier)
-            .then(|| identifier.to_string())
-    }
+    identifier_key(&bundle.app_authorizations, identifier)
 }
 
 /// Whether an `Identifier` is in its ARN form rather than its bare-UUID form.
