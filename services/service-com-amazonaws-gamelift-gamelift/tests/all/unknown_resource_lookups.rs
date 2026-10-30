@@ -19,20 +19,9 @@
 use serde_json::{json, Value};
 
 use crate::hosting_loop::{
-    create_fleet, ec2_fleet, gamelift_arn, wait_for_due_transitions, GameLift, REGION,
+    create_fleet, ec2_fleet, error_message, gamelift_arn, wait_for_due_transitions, GameLift,
+    REGION,
 };
-
-/// The `Message` member of a modelled error body. awsJson renders the member under its
-/// modelled name (`NotFoundException$Message`); the lower-case spelling is accepted too
-/// so this helper reads the body whichever casing the protocol layer emits.
-fn error_message(body: &Value) -> String {
-    for key in ["Message", "message"] {
-        if let Some(message) = body.get(key).and_then(Value::as_str) {
-            return message.to_string();
-        }
-    }
-    format!("<no Message in {body}>")
-}
 
 /// The `FleetId`s a `DescribeFleetAttributes` response reports, in order.
 fn reported_fleet_ids(body: &Value) -> Vec<String> {

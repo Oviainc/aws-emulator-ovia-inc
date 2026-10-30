@@ -171,9 +171,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(placement) = state.game_session_placements.get(&input.placement_id) else {
             return Err(DescribeGameSessionPlacementErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "Game session placement {} does not exist.",
-                        input.placement_id
+                    message: Some(crate::state::placement_not_found_message(
+                        &input.placement_id,
                     )),
                 },
             )

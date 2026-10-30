@@ -29,6 +29,8 @@ mod locations;
 mod matchmaking;
 #[path = "all/matchmaking_rule_set_persistence.rs"]
 mod matchmaking_rule_set_persistence;
+#[path = "all/refusal_message_wording.rs"]
+mod refusal_message_wording;
 #[path = "all/resource_updates.rs"]
 mod resource_updates;
 #[path = "all/scripts.rs"]

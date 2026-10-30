@@ -124,6 +124,18 @@ impl GameLift {
     }
 }
 
+/// The `Message` member of a modelled error body. awsJson renders the member under its
+/// modelled name (`NotFoundException$Message`); the lower-case spelling is accepted too
+/// so this helper reads the body whichever casing the protocol layer emits.
+pub(crate) fn error_message(body: &Value) -> String {
+    for key in ["Message", "message"] {
+        if let Some(message) = body.get(key).and_then(Value::as_str) {
+            return message.to_string();
+        }
+    }
+    format!("<no Message in {body}>")
+}
+
 /// The wire error code of an awsJson error body (`__type`), without its namespace.
 pub(crate) fn error_code(body: &Value) -> String {
     let raw = body

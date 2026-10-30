@@ -1512,6 +1512,24 @@ impl MatchmakingTicketRecord {
     }
 }
 
+/// What the service answers when no game session placement is stored under the
+/// `PlacementId` an operation was asked about — the message of the modelled
+/// `NotFoundException`, shared by every operation that must act on a placement named by
+/// its id.
+///
+/// A placement is the service's reservation for the game session a queue is asked to
+/// start (`StartGameSessionPlacement` "generates a new game session placement request and
+/// adds it to the game session queue"), and a reservation is held per account, so the
+/// refusal states which reservation was asked for and which account it was looked for in.
+/// Those two are its only variable parts: the id comes from the request, the account from
+/// the request's own context — the one account every emulated response presents.
+pub fn placement_not_found_message(placement_id: &str) -> String {
+    format!(
+        "No GameSessionReservation found for reservation {placement_id} accountId {}",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// A game session placement request, as `StartGameSessionPlacement` persisted it.
 #[derive(Debug, Clone)]
 pub struct GameSessionPlacementRecord {
@@ -1635,6 +1653,18 @@ impl VpcPeeringAuthorizationRecord {
     }
 }
 
+/// What the service answers when the rule set document cannot be read as a rule set at
+/// all, so the rule language version it is written in cannot be extracted from it: the
+/// service's fixed text for that failure, whose only variable part is the position in the
+/// document it was reached at — "top level" for a document nothing could be read from.
+///
+/// The reading failure is reported as the failure it is, never as the diagnostic of
+/// whichever parser did the reading: an expected token, a line and a column describe the
+/// implementation that tried, not the rule set the caller sent, and they differ for every
+/// body, so nothing can match on them.
+pub const RULE_SET_VERSION_EXTRACTION_FAILURE: &str =
+    "Encountered IOException attempting to extract version; location: top level";
+
 /// Whether `body` is a FlexMatch rule set, or the reason it is not — which both
 /// `CreateMatchmakingRuleSet` and `ValidateMatchmakingRuleSet` answer with the modelled
 /// `InvalidRequestException`.
@@ -1652,10 +1682,14 @@ impl VpcPeeringAuthorizationRecord {
 /// The reason names the element and the constraint it missed, in the form the service's
 /// own rule-set errors take (`<what is wrong>; location: <where>`).
 pub fn validate_rule_set_body(body: &str) -> Result<(), String> {
+    // The version is read out of the rule set document itself, so a body that is not a
+    // readable document — unparseable, or parseable but not an object with elements to
+    // read — fails that one extraction, and is refused with the text the service gives it
+    // rather than with the parser's own complaint.
     let parsed: serde_json::Value = serde_json::from_str(body)
-        .map_err(|error| format!("RuleSetBody is not valid JSON ({error}); location: top level"))?;
+        .map_err(|_| RULE_SET_VERSION_EXTRACTION_FAILURE.to_string())?;
     let Some(object) = parsed.as_object() else {
-        return Err("RuleSetBody must be a JSON object; location: top level".to_string());
+        return Err(RULE_SET_VERSION_EXTRACTION_FAILURE.to_string());
     };
 
     match object.get("ruleLanguageVersion") {

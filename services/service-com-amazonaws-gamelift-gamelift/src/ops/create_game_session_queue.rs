@@ -247,14 +247,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The maximum time, in seconds, that a new game session placement request
         // remains in the queue [...] The minimum value is 10 and the maximum value is
         // 600." The modelled `WholeNumber` range bounds the member only below, so the
-        // documented bounds are what this refusal enforces — and the message names the
-        // member, the value and the bounds it missed.
+        // documented bounds are what this refusal enforces — and the message is the
+        // service's fixed sentence, naming the member and those two documented bounds and
+        // reading the same whatever value was rejected.
         let (min_timeout, max_timeout) = QUEUE_TIMEOUT_RANGE_SECONDS;
         let timeout_in_seconds = match input.timeout_in_seconds {
             Some(requested) if !(min_timeout..=max_timeout).contains(&requested) => {
                 return Err(invalid(format!(
-                    "TimeoutInSeconds must be between {min_timeout} and {max_timeout}; the \
-                     request asked for {requested}."
+                    "TimeoutInSeconds must be between {min_timeout} and {max_timeout} seconds"
                 )))
             }
             Some(requested) => requested,
