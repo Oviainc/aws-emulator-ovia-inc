@@ -3683,6 +3683,91 @@ pub fn decode_namespaced_list_page_token(
     is_minted_identifier(&decoded).then_some(decoded)
 }
 
+/// A stored list of one of the collections a `DefaultLists`-selected listing
+/// enumerates — an applications list or a protocols list.
+///
+/// It carries the ONE thing [`namespaced_list_page`] needs of such a record:
+/// which namespace of its collection the record belongs to. The stored flag is
+/// what tells a Firewall Manager MANAGED list from a customer one, the same
+/// split [`ComAmazonawsFmsAwsfms20180101State::apps_list_in_namespace`] resolves
+/// a single id in, so the page walk reads the namespace off the record exactly
+/// as a reader of one list does.
+pub trait NamespacedListRecord {
+    /// Whether this list is a Firewall Manager MANAGED (default) list.
+    fn default_list(&self) -> bool;
+}
+
+impl NamespacedListRecord for AppsListRecord {
+    fn default_list(&self) -> bool {
+        self.default_list
+    }
+}
+
+impl NamespacedListRecord for ProtocolsListRecord {
+    fn default_list(&self) -> bool {
+        self.default_list
+    }
+}
+
+/// One page of a `DefaultLists`-selected listing: the records it reports, in the
+/// ascending `ListId` order the store keeps them in, and the `NextToken` the
+/// following page resumes at — `None` on the last page.
+#[derive(Debug)]
+pub struct NamespacedListPage<'store, Record> {
+    /// The records this page reports, at most [`page_size`] of them.
+    pub records: Vec<&'store Record>,
+    /// The boundary token of the following page, minted only when a list of
+    /// this page is left after the records above.
+    pub next_token: Option<String>,
+}
+
+/// Serve one page of the namespace `default_lists` selects inside the list
+/// collection `collection` names, out of the `ListId`-keyed store `lists`.
+///
+/// The ONE copy of the page rule both `DefaultLists`-selected listings follow,
+/// so neither can drift from the other: the page starts at the boundary
+/// `next_token` names ([`decode_namespaced_list_page_token`]) or at the first
+/// `ListId` when there is none, holds only the lists of the selected namespace,
+/// is bounded by the shared [`page_size`] rule, and mints a boundary token of
+/// its own ([`encode_namespaced_list_page_token`]) only when a list of this page
+/// remains after it.
+///
+/// `None` when `next_token` names no boundary of THIS page — a token this
+/// service did not mint, or one minted for the other namespace or the other
+/// collection, whose `ListId` is either absent here or sorts past lists this
+/// page does hold. The calling listing refuses such a request in its own words,
+/// since each one names itself in its refusal.
+pub fn namespaced_list_page<'store, Record: NamespacedListRecord>(
+    lists: &'store BTreeMap<String, Record>,
+    collection: &str,
+    default_lists: bool,
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+) -> Option<NamespacedListPage<'store, Record>> {
+    // The boundary is a store key, so the page resumes at the first `ListId` at
+    // or after it; with no token the lower bound is the empty id, which sorts
+    // before every `ListId`.
+    let lower = match next_token {
+        Some(token) => decode_namespaced_list_page_token(collection, default_lists, token)?,
+        None => String::new(),
+    };
+    let mut remaining = lists
+        .range(lower..)
+        .filter(|(_, record)| record.default_list() == default_lists);
+    let records: Vec<&Record> = remaining
+        .by_ref()
+        .take(page_size(max_results))
+        .map(|(_, record)| record)
+        .collect();
+    let next_token = remaining
+        .next()
+        .map(|(list_id, _)| encode_namespaced_list_page_token(collection, default_lists, list_id));
+    Some(NamespacedListPage {
+        records,
+        next_token,
+    })
+}
+
 /// Mint a fresh service-owned identifier: 36 lowercase hex characters, which
 /// satisfies the model's `PolicyId` pattern (`^[a-z0-9A-Z-]{36}$`, length 36)
 /// and also `PolicyUpdateToken`'s (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`, length

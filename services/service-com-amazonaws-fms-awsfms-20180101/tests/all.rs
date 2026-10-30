@@ -156,6 +156,12 @@ mod list_namespace_page_token_scoping;
 // Declared beside them, for the same reason: this suite's name sorts right into
 // the contended region of the list below. The suite itself is an ordinary
 // `tests/all/<name>.rs` file.
+#[path = "all/namespaced_list_page_single_rule.rs"]
+mod namespaced_list_page_single_rule;
+
+// Declared beside them, for the same reason: this suite's name sorts right into
+// the contended region of the list below. The suite itself is an ordinary
+// `tests/all/<name>.rs` file.
 #[path = "all/organization_roster_clock_reading.rs"]
 mod organization_roster_clock_reading;
 
