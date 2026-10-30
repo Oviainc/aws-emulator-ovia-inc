@@ -21,10 +21,11 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 use tokio::time::sleep;
 
-use super::automation_rule_lifecycle::{call_ok, emulator, member, minimal_rule, string_member};
+use super::automation_rule_lifecycle::{
+    call_ok, create_rule, emulator, listed_rule, member, read_rule, timestamp,
+};
 
 /// A pause between the create and the tag write, so "the timestamp moved" is a
 /// statement about the write rather than about the resolution of the clock the
@@ -209,71 +210,6 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// Create a rule carrying `tags` and answer `(ruleArn, ruleRevision)`.
-async fn create_rule(
-    router: &MultiServiceRouter,
-    name: &str,
-    tags: &Value,
-    case: &str,
-) -> (String, i64) {
-    let mut request = minimal_rule(name);
-    // A row whose rule starts untagged sends no `tags` member at all, which is
-    // the state a plain create leaves.
-    if !tags.as_array().is_some_and(Vec::is_empty) {
-        request["tags"] = tags.clone();
-    }
-    let created = call_ok(router, "CreateAutomationRule", &request, case).await;
-    (
-        string_member(&created, "ruleArn"),
-        member(&created, "ruleRevision")
-            .as_i64()
-            .expect("the created rule carries a revision"),
-    )
-}
-
-/// The rule `GetAutomationRule` reports for `rule_arn`.
-async fn read_rule(router: &MultiServiceRouter, rule_arn: &str, case: &str) -> Value {
-    call_ok(
-        router,
-        "GetAutomationRule",
-        &json!({"ruleArn": rule_arn}),
-        case,
-    )
-    .await
-}
-
-/// The `AutomationRule` summary `ListAutomationRules` reports for `rule_arn`.
-async fn listed_rule(router: &MultiServiceRouter, rule_arn: &str, case: &str) -> Value {
-    let listed = call_ok(
-        router,
-        "ListAutomationRules",
-        &json!({"maxResults": 100}),
-        case,
-    )
-    .await;
-    let found = member(&listed, "automationRules")
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|rule| string_member(rule, "ruleArn") == rule_arn);
-    assert!(
-        found.is_some(),
-        "case {case:?}: the rule {rule_arn} must be listed, got {listed}"
-    );
-    found.unwrap_or(Value::Null)
-}
-
-/// The member, required to be present and an epoch-seconds Timestamp.
-fn timestamp(body: &Value, name: &str, case: &str) -> f64 {
-    let value = member(body, name).as_f64();
-    assert!(
-        value.is_some_and(|seconds| seconds > 0.0),
-        "case {case:?}: {name} must be present and an epoch-seconds Timestamp, got {body}"
-    );
-    value.unwrap_or_default()
-}
-
 /// A tag write that changes the stored rule stamps its `lastUpdatedTimestamp`;
 /// one that leaves the rule as it stood leaves the timestamp alone. Neither
 /// moves `ruleRevision` or `createdTimestamp`, and both readers of a stored rule
@@ -287,6 +223,7 @@ async fn a_tag_write_stamps_last_updated_timestamp_when_it_changes_the_rule() {
         let (rule_arn, revision) = create_rule(
             &router,
             &format!("tag-stamp-rule-{index}"),
+            "Active",
             &case.created_with,
             name,
         )
@@ -387,6 +324,7 @@ async fn a_replayed_tag_write_keeps_the_timestamp_the_first_call_stamped() {
         let (rule_arn, revision) = create_rule(
             &router,
             &format!("tag-replay-rule-{index}"),
+            "Active",
             &json!([{"key": "owner", "value": "payments"}]),
             case,
         )

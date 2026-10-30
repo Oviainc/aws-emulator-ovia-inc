@@ -184,6 +184,77 @@ pub(crate) fn minimal_rule(name: &str) -> Value {
     })
 }
 
+/// Create a rule named `name` in `status` carrying `tags`, and answer
+/// `(ruleArn, ruleRevision)`.
+///
+/// An empty `tags` sends no `tags` member at all, which is the state a plain
+/// create leaves. `pub(crate)` because more than one suite needs a rule in a
+/// chosen status with a chosen tag list to write against.
+pub(crate) async fn create_rule(
+    router: &MultiServiceRouter,
+    name: &str,
+    status: &str,
+    tags: &Value,
+    case: &str,
+) -> (String, i64) {
+    let mut request = minimal_rule(name);
+    request["status"] = json!(status);
+    if !tags.as_array().is_some_and(Vec::is_empty) {
+        request["tags"] = tags.clone();
+    }
+    let created = call_ok(router, "CreateAutomationRule", &request, case).await;
+    (
+        string_member(&created, "ruleArn"),
+        member(&created, "ruleRevision")
+            .as_i64()
+            .expect("the created rule carries a revision"),
+    )
+}
+
+/// The rule `GetAutomationRule` reports for `rule_arn`.
+pub(crate) async fn read_rule(router: &MultiServiceRouter, rule_arn: &str, case: &str) -> Value {
+    call_ok(
+        router,
+        "GetAutomationRule",
+        &json!({"ruleArn": rule_arn}),
+        case,
+    )
+    .await
+}
+
+/// The `AutomationRule` summary `ListAutomationRules` reports for `rule_arn` —
+/// the second, independent reader of a stored rule.
+pub(crate) async fn listed_rule(router: &MultiServiceRouter, rule_arn: &str, case: &str) -> Value {
+    let listed = call_ok(
+        router,
+        "ListAutomationRules",
+        &json!({"maxResults": 100}),
+        case,
+    )
+    .await;
+    let found = member(&listed, "automationRules")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|rule| string_member(rule, "ruleArn") == rule_arn);
+    assert!(
+        found.is_some(),
+        "case {case:?}: the rule {rule_arn} must be listed, got {listed}"
+    );
+    found.unwrap_or(Value::Null)
+}
+
+/// The member, required to be present and an epoch-seconds `Timestamp`.
+pub(crate) fn timestamp(body: &Value, name: &str, case: &str) -> f64 {
+    let value = member(body, name).as_f64();
+    assert!(
+        value.is_some_and(|seconds| seconds > 0.0),
+        "case {case:?}: {name} must be present and an epoch-seconds Timestamp, got {body}"
+    );
+    value.unwrap_or_default()
+}
+
 pub(crate) fn member<'a>(body: &'a Value, name: &str) -> &'a Value {
     body.get(name).unwrap_or(&Value::Null)
 }

@@ -95,6 +95,8 @@ mod reserved_tag_keys;
 mod resource_tagging;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/rule_change_stamps.rs"]
+mod rule_change_stamps;
 #[path = "all/rule_projection.rs"]
 mod rule_projection;
 #[path = "all/rule_value_validation.rs"]
