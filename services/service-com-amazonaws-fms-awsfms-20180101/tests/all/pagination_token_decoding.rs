@@ -13,9 +13,9 @@
 //! The decode step itself (`crate::state::decode_key_token`) is one helper every
 //! specialised decoder delegates to, and each page class adds only its own shape
 //! check on the decoded key — an `AWSAccountId` for the account-keyed pages, a
-//! 36-character minted identifier for the policy-keyed ones — plus, for a page
-//! class SEVERAL listings of this service serve, the collection the boundary
-//! belongs to. This suite drives
+//! 36-character minted identifier for the policy-keyed ones — plus the
+//! collection the boundary belongs to, which every page class of this service
+//! whose key class it shares with another stamps on its token. This suite drives
 //! that shared path end-to-end through an operation of EACH class, so the two
 //! kinds of page cannot come to disagree about what a token of this service is:
 //!
@@ -108,7 +108,7 @@ fn page_classes() -> Vec<PageClass> {
             key_member: Some("PolicyId"),
             refusal: "ValidationException",
             foreign_key: ACCOUNT_SHAPED_KEY,
-            token: state::encode_page_token,
+            token: state::encode_policy_page_token,
         },
     ]
 }

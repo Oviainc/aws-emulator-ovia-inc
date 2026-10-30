@@ -1131,6 +1131,39 @@ pub fn shield_attack_key_prefix(policy_id: &str) -> String {
     format!("{policy_id}#")
 }
 
+/// Decode a `PaginationToken` produced by [`encode_key_token`] for the attacks
+/// recorded under `policy_id`, yielding the whole store key the next page of that
+/// policy's attacks resumes at.
+///
+/// `None` when the token was not produced by this service, or was produced for
+/// another collection: the policy's prefix alone does NOT identify this page,
+/// because the other listing this service narrows by a `PolicyId`
+/// (`ListComplianceStatus`) stamps its boundaries with the very same policy
+/// ([`encode_scoped_page_token`]), so a boundary of that page carries this
+/// prefix too while naming an account rather than an attack. An account id sorts
+/// arbitrarily among the zero-padded instants these keys carry, so resuming from
+/// one would silently drop the attacks below it and report the remainder — or
+/// nothing at all — as a complete page.
+///
+/// What tells the two apart is the key's own FORM: a boundary of this page is a
+/// key [`shield_attack_key`] would write, so the decoded value is taken apart
+/// into the instant and the attack id it names and then written back through
+/// that same function — nothing else is a key of this page, and the check cannot
+/// drift from the writer. The split is at the FIRST separator after the instant,
+/// which leaves any further one with the attack id; the round trip is what
+/// decides, so a key of this policy's range is accepted however its id reads.
+pub fn decode_shield_attack_page_token(policy_id: &str, token: &str) -> Option<String> {
+    let decoded = decode_key_token(token)?;
+    let (instant, attack_id) = decoded
+        .strip_prefix(&shield_attack_key_prefix(policy_id))?
+        .split_once('#')?;
+    let (seconds, nanos) = instant.split_once('.')?;
+    let started_at = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds.parse().ok()?))?
+        .checked_add(Duration::from_nanos(nanos.parse().ok()?))?;
+    (shield_attack_key(policy_id, started_at, attack_id) == decoded).then_some(decoded)
+}
+
 /// `PolicyComplianceStatusType` of a member account none of whose resources
 /// violates the policy. One of
 /// [`crate::ops::types::POLICY_COMPLIANCE_STATUS_TYPE_VALUES`].
@@ -3490,27 +3523,32 @@ pub fn page_size(max_results: Option<i32>) -> usize {
         .clamp(1, MAX_PAGE_SIZE)
 }
 
-/// Encode a page boundary (the key the next page starts at — a `PolicyId` for
-/// `ListPolicies`) as an opaque `PaginationToken`.
+/// The collection `ListPolicies` pages, which
+/// [`encode_policy_page_token`] stamps its boundaries with: the policies this
+/// service stores ([`ComAmazonawsFmsAwsfms20180101State::policies`]).
+pub const POLICIES_PAGE: &str = "ListPolicies";
+
+/// Encode a page boundary of `ListPolicies` (the `PolicyId` the next page starts
+/// at) as an opaque `PaginationToken`.
 ///
-/// For a page whose key class more than ONE listing of this service uses, the
-/// boundary carries the collection it belongs to beside the key
-/// ([`encode_scoped_page_token`], [`encode_account_page_token`]) instead.
-///
-/// Hex keeps the token inside the modelled `PaginationToken` pattern
-/// (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`) and its 1..4096 length, and makes it
-/// opaque to a caller: nothing in it is meaningful without decoding.
-pub fn encode_page_token(policy_id: &str) -> String {
-    encode_key_token(policy_id)
+/// The stamp is what lets [`decode_policy_page_token`] tell a boundary of the
+/// policies from one minted for ANOTHER collection this service keys by the same
+/// minted-identifier class — the lists both `DefaultLists`-selected listings
+/// enumerate, whose `ListId`s come from the same mint ([`mint_identifier`]) and
+/// are therefore indistinguishable from a `PolicyId` by shape alone; the
+/// encoding is [`encode_scoped_page_token`]'s, so these tokens stay inside the
+/// modelled `PaginationToken` pattern and length and stay opaque to a caller.
+pub fn encode_policy_page_token(policy_id: &str) -> String {
+    encode_scoped_page_token(POLICIES_PAGE, policy_id)
 }
 
 /// Encode an arbitrary page boundary (the store key the next page starts at) as
-/// an opaque `PaginationToken`, for the paginated operations whose key is not a
-/// `PolicyId`.
+/// an opaque `PaginationToken`, for the paginated operations whose key already
+/// carries the collection it belongs to.
 ///
-/// Hex for the same reasons as [`encode_page_token`]: it keeps the token inside
-/// the modelled `PaginationToken` pattern and length whatever the key contains,
-/// and nothing in it is meaningful to a caller without decoding.
+/// Hex keeps the token inside the modelled `PaginationToken` pattern
+/// (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`) and its 1..4096 length whatever the key
+/// contains, and nothing in it is meaningful to a caller without decoding.
 pub fn encode_key_token(key: &str) -> String {
     ::hex::encode(key)
 }
@@ -3524,17 +3562,23 @@ pub fn decode_key_token(token: &str) -> Option<String> {
     is_key.then_some(decoded)
 }
 
-/// Decode a `PaginationToken` produced by [`encode_page_token`]. `None` when the
-/// token was not produced by this service.
+/// Decode a `PaginationToken` produced by [`encode_policy_page_token`], yielding
+/// the `PolicyId` the next page of the policies starts at.
 ///
-/// The decoded value must still be a 36-character identifier this service mints
-/// — the form the model gives both `com.amazonaws.fms#PolicyId` and
-/// `com.amazonaws.fms#ListId` (36 characters matching `^[a-z0-9A-Z-]{36}$`), so
-/// one check serves the policy-keyed and the list-keyed pages — and a foreign
-/// token that happens to be valid hex is refused rather than resumed from as an
-/// arbitrary key.
-pub fn decode_page_token(token: &str) -> Option<String> {
-    let decoded = decode_key_token(token)?;
+/// `None` when the token was not produced by this service, or was produced for
+/// ANOTHER collection: the token-to-key step is [`decode_scoped_page_token`]'s,
+/// which answers only for a boundary stamped [`POLICIES_PAGE`], so a boundary of
+/// a collection this service keys by the same identifier class names no page
+/// here. A `ListId` of either list collection sorts arbitrarily among the stored
+/// `PolicyId`s, so resuming from one would silently drop the policies below it
+/// and report the remainder as a complete page.
+///
+/// The decoded boundary must still be a 36-character identifier this service
+/// mints ([`is_minted_identifier`] — the form the model gives
+/// `com.amazonaws.fms#PolicyId`), the shape check this page class adds on top of
+/// the shared token-to-key step.
+pub fn decode_policy_page_token(token: &str) -> Option<String> {
+    let decoded = decode_scoped_page_token(POLICIES_PAGE, token)?;
     is_minted_identifier(&decoded).then_some(decoded)
 }
 

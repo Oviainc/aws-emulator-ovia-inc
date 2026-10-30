@@ -258,27 +258,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A token this service did not mint, or one minted for ANOTHER policy's
-        // page, names no boundary in this policy's attacks: every key of this
-        // policy's range carries the policy's prefix.
+        // page or for another collection narrowed by this same policy, names no
+        // boundary in this policy's attacks: a boundary of this page is a key
+        // [`crate::state::shield_attack_key`] writes, which carries the policy's
+        // prefix AND the instant and attack id that follow it
+        // ([`crate::state::decode_shield_attack_page_token`]).
         let prefix = crate::state::shield_attack_key_prefix(&input.policy_id);
         let start = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_key_token(token)
-                .filter(|key| key.starts_with(&prefix))
-            {
-                Some(start) => Some(start),
-                None => {
-                    return Err(GetProtectionStatusErrorModeled::InvalidInputException(
-                        InvalidInputException {
-                            message: Some(format!(
-                                "NextToken is not a pagination token issued by \
-                                 GetProtectionStatus for policy {}",
-                                input.policy_id
-                            )),
-                        },
-                    )
-                    .into());
+            Some(token) => {
+                match crate::state::decode_shield_attack_page_token(&input.policy_id, token) {
+                    Some(start) => Some(start),
+                    None => {
+                        return Err(GetProtectionStatusErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message: Some(format!(
+                                    "NextToken is not a pagination token issued by \
+                                     GetProtectionStatus for policy {}",
+                                    input.policy_id
+                                )),
+                            },
+                        )
+                        .into());
+                    }
                 }
-            },
+            }
             None => None,
         };
 

@@ -14,8 +14,10 @@
 //! Paging follows the model's `@paginated(inputToken: NextToken, outputToken:
 //! NextToken, items: PolicyList, pageSize: MaxResults)`: at most `MaxResults`
 //! summaries per page, and a `NextToken` ONLY when policies remain after the
-//! page. The token is opaque and carries the id the next page starts at, so it
-//! round-trips into the next page without a server-side cursor.
+//! page. The token is opaque and carries the collection it is a boundary of
+//! beside the id the next page starts at, so it round-trips into the next page
+//! without a server-side cursor and names no boundary in another collection of
+//! this service ([`crate::state::encode_policy_page_token`]).
 //!
 //! ## Shape of an operation
 //!
@@ -187,11 +189,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not the administrator".
         crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
 
-        // A token this service did not mint names no page boundary. The model
-        // declares no client-input error for ListPolicies, so refuse it as a bad
-        // request rather than inventing a page.
+        // A token this service did not mint names no page boundary — and
+        // neither does one it minted for ANOTHER of its collections. This page is
+        // the stored policies, so a boundary of it is a `PolicyId` minted for
+        // THIS collection: the token carries the collection beside the id
+        // ([`crate::state::encode_policy_page_token`]), because a `PolicyId` is
+        // indistinguishable by shape from the `ListId` of either list collection
+        // — all three come from one mint — and a boundary of those names no
+        // policy. The model declares no client-input error for ListPolicies, so a
+        // token naming no boundary of this page is refused as a bad request
+        // rather than resumed from as an arbitrary key.
         let start = match input.next_token.as_deref() {
-            Some(token) => match crate::state::decode_page_token(token) {
+            Some(token) => match crate::state::decode_policy_page_token(token) {
                 Some(start) => Some(start),
                 None => {
                     return Err(crate::scaffolded::Scaffolded::validation(
@@ -226,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries none.
         let next_token = remaining
             .next()
-            .map(|(policy_id, _)| crate::state::encode_page_token(policy_id));
+            .map(|(policy_id, _)| crate::state::encode_policy_page_token(policy_id));
 
         Ok(ListPoliciesOutput {
             policy_list: Some(policy_list),
