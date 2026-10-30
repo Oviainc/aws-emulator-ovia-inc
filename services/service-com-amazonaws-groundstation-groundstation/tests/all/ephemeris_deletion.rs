@@ -189,7 +189,7 @@ pub(crate) fn put_in_status(engine: &engine::InMemoryEngine, contact_id: &str, s
 /// `slot` moves the window a day per row, so each reservation of a table holds a window of
 /// its own: an antenna serves one pass at a time, so a second reservation of the SAME
 /// window at one ground station is refused.
-async fn reserve_against(
+pub(crate) async fn reserve_against(
     router: &MultiServiceRouter,
     case: &str,
     profile_arn: &str,

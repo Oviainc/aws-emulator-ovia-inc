@@ -2418,8 +2418,21 @@ pub fn config_in_use_by_configs_message(config_arns: &[String]) -> String {
 /// sentence cannot drift between the deletes that answer it; only what is held and what
 /// holds it differs.
 fn resource_in_use_text(resource: &str, holder_kind_plural: &str, holders: &[String]) -> String {
+    resource_in_use_text_for(resource, "deleted", holder_kind_plural, holders)
+}
+
+/// The same sentence as [`resource_in_use_text`], for the write `action` the hold refuses:
+/// a resource in use "cannot be modified or deleted" (`smithy_query(query="doc",
+/// shape="ResourceInUseException")`), so a MODIFY of one is refused in the same words as
+/// its delete and only the action named differs.
+fn resource_in_use_text_for(
+    resource: &str,
+    action: &str,
+    holder_kind_plural: &str,
+    holders: &[String],
+) -> String {
     format!(
-        "{resource} cannot be deleted; it is currently being used by the following \
+        "{resource} cannot be {action}; it is currently being used by the following \
          {holder_kind_plural}: {}",
         holders.join(", ")
     )
@@ -3392,6 +3405,23 @@ pub const EPHEMERIS_NOT_FOUND: &str = "Ephemeris not found";
 /// for a config a mission profile still references ([`config_in_use_message`]).
 pub fn ephemeris_in_use_message(contact_ids: &[String]) -> String {
     resource_in_use_text("Ephemeris", "contacts", contact_ids)
+}
+
+/// What this service answers while a WRITE onto an ephemeris would take the trajectory out
+/// from under a pass still to be flown: the refusal names the contacts that would have lost
+/// it, which is what tells a caller what has to be flown or released first.
+///
+/// The status (431) and the error code (`InvalidParameterException`) are the contract —
+/// `UpdateEphemeris` models no `ResourceInUseException` (`smithy_query(query="operation",
+/// operation="UpdateEphemeris")`), so the in-use refusal is the bad-parameter one this
+/// service's other writers held by an in-use resource already answer
+/// ([`mission_profile_in_use_message`], [`dataflow_endpoint_group_in_use_message`]). The
+/// sentence is the one template every in-use refusal of this service is composed from
+/// ([`resource_in_use_text_for`]), in the action AWS's own in-use text pairs with the
+/// delete's — "cannot be modified or deleted" — and the ids in it are the ones the store
+/// holds rather than anything echoed from the request.
+pub fn ephemeris_in_use_for_update_message(contact_ids: &[String]) -> String {
+    resource_in_use_text_for("Ephemeris", "modified", "contacts", contact_ids)
 }
 
 /// Why an ephemeris whose supplied data describes a backwards-running validity range did
@@ -5317,6 +5347,94 @@ impl ComAmazonawsGroundstationGroundstationState {
                     .is_some_and(Contact::is_non_terminal)
             })
             .collect()
+    }
+
+    /// Write onto the ephemeris `ephemeris_id` names the members an update carries — the
+    /// required `enabled`, plus `name` and `priority` when the request carries them — and
+    /// land it on the status its flag selects; or, when that write would leave a pass still
+    /// to be flown with no trajectory at all, write NOTHING and answer the contacts it
+    /// would have left without one.
+    ///
+    /// A resource "in use by non-terminal state contacts ... cannot be modified or deleted"
+    /// (`smithy_query(query="doc", shape="ResourceInUseException")`), so the hold a contact
+    /// still to be flown has on what it is flown with binds THIS writer as well as the
+    /// delete ([`Self::contacts_using_ephemeris`]): a write that takes this ephemeris out
+    /// from under such a pass is refused, unless another ephemeris the account holds takes
+    /// that satellite over ([`Self::ephemeris_in_force_for_satellite`]) — the pointing
+    /// follows whichever ephemeris is in force, so a pass handed to the one that was
+    /// superseded still has the trajectory it is flown on, and only a write that leaves it
+    /// with none takes the trajectory away.
+    ///
+    /// Which contacts a write releases is decided by APPLYING it and asking that one helper
+    /// again, rather than by a second copy of the status and precedence rules that decide
+    /// what a pass is flown on, and the ephemeris as it stood goes back before the refusal
+    /// returns — so a refused write leaves the store exactly as it was. A contact that
+    /// names this ephemeris OUTRIGHT in its program track holds it whatever its status
+    /// ([`Contact::program_tracks_ephemeris`]), so no write of these members releases such
+    /// a contact and none is ever refused for one.
+    ///
+    /// Enabling or disabling "doesn't require re-validation" (`smithy_query(query="doc",
+    /// shape="UpdateEphemerisRequest", member="enabled")`), so an ephemeris whose data has
+    /// already validated takes the status its new flag selects straight away; one still
+    /// validating keeps the move it is owed, which lands on the flag as it stands when that
+    /// move falls due, and one that did not validate or whose expiration has passed keeps
+    /// the status its data earned.
+    ///
+    /// The ephemeris must be one this store holds: a caller addressed at an id it does not
+    /// hold has already answered the missing-resource refusal.
+    pub fn write_ephemeris_update(
+        &mut self,
+        ephemeris_id: &str,
+        enabled: bool,
+        name: Option<String>,
+        priority: Option<i32>,
+    ) -> Result<(), Vec<String>> {
+        // The passes flown on this ephemeris as it stands, read before anything is written.
+        let flown_before = self.contacts_using_ephemeris(ephemeris_id);
+
+        let stored = self
+            .ephemerides
+            .get_mut(ephemeris_id)
+            .expect("an ephemeris this store holds, as this method's contract requires");
+        // Kept whole, so a write that turns out to take a trajectory away is undone rather
+        // than reconstructed member by member.
+        let before = stored.clone();
+        let satellite_id = stored.satellite_id.clone();
+
+        stored.enabled = enabled;
+        if let Some(name) = name {
+            stored.name = name;
+        }
+        if let Some(priority) = priority {
+            stored.priority = priority;
+        }
+        if matches!(
+            stored.status.as_str(),
+            EPHEMERIS_ENABLED | EPHEMERIS_DISABLED
+        ) {
+            stored.status = if stored.enabled {
+                EPHEMERIS_ENABLED.to_string()
+            } else {
+                EPHEMERIS_DISABLED.to_string()
+            };
+        }
+
+        // The passes the write took this ephemeris out from under, and whether the
+        // satellite they are flown against is left with a trajectory at all.
+        let flown_after = self.contacts_using_ephemeris(ephemeris_id);
+        let released: Vec<String> = flown_before
+            .into_iter()
+            .filter(|contact_id| !flown_after.contains(contact_id))
+            .collect();
+        let taken_over = satellite_id.as_deref().is_some_and(|satellite_id| {
+            self.ephemeris_in_force_for_satellite(satellite_id).is_some()
+        });
+        if released.is_empty() || taken_over {
+            return Ok(());
+        }
+
+        self.ephemerides.insert(ephemeris_id.to_string(), before);
+        Err(released)
     }
 
     /// Remove the ephemeris `ephemeris_id` addresses, along with the ARN index entry that

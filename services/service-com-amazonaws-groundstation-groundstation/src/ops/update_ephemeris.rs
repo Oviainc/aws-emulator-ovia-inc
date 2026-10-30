@@ -18,6 +18,17 @@
 //! validate, or whose expiration has passed, keeps the status its data earned — a flag
 //! does not revalidate or un-expire a trajectory.
 //!
+//! What this operation does NOT do is take the trajectory out from under a pass that is
+//! still to happen: a resource in use by non-terminal contacts "cannot be modified or
+//! deleted" (`smithy_query(query="doc", shape="ResourceInUseException")`), so the in-use
+//! hold the sibling delete is refused on binds this writer too. A write that would leave a
+//! contact still to be flown with no trajectory at all — this ephemeris taken out of force
+//! for its satellite and no other ephemeris of the account taking that satellite over — is
+//! refused with the modelled `InvalidParameterException` (HTTP 431) naming those contacts,
+//! and nothing is written (`state::write_ephemeris_update`). A write that only hands the
+//! pass to the ephemeris this one superseded is answered: the pointing follows whichever
+//! ephemeris is in force.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -181,53 +192,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut guard = state.lock();
-        // An ephemeris leaves `VALIDATING` at an instant its create recorded, and becomes
-        // `EXPIRED` once its expiration time passes: both moves were owed at this instant
-        // whether or not anybody called, so materialising them before this update reads
-        // the status it is about to act on changes nothing a later caller could otherwise
-        // have seen.
+        // Both sides of the in-use question are statuses the clock moves on its own: an
+        // ephemeris leaves `VALIDATING` at an instant its create recorded and becomes
+        // `EXPIRED` once its expiration time passes, and a contact is scheduled and its
+        // release completed at instants its reservation and its cancel recorded. Each move
+        // was owed at this instant whether or not anybody called, so materialising them
+        // before this update reads the statuses it is about to act on changes nothing a
+        // later caller could otherwise have seen.
         guard.settle_due_ephemerides();
+        guard.settle_due_contacts();
 
-        let stored = guard
-            .ephemerides
-            .get_mut(&input.ephemeris_id)
-            .ok_or_else(|| {
-                UpdateEphemerisErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        if !guard.ephemerides.contains_key(&input.ephemeris_id) {
+            return Err(UpdateEphemerisErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
                     // This service's ephemeris literal: it discloses neither the id that
                     // was asked for nor the account it was looked for in, exactly as the
                     // sibling read and delete of the same dead id answer.
                     message: Some(crate::state::EPHEMERIS_NOT_FOUND.to_string()),
-                })
-            })?;
+                },
+            )
+            .into());
+        }
 
         // `enabled` is required, so every update states whether the ephemeris is to be
         // used; `name` and `priority` are optional, and one the request omits leaves the
-        // stored value alone.
-        stored.enabled = input.enabled;
-        if let Some(name) = input.name {
-            stored.name = name;
-        }
-        if let Some(priority) = input.priority {
-            stored.priority = priority;
-        }
-
-        // Changing the flag needs no re-validation, so an ephemeris whose data already
-        // validated moves between the two statuses the flag selects at once. One still
-        // `VALIDATING` is left the move it is owed, which lands on the flag as it now
-        // stands; one `INVALID` or `EXPIRED` keeps the status its data earned.
-        if matches!(
-            stored.status.as_str(),
-            crate::state::EPHEMERIS_ENABLED | crate::state::EPHEMERIS_DISABLED
+        // stored value alone. The write is refused instead of applied when it would take
+        // the trajectory out from under a pass still to be flown — an in-use resource
+        // "cannot be modified or deleted", which binds this writer as it binds the delete —
+        // and then nothing is written: the refusal names the contacts that would have been
+        // left without one, which is what tells a caller what has to be flown or released
+        // first (`state::write_ephemeris_update`).
+        if let Err(released) = guard.write_ephemeris_update(
+            &input.ephemeris_id,
+            input.enabled,
+            input.name,
+            input.priority,
         ) {
-            stored.status = if stored.enabled {
-                crate::state::EPHEMERIS_ENABLED.to_string()
-            } else {
-                crate::state::EPHEMERIS_DISABLED.to_string()
-            };
+            return Err(UpdateEphemerisErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::ephemeris_in_use_for_update_message(&released)),
+                    // The hold is on the ephemeris this update addresses rather than on a
+                    // value the request carried, so no one member is at fault — the same
+                    // composition as this service's other in-use refusals.
+                    parameter_name: None,
+                },
+            )
+            .into());
         }
 
         Ok(UpdateEphemerisOutput {
-            ephemeris_id: Some(stored.ephemeris_id.clone()),
+            ephemeris_id: Some(input.ephemeris_id),
         })
     }
 }
