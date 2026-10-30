@@ -19,30 +19,33 @@
 //! 1. the envelope is AWS's `N validation error(s) detected: ` over one clause per
 //!    offending member, joined with `; `, in the order the walk found them
 //!    ([`envelope`]);
-//! 2. a clause states the value the member held, its dotted path and the requirement it
-//!    failed — EXCEPT for the two classes whose clause states the REQUIREMENT alone
-//!    ([`echoes_refused_value`]): a value outside a `@range` bound, where the bound the
-//!    model declares is the whole of what a caller needs to resubmit, and a value outside
-//!    an enum's admitted set, where that set is. Both keep the rejected request content
-//!    out of the sentence, and both are decided by the violation's CLASS, so each holds
-//!    for every member of every operation that carries that constraint;
-//! 3. a reported `@pattern` is the expression WITHOUT the `^` / `$` anchors the model
-//!    spells it with ([`unanchored`]): the advertised constraint is the character grammar
-//!    a value must satisfy, and a caller that lifts the expression out of the message to
-//!    re-validate locally must get the expression the service publishes, not the model's
-//!    way of making the match total;
+//! 2. a clause states its member's dotted path and the requirement it failed, and QUOTES
+//!    the value the member held only where the model binds that member to the request URI —
+//!    a `@httpLabel` path segment or a `@httpQuery` parameter, the tokens the service reads
+//!    off the request line ([`quotes_the_value`], [`URI_BOUND_MEMBERS`]). A member the
+//!    service reads out of the request BODY is reported by its position alone
+//!    (`Value at '<path>' failed to satisfy constraint: …`), so no body content a caller
+//!    submitted reaches the sentence. The decision is the MEMBER's binding, not the
+//!    violation's class, so one rule covers a `@length`, a `@range`, a `@pattern` and an
+//!    enum alike, wherever that member is reached; a member the request OMITTED held no
+//!    value at all and is stated as `Value null` whatever its binding;
+//! 3. a reported `@pattern` is the expression the WHOLE value must match
+//!    ([`whole_value_expression`]), with the two ends decided independently: an end the
+//!    model ANCHORS carries its `^` / `$` away with it, which is the model's way of making
+//!    the match total rather than part of the character grammar, and an end the model leaves
+//!    OPEN — where Smithy matches the expression anywhere in the value — is spelled with the
+//!    unconstrained run `.*` that end admits. Either way a caller that lifts the expression
+//!    out of the message to re-validate locally gets one its own whole value has to satisfy;
 //! 4. a violation on an ELEMENT of a collection is reported against the COLLECTION MEMBER
 //!    — no element index and no `member` step — with the ELEMENT SHAPE'S WHOLE CONSTRAINT
-//!    SET nested inside `Member must satisfy constraint: [ … ]`, and the collection
-//!    rendered as the value ([`collapsed`], [`element_constraint_set`]). The set is the
+//!    SET nested inside `Member must satisfy constraint: [ … ]` ([`collapsed`],
+//!    [`element_constraint_set`]). The set is the
 //!    element's, not just the constraint that happened to fail: the clause tells a caller
 //!    what every element of that member has to satisfy. A violation on the collection
 //!    ITSELF (its own `@length`, its `@uniqueItems`) is not nested, and neither is one on
 //!    a member INSIDE a structure element, which keeps its own full path;
-//! 5. an enum clause states the admitted VALUE SET and the position —
-//!    `Value at '<path>' failed to satisfy constraint: Member must satisfy enum value set:
-//!    [ … ]` — never the value the member held, which is rule 2's second exception: what
-//!    such a caller acts on is the set it must choose from. The set's MEMBERSHIP is the
+//! 5. an enum clause states the admitted VALUE SET —
+//!    `Member must satisfy enum value set: [ … ]`. The set's MEMBERSHIP is the
 //!    model's; the ORDER it is listed in is the service's own listing of that enum's values
 //!    ([`VALUE_LISTINGS`], [`listed`]), which no order the model carries reproduces. The
 //!    order is a property of the ENUM, not of the member or the operation reaching it, so
@@ -59,8 +62,10 @@
 //!
 //! What the refusal does NOT carry is the value a collection member held — only the
 //! elements that offended, each already elided to the framework's echo cap — so the VALUE a
-//! collection clause states is the one formed from those elements. That divergence, and why
-//! closing it belongs elsewhere, is recorded on [`Clause::render`].
+//! URI-bound collection's clause states is the one formed from those elements. That
+//! divergence, and why closing it belongs elsewhere, is recorded on [`Clause::render`]; a
+//! collection the service reads out of the BODY states no value at all (rule 2), so it
+//! cannot reach it.
 //!
 //! A violation class this module has no wording for falls back to the FRAMEWORK's own
 //! clause for that one violation ([`ViolationKind`] is `#[non_exhaustive]`, so a class can
@@ -68,12 +73,15 @@
 //!
 //! MIGRATION NOTE (`services/common/src/validation.rs`): rules 1-3 are AWS's wording
 //! rather than this service's, and ~24 sibling crates carry their own copy of parts of
-//! them (`grep -rln 'fn unanchored' services/*/src`). That module is the staged home for
-//! exactly those clause rules; as its header asks, this is the note rather than a silent
-//! further copy — migrating them re-words services whose recorded behaviour their own
-//! suites pin, so it is one change of its own. What would stay here is rule 4's
-//! model-derived element constraint set.
+//! them (`grep -rln 'fn unanchored' services/*/src`, and `grep -rn '\.\*{pattern}'` for the
+//! open-end half rule 3 adds, which two more crates spell inline). That module is the staged
+//! home for exactly those clause rules; as its header asks, this is the note rather than a
+//! silent further copy — migrating them re-words services whose recorded behaviour their own
+//! suites pin, so it is one change of its own, and that module now records this service's
+//! whole-value rendering beside the pair-positional one the crates calling it state. What
+//! would stay here is rule 4's model-derived element constraint set.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -140,11 +148,12 @@ fn min_value(min: &str) -> String {
     format!("Member must have value greater than or equal to {min}")
 }
 
-/// The `@pattern`, as a requirement reads: the expression UNANCHORED (rule 3).
+/// The `@pattern`, as a requirement reads: the expression the WHOLE value must match
+/// (rule 3).
 fn pattern_requirement(pattern: &str) -> String {
     format!(
         "Member must satisfy regular expression pattern: {}",
-        unanchored(pattern)
+        whole_value_expression(pattern)
     )
 }
 
@@ -241,22 +250,51 @@ fn render_bound(bound: f64) -> String {
     }
 }
 
-/// Whether a violation of this class states the value it refused.
+/// Whether a clause reported at `member_path` QUOTES the value the request carried there.
 ///
-/// Two classes do NOT. A `@range` violation names the member and the bound it broke and
-/// stops there, for every numeric member of every operation — a minimum as much as a
-/// maximum, an integer member as much as a fractional one, and whether the bound was
-/// declared on the member's target or inherited by it. An enum violation does the same with
-/// the admitted value set, for every enum-constrained member of every operation: the set is
-/// what a caller has to choose from, so the value it chose instead is not restated. Every
-/// other class this module words keeps the value (rule 2), and an absent member has none to
-/// state.
-fn echoes_refused_value(kind: &ViolationKind) -> bool {
-    !matches!(
-        kind,
-        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_) | ViolationKind::EnumValue(_)
-    )
+/// Decided by WHERE the service read that value, which is what the model's HTTP binding
+/// says: a member bound to the request URI — a `@httpLabel` path segment or a `@httpQuery`
+/// parameter — is a token read off the request line and quoted back, and a member read
+/// anywhere else (the request body, a header) is reported by its position alone
+/// ([`URI_BOUND_MEMBERS`]). The binding is a property of the MEMBER, so one decision
+/// covers every constraint class and every operation reaching that member rather than the
+/// class a single report happened to cite; a member NESTED inside a body structure is never
+/// URI-bound, so its path reaches this with no entry and is reported by position.
+fn quotes_the_value(member_path: &str) -> bool {
+    URI_BOUND_MEMBERS.contains(member_path)
 }
+
+/// The top-level members of this service's input shapes the model binds to the request URI,
+/// keyed by the member path the validation walk reports them under.
+///
+/// Built once off the generated schemas, the way [`ELEMENT_CONSTRAINTS`] is — so the
+/// binding is the MODEL's and a member whose binding changes there changes here with it. A
+/// member NAME several operations declare is recorded only when every one of them binds it
+/// to the URI: `resourceArn` is a path label on the resource-policy operations and a body
+/// member on others, and a violation's path cannot tell those apart, so an ambiguous name
+/// is reported the way a body member is.
+static URI_BOUND_MEMBERS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    let mut uri: HashSet<String> = HashSet::new();
+    let mut read_elsewhere: HashSet<String> = HashSet::new();
+    for schema in input_schemas() {
+        for member in schema.members() {
+            let Some(name) = member.member_name() else {
+                continue;
+            };
+            let path = constraints::path::member(name);
+            if member.http_label().is_some()
+                || member.http_query().is_some()
+                || member.http_query_params().is_some()
+            {
+                uri.insert(path);
+            } else {
+                read_elsewhere.insert(path);
+            }
+        }
+    }
+    uri.retain(|path| !read_elsewhere.contains(path));
+    uri
+});
 
 /// The requirement a violation states, or `None` for a class this module has no wording
 /// for.
@@ -274,22 +312,96 @@ fn requirement(kind: &ViolationKind) -> Option<String> {
     })
 }
 
-/// A `@pattern` expression without the anchors a model may spell it with.
+/// The unconstrained run an expression spells for an end a `@pattern` leaves open.
+const ANY: &str = ".*";
+
+/// A `@pattern` as a requirement QUOTES it: the expression the WHOLE value must match.
+///
+/// A Smithy `@pattern` is a FIND rather than a total match, so the expression a member
+/// declares and the expression its whole value must satisfy are two different things, and a
+/// requirement states the second — it is what a caller lifts out of the message to
+/// re-validate locally. The two ends are decided independently, because a model may anchor
+/// one of them and leave the other open:
+///
+/// * an end the model ANCHORS carries the `^` / `$` away with it ([`split_anchors`]): that
+///   is the model's way of making the match total at that end, not part of the character
+///   grammar a caller has to satisfy;
+/// * an end the model leaves OPEN admits any run of characters before (or after) the match,
+///   which the requirement spells as [`ANY`] unless the expression already leaves that end
+///   open with one;
+/// * an expression that anchors neither end but carries an anchor inside itself
+///   ([`carries_an_anchor`]) — this model declares one that anchors each of its top-level
+///   alternatives — already describes the whole value, so it is quoted as it is declared.
+fn whole_value_expression(pattern: &str) -> Cow<'_, str> {
+    let (body, anchored_at_start, anchored_at_end) = split_anchors(pattern);
+    match (anchored_at_start, anchored_at_end) {
+        (true, true) => Cow::Borrowed(body),
+        // Anchored inside its own alternatives rather than at either end.
+        (false, false) if carries_an_anchor(pattern) => Cow::Borrowed(body),
+        (start, end) => Cow::Owned(opened(body, !start, !end)),
+    }
+}
+
+/// `body` with the unconstrained run [`ANY`] spelled at each open end, unless the
+/// expression already leaves that end open with one.
+fn opened(body: &str, at_start: bool, at_end: bool) -> String {
+    let mut expression = String::with_capacity(body.len() + 2 * ANY.len());
+    if at_start && !body.starts_with(ANY) {
+        expression.push_str(ANY);
+    }
+    expression.push_str(body);
+    if at_end && !body.ends_with(ANY) {
+        expression.push_str(ANY);
+    }
+    expression
+}
+
+/// Whether `pattern` anchors its match: it carries a `^` or a `$` that is an ANCHOR rather
+/// than an ordinary character.
+///
+/// Either character inside a character class (`[^:]+`) is an ordinary member of that class,
+/// and either one escaped by a backslash is the literal character, so neither anchors
+/// anything. The anchor may sit ANYWHERE in the expression, not only at its ends: this
+/// model declares one that anchors each of its top-level alternatives
+/// (`(^…$)|(^…$)`), which describes the whole value exactly as an expression anchored at
+/// its ends does.
+fn carries_an_anchor(pattern: &str) -> bool {
+    let mut escaped = false;
+    let mut in_class = false;
+    for character in pattern.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '^' | '$' if !in_class => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A `@pattern` expression without the anchors a model may spell it at its ends, and WHICH
+/// of the two ends carried one — reported together, so a caller that has to tell an
+/// anchored end from an open one cannot disagree with what was stripped.
 ///
 /// A `$` preceded by an ODD number of backslashes is an escaped dollar sign — a literal
-/// character of the expression, not the end anchor — so it stays.
-fn unanchored(pattern: &str) -> &str {
-    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+/// character of the expression, not the end anchor — so it stays and that end is open.
+fn split_anchors(pattern: &str) -> (&str, bool, bool) {
+    let (body, at_start) = match pattern.strip_prefix('^') {
+        Some(body) => (body, true),
+        None => (pattern, false),
+    };
     match body.strip_suffix('$') {
-        Some(trimmed) => {
-            let escapes = trimmed.len() - trimmed.trim_end_matches('\\').len();
-            if escapes % 2 == 0 {
-                trimmed
-            } else {
-                body
-            }
+        Some(trimmed)
+            if (trimmed.len() - trimmed.trim_end_matches('\\').len()) % 2 == 0 =>
+        {
+            (trimmed, at_start, true)
         }
-        None => body,
+        _ => (body, at_start, false),
     }
 }
 
@@ -492,11 +604,10 @@ struct Clause {
     /// The framework's own clause, kept verbatim for a violation class this module has no
     /// wording for, so one such class does not cost the refusal its other clauses.
     verbatim: Option<String>,
-    /// Whether the clause states the value the member held: false while EVERY violation
-    /// folded into it is one of the classes that does not ([`echoes_refused_value`]). A
-    /// clause one violation of another class also joined — which only a collection's
-    /// element set can be — states the value, since that class's own rule asks for it.
-    echoes_value: bool,
+    /// Whether the clause QUOTES the value the request carried at this member: decided
+    /// once, from where the service read it ([`quotes_the_value`]), so every violation that
+    /// folds into the clause states it the same way.
+    quotes_value: bool,
 }
 
 impl Clause {
@@ -522,15 +633,16 @@ impl Clause {
         if let Some(verbatim) = &self.verbatim {
             return verbatim.clone();
         }
-        // No value at all: an absent member, reported as the `null` it was. Read off what
-        // the clause COLLECTED rather than off the violation that opened it, so a clause
-        // that did collect a value always echoes it.
-        let subject = if !self.echoes_value {
-            // A class whose clause carries no value at all: the member and the requirement
-            // are the whole sentence, whatever the request held.
-            "Value".to_string()
-        } else if self.values.is_empty() {
+        // A member the request OMITTED held no value at all, whatever its binding, and is
+        // reported as the `null` it was. Read off what the clause COLLECTED rather than off
+        // the violation that opened it, so a clause that did collect a value is never
+        // reported as an absence.
+        let subject = if self.values.is_empty() {
             "Value null".to_string()
+        } else if !self.quotes_value {
+            // A member the service read anywhere but the request URI: the position and the
+            // requirement are the whole sentence, whatever the request held.
+            "Value".to_string()
         } else if self.depth == 0 {
             format!(
                 "Value '{}'",
@@ -633,15 +745,12 @@ pub(crate) fn envelope(violations: &[Violation]) -> Option<String> {
                     depth,
                     values: Vec::new(),
                     verbatim,
-                    // Decided by the OR-fold below, over this violation and every later one
-                    // that joins the clause.
-                    echoes_value: false,
+                    // A property of the MEMBER the clause is reported at, so it is the same
+                    // for every violation that folds into this clause.
+                    quotes_value: quotes_the_value(path),
                 })
             }
         };
-        // One clause, several violations: it echoes the value as soon as ANY of them is a
-        // class that states one.
-        clause.echoes_value |= echoes_refused_value(&violation.kind);
         if let Some(value) = violation.value.as_deref() {
             // One rendered value per violation PATH: the same element breaking two of its
             // shape's constraints is one value, two elements are two.
@@ -940,28 +1049,135 @@ mod tests {
         }
     }
 
-    /// The anchors are stripped, and only the anchors: a `$` that is part of the
-    /// expression stays. The forms this model reaches are covered end-to-end by
+    /// The anchors are stripped, and only the anchors, and the END each one was stripped
+    /// from is reported with the body: a `$` that is part of the expression stays and leaves
+    /// that end OPEN. The forms this model reaches are covered end-to-end by
     /// `tests/all/validation_message_wording.rs`; these rows pin the branches no input
     /// shape of THIS model produces today, so the rule stays stated for a model that
     /// grows one.
     #[test]
     fn only_the_anchors_are_stripped_from_a_pattern() {
-        for (pattern, expected) in [
-            (r"^[a-z]+$", "[a-z]+"),
-            (r"[a-z]+", "[a-z]+"),
-            (r"^[a-z]+", "[a-z]+"),
-            (r"[a-z]+$", "[a-z]+"),
+        // (the declared expression, the body, the end each anchor was stripped from)
+        for (pattern, expected, at_start, at_end) in [
+            (r"^[a-z]+$", "[a-z]+", true, true),
+            (r"[a-z]+", "[a-z]+", false, false),
+            (r"^[a-z]+", "[a-z]+", true, false),
+            (r"[a-z]+$", "[a-z]+", false, true),
             // An escaped dollar is a literal character, not the end anchor.
-            (r"^[a-z]+\$", r"[a-z]+\$"),
+            (r"^[a-z]+\$", r"[a-z]+\$", true, false),
             // An escaped backslash before the anchor: the anchor is still an anchor.
-            (r"^[a-z]+\\$", r"[a-z]+\\"),
-            ("^$", ""),
+            (r"^[a-z]+\\$", r"[a-z]+\\", true, true),
+            ("^$", "", true, true),
         ] {
-            let actual = unanchored(pattern);
+            let actual = split_anchors(pattern);
+            assert_eq!(
+                actual,
+                (expected, at_start, at_end),
+                "case {pattern:?}: expected {:?}, got {actual:?}",
+                (expected, at_start, at_end)
+            );
+        }
+    }
+
+    /// An expression anchors its match only when a `^` or a `$` of it is an ANCHOR: inside
+    /// a character class, or escaped, either character is an ordinary one.
+    #[test]
+    fn an_anchor_is_told_apart_from_the_same_character_used_literally() {
+        for (pattern, anchored) in [
+            (r"^[a-z]+$", true),
+            (r"^[a-z]+", true),
+            (r"[a-z]+$", true),
+            // Anchored inside each top-level alternative rather than at the ends, which is
+            // how this model spells `TaggableResourcesArn`.
+            (r"(^[a-z]+$)|(^arn:aws:[a-z]+$)", true),
+            // `^` as the negation of a character class is an ordinary character of it.
+            (r"arn:aws(-[^:]+)?:bedrock:.*", false),
+            // `$` inside a class, and an escaped one, are the literal character.
+            (r"[a-z$]+", false),
+            (r"[a-z]+\$", false),
+            (r"arn:aws:sagemaker:.*:hub-content/SageMakerPublicHub/Model/.*", false),
+        ] {
+            let actual = carries_an_anchor(pattern);
+            assert_eq!(
+                actual, anchored,
+                "case {pattern:?}: expected carries_an_anchor {anchored}, got {actual}"
+            );
+        }
+    }
+
+    /// The expression a requirement quotes is the one the WHOLE value must match: an
+    /// anchored end loses its anchor, an open end is spelled with the run it admits, and an
+    /// expression anchored only inside its alternatives is quoted as declared.
+    #[test]
+    fn a_quoted_pattern_is_the_expression_the_whole_value_must_match() {
+        for (pattern, expected) in [
+            // Anchored at both ends: the anchors go, nothing is added.
+            (r"^[a-z]+$", "[a-z]+"),
+            (r"^(([1-9][0-9]{0,7})|(DRAFT))$", "(([1-9][0-9]{0,7})|(DRAFT))"),
+            // Anchored inside its alternatives: there are no end anchors to strip and the
+            // expression already describes the whole value.
+            (r"(^[a-z]+$)|(^arn:aws:[a-z]+$)", r"(^[a-z]+$)|(^arn:aws:[a-z]+$)"),
+            // Unanchored: the run each open end admits is spelled out, unless the
+            // expression already leaves that end open.
+            (r"[a-z]+", r".*[a-z]+.*"),
+            (
+                r"arn:aws:sagemaker:.*:hub-content/SageMakerPublicHub/Model/.*",
+                r".*arn:aws:sagemaker:.*:hub-content/SageMakerPublicHub/Model/.*",
+            ),
+            (r".*suffix", r".*suffix.*"),
+            (r".*both.*", r".*both.*"),
+            // Anchored at ONE end: that end loses its anchor and the OTHER is spelled with
+            // the run it admits. No input shape of this model declares such an expression
+            // today; the rows keep the rule stated for a model that grows one.
+            (r"^[a-z]+", r"[a-z]+.*"),
+            (r"[a-z]+$", r".*[a-z]+"),
+            // An escaped dollar is a literal character, so that end is open.
+            (r"^[a-z]+\$", r"[a-z]+\$.*"),
+        ] {
+            let actual = whole_value_expression(pattern);
             assert_eq!(
                 actual, expected,
                 "case {pattern:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// The members whose clause quotes the value are exactly the ones this MODEL binds to
+    /// the request URI, and every one of them is a top-level member path.
+    #[test]
+    fn the_members_that_quote_a_value_are_the_models_uri_bound_ones() {
+        let bound = &*URI_BOUND_MEMBERS;
+        assert!(
+            !bound.is_empty(),
+            "this model binds input members to the URI, so the catalog must not be empty"
+        );
+        for path in bound {
+            assert!(
+                !path.contains('.'),
+                "case {path:?}: only a top-level member carries an HTTP binding"
+            );
+        }
+        // A query parameter and a path label of this model, against a body member of it, a
+        // member nested in one, and a member NAME the model binds both ways
+        // (`smithy_query(query="operation")`: `ListCustomModels` binds `modelStatus` to the
+        // query string, `GetGuardrail` binds `guardrailIdentifier` to a path label,
+        // `CreateGuardrail` carries `name` in the body, `CreateModelInvocationJob` reaches
+        // `s3Uri` inside it, and `resourceArn` is a path label on the resource-policy
+        // operations while other operations carry it in the body — a violation's path cannot
+        // tell those apart, so an ambiguous name keeps the body form).
+        for (path, quotes) in [
+            ("modelStatus", true),
+            ("maxResults", true),
+            ("guardrailIdentifier", true),
+            ("name", false),
+            ("modelSourceIdentifier", false),
+            ("inputDataConfig.s3InputDataConfig.s3Uri", false),
+            ("resourceArn", false),
+        ] {
+            let actual = quotes_the_value(path);
+            assert_eq!(
+                actual, quotes,
+                "case {path:?}: expected quotes_the_value {quotes}, got {actual}"
             );
         }
     }

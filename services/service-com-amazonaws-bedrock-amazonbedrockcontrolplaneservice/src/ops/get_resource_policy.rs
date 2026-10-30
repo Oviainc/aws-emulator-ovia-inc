@@ -16,8 +16,10 @@
 //! Two different absences, answered the two different ways the model separates them:
 //!
 //! * a resource this account HOLDS which has no policy attached is reported 200 with
-//!   `resourcePolicy` ABSENT — the member is not `@required`, so "this resource carries no
-//!   policy" is a reportable state of a resource that WAS found, not a failure;
+//!   `resourcePolicy` set to the EMPTY policy document [`NO_POLICY_ATTACHED`] — "this
+//!   resource carries no policy" is a reportable state of a resource that WAS found, and
+//!   the member is the only thing this operation reports, so a caller reading, diffing or
+//!   backing a policy up always gets a document to compare against;
 //! * an ARN naming no resource of this account is 404 `ResourceNotFoundException`, with
 //!   the sentence the model writes for that error ([`NO_SUCH_RESOURCE`]).
 //!
@@ -132,6 +134,16 @@ const NO_SUCH_RESOURCE: &str = "The specified resource Amazon Resource Name (ARN
                                 found. Check the Amazon Resource Name (ARN) and try your \
                                 request again.";
 
+/// What this operation reports for a resource that holds no policy: the EMPTY policy
+/// document — a JSON object with no statements, which is what "no policy is attached"
+/// reads as in the document form the member carries.
+///
+/// Fixed text with no variable part, and inside `ResourcePolicyDocument`'s modelled
+/// `@length 1..20480` (`smithy_query(query="operation",operation="GetResourcePolicy")`), so
+/// a read of a policy-less resource answers in the member's own shape rather than by
+/// leaving the only member this operation has unset.
+const NO_POLICY_ATTACHED: &str = "{}";
+
 /// The `GetResourcePolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -196,11 +208,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A resource that holds no policy reports the member ABSENT.
+        // A resource that holds no policy reports the EMPTY policy document: the member is
+        // the whole of what this operation reports, so it is always stated.
         Ok(GetResourcePolicyOutput {
-            resource_policy: store
-                .resource_policy(&input.resource_arn, &region, now)
-                .map(str::to_string),
+            resource_policy: Some(
+                store
+                    .resource_policy(&input.resource_arn, &region, now)
+                    .unwrap_or(NO_POLICY_ATTACHED)
+                    .to_string(),
+            ),
         })
     }
 }

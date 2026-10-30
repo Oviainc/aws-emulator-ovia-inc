@@ -107,12 +107,16 @@ mod published_catalogues;
 mod range_refusal_wording;
 #[path = "all/refusal_message_fidelity.rs"]
 mod refusal_message_fidelity;
+#[path = "all/refused_value_is_quoted_by_binding.rs"]
+mod refused_value_is_quoted_by_binding;
 #[path = "all/provisioned_model_throughputs.rs"]
 mod provisioned_model_throughputs;
 #[path = "all/provisioned_model_units_wire_form.rs"]
 mod provisioned_model_units_wire_form;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
+#[path = "all/resource_policy_empty_document.rs"]
+mod resource_policy_empty_document;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/state_roundtrip.rs"]

@@ -146,9 +146,13 @@ fn refusal_message(case: &str, reply: &Reply) -> String {
 }
 
 /// The clause a refusal states for `member`, however many clauses it joined.
-fn clause_for(member: &str, listed: &[&str]) -> String {
+fn clause_for(quoted: Option<&str>, member: &str, listed: &[&str]) -> String {
+    let subject = match quoted {
+        Some(value) => format!("Value '{value}'"),
+        None => "Value".to_string(),
+    };
     format!(
-        "Value at '{member}' failed to satisfy constraint: Member must satisfy enum value \
+        "{subject} at '{member}' failed to satisfy constraint: Member must satisfy enum value \
          set: [{}]",
         listed.join(", ")
     )
@@ -173,6 +177,9 @@ struct Row {
     body: Option<Value>,
     /// The member path the clause is reported at.
     member: &'static str,
+    /// The value the request carries, when the clause quotes it: `Some` for a member the
+    /// model binds to the request URI, `None` for one the service reads out of the body.
+    quoted: Option<&'static str>,
     /// The admitted values in the order the clause must list them.
     listed: &'static [&'static str],
 }
@@ -230,6 +237,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/data-retention".to_string(),
             body: Some(json!({ "mode": "keep-everything" })),
             member: "mode",
+            quoted: None,
             listed: DATA_RETENTION_MODE,
         },
         Row {
@@ -238,6 +246,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/evaluation-jobs?sortOrder=sideways".to_string(),
             body: None,
             member: "sortOrder",
+            quoted: Some("sideways"),
             listed: SORT_ORDER,
         },
         Row {
@@ -246,6 +255,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/model-copy-jobs?sortOrder=Asc".to_string(),
             body: None,
             member: "sortOrder",
+            quoted: Some("Asc"),
             listed: SORT_ORDER,
         },
         Row {
@@ -254,6 +264,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/custom-models?sortOrder=ascending".to_string(),
             body: None,
             member: "sortOrder",
+            quoted: Some("ascending"),
             listed: SORT_ORDER,
         },
         Row {
@@ -262,6 +273,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/advanced-prompt-optimization-jobs?sortOrder=DESC".to_string(),
             body: None,
             member: "sortOrder",
+            quoted: Some("DESC"),
             listed: SORT_ORDER,
         },
         Row {
@@ -270,6 +282,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/evaluation-jobs?sortBy=Name".to_string(),
             body: None,
             member: "sortBy",
+            quoted: Some("Name"),
             listed: CREATION_TIME,
         },
         Row {
@@ -278,6 +291,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/imported-models?sortBy=Name".to_string(),
             body: None,
             member: "sortBy",
+            quoted: Some("Name"),
             listed: CREATION_TIME,
         },
         Row {
@@ -286,6 +300,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/evaluation-jobs?statusEquals=Pending".to_string(),
             body: None,
             member: "statusEquals",
+            quoted: Some("Pending"),
             listed: EVALUATION_JOB_STATUS,
         },
         Row {
@@ -294,6 +309,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/model-invocation-jobs?statusEquals=Pending".to_string(),
             body: None,
             member: "statusEquals",
+            quoted: Some("Pending"),
             listed: MODEL_INVOCATION_JOB_STATUS,
         },
         Row {
@@ -302,6 +318,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/model-copy-jobs?statusEquals=Pending".to_string(),
             body: None,
             member: "statusEquals",
+            quoted: Some("Pending"),
             listed: MODEL_COPY_JOB_STATUS,
         },
         Row {
@@ -312,6 +329,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
                 .to_string(),
             body: None,
             member: "statusEquals",
+            quoted: Some("Deleting"),
             listed: CUSTOM_MODEL_DEPLOYMENT_STATUS,
         },
         Row {
@@ -321,6 +339,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/custom-models?modelStatus=Deleting".to_string(),
             body: None,
             member: "modelStatus",
+            quoted: Some("Deleting"),
             listed: MODEL_STATUS,
         },
         Row {
@@ -329,6 +348,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/evaluation-jobs?applicationTypeEquals=Model".to_string(),
             body: None,
             member: "applicationTypeEquals",
+            quoted: Some("Model"),
             listed: APPLICATION_TYPE,
         },
         Row {
@@ -337,6 +357,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/foundation-models?byCustomizationType=PRE_TRAINING".to_string(),
             body: None,
             member: "byCustomizationType",
+            quoted: Some("PRE_TRAINING"),
             listed: MODEL_CUSTOMIZATION,
         },
         Row {
@@ -349,6 +370,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             ),
             body: Some(json!({})),
             member: "buildWorkflowType",
+            quoted: Some("NOT_A_WORKFLOW_TYPE"),
             listed: BUILD_WORKFLOW_TYPE,
         },
         Row {
@@ -358,6 +380,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
             path: "/guardrails".to_string(),
             body: Some(guardrail_with_input_strength("VERY_HIGH")),
             member: "contentPolicyConfig.filtersConfig.1.member.inputStrength",
+            quoted: None,
             listed: GUARDRAIL_FILTER_STRENGTH,
         },
     ];
@@ -366,7 +389,7 @@ async fn an_enum_clause_lists_one_ordered_set_per_enum_wherever_it_is_reached() 
         let case = row.case;
         let reply = emulator.call(row.method, &row.path, row.body.clone()).await;
         let stated = refusal_message(case, &reply);
-        let expected = expected_message(row.member, row.listed);
+        let expected = expected_message(row.quoted, row.member, row.listed);
         assert_eq!(
             stated, expected,
             "case {case:?}: expected {expected:?}, got {stated:?}"
@@ -397,12 +420,12 @@ async fn every_enum_clause_of_one_refusal_states_its_own_enums_listing() {
         stated.starts_with("3 validation errors detected: "),
         "case {case:?}: expected the envelope over three clauses, got {stated:?}"
     );
-    for (member, listed) in [
-        ("statusEquals", EVALUATION_JOB_STATUS),
-        ("applicationTypeEquals", APPLICATION_TYPE),
-        ("sortOrder", SORT_ORDER),
+    for (member, quoted, listed) in [
+        ("statusEquals", "Pending", EVALUATION_JOB_STATUS),
+        ("applicationTypeEquals", "Model", APPLICATION_TYPE),
+        ("sortOrder", "sideways", SORT_ORDER),
     ] {
-        let clause = clause_for(member, listed);
+        let clause = clause_for(Some(quoted), member, listed);
         assert!(
             stated.contains(&clause),
             "case {case:?}: expected the clause {clause:?}, got {stated:?}"

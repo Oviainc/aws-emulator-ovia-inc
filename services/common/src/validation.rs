@@ -858,6 +858,16 @@ fn rendered_list(elements: &[&str]) -> String {
 /// what AWS publishes is that inner expression. A model that means an alternation of
 /// whole-value branches parenthesises them (`(^a$)|(^b$)`), which carries no outer pair and
 /// is quoted verbatim. Every one of these forms is a row in the module's own table test.
+///
+/// A SECOND RENDERING this does not implement, recorded here so the migration above carries
+/// both: a service whose refusals quote the expression the WHOLE value must match decides
+/// the two ends INDEPENDENTLY — an anchored end loses its anchor, and an end the model
+/// leaves open is spelled with the unconstrained run (`.*`) that end admits, while an
+/// expression anchored only inside its own branches is quoted verbatim. The bedrock control
+/// plane is recorded stating that form (`services/service-com-amazonaws-bedrock-\
+/// amazonbedrockcontrolplaneservice/src/service/validation.rs`), so its rendering stays
+/// beside its own recordings until the migration can take both; this function keeps the
+/// pair-positional rule the services that call it are recorded stating.
 #[must_use]
 pub fn unanchored(regex: &str) -> String {
     let Some(body) = regex.strip_prefix('^') else {

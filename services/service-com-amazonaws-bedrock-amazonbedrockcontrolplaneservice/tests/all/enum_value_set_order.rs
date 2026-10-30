@@ -85,15 +85,20 @@ const GUARDRAIL_CONTENT_FILTER_TYPE: &[&str] = &[
 // ---------------------------------------------------------------------------------------
 
 /// The whole message a request with ONE enum-constrained member outside its set is refused
-/// with: the AWS envelope over the position and the admitted set, with the value the member
-/// held not echoed.
+/// with: the AWS envelope over the admitted set, with the value the member held quoted only
+/// where the model binds that member to the request URI (`src/service/validation.rs`,
+/// rule 2) and the position stated alone for one carried in the body.
 ///
 /// `pub(crate)` because `tests/all/enum_value_set_listing.rs` — the suite for the ORDER the
 /// set is listed in — reads a refusal through these same three readers rather than through a
 /// second copy of them.
-pub(crate) fn expected_message(member: &str, values: &[&str]) -> String {
+pub(crate) fn expected_message(quoted: Option<&str>, member: &str, values: &[&str]) -> String {
+    let subject = match quoted {
+        Some(value) => format!("Value '{value}'"),
+        None => "Value".to_string(),
+    };
     format!(
-        "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
+        "1 validation error detected: {subject} at '{member}' failed to satisfy constraint: \
          Member must satisfy enum value set: [{}]",
         values.join(", ")
     )
@@ -135,6 +140,9 @@ struct Row {
     body: Option<Value>,
     /// The member path the clause is reported at.
     member: &'static str,
+    /// The value the request carries, when the clause quotes it: `Some` for a member the
+    /// model binds to the request URI, `None` for one the service reads out of the body.
+    quoted: Option<&'static str>,
     /// The admitted values in the order the clause must list them.
     listed: &'static [&'static str],
     /// The same values as the MODEL declares them, which the clause's membership must
@@ -174,6 +182,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             path: "/data-retention",
             body: Some(json!({ "mode": "thirty-seven-years" })),
             member: "mode",
+            quoted: None,
             listed: DATA_RETENTION_MODE,
             declared: DATA_RETENTION_MODE_DECLARED,
         },
@@ -183,6 +192,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             path: "/data-retention",
             body: Some(json!({ "mode": "DEFAULT" })),
             member: "mode",
+            quoted: None,
             listed: DATA_RETENTION_MODE,
             declared: DATA_RETENTION_MODE_DECLARED,
         },
@@ -193,6 +203,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             path: "/data-retention",
             body: Some(json!({ "mode": "TEXT" })),
             member: "mode",
+            quoted: None,
             listed: DATA_RETENTION_MODE,
             declared: DATA_RETENTION_MODE_DECLARED,
         },
@@ -202,6 +213,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             path: "/foundation-models?byOutputModality=AUDIO",
             body: None,
             member: "byOutputModality",
+            quoted: Some("AUDIO"),
             listed: MODEL_MODALITY,
             declared: MODEL_MODALITY,
         },
@@ -211,6 +223,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             path: "/foundation-models?byInferenceType=ONDEMAND",
             body: None,
             member: "byInferenceType",
+            quoted: Some("ONDEMAND"),
             listed: INFERENCE_TYPE,
             declared: INFERENCE_TYPE,
         },
@@ -220,6 +233,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             path: "/foundation-models?byCustomizationType=PRE_TRAINING",
             body: None,
             member: "byCustomizationType",
+            quoted: Some("PRE_TRAINING"),
             listed: MODEL_CUSTOMIZATION,
             declared: MODEL_CUSTOMIZATION,
         },
@@ -229,6 +243,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             path: "/provisioned-model-throughputs?sortOrder=sideways",
             body: None,
             member: "sortOrder",
+            quoted: Some("sideways"),
             listed: SORT_ORDER,
             declared: SORT_ORDER,
         },
@@ -238,6 +253,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             path: "/provisioned-model-throughputs?sortBy=Name",
             body: None,
             member: "sortBy",
+            quoted: Some("Name"),
             listed: SORT_BY_PROVISIONED_MODELS,
             declared: SORT_BY_PROVISIONED_MODELS,
         },
@@ -247,6 +263,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             path: "/provisioned-model-throughputs?statusEquals=Deleting",
             body: None,
             member: "statusEquals",
+            quoted: Some("Deleting"),
             listed: PROVISIONED_MODEL_STATUS,
             declared: PROVISIONED_MODEL_STATUS,
         },
@@ -257,6 +274,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             path: "/guardrails",
             body: Some(guardrail_with_filter_type("NOT_A_CATEGORY")),
             member: "contentPolicyConfig.filtersConfig.1.member.type",
+            quoted: None,
             listed: GUARDRAIL_CONTENT_FILTER_TYPE,
             declared: GUARDRAIL_CONTENT_FILTER_TYPE,
         },
@@ -273,7 +291,7 @@ async fn an_enum_clause_lists_the_admitted_values_in_the_order_the_service_lists
             reply.body
         );
         let stated = message(case, &reply);
-        let expected = expected_message(row.member, row.listed);
+        let expected = expected_message(row.quoted, row.member, row.listed);
         assert_eq!(
             stated, expected,
             "case {case:?}: expected {expected:?}, got {stated:?}"

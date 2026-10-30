@@ -6,23 +6,28 @@
 //! Two rules are under test, each asserted over a SET of inputs rather than over one
 //! recorded request:
 //!
-//! 1. **A reported `@pattern` is the expression WITHOUT the `^` / `$` anchors the model
-//!    spells it with**, and only those: a `^` inside a character class (`[^:]+`) and a
-//!    pattern the model does not anchor at its ends are reported verbatim. The rows span
-//!    five modelled patterns across six operations and three member names.
+//! 1. **A reported `@pattern` is the expression the WHOLE value must match**: an expression
+//!    the model ANCHORS is quoted without the `^` / `$` at its ends, and only those (a `^`
+//!    inside a character class (`[^:]+`) and a pattern anchored inside each of its
+//!    alternatives are reported verbatim). The rows span five modelled patterns across six
+//!    operations and three member names; the `.*` form an UNANCHORED expression is quoted
+//!    in is the rule of `tests/all/refused_value_is_quoted_by_binding.rs`.
 //! 2. **A violation on an ELEMENT of a collection is reported against the collection
 //!    MEMBER** — no `<index>.member` step — with that element shape's WHOLE constraint set
 //!    nested inside `Member must satisfy constraint: [ … ]`. The rows span two collection
 //!    members over different element shapes, one and several offending elements, an
 //!    element that breaks two of its shape's constraints at once, and — as the contrast —
 //!    a violation on the collection's OWN `@length`, which is not nested.
-//! 3. **A clause whose requirement is an enum's admitted value set states the POSITION
-//!    alone**: `Value at '<path>' failed to satisfy constraint: Member must satisfy enum
-//!    value set: [ … ]`, with the value the member held NOT echoed, unlike every other
-//!    constraint class. The rows span enum-constrained members of three operations, in the
-//!    body and in the query string, over enums of two, three and five values, and assert
-//!    the WHOLE clause — the set's membership AND the order the service lists it in, which
-//!    `tests/all/enum_value_set_listing.rs` is the rule for.
+//! 3. **A clause quotes the value the member held only where the model binds that member to
+//!    the request URI**, so an enum-constrained member in the BODY states
+//!    `Value at '<path>' failed to satisfy constraint: Member must satisfy enum value set:
+//!    [ … ]` while one in the QUERY string quotes the token it refused. The rows span
+//!    enum-constrained members of three operations, in the body and in the query string,
+//!    over enums of two, three and five values, and assert the WHOLE clause — the set's
+//!    membership AND the order the service lists it in, which
+//!    `tests/all/enum_value_set_listing.rs` is the rule for. The binding rule itself is
+//!    asserted across every constraint class in
+//!    `tests/all/refused_value_is_quoted_by_binding.rs`.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation")` / `query="shape"`), never from a recorded response
@@ -45,7 +50,10 @@ const GUARDRAIL_IDENTIFIER: &str =
     r"(([a-z0-9]+)|(arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:guardrail/[a-z0-9]+))";
 
 /// `GuardrailVersion`'s `@pattern`, unanchored. Model: `^(([1-9][0-9]{0,7})|(DRAFT))$`.
-const GUARDRAIL_VERSION: &str = r"(([1-9][0-9]{0,7})|(DRAFT))";
+///
+/// `pub(crate)` because `tests/all/refused_value_is_quoted_by_binding.rs` quotes the same
+/// expression for the same member rather than keeping a second copy of it.
+pub(crate) const GUARDRAIL_VERSION: &str = r"(([1-9][0-9]{0,7})|(DRAFT))";
 
 /// `GuardrailNumericalVersion`'s `@pattern`, unanchored. Model: `^[1-9][0-9]{0,7}$`.
 const GUARDRAIL_NUMERICAL_VERSION: &str = r"[1-9][0-9]{0,7}";
@@ -61,9 +69,12 @@ const APO_JOB_IDENTIFIER: &str = r"((arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0
 
 /// `TaggableResourcesArn`'s `@pattern`, which the model anchors INSIDE each of its
 /// alternatives rather than at the ends (it opens `(^[a-zA-Z0-9]…` and closes `…)`), so
-/// the reported expression is the model's verbatim: there are no end anchors to strip.
+/// the reported expression is the model's verbatim: there are no end anchors to strip, and
+/// an expression carrying anchors already describes the whole value.
 /// Model: `query="shape"`, shape `TaggableResourcesArn`.
-const TAGGABLE_RESOURCE_ARN: &str = r"(^[a-zA-Z0-9][a-zA-Z0-9\-]*$)|(^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:custom-model/(imported)/[a-z0-9]{12}$)|(^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:([0-9]{12}|)((:(fine-tuning-job|model-customization-job|custom-model)/[a-z0-9-]{1,63}[.]{1}[a-z0-9-]{1,63}([a-z0-9-]{1,63}[.]){0,2}[a-z0-9-]{1,63}([:][a-z0-9-]{1,63}){0,2}(/[a-z0-9]{12})$)|(:guardrail/[a-z0-9]+$)|(:automated-reasoning-policy/[a-zA-Z0-9]+(:[a-zA-Z0-9]+)?$)|(:(inference-profile|application-inference-profile)/[a-zA-Z0-9-:.]+$)|(:(provisioned-model|model-invocation-job|model-evaluation-job|evaluation-job|model-import-job|imported-model|async-invoke|provisioned-model-v2|provisioned-model-reservation|prompt-router|custom-model-deployment)/[a-z0-9]{12}$)))";
+///
+/// `pub(crate)` for the reason [`GUARDRAIL_VERSION`] is.
+pub(crate) const TAGGABLE_RESOURCE_ARN: &str = r"(^[a-zA-Z0-9][a-zA-Z0-9\-]*$)|(^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:[0-9]{12}:custom-model/(imported)/[a-z0-9]{12}$)|(^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}:([0-9]{12}|)((:(fine-tuning-job|model-customization-job|custom-model)/[a-z0-9-]{1,63}[.]{1}[a-z0-9-]{1,63}([a-z0-9-]{1,63}[.]){0,2}[a-z0-9-]{1,63}([:][a-z0-9-]{1,63}){0,2}(/[a-z0-9]{12})$)|(:guardrail/[a-z0-9]+$)|(:automated-reasoning-policy/[a-zA-Z0-9]+(:[a-zA-Z0-9]+)?$)|(:(inference-profile|application-inference-profile)/[a-zA-Z0-9-:.]+$)|(:(provisioned-model|model-invocation-job|model-evaluation-job|evaluation-job|model-import-job|imported-model|async-invoke|provisioned-model-v2|provisioned-model-reservation|prompt-router|custom-model-deployment)/[a-z0-9]{12}$)))";
 
 /// `TagKey`'s `@pattern`, unanchored. Model (`query="shape"`, shape `TagKeyList`): the
 /// list's member targets `TagKey`, `@length 1..128`, `@pattern
@@ -71,9 +82,21 @@ const TAGGABLE_RESOURCE_ARN: &str = r"(^[a-zA-Z0-9][a-zA-Z0-9\-]*$)|(^arn:aws(-[
 const TAG_KEY: &str = r"[a-zA-Z0-9\s._:/=+@-]*";
 
 /// The requirement clause a `@pattern` violation states, over the expression as the
-/// message quotes it (UNANCHORED).
-fn pattern_requirement(expression: &str) -> String {
+/// message quotes it (the one the WHOLE value must match).
+///
+/// `pub(crate)` for the reason [`GUARDRAIL_VERSION`] is.
+pub(crate) fn pattern_requirement(expression: &str) -> String {
     format!("Member must satisfy regular expression pattern: {expression}")
+}
+
+/// The subject a clause opens with: the value the request carried, quoted, for a member the
+/// model binds to the request URI, and the position ALONE for one the service reads out of
+/// the request body (`src/service/validation.rs`, rule 2).
+fn subject(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("Value '{value}'"),
+        None => "Value".to_string(),
+    }
 }
 
 /// The element constraint set of `AdvancedPromptOptimizationJobIdentifiers`' member:
@@ -165,23 +188,26 @@ async fn refuse(
     emulator.call(method, path, body).await.into()
 }
 
-/// Every `@pattern` this service reports is the expression without the `^` / `$` the model
-/// anchors it with — over five modelled patterns, six operations and three member names.
+/// Every `@pattern` this service reports is the expression the whole value must match — for
+/// an expression the model anchors, that expression without the `^` / `$` at its ends —
+/// over five modelled patterns, six operations and three member names.
 ///
 /// The rejected value differs per row along what the rule generalises over: which pattern
 /// the member declares, which operation and member carry it, and whether the model anchors
-/// the expression at its ends at all.
+/// the expression at its ends at all. Whether the clause QUOTES that value is rule 2's
+/// question, answered by the member's binding: the URI-bound rows quote it, the body row
+/// does not.
 #[tokio::test]
-async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
+async fn a_reported_pattern_is_the_expression_the_whole_value_must_match() {
     let emulator = emulator();
-    let pattern_row = |case, method, path: String, body, value: &'static str, member, expression| Row {
+    let pattern_row = |case, method, path: String, body, value: Option<&'static str>, member, expression| Row {
         case,
         method,
         path,
         body,
         member,
         requirement: pattern_requirement(expression),
-        value: Some(value),
+        value,
     };
     let rows = vec![
         pattern_row(
@@ -189,7 +215,7 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
             "GET",
             "/guardrails/Not_An_Id".to_string(),
             None,
-            "Not_An_Id",
+            Some("Not_An_Id"),
             "guardrailIdentifier",
             GUARDRAIL_IDENTIFIER,
         ),
@@ -198,7 +224,7 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
             "GET",
             "/guardrails/abc123?guardrailVersion=0".to_string(),
             None,
-            "0",
+            Some("0"),
             "guardrailVersion",
             GUARDRAIL_VERSION,
         ),
@@ -207,7 +233,7 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
             "DELETE",
             "/guardrails/abc123?guardrailVersion=DRAFT".to_string(),
             None,
-            "DRAFT",
+            Some("DRAFT"),
             "guardrailVersion",
             GUARDRAIL_NUMERICAL_VERSION,
         ),
@@ -219,7 +245,7 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
                 label("arn:aws:bedrock:us-east-1:000000000000:evaluation-job/nonexistent")
             ),
             None,
-            "arn:aws:bedrock:us-east-1:000000000000:evaluation-job/nonexistent",
+            Some("arn:aws:bedrock:us-east-1:000000000000:evaluation-job/nonexistent"),
             "jobIdentifier",
             EVALUATION_JOB_IDENTIFIER,
         ),
@@ -228,7 +254,7 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
             "POST",
             format!("/evaluation-job/{}/stop", label("not-a-job")),
             None,
-            "not-a-job",
+            Some("not-a-job"),
             "jobIdentifier",
             EVALUATION_JOB_IDENTIFIER,
         ),
@@ -240,7 +266,7 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
                 label("arn:aws:bedrock:us-east-1:000000000000:advanced-prompt-optimization-job/nope")
             ),
             None,
-            "arn:aws:bedrock:us-east-1:000000000000:advanced-prompt-optimization-job/nope",
+            Some("arn:aws:bedrock:us-east-1:000000000000:advanced-prompt-optimization-job/nope"),
             "jobIdentifier",
             APO_JOB_IDENTIFIER,
         ),
@@ -249,16 +275,19 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
             "POST",
             format!("/advanced-prompt-optimization-jobs/{}/stop", label("UPPERCASE123")),
             None,
-            "UPPERCASE123",
+            Some("UPPERCASE123"),
             "jobIdentifier",
             APO_JOB_IDENTIFIER,
         ),
         pattern_row(
-            "UntagResource resourceARN outside a pattern the model does not anchor at its ends",
+            "UntagResource resourceARN, a BODY member, outside a pattern the model does \
+             not anchor at its ends",
             "POST",
             "/untagResource".to_string(),
             Some(json!({ "resourceARN": "not a taggable arn!!", "tagKeys": ["Team"] })),
-            "not a taggable arn!!",
+            // A member the service reads out of the body: the clause states the position
+            // alone, so the request's own text is not reflected back (rule 2).
+            None,
             "resourceARN",
             TAGGABLE_RESOURCE_ARN,
         ),
@@ -275,8 +304,8 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
             reply.message
         );
         let expected = format!(
-            "1 validation error detected: Value '{}' at '{}' failed to satisfy constraint: {}",
-            row.value.unwrap_or_default(),
+            "1 validation error detected: {} at '{}' failed to satisfy constraint: {}",
+            subject(row.value),
             row.member,
             row.requirement
         );
@@ -288,17 +317,18 @@ async fn a_reported_pattern_is_the_expression_without_the_models_anchors() {
     }
 }
 
-/// Rule 3: an enum clause names the position and the admitted set, and does NOT echo the
-/// value the member held.
+/// Rule 3: an enum clause names the admitted set, and quotes the value the member held
+/// only where the model binds that member to the request URI.
 ///
 /// The rows differ along what the rule generalises over: which operation and member carry
-/// the enum, whether the value travels in the BODY or in the QUERY string, and how many
+/// the enum, whether the value travels in the BODY (reported by position alone) or in the
+/// QUERY string (quoted), and how many
 /// values the enum publishes (two, three and five). Each row asserts the WHOLE clause: the
 /// membership is the model's (`smithy_query(query="shape",shape=...)`) and the order is the
 /// one this service lists that enum's values in, which `tests/all/enum_value_set_listing.rs`
 /// and `tests/all/enum_value_set_order.rs` are the rule for over a superset of these enums.
 #[tokio::test]
-async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
+async fn an_enum_clause_states_the_admitted_set_and_quotes_a_uri_bound_value() {
     /// One enum-constrained member driven outside its set.
     ///
     /// A named struct rather than a tuple, for the reason [`Row`] is one: the row carries a
@@ -310,8 +340,9 @@ async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
         path: &'static str,
         body: Option<Value>,
         member: &'static str,
-        /// The value the request carries, which the clause must NOT echo.
-        value: &'static str,
+        /// The value the request carries, and whether the clause quotes it: `Some` for a
+        /// member the model binds to the request URI, `None` for one carried in the body.
+        quoted: Option<&'static str>,
         /// The values the model admits for that member, in the order this service lists
         /// that enum's values — its own listing for `DataRetentionMode`, the model's
         /// declaration order for an enum it publishes no listing for.
@@ -322,12 +353,12 @@ async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
     let rows = vec![
         EnumRow {
             // `DataRetentionMode`, five values.
-            case: "PutAccountDataRetention mode outside DataRetentionMode",
+            case: "PutAccountDataRetention mode outside DataRetentionMode, in the body",
             method: "PUT",
             path: "/data-retention",
             body: Some(json!({ "mode": "retain-everything" })),
             member: "mode",
-            value: "retain-everything",
+            quoted: None,
             admitted: &[
                 "default",
                 "provider_data_share",
@@ -343,7 +374,7 @@ async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
             path: "/foundation-models?byOutputModality=AUDIO",
             body: None,
             member: "byOutputModality",
-            value: "AUDIO",
+            quoted: Some("AUDIO"),
             admitted: &["TEXT", "IMAGE", "EMBEDDING"],
         },
         EnumRow {
@@ -353,7 +384,7 @@ async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
             path: "/foundation-models?byInferenceType=ONDEMAND",
             body: None,
             member: "byInferenceType",
-            value: "ONDEMAND",
+            quoted: Some("ONDEMAND"),
             admitted: &["ON_DEMAND", "PROVISIONED"],
         },
         EnumRow {
@@ -363,7 +394,7 @@ async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
             path: "/provisioned-model-throughputs?sortOrder=sideways",
             body: None,
             member: "sortOrder",
-            value: "sideways",
+            quoted: Some("sideways"),
             admitted: &["Ascending", "Descending"],
         },
     ];
@@ -379,21 +410,15 @@ async fn an_enum_clause_states_the_admitted_set_and_not_the_value() {
             reply.message
         );
         let expected = format!(
-            "1 validation error detected: Value at '{}' failed to satisfy constraint: \
+            "1 validation error detected: {} at '{}' failed to satisfy constraint: \
              Member must satisfy enum value set: [{}]",
+            subject(row.quoted),
             row.member,
             row.admitted.join(", ")
         );
         assert_eq!(
             reply.message, expected,
             "case {case}: expected {expected:?}, got {:?}",
-            reply.message
-        );
-        assert!(
-            !reply.message.contains(row.value),
-            "case {case}: an enum clause states the admitted set, never the value the \
-             member held ({:?}), got {:?}",
-            row.value,
             reply.message
         );
     }
@@ -407,13 +432,14 @@ async fn an_element_violation_is_reported_at_its_collection_with_the_elements_co
     let emulator = emulator();
     let evaluation_arn =
         |suffix: &str| format!("arn:aws:bedrock:us-east-1:000000000000:evaluation-job/{suffix}");
-    // (case, path, body, the value the clause states, the member, the element set)
-    let rows: Vec<(&str, &str, Value, String, &str, String)> = vec![
+    // (case, path, body, the member, the element set). Every collection of this model is
+    // a BODY member, so the clause states the position alone (rule 2) whatever the
+    // offending elements were.
+    let rows: Vec<(&str, &str, Value, &str, String)> = vec![
         (
             "BatchDeleteEvaluationJob, one offending element",
             "/evaluation-jobs/batch-delete",
             json!({ "jobIdentifiers": [evaluation_arn("nonexistent")] }),
-            format!("[{}]", evaluation_arn("nonexistent")),
             "jobIdentifiers",
             evaluation_element_set(),
         ),
@@ -421,11 +447,6 @@ async fn an_element_violation_is_reported_at_its_collection_with_the_elements_co
             "BatchDeleteEvaluationJob, two offending elements",
             "/evaluation-jobs/batch-delete",
             json!({ "jobIdentifiers": [evaluation_arn("first"), evaluation_arn("second")] }),
-            format!(
-                "[{}, {}]",
-                evaluation_arn("first"),
-                evaluation_arn("second")
-            ),
             "jobIdentifiers",
             evaluation_element_set(),
         ),
@@ -433,7 +454,6 @@ async fn an_element_violation_is_reported_at_its_collection_with_the_elements_co
             "BatchDeleteAdvancedPromptOptimizationJob, one offending element",
             "/advanced-prompt-optimization-job/batch-delete",
             json!({ "jobIdentifiers": ["NOT-AN-ID"] }),
-            "[NOT-AN-ID]".to_string(),
             "jobIdentifiers",
             apo_element_set(),
         ),
@@ -441,7 +461,6 @@ async fn an_element_violation_is_reported_at_its_collection_with_the_elements_co
             "BatchDeleteAdvancedPromptOptimizationJob, three offending elements",
             "/advanced-prompt-optimization-job/batch-delete",
             json!({ "jobIdentifiers": ["A", "BB", "CCC"] }),
-            "[A, BB, CCC]".to_string(),
             "jobIdentifiers",
             apo_element_set(),
         ),
@@ -449,7 +468,6 @@ async fn an_element_violation_is_reported_at_its_collection_with_the_elements_co
             "UntagResource, an element below the element shape's minimum length",
             "/untagResource",
             json!({ "resourceARN": "abcdefghij0123456789", "tagKeys": [""] }),
-            "[]".to_string(),
             "tagKeys",
             tag_key_element_set(),
         ),
@@ -457,13 +475,12 @@ async fn an_element_violation_is_reported_at_its_collection_with_the_elements_co
             "UntagResource, an element outside the element shape's pattern",
             "/untagResource",
             json!({ "resourceARN": "abcdefghij0123456789", "tagKeys": ["no*stars"] }),
-            "[no*stars]".to_string(),
             "tagKeys",
             tag_key_element_set(),
         ),
     ];
 
-    for (case, path, body, value, member, element_set) in rows {
+    for (case, path, body, member, element_set) in rows {
         let reply = refuse(&emulator, "POST", path, Some(body)).await;
         assert_eq!(
             (reply.status, reply.error.as_deref()),
@@ -473,7 +490,7 @@ async fn an_element_violation_is_reported_at_its_collection_with_the_elements_co
             reply.message
         );
         let expected = format!(
-            "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+            "1 validation error detected: Value at '{member}' failed to satisfy \
              constraint: Member must satisfy constraint: [{element_set}]"
         );
         assert_eq!(
@@ -515,7 +532,7 @@ async fn an_element_breaking_two_constraints_states_one_clause() {
     assert!(
         reply
             .message
-            .starts_with("1 validation error detected: Value '["),
+            .starts_with("1 validation error detected: Value at 'jobIdentifiers'"),
         "case an element past its maximum length: two broken constraints of one element \
          shape are one error, got {:?}",
         reply.message
@@ -542,12 +559,10 @@ async fn an_element_breaking_two_constraints_states_one_clause() {
 /// A collection only PARTLY invalid still names the member and the element shape's whole
 /// constraint set.
 ///
-/// The value is where this diverges, deliberately and recorded in `Clause::render`: the
-/// structured refusal the service words carries the OFFENDING elements, not the collection
-/// they came from, so the clause echoes the collection formed from those — AWS echoes the
-/// whole list. Inventing the elements the refusal never carried would echo bytes the caller
-/// never sent; what a caller acts on (which member, and what every element of it must
-/// satisfy) is exact.
+/// Nothing of the collection is quoted: it is a member the service reads out of the request
+/// body, so the clause states its position and what every element of it must satisfy
+/// (rule 2) — which is also what keeps the elements the structured refusal does not carry
+/// out of the sentence.
 #[tokio::test]
 async fn a_partly_invalid_collection_names_the_member_and_its_element_constraint_set() {
     let emulator = emulator();
@@ -568,7 +583,7 @@ async fn a_partly_invalid_collection_names_the_member_and_its_element_constraint
         reply.message
     );
     let expected = format!(
-        "1 validation error detected: Value '[NOT-AN-ID]' at 'jobIdentifiers' failed to \
+        "1 validation error detected: Value at 'jobIdentifiers' failed to \
          satisfy constraint: Member must satisfy constraint: [{}]",
         apo_element_set()
     );

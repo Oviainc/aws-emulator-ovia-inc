@@ -5,9 +5,13 @@
 //!
 //! The rule under test: a value outside a `@range` bound is refused with HTTP 400
 //! `ValidationException` whose message names the member's dotted path and the BOUND the
-//! model declares — `1 validation error detected: Value at '<member path>' failed to
-//! satisfy constraint: Member must have value {less,greater} than or equal to <bound>` —
-//! and states no part of the number that was sent. It holds for every `@range`-constrained
+//! model declares — `1 validation error detected: <subject> at '<member path>' failed to
+//! satisfy constraint: Member must have value {less,greater} than or equal to <bound>`
+//! ([`a_range_violation_states_the_member_and_the_bound_with_the_subject_its_binding_decides`]).
+//! Whether that subject quotes the number sent is the MEMBER's binding and not the range
+//! class's (`src/service/validation.rs`, rule 2): a member the service reads out of the
+//! request body states its position alone, one the model binds to the query string quotes
+//! the token it refused. It holds for every `@range`-constrained
 //! member of every operation, so the rows below span:
 //!
 //! * both bounds of a range (a minimum and a maximum), each broken by one step and by far
@@ -19,9 +23,10 @@
 //! * members bound to a query string and members carried in the body, over six operations
 //!   and three member names, two of which share a member name across operations.
 //!
-//! The CONTRAST row is in [`a_range_clause_states_no_value_beside_a_clause_that_does`]: a
-//! `@pattern` violation in the same request keeps the value it refused, so what is removed
-//! is the `@range` class's value and not the envelope's subject everywhere.
+//! The CONTRAST row is in [`the_subject_of_a_clause_follows_the_members_binding_not_its_class`]: a
+//! `@pattern` violation on a query-bound member in the same request keeps the value it
+//! refused, so what the body rows remove is that member's content and not the envelope's
+//! subject everywhere.
 //!
 //! Every bound below is quoted from this service's Smithy model, cited per row
 //! (`smithy_query(query="operation",operation="…")` /
@@ -58,10 +63,15 @@ fn one_error(clause: &str) -> String {
     format!("1 validation error detected: {clause}")
 }
 
-/// The clause a `@range` violation states: the member path and the requirement, with NO
-/// subject value.
-fn range_clause(member: &str, requirement: &str) -> String {
-    format!("Value at '{member}' failed to satisfy constraint: {requirement}")
+/// The clause a `@range` violation states: the member path and the requirement, with the
+/// subject the member's binding decides — the refused number quoted for a member the model
+/// binds to the request URI, the position alone for one carried in the body.
+fn range_clause(quoted: Option<&str>, member: &str, requirement: &str) -> String {
+    let subject = match quoted {
+        Some(value) => format!("Value '{value}'"),
+        None => "Value".to_string(),
+    };
+    format!("{subject} at '{member}' failed to satisfy constraint: {requirement}")
 }
 
 /// The requirement a `@range` maximum states.
@@ -83,6 +93,9 @@ struct Row {
     body: Option<Value>,
     /// The member path the clause must be reported at.
     member: &'static str,
+    /// The number the request carries, when the clause quotes it: `Some` for a member the
+    /// model binds to the request URI, `None` for one carried in the body.
+    quoted: Option<&'static str>,
     /// The requirement the clause must state.
     requirement: String,
 }
@@ -123,7 +136,7 @@ fn message(reply: &Reply) -> String {
 /// A number outside a member's `@range` is refused with the member and the bound, and with
 /// no echo of the number that was sent — over every row of the table.
 #[tokio::test]
-async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
+async fn a_range_violation_states_the_member_and_the_bound_with_the_subject_its_binding_decides() {
     let emu = emulator();
     let policy_arn = create_policy(&emu, "range-wording-policy").await;
     // A test case under that policy, so the UPDATE row addresses a `testCaseId` the
@@ -151,6 +164,7 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
             path: test_cases_path(&policy_arn),
             body: Some(test_case_body(json!(1.5))),
             member: "confidenceThreshold",
+            quoted: None,
             requirement: at_most("1"),
         },
         Row {
@@ -162,6 +176,7 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
             path: test_cases_path(&policy_arn),
             body: Some(test_case_body(json!(-0.25))),
             member: "confidenceThreshold",
+            quoted: None,
             requirement: at_least("0"),
         },
         Row {
@@ -173,6 +188,7 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
             path: test_cases_path(&policy_arn),
             body: Some(test_case_body(json!(1.000_000_1))),
             member: "confidenceThreshold",
+            quoted: None,
             requirement: at_most("1"),
         },
         Row {
@@ -199,15 +215,18 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
                 "confidenceThreshold": 2,
             })),
             member: "confidenceThreshold",
+            quoted: None,
             requirement: at_most("1"),
         },
         Row {
-            // An `integer` member bound to a QUERY string, below its minimum.
+            // An `integer` member bound to a QUERY string, below its minimum: a token the
+            // service read off the request line, so the clause quotes it.
             case: "ListGuardrails maxResults below its minimum",
             method: "GET",
             path: format!("/guardrails?maxResults={}", MAX_RESULTS_MIN - 1),
             body: None,
             member: "maxResults",
+            quoted: Some("0"),
             requirement: at_least(&MAX_RESULTS_MIN.to_string()),
         },
         Row {
@@ -216,6 +235,7 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
             path: format!("/guardrails?maxResults={}", MAX_RESULTS_MAX + 1),
             body: None,
             member: "maxResults",
+            quoted: Some("1001"),
             requirement: at_most(&MAX_RESULTS_MAX.to_string()),
         },
         Row {
@@ -225,6 +245,7 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
             path: format!("/custom-models?maxResults={}", MAX_RESULTS_MAX * 100),
             body: None,
             member: "maxResults",
+            quoted: Some("100000"),
             requirement: at_most(&MAX_RESULTS_MAX.to_string()),
         },
         Row {
@@ -233,6 +254,7 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
             path: "/automated-reasoning-policies?maxResults=0".to_string(),
             body: None,
             member: "maxResults",
+            quoted: Some("0"),
             requirement: at_least(&MAX_RESULTS_MIN.to_string()),
         },
         Row {
@@ -246,6 +268,7 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
                 "modelUnits": MODEL_UNITS_MIN - 1,
             })),
             member: "modelUnits",
+            quoted: None,
             requirement: at_least(&MODEL_UNITS_MIN.to_string()),
         },
         Row {
@@ -258,6 +281,7 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
                 "modelUnits": -4096,
             })),
             member: "modelUnits",
+            quoted: None,
             requirement: at_least(&MODEL_UNITS_MIN.to_string()),
         },
     ];
@@ -272,15 +296,18 @@ async fn a_range_violation_states_the_member_and_the_bound_without_the_value() {
             "case {case:?}: expected 400 ValidationException, got {} {stated:?}",
             reply.status
         );
-        let expected = one_error(&range_clause(row.member, &row.requirement));
+        let expected = one_error(&range_clause(row.quoted, row.member, &row.requirement));
         assert_eq!(
             stated, expected,
             "case {case:?}: expected {expected:?}, got {stated:?}"
         );
-        assert!(
-            !stated.contains("Value '"),
-            "case {case:?}: a range clause quotes no value, got {stated:?}"
-        );
+        if row.quoted.is_none() {
+            assert!(
+                !stated.contains("Value '"),
+                "case {case:?}: a clause on a member read out of the body quotes no value, \
+                 got {stated:?}"
+            );
+        }
     }
 }
 
@@ -351,15 +378,18 @@ async fn each_published_bound_of_a_range_is_accepted() {
     }
 }
 
-/// A `@range` clause states no value BESIDE a clause that does: one request breaking a
-/// range and a `@pattern` at once states both, and only the pattern clause quotes what it
-/// refused.
+/// The envelope's subject follows the MEMBER's binding and not the violation's class: one
+/// request whose two offending members are both read off the request line states two
+/// clauses that each quote what they refused — a `@range` as much as a `@pattern` — and one
+/// whose two offending members are both read out of the body states two clauses that quote
+/// nothing.
 #[tokio::test]
-async fn a_range_clause_states_no_value_beside_a_clause_that_does() {
+async fn the_subject_of_a_clause_follows_the_members_binding_not_its_class() {
     let emu = emulator();
     // `ListGuardrails$guardrailIdentifier` targets `GuardrailIdentifier`
     // (`query="operation"`, `ListGuardrails`), whose `@pattern` admits a bare id or a
     // guardrail ARN and neither of which `Not_An_Id` is; `maxResults` is past its maximum.
+    // Both are `@httpQuery` members of that operation.
     let reply = call(
         &emu,
         "GET",
@@ -383,12 +413,63 @@ async fn a_range_clause_states_no_value_beside_a_clause_that_does() {
         "case {case:?}: the envelope counts both clauses, got {stated:?}"
     );
     assert!(
-        stated.contains(&range_clause("maxResults", &at_most(&MAX_RESULTS_MAX.to_string()))),
-        "case {case:?}: the range clause states the member and the bound alone, got \
-         {stated:?}"
+        stated.contains(&range_clause(
+            Some("1001"),
+            "maxResults",
+            &at_most(&MAX_RESULTS_MAX.to_string())
+        )),
+        "case {case:?}: the range clause on a query-bound member quotes the number it \
+         refused, got {stated:?}"
     );
     assert!(
         stated.contains("Value 'Not_An_Id' at 'guardrailIdentifier'"),
         "case {case:?}: the pattern clause keeps the value it refused, got {stated:?}"
+    );
+
+    // The contrast: `CreateProvisionedModelThroughput` carries both offending members in
+    // its BODY (`query="operation"`, `CreateProvisionedModelThroughput`:
+    // `provisionedModelName` declares a `@pattern`, `modelUnits` a `@range` minimum), so
+    // neither clause quotes anything.
+    let reply = call(
+        &emu,
+        "POST",
+        "/provisioned-model-throughput",
+        Some(json!({
+            "provisionedModelName": "not a legal name!",
+            "modelId": "amazon.titan-text-lite-v1",
+            "modelUnits": MODEL_UNITS_MIN - 1,
+        })),
+    )
+    .await;
+    let stated = message(&reply);
+    let case = "a provisionedModelName outside its pattern beside a modelUnits below its minimum";
+    assert_eq!(
+        (reply.status, reply.error.as_deref()),
+        (400, Some("ValidationException")),
+        "case {case:?}: expected 400 ValidationException, got {} {stated:?}",
+        reply.status
+    );
+    assert!(
+        stated.starts_with("2 validation errors detected: "),
+        "case {case:?}: the envelope counts both clauses, got {stated:?}"
+    );
+    assert!(
+        stated.contains(&range_clause(
+            None,
+            "modelUnits",
+            &at_least(&MODEL_UNITS_MIN.to_string())
+        )),
+        "case {case:?}: the range clause on a body member states the member and the bound \
+         alone, got {stated:?}"
+    );
+    assert!(
+        stated.contains("Value at 'provisionedModelName' failed to satisfy constraint: Member \
+                         must satisfy regular expression pattern: "),
+        "case {case:?}: the pattern clause on a body member states the position and the \
+         expression alone, got {stated:?}"
+    );
+    assert!(
+        !stated.contains("Value '"),
+        "case {case:?}: no body content reaches the sentence, got {stated:?}"
     );
 }

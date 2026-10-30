@@ -25,13 +25,13 @@
 //!    FIXED non-conforming-document sentence — one text for every such document, carrying
 //!    nothing of the request.
 //! 5. **A resource this account holds which carries no policy is 200 with `resourcePolicy`
-//!    ABSENT** (the member is not `@required`), while an ARN naming no resource of this
-//!    account — including a resource that was deleted — is 404
+//!    set to the EMPTY policy document** [`NO_POLICY`], while an ARN naming no resource of
+//!    this account — including a resource that was deleted — is 404
 //!    `ResourceNotFoundException`: a read never reports a grant on a resource that no
 //!    longer exists, and never reports a found resource as missing.
 //! 6. **A delete leaves the resource it names governed by no policy, and only that one** —
 //!    over the same resource types and document forms the attach spans, after which the
-//!    read reports the member absent and a further put attaches again; the delete is
+//!    read reports the empty policy document and a further put attaches again; the delete is
 //!    `@idempotent`, so repeating it, or making it on a resource that holds no policy, is
 //!    the same 200 as making it once, and the other resources keep their documents.
 //! 7. **A delete reaches exactly the resources the put and the read reach** — either ARN
@@ -51,11 +51,21 @@ use serde_json::json;
 
 use crate::support::{emulator, label, Emulator, Reply, ACCOUNT, REGION};
 
+/// What a read reports for a resource that holds no policy: the EMPTY policy document, the
+/// form "no policy is attached" takes in the member `GetResourcePolicy` reports
+/// (`src/ops/get_resource_policy.rs`).
+///
+/// `pub(crate)` for the reason [`get_policy`] is.
+pub(crate) const NO_POLICY: &str = "{}";
+
 // ---------------------------------------------------------------------------------------
 // Request helpers.
 // ---------------------------------------------------------------------------------------
 
-async fn put_policy(emu: &Emulator, resource_arn: &str, document: &str) -> Reply {
+/// `pub(crate)` because `tests/all/resource_policy_empty_document.rs` — the suite whose
+/// rule is the document a read states for a resource holding NO policy — drives the same
+/// three calls rather than a second copy of them.
+pub(crate) async fn put_policy(emu: &Emulator, resource_arn: &str, document: &str) -> Reply {
     emu.call(
         "POST",
         "/resource-policy",
@@ -64,7 +74,7 @@ async fn put_policy(emu: &Emulator, resource_arn: &str, document: &str) -> Reply
     .await
 }
 
-async fn get_policy(emu: &Emulator, resource_arn: &str) -> Reply {
+pub(crate) async fn get_policy(emu: &Emulator, resource_arn: &str) -> Reply {
     emu.call(
         "GET",
         &format!("/resource-policy/{}", label(resource_arn)),
@@ -73,7 +83,7 @@ async fn get_policy(emu: &Emulator, resource_arn: &str) -> Reply {
     .await
 }
 
-async fn delete_policy(emu: &Emulator, resource_arn: &str) -> Reply {
+pub(crate) async fn delete_policy(emu: &Emulator, resource_arn: &str) -> Reply {
     emu.call(
         "DELETE",
         &format!("/resource-policy/{}", label(resource_arn)),
@@ -83,7 +93,7 @@ async fn delete_policy(emu: &Emulator, resource_arn: &str) -> Reply {
 }
 
 /// A guardrail created through `CreateGuardrail`, as its `guardrailArn`.
-async fn guardrail_arn(emu: &Emulator, name: &str) -> String {
+pub(crate) async fn guardrail_arn(emu: &Emulator, name: &str) -> String {
     let reply = emu
         .create(json!({
             "name": name,
@@ -100,7 +110,7 @@ async fn guardrail_arn(emu: &Emulator, name: &str) -> String {
 }
 
 /// A prompt router created through `CreatePromptRouter`, as its `promptRouterArn`.
-async fn prompt_router_arn(emu: &Emulator, name: &str) -> String {
+pub(crate) async fn prompt_router_arn(emu: &Emulator, name: &str) -> String {
     let reply = emu
         .call(
             "POST",
@@ -131,7 +141,7 @@ async fn prompt_router_arn(emu: &Emulator, name: &str) -> String {
 
 /// A Provisioned Throughput created through `CreateProvisionedModelThroughput`, as its
 /// `provisionedModelArn`.
-async fn provisioned_model_arn(emu: &Emulator, name: &str) -> String {
+pub(crate) async fn provisioned_model_arn(emu: &Emulator, name: &str) -> String {
     let reply = emu
         .call(
             "POST",
@@ -173,7 +183,7 @@ const STATEMENT: &str = "{\"Effect\":\"Allow\",\"Action\":[\"bedrock:ApplyGuardr
 /// on read, so the key order the caller chose, its string literals and its number
 /// spellings survive while its layout does not. Each row's reported text is written out
 /// here rather than computed, so a row pins the bytes a client reads.
-fn admitted_documents() -> Vec<(&'static str, String, String)> {
+pub(crate) fn admitted_documents() -> Vec<(&'static str, String, String)> {
     let already_canonical = |case: &'static str, document: String| (case, document.clone(), document);
     vec![
         already_canonical(
@@ -581,10 +591,10 @@ async fn a_document_that_is_not_a_resource_policy_is_refused_with_bedrocks_own_s
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_resource_holding_no_policy_reports_an_absent_policy_on_the_read() {
+async fn a_resource_holding_no_policy_reports_the_empty_policy_on_the_read() {
     let emu = emulator();
     // One resource of each type, each holding no policy: the read reports the resource it
-    // FOUND, with the optional `resourcePolicy` member absent rather than a 404.
+    // FOUND, with `resourcePolicy` set to the empty policy document rather than a 404.
     let rows = [
         ("guardrail", guardrail_arn(&emu, "unattached-guardrail").await),
         (
@@ -605,14 +615,15 @@ async fn a_resource_holding_no_policy_reports_an_absent_policy_on_the_read() {
             read.status, read.body
         );
         assert_eq!(
-            read.get("resourcePolicy"),
-            json!(null),
-            "case {case:?}: a resource carrying no policy reports the member absent, got \
-             {:?}",
+            read.text("resourcePolicy"),
+            NO_POLICY,
+            "case {case:?}: a resource carrying no policy reports the empty policy document, \
+             got {:?}",
             read.body
         );
-        // The same resource, once a policy IS attached, reports it — so the absence above
-        // is the resource's state and not a read that reports nothing whatever is stored.
+        // The same resource, once a policy IS attached, reports it — so the empty document
+        // above is the resource's state and not a read that reports nothing whatever is
+        // stored.
         let document = admitted_documents()[0].1.clone();
         put_policy(&emu, &arn, &document).await;
         let attached = get_policy(&emu, &arn).await;
@@ -774,7 +785,7 @@ async fn every_resource_type_and_policy_form_is_taken_away_by_the_delete() {
             assert_accepted_delete(&case, &removed);
 
             // The resource is still HELD — so it is found — and now governed by no
-            // policy, which the read reports as the member being absent.
+            // policy, which the read reports as the empty policy document.
             let read = get_policy(&emu, arn).await;
             assert_eq!(
                 read.status, 200,
@@ -782,8 +793,8 @@ async fn every_resource_type_and_policy_form_is_taken_away_by_the_delete() {
                 read.status, read.body
             );
             assert_eq!(
-                read.get("resourcePolicy"),
-                json!(null),
+                read.text("resourcePolicy"),
+                NO_POLICY,
                 "case {case:?}: the deleted policy is reported no longer, got {:?}",
                 read.body
             );
@@ -839,8 +850,8 @@ async fn repeating_the_delete_has_the_effect_of_making_it_once() {
                 read.status, read.body
             );
             assert_eq!(
-                read.get("resourcePolicy"),
-                json!(null),
+                read.text("resourcePolicy"),
+                NO_POLICY,
                 "case {case:?}: it still holds no policy, got {:?}",
                 read.body
             );
@@ -855,8 +866,8 @@ async fn repeating_the_delete_has_the_effect_of_making_it_once() {
             assert_accepted_delete(&case, &removed);
             let read = get_policy(&emu, arn).await;
             assert_eq!(
-                read.get("resourcePolicy"),
-                json!(null),
+                read.text("resourcePolicy"),
+                NO_POLICY,
                 "case {case:?}: the policy stays removed, got {:?}",
                 read.body
             );
@@ -907,7 +918,7 @@ async fn the_delete_takes_away_only_the_named_resources_policy() {
         for (other, other_arn, other_document) in &rows {
             let read = get_policy(&emu, other_arn).await;
             let expected = if removed_so_far.contains(&other_arn.as_str()) {
-                json!(null)
+                json!(NO_POLICY)
             } else {
                 json!(other_document)
             };
@@ -959,8 +970,8 @@ async fn a_delete_under_either_arn_spelling_removes_the_one_policy() {
 
         let read = get_policy(&emu, read_through).await;
         assert_eq!(
-            read.get("resourcePolicy"),
-            json!(null),
+            read.text("resourcePolicy"),
+            NO_POLICY,
             "case {case:?}: both spellings address the one policy, got {:?}",
             read.body
         );
