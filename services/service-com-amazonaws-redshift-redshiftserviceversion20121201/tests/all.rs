@@ -21,6 +21,8 @@ mod authentication_profiles;
 mod batch_delete_cluster_snapshots;
 #[path = "all/batch_modify_cluster_snapshots.rs"]
 mod batch_modify_cluster_snapshots;
+#[path = "all/cluster_credentials.rs"]
+mod cluster_credentials;
 #[path = "all/cluster_endpoint_publication.rs"]
 mod cluster_endpoint_publication;
 #[path = "all/cluster_iam_roles.rs"]

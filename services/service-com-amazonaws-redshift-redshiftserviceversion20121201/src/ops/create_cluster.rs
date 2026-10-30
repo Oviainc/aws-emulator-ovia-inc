@@ -810,6 +810,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
             master_user_password: input.master_user_password.clone(),
             available_at: started + st::PROVISIONING_SPAN,
             endpoint,
+            // The admin user the request named is a user OF the cluster's
+            // database from the moment the cluster is allocated.
+            database_users: st::initial_database_users(cluster.master_username.as_deref()),
         });
 
         Ok((

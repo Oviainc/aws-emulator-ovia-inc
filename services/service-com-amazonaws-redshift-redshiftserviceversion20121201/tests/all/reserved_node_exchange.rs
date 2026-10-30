@@ -224,6 +224,8 @@ fn seed_ds2(emulator: &Emulator, cluster_identifier: &str) -> String {
             "vpc-seeded",
             &format!("{REGION}a"),
         ),
+        // A seeded cluster names no admin user, so its database holds none.
+        database_users: Default::default(),
     });
     store.reserved_nodes.push(state::StoredReservedNode {
         node: ReservedNode {

@@ -1066,6 +1066,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
                 .flatten(),
             available_at: started + st::PROVISIONING_SPAN,
             endpoint,
+            // A restored cluster has the database the snapshot holds, so its
+            // admin user is a user of it exactly as a created cluster's is.
+            database_users: st::initial_database_users(cluster.master_username.as_deref()),
         });
 
         // The snapshot this cluster was built from, as the event naming it

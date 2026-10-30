@@ -3334,6 +3334,19 @@ pub struct StoredCluster {
     /// [`StoredCluster::cluster`] carries it only from the moment this record's
     /// provisioning completed (see [`StoredCluster::publish_endpoint`]).
     pub endpoint: Endpoint,
+    /// The users of this cluster's DATABASE, each with the database groups it
+    /// belongs to.
+    ///
+    /// A database user is not a modelled member of any shape — it lives in the
+    /// cluster's database rather than in the control plane — so it is held here
+    /// and can never reach the wire. The admin user the create named is in it
+    /// from the moment the cluster is allocated ([`initial_database_users`]),
+    /// and `GetClusterCredentials` adds one when its `AutoCreate` asks for a
+    /// user the database does not hold yet (see
+    /// [`StoredCluster::create_database_user`]). Keyed by user name, so the
+    /// database holds at most one user under a name however often credentials
+    /// are issued for it.
+    pub database_users: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl StoredCluster {
@@ -3360,6 +3373,120 @@ impl StoredCluster {
             self.publish_endpoint();
         }
     }
+
+    /// Create the database user `db_user`, joined to `groups` beside
+    /// [`PUBLIC_DATABASE_GROUP`], unless this cluster's database already holds a
+    /// user under that name or holds as many users as it may.
+    ///
+    /// The rule is `GetClusterCredentials$AutoCreate`, "Create a database user
+    /// with the name specified for the user named in DbUser IF ONE DOES NOT
+    /// EXIST", together with `GetClusterCredentials$DbGroups`: the groups a
+    /// request names are joined "for the current session, IN ADDITION TO any
+    /// group memberships for an existing user", so a user the database already
+    /// holds keeps exactly the memberships it has — a session's groups are the
+    /// session's, not a change to the user — and a new one "is added only to
+    /// PUBLIC" when the request names none.
+    ///
+    /// A created user outlives the call that created it and is released only
+    /// with the cluster, so the count is bounded by
+    /// [`DATABASE_USERS_PER_CLUSTER_QUOTA`]: a request that would take the
+    /// database past it creates nothing and is told so.
+    pub fn create_database_user(
+        &mut self,
+        db_user: &str,
+        groups: &[String],
+    ) -> DatabaseUserCreation {
+        if self.database_users.contains_key(db_user) {
+            return DatabaseUserCreation::AlreadyPresent;
+        }
+        if self.database_users.len() >= DATABASE_USERS_PER_CLUSTER_QUOTA {
+            return DatabaseUserCreation::QuotaExceeded;
+        }
+        let mut joined = BTreeSet::from([PUBLIC_DATABASE_GROUP.to_string()]);
+        joined.extend(groups.iter().cloned());
+        self.database_users.insert(db_user.to_string(), joined);
+        DatabaseUserCreation::Created
+    }
+}
+
+/// What [`StoredCluster::create_database_user`] did with the name it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseUserCreation {
+    /// The database held no user under that name, and now holds one.
+    Created,
+    /// The database already held a user under that name, which is left exactly
+    /// as it stands.
+    AlreadyPresent,
+    /// The database holds as many users as it may
+    /// ([`DATABASE_USERS_PER_CLUSTER_QUOTA`]), so no user was created.
+    QuotaExceeded,
+}
+
+/// How many users one cluster's database holds before `GetClusterCredentials`
+/// refuses to create another.
+///
+/// The same reasoning as [`CLUSTER_QUOTA`]: neither the model nor the shape docs
+/// state a number, so this is the emulator's OWN bound on
+/// [`StoredCluster::database_users`] rather than a claim about any account's
+/// published limit. It is what stops that map growing without end — a database
+/// user outlives the call that created it and is released only when the cluster
+/// is deleted — and it is far above any workflow an emulator serves.
+pub const DATABASE_USERS_PER_CLUSTER_QUOTA: usize = 1_000;
+
+/// Why a request whose `AutoCreate` would take a cluster's database past
+/// [`DATABASE_USERS_PER_CLUSTER_QUOTA`] is refused, naming the cluster and the
+/// bound.
+pub fn database_user_quota_message(cluster_identifier: &str) -> String {
+    format!(
+        "Emulator limit, not a defect in this request: the database of cluster \
+         {cluster_identifier} holds at most {DATABASE_USERS_PER_CLUSTER_QUOTA} users; \
+         no further user can be created in it."
+    )
+}
+
+/// How many database groups one session may join.
+///
+/// The same reasoning as [`DATABASE_USERS_PER_CLUSTER_QUOTA`]: the model bounds
+/// `GetClusterCredentials$DbGroups` by nothing at all, so this is the
+/// emulator's own bound on how many names one request may carry — and, because a
+/// created user keeps the groups it joined, on how many a single call can place
+/// in the store.
+pub const MAX_DB_GROUPS_PER_SESSION: usize = 50;
+
+/// Why a request naming more than [`MAX_DB_GROUPS_PER_SESSION`] database groups
+/// is refused, naming the count it carried and the bound.
+pub fn db_groups_limit_message(requested: usize) -> String {
+    format!(
+        "Emulator limit, not a defect in this request: a session may join at most \
+         {MAX_DB_GROUPS_PER_SESSION} database groups; DbGroups named {requested}."
+    )
+}
+
+/// The database group every user of a Redshift database belongs to.
+///
+/// Source: `smithy_query(query="doc", shape="GetClusterCredentialsMessage",
+/// member="DbGroups")` — "If not specified, a new user is added only to
+/// PUBLIC" — and the same member's `DbUser` sibling, "a new user is created
+/// using the value for DbUser with PUBLIC permissions".
+pub const PUBLIC_DATABASE_GROUP: &str = "PUBLIC";
+
+/// The database users a cluster's database holds the moment the cluster is
+/// allocated: the admin user the create named, in [`PUBLIC_DATABASE_GROUP`].
+///
+/// `MasterUsername` is "the user name associated with the admin user account for
+/// the cluster", so that user EXISTS in the database from the start — which is
+/// what makes `GetClusterCredentials$AutoCreate`'s "if one does not exist" mean
+/// something for it. A cluster record carrying no admin user name (one seeded
+/// straight into the store) holds no database user.
+pub fn initial_database_users(master_username: Option<&str>) -> BTreeMap<String, BTreeSet<String>> {
+    master_username
+        .map(|name| {
+            BTreeMap::from([(
+                name.to_string(),
+                BTreeSet::from([PUBLIC_DATABASE_GROUP.to_string()]),
+            )])
+        })
+        .unwrap_or_default()
 }
 
 /// A cluster parameter group as this service stores it.
@@ -5767,6 +5894,152 @@ pub fn check_identifier(rule: IdentifierRule, member: &str, value: &str) -> Resu
         return refuse("The identifier cannot contain two consecutive hyphens.");
     }
     Ok(())
+}
+
+/// The syntax rule Redshift documents for a DATABASE object name — a database
+/// user, a database name or a database group name.
+///
+/// A different alphabet from [`IdentifierRule`]'s, which is why it is its own
+/// rule: a control-plane identifier admits alphanumerics and hyphens, while a
+/// database object name also admits underscore, plus sign, period, at symbol and
+/// hyphen, and the three members differ only in whether an uppercase letter is
+/// admitted.
+#[derive(Debug, Clone, Copy)]
+pub struct DatabaseNameRule {
+    /// The input member the rule belongs to, named in the refusal.
+    pub member: &'static str,
+    /// Whether the documented rule forbids uppercase letters.
+    pub lowercase_only: bool,
+    /// Whether the documented rule forbids the value `PUBLIC`, the group every
+    /// database user is in ([`PUBLIC_DATABASE_GROUP`]).
+    pub forbids_public: bool,
+}
+
+/// The documented maximum length, in characters, of every database object name
+/// below: "Must be 1 to 64 alphanumeric characters or hyphens".
+pub const DATABASE_NAME_MAX_LEN: usize = 64;
+
+/// The rule for the database user a credential is issued for (`DbUser`).
+///
+/// Source: `smithy_query(query="doc", shape="GetClusterCredentialsMessage",
+/// member="DbUser")` — "Must be 1 to 64 alphanumeric characters or hyphens. The
+/// user name can't be PUBLIC. Must contain uppercase or lowercase letters,
+/// numbers, underscore, plus sign, period (dot), at symbol (@), or hyphen. First
+/// character must be a letter. Must not contain a colon ( : ) or slash ( / )."
+pub const DB_USER_RULE: DatabaseNameRule = DatabaseNameRule {
+    member: "DbUser",
+    lowercase_only: false,
+    forbids_public: true,
+};
+
+/// The rule for the database a credential authorises logging on to (`DbName`).
+///
+/// Source: `smithy_query(query="doc", shape="GetClusterCredentialsMessage",
+/// member="DbName")` — the same sentences as [`DB_USER_RULE`]'s, without the
+/// `PUBLIC` exclusion: "Must be 1 to 64 alphanumeric characters or hyphens Must
+/// contain uppercase or lowercase letters, numbers, underscore, plus sign,
+/// period (dot), at symbol (@), or hyphen. First character must be a letter.
+/// Must not contain a colon ( : ) or slash ( / )."
+pub const DB_NAME_RULE: DatabaseNameRule = DatabaseNameRule {
+    member: "DbName",
+    lowercase_only: false,
+    forbids_public: false,
+};
+
+/// The rule for one database group a session joins (`DbGroups`).
+///
+/// Source: `smithy_query(query="doc", shape="GetClusterCredentialsMessage",
+/// member="DbGroups")` — "Must be 1 to 64 alphanumeric characters or hyphens
+/// Must contain ONLY LOWERCASE letters, numbers, underscore, plus sign, period
+/// (dot), at symbol (@), or hyphen. First character must be a letter. Must not
+/// contain a colon ( : ) or slash ( / )."
+pub const DB_GROUP_RULE: DatabaseNameRule = DatabaseNameRule {
+    member: "DbGroups",
+    lowercase_only: true,
+    forbids_public: false,
+};
+
+/// Check one database object name against `rule`, naming the member and the
+/// constraint it broke.
+///
+/// The documented alphabet is the whole of what is admitted, so the colon and
+/// the slash the same documentation calls out separately cannot pass it either.
+/// The documentation's remaining constraint, "cannot be a reserved word", is a
+/// list published in the Amazon Redshift Database Developer Guide rather than
+/// anything the API model carries, so it is not checked here.
+pub fn check_database_name(rule: DatabaseNameRule, value: &str) -> Result<(), String> {
+    let member = rule.member;
+    let refuse = |why: &str| {
+        Err(format!(
+            "Invalid value for {member}: '{value}'. {why} (allowed: 1 to {DATABASE_NAME_MAX_LEN} {}letters, numbers, underscore, plus sign, period, at symbol or hyphen, first character a letter)",
+            if rule.lowercase_only { "lowercase " } else { "" },
+        ))
+    };
+    if value.is_empty() {
+        return refuse("The name cannot be null, empty, or blank.");
+    }
+    if value.chars().count() > DATABASE_NAME_MAX_LEN {
+        return refuse("The name is longer than allowed.");
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '.' | '@' | '-'))
+    {
+        return refuse("The name contains a character that is not allowed in it.");
+    }
+    if rule.lowercase_only && value.chars().any(|c| c.is_ascii_uppercase()) {
+        return refuse("Alphabetic characters must be lowercase.");
+    }
+    if !value.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return refuse("The first character must be a letter.");
+    }
+    // Redshift folds an unquoted database identifier to lower case, so the
+    // excluded name is matched without regard to the case it arrived in.
+    if rule.forbids_public && value.eq_ignore_ascii_case(PUBLIC_DATABASE_GROUP) {
+        return refuse("The name cannot be PUBLIC.");
+    }
+    Ok(())
+}
+
+/// The window `GetClusterCredentials` documents for the lifetime of the
+/// temporary database credentials it issues: the lifetime a request that names
+/// none gets, and the inclusive bounds a request may ask for.
+///
+/// Source: `smithy_query(query="doc", shape="GetClusterCredentialsMessage",
+/// member="DurationSeconds")` — "The number of seconds until the returned
+/// temporary password expires. Constraint: minimum 900, maximum 3600. Default:
+/// 900". A documented duration, so these are Amazon Redshift's numbers rather
+/// than this emulator's choice.
+pub const CREDENTIAL_DURATION_DEFAULT_SECONDS: i32 = 900;
+/// The smallest `DurationSeconds` a request may name. See
+/// [`CREDENTIAL_DURATION_DEFAULT_SECONDS`].
+pub const CREDENTIAL_DURATION_MIN_SECONDS: i32 = 900;
+/// The largest `DurationSeconds` a request may name. See
+/// [`CREDENTIAL_DURATION_DEFAULT_SECONDS`].
+pub const CREDENTIAL_DURATION_MAX_SECONDS: i32 = 3600;
+
+/// How long the credentials a request asks for last, or why the request's
+/// `DurationSeconds` is outside the documented window.
+pub fn credential_duration(requested: Option<i32>) -> Result<Duration, String> {
+    let seconds = requested.unwrap_or(CREDENTIAL_DURATION_DEFAULT_SECONDS);
+    if !(CREDENTIAL_DURATION_MIN_SECONDS..=CREDENTIAL_DURATION_MAX_SECONDS).contains(&seconds) {
+        return Err(format!(
+            "Invalid value for DurationSeconds: {seconds}. DurationSeconds must be between {CREDENTIAL_DURATION_MIN_SECONDS} and {CREDENTIAL_DURATION_MAX_SECONDS}."
+        ));
+    }
+    Ok(Duration::from_secs(seconds.unsigned_abs().into()))
+}
+
+/// The `DbUser` a `GetClusterCredentials` response reports for the user named in
+/// its request.
+///
+/// Source: `smithy_query(query="doc", operation="GetClusterCredentials")` — "The
+/// action returns the database user name prefixed with `IAM:` if `AutoCreate` is
+/// `False` or `IAMA:` if `AutoCreate` is `True`" — so the prefix is decided by
+/// the request's own `AutoCreate` and by nothing else.
+pub fn credential_db_user(db_user: &str, auto_create: bool) -> String {
+    let prefix = if auto_create { "IAMA:" } else { "IAM:" };
+    format!("{prefix}{db_user}")
 }
 
 /// The opaque `Marker` cursor the paginated `Describe*` operations hand out for
