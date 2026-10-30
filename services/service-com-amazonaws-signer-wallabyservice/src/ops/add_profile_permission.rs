@@ -255,14 +255,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `principal` and `statementId` are required strings the model puts no
         // length on, so an empty one reaches here: a statement with no principal
-        // grants nothing, and one with no id could never be removed again. Judged
-        // on the request's own values, so it is decided before anything the
-        // request names is resolved.
-        for (member, value) in [
-            ("principal", input.principal.as_str()),
-            ("statementId", input.statement_id.as_str()),
+        // grants nothing, and one with no id could never be removed again — the
+        // form a stored statement id is held to, stated once in
+        // [`crate::state::is_statement_id`]. Judged on the request's own values,
+        // so it is decided before anything the request names is resolved.
+        for (member, well_formed) in [
+            ("principal", !input.principal.trim().is_empty()),
+            (
+                "statementId",
+                crate::state::is_statement_id(&input.statement_id),
+            ),
         ] {
-            if value.trim().is_empty() {
+            if !well_formed {
                 return Err(validation(format!("{member} must not be empty")));
             }
         }

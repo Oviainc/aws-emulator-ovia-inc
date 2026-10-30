@@ -24,7 +24,14 @@
 //!   writers holding one revision unable to both succeed;
 //! * an `action` outside the set the profile's signing platform admits is refused
 //!   400 `ValidationException`, and a statement id, profile or profile version
-//!   that does not exist is refused 404.
+//!   that does not exist is refused 404;
+//! * the `nextToken` a page of `ListProfilePermissions` hands out is this
+//!   service's own opaque cursor into THAT profile's policy: carrying it back
+//!   serves the statements still at or after the position it names — so paging
+//!   finishes even when statements, the one the cursor named included, were
+//!   removed in between — while a value that listing never issued, a statement
+//!   id or a cursor of another listing among them, is refused 400
+//!   `InvalidNextToken`.
 //!
 //! The cases are tables: a row per input class the rules generalise over (which
 //! grantable action, the form of the principal, whether the grant names a profile
@@ -487,8 +494,13 @@ async fn every_grant_round_trips_through_list_profile_permissions() {
         previous_size = size;
     }
 
-    // `nextToken` is the statement id a page resumes at, so a token a client holds
-    // reports the suffix of the same total order.
+    // Every statement the policy holds is reported in one total order, keyed by
+    // `statementId`; a policy that fits in one page hands out no cursor at all,
+    // and a statement id is not a cursor this read ever issued, so carrying one
+    // back resumes nothing (`a_next_token_this_service_never_handed_out_is_refused`
+    // drives that refusal, and
+    // `a_next_token_this_service_handed_out_still_pages_after_removals` the cursors
+    // a larger policy does hand out).
     let all = list_permissions(&router, "RoundTrip_Profile").await;
     let ids = all.statement_ids();
     assert_eq!(
@@ -496,25 +508,17 @@ async fn every_grant_round_trips_through_list_profile_permissions() {
         expected.keys().cloned().collect::<Vec<_>>(),
         "expected the statements in statementId order, got {ids:?}"
     );
-    for start in 0..ids.len() {
-        let page = list_permissions_from(&router, "RoundTrip_Profile", &ids[start]).await;
-        assert_eq!(
-            page.statement_ids(),
-            ids[start..].to_vec(),
-            "nextToken {}: expected the suffix {:?}, got {:?}",
-            ids[start],
-            &ids[start..],
-            page.statement_ids()
-        );
-        assert_eq!(
-            page.policy_size_bytes(),
-            all.policy_size_bytes(),
-            "nextToken {}: expected policySizeBytes to report the WHOLE policy ({}), got {}",
-            ids[start],
-            all.policy_size_bytes(),
-            page.policy_size_bytes()
-        );
-    }
+    assert!(
+        ids.len() <= PAGE_LIMIT,
+        "expected the round-trip policy to fit in one page of {PAGE_LIMIT}, got {}",
+        ids.len()
+    );
+    assert_eq!(
+        all.body["nextToken"].as_str(),
+        None,
+        "expected a policy within one page to hand out no cursor, got {:?}",
+        all.body["nextToken"]
+    );
 }
 
 #[tokio::test]
@@ -1316,13 +1320,15 @@ async fn a_next_token_this_service_never_handed_out_is_refused() {
         granted.status, granted.body
     );
 
-    // Rows differ in how the token falls outside the ids the policy holds: before
-    // them in the order, after them, a statement that was never granted, and a
-    // revision id rather than a statement id.
+    // Rows differ in the form of the value the caller sent in place of a cursor:
+    // a statement id before every id the policy holds, one after them all, one
+    // the policy never held, one the policy DOES hold — a statement id is not a
+    // cursor this service ever handed out — and a revision id.
     for (case, token) in [
         ("before every statement id", "a"),
         ("after every statement id", "zzz"),
         ("a statement the policy never held", "never-granted"),
+        ("a statement id the policy holds", "held"),
         (
             "a revision id in place of a statement id",
             granted.revision_id().unwrap_or_default(),
@@ -1341,14 +1347,246 @@ async fn a_next_token_this_service_never_handed_out_is_refused() {
             answer.code()
         );
     }
+}
 
-    // The one token the policy does admit is a statement id it holds.
-    let held = list_permissions_from(&router, "Token_Profile", "held").await;
+/// How many statements a cursor case seeds: more than one page, so the first
+/// page hands a cursor out and several statements sit at or after it.
+const CURSOR_CASE_STATEMENTS: usize = PAGE_LIMIT + 5;
+
+/// Which statements a cursor case takes out of the policy after the cursor was
+/// handed out, as offsets into the seeded order — `cursor` is the offset of the
+/// statement the cursor names (the first one the second page starts at).
+struct CursorCase {
+    case: &'static str,
+    removed: fn(cursor: usize) -> Vec<usize>,
+}
+
+/// The rows differ along what the rule generalises over: which statements have
+/// left the policy by the time the cursor is carried back, how many of them, and
+/// where they sit relative to the position the cursor names.
+fn cursor_cases() -> Vec<CursorCase> {
+    vec![
+        CursorCase {
+            case: "nothing removed",
+            removed: |_| Vec::new(),
+        },
+        CursorCase {
+            case: "the statement the cursor names",
+            removed: |cursor| vec![cursor],
+        },
+        CursorCase {
+            case: "the statement the cursor names and the two after it",
+            removed: |cursor| vec![cursor, cursor + 1, cursor + 2],
+        },
+        CursorCase {
+            case: "statements before the cursor only",
+            removed: |cursor| vec![0, cursor - 1],
+        },
+        CursorCase {
+            case: "every other statement from the cursor on",
+            removed: |cursor| {
+                (cursor..CURSOR_CASE_STATEMENTS)
+                    .filter(|offset| (offset - cursor) % 2 == 0)
+                    .collect()
+            },
+        },
+        CursorCase {
+            case: "every statement from the cursor on but the last",
+            removed: |cursor| (cursor..CURSOR_CASE_STATEMENTS - 1).collect(),
+        },
+        CursorCase {
+            case: "every statement from the cursor on",
+            removed: |cursor| (cursor..CURSOR_CASE_STATEMENTS).collect(),
+        },
+    ]
+}
+
+/// The id of the `offset`th seeded statement — zero padded, so the seeding order
+/// is also the order the policy keys them in.
+fn cursor_case_statement_id(offset: usize) -> String {
+    format!("statement-{offset:03}")
+}
+
+/// A `nextToken` a page handed out still serves the statements that follow the
+/// position it names, however many of them — including the one it names itself —
+/// have been removed in between: a cursor is a position in the enumeration, not a
+/// claim that the statement it names still exists.
+#[tokio::test]
+async fn a_next_token_this_service_handed_out_still_pages_after_removals() {
+    let router = emulator();
+
+    for (row, CursorCase { case, removed }) in cursor_cases().into_iter().enumerate() {
+        let profile = format!("Cursor_Profile_{row:02}");
+        seed_profile(&router, &profile).await;
+        let seeded: Vec<String> = (0..CURSOR_CASE_STATEMENTS)
+            .map(cursor_case_statement_id)
+            .collect();
+        for (offset, statement_id) in seeded.iter().enumerate() {
+            let answer = add_permission(
+                &router,
+                &profile,
+                json!({
+                    "statementId": statement_id,
+                    "action": GRANTABLE_ACTIONS[offset % GRANTABLE_ACTIONS.len()],
+                    "principal": "123456789012",
+                }),
+            )
+            .await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: granting {statement_id}: expected 200, got {} {:?}",
+                answer.status, answer.body
+            );
+        }
+
+        // The cursor the first page hands out, and the statement it resumes at:
+        // the first one that page did not report.
+        let first = list_permissions(&router, &profile).await;
+        assert_eq!(
+            first.status, 200,
+            "case {case:?}: expected 200 for the first page, got {} {:?}",
+            first.status, first.body
+        );
+        let token = first.body["nextToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected a nextToken for a policy of \
+                     {CURSOR_CASE_STATEMENTS} statements, got {:?}",
+                    first.body
+                )
+            })
+            .to_string();
+        let cursor = first.statement_ids().len();
+        assert_eq!(
+            cursor, PAGE_LIMIT,
+            "case {case:?}: expected the first page to report {PAGE_LIMIT} statements, got {cursor}"
+        );
+
+        // The statements the case takes out between the two pages, each against
+        // the revision the policy is at when it is removed.
+        let removed = removed(cursor);
+        for offset in &removed {
+            let statement_id = cursor_case_statement_id(*offset);
+            let current = list_permissions(&router, &profile).await;
+            let revision = current.revision_id().unwrap_or_default().to_string();
+            let answer = remove_permission(&router, &profile, &statement_id, &revision).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: removing {statement_id}: expected 200, got {} {:?}",
+                answer.status, answer.body
+            );
+        }
+
+        // Carrying the cursor back reports every statement still at or after the
+        // position it names, in order and exactly once, over as many pages as it
+        // takes — and never a statement the first page already served.
+        let expected: Vec<String> = (cursor..CURSOR_CASE_STATEMENTS)
+            .filter(|offset| !removed.contains(offset))
+            .map(cursor_case_statement_id)
+            .collect();
+        // What the policy holds and reports once the removals are done, which is
+        // what every page of it reports for the WHOLE policy.
+        let current = list_permissions(&router, &profile).await;
+        let policy_size = current.policy_size_bytes();
+        let revision = current.revision_id().unwrap_or_default().to_string();
+        let mut walked: Vec<String> = Vec::new();
+        let mut next = Some(token);
+        for _ in 0..=CURSOR_CASE_STATEMENTS {
+            let Some(token) = next.take() else { break };
+            let page = list_permissions_from(&router, &profile, &token).await;
+            assert_eq!(
+                page.status, 200,
+                "case {case:?}: expected the cursor to still be served with 200, got {} {:?}",
+                page.status, page.body
+            );
+            let ids = page.statement_ids();
+            assert!(
+                ids.len() <= PAGE_LIMIT,
+                "case {case:?}: expected at most {PAGE_LIMIT} per page, got {}",
+                ids.len()
+            );
+            assert_eq!(
+                page.policy_size_bytes(),
+                policy_size,
+                "case {case:?}: expected policySizeBytes to report the WHOLE policy \
+                 ({policy_size}), got {}",
+                page.policy_size_bytes()
+            );
+            assert_eq!(
+                page.revision_id(),
+                Some(revision.as_str()),
+                "case {case:?}: expected the page to report the current revision \
+                 ({revision}), got {:?}",
+                page.revision_id()
+            );
+            walked.extend(ids);
+            next = page.body["nextToken"].as_str().map(str::to_string);
+        }
+        assert_eq!(
+            walked, expected,
+            "case {case:?}: expected the resumed walk to report {expected:?}, got {walked:?}"
+        );
+    }
+}
+
+/// A cursor one profile's policy handed out resumes THAT policy's enumeration
+/// and no other: carried to another profile's listing it is a token that listing
+/// never issued.
+#[tokio::test]
+async fn a_next_token_is_refused_by_a_listing_that_did_not_issue_it() {
+    let router = emulator();
+
+    for profile in ["Cursor_Issuer", "Cursor_Other"] {
+        seed_profile(&router, profile).await;
+        for offset in 0..CURSOR_CASE_STATEMENTS {
+            let statement_id = cursor_case_statement_id(offset);
+            let answer = add_permission(
+                &router,
+                profile,
+                json!({
+                    "statementId": statement_id,
+                    "action": GRANTABLE_ACTIONS[offset % GRANTABLE_ACTIONS.len()],
+                    "principal": "123456789012",
+                }),
+            )
+            .await;
+            assert_eq!(
+                answer.status, 200,
+                "seeding {profile}/{}: expected 200, got {} {:?}",
+                cursor_case_statement_id(offset),
+                answer.status,
+                answer.body
+            );
+        }
+    }
+
+    let issued = list_permissions(&router, "Cursor_Issuer").await;
+    let token = issued.body["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a nextToken, got {:?}", issued.body))
+        .to_string();
+
+    // The listing that issued the cursor resumes it; the other profile's listing
+    // refuses it, so no page is ever cut out of a different enumeration.
+    let resumed = list_permissions_from(&router, "Cursor_Issuer", &token).await;
     assert_eq!(
-        held.statement_ids(),
-        vec!["held".to_string()],
-        "expected the page at the statement's own id to report it, got {:?}",
-        held.statement_ids()
+        resumed.status, 200,
+        "case {:?}: expected 200, got {} {:?}",
+        "the issuing listing", resumed.status, resumed.body
+    );
+    let other = list_permissions_from(&router, "Cursor_Other", &token).await;
+    assert_eq!(
+        other.status, 400,
+        "case {:?}: expected 400, got {} {:?}",
+        "another profile's listing", other.status, other.body
+    );
+    assert_eq!(
+        other.code(),
+        Some(ERROR_CODE_INVALID_NEXT_TOKEN),
+        "case {:?}: expected code {ERROR_CODE_INVALID_NEXT_TOKEN}, got {:?}",
+        "another profile's listing",
+        other.code()
     );
 }
 

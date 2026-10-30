@@ -1862,6 +1862,17 @@ pub fn is_job_id(value: &str) -> bool {
     }) && groups.next().is_none()
 }
 
+/// True when `value` has the form of a statement id this service stores — the
+/// only form `AddProfilePermission` admits, since `statementId` is an
+/// unconstrained `String` in the model: anything but blank, an id no later call
+/// could name again.
+///
+/// For a statement id read out of a value nothing else constrains: the one a
+/// decoded pagination token resumes at.
+pub fn is_statement_id(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
 /// Whether `signature_timestamp` falls at or after `effective_from`.
 ///
 /// A modelled `Timestamp` is whole epoch seconds (signed) plus a non-negative
@@ -1915,6 +1926,10 @@ const LISTING_KIND_PLATFORMS: &str = "signing-platforms";
 /// The signing-job listing's kind marker (see [`LISTING_KIND_PROFILES`]).
 const LISTING_KIND_JOBS: &str = "signing-jobs";
 
+/// The profile-permission listing's kind marker (see
+/// [`LISTING_KIND_PROFILES`]).
+const LISTING_KIND_PERMISSIONS: &str = "profile-permissions";
+
 /// One field of a rendered listing: its byte length, then the value.
 ///
 /// Length-prefixed rather than delimiter-joined because `platformId` and
@@ -1964,6 +1979,50 @@ impl ProfileListing {
     pub fn resume_at(&self, token: &str) -> Option<String> {
         let resume_at = decoded_resume_at(&self.canonical(), token)?;
         is_profile_name(&resume_at).then_some(resume_at)
+    }
+}
+
+/// Which permission statements one profile-permission listing enumerates: the
+/// statements of the policy held by the profile of that name in the region whose
+/// endpoint is answering.
+///
+/// A pagination token is issued FOR one listing and resumes only a call that
+/// enumerates that same listing, so a token carried over to another region or
+/// another profile is refused rather than serving a page out of a different
+/// enumeration.
+#[derive(Debug)]
+pub struct PermissionListing {
+    /// The region whose profile's policy is enumerated, and no other region's.
+    pub region: String,
+    /// The profile whose policy is enumerated.
+    pub profile_name: String,
+}
+
+impl PermissionListing {
+    /// What this listing enumerates, rendered canonically (see
+    /// [`ProfileListing::canonical`]).
+    fn canonical(&self) -> String {
+        let mut canonical = String::from(PAGE_TOKEN_VERSION);
+        canonical.push_str(&rendered_field(LISTING_KIND_PERMISSIONS));
+        canonical.push_str(&rendered_field(&self.region));
+        canonical.push_str(&rendered_field(&self.profile_name));
+        canonical
+    }
+
+    /// The `nextToken` a page of this listing that stops BEFORE the statement
+    /// `resume_at` hands back.
+    pub fn page_token(&self, resume_at: &str) -> String {
+        rendered_page_token(&self.canonical(), resume_at)
+    }
+
+    /// The statement id `token` resumes THIS listing at, or `None` when `token`
+    /// is not one this listing handed out: a value whose digest does not match
+    /// the cursor it carries, a cursor issued for another region, another profile
+    /// or another paginated read, or one resuming at a value that is not a
+    /// statement id at all.
+    pub fn resume_at(&self, token: &str) -> Option<String> {
+        let resume_at = decoded_resume_at(&self.canonical(), token)?;
+        is_statement_id(&resume_at).then_some(resume_at)
     }
 }
 

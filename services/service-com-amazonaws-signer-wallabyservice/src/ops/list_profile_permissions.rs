@@ -211,39 +211,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(profile_not_found(&input.profile_name));
         };
 
-        // `nextToken` is the statement id the next page starts at, so the only
-        // tokens this service hands out are statement ids of this profile's
-        // policy; anything else is refused with the modelled 400 rather than
-        // silently answering an arbitrary suffix of the order. Judged on the
-        // request's own value, so it is decided before the state of the policy it
-        // asks to resume — a profile holding no policy has handed out no token at
-        // all, so every token is one it never issued.
-        let policy = store.profile_policy(&region, &input.profile_name);
-        if let Some(token) = input.next_token.as_deref() {
-            if policy.is_none_or(|policy| !policy.statements.contains_key(token)) {
-                return Err(invalid_next_token());
-            }
-        }
+        // Which statements this call enumerates — the listing a page of it hands
+        // a token out for, and the only listing that token resumes.
+        let listing = crate::state::PermissionListing {
+            region: region.clone(),
+            profile_name: input.profile_name.clone(),
+        };
+
+        // `nextToken` is this service's own opaque cursor into THIS listing, so
+        // the statement id the next page starts at is read back out of the token
+        // rather than taken from it. A value the service never handed out — one it
+        // cannot decode, or one issued for another region, another profile or
+        // another paginated read — is refused with the modelled 400, whose `code`
+        // names the condition a paginating client resets on, instead of serving a
+        // page out of some other ordering. Judged on the request's own value, so
+        // it is decided before the state of the policy it asks to resume.
+        let resume_at = match input.next_token.as_deref() {
+            Some(token) => match listing.resume_at(token) {
+                Some(resume_at) => Some(resume_at),
+                None => return Err(invalid_next_token()),
+            },
+            None => None,
+        };
 
         // A policy exists only while it holds a statement, so a profile nobody
         // has granted anything on — and one whose last statement has been removed
         // — has no policy to report.
-        let Some(policy) = policy.filter(|policy| !policy.is_empty()) else {
+        let Some(policy) = store
+            .profile_policy(&region, &input.profile_name)
+            .filter(|policy| !policy.is_empty())
+        else {
             return Err(policy_not_found(&input.profile_name));
         };
 
         // The operation models no `maxResults`, so the page size is the service's:
-        // at most `PERMISSION_PAGE_LIMIT` statements per answer, with the id the
-        // next page resumes at handed back when the policy holds more — so one
-        // read costs a bounded amount however many statements have accumulated.
+        // at most `PERMISSION_PAGE_LIMIT` statements per answer, with a cursor at
+        // the statement the next page resumes at handed back when the policy holds
+        // more — so one read costs a bounded amount however many statements have
+        // accumulated.
+        //
+        // The page starts at the first statement id AT OR AFTER the one the cursor
+        // carries, which the stored order (a `BTreeMap` keyed by `statementId`)
+        // answers directly, so a page is still served when the statement the
+        // cursor named has since been removed from the policy.
         let mut permissions = Vec::with_capacity(crate::state::permissions::PERMISSION_PAGE_LIMIT);
         let mut next_token = None;
-        for (statement_id, statement) in policy
-            .statements
-            .range(input.next_token.clone().unwrap_or_default()..)
-        {
+        let resume_from = resume_at.unwrap_or_default();
+        for (statement_id, statement) in policy.statements.range(resume_from..) {
             if permissions.len() == crate::state::permissions::PERMISSION_PAGE_LIMIT {
-                next_token = Some(statement_id.clone());
+                next_token = Some(listing.page_token(statement_id));
                 break;
             }
             permissions.push(statement.to_permission());
