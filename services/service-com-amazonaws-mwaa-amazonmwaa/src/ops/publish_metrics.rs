@@ -19,6 +19,16 @@
 //! The model marks this operation internal, so nothing it accepts is reported by another
 //! operation of this service: what it answers is the modelled empty output at HTTP 200.
 //!
+//! ## Which endpoint hosts it
+//!
+//! The model hosts this operation on the INTERNAL OPERATIONS endpoint (`@endpoint` host
+//! prefix `ops.`), an endpoint class of its own: neither the control plane (`api.`) nor the
+//! per-environment Apache Airflow front door (`env.`) — see
+//! [`crate::service::endpoints`]. Nothing resolves the environment ahead of this handler, so
+//! a name that resolves to nothing is refused HERE, in the only client error the model gives
+//! this operation, and worded by the one builder every refusal this service's own layer
+//! raises for a named environment uses ([`crate::state::environment_not_found_message`]).
+//!
 //! ## What is refused
 //!
 //! The modelled constraints — `EnvironmentName`'s length and pattern, `MetricName` and
@@ -357,6 +367,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
+        // Nothing resolved this name before the request reached here (the operation is
+        // hosted on the `ops.` endpoint, not behind the per-environment front door), so this
+        // layer owns the refusal: the shared sentence for a named environment it holds no
+        // record of, in the only client error this operation models.
         let stored = store
             .environment_mut(&region, &input.environment_name)
             .ok_or_else(|| {

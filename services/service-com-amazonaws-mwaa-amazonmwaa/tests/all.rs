@@ -15,6 +15,8 @@
 mod airflow_rest_api;
 #[path = "all/airflow_rest_api_entity_keys.rs"]
 mod airflow_rest_api_entity_keys;
+#[path = "all/endpoint_host_prefix_census.rs"]
+mod endpoint_host_prefix_census;
 #[path = "all/env_endpoint_front_door.rs"]
 mod env_endpoint_front_door;
 #[path = "all/env_endpoint_not_found_wording.rs"]

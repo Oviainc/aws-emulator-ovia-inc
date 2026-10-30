@@ -37,6 +37,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_mwaa_amazonmwaa::service::endpoints::Endpoint;
+
 /// A signed-looking request header so the router's `can_handle` resolves this service by
 /// its SigV4 credential scope, the way an SDK request does. Signature verification is off
 /// in this harness, so the signature value is never checked.
@@ -231,43 +233,63 @@ fn unknown_names() -> Vec<String> {
     ]
 }
 
-/// Every operation addressed by `Name`, as `(label, method, uri template, body, host
-/// prefix)`. The template's `{}` takes the name, and the host prefix is the one the model's
-/// `@endpoint` trait declares for the operation — which is what decides the refusal's
+/// Every operation addressed by `Name`, as `(label, method, uri template, body, endpoint)`.
+/// The template's `{}` takes the name, and the endpoint is the one the model's `@endpoint`
+/// trait hosts the operation on — read from the crate's endpoint census
+/// (`service::endpoints`, checked against the shipped model by
+/// `tests/all/endpoint_host_prefix_census.rs`) — which is what decides the refusal's
 /// wording, and the shape it travels in.
 type NamedCall = (
     &'static str,
     &'static str,
     &'static str,
     Option<Value>,
-    &'static str,
+    Endpoint,
 );
 
 fn name_addressed_calls() -> Vec<NamedCall> {
     vec![
-        ("GetEnvironment", "GET", "/environments/{}", None, "api."),
+        (
+            "GetEnvironment",
+            "GET",
+            "/environments/{}",
+            None,
+            Endpoint::ControlPlane,
+        ),
         (
             "UpdateEnvironment",
             "PATCH",
             "/environments/{}",
             Some(json!({"MaxWorkers": 2})),
-            "api.",
+            Endpoint::ControlPlane,
         ),
         (
             "DeleteEnvironment",
             "DELETE",
             "/environments/{}",
             None,
-            "api.",
+            Endpoint::ControlPlane,
         ),
-        ("CreateCliToken", "POST", "/clitoken/{}", None, "env."),
-        ("CreateWebLoginToken", "POST", "/webtoken/{}", None, "env."),
+        (
+            "CreateCliToken",
+            "POST",
+            "/clitoken/{}",
+            None,
+            Endpoint::EnvironmentData,
+        ),
+        (
+            "CreateWebLoginToken",
+            "POST",
+            "/webtoken/{}",
+            None,
+            Endpoint::EnvironmentData,
+        ),
         (
             "InvokeRestApi",
             "POST",
             "/restapi/{}",
             Some(json!({"Path": "/dags", "Method": "GET"})),
-            "env.",
+            Endpoint::EnvironmentData,
         ),
     ]
 }
@@ -284,7 +306,7 @@ async fn every_name_addressed_operation_refuses_an_unknown_environment_with_the_
     );
 
     for name in unknown_names() {
-        for (operation, method, uri, body, host_prefix) in name_addressed_calls() {
+        for (operation, method, uri, body, endpoint) in name_addressed_calls() {
             let case = format!("{operation}/{name}");
             let answer = harness
                 .send(method, &uri.replace("{}", &name), body.clone())
@@ -309,7 +331,8 @@ async fn every_name_addressed_operation_refuses_an_unknown_environment_with_the_
             );
             // The control plane words the condition from the request; the environment data
             // endpoint's front door words it itself, naming no environment.
-            let expected = if host_prefix == "env." {
+            let host_prefix = endpoint.host_prefix();
+            let expected = if endpoint == Endpoint::EnvironmentData {
                 service_com_amazonaws_mwaa_amazonmwaa::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE
                     .to_string()
             } else {

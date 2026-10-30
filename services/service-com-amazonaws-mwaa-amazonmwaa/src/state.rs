@@ -1606,17 +1606,30 @@ impl ComAmazonawsMwaaAmazonmwaaState {
     }
 }
 
-/// The message an environment-not-found refusal of a CONTROL-PLANE operation carries: the
-/// sentence names the environment the REQUEST asked for.
+/// The message carried by an environment-not-found refusal THIS SERVICE'S OWN layer raises
+/// for a request that names the environment: the sentence names the environment the REQUEST
+/// asked for.
 ///
 /// Request-derived, so the form is the rule and the name is whatever the request carried.
-/// Every operation the model hosts on the control-plane endpoint (`@endpoint` host prefix
-/// `api.`) and addresses by `Name` — `GetEnvironment`, `UpdateEnvironment`,
-/// `DeleteEnvironment` — words the same condition through this one builder, so none of them
-/// can drift from the rest. The operations hosted on the ENVIRONMENT data endpoint
-/// (`@endpoint` host prefix `env.`: `CreateCliToken`, `CreateWebLoginToken`,
-/// `InvokeRestApi`) never reach this builder — that front door words the condition itself,
-/// and names no environment: see [`ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`].
+/// What decides the wording is which layer refuses, not which operation was called: every
+/// operation that resolves an environment by its NAME and is refused by the layer that owns
+/// this service's modelled errors words the condition through this one builder, so none of
+/// them can drift from the rest. That is every such operation on the control-plane endpoint
+/// (`@endpoint` host prefix `api.`: `GetEnvironment`, `UpdateEnvironment`,
+/// `DeleteEnvironment`) and the one on the internal operations endpoint (host prefix
+/// `ops.`: `PublishMetrics`) — see [`crate::service::endpoints`] for the whole
+/// classification. The error SHAPE the sentence travels in is the model's own and differs
+/// between them (`ResourceNotFoundException` at 404 where the operation models it,
+/// `ValidationException` at 400 for the operation that models no 404); the sentence does
+/// not, because the condition is the same one.
+///
+/// Two refusals of this service are NOT this one. The operations hosted on the
+/// per-environment data endpoint (`@endpoint` host prefix `env.`: `CreateCliToken`,
+/// `CreateWebLoginToken`, `InvokeRestApi`) never reach this builder — the front door ahead
+/// of that layer words the condition itself, and names no environment: see
+/// [`ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`]. The `/tags/{ResourceArn}` operations address
+/// their resource by an ARN rather than a name, so there is no name to state: see
+/// [`RESOURCE_NOT_FOUND_MESSAGE`].
 pub fn environment_not_found_message(name: &str) -> String {
     format!("Environment {name} not found.")
 }

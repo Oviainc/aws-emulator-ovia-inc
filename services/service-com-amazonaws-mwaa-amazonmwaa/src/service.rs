@@ -46,6 +46,9 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// WHICH endpoint the model hosts each operation of this service on — the fact the
+/// refusal wording of a name this service cannot resolve depends on.
+pub mod endpoints;
 pub mod env_endpoint;
 
 /// The error code this service answers an input-constraint violation with: the modeled

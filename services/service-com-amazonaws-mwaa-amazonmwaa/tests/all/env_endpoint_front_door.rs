@@ -31,6 +31,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_mwaa_amazonmwaa::service::endpoints::{Endpoint, OPERATION_ENDPOINTS};
 use service_com_amazonaws_mwaa_amazonmwaa::state;
 
 /// A signed-looking request header so the router's `can_handle` resolves this service by
@@ -204,10 +205,12 @@ type Call = (&'static str, &'static str, &'static str, Option<Value>);
 /// `@length(1, 64)` bounds (one character, and 64) and whether `Body` / `QueryParameters`
 /// are carried at all.
 ///
-/// Source for the host prefixes and both value lists: this service's Smithy model —
-/// `smithy_query(query="operation",operation="CreateCliToken,CreateWebLoginToken,InvokeRestApi",model_path="services/service-com-amazonaws-mwaa-amazonmwaa/smithy-model/com-amazonaws-mwaa-amazonmwaa.json")`
-/// reports `endpoint.hostPrefix` `env.` for these three, and
-/// `smithy_query(query="shape",shape="RestApiMethod,RestApiPath",…)` the two value lists.
+/// Source for both value lists: this service's Smithy model —
+/// `smithy_query(query="shape",shape="RestApiMethod,RestApiPath",model_path="services/service-com-amazonaws-mwaa-amazonmwaa/smithy-model/com-amazonaws-mwaa-amazonmwaa.json")`.
+/// WHICH operations the data endpoint hosts is not restated here: it is read from the crate's
+/// endpoint census (`service::endpoints`, checked against the shipped model by
+/// `tests/all/endpoint_host_prefix_census.rs`) in the test below, which fails if this suite
+/// leaves one of them out.
 fn environment_data_calls() -> Vec<Call> {
     vec![
         ("CreateCliToken", "POST", "/clitoken/{}", None),
@@ -259,6 +262,21 @@ async fn the_front_door_refuses_an_unresolvable_name_with_the_sentence_as_the_wh
         200,
         "the fixture create must succeed"
     );
+
+    // The class this suite is about, read from the crate's census rather than restated: every
+    // operation the model hosts on the data endpoint must be exercised by a row below.
+    for (operation, _) in OPERATION_ENDPOINTS
+        .iter()
+        .filter(|(_, endpoint)| *endpoint == Endpoint::EnvironmentData)
+    {
+        assert!(
+            environment_data_calls()
+                .iter()
+                .any(|(label, ..)| label.starts_with(operation)),
+            "the suite must exercise every operation the census hosts on the data endpoint, \
+             and {operation:?} has no row"
+        );
+    }
 
     for name in unknown_names() {
         for (operation, method, uri, body) in environment_data_calls() {

@@ -28,10 +28,11 @@
 //! sentence still reach the caller.
 //!
 //! Every OTHER refusal of this service keeps the protocol's own error document: the
-//! control-plane (`api.`) lookups, which word the condition from the request, and every
-//! refusal the application layer behind this front door raises — a request outside a
-//! modelled constraint, an Apache Airflow call the environment's own API refused — are
-//! answered by the layer that models them, not by the front door.
+//! refusals raised on the service's other endpoints ([`super::endpoints`]), which word the
+//! condition from the request, and every refusal the application layer behind this front
+//! door raises — a request outside a modelled constraint, an Apache Airflow call the
+//! environment's own API refused — are answered by the layer that models them, not by the
+//! front door.
 //!
 //! Only the body is the front door's: the status, the `x-amzn-errortype` header and the
 //! media type the protocol announces are left where their renderer put them, because what
@@ -55,15 +56,15 @@ use aws_smithy_types::body::SdkBody;
 use serde_json::Value;
 use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
 
-/// Every operation the model hosts on the environment data endpoint, by the routing key
-/// (the operation's shape name) the protocol resolves for it.
-///
-/// Source: this service's Smithy model —
-/// `smithy_query(query="operation",operation="CreateCliToken,CreateWebLoginToken,InvokeRestApi",model_path="services/service-com-amazonaws-mwaa-amazonmwaa/smithy-model/com-amazonaws-mwaa-amazonmwaa.json")`
-/// reports `endpoint.hostPrefix` `env.` for these three, and `api.` for every other
-/// operation of this service.
-pub const ENVIRONMENT_DATA_OPERATIONS: [&str; 3] =
-    ["CreateCliToken", "CreateWebLoginToken", "InvokeRestApi"];
+use super::endpoints::{self, Endpoint};
+
+/// Whether the model hosts the operation this routing key names on the environment data
+/// endpoint — read from the crate's endpoint census ([`super::endpoints`]), which records
+/// the host prefix the model declares for EVERY operation of this service, so membership
+/// here is the `env.` class itself and not the complement of another one.
+fn hosted_here(key: &str) -> bool {
+    endpoints::hosted_on(key, Endpoint::EnvironmentData)
+}
 
 /// The response header restJson1 resolves an error shape from.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
@@ -71,8 +72,8 @@ const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 /// The response header a renderer that advertises its body's length writes.
 const CONTENT_LENGTH: &str = "content-length";
 
-/// The shape the front door's refusal of an unresolvable name names — the only error any
-/// of [`ENVIRONMENT_DATA_OPERATIONS`] models at HTTP 404.
+/// The shape the front door's refusal of an unresolvable name names — the only error the
+/// operations hosted on this endpoint model at HTTP 404.
 const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
 /// The members a JSON error document can carry its error code in, in the order an SDK's
@@ -160,7 +161,7 @@ fn environment_data_operation<'s>(
 ) -> Option<&'s dyn ErasedOperation> {
     let definition = svc.definition();
     let key = definition.protocol().routing_key(req).ok()?;
-    if !ENVIRONMENT_DATA_OPERATIONS.contains(&key) {
+    if !hosted_here(key) {
         return None;
     }
     definition.routing_table().get(key)
@@ -180,7 +181,7 @@ pub fn routes<Eng: Send + Sync + 'static>(
         .protocol()
         .routing_key(req)
         .ok()
-        .filter(|key| ENVIRONMENT_DATA_OPERATIONS.contains(key))
+        .filter(|key| hosted_here(key))
         .and_then(|key| entry.routing_table().get(key))
         .is_some()
 }
