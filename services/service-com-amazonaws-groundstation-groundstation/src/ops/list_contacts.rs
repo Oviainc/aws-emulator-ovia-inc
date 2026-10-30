@@ -436,7 +436,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the satellite as the missing resource both writers of a contact version
             // refuse it as (`crate::state::satellite_reference_fault`), the ground station
             // as the bad parameter every operation whose subject is a station named in a
-            // member refuses it as (`crate::state::ground_station_not_found_message`), in
+            // member refuses it as (`crate::state::GROUND_STATION_INVALID`), in
             // the order `ReserveContact` resolves the two.
             if let Some(error) = guard.satellite_reference_fault(input.satellite_arn.as_deref()) {
                 return Err(ListContactsErrorModeled::ResourceNotFoundException(error).into());
@@ -445,7 +445,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !guard.knows_ground_station(name) {
                     return Err(ListContactsErrorModeled::InvalidParameterException(
                         InvalidParameterException {
-                            message: Some(crate::state::ground_station_not_found_message(name)),
+                            message: Some(crate::state::GROUND_STATION_INVALID.to_string()),
                             parameter_name: Some("groundStation".to_string()),
                         },
                     )

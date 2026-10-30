@@ -197,13 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `groundStationId` naming no ground station this account knows references
         // nothing, so the request is answered as the bad parameter it carries rather than
         // with the empty page the lookup would otherwise select — which a caller could not
-        // tell from "this ground station has no antenna".
+        // tell from "this ground station has no antenna". The text is this service's own
+        // for that class (`crate::state::GROUND_STATION_INVALID`): it reports the name as
+        // invalid, unknown or inaccessible and echoes none of the request back.
         if !guard.knows_ground_station(&input.ground_station_id) {
             return Err(ListAntennasErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(crate::state::ground_station_not_found_message(
-                        &input.ground_station_id,
-                    )),
+                    message: Some(crate::state::GROUND_STATION_INVALID.to_string()),
                     parameter_name: Some("groundStationId".to_string()),
                 },
             )

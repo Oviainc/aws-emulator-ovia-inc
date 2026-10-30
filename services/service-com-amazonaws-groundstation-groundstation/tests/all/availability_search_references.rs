@@ -35,7 +35,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    ground_station_not_found_message, satellite_not_found_message, CONTACT_AVAILABLE,
+    satellite_not_found_message, CONTACT_AVAILABLE, GROUND_STATION_INVALID,
     MISSION_PROFILE_NOT_FOUND,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -234,13 +234,15 @@ impl Refusal {
     }
 
     /// The refusal of a ground station this account cannot address: the bad parameter every
-    /// operation whose subject is a station named in a member reports, naming that member.
-    fn ground_station(member: &str, name: &str) -> Self {
+    /// operation whose subject is a station named in a member reports, naming that member,
+    /// under the one fixed text this service answers for a name it cannot resolve — which
+    /// echoes nothing of the request, so the name is not part of it.
+    fn ground_station(member: &str) -> Self {
         Self {
             status: 431,
             error: "InvalidParameterException".to_string(),
             parameter: Some(member.to_string()),
-            message: ground_station_not_found_message(name),
+            message: GROUND_STATION_INVALID.to_string(),
         }
     }
 
@@ -304,7 +306,7 @@ async fn every_reference_an_availability_search_computes_from_is_resolved() {
         (
             "the ground station is one the account cannot address",
             Unresolved::GroundStation,
-            Some(Refusal::ground_station("groundStation", absent_station)),
+            Some(Refusal::ground_station("groundStation")),
         ),
         (
             "the mission profile names no profile",
@@ -485,7 +487,7 @@ async fn an_availability_search_refuses_a_ground_station_this_account_cannot_add
         if known == Known::NotAtAll {
             assert_eq!(
                 Refusal::of(&reply),
-                Refusal::ground_station("groundStation", &station),
+                Refusal::ground_station("groundStation"),
                 "case {case:?}: the search must be refused as the bad parameter it carries, \
                  got {} {}",
                 reply.status,

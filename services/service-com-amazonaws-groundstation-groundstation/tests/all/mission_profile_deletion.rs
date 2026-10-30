@@ -26,8 +26,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    mission_profile_in_use_message, service_state, MISSION_PROFILE_NOT_FOUND,
-    TERMINAL_CONTACT_STATUSES,
+    mission_profile_delete_not_found_message, mission_profile_in_use_message, service_state,
+    MISSION_PROFILE_NOT_FOUND, TERMINAL_CONTACT_STATUSES,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -487,7 +487,7 @@ async fn a_refused_delete_leaves_the_profile_and_the_contact_loop_exactly_as_the
     );
     assert_eq!(
         absent.string("message"),
-        MISSION_PROFILE_NOT_FOUND,
+        mission_profile_delete_not_found_message(ABSENT_UUID),
         "case absent: wrong text for an id naming no profile, got {}",
         absent.body
     );

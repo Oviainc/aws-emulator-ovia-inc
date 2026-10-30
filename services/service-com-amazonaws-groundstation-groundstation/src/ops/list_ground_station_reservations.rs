@@ -260,15 +260,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with the empty page the lookup would otherwise select — which a caller could not
         // tell from "this ground station holds no antenna time". The same rule the sibling
         // listing bound under this id reads, under the same text
-        // (`crate::state::ground_station_not_found_message`), and refused before anything
+        // (`crate::state::GROUND_STATION_INVALID`), and refused before anything
         // is written.
         if !guard.knows_ground_station(&input.ground_station_id) {
             return Err(
                 ListGroundStationReservationsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(crate::state::ground_station_not_found_message(
-                            &input.ground_station_id,
-                        )),
+                        message: Some(crate::state::GROUND_STATION_INVALID.to_string()),
                         parameter_name: Some("groundStationId".to_string()),
                     },
                 )

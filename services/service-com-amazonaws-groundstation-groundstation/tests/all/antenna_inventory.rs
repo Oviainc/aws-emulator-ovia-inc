@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
     parse_ground_stations, parse_satellites, service_state, GroundStation, BAD_REQUEST_ERROR_CODE,
-    MAX_ANTENNAS_PER_GROUND_STATION,
+    GROUND_STATION_INVALID, MAX_ANTENNAS_PER_GROUND_STATION,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -428,9 +428,16 @@ async fn list_antennas_refuses_a_ground_station_this_account_does_not_know() {
             "case {case} ({ground_station}): the refusal must name the parameter at fault, got {}",
             reply.body
         );
+        assert_eq!(
+            member(&reply.body, "message"),
+            GROUND_STATION_INVALID,
+            "case {case} ({ground_station}): the refusal must carry this service's fixed text \
+             for a name it cannot resolve, got {}",
+            reply.body
+        );
         assert!(
-            member(&reply.body, "message").contains(ground_station),
-            "case {case}: the refusal must name the id it was given, got {}",
+            !member(&reply.body, "message").contains(ground_station),
+            "case {case}: the fixed text echoes no part of the request back, got {}",
             reply.body
         );
     }

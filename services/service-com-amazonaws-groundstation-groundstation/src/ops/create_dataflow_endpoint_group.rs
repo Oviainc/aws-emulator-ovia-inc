@@ -218,15 +218,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `@required` (`name`, `egressAddress`, `ingressAddress`), and the model
             // leaves `securityDetails` optional for exactly that reason: it is not
             // demanded of one. See `EndpointKind::requires_security_details`.
+            //
+            // The refusal is this error class's own fixed sentence, naming the shape and
+            // the member that is missing: it interpolates nothing — not the index of the
+            // item that carried the fault, which would make one text per request — so the
+            // caller reads the same words whichever item of the list omitted it.
             if kind.requires_security_details() && details.security_details.is_none() {
                 return Err(invalid_parameter(
                     "securityDetails",
-                    format!(
-                        "endpointDetails[{index}] is {} and names no securityDetails; a \
-                         dataflow endpoint requires the subnetIds, securityGroupIds and \
-                         roleArn Ground Station connects its streams with",
-                        kind.description()
-                    ),
+                    "EndpointDetails securityDetails cannot be null".to_string(),
                 ));
             }
 

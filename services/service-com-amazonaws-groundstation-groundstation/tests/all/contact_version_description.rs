@@ -550,7 +550,7 @@ async fn a_version_the_contact_does_not_hold_is_not_described() {
         );
         assert_eq!(
             reply.string("message"),
-            "ContactVersion not found",
+            "Contact version not found",
             "case version {version_id}: wrong refusal text, got {}",
             reply.body
         );
@@ -601,7 +601,8 @@ async fn a_version_the_contact_does_not_hold_is_not_described() {
 
     // A `contactId` naming no contact: well-formed `Uuid`s (a run of zeros, a run of `f`s
     // and a mixed one, so the refusal cannot be passing on one id's shape), each refused
-    // with the literal this service's reads of a contact by that label answer.
+    // with the SAME text an unresolvable version is — this operation addresses a contact
+    // version, so either label failing to resolve leaves no contact version to describe.
     for absent in [
         ABSENT_UUID,
         "ffffffff-ffff-4fff-bfff-ffffffffffff",
@@ -625,7 +626,7 @@ async fn a_version_the_contact_does_not_hold_is_not_described() {
         );
         assert_eq!(
             reply.string("message"),
-            "Contact not found",
+            "Contact version not found",
             "case contact {absent}: wrong refusal text, got {}",
             reply.body
         );

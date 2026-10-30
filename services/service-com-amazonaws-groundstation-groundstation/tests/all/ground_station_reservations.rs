@@ -46,7 +46,7 @@
 use serde_json::Value;
 use service_com_amazonaws_groundstation_groundstation::state::{
     antenna_name, parse_ground_stations, parse_maintenance, service_state,
-    BAD_REQUEST_ERROR_CODE,
+    BAD_REQUEST_ERROR_CODE, GROUND_STATION_INVALID,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1244,9 +1244,16 @@ async fn the_listing_refuses_a_ground_station_this_account_does_not_know() {
              got {}",
             reply.body
         );
+        assert_eq!(
+            reply.string("message"),
+            GROUND_STATION_INVALID,
+            "case {case} ({ground_station}): the refusal must carry this service's fixed text \
+             for a name it cannot resolve, got {}",
+            reply.body
+        );
         assert!(
-            reply.string("message").contains(&ground_station),
-            "case {case}: the refusal must name the id it was given, got {}",
+            !reply.string("message").contains(&ground_station),
+            "case {case}: the fixed text echoes no part of the request back, got {}",
             reply.body
         );
         assert!(

@@ -401,8 +401,8 @@ async fn an_update_the_contact_cannot_take_is_refused_and_appends_nothing() {
     let satellite = onboard_satellite_arns(&engine, 1)[0].clone();
     let contact_id = reserve_contact(&router, &profile_arn, Some(&satellite)).await;
 
-    // An id that names no contact: the MUTATION path's text, which names the id the
-    // request addressed and the account the write was scoped to.
+    // An id that names no contact: this operation's own text, which names the id the
+    // request addressed and nothing else.
     for absent in ABSENT_CONTACT_IDS {
         let refused = update_contact(&router, absent, json!({"satelliteArn": satellite})).await;
         assert_eq!(
@@ -419,7 +419,7 @@ async fn an_update_the_contact_cannot_take_is_refused_and_appends_nothing() {
         );
         assert_eq!(
             refused.string("message"),
-            state::contact_mutation_not_found_message(absent),
+            state::contact_update_not_found_message(absent),
             "case absent {absent}: wrong message, got {}",
             refused.body
         );

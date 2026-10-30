@@ -62,7 +62,11 @@ const CAPABILITY_TYPES: &[(&str, &str)] = &[
 /// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`) that name nothing:
 /// a run of zeros, a run of `f`s and a mixed one, so an assertion about a message cannot
 /// be passing on one id's shape.
-const ABSENT_UUIDS: &[&str] = &[
+///
+/// `pub(crate)` so the sibling suite that asserts the refusal TEXT of the other
+/// operations (`crate::refusal_message_templates`) spans the same ids from this one table
+/// rather than keeping a second copy of it.
+pub(crate) const ABSENT_UUIDS: &[&str] = &[
     ABSENT_UUID,
     "ffffffff-ffff-4fff-bfff-ffffffffffff",
     "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
@@ -87,7 +91,11 @@ fn mission_profile_arn(region: &str, mission_profile_id: &str) -> String {
 /// The `message` of a not-found answer, after asserting the answer really is this
 /// service's `ResourceNotFoundException`: HTTP 434 and that error shape, per
 /// `smithy_query` (`@error("client")`, `@httpError(434)`).
-fn not_found_message(case: &str, reply: &Reply) -> String {
+///
+/// `pub(crate)` so every suite that reads a not-found TEXT asserts the status and the
+/// error shape through this ONE helper (`crate::refusal_message_templates` does), and the
+/// two cannot drift into two notions of what a not-found answer is.
+pub(crate) fn not_found_message(case: &str, reply: &Reply) -> String {
     assert_eq!(
         reply.status, 434,
         "case {case}: expected the modelled ResourceNotFoundException status 434, got {} {}",

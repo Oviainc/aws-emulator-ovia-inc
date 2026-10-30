@@ -140,11 +140,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // The service's mission-profile literal, for either read of the store below: it
-        // does not disclose the id that was asked for.
+        // The text this operation answers for either read of the store below: the fixed
+        // words around the one variable part, the `{missionProfileId}` the request path
+        // carried, so a caller deleting several profiles can attribute the failure.
         let not_found = || {
             DeleteMissionProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::MISSION_PROFILE_NOT_FOUND.to_string()),
+                message: Some(crate::state::mission_profile_delete_not_found_message(
+                    &input.mission_profile_id,
+                )),
             })
         };
 

@@ -291,12 +291,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// What this operation answers when `{contactId}` names no contact of this account.
 ///
-/// The MUTATION path's text: the id the request addressed plus the account the write was
-/// scoped to, as this service's other mutations answer. `DescribeContact` and
+/// This operation's own text: the fixed words `Contact not found: ` followed by the
+/// `{contactId}` the request path carried, and nothing else
+/// (`crate::state::contact_update_not_found_message`). `DescribeContact` and
 /// `CancelContact` answer their own texts for the same missing contact.
 fn contact_not_found(contact_id: &str) -> UpdateContactError {
     UpdateContactErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::contact_mutation_not_found_message(contact_id)),
+        message: Some(crate::state::contact_update_not_found_message(contact_id)),
     })
     .into()
 }

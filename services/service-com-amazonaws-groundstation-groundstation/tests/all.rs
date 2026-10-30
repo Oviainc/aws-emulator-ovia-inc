@@ -117,6 +117,8 @@ mod placement_reads_the_clock;
 mod program_track_reference_integrity;
 #[path = "all/recording_bucket_refusal_message.rs"]
 mod recording_bucket_refusal_message;
+#[path = "all/refusal_message_templates.rs"]
+mod refusal_message_templates;
 #[path = "all/request_validation.rs"]
 mod request_validation;
 #[path = "all/resource_tagging.rs"]

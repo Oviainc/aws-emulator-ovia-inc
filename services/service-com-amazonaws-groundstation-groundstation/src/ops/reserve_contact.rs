@@ -275,14 +275,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::placement_antennas`) would hold time at a station the service
         // itself reports the account cannot address — the reservation could never be
         // listed. The same rule, under the same text
-        // (`crate::state::ground_station_not_found_message`), that every operation whose
+        // (`crate::state::GROUND_STATION_INVALID`), that every operation whose
         // subject is a ground station named in a required member reads.
         if !guard.knows_ground_station(&input.ground_station) {
             return Err(ReserveContactErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(crate::state::ground_station_not_found_message(
-                        &input.ground_station,
-                    )),
+                    message: Some(crate::state::GROUND_STATION_INVALID.to_string()),
                     parameter_name: Some("groundStation".to_string()),
                 },
             )

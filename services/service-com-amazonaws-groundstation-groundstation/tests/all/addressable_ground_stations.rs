@@ -33,7 +33,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    antenna_name, ground_station_not_found_message, BAD_REQUEST_ERROR_CODE,
+    antenna_name, BAD_REQUEST_ERROR_CODE, GROUND_STATION_INVALID,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -256,8 +256,9 @@ async fn stored_contacts(router: &MultiServiceRouter) -> Vec<String> {
 }
 
 /// Assert `reply` is this service's refusal of a ground station the account cannot address:
-/// the modelled status and shape, the member `parameter` at fault, and the one not-found
-/// text built from the name the request gave.
+/// the modelled status and shape, the member `parameter` at fault, and the one fixed text
+/// this service answers for a name it cannot resolve — which echoes no part of the request
+/// back, so the `ground_station` the row asked for must not appear in it.
 fn assert_refused(reply: &Reply, case: &str, parameter: &str, ground_station: &str) {
     assert_eq!(
         reply.status, REFUSED_STATUS,
@@ -279,9 +280,14 @@ fn assert_refused(reply: &Reply, case: &str, parameter: &str, ground_station: &s
     );
     assert_eq!(
         reply.string("message"),
-        ground_station_not_found_message(ground_station),
-        "case {case:?}: the refusal must carry this service's not-found text for the name it \
-         was given, got {}",
+        GROUND_STATION_INVALID,
+        "case {case:?}: the refusal must carry this service's fixed text for a name it cannot \
+         resolve, got {}",
+        reply.body
+    );
+    assert!(
+        !reply.string("message").contains(ground_station),
+        "case {case:?}: the fixed text echoes no part of the request back, got {}",
         reply.body
     );
 }

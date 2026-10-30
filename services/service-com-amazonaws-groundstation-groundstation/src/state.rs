@@ -913,8 +913,23 @@ pub fn addresses_config(reference: &str, config_arn: &str) -> bool {
 /// It lives here rather than in one handler because BOTH operations that resolve a
 /// mission profile answer it — `GetMissionProfile`, which resolves one by
 /// `{missionProfileId}`, and `ReserveContact`, which resolves one by `missionProfileArn`
-/// — so it is one text of the service, not one text per operation.
+/// — so it is one text of the service, not one text per operation. The DELETE of a
+/// profile answers its own, id-bearing text instead
+/// ([`mission_profile_delete_not_found_message`]).
 pub const MISSION_PROFILE_NOT_FOUND: &str = "MissionProfile not found";
+
+/// The message `DeleteMissionProfile` carries when `{missionProfileId}` names no profile:
+/// the fixed words `Mission Profile ` … ` not found` around the one variable part, the
+/// `{missionProfileId}` the request path carried.
+///
+/// A delete reports WHICH profile it could not find, because a caller deleting several at
+/// once attributes the failure by that id; the reads of a profile answer the bare
+/// [`MISSION_PROFILE_NOT_FOUND`] literal and `UpdateMissionProfile` answers its own
+/// account-qualified text ([`mission_profile_mutation_not_found_message`]), so no one of
+/// the three is derived from another.
+pub fn mission_profile_delete_not_found_message(mission_profile_id: &str) -> String {
+    format!("Mission Profile {mission_profile_id} not found")
+}
 
 /// The region to mint this request's ARNs in: the SigV4 credential scope's region,
 /// which is the region the caller addressed, falling back to [`DEFAULT_REGION`].
@@ -2372,17 +2387,17 @@ pub fn mission_profile_mutation_not_found_message(mission_profile_id: &str) -> S
     )
 }
 
-/// The message `UpdateContact` carries when `{contactId}` names no contact: the id the
-/// request addressed plus the account the write was scoped to — the composition every
-/// MUTATION path of this service uses ([`config_mutation_not_found_message`],
-/// [`mission_profile_mutation_not_found_message`]), where the READ path
-/// (`DescribeContact`) answers a bare literal and `CancelContact` quotes the id on its
-/// own.
-pub fn contact_mutation_not_found_message(contact_id: &str) -> String {
-    format!(
-        "No contact found with ID {contact_id} for customer {}",
-        ::engine::emulator_account_id()
-    )
+/// The message `UpdateContact` carries when `{contactId}` names no contact: the fixed
+/// text `Contact not found: ` followed by the one variable part, the `{contactId}` the
+/// request path carried.
+///
+/// The id is the ONLY thing interpolated — nothing of the environment (the account the
+/// write was scoped to) belongs in it, so the text reads the same wherever this emulator
+/// runs. `DescribeContact` answers a bare literal for the same missing contact and
+/// `CancelContact` quotes the id in a sentence of its own: each operation carries the text
+/// of its own error class.
+pub fn contact_update_not_found_message(contact_id: &str) -> String {
+    format!("Contact not found: {contact_id}")
 }
 
 /// What `DeleteConfig` answers while a live mission profile still references the config:
@@ -2673,14 +2688,16 @@ pub fn config_reference_not_found_message(arn: &str, required_type: Option<&str>
 }
 
 /// What this service answers when a dataflow endpoint group a request names does not
-/// exist: a fixed literal that discloses neither the id nor the ARN that was asked for,
-/// spelled the way this service already answers for a missing mission profile (see
-/// [`MISSION_PROFILE_NOT_FOUND`]).
+/// exist: the service's own fixed sentence for that error class, which names the kind of
+/// resource and ends the sentence, and discloses neither the id nor the ARN that was asked
+/// for.
 ///
 /// It lives here rather than in one handler because every operation addressed at a group
 /// by its `{dataflowEndpointGroupId}` label answers it — `GetDataflowEndpointGroup` and
-/// `DeleteDataflowEndpointGroup` — so it is one text of the service.
-pub const DATAFLOW_ENDPOINT_GROUP_NOT_FOUND: &str = "DataflowEndpointGroup not found";
+/// `DeleteDataflowEndpointGroup` — so it is one text of the service: one resource, one
+/// error class, one sentence. The read's wording is the recorded one; the delete reads it
+/// from here rather than carrying a sentence of its own.
+pub const DATAFLOW_ENDPOINT_GROUP_NOT_FOUND: &str = "The specified group does not exist.";
 
 /// Which kind of endpoint an `EndpointDetails` describes.
 ///
@@ -3422,8 +3439,7 @@ pub const EPHEMERIS_EXPIRED: &str = "EXPIRED";
 /// What this service answers when an ephemeris a request addresses by its `{ephemerisId}`
 /// does not exist: a fixed literal that discloses neither the id nor the ARN that was
 /// asked for, spelled the way this service already answers for a missing mission profile
-/// or dataflow endpoint group (see [`MISSION_PROFILE_NOT_FOUND`],
-/// [`DATAFLOW_ENDPOINT_GROUP_NOT_FOUND`]).
+/// (see [`MISSION_PROFILE_NOT_FOUND`]).
 ///
 /// It lives here rather than in one handler because every operation addressed at an
 /// ephemeris by that label answers it, so it is one text of the service.
@@ -4216,16 +4232,19 @@ pub fn parse_maintenance(setting: &str) -> Vec<MaintenanceReservation> {
 }
 
 /// What this service answers when a `groundStationId` names no ground station this
-/// account is served by.
+/// account is served by: a fixed sentence with no variable part, which deliberately
+/// reports the name as invalid, unknown OR inaccessible rather than asserting it does not
+/// exist, and echoes nothing of the request back.
 ///
 /// Shared by every operation whose subject is a ground station addressed by name
-/// ([`ComAmazonawsGroundstationGroundstationState::knows_ground_station`]), so the two
-/// listings bound under that id answer one text. Built from the request: the refusal names
-/// the id it was given, so a caller can tell which of its parameters is the one that
-/// resolves to nothing.
-pub fn ground_station_not_found_message(ground_station_id: &str) -> String {
-    format!("No ground station found with id {ground_station_id}")
-}
+/// ([`ComAmazonawsGroundstationGroundstationState::knows_ground_station`]), so each of
+/// them answers one text of the service. The operations that resolve a ground station
+/// model no not-found error for it (`ListAntennas` models only
+/// `InvalidParameterException` — `smithy_query(query="operation",
+/// operation="ListAntennas")`), so an unresolvable name is a bad parameter by
+/// construction, which is what this sentence says.
+pub const GROUND_STATION_INVALID: &str =
+    "Invalid request: Ground station is invalid, does not exist, or you do not have access to it";
 
 /// The environment variable an operator uses to describe the ground stations THIS
 /// emulated account is served by and the antennas at each, since the API models no

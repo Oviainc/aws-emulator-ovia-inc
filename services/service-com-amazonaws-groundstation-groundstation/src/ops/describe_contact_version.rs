@@ -193,15 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        /// What this operation answers when the contact holds no version with the
-        /// `{versionId}` the request addressed.
+        /// What this operation answers when the `(contactId, versionId)` pair the request
+        /// addressed resolves to no version.
         ///
-        /// This service's not-found texts for a resource whose id it does not disclose
-        /// name the resource as the model's own shape spells it — `DescribeContact`'s
-        /// "Contact not found", `crate::state::MISSION_PROFILE_NOT_FOUND`,
-        /// `crate::state::EPHEMERIS_NOT_FOUND` — and the resource missing here is the
-        /// `ContactVersion` the second label names.
-        const CONTACT_VERSION_NOT_FOUND: &str = "ContactVersion not found";
+        /// The refusal is phrased about the resource THIS operation addresses — a contact
+        /// version — so both ways the pair can fail to resolve answer it: a `{contactId}`
+        /// naming no contact, and a `{versionId}` the named contact holds no version at,
+        /// are one and the same missing contact version, and neither is the missing
+        /// CONTACT that `DescribeContact` reports.
+        const CONTACT_VERSION_NOT_FOUND: &str = "Contact version not found";
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeContactVersionErrorModeled::DependencyException(DependencyException {
@@ -222,16 +222,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // through the group that holds it.
         guard.settle_due_endpoints();
 
-        let contact = guard.contacts.get(&input.contact_id).ok_or_else(|| {
+        // The refusal above, built once so the two labels cannot drift into answering two
+        // different texts for one unresolvable pair.
+        let not_found = || {
             DescribeContactVersionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    // The `{contactId}` label resolves first, and it answers what this
-                    // service's other reads of a contact by that label answer: a fixed
-                    // literal, which discloses no id.
-                    message: Some("Contact not found".to_string()),
+                    message: Some(CONTACT_VERSION_NOT_FOUND.to_string()),
                 },
             )
-        })?;
+        };
+
+        let contact = guard.contacts.get(&input.contact_id).ok_or_else(not_found)?;
 
         // The version the second label names, out of the history the store holds for this
         // contact. A `versionId` inside the modelled range that this contact never
@@ -240,13 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .versions
             .iter()
             .find(|version| version.version_id == input.version_id)
-            .ok_or_else(|| {
-                DescribeContactVersionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(CONTACT_VERSION_NOT_FOUND.to_string()),
-                    },
-                )
-            })?;
+            .ok_or_else(not_found)?;
 
         Ok(DescribeContactVersionOutput {
             contact_id: Some(contact.contact_id.clone()),
