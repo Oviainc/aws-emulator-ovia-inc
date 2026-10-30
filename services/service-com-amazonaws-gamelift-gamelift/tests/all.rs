@@ -15,6 +15,8 @@
 mod aliases;
 #[path = "all/builds.rs"]
 mod builds;
+#[path = "all/error_message_templates.rs"]
+mod error_message_templates;
 #[path = "all/fleet_attributes.rs"]
 mod fleet_attributes;
 #[path = "all/game_session_placements.rs"]

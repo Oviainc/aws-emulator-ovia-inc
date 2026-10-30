@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             forget(&minted.id, "no stored build to issue credentials for");
             return Err(RequestUploadCredentialsErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!("The build {} was not found.", input.build_id)),
+                    message: Some(crate::state::build_not_found_message(&input.build_id)),
                 },
             )
             .into());

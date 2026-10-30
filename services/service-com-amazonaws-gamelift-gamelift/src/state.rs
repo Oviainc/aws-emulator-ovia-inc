@@ -1060,18 +1060,18 @@ pub fn validate_routing_strategy(strategy: &RoutingStrategy) -> Result<(), Strin
     match strategy.r#type.as_deref() {
         Some(ROUTING_STRATEGY_TYPE_SIMPLE) => {
             if strategy.fleet_id.is_none() {
-                return Err(format!(
-                    "RoutingStrategy of type {ROUTING_STRATEGY_TYPE_SIMPLE} must name the fleet \
-                     it resolves to in RoutingStrategy.FleetId."
+                return Err(routing_strategy_member_required(
+                    ROUTING_STRATEGY_TYPE_SIMPLE,
+                    "FleetId",
                 ));
             }
             Ok(())
         }
         Some(ROUTING_STRATEGY_TYPE_TERMINAL) => {
             if strategy.message.is_none() {
-                return Err(format!(
-                    "RoutingStrategy of type {ROUTING_STRATEGY_TYPE_TERMINAL} must carry the \
-                     message to display in RoutingStrategy.Message."
+                return Err(routing_strategy_member_required(
+                    ROUTING_STRATEGY_TYPE_TERMINAL,
+                    "Message",
                 ));
             }
             Ok(())
@@ -1081,6 +1081,14 @@ pub fn validate_routing_strategy(strategy: &RoutingStrategy) -> Result<(), Strin
              {ROUTING_STRATEGY_TYPE_TERMINAL}."
         )),
     }
+}
+
+/// What the service answers a routing strategy that does not carry the member its own type
+/// requires: the type, the member and the one sentence, with nothing of the request
+/// interpolated — the text is the same for every request that misses that member, which is
+/// what lets a client match on it.
+fn routing_strategy_member_required(strategy_type: &str, member: &str) -> String {
+    format!("{strategy_type} RoutingStrategy must contain a valid {member}.")
 }
 
 /// A custom location, as `CreateLocation` persisted it.
@@ -1218,6 +1226,19 @@ pub fn service_owned_script_location(region: &str, script_id: &str) -> S3Locatio
         role_arn: None,
         object_version: None,
     }
+}
+
+/// What the service answers when no custom game build is stored under the `BuildIdOrArn`
+/// an operation was asked to act on — the message of the modelled `NotFoundException`,
+/// shared by every operation that names ONE build, so the same missing build reads the
+/// same way whichever of them was called.
+///
+/// The resource kind leads the sentence and the identifier the CALLER supplied is its one
+/// variable part, carried verbatim in parentheses: either of the two forms `BuildIdOrArn`
+/// accepts (`^(build-\S+|arn:.*:build\/build-\S+)$`) selects the same build, so the
+/// refusal states what was asked for rather than anything the service resolved it to.
+pub fn build_not_found_message(id_or_arn: &str) -> String {
+    format!("Build ({id_or_arn}) not found")
 }
 
 /// A custom game build, as `CreateBuild` persisted it — the one projection every read of

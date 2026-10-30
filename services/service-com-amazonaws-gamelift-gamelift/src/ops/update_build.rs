@@ -167,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // either not created yet or deleted"), and nothing is written.
         let Some(build_id) = state.resolve_build_id(&input.build_id) else {
             return Err(UpdateBuildErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("The build {} was not found.", input.build_id)),
+                message: Some(crate::state::build_not_found_message(&input.build_id)),
             })
             .into());
         };

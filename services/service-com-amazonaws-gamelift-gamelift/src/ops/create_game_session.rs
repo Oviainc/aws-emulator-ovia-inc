@@ -212,6 +212,19 @@ impl From<CreateGameSessionErrorModeled> for CreateGameSessionError {
     }
 }
 
+/// What the service answers when no server process on the fleet is both active and
+/// available to host the session asked for.
+///
+/// "This operation prompts an available server process to start a game session", so the
+/// reservation of a process is what fails, whichever way the fleet ran out of them — none
+/// running there at all, every one of them already hosting a session, or every port they
+/// listen on held. The text is the service's own fixed text for that failure: it has no
+/// slot for a fleet, a location or a count, so none is interpolated — a message that moved
+/// with the generated identifiers of the fleet it was refused on could not be matched on
+/// at all.
+const PROCESS_RESERVATION_FAILURE: &str =
+    "Unable to reserve a process(No active and available server processes found on the fleet)";
+
 /// The `CreateGameSession` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -431,21 +444,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // or because every one of them is already hosting a session — has no instance to
         // fulfil the request. This is also what bounds the stored session set.
         if state.live_game_sessions_at(&fleet_id, &location) >= capacity {
-            let detail = if capacity == 0 {
-                format!(
-                    "no active and available server processes found at location {location} of \
-                     fleet {fleet_id}"
-                )
-            } else {
-                format!(
-                    "all {capacity} server processes at location {location} of fleet {fleet_id} \
-                     are hosting a game session"
-                )
-            };
             return Err(
                 CreateGameSessionErrorModeled::FleetCapacityExceededException(
                     FleetCapacityExceededException {
-                        message: Some(format!("Unable to reserve a process({detail})")),
+                        message: Some(PROCESS_RESERVATION_FAILURE.to_string()),
                     },
                 )
                 .into(),
@@ -460,10 +462,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateGameSessionErrorModeled::FleetCapacityExceededException(
                     FleetCapacityExceededException {
-                        message: Some(format!(
-                            "Unable to reserve a process(all {open_ports} port(s) that fleet \
-                             {fleet_id} opens are held by a game session)"
-                        )),
+                        message: Some(PROCESS_RESERVATION_FAILURE.to_string()),
                     },
                 )
                 .into(),

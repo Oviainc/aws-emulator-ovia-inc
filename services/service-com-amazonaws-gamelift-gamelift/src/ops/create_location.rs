@@ -199,13 +199,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation would cause a conflict with the current state of a service resource
         // associated with the request"), and the stored location is left exactly as it
         // was. This check and the insert below both run under the state lock this handler
-        // holds, so concurrent creates of one name produce exactly ONE winner.
+        // holds, so concurrent creates of one name produce exactly ONE winner. The refusal
+        // is the service's own text for that conflict: the resource kind, the name the
+        // REQUEST asked for as its one variable part, and no further clause.
         if state.custom_locations.contains_key(&input.location_name) {
             return Err(CreateLocationErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(format!(
-                        "Location {} already exists; a custom location name identifies one \
-                         location.",
+                        "A Location with name: {} already exists.",
                         input.location_name
                     )),
                 },

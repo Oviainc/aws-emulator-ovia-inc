@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(build) = state.resolve_build(&input.build_id) else {
             return Err(DescribeBuildErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!("The build {} was not found.", input.build_id)),
+                    message: Some(crate::state::build_not_found_message(&input.build_id)),
                 },
             )
             .into());
