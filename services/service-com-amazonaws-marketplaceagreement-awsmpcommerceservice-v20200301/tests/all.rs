@@ -107,6 +107,8 @@ mod seller_submitted_request_views;
 mod state_roundtrip;
 #[path = "all/store_full_refusals.rs"]
 mod store_full_refusals;
+#[path = "all/store_full_replays.rs"]
+mod store_full_replays;
 #[path = "all/time_windows.rs"]
 mod time_windows;
 #[path = "all/unknown_ids.rs"]
