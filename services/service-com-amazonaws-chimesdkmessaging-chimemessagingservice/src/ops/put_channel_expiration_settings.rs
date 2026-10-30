@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutChannelExpirationSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutChannelExpirationSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutChannelExpirationSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the `ExpirationSettings` the request carries onto the stored channel and
+//! echoes the settings now in force, so the next `DescribeChannel` reports the retention
+//! policy the caller configured. The settings are the channel's whole expiry
+//! sub-resource, so a request that carries none leaves the channel with no expiration
+//! settings at all and echoes none.
 //!
 //! ## Shape of an operation
 //!
@@ -103,10 +100,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `PutChannelExpirationSettingsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#PutChannelExpirationSettings")]
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// (`GetChannelMessage` lists it) that this operation's own error list omits: setting the
+// expiry of a channel ARN that names no channel has to say the channel is not there.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chimesdkmessaging#PutChannelExpirationSettings",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum PutChannelExpirationSettingsErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -164,20 +168,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutChannelExpirationSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutChannelExpirationSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutChannelExpirationSettings"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutChannelExpirationSettingsErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    code: Some("ServiceFailure".to_string()),
+                    message: Some("the channel store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The model documents the `x-amz-chime-bearer` header as mandatory for this
+        // operation even though the member itself is optional, and the caller it names is
+        // what the channel's authorization rule is decided on.
+        let bearer = input.chime_bearer.as_deref().ok_or_else(|| {
+            bad_request("the x-amz-chime-bearer header is required".to_string())
+        })?;
+        // `ExpirationDays` outside the modelled range and an `ExpirationCriterion`
+        // outside its catalog are refused by the boundary validator before this handler
+        // runs, so reaching here means the settings are ones a channel can hold.
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
+            PutChannelExpirationSettingsErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!("channel {} not found", input.channel_arn)),
+            })
+        })?;
+        // When a channel expires is part of the channel's own configuration, so it is a
+        // moderator's to set, exactly as `UpdateChannel`'s members are.
+        if !channel.is_moderator(bearer) {
+            return Err(
+                PutChannelExpirationSettingsErrorModeled::ForbiddenException(ForbiddenException {
+                    code: Some("Forbidden".to_string()),
+                    message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // A PUT of the expiry sub-resource REPLACES it: the settings the request carries
+        // become the ones in force, and a request carrying none leaves the channel with
+        // no expiry at all.
+        channel.expiration_settings = input.expiration_settings;
+        channel.last_updated_millis = now;
+
+        Ok(PutChannelExpirationSettingsOutput {
+            channel_arn: Some(channel.arn.clone()),
+            expiration_settings: channel.expiration_settings.clone(),
+        })
     }
+}
+
+/// Refuse the request with this service's own client-input error, HTTP 400.
+fn bad_request(message: String) -> PutChannelExpirationSettingsError {
+    PutChannelExpirationSettingsErrorModeled::BadRequestException(BadRequestException {
+        code: Some("BadRequest".to_string()),
+        message: Some(message),
+    })
+    .into()
 }

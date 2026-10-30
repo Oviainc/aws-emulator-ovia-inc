@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the `Name`, `Mode` and `Metadata` the request supplies onto the stored channel
+//! and advances its `LastUpdatedTimestamp`, so the next `DescribeChannel` /
+//! `ListChannels` / `SearchChannels` reports the updated channel. A member the request
+//! omits is left as it was; a member it supplies is stored verbatim, including an empty
+//! `Metadata`, which that member's modelled `len 0..1024` makes a value it can hold
+//! (`Name` is `len 1..256`, so it has no empty value at all). The channel's `Privacy` is
+//! not an input, which is the model's way of stating the documented restriction that an
+//! update cannot change it.
 //!
 //! ## Shape of an operation
 //!
@@ -102,10 +102,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-chimesdkmessaging-chime
 // here — hence the `UpdateChannelError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.chimesdkmessaging#UpdateChannel")]
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// (`GetChannelMessage` lists it) that this operation's own error list omits: updating a
+// channel ARN that names no channel has to say the channel is not there, which is how
+// every other operation in this crate answers an ARN it holds no channel for.
+#[smithy_macros::operation_error(
+    "com.amazonaws.chimesdkmessaging#UpdateChannel",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateChannelErrorModeled {
     BadRequestException(BadRequestException),
+    NotFoundException(NotFoundException),
     ConflictException(ConflictException),
     ForbiddenException(ForbiddenException),
     ServiceFailureException(ServiceFailureException),
@@ -163,20 +171,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateChannelErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the channel store is unavailable".to_string()),
+            })
+        })?;
+
+        // `Mode` outside the `ChannelMode` catalog, and a `Name` or `Metadata` outside
+        // its modelled length, are refused by the boundary validator before this handler
+        // runs, so reaching here means every member is one the channel can hold.
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        let channel = store.channels.get_mut(&input.channel_arn).ok_or_else(|| {
+            UpdateChannelErrorModeled::NotFoundException(NotFoundException {
+                code: Some("NotFound".to_string()),
+                message: Some(format!("channel {} not found", input.channel_arn)),
+            })
+        })?;
+        // Editing the channel itself is a moderator's action, as creating a ban or
+        // promoting a moderator is: the channel's own configuration is not a plain
+        // member's to rewrite.
+        if !channel.is_moderator(&input.chime_bearer) {
+            return Err(UpdateChannelErrorModeled::ForbiddenException(ForbiddenException {
+                code: Some("Forbidden".to_string()),
+                message: Some(crate::state::INSUFFICIENT_ACCESS_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
+        // Each member the request SUPPLIES replaces the stored value; an omitted member
+        // leaves the stored one alone. A supplied `Metadata` is stored as it arrived: the
+        // member is modelled `len 0..1024`, so an empty string is one of its values and
+        // is reported as a present, empty `Metadata` rather than as an absent one.
+        if let Some(name) = input.name {
+            channel.name = name;
+        }
+        if let Some(mode) = input.mode {
+            channel.mode = mode;
+        }
+        if let Some(metadata) = input.metadata {
+            channel.metadata = Some(metadata);
+        }
+        // The accepted update is the channel's most recent write, whichever members it
+        // carried.
+        channel.last_updated_millis = now;
+
+        Ok(UpdateChannelOutput {
+            channel_arn: Some(channel.arn.clone()),
+        })
     }
 }
