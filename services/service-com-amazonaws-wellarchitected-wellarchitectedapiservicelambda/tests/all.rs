@@ -456,3 +456,17 @@ mod tag_family_envelopes;
 // for an agent suite is the one gap of this list every new agent suite lands in.
 #[path = "all/agent_recommendation_status_idempotence.rs"]
 mod agent_recommendation_status_idempotence;
+
+// Appended at the end of this list for the reason the notes above give: the sorted position
+// for a review-template suite falls in a crowded run of this list.
+#[path = "all/review_template_name_uniqueness.rs"]
+mod review_template_name_uniqueness;
+
+// Appended at the end of this list for the same reason as the declaration above.
+#[path = "all/review_template_not_found_wording.rs"]
+mod review_template_not_found_wording;
+
+// Appended at the end of this list for the same reason as the declarations above: the
+// sorted position for a workload suite falls in a crowded run of this list.
+#[path = "all/workload_ftr_support.rs"]
+mod workload_ftr_support;

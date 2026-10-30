@@ -293,6 +293,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {}
         }
 
+        // A review template's name identifies it within the account, so a request naming
+        // one another template already holds asks for a resource that exists — the
+        // modelled `ConflictException`'s own case — rather than for a second template
+        // under the same name. It is decided by the comparison this service applies to
+        // every name it meters for uniqueness (`crate::state::normalize_unique_name`), the
+        // one place that rule lives, and reports the template already holding the name, so
+        // a caller relying on create-or-conflict to make creation idempotent is handed the
+        // ARN later lookups by that name resolve to.
+        //
+        // It runs AFTER the idempotency replay above, so a genuine retry is still answered
+        // with the original request's result rather than with a collision against the
+        // template that retry itself created.
+        if let Some(existing) = store.review_template_holding_name(&input.template_name) {
+            let collision = crate::state::review_template_name_conflict(
+                &existing.template_name,
+                &existing.template_arn,
+            );
+            return Err(CreateReviewTemplateErrorModeled::ConflictException(collision).into());
+        }
+
         // Review templates are metered, and this operation models
         // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
         // the store bounded: the create tokens are 1:1 with a live template. The ceiling

@@ -81,7 +81,7 @@ fn assert_template_absent(answer: &Answer, template_arn: &str, case: &str) {
     assert_eq!(
         member(answer, "Message"),
         format!(
-            "[ResourceNotFound] No review template with ARN {template_arn} was found in \
+            "[ResourceNotFound] No Review Template with ARN {template_arn} was found in \
              account {}.",
             engine::emulator_account_id()
         ),

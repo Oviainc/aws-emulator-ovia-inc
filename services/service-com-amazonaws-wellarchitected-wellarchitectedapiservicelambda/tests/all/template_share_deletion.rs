@@ -144,7 +144,7 @@ fn assert_template_missing(case: &str, answer: &Answer, template_arn: &str) {
         answer,
         state::REVIEW_TEMPLATE_RESOURCE_TYPE,
         template_arn,
-        &format!("review template with ARN {template_arn}"),
+        &format!("Review Template with ARN {template_arn}"),
     );
 }
 

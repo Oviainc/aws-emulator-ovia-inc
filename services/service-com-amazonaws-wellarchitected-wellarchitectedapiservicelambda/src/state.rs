@@ -2695,6 +2695,13 @@ impl WorkloadRecord {
     /// ([`Self::risk_counts`]).
     pub fn to_workload(&self, content: &ReviewedLensContent) -> Workload {
         Workload {
+            // Whether this workload is supported for a Foundational Technical Review. No
+            // operation this service exposes enrols a workload in that review, and no
+            // lens in this emulator's catalog is its lens, so no workload this store
+            // holds is FTR-supported. It is REPORTED rather than omitted, so a caller
+            // reading the flag to decide whether to offer the workflow can tell "not
+            // supported" from "unknown".
+            ftr_supported: Some(false),
             workload_id: Some(self.workload_id.clone()),
             workload_arn: Some(self.workload_arn.clone()),
             workload_name: Some(self.workload_name.clone()),
@@ -7652,6 +7659,23 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         ))
     }
 
+    /// The review template already holding `name` under the service's own loose
+    /// comparison ([`normalize_unique_name`]), if one holds it: a review template's name
+    /// identifies it within the account, so the scope of the lookup is the whole store
+    /// and a spelling differing only in capitalization or whitespace finds the same
+    /// template.
+    ///
+    /// The record it answers with is the template AS STORED, which is what
+    /// [`review_template_name_conflict`] reports rather than the caller's spelling of the
+    /// name. The scan is over a store bounded by [`MAX_REVIEW_TEMPLATES`], exactly as
+    /// [`Self::milestone_holding_name`] scans the milestones of one workload.
+    pub fn review_template_holding_name(&self, name: &str) -> Option<&ReviewTemplateRecord> {
+        let normalized = normalize_unique_name(name);
+        self.review_templates
+            .values()
+            .find(|record| normalize_unique_name(&record.template_name) == normalized)
+    }
+
     /// The milestone `number` recorded for `workload_id`, if one is.
     pub fn milestone(&self, workload_id: &str, number: i32) -> Option<&MilestoneRecord> {
         self.milestones.get(workload_id)?.get(&number)
@@ -8198,7 +8222,9 @@ fn take_share<R>(
 /// (`smithy_query(query="shape", shape="WorkloadName")`) — and it is how every name
 /// this service meters for uniqueness is compared, so the rule cannot differ between
 /// the resources that carry it: a workload name (through
-/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::workload_name_index`])
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::workload_name_index`]),
+/// a review template's name within the account (through
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::review_template_holding_name`])
 /// and a milestone name within its workload (through
 /// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::milestone_holding_name`]).
 pub fn normalize_unique_name(name: &str) -> String {
@@ -9319,11 +9345,14 @@ pub fn too_many_profile_arns_exception(named: usize) -> crate::ops::types::Valid
 /// [`resource_not_found`] for a template ARN that names no stored review template.
 /// Shared by every operation that resolves a `TemplateArn`, so they cannot word it
 /// differently.
+///
+/// The resource noun is the service's own display noun for this resource class —
+/// capitalised `Review Template`, as AWS words this failure for a review template.
 pub fn review_template_not_found(template_arn: &str) -> ResourceNotFoundException {
     resource_not_found(
         REVIEW_TEMPLATE_RESOURCE_TYPE,
         template_arn.to_string(),
-        &format!("review template with ARN {template_arn}"),
+        &format!("Review Template with ARN {template_arn}"),
     )
 }
 
@@ -9723,6 +9752,26 @@ pub fn workload_name_conflict(existing_name: &str, existing_id: &str) -> Conflic
         WORKLOAD_RESOURCE_TYPE,
         existing_id.to_string(),
         &format!("A workload with name {existing_name} already exists."),
+    )
+}
+
+/// [`conflict`] for a review template name that is already taken: a review template's
+/// name identifies it within the account, so a create or a rename that would leave two
+/// templates holding one name is refused.
+///
+/// Worded as AWS words this failure for a review template, and decided by the comparison
+/// this service applies to every name it meters for uniqueness
+/// ([`normalize_unique_name`]). `existing_name` / `existing_arn` are the stored name and
+/// ARN of the template already holding the name, so the caller is told which template to
+/// fetch rather than its own spelling of the name.
+pub fn review_template_name_conflict(
+    existing_name: &str,
+    existing_arn: &str,
+) -> ConflictException {
+    conflict(
+        REVIEW_TEMPLATE_RESOURCE_TYPE,
+        existing_arn.to_string(),
+        &format!("A review template with name {existing_name} already exists."),
     )
 }
 

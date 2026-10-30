@@ -308,6 +308,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // BEFORE the template is taken for writing.
         let reviews = store.applied_lens_reviews(&fresh, now);
 
+        // A rename has to leave the account's template names unique, so it is resolved
+        // BEFORE anything is mutated: the same rule `CreateReviewTemplate` enforces, from
+        // the one place the lookup lives, so which path a name arrived through cannot
+        // change whether two templates may hold it. A request renaming a template to the
+        // name it already holds collides with itself and is not refused.
+        if let Some(new_name) = &input.template_name {
+            if let Some(existing) = store.review_template_holding_name(new_name) {
+                if existing.template_arn != input.template_arn {
+                    let collision = crate::state::review_template_name_conflict(
+                        &existing.template_name,
+                        &existing.template_arn,
+                    );
+                    return Err(
+                        UpdateReviewTemplateErrorModeled::ConflictException(collision).into()
+                    );
+                }
+            }
+        }
+
         let template = store
             .review_templates
             .get_mut(&input.template_arn)

@@ -13,7 +13,9 @@
 //!    stored state.
 //! 2. A `ClientRequestToken` makes the create idempotent: the same token with the same
 //!    parameters returns the original template, the same token with different parameters
-//!    is a `409 ConflictException`, and a fresh token creates a second template.
+//!    is a `409 ConflictException`, and a fresh token creates a second template — under a
+//!    name no stored template holds, since a fresh token does not make a taken name free
+//!    (`super::review_template_name_uniqueness` pins that rule).
 //! 3. A `TemplateArn` is RESOLVED against the store: one naming no stored template is a
 //!    `404 ResourceNotFoundException` carrying the ARN as sent and the missing
 //!    resource's type.
@@ -377,14 +379,34 @@ async fn the_client_request_token_makes_the_create_idempotent() {
         );
     }
 
-    // A fresh token with the same parameters is a second, distinct template.
+    // A fresh token does NOT make the name free: a template already holds it, so the
+    // create collides on the name rather than minting a second template under it. The
+    // conflict names the template that holds it, which is the ARN the first create
+    // answered with.
     let mut second_request = original.clone();
     second_request["ClientRequestToken"] = json!("tok-idempotent-2");
+    let refused = client.create_review_template(second_request).await;
+    assert_eq!(
+        refused.status, 409,
+        "case \"fresh-token\": a duplicate name must be refused, got {refused:?}"
+    );
+    assert_eq!(
+        member(&refused, "ResourceId"),
+        arn,
+        "case \"fresh-token\": the conflict must name the template holding the name, \
+         got {refused:?}"
+    );
+
+    // …and a fresh token WITH a free name is a second, distinct template.
+    let mut second_request = original.clone();
+    second_request["ClientRequestToken"] = json!("tok-idempotent-3");
+    second_request["TemplateName"] = json!("idempotent-template-two");
     let second = client.create_review_template(second_request).await;
-    let second_arn = created_arn(&second, "fresh-token");
+    let second_arn = created_arn(&second, "fresh-token-fresh-name");
     assert_ne!(
         second_arn, arn,
-        "case \"fresh-token\": a fresh token must create a second template"
+        "case \"fresh-token-fresh-name\": a fresh token and a free name must create a \
+         second template"
     );
 }
 
@@ -454,7 +476,7 @@ async fn a_template_arn_that_names_no_template_is_a_not_found() {
         assert_eq!(
             member(&answer, "Message"),
             format!(
-                "[ResourceNotFound] No review template with ARN {template_arn} was found in \
+                "[ResourceNotFound] No Review Template with ARN {template_arn} was found in \
                  account {}.",
                 engine::emulator_account_id()
             ),

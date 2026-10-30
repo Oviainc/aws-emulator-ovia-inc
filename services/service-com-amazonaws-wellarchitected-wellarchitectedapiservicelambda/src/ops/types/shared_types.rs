@@ -296,6 +296,13 @@ pub struct WorkloadProfile {
 #[smithy_macros::smithy(shape = "com.amazonaws.wellarchitected#Workload")]
 #[derive(Debug, Clone, Default)]
 pub struct Workload {
+    /// Whether this workload is supported for a Foundational Technical Review. The member
+    /// was added to this service's on-disk model from the recorded AWS responses — the
+    /// shipped model snapshot carries no such member on this shape, while AWS reports the
+    /// flag on a workload it returns — and its value is projected by
+    /// [`crate::state::WorkloadRecord::to_workload`], the one place a stored workload
+    /// becomes this shape.
+    pub ftr_supported: Option<bool>,
     pub workload_id: Option<String>,
     pub workload_arn: Option<String>,
     pub workload_name: Option<String>,
