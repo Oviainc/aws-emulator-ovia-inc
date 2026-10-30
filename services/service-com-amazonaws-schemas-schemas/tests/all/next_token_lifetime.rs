@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::state::{
-    encode_next_token, schema_name_order_key, selection_fingerprint, NEXT_TOKEN_TTL,
+    encode_next_token, selection_fingerprint, NEXT_TOKEN_TTL,
 };
 
 use crate::discoverer_state::{source_arn, DISCOVERERS_URI};
@@ -168,7 +168,10 @@ async fn a_next_token_resumes_its_listing_only_until_it_expires() {
                 "ListSchemas",
                 &[("registryName", REGISTRY), ("schemaNamePrefix", "")],
             ),
-            resume_after: schema_name_order_key(schemas[0]),
+            // A listing of schemas resumes after a schema NAME: the order a listing
+            // is served in is the codepoint order of those names, so the name is the
+            // key a token carries.
+            resume_after: schemas[0].to_string(),
             expected: vec![schemas[1].to_string()],
             items: schema_names,
         },

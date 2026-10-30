@@ -59,6 +59,8 @@ mod name_constraints;
 mod next_token_lifetime;
 #[path = "all/policy_registry_name.rs"]
 mod policy_registry_name;
+#[path = "all/published_catalogue_entries.rs"]
+mod published_catalogue_entries;
 #[path = "all/published_document_bytes.rs"]
 mod published_document_bytes;
 #[path = "all/registry_schema_lifecycle.rs"]

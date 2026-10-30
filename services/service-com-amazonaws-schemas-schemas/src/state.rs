@@ -1559,6 +1559,11 @@ impl Schema {
 /// types and no CloudTrail-delivered schema at all, in which case it appears here and
 /// not in [`AWS_EVENT_SOURCES`].
 ///
+/// Where AWS has published ONE event type under more than one `detail-type` spelling —
+/// a legacy name and a current one, differing in a letter's case — the catalogue holds
+/// the entry each spelling yields, because each is a name a client resolves by, so both
+/// are written out as rows of their own.
+///
 /// Source: the `detail` of each event as AWS documents it (the EventBridge event
 /// reference for the publishing service); the `detail_type` is the `detail-type`
 /// EventBridge delivers it under and the `event_name` is the name the catalogue
@@ -1626,11 +1631,22 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
         event_name: "AWSHealthEvent",
         components: r##"{"AWSHealthEvent":{"type":"object","required":["eventArn","eventTypeCategory","eventTypeCode","service","startTime"],"properties":{"affectedEntities":{"type":"array","items":{"$ref":"#/components/schemas/AWSHealthAffectedEntity"}},"endTime":{"type":"string"},"eventArn":{"type":"string"},"eventDescription":{"type":"array","items":{"$ref":"#/components/schemas/AWSHealthEventDescription"}},"eventTypeCategory":{"type":"string"},"eventTypeCode":{"type":"string"},"service":{"type":"string"},"startTime":{"type":"string"}}},"AWSHealthAffectedEntity":{"type":"object","properties":{"entityValue":{"type":"string"},"status":{"type":"string"}}},"AWSHealthEventDescription":{"type":"object","properties":{"language":{"type":"string"},"latestDescription":{"type":"string"}}}}"##,
     },
+    // The tag-change event, published under BOTH spellings AWS has published it as:
+    // the `detail-type` has been written with a lower-case and with a capital "on", and
+    // the catalogue holds the entry each spelling yields — see
+    // [`aws_managed_event_types`] on why two spellings are two entries. One components
+    // template serves them, because they describe the SAME event.
     ManagedEventType {
         source: "aws.tag",
         detail_type: "Tag Change on Resource",
         event_name: "TagChangeonResource",
-        components: r##"{"TagChangeonResource":{"type":"object","required":["changed-tag-keys","resource-type","service","version"],"properties":{"changed-tag-keys":{"type":"array","items":{"type":"string"}},"resource-type":{"type":"string"},"service":{"type":"string"},"tags":{"type":"object"},"version":{"type":"integer"}}}}"##,
+        components: TAG_CHANGE_COMPONENTS,
+    },
+    ManagedEventType {
+        source: "aws.tag",
+        detail_type: "Tag Change On Resource",
+        event_name: "TagChangeOnResource",
+        components: TAG_CHANGE_COMPONENTS,
     },
     ManagedEventType {
         source: "aws.acm",
@@ -1668,6 +1684,37 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
         "UnusedAccessFindingforIAMentities",
     ),
     ManagedEventType::identified(
+        "aws.account",
+        "Region Opt-In Status Change",
+        "RegionOpt-InStatusChange",
+    ),
+    // The certificate lifecycle event types `aws.acm` publishes. The two revocation
+    // entries whose names differ only in a letter's case are two entries, not one: AWS
+    // has published the revocation event under more than one `detail-type` spelling and
+    // the catalogue holds each of them.
+    ManagedEventType::identified(
+        "aws.acm",
+        "ACM Certificate Approaching Expiration",
+        "ACMCertificateApproachingExpiration",
+    ),
+    ManagedEventType::identified("aws.acm", "ACM Certificate Expired", "ACMCertificateExpired"),
+    ManagedEventType::identified(
+        "aws.acm",
+        "ACM Certificate Renewal Action Required",
+        "ACMCertificateRenewalActionRequired",
+    ),
+    ManagedEventType::identified("aws.acm", "ACM Certificate Revoked", "ACMCertificateRevoked"),
+    ManagedEventType::identified(
+        "aws.acm",
+        "ACM Certificate Revoked By CA",
+        "ACMCertificateRevokedByCA",
+    ),
+    ManagedEventType::identified(
+        "aws.acm",
+        "ACM Certificate Revoked by Certificate Authority CA",
+        "ACMCertificateRevokedbyCertificateAuthorityCA",
+    ),
+    ManagedEventType::identified(
         "aws.acm-pca",
         "ACM Private CA Audit Report Generation",
         "ACMPrivateCAAuditReportGeneration",
@@ -1697,10 +1744,53 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
         "Trust Bundle Association Version Updated",
         "TrustBundleAssociationVersionUpdated",
     ),
+    // The investigation lifecycle `aws.aidevops` publishes: one event type per state an
+    // investigation reaches.
+    ManagedEventType::identified(
+        "aws.aidevops",
+        "Investigation Cancelled",
+        "InvestigationCancelled",
+    ),
+    ManagedEventType::identified(
+        "aws.aidevops",
+        "Investigation Completed",
+        "InvestigationCompleted",
+    ),
+    ManagedEventType::identified(
+        "aws.aidevops",
+        "Investigation Created",
+        "InvestigationCreated",
+    ),
+    ManagedEventType::identified("aws.aidevops", "Investigation Failed", "InvestigationFailed"),
+    ManagedEventType::identified(
+        "aws.aidevops",
+        "Investigation In Progress",
+        "InvestigationInProgress",
+    ),
+    ManagedEventType::identified("aws.aidevops", "Investigation Linked", "InvestigationLinked"),
+    ManagedEventType::identified(
+        "aws.aidevops",
+        "Investigation Pending Triage",
+        "InvestigationPendingTriage",
+    ),
+    ManagedEventType::identified(
+        "aws.appflow",
+        "AppFlow Automatic Field Import Report",
+        "AppFlowAutomaticFieldImportReport",
+    ),
     ManagedEventType::identified(
         "aws.application-autoscaling",
         "Application Auto Scaling Scaling Activity State Change",
         "ApplicationAutoScalingScalingActivityStateChange",
+    ),
+    // The spelling of the API-call `detail-type` the catalogue publishes for
+    // `aws.autoscaling` BESIDE the one [`CLOUD_TRAIL_EVENT_FAMILY`] carries: AWS has
+    // published this event with a capital and with a lower-case "via", and a client
+    // resolving either spelling by name reads the entry for it.
+    ManagedEventType::cloud_trail(
+        "aws.autoscaling",
+        "AWS API Call Via CloudTrail",
+        "AWSAPICallViaCloudTrail",
     ),
     ManagedEventType::identified(
         "aws.cleanrooms",
@@ -1807,6 +1897,24 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
     // scheduled event ([`AWS_SERVICE_EVENT_TYPES`] above, which carries a document)
     // and the one whose payload is JSON.
     ManagedEventType::identified("aws.events", "Scheduled Json", "ScheduledJson"),
+    // `aws.labs` and `aws.maester` publish their own event types and NOTHING of the
+    // CloudTrail-delivered family, which is why neither is in [`AWS_EVENT_SOURCES`].
+    ManagedEventType::identified("aws.labs", "Lab Auto Cancelled", "LabAutoCancelled"),
+    ManagedEventType::identified("aws.labs", "Lab Cost Alert", "LabCostAlert"),
+    ManagedEventType::identified("aws.labs", "Lab Cost Update", "LabCostUpdate"),
+    ManagedEventType::identified(
+        "aws.labs",
+        "Lab Launch Status Change",
+        "LabLaunchStatusChange",
+    ),
+    ManagedEventType::identified(
+        "aws.labs",
+        "Lab Termination Status Change",
+        "LabTerminationStatusChange",
+    ),
+    ManagedEventType::identified("aws.maester", "Document Created", "DocumentCreated"),
+    ManagedEventType::identified("aws.maester", "Document Deleted", "DocumentDeleted"),
+    ManagedEventType::identified("aws.maester", "Document Updated", "DocumentUpdated"),
 ];
 
 /// The `components.schemas` of an event type whose `detail` AWS publishes no member
@@ -1820,6 +1928,16 @@ pub const AWS_SERVICE_EVENT_TYPES: &[ManagedEventType] = &[
 /// generated model reject real events. So the component says exactly what is known:
 /// the `detail` is a JSON object.
 const UNDOCUMENTED_DETAIL: &str = r##"{"{EventName}":{"type":"object"}}"##;
+
+/// The `components.schemas` of the tag-change event, excluding the envelope
+/// [`event_schema_document`] renders around them.
+///
+/// Source: the `detail` AWS documents for the tag-change event (the EventBridge event
+/// reference for tag changes). The component is named by
+/// [`EVENT_COMPONENT_PLACEHOLDER`], because the catalogue publishes this one event under
+/// each spelling of its `detail-type`, and each spelling is published under its own
+/// component name.
+const TAG_CHANGE_COMPONENTS: &str = r##"{"{EventName}":{"type":"object","required":["changed-tag-keys","resource-type","service","version"],"properties":{"changed-tag-keys":{"type":"array","items":{"type":"string"}},"resource-type":{"type":"string"},"service":{"type":"string"},"tags":{"type":"object"},"version":{"type":"integer"}}}}"##;
 
 /// The token a components template carries where the event type's own component name
 /// goes, substituted by [`ManagedEventType::components_json`].
@@ -1840,10 +1958,24 @@ const EVENT_COMPONENT_PLACEHOLDER: &str = "{EventName}";
 /// count a listing reports stays what the store actually holds.
 ///
 /// Source: the counts AWS reports for these entries. Anything not named here is
-/// published at one version, which is the catalogue's norm.
+/// published at one version, which is the catalogue's norm. The count is PER ENTRY and
+/// not a property of the source: entries of one source carry different counts, so a row
+/// is written for each entry the catalogue publishes more than one version of.
 const MANAGED_VERSION_COUNTS: &[(&str, u64)] = &[
     ("aws.a4b@RoomStateChange", 3),
+    ("aws.acm@ACMCertificateApproachingExpiration", 3),
     ("aws.acm@ACMCertificateAvailable", 3),
+    ("aws.acm@ACMCertificateExpired", 3),
+    ("aws.acm@ACMCertificateRenewalActionRequired", 3),
+    ("aws.acm@ACMCertificateRevoked", 2),
+    ("aws.aidevops@InvestigationCancelled", 2),
+    ("aws.aidevops@InvestigationCompleted", 2),
+    ("aws.aidevops@InvestigationCreated", 2),
+    ("aws.aidevops@InvestigationFailed", 2),
+    ("aws.aidevops@InvestigationInProgress", 2),
+    ("aws.aidevops@InvestigationLinked", 2),
+    ("aws.aidevops@InvestigationPendingTriage", 2),
+    ("aws.tag@TagChangeOnResource", 4),
 ];
 
 /// The number of versions the catalogue publishes for the schema named — see
@@ -2454,17 +2586,65 @@ pub struct ManagedSchema {
 /// makes every entry report the same instant, moves that instant on every boot, and so
 /// invalidates every client's cache on every run.
 ///
-/// AWS publishes no rule for the instant itself, so it is derived from the one thing
-/// that identifies the schema and never changes — its name — by a stable digest, and
-/// placed in the window the catalogue has been maintained over ([`CATALOGUE_EPOCH`],
-/// [`CATALOGUE_SPAN`]). Derived, not stored: the catalogue is built from constants, so
-/// every process derives the same instant for the same name.
+/// An entry the catalogue publishes a publication instant OF ITS OWN for carries it as
+/// seed data ([`MANAGED_PUBLICATION_INSTANTS`]), because such an instant is a fact about
+/// that one entry and no function of its name. For an entry the catalogue publishes no
+/// instant for, it is derived from the one thing that identifies the schema and never
+/// changes — its name — by a stable digest, placed in the window the catalogue has been
+/// maintained over ([`CATALOGUE_EPOCH_SECONDS`], [`CATALOGUE_SPAN_SECONDS`]), so every
+/// process derives the same instant for the same name.
 pub fn managed_last_modified(schema_name: &str) -> SystemTime {
+    if let Some((_, published)) = MANAGED_PUBLICATION_INSTANTS
+        .iter()
+        .find(|(name, _)| *name == schema_name)
+    {
+        return published_instant(published);
+    }
     let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(schema_name.as_bytes());
     let mut offset = [0u8; 8];
     offset.copy_from_slice(&digest[..8]);
     let seconds = u64::from_be_bytes(offset) % CATALOGUE_SPAN_SECONDS;
     SystemTime::UNIX_EPOCH + Duration::from_secs(CATALOGUE_EPOCH_SECONDS + seconds)
+}
+
+/// The instant the catalogue publishes as a schema's `LastModified`, for the entries it
+/// publishes one of their own for.
+///
+/// Some published entries carry a historical publication instant that belongs to that
+/// entry alone — two entries of one source, named alike but for a letter's case, report
+/// instants years apart — so the instant is CATALOGUE DATA, seeded per entry like the
+/// entry's name, its version count and its document, and nothing about the name yields
+/// it. An entry absent from this table has no published instant to report, and
+/// [`managed_last_modified`] derives a stable one for it instead.
+///
+/// Each value is a whole-second `date-time`, as [`published_instant`] reads it.
+const MANAGED_PUBLICATION_INSTANTS: &[(&str, &str)] = &[
+    (
+        "aws.autoscaling@AWSAPICallViaCloudTrail",
+        "2019-12-01T00:59:43Z",
+    ),
+    ("aws.tag@TagChangeOnResource", "2022-03-24T16:40:20Z"),
+];
+
+/// One of [`MANAGED_PUBLICATION_INSTANTS`]' values as an instant.
+///
+/// Read by the same `date-time` reader the wire uses, so a seeded instant is exactly
+/// the instant its text names rather than one hand-computed from calendar arithmetic
+/// here. Panics for text that is not a `date-time`: these are constants, so that is a
+/// typo in the table rather than a runtime condition, and it fails in every build
+/// instead of making an entry report an instant the catalogue does not publish.
+fn published_instant(text: &str) -> SystemTime {
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        text,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| {
+        panic!("the seeded publication instant {text:?} must be a date-time: {error}")
+    });
+    let seconds = u64::try_from(parsed.secs()).unwrap_or_else(|_| {
+        panic!("the seeded publication instant {text:?} must be after the Unix epoch")
+    });
+    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
 }
 
 /// The start of the window the AWS-managed catalogue's publication instants fall in,
@@ -2719,8 +2899,8 @@ pub fn aws_managed_schemas() -> &'static [ManagedSchema] {
 /// see [`Registry::schema_arn_in`].
 ///
 /// Nothing here reads the clock: every instant a catalogue entry reports is the
-/// published schema's own, derived from its name ([`managed_last_modified`]), so two
-/// stores seeded at two different moments report the same catalogue.
+/// published schema's own ([`managed_last_modified`]), so two stores seeded at two
+/// different moments report the same catalogue.
 fn aws_managed_registries() -> BTreeMap<String, Registry> {
     let mut registries: BTreeMap<String, Registry> = AWS_MANAGED_REGISTRIES
         .iter()
@@ -3345,10 +3525,17 @@ pub struct Page<T> {
     pub next_token: Option<String>,
 }
 
-/// Collate a listing of a registry's schemas: the schemas `entries` names, paired with
-/// the key [`schema_name_order_key`] collates each name under, in that key's order —
-/// which is the order `ListSchemas` and `SearchSchemas` serve a registry's schemas in
-/// and [`page_by_key`] then pages over.
+/// Collate a listing of a registry's schemas: the schemas `entries` names, each paired
+/// with its own `SchemaName`, in the CODEPOINT order of those names — which is the
+/// order `ListSchemas` and `SearchSchemas` serve a registry's schemas in and
+/// [`page_by_key`] then pages over.
+///
+/// The order is the names' codepoints and nothing else: a name's own characters decide
+/// its place, so an upper-case letter precedes the lower-case one at the same position
+/// and punctuation participates like any other character. That makes the order total
+/// over distinct names — a `NextToken` names a POSITION in it, so an order two distinct
+/// names could share would make a resumed walk skip or repeat one of them — and it is
+/// exactly how [`page_by_key`] compares keys, as strings.
 ///
 /// The names are collated, not the values: this orders the WHOLE selection (so the
 /// caller filters cheaply before it, or lazily over the result) and touches nothing but
@@ -3357,50 +3544,11 @@ pub fn in_schema_name_order<'a, V>(
     entries: impl Iterator<Item = (&'a String, V)>,
 ) -> Vec<(String, V)> {
     let mut collated: Vec<(String, V)> = entries
-        .map(|(name, value)| (schema_name_order_key(name), value))
+        .map(|(name, value)| (name.clone(), value))
         .collect();
     collated.sort_by(|(left, _), (right, _)| left.cmp(right));
     collated
 }
-
-/// The key a `SchemaName` is collated under in a listing of schemas.
-///
-/// A registry is NOT served in byte order of its schema names: the published catalogue
-/// orders `aws.application-autoscaling@ApplicationAutoScalingScalingActivityStateChange`
-/// ahead of `aws.application-autoscaling@AWSAPICallviaCloudTrail` (which needs case to
-/// be folded, since `A` < `a` byte-wise would decide it the other way) and
-/// `aws.autoscaling@AWSAPICallviaCloudTrail` ahead of
-/// `aws.autoscaling-plans@AWSAPICallviaCloudTrail` (which needs the punctuation to be
-/// left out, since `-` < `@` byte-wise would decide it the other way). So the collation
-/// compares a name's LETTERS AND DIGITS, case-folded, and nothing else.
-///
-/// Two names can fold to the same letters and digits (one `-` apart, or one letter's
-/// case apart), and a listing's order has to be total — a `NextToken` names a POSITION
-/// in it, so two names it cannot separate would make a resumed walk skip or repeat one
-/// of them. The raw name therefore breaks the tie, after
-/// [`COLLATION_TIEBREAK_SEPARATOR`]: that separator is below every byte a folded half
-/// can hold, so comparing two of these keys as strings is exactly comparing their
-/// `(folded, raw)` pairs — which is what lets [`page_by_key`] keep comparing keys as
-/// strings.
-pub fn schema_name_order_key(schema_name: &str) -> String {
-    let mut key: String = schema_name
-        .chars()
-        .filter(|character| character.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
-    key.push(COLLATION_TIEBREAK_SEPARATOR);
-    key.push_str(schema_name);
-    key
-}
-
-/// What separates the two halves of a [`schema_name_order_key`]: the folded half it
-/// collates by, and the raw name that breaks a tie between two names that fold alike.
-///
-/// A folded half holds only alphanumeric characters, every one of which encodes to
-/// bytes above this one, so the separator cannot appear inside a half and a key's
-/// string order is its `(folded, raw)` order — including where one folded half is a
-/// prefix of another, which this byte makes the shorter one.
-const COLLATION_TIEBREAK_SEPARATOR: char = '\u{1}';
 
 /// Render the fingerprint of a listing's selection: the listing itself, and the
 /// request members that decide WHICH items it contains, each with the value this
@@ -3498,8 +3646,8 @@ fn decode_next_token(selection: &str, token: &str, now: SystemTime) -> Option<St
 /// Take one page out of a key-ordered sequence.
 ///
 /// `entries` must be ordered by key (a `BTreeMap`'s iteration order is, and
-/// [`in_schema_name_order`]'s output is ordered by the collation key it pairs each
-/// item with). The page starts strictly after the key `token` encodes and holds at most
+/// [`in_schema_name_order`]'s output is ordered by the name it pairs each item with).
+/// The page starts strictly after the key `token` encodes and holds at most
 /// `page_size` items; `next_token` is minted only when a further entry exists, so the
 /// last page of a listing carries none.
 ///
@@ -4213,16 +4361,16 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
     }
 
-    /// The collation a listing of schemas serves is the order of each name's letters
-    /// and digits, case-folded, with the raw name breaking a tie — and comparing the
-    /// composite keys as strings is exactly comparing those `(folded, raw)` pairs.
+    /// [`in_schema_name_order`] puts a selection into the CODEPOINT order of its schema
+    /// names, whatever order the store handed it over in, and pairs each item with the
+    /// name itself — the key [`page_by_key`] then compares.
     ///
     /// Driven over a generated cross product rather than a handful of names: every
     /// combination of a separator, a casing and a trailing fragment, which is what the
-    /// rule generalises over. The expectation is computed independently of
-    /// [`schema_name_order_key`], from the pair itself.
+    /// rule generalises over. The expectation is computed independently of the helper,
+    /// by comparing the names character by character.
     #[test]
-    fn a_schema_name_collates_by_its_letters_and_digits() {
+    fn a_selection_is_collated_in_codepoint_order_of_its_names() {
         // Fragments crossed into names: the separators a schema name carries, both
         // casings of the words around them, and tails that differ in length, in digits
         // and in nothing but case.
@@ -4241,73 +4389,39 @@ mod tests {
         names.sort_unstable();
         names.dedup();
 
-        // The pair the collation is DEFINED by, computed here without the key.
-        let pair = |name: &str| -> (String, String) {
-            (
-                name.chars()
-                    .filter(|character| character.is_alphanumeric())
-                    .flat_map(char::to_lowercase)
-                    .collect(),
-                name.to_string(),
-            )
-        };
+        // The order the rule names, computed without the helper.
+        let mut expected = names.clone();
+        expected.sort_by(|left, right| left.chars().cmp(right.chars()));
 
-        for left in &names {
-            for right in &names {
-                let case = (left, right);
-                let by_key = schema_name_order_key(left).cmp(&schema_name_order_key(right));
-                let by_pair = pair(left).cmp(&pair(right));
-                assert_eq!(
-                    by_key, by_pair,
-                    "case {case:?}: the key order must be the (folded, raw) order, \
-                     got {by_key:?} against {by_pair:?}"
-                );
-            }
-        }
+        // Handed over in the REVERSE of it, so no case could pass by reporting the
+        // order it was given.
+        let stored: Vec<String> = expected.iter().rev().cloned().collect();
+        let collated = in_schema_name_order(stored.iter().map(|name| (name, name)));
 
-        // A key is a total order over distinct names: no two of them share one, so a
-        // `NextToken` naming a position can never be ambiguous.
-        let keys: BTreeSet<String> = names.iter().map(|name| schema_name_order_key(name)).collect();
-        assert_eq!(
-            keys.len(),
-            names.len(),
-            "every distinct name must have its own key, got {} keys for {} names",
-            keys.len(),
-            names.len()
-        );
-    }
-
-    /// [`in_schema_name_order`] puts a selection into exactly that order, whatever
-    /// order the store handed it over in.
-    #[test]
-    fn a_selection_is_collated_before_it_is_paged() {
-        // Source: the two orderings a byte comparison answers the other way round —
-        // one decided by case, one by punctuation.
-        let stored: Vec<String> = [
-            "svc.autoscaling-plans@AWSAPICallviaCloudTrail",
-            "svc.autoscaling@AWSAPICallViaCloudTrail",
-            "svc.autoscaling@AWSAPICallviaCloudTrail",
-            "svc.application-autoscaling@AWSAPICallviaCloudTrail",
-            "svc.application-autoscaling@ApplicationAutoScalingScalingActivityStateChange",
-        ]
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect();
-
-        let collated: Vec<&str> = in_schema_name_order(stored.iter().map(|name| (name, name)))
-            .into_iter()
-            .map(|(_, name)| name.as_str())
+        let served: Vec<String> = collated
+            .iter()
+            .map(|(_, name)| (*name).to_string())
             .collect();
         assert_eq!(
-            collated,
-            vec![
-                "svc.application-autoscaling@ApplicationAutoScalingScalingActivityStateChange",
-                "svc.application-autoscaling@AWSAPICallviaCloudTrail",
-                "svc.autoscaling@AWSAPICallViaCloudTrail",
-                "svc.autoscaling@AWSAPICallviaCloudTrail",
-                "svc.autoscaling-plans@AWSAPICallviaCloudTrail",
-            ],
-            "the selection must come out in the collated order"
+            served, expected,
+            "the selection must come out in the codepoint order of its names"
+        );
+        for (key, name) in &collated {
+            assert_eq!(
+                key, *name,
+                "case {name:?}: the paging key of an item is its own name, got {key:?}"
+            );
+        }
+
+        // That key is a total order over distinct names: no two of them share one, so a
+        // `NextToken` naming a position can never be ambiguous.
+        let keys: BTreeSet<&String> = collated.iter().map(|(key, _)| key).collect();
+        assert_eq!(
+            keys.len(),
+            collated.len(),
+            "every distinct name must have its own key, got {} keys for {} names",
+            keys.len(),
+            collated.len()
         );
     }
 

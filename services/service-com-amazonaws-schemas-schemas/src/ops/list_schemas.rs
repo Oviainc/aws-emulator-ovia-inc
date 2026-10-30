@@ -212,10 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         // Selected first (a prefix is a test on the name alone), then COLLATED: the
-        // order a registry's schemas come back in is the collation
-        // `crate::state::schema_name_order_key` defines, not the byte order the store
-        // keys them by, and `Limit`/`NextToken` page over that order — so the page a
-        // token resumes is a page of the order the caller was served.
+        // order a registry's schemas come back in is the codepoint order of their
+        // names (`crate::state::in_schema_name_order`), and `Limit`/`NextToken` page
+        // over that order — so the page a token resumes is a page of the order the
+        // caller was served.
         let matching = crate::state::in_schema_name_order(registry.schemas.iter().filter(
             |(name, _)| {
                 input

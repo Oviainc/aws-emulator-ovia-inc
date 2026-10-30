@@ -246,8 +246,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         // The schemas are COLLATED first — a search of a registry reports its matches
-        // in the same order a listing of it does, the collation
-        // `crate::state::schema_name_order_key` defines — and the keyword match runs
+        // in the same order a listing of it does, the codepoint order of their names
+        // (`crate::state::in_schema_name_order`) — and the keyword match runs
         // LAZILY over that order: `page_by_key` pulls from this filter only until the
         // page is full plus one, so a search that finds its page early stops there and
         // reads no further schema's documents.

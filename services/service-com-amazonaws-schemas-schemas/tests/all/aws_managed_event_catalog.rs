@@ -16,8 +16,8 @@
 
 use serde_json::Value;
 use service_com_amazonaws_schemas_schemas::state::{
-    aws_managed_schemas, schema_name_order_key, ManagedSchema, AWS_EVENT_SOURCES,
-    AWS_MANAGED_REGISTRY, AWS_MANAGED_SCHEMA_TYPE, AWS_SERVICE_EVENT_TYPES, CLOUD_TRAIL_EVENT_NAME,
+    aws_managed_schemas, ManagedSchema, AWS_EVENT_SOURCES, AWS_MANAGED_REGISTRY,
+    AWS_MANAGED_SCHEMA_TYPE, AWS_SERVICE_EVENT_TYPES, CLOUD_TRAIL_EVENT_NAME,
     EVENT_ENVELOPE_COMPONENT, MAX_PAGE_SIZE,
 };
 
@@ -100,7 +100,9 @@ async fn the_catalogue_holds_the_api_call_event_type_of_every_cloud_trail_source
         }
     }
 
-    // Every service-specific event type the catalogue names is published too.
+    // Every service-specific event type the catalogue names is published too. The
+    // prefix is the whole name, so the listing holds that entry — and, where the
+    // catalogue publishes a longer name starting with it, those entries too.
     for event in AWS_SERVICE_EVENT_TYPES {
         let expected = event.schema_name();
         let listed = emulator
@@ -110,11 +112,18 @@ async fn the_catalogue_holds_the_api_call_event_type_of_every_cloud_trail_source
                 None,
             )
             .await;
-        assert_eq!(
-            schema_names(&listed),
-            vec![expected.clone()],
-            "case {expected:?}: the catalogue must publish exactly it"
+        let names = schema_names(&listed);
+        assert!(
+            names.contains(&expected),
+            "case {expected:?}: the catalogue must publish it, got {names:?}"
         );
+        for name in &names {
+            assert!(
+                name.starts_with(&expected),
+                "case {expected:?}: a prefix selects only names starting with it, \
+                 got {name:?}"
+            );
+        }
     }
 }
 
@@ -285,9 +294,9 @@ async fn paging_the_catalogue_walks_every_member_exactly_once() {
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
-    // The order a listing serves, which is the collation of the schema NAMES — not
-    // their bytes. Source: `crate::state::schema_name_order_key`.
-    expected.sort_by_key(|name| schema_name_order_key(name));
+    // The order a listing serves, which is the codepoint order of the schema NAMES.
+    // Source: `crate::state::in_schema_name_order`.
+    expected.sort();
     assert!(
         expected.len() > MAX_PAGE_SIZE,
         "the catalogue must be larger than one page for this case to page at all, got {}",

@@ -6,10 +6,11 @@
 //! Two rules are under test:
 //!
 //! 1. a listing of schemas (`ListSchemas`, and the search that reports the same
-//!    summaries) is collated by each `SchemaName`'s LETTERS AND DIGITS, case-folded,
-//!    with the raw name breaking a tie — so punctuation (`.`, `-`, `@`, `_`) does not
-//!    decide the order and neither does case — and `Limit`/`NextToken` page over that
-//!    order, which is what makes a page's membership reproducible;
+//!    summaries) is served in the CODEPOINT order of the `SchemaName`s — every
+//!    character of a name decides its place, so an upper-case letter precedes the
+//!    lower-case one at the same position and punctuation participates like any other
+//!    character — and `Limit`/`NextToken` page over that order, which is what makes a
+//!    page's membership reproducible;
 //! 2. which schemas the AWS-managed registry publishes for one event source is
 //!    per-source published data: a source carries the event types published for it,
 //!    which is not the same set for every source.
@@ -18,7 +19,7 @@
 //! `registry_schema_lifecycle.rs` — nothing here touches the state struct directly.
 
 use service_com_amazonaws_schemas_schemas::state::{
-    schema_name_order_key, AWS_MANAGED_REGISTRY, CLOUD_TRAIL_EVENT_FAMILY,
+    AWS_MANAGED_REGISTRY, CLOUD_TRAIL_EVENT_FAMILY,
 };
 
 use crate::registry_schema_lifecycle::{create_registry, schema_names, schema_uri, walk, Emulator};
@@ -59,45 +60,49 @@ async fn create_schema(emulator: &Emulator, registry: &str, name: &str) {
 
 /// The rows the collation cases run over, in the order a listing must serve them.
 ///
-/// They differ along what the rule generalises over: which punctuation separates the
+/// They differ along what the rule generalises over: the CASE of a letter at the
+/// position that decides a pair (two names alike but for one letter's case, and two
+/// whose differing letters are of different cases), which punctuation separates the
 /// words (`.`, `-`, `@`, `_`, none), WHERE that punctuation falls relative to the
-/// letters that follow it, the case of the letters, and whether a name's letters and
-/// digits are a prefix of another's. The first four rows are the two orderings the
-/// issue cited, with its `aws.` prefix replaced — the rule is about any schema name,
-/// not about the published catalogue's names.
+/// letters that follow it, and whether one name is a prefix of another. The first rows
+/// are the two orderings the issue cited, with its `aws.` prefix replaced — the rule is
+/// about any schema name, not about the published catalogue's names.
 ///
-/// A byte comparison of these names would answer a different order for every
-/// neighbouring pair below, which `a_byte_order_would_answer_another_order` pins.
+/// A case-folded collation of these names answers a different order, which
+/// `a_case_folded_order_would_answer_another_order` pins.
 fn collated_rows() -> Vec<String> {
     [
-        // Case folded: byte-wise `A` < `a` would put `AWSAPICall...` first.
-        "svc.application-autoscaling@ApplicationAutoScalingScalingActivityStateChange",
-        "svc.application-autoscaling@AWSAPICallviaCloudTrail",
-        // The raw name breaks a tie between two names that fold alike.
+        // An upper-case first letter precedes every lower-case one.
+        "Zeta03",
+        // `CRLGeneration` before `CertificateIssuance` before `Creation`: `R` < `e` <
+        // `r`, which a case-folded comparator answers the other way round.
+        "svc.acm-pca@ACMPrivateCAAuditReportGeneration",
+        "svc.acm-pca@ACMPrivateCACRLGeneration",
+        "svc.acm-pca@ACMPrivateCACertificateIssuance",
+        "svc.acm-pca@ACMPrivateCACreation",
+        // Punctuation participates: `-` < `@`, so the longer source name comes first.
+        "svc.autoscaling-plans@AWSAPICallviaCloudTrail",
+        // Two names alike but for one letter's case: the upper-case one precedes.
         "svc.autoscaling@AWSAPICallViaCloudTrail",
         "svc.autoscaling@AWSAPICallviaCloudTrail",
-        // Punctuation does not participate: byte-wise `-` < `@` would put
-        // `autoscaling-plans` first.
-        "svc.autoscaling-plans@AWSAPICallviaCloudTrail",
-        // Digits collate as the characters they are, and the punctuation around them
-        // does not decide anything.
+        // Digits and punctuation collate as the characters they are: `-` < `.` < `1` <
+        // `_`.
         "zeta-02",
-        "Zeta03",
-        "zeta_1",
-        // A name whose letters and digits are a prefix of the next one's sorts first.
+        // A name that is a prefix of the next one's start sorts first.
         "zeta.10a",
         "zeta1.0a1",
+        "zeta_1",
     ]
     .iter()
     .map(|name| (*name).to_string())
     .collect()
 }
 
-/// RULE: a listing of a registry's schemas is collated by each name's letters and
-/// digits, case-folded, with the raw name breaking a tie — whatever punctuation the
-/// names carry and whatever order they were created in.
+/// RULE: a listing of a registry's schemas is served in the codepoint order of its
+/// schema names — whatever punctuation and casing the names carry and whatever order
+/// they were created in.
 #[tokio::test]
-async fn a_listing_collates_schema_names_by_letters_and_digits() {
+async fn a_listing_serves_schema_names_in_codepoint_order() {
     let emulator = Emulator::new();
     let registry = "collation";
     create_registry(&emulator, registry).await;
@@ -117,46 +122,58 @@ async fn a_listing_collates_schema_names_by_letters_and_digits() {
     assert_eq!(
         schema_names(&listed),
         collated_rows(),
-        "a listing must serve the registry's schemas in the collated order"
+        "a listing must serve the registry's schemas in codepoint order"
     );
 }
 
-/// The order a byte comparison of [`collated_rows`] would answer — which the collation
-/// must NOT be, or the rows would prove nothing.
+/// The order a CASE-FOLDED collation of [`collated_rows`] would answer — which the
+/// order a listing serves must not be, or the rows would prove nothing.
 #[test]
-fn a_byte_order_would_answer_another_order() {
-    let mut by_bytes = collated_rows();
-    by_bytes.sort_unstable();
+fn a_case_folded_order_would_answer_another_order() {
+    // The key a comparator that folds case and drops punctuation collates under —
+    // computed here, because it is what the rows must NOT be ordered by.
+    let folded = |name: &str| -> String {
+        name.chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+
+    let mut by_folding = collated_rows();
+    by_folding.sort_by_key(|name| folded(name));
     assert_ne!(
-        by_bytes,
+        by_folding,
         collated_rows(),
-        "the rows must be a case where a byte sort and the collation disagree"
+        "the rows must be a case where a case-folded order and the served order disagree"
     );
-    // And the two orderings the issue cited are each a neighbouring pair the byte sort
-    // inverts.
+
+    // And the orderings the issue cited are each a neighbouring pair of rows the folded
+    // order inverts: one decided by a letter's case, one by punctuation, one by the case
+    // of a name's first letter.
     for (first, second) in [
         (
-            "svc.application-autoscaling@ApplicationAutoScalingScalingActivityStateChange",
-            "svc.application-autoscaling@AWSAPICallviaCloudTrail",
+            "svc.acm-pca@ACMPrivateCACRLGeneration",
+            "svc.acm-pca@ACMPrivateCACertificateIssuance",
         ),
         (
-            "svc.autoscaling@AWSAPICallviaCloudTrail",
             "svc.autoscaling-plans@AWSAPICallviaCloudTrail",
+            "svc.autoscaling@AWSAPICallviaCloudTrail",
         ),
+        ("Zeta03", "svc.acm-pca@ACMPrivateCAAuditReportGeneration"),
     ] {
         assert!(
-            schema_name_order_key(first) < schema_name_order_key(second),
-            "case {first:?}: must collate before {second:?}"
+            first < second,
+            "case {first:?}: must be served before {second:?}"
         );
         assert!(
-            first > second,
-            "case {first:?}: a byte comparison must put it after {second:?}, or the \
-             case proves nothing"
+            folded(first) > folded(second),
+            "case {first:?}: a case-folded comparator must put it after {second:?}, or \
+             the case proves nothing"
         );
     }
 }
 
-/// RULE (an invariant): `Limit`/`NextToken` page over the collated order — every page
+/// RULE (an invariant): `Limit`/`NextToken` page over the codepoint order — every page
 /// is a contiguous run of it, and following the token to exhaustion walks the registry
 /// exactly once with no repeat and no gap, for every page size.
 #[tokio::test]
@@ -175,7 +192,7 @@ async fn paging_a_listing_walks_the_collated_order_exactly_once() {
         let walked = walk(&emulator, &listing_uri(registry), limit, schema_names).await;
         assert_eq!(
             walked, expected,
-            "case limit={limit:?}: paging must walk the collated order exactly once"
+            "case limit={limit:?}: paging must walk the codepoint order exactly once"
         );
     }
 
@@ -192,12 +209,12 @@ async fn paging_a_listing_walks_the_collated_order_exactly_once() {
         assert_eq!(
             schema_names(&page),
             expected[..limit].to_vec(),
-            "case limit={limit}: the first page is the first {limit} of the collated order"
+            "case limit={limit}: the first page is the first {limit} of the codepoint order"
         );
     }
 }
 
-/// RULE: `SearchSchemas` reports its matches in the same collated order a listing of
+/// RULE: `SearchSchemas` reports its matches in the same codepoint order a listing of
 /// the registry serves — the two report the same summaries of the same registry, so
 /// they cannot disagree about the order, and a search pages over it too.
 #[tokio::test]
@@ -217,23 +234,23 @@ async fn a_search_reports_its_matches_in_the_collated_order() {
         assert_eq!(
             walked,
             collated_rows(),
-            "case limit={limit:?}: a search must serve the collated order too"
+            "case limit={limit:?}: a search must serve the codepoint order too"
         );
     }
 }
 
-/// RULE: the AWS-managed catalogue is served in that same collated order, so paging it
-/// yields pages a client can reproduce — in particular a source's own event types
-/// collate among its CloudTrail-delivered ones by their letters, and a source whose
-/// name is another source's name plus punctuation does not interleave with it.
+/// RULE: the AWS-managed catalogue is served in that same codepoint order, so paging it
+/// yields pages a client can reproduce — in particular two spellings of one event type
+/// that differ in a letter's case are served upper-case first, and a source whose name
+/// is another source's name plus punctuation does not interleave with it.
 #[tokio::test]
-async fn the_published_catalogue_is_served_in_the_collated_order() {
+async fn the_published_catalogue_is_served_in_codepoint_order() {
     let emulator = Emulator::new();
 
-    // Rows: sources whose entries the collation and a byte order disagree about
-    // (`aws.application-autoscaling`, whose own event type collates before its
-    // CloudTrail family), a source that publishes its own event types and nothing
-    // else, and sources the issue did not cite.
+    // Rows: a source publishing its own event types among its CloudTrail-delivered
+    // ones, a source whose entries a case-folded order would place differently
+    // (`aws.acm-pca`), a source that publishes its own event types and nothing else,
+    // and sources the issue did not cite.
     for source in [
         "aws.application-autoscaling",
         "aws.autoscaling",
@@ -244,16 +261,16 @@ async fn the_published_catalogue_is_served_in_the_collated_order() {
     ] {
         let listed = walk(&emulator, &source_listing_uri(source), None, schema_names).await;
         let mut collated = listed.clone();
-        collated.sort_by_key(|name| schema_name_order_key(name));
+        collated.sort();
         assert_eq!(
             listed, collated,
-            "case {source:?}: the catalogue must be served in the collated order"
+            "case {source:?}: the catalogue must be served in codepoint order"
         );
     }
 
-    // The recorded ordering this generalises from: every `aws.autoscaling@` entry
-    // precedes every `aws.autoscaling-plans@` entry, which a byte order inverts
-    // because `-` < `@`.
+    // The recorded ordering this generalises from: the capital-`V` spelling of the
+    // API-call event precedes the lower-case one, and every `aws.autoscaling-plans@`
+    // entry precedes every `aws.autoscaling@` entry, because `-` < `@`.
     let both = walk(
         &emulator,
         &format!(
@@ -264,22 +281,32 @@ async fn the_published_catalogue_is_served_in_the_collated_order() {
         schema_names,
     )
     .await;
-    let plans_from = both
+    let own_from = both
         .iter()
-        .position(|name| name.starts_with("aws.autoscaling-plans@"))
-        .unwrap_or_else(|| panic!("the catalogue must publish aws.autoscaling-plans, got {both:?}"));
+        .position(|name| name.starts_with("aws.autoscaling@"))
+        .unwrap_or_else(|| panic!("the catalogue must publish aws.autoscaling, got {both:?}"));
     assert!(
-        both[..plans_from]
+        both[..own_from]
             .iter()
-            .all(|name| name.starts_with("aws.autoscaling@")),
-        "every aws.autoscaling@ entry must precede the first aws.autoscaling-plans@ \
+            .all(|name| name.starts_with("aws.autoscaling-plans@")),
+        "every aws.autoscaling-plans@ entry must precede the first aws.autoscaling@ \
          one, got {both:?}"
     );
     assert!(
-        both[plans_from..]
+        both[own_from..]
             .iter()
-            .all(|name| name.starts_with("aws.autoscaling-plans@")),
-        "the aws.autoscaling-plans@ entries must be one contiguous run, got {both:?}"
+            .all(|name| name.starts_with("aws.autoscaling@")),
+        "the aws.autoscaling@ entries must be one contiguous run, got {both:?}"
+    );
+    let position = |name: &str| {
+        both.iter()
+            .position(|listed| listed == name)
+            .unwrap_or_else(|| panic!("the catalogue must publish {name:?}, got {both:?}"))
+    };
+    assert!(
+        position("aws.autoscaling@AWSAPICallViaCloudTrail")
+            < position("aws.autoscaling@AWSAPICallviaCloudTrail"),
+        "the capital-V spelling must be served before the lower-case one, got {both:?}"
     );
 }
 
@@ -378,7 +405,7 @@ async fn a_source_publishes_exactly_the_event_types_the_catalogue_holds_for_it()
                     .map(|(_, event)| format!("{}@{event}", row.source)),
             );
         }
-        expected.sort_by_key(|name| schema_name_order_key(name));
+        expected.sort();
         assert_eq!(
             published, expected,
             "case {:?}: the catalogue must publish exactly the event types held for it",
@@ -439,7 +466,7 @@ async fn the_event_bridge_source_publishes_its_own_event_types() {
             .iter()
             .map(|(_, event)| format!("aws.events@{event}")),
     );
-    expected.sort_by_key(|name| schema_name_order_key(name));
+    expected.sort();
 
     let published = walk(
         &emulator,

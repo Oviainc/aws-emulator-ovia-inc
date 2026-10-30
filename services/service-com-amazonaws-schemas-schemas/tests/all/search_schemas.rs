@@ -135,14 +135,14 @@ async fn keywords_select_exactly_the_schemas_indexed_under_them() {
     let emulator = Emulator::new();
     seed(&emulator).await;
 
-    // Results come back in the registry's key order, which collates the schema names
-    // by their case-folded letters and digits.
+    // Results come back in the registry's key order, which is the codepoint order of
+    // the schema names.
     let everything = vec![
-        "invoice-v2",
         "MiXeD-case",
+        "invoice-v2",
+        "orders-report",
         "orders.cancelled",
         "orders.placed",
-        "orders-report",
         "payments",
     ];
 
