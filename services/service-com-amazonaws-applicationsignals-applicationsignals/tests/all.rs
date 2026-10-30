@@ -59,6 +59,8 @@ mod instrumentation_configuration_arn;
 mod instrumentation_configuration_deletion;
 #[path = "all/instrumentation_configuration_identity.rs"]
 mod instrumentation_configuration_identity;
+#[path = "all/instrumentation_configuration_removal.rs"]
+mod instrumentation_configuration_removal;
 #[path = "all/instrumentation_configuration_status.rs"]
 mod instrumentation_configuration_status;
 #[path = "all/instrumentation_configuration_tags.rs"]

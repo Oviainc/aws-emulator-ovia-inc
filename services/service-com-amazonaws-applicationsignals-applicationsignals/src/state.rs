@@ -4859,6 +4859,10 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// so the common call pays no scan at all — and the walk itself is over a store bounded
     /// by [`MAX_INSTRUMENTATION_CONFIGURATIONS`] entries, scopes included, so its cost cannot
     /// grow with the scopes a caller mints.
+    ///
+    /// Each lapsed record is taken away by [`Self::remove_instrumentation_configuration`],
+    /// the one place that knows what a configuration record owns: a lapse and a delete remove
+    /// the same things, so anything a record gains later is torn down for both at once.
     pub fn expire_instrumentation_configurations(&mut self, now: &DateTime) {
         let threshold = instant_nanos(now);
         if self
@@ -4868,40 +4872,26 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             return;
         }
 
-        let lapsed: Vec<(InstrumentationScope, String, DateTime, String)> = self
+        let lapsed: Vec<(InstrumentationScope, String, DateTime)> = self
             .instrumentation_configurations
             .iter()
             .flat_map(|(scope, set)| {
                 set.configurations.iter().filter_map(move |(key, stored)| {
                     let expires_at = stored.expires_at?;
-                    (instant_nanos(&expires_at) <= threshold).then(|| {
-                        (
-                            scope.clone(),
-                            key.clone(),
-                            expires_at,
-                            stored.arn.clone(),
-                        )
-                    })
+                    (instant_nanos(&expires_at) <= threshold)
+                        .then(|| (scope.clone(), key.clone(), expires_at))
                 })
             })
             .collect();
 
-        for (scope, key, expires_at, arn) in lapsed {
-            if let Some(set) = self.instrumentation_configurations.get_mut(&scope) {
-                set.configurations.remove(&key);
-                // The status history belongs to the configuration, so it goes with it: a
-                // later configuration created at the same location is a NEW resource and
-                // has reported nothing yet.
-                set.status_history.remove(&key);
-                set.record_change(expires_at);
-            }
-            // A lapse takes the configuration away exactly as a delete does, so the location
-            // is remembered as one a configuration was removed from — dated at the instant
-            // the lapse fell due, which is when the record went.
-            self.remember_instrumentation_removal(&scope, &key, expires_at);
-            // Tags are addressed by resource ARN, so a record that is gone takes its tags
-            // with it rather than leaving them for the next resource minted at that ARN.
-            self.tags.remove(&arn);
+        for (scope, key, expires_at) in lapsed {
+            // A lapse takes the configuration away exactly as a delete does — the record,
+            // its status history, its tags and the location remembered as one a
+            // configuration was removed from all go together — so it IS that removal, dated
+            // at the instant the lapse fell due rather than at the instant of a call. The
+            // only thing the removal does beyond this is schedule the horizon of a scope it
+            // empties, which the whole-store re-derivation below computes again anyway.
+            self.remove_instrumentation_configuration(&scope, &key, expires_at);
         }
 
         // An emptied scope keeps its last-change instant only while a caller could still be
@@ -5429,6 +5419,11 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// Remove the configuration stored in `scope` under `key` ([`instrumentation_key`]),
     /// along with its tags, and hand back the removed record. `None` — and nothing removed —
     /// when the scope holds no configuration at that location.
+    ///
+    /// This is the ONLY place a configuration record is taken away: the explicit delete and
+    /// the clock-owed lapse ([`Self::expire_instrumentation_configurations`]) both come
+    /// through here, so a record that grows a fourth thing keyed off its key or its ARN is
+    /// torn down on both paths without either having to learn about it.
     ///
     /// `at` is recorded as the instant the scope's set changed, the mirror of
     /// [`Self::put_instrumentation_configuration`]: a deletion is news to every caller that
