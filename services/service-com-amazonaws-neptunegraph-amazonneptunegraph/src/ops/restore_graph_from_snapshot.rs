@@ -271,19 +271,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let captured_configuration = snapshot.source_configuration.clone();
         let captured_data = snapshot.data.clone();
 
-        // Only a complete snapshot can be restored: while its creation is still
-        // outstanding the snapshot holds no usable copy of the data, and one whose
-        // deletion has been accepted is on its way out. That is the record-at-rest
-        // condition `CreateGraphSnapshot` states about the graph it captures, read here
-        // of the snapshot, and it is worded by the one builder every snapshot state gate
-        // in this service reaches.
-        if snapshot_status != crate::state::SnapshotStatus::Available {
-            return Err(RestoreGraphFromSnapshotErrorModeled::ConflictException(
-                crate::state::snapshot_state_conflict("restore", snapshot_status),
-            )
-            .into());
-        }
-
         // `graphName` is unique per account PER REGION, exactly as it is for
         // `CreateGraph`: the restored graph is a new graph, so a stored graph of the
         // SAME Region by that name (including one that is still DELETING, which holds
@@ -315,6 +302,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // Only a complete snapshot can be restored: while its creation is still
+        // outstanding the snapshot holds no usable copy of the data, and one whose
+        // deletion has been accepted is on its way out. That is the record-at-rest
+        // condition `CreateGraphSnapshot` states about the graph it captures, read here
+        // of the snapshot, and it is worded by the one builder every snapshot state gate
+        // in this service reaches. Checked after the two refusals above, as every
+        // minting handler here checks the name it reserves and the store it grows first,
+        // so a taken name or a store with no room left is reported as what it is,
+        // whatever the source record is doing.
+        if snapshot_status != crate::state::SnapshotStatus::Available {
+            return Err(RestoreGraphFromSnapshotErrorModeled::ConflictException(
+                crate::state::snapshot_state_conflict("restore", snapshot_status),
+            )
+            .into());
         }
 
         let id = store.next_graph_id();

@@ -268,34 +268,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let source_graph_id = graph.id.clone();
         let source_graph_status = graph.status;
 
+        // The store is shared and grows by one task per call, and a finished task stays
+        // readable, so it has a ceiling (`crate::state::MAX_EXPORT_TASKS`). Checked
+        // before the source graph's status, as every other minting handler here checks
+        // the store it grows, so a store with no room left is reported as the full store
+        // it is, whatever the graph is doing: no status the graph could reach would make
+        // room for this record. This operation models no quota error, so reaching the
+        // ceiling is reported with the `ConflictException` it does model, by the one
+        // builder every full-store refusal in this crate reaches
+        // (`crate::state::store_ceiling_conflict`): the request conflicts with what the
+        // store already holds, and no member of it is invalid.
+        if store.export_tasks.len() >= crate::state::MAX_EXPORT_TASKS {
+            return Err(StartExportTaskErrorModeled::ConflictException(
+                crate::state::store_ceiling_conflict(
+                    "export tasks",
+                    crate::state::MAX_EXPORT_TASKS,
+                ),
+            )
+            .into());
+        }
+
         // "The graph state should be AVAILABLE"
         // (`smithy_query(query="operation",operation="StartExportTask")`): an export
         // reads the graph through its serving data plane, so a graph that is not serving
-        // has nothing to export from. The wording is the
-        // service's one precondition refusal
-        // (`crate::state::graph_status_precondition_conflict`), which fronts no
+        // has nothing to export from. The wording is the service's one precondition
+        // refusal (`crate::state::graph_status_precondition_conflict`), which fronts no
         // identifier: the graph was addressed by one the caller sent.
         if source_graph_status != crate::state::GraphStatus::Available {
             return Err(StartExportTaskErrorModeled::ConflictException(
                 crate::state::graph_status_precondition_conflict(
                     "start the export task",
                     source_graph_status,
-                ),
-            )
-            .into());
-        }
-
-        // The store is shared and grows by one task per call, and a finished task stays
-        // readable, so it has a ceiling (`crate::state::MAX_EXPORT_TASKS`). This
-        // operation models no quota error, so reaching the ceiling is reported with the
-        // `ConflictException` it does model, by the one builder every full-store refusal
-        // in this crate reaches (`crate::state::store_ceiling_conflict`): the request
-        // conflicts with what the store already holds, and no member of it is invalid.
-        if store.export_tasks.len() >= crate::state::MAX_EXPORT_TASKS {
-            return Err(StartExportTaskErrorModeled::ConflictException(
-                crate::state::store_ceiling_conflict(
-                    "export tasks",
-                    crate::state::MAX_EXPORT_TASKS,
                 ),
             )
             .into());

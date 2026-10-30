@@ -285,11 +285,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let graph_is_empty = graph.data.is_empty();
 
         // The store is shared and grows by one task per call, and a task is never
-        // reclaimed, so it has a ceiling (`crate::state::MAX_IMPORT_TASKS`). This
-        // operation models no quota error, so reaching the ceiling is reported with the
-        // `ConflictException` it does model, by the one builder every full-store refusal
-        // in this crate reaches (`crate::state::store_ceiling_conflict`): the request
-        // conflicts with what the store already holds.
+        // reclaimed, so it has a ceiling (`crate::state::MAX_IMPORT_TASKS`). Checked
+        // before the graph's status, as every other minting handler here checks the store
+        // it grows, so a store with no room left is reported as the full store it is,
+        // whatever the graph is doing: no status the graph could reach would make room
+        // for this record. This operation models no quota error, so reaching the ceiling
+        // is reported with the `ConflictException` it does model, by the one builder
+        // every full-store refusal in this crate reaches
+        // (`crate::state::store_ceiling_conflict`): the request conflicts with what the
+        // store already holds.
         if store.import_tasks.len() >= crate::state::MAX_IMPORT_TASKS {
             return Err(StartImportTaskErrorModeled::ConflictException(
                 crate::state::store_ceiling_conflict(

@@ -2337,9 +2337,10 @@ pub const IMPORT_CANCELLED_REASON: &str =
 /// error (`smithy_query(query="operation",operation="StartExportTask")` declares
 /// `ConflictException`, `ValidationException`, `ThrottlingException`,
 /// `ResourceNotFoundException` and `InternalServerException` only), so reaching it is
-/// reported as the `ValidationException` that names this bound — not as throttling,
-/// which would promise that a retry can succeed. Set well above any realistic use of a
-/// local emulator.
+/// reported with the `ConflictException` (409) it does model, through
+/// [`store_ceiling_conflict`] — the request conflicts with what the store already holds
+/// — and not as throttling, which would promise that a retry can succeed. Set well
+/// above any realistic use of a local emulator.
 pub const MAX_EXPORT_TASKS: usize = 100;
 
 /// The most queries one store holds in flight, across every graph.

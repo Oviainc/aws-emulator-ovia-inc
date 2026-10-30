@@ -103,6 +103,8 @@ mod snapshot_of_a_graph_at_rest;
 mod state_roundtrip;
 #[path = "all/store_ceiling_quota_refusals.rs"]
 mod store_ceiling_quota_refusals;
+#[path = "all/store_refusal_precedence.rs"]
+mod store_refusal_precedence;
 #[path = "all/task_namespace_refusals.rs"]
 mod task_namespace_refusals;
 #[path = "all/unissued_page_token_refusal.rs"]
