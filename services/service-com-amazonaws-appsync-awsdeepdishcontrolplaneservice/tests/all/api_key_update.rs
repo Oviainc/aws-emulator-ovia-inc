@@ -10,8 +10,8 @@
 //!    the rest of it as it was — the key keeps its id and its place in the list — and
 //!    the body it answers with is the one `ListApiKeys` reports next;
 //! 2. the expiration an update names is kept as epoch seconds floored to the hour, and
-//!    the deletion time moves with it, whether the new expiration is later or earlier
-//!    than the stored one;
+//!    the deletion time moves with it — the expiration plus the 60-day post-expiry
+//!    retention — whether the new expiration is later or earlier than the stored one;
 //! 3. the expiration has to land between 1 and 365 days from the update, and a value
 //!    outside that window is refused with `ApiKeyValidityOutOfBoundsException` (400)
 //!    naming the window, leaving the stored key exactly as it was;
@@ -33,6 +33,12 @@ const HOUR: i64 = 3_600;
 
 /// One day in seconds — the unit the API-key validity window is stated in.
 const DAY: i64 = 86_400;
+
+/// How long an expired API key is kept before the service reclaims it — the span
+/// between a key's `expires` and its `deletes`. Source: the `ApiKey` shape's doc for
+/// the `da2` key version, "Expired API keys are kept for 60 days after the expiration
+/// time" (`smithy_query(query="doc", shape="ApiKey")`).
+const RETENTION: i64 = 60 * DAY;
 
 /// How far inside or outside a validity bound a row sits.
 ///
@@ -261,11 +267,12 @@ async fn an_update_writes_the_submitted_expiration_and_description_onto_the_stor
             "case {case}: expected the submitted expiration floored to the hour \
              ({expected_expires}), got {updated:?}"
         );
+        let expected_deletes = floor_to_hour(expected_expires + RETENTION);
         assert_eq!(
             updated["deletes"].as_i64(),
-            Some(expected_expires),
-            "case {case}: the deletion time must move onto the new expiration \
-             ({expected_expires}), got {updated:?}"
+            Some(expected_deletes),
+            "case {case}: the deletion time must move onto the new expiration plus the \
+             retention ({expected_deletes}), got {updated:?}"
         );
         let expected_description = if submits_description {
             format!("{case}: after")
@@ -288,7 +295,8 @@ async fn an_update_writes_the_submitted_expiration_and_description_onto_the_stor
 
 /// Rule 2, as an invariant over a WALK: whatever sequence of accepted expirations a key
 /// is walked through, the key reports the last one, floored to the hour, with its
-/// deletion time on it — the stored expiration an update starts from never takes part.
+/// deletion time one retention span past it — the stored expiration an update starts
+/// from never takes part.
 #[tokio::test]
 async fn the_deletion_time_follows_the_expiration_through_every_update() {
     let router = router();
@@ -331,8 +339,10 @@ async fn the_deletion_time_follows_the_expiration_through_every_update() {
         );
         assert_eq!(
             key["deletes"].as_i64(),
-            key["expires"].as_i64(),
-            "case {case}: deletes must equal the expiration it follows, got {key:?}"
+            Some(floor_to_hour(expected + RETENTION)),
+            "case {case}: deletes must be the expiration it follows plus the retention \
+             ({}), got {key:?}",
+            floor_to_hour(expected + RETENTION)
         );
         assert_eq!(
             listed_key(&router, &api_id, &key_id).await,
@@ -391,10 +401,11 @@ async fn an_update_that_names_no_expiration_keeps_the_stored_one() {
             "case {case}: expected the stored expiration {stored_expires} to stand, \
              got {updated:?}"
         );
+        let stored_deletes = floor_to_hour(stored_expires + RETENTION);
         assert_eq!(
             updated["deletes"].as_i64(),
-            Some(stored_expires),
-            "case {case}: expected the stored deletion time {stored_expires} to stand, \
+            Some(stored_deletes),
+            "case {case}: expected the stored deletion time {stored_deletes} to stand, \
              got {updated:?}"
         );
         assert_eq!(

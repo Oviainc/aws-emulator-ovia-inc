@@ -42,6 +42,12 @@ const DAY: i64 = 86_400;
 /// is 7 days from creation time."
 const DEFAULT_VALIDITY: i64 = 7 * DAY;
 
+/// How long an expired API key is kept before the service reclaims it — the span
+/// between a key's `expires` and its `deletes`. Source: the `ApiKey` shape's doc for
+/// the `da2` key version, "Expired API keys are kept for 60 days after the expiration
+/// time" (`smithy_query(query="doc", shape="ApiKey")`).
+const RETENTION: i64 = 60 * DAY;
+
 /// How far inside a validity bound a row sits, so the seconds that elapse between this
 /// test's clock read and the handler's cannot push the row across the bound it
 /// exercises. The bounds themselves come from `ApiKeyValidityOutOfBoundsException`:
@@ -392,8 +398,9 @@ async fn an_api_key_lifecycle_runs_on_an_api_of_either_family() {
             );
             assert_eq!(
                 key["deletes"].as_i64(),
-                Some(expires),
-                "case {case}: expected the deletion time on the expiration, got {key:?}"
+                Some(floor_to_hour(expires + RETENTION)),
+                "case {case}: expected the deletion time one retention span past the \
+                 expiration, got {key:?}"
             );
 
             // The listing reports the key the create stored, so the create answered
@@ -434,6 +441,12 @@ async fn an_api_key_lifecycle_runs_on_an_api_of_either_family() {
                 Some(floor_to_hour(submitted)),
                 "case {case}: expected the submitted expiration floored to the hour, \
                  got {updated_key:?}"
+            );
+            assert_eq!(
+                updated_key["deletes"].as_i64(),
+                Some(floor_to_hour(floor_to_hour(submitted) + RETENTION)),
+                "case {case}: expected the deletion time one retention span past the \
+                 updated expiration, got {updated_key:?}"
             );
             let listed = listed_keys(&router, &api_id).await;
             assert!(

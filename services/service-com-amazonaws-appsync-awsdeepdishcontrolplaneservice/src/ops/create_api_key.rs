@@ -231,8 +231,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             key_id = format!("{KEY_VERSION_PREFIX}{}", guard.mint_id());
         }
         let seq = guard.next_seq();
-        // `ApiKeyRecord::new` floors the requested instant to the hour and moves the
-        // deletion time with it, the form both members are documented in.
+        // `ApiKeyRecord::new` floors the requested instant to the hour and derives the
+        // deletion time from it, the form both members are documented in.
         let record = crate::state::ApiKeyRecord::new(
             seq,
             key_id.clone(),

@@ -246,15 +246,20 @@ impl ApiKeyRecord {
     }
 
     /// Set the key's expiration, in epoch seconds, to the instant the call that sets
-    /// it asked for.
+    /// it asked for, and move the key's deletion time onto it.
     ///
     /// Both `expires` and `deletes` are documented as "seconds since the epoch,
     /// rounded down to the nearest hour", so the instant is floored here rather than
-    /// by each caller; the deletion time moves with the expiration, since the model
-    /// states no span between an API key expiring and being deleted.
+    /// by each caller. The deletion time is derived from the expiration by adding the
+    /// post-expiry retention the service keeps an expired key for
+    /// ([`API_KEY_RETENTION_SECONDS`]), so every operation that reports a key — the
+    /// create and the update that write it, and the listing that pages over it —
+    /// reports one value per key.
     pub fn set_expiration(&mut self, expires: i64) {
         self.expires = floor_to_hour(expires);
-        self.deletes = self.expires;
+        // Floored again so the documented form of `deletes` holds whatever the
+        // retention span is, rather than only while it is a whole number of hours.
+        self.deletes = floor_to_hour(self.expires.saturating_add(API_KEY_RETENTION_SECONDS));
     }
 }
 
@@ -276,6 +281,15 @@ pub const API_KEY_MIN_VALIDITY_SECONDS: i64 = SECONDS_PER_DAY;
 /// The longest validity an API key accepts ([`API_KEY_MIN_VALIDITY_SECONDS`] states
 /// the source).
 pub const API_KEY_MAX_VALIDITY_SECONDS: i64 = 365 * SECONDS_PER_DAY;
+
+/// How long an API key is kept after it expires, before the service reclaims it —
+/// the span between a key's `expires` and its `deletes`.
+///
+/// Source: the `ApiKey` shape's own documentation for the `da2` key version this
+/// service mints — "Expired API keys are kept for 60 days after the expiration time"
+/// (`smithy_query(query="doc", shape="ApiKey")`), which `ListApiKeys` repeats as "API
+/// keys are deleted automatically 60 days after they expire".
+pub const API_KEY_RETENTION_SECONDS: i64 = 60 * SECONDS_PER_DAY;
 
 /// Whether `validity` seconds is inside the documented API-key validity window
 /// ([`API_KEY_MIN_VALIDITY_SECONDS`]..=[`API_KEY_MAX_VALIDITY_SECONDS`]).

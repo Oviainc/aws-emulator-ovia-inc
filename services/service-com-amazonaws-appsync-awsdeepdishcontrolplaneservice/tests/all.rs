@@ -15,6 +15,8 @@
 mod api_cache;
 #[path = "all/api_cache_create_rules.rs"]
 mod api_cache_create_rules;
+#[path = "all/api_key_deletion_window.rs"]
+mod api_key_deletion_window;
 #[path = "all/api_key_update.rs"]
 mod api_key_update;
 #[path = "all/api_keys_across_api_families.rs"]

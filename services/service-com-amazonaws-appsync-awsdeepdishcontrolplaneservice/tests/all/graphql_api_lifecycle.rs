@@ -31,6 +31,12 @@ const HOUR: i64 = 3_600;
 /// One day in seconds — the unit the API-key validity window is stated in.
 const DAY: i64 = 86_400;
 
+/// How long an expired API key is kept before the service reclaims it — the span
+/// between a key's `expires` and its `deletes`. Source: the `ApiKey` shape's doc for
+/// the `da2` key version, "Expired API keys are kept for 60 days after the expiration
+/// time" (`smithy_query(query="doc", shape="ApiKey")`).
+const RETENTION: i64 = 60 * DAY;
+
 /// How far inside or outside a validity bound a row sits.
 ///
 /// `CreateApiKey` checks the submitted `expires` against the clock IT reads when the
@@ -487,10 +493,12 @@ async fn api_keys_are_stored_under_their_api_and_listed_back() {
             0,
             "case {case}: expires must land on an hour boundary, got {reported}"
         );
+        let expected_deletes = (reported + RETENTION) - (reported + RETENTION).rem_euclid(HOUR);
         assert_eq!(
             key["deletes"].as_i64(),
-            Some(reported),
-            "case {case}: deletes must be an hour-floored epoch second, got {key:?}"
+            Some(expected_deletes),
+            "case {case}: deletes must be the expiration plus the retention \
+             ({expected_deletes}), got {key:?}"
         );
         assert_eq!(
             key["description"].as_str(),

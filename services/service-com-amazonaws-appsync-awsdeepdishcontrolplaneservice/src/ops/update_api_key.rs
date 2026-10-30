@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each member the request carries is applied to the STORED key and everything
         // else about it is left as it was: it keeps its id and its creation order, and
-        // a new expiration carries the deletion time with it (see
+        // a new expiration carries a new deletion time with it (see
         // `crate::state::ApiKeyRecord::set_expiration`).
         if let Some(expires) = requested {
             stored.set_expiration(expires);
