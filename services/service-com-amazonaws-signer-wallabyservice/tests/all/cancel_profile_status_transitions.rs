@@ -7,15 +7,15 @@
 //! credential scope the region is read from, the handler, the persisted record
 //! and serialization — the same path a client takes. The rules under test:
 //!
-//! * a refusal carries one of the error shapes the OPERATION's own model
-//!   declares (`AccessDeniedException`/403, `ResourceNotFoundException`/404,
-//!   `TooManyRequestsException`/429, `InternalServiceErrorException`/500 — see
-//!   [`MODELLED_ERROR_STATUSES`]), and nothing else: a client's generated error
-//!   union for the operation can carry no other shape;
-//! * the cancel therefore has no state refusal at all. It applies the documented
-//!   transition where its source status holds — an `Active` profile becomes
-//!   `Canceled` — answers success for a profile that already sits in a terminal,
-//!   non-signing status, and leaves that status as it stands.
+//! * a cancel applies the documented transition where its source status holds —
+//!   an `Active` profile becomes `Canceled` — and answers success, with the
+//!   status left where it stands, for a profile that is already `Canceled`;
+//! * a profile whose signatures have been REVOKED cannot be canceled at all: the
+//!   call is refused with the recorded 400 whose `code` names the status that
+//!   forbade it, and the profile stays `Revoked`;
+//! * every other answer carries a status the operation refuses with (see
+//!   [`MODELLED_ERROR_STATUSES`]): a profile this region cannot resolve is the
+//!   modelled 404 and nothing else.
 //!
 //! The rows differ along what the rules generalise over: the status the profile
 //! is in when the cancel arrives, how it got there (including a re-put, which
@@ -34,8 +34,18 @@ use smithy_server_runtime::MultiServiceRouter;
 /// each shape in the operation's modelled `errors` list
 /// (`smithy_query(query="operation", operation="CancelSigningProfile")` —
 /// `AccessDeniedException` 403, `ResourceNotFoundException` 404,
-/// `TooManyRequestsException` 429, `InternalServiceErrorException` 500).
-const MODELLED_ERROR_STATUSES: [u16; 4] = [403, 404, 429, 500];
+/// `TooManyRequestsException` 429, `InternalServiceErrorException` 500), plus
+/// the 400 the RECORDED AWS answer refuses a revoked profile with.
+const MODELLED_ERROR_STATUSES: [u16; 5] = [400, 403, 404, 429, 500];
+
+/// The status a cancel of a REVOKED profile answers, and the `code` and error
+/// shape it carries.
+const REVOKED_REFUSAL_STATUS: u16 = 400;
+/// The `code` that refusal carries: `Profile` followed by the status that
+/// forbade the call.
+const ERROR_CODE_PROFILE_REVOKED: &str = "ProfileRevoked";
+/// The error shape it is answered in — a 400 shape this SERVICE models.
+const REVOKED_REFUSAL_SHAPE: &str = "ValidationException";
 
 /// The status a successful cancel answers: the recorded answer to this `DELETE`.
 const SUCCESS_STATUS: u16 = 204;
@@ -71,6 +81,11 @@ impl Answer {
     /// The modelled `code` member, or `""` when the body carries none.
     fn code(&self) -> &str {
         self.body["code"].as_str().unwrap_or_default()
+    }
+
+    /// The modelled `message` member, or `""` when the body carries none.
+    fn message(&self) -> &str {
+        self.body["message"].as_str().unwrap_or_default()
     }
 
     fn str_member(&self, member: &str) -> String {
@@ -233,6 +248,14 @@ struct Case {
     status_after: &'static str,
 }
 
+impl Case {
+    /// Whether the status this profile is in forbids the cancel: a revoked
+    /// profile cannot be canceled, and no other status refuses the call.
+    fn refused(&self) -> bool {
+        self.status_before == "Revoked"
+    }
+}
+
 /// Every status a stored profile can be in when a cancel arrives
 /// (`SigningProfileStatus` is `Active | Canceled | Revoked`), reached two ways
 /// where a re-put can reach it, across four platforms and four regions.
@@ -266,8 +289,8 @@ const CASES: &[Case] = &[
         region: "ap-southeast-1",
         platform: "AWSIoTDeviceManagement-SHA256-ECDSA",
         setup: Setup::Revoked,
-        // A revocation is a stronger fact than a cancel, and this operation
-        // models no refusal for it: the status stays where the revoke put it.
+        // A revocation is already-final: the cancel is refused for it rather
+        // than moving the profile to the weaker status.
         status_before: "Revoked",
         status_after: "Revoked",
     },
@@ -287,8 +310,8 @@ const CASES: &[Case] = &[
         platform: "Notation-OCI-SHA384-ECDSA",
         setup: Setup::RevokedThenReput,
         // A re-put re-versions the profile without restoring trust in what the
-        // revocation untrusted, so the revoked status stands — and a cancel,
-        // the weaker fact, leaves it where it is.
+        // revocation untrusted, so the revoked status stands — and with it the
+        // refusal of the cancel.
         status_before: "Revoked",
         status_after: "Revoked",
     },
@@ -334,33 +357,69 @@ async fn seed(router: &MultiServiceRouter, case: &Case) {
     );
 }
 
-/// A cancel of a stored profile is never refused for the status that profile is
-/// in: it answers the success status whatever that status is, moves a profile
-/// the transition's source status holds for, and leaves a terminal status alone.
+/// A cancel of a stored profile either applies the documented transition or is
+/// refused for the ONE status that forbids it: a revoked profile answers the
+/// recorded 400 and keeps its status, every other status answers the success
+/// status, and the status the profile ends in is the one the row states.
 #[tokio::test]
-async fn a_cancel_of_a_stored_profile_is_never_refused_for_its_status() {
+async fn a_cancel_of_a_stored_profile_follows_the_status_it_is_in() {
     for case in CASES {
         let router = emulator();
         seed(&router, case).await;
 
         let answer = cancel_profile(&router, case.region, case.name).await;
-        assert_eq!(
-            answer.status, SUCCESS_STATUS,
-            "case {:?} ({}): expected HTTP {SUCCESS_STATUS}, got {} {:?}",
-            case.name, case.status_before, answer.status, answer.body
-        );
-        assert!(
-            answer.raw_body.is_empty(),
-            "case {:?}: expected an empty body on {SUCCESS_STATUS}, got {:?}",
-            case.name,
-            String::from_utf8_lossy(&answer.raw_body)
-        );
-        assert!(
-            answer.error_type.is_none(),
-            "case {:?}: expected no x-amzn-errortype on a success, got {:?}",
-            case.name,
-            answer.error_type
-        );
+        if case.refused() {
+            assert_eq!(
+                answer.status, REVOKED_REFUSAL_STATUS,
+                "case {:?} ({}): expected HTTP {REVOKED_REFUSAL_STATUS}, got {} {:?}",
+                case.name, case.status_before, answer.status, answer.body
+            );
+            assert_eq!(
+                answer.code(),
+                ERROR_CODE_PROFILE_REVOKED,
+                "case {:?}: expected the code to name the status that forbade the call, got {:?}",
+                case.name,
+                answer.body
+            );
+            assert_eq!(
+                answer.shape(),
+                REVOKED_REFUSAL_SHAPE,
+                "case {:?}: expected the error shape {REVOKED_REFUSAL_SHAPE}, got {:?}",
+                case.name,
+                answer.body
+            );
+            assert_eq!(
+                answer.error_type.as_deref(),
+                Some(REVOKED_REFUSAL_SHAPE),
+                "case {:?}: expected x-amzn-errortype {REVOKED_REFUSAL_SHAPE}, got {:?}",
+                case.name,
+                answer.error_type
+            );
+            assert!(
+                answer.message().contains(case.name),
+                "case {:?}: expected the refusal to name the profile, got {:?}",
+                case.name,
+                answer.message()
+            );
+        } else {
+            assert_eq!(
+                answer.status, SUCCESS_STATUS,
+                "case {:?} ({}): expected HTTP {SUCCESS_STATUS}, got {} {:?}",
+                case.name, case.status_before, answer.status, answer.body
+            );
+            assert!(
+                answer.raw_body.is_empty(),
+                "case {:?}: expected an empty body on {SUCCESS_STATUS}, got {:?}",
+                case.name,
+                String::from_utf8_lossy(&answer.raw_body)
+            );
+            assert!(
+                answer.error_type.is_none(),
+                "case {:?}: expected no x-amzn-errortype on a success, got {:?}",
+                case.name,
+                answer.error_type
+            );
+        }
 
         let got = get_profile(&router, case.region, case.name).await;
         assert_eq!(
@@ -378,13 +437,13 @@ async fn a_cancel_of_a_stored_profile_is_never_refused_for_its_status() {
             got.body["status"]
         );
 
-        // The call is idempotent: a second cancel answers the same and moves
-        // nothing further.
+        // The call is repeatable: a second cancel answers exactly what the first
+        // did and moves nothing further.
         let again = cancel_profile(&router, case.region, case.name).await;
         assert_eq!(
-            again.status, SUCCESS_STATUS,
-            "case {:?}: expected a repeated cancel to answer HTTP {SUCCESS_STATUS}, got {} {:?}",
-            case.name, again.status, again.body
+            again.status, answer.status,
+            "case {:?}: expected a repeated cancel to answer HTTP {}, got {} {:?}",
+            case.name, answer.status, again.status, again.body
         );
         let after_again = get_profile(&router, case.region, case.name).await;
         assert_eq!(
@@ -403,12 +462,12 @@ async fn a_cancel_of_a_stored_profile_is_never_refused_for_its_status() {
     }
 }
 
-/// The ONLY refusal this operation answers is the one its model declares for a
-/// profile it cannot resolve: `ResourceNotFoundException`/404. No answer — to a
-/// stored profile in any status, or to a profile this region does not hold —
-/// carries a status or a shape outside the modelled set.
+/// Every answer this operation gives carries a status it refuses with and a
+/// shape the service models: a profile it cannot resolve is
+/// `ResourceNotFoundException`/404, and a revoked one the 400 above — nothing
+/// else.
 #[tokio::test]
-async fn every_cancel_answer_stays_inside_the_modelled_error_set() {
+async fn every_cancel_answer_stays_inside_the_refusal_set() {
     let router = emulator();
 
     // Profiles in every status, all in one region, plus the same names in
@@ -428,21 +487,40 @@ async fn every_cancel_answer_stays_inside_the_modelled_error_set() {
     // and a plain unknown name.
     let unknown: [String; 3] = ["Ab".to_string(), "N".repeat(64), "No_Such_Profile".to_string()];
 
-    let mut rows: Vec<(String, &str, bool)> = Vec::new();
-    for case in CASES {
-        // Stored here: resolvable, so a success.
-        rows.push((case.name.to_string(), holding_region, true));
-        // The same name through a region that holds no such profile.
-        rows.push((case.name.to_string(), empty_region, false));
-    }
-    for name in &unknown {
-        rows.push((name.clone(), holding_region, false));
+    /// What a row expects of the answer.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Expected {
+        /// The profile is stored here and its status admits the cancel.
+        Success,
+        /// The profile is stored here and is revoked.
+        Revoked,
+        /// This region holds no profile of that name.
+        Unresolvable,
     }
 
-    for (name, region, resolvable) in rows {
+    let mut rows: Vec<(String, &str, Expected)> = Vec::new();
+    for case in CASES {
+        // Stored here: resolvable, so a success unless its status forbids it.
+        rows.push((
+            case.name.to_string(),
+            holding_region,
+            if case.refused() {
+                Expected::Revoked
+            } else {
+                Expected::Success
+            },
+        ));
+        // The same name through a region that holds no such profile.
+        rows.push((case.name.to_string(), empty_region, Expected::Unresolvable));
+    }
+    for name in &unknown {
+        rows.push((name.clone(), holding_region, Expected::Unresolvable));
+    }
+
+    for (name, region, expected) in rows {
         let answer = cancel_profile(&router, region, &name).await;
         let case = format!("{name} in {region}");
-        if resolvable {
+        if expected == Expected::Success {
             assert_eq!(
                 answer.status, SUCCESS_STATUS,
                 "case {case:?}: expected HTTP {SUCCESS_STATUS}, got {} {:?}",
@@ -452,33 +530,45 @@ async fn every_cancel_answer_stays_inside_the_modelled_error_set() {
         }
         assert!(
             MODELLED_ERROR_STATUSES.contains(&answer.status),
-            "case {case:?}: expected a status the operation models ({MODELLED_ERROR_STATUSES:?}), \
-             got {} {:?}",
+            "case {case:?}: expected a status the operation refuses with \
+             ({MODELLED_ERROR_STATUSES:?}), got {} {:?}",
             answer.status,
             answer.body
         );
+        let (status, shape, code) = if expected == Expected::Revoked {
+            (
+                REVOKED_REFUSAL_STATUS,
+                REVOKED_REFUSAL_SHAPE,
+                ERROR_CODE_PROFILE_REVOKED,
+            )
+        } else {
+            (
+                404,
+                "ResourceNotFoundException",
+                ERROR_CODE_PROFILE_NOT_FOUND,
+            )
+        };
         assert_eq!(
-            answer.status, 404,
-            "case {case:?}: expected the modelled 404 for a profile that cannot be resolved, \
-             got {} {:?}",
+            answer.status, status,
+            "case {case:?}: expected HTTP {status}, got {} {:?}",
             answer.status, answer.body
         );
         assert_eq!(
             answer.shape(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected the modelled error shape, got {:?}",
+            shape,
+            "case {case:?}: expected the error shape {shape}, got {:?}",
             answer.body
         );
         assert_eq!(
             answer.error_type.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case:?}: expected x-amzn-errortype to name the modelled shape, got {:?}",
+            Some(shape),
+            "case {case:?}: expected x-amzn-errortype to name the shape, got {:?}",
             answer.error_type
         );
         assert_eq!(
             answer.code(),
-            ERROR_CODE_PROFILE_NOT_FOUND,
-            "case {case:?}: expected the modelled code naming the condition, got {:?}",
+            code,
+            "case {case:?}: expected the code naming the condition, got {:?}",
             answer.body
         );
     }

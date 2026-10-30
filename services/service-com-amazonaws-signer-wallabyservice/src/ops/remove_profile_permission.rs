@@ -122,9 +122,19 @@ fn profile_not_found(profile_name: &str) -> RemoveProfilePermissionError {
     .into()
 }
 
+/// The modelled 404 for a profile that holds no permission policy: a profile's
+/// resource policy exists only while it holds a statement, so there is no policy
+/// to take one out of and no revision to name.
+fn policy_not_found(profile_name: &str) -> RemoveProfilePermissionError {
+    RemoveProfilePermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::permissions::no_policy_message(profile_name)),
+        code: Some(crate::state::permissions::ERROR_CODE_POLICY_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
 /// The modelled 404 for a statement id the profile's permission policy does not
-/// hold — including the case where the profile holds no policy at all, which is a
-/// policy holding no statement of that id.
+/// hold.
 ///
 /// `statementId` is a bare string in the model, so it is quoted through the one
 /// ceiling this crate states for a request value a clause carries.
@@ -197,29 +207,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(policy) = store.profile_policy(&region, &input.profile_name) else {
-            return Err(statement_not_found(
-                &input.profile_name,
-                &input.statement_id,
-            ));
+            return Err(policy_not_found(&input.profile_name));
         };
 
         // `revisionId` is required here: a removal is applied only while the
         // revision it was issued against is still current, so a writer holding a
-        // superseded revision is told rather than removing a statement it has not
-        // seen the policy in.
+        // superseded revision is told — and told which revision the policy is at,
+        // so it can re-issue the removal — rather than removing a statement it has
+        // not seen the policy in.
         if policy.revision_id != input.revision_id {
             return Err(
                 RemoveProfilePermissionErrorModeled::ConflictException(ConflictException {
-                    // `revisionId` is a bare string in the model, so it is
-                    // quoted through the one ceiling this crate states for a
-                    // request value a clause carries.
-                    message: Some(format!(
-                        "revision id {} is not the current revision of the permissions of \
-                         profile {}",
-                        crate::state::stated_value(&input.revision_id),
-                        input.profile_name
+                    message: Some(crate::state::permissions::revision_mismatch_message(
+                        &input.revision_id,
+                        &policy.revision_id,
                     )),
-                    code: Some(crate::state::permissions::ERROR_CODE_CONFLICT.to_string()),
+                    // The condition a writer branches on, rather than the
+                    // modelled shape's own name: losing the policy's
+                    // optimistic-concurrency check is recoverable by re-reading
+                    // it, and no other 409 of this operation is.
+                    code: Some(
+                        crate::state::permissions::ERROR_CODE_POLICY_REVISION_ID_MISMATCH
+                            .to_string(),
+                    ),
                 })
                 .into(),
             );
@@ -231,19 +241,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // The removal moves the policy to a fresh revision, which is what this
-        // call answers with and what every later read of the policy reports. The
-        // policy itself survives its last statement going: its revision chain is
-        // what a later add has to name.
+        // The removal moves the policy to a fresh revision. The policy itself
+        // exists only while it holds a statement, so a removal that takes the
+        // LAST one out leaves no policy behind: a later read reports it as absent
+        // rather than as a policy with no statements.
         let revision_id = store.mint_permission_revision_id();
         let policy = store
             .profile_policy_mut(&region, &input.profile_name)
             .expect("the policy resolved above is still in the store");
         policy.statements.remove(&input.statement_id);
         policy.revision_id = revision_id;
+        if policy.is_empty() {
+            store.drop_profile_policy(&region, &input.profile_name);
+        }
 
-        Ok(RemoveProfilePermissionOutput {
-            revision_id: Some(policy.revision_id.clone()),
-        })
+        // The modelled `revisionId` is optional and the recorded reply carries
+        // none: a removal does not hand the next revision back, so a writer that
+        // needs it re-reads the policy — which is the only answer that can report
+        // a revision the policy still has (this one may have removed the policy
+        // altogether).
+        Ok(RemoveProfilePermissionOutput { revision_id: None })
     }
 }

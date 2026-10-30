@@ -531,26 +531,31 @@ async fn signing_material_is_required_exactly_on_the_platforms_that_publish_it()
 }
 
 /// What a cancel does to each status a profile can be in: an `Active` profile
-/// becomes `Canceled`, and a profile already in a terminal, non-signing status
-/// keeps it — the call answers the recorded 204 either way, because this
-/// operation's modelled error set carries no refusal for the stored status. A
-/// profile that was revoked and then RE-PUT keeps its revocation, so it is still
-/// `Revoked` and the cancel leaves it there: the transition follows the stored
-/// status, and a write to the profile does not restore the trust the revocation
-/// ended.
+/// becomes `Canceled`, a profile already `Canceled` keeps that status and still
+/// answers the recorded 204 — and a REVOKED profile is refused, because a
+/// revocation cannot be weakened into a cancel. A profile that was revoked and
+/// then RE-PUT keeps its revocation, so it is still `Revoked` and the cancel is
+/// refused there too: the answer follows the stored status, and a write to the
+/// profile does not restore the trust the revocation ended.
 #[tokio::test]
 async fn a_cancel_moves_only_a_profile_its_source_status_holds_for() {
     // One row per status a profile can be in when the cancel arrives, plus the
     // row that is re-put after a revoke. 204 is the recorded success for this
-    // DELETE.
-    let rows: [(&str, &str, u16, &str); 4] = [
-        ("Active", "Active_Cancel", 204, "Canceled"),
-        ("Canceled", "Canceled_Cancel", 204, "Canceled"),
-        ("Revoked", "Revoked_Cancel", 204, "Revoked"),
-        ("Revoked then re-put", "Reput_Cancel", 204, "Revoked"),
+    // DELETE; 400 with the code naming the status is the recorded refusal.
+    let rows: [(&str, &str, u16, &str, &str); 4] = [
+        ("Active", "Active_Cancel", 204, "Canceled", ""),
+        ("Canceled", "Canceled_Cancel", 204, "Canceled", ""),
+        ("Revoked", "Revoked_Cancel", 400, "Revoked", "ProfileRevoked"),
+        (
+            "Revoked then re-put",
+            "Reput_Cancel",
+            400,
+            "Revoked",
+            "ProfileRevoked",
+        ),
     ];
 
-    for (status_before, name, expected_status, status_after) in rows {
+    for (status_before, name, expected_status, status_after, expected_code) in rows {
         let router = emulator();
         let version = seed_profile(&router, name).await;
         match status_before {
@@ -584,11 +589,26 @@ async fn a_cancel_moves_only_a_profile_its_source_status_holds_for() {
             "case {status_before}: expected HTTP {expected_status}, got {} {:?}",
             answer.status, answer.body
         );
-        assert!(
-            answer.error_type.is_none(),
-            "case {status_before}: expected no x-amzn-errortype on a success, got {:?}",
-            answer.error_type
-        );
+        if expected_code.is_empty() {
+            assert!(
+                answer.error_type.is_none(),
+                "case {status_before}: expected no x-amzn-errortype on a success, got {:?}",
+                answer.error_type
+            );
+        } else {
+            assert_eq!(
+                answer.code(),
+                Some(expected_code),
+                "case {status_before}: expected the code {expected_code}, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.error_type.as_deref(),
+                Some("ValidationException"),
+                "case {status_before}: expected x-amzn-errortype on a refusal, got {:?}",
+                answer.error_type
+            );
+        }
 
         // The status the cancel left behind.
         let got = get_profile(&router, name).await;

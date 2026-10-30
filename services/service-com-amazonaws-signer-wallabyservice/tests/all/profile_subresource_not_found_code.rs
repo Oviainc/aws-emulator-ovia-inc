@@ -42,6 +42,10 @@ const ERROR_CODE_PROFILE_NOT_FOUND: &str = "ProfileNotFound";
 /// code for can say.
 const ERROR_CODE_NOT_FOUND: &str = "ResourceNotFoundException";
 
+/// The `code` a read of a profile that holds no permission policy carries: the
+/// policy is a resource of its own, and Signer publishes a code for it.
+const ERROR_CODE_POLICY_NOT_FOUND: &str = "PolicyNotFound";
+
 /// A platform whose profiles need no `signingMaterial`, so a seeded profile is
 /// one `PutSigningProfile` call.
 const PLATFORM_ID: &str = "AWSLambda-SHA384-ECDSA";
@@ -310,9 +314,15 @@ async fn an_unknown_profile_version_is_refused_as_a_sub_resource() {
     );
     let listed = list_permissions(&router, "Subject_Profile").await;
     assert_eq!(
-        listed.body["permissions"],
-        json!([]),
-        "expected the refused grants to have written no statement, got {:?}",
+        listed.status, 404,
+        "expected the refused grants to have written no statement, so no policy to read, \
+         got {} {:?}",
+        listed.status, listed.body
+    );
+    assert_eq!(
+        listed.code(),
+        Some(ERROR_CODE_POLICY_NOT_FOUND),
+        "expected the refused grants to leave no policy, got {:?}",
         listed.body
     );
 

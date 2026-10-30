@@ -168,8 +168,12 @@ async fn get_platform(router: &MultiServiceRouter, platform_id: &str) -> Answer 
 
 /// A `platformId` outside the published catalog is refused with the modelled 404
 /// the platform readers answer, stores no profile, and is reported as unpublished
-/// by `GetSigningPlatform` too — whether or not the request names signing
-/// material.
+/// by `GetSigningPlatform` too.
+///
+/// The create has to carry `signingMaterial` to reach that refusal: the member is
+/// judged on the request before the platform it names is resolved, so a create
+/// that leaves it out is refused for the member instead — which is the row below
+/// it.
 #[tokio::test]
 async fn an_unpublished_platform_id_refuses_the_create_and_stores_nothing() {
     let router = emulator();
@@ -186,52 +190,89 @@ async fn an_unpublished_platform_id_refuses_the_create_and_stores_nothing() {
             published.status, published.body
         );
 
-        for (variant, body) in [
-            (
-                "with signingMaterial",
-                json!({
-                    "platformId": platform,
-                    "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
-                }),
-            ),
-            ("without signingMaterial", json!({ "platformId": platform })),
-        ] {
-            let name = format!("Unpublished_{ordinal}_{}", variant.replace(' ', "_"));
-            let put = put_profile(&router, &name, body).await;
-            assert_eq!(
-                put.status, 404,
-                "case {case} {variant}: expected HTTP 404, got {} {:?}",
-                put.status, put.body
-            );
-            assert_eq!(
-                put.shape(),
-                "ResourceNotFoundException",
-                "case {case} {variant}: expected the modelled 404 shape, got {:?}",
-                put.body
-            );
-            assert_eq!(
-                put.error_type.as_deref(),
-                Some("ResourceNotFoundException"),
-                "case {case} {variant}: expected x-amzn-errortype ResourceNotFoundException, got \
-                 {:?}",
-                put.error_type
-            );
-            assert_eq!(
-                put.code(),
-                Some(ERROR_CODE_PLATFORM_NOT_FOUND),
-                "case {case} {variant}: expected the modelled code to name the condition, got {:?}",
-                put.body
-            );
-            assert!(
-                put.message().contains(*platform),
-                "case {case} {variant}: expected the refusal to name the platform, got {:?}",
-                put.body["message"]
-            );
+        let name = format!("Unpublished_{ordinal}_with_signingMaterial");
+        let put = put_profile(
+            &router,
+            &name,
+            json!({
+                "platformId": platform,
+                "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
+            }),
+        )
+        .await;
+        assert_eq!(
+            put.status, 404,
+            "case {case} with signingMaterial: expected HTTP 404, got {} {:?}",
+            put.status, put.body
+        );
+        assert_eq!(
+            put.shape(),
+            "ResourceNotFoundException",
+            "case {case} with signingMaterial: expected the modelled 404 shape, got {:?}",
+            put.body
+        );
+        assert_eq!(
+            put.error_type.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case} with signingMaterial: expected x-amzn-errortype \
+             ResourceNotFoundException, got {:?}",
+            put.error_type
+        );
+        assert_eq!(
+            put.code(),
+            Some(ERROR_CODE_PLATFORM_NOT_FOUND),
+            "case {case} with signingMaterial: expected the modelled code to name the \
+             condition, got {:?}",
+            put.body
+        );
+        assert!(
+            put.message().contains(*platform),
+            "case {case} with signingMaterial: expected the refusal to name the platform, got {:?}",
+            put.body["message"]
+        );
 
-            let read_back = get_profile(&router, &name).await;
+        // Without the member, the SAME request is refused for the member it left
+        // out: the request's own values are judged before the resource it names
+        // is resolved, so a malformed create is never reported as a missing
+        // platform.
+        let without_name = format!("Unpublished_{ordinal}_without_signingMaterial");
+        let without = put_profile(&router, &without_name, json!({ "platformId": platform })).await;
+        assert_eq!(
+            without.status, 400,
+            "case {case} without signingMaterial: expected HTTP 400, got {} {:?}",
+            without.status, without.body
+        );
+        assert_eq!(
+            without.shape(),
+            "ValidationException",
+            "case {case} without signingMaterial: expected the modelled 400 shape, got {:?}",
+            without.body
+        );
+        assert_eq!(
+            without.error_type.as_deref(),
+            Some("ValidationException"),
+            "case {case} without signingMaterial: expected x-amzn-errortype \
+             ValidationException, got {:?}",
+            without.error_type
+        );
+        assert_eq!(
+            without.code(),
+            Some(ERROR_CODE_VALIDATION),
+            "case {case} without signingMaterial: expected the modelled code, got {:?}",
+            without.body
+        );
+        assert!(
+            !without.message().contains(*platform),
+            "case {case} without signingMaterial: expected the refusal to be about the member \
+             rather than the platform, got {:?}",
+            without.body["message"]
+        );
+
+        for name in [&name, &without_name] {
+            let read_back = get_profile(&router, name).await;
             assert_eq!(
                 read_back.status, 404,
-                "case {case} {variant}: a refused create must store no profile, got {} {:?}",
+                "case {case} ({name}): a refused create must store no profile, got {} {:?}",
                 read_back.status, read_back.body
             );
         }

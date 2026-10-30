@@ -15,48 +15,119 @@
 
 use std::collections::BTreeMap;
 
-use super::SigningProfileRecord;
+use super::{SigningProfileRecord, SigningWorkflow};
 
-/// The request lost an optimistic-concurrency check, or asked for something the
-/// resource's current state already holds: the modelled shape's own name.
+/// The request asked for something the resource's current state already holds:
+/// the modelled shape's own name.
 pub const ERROR_CODE_CONFLICT: &str = "ConflictException";
+
+/// The request named a `revisionId` that is not the one the profile's policy is
+/// at — the condition a writer recovers from by re-reading the policy and
+/// re-issuing the call against the revision it reports.
+pub const ERROR_CODE_POLICY_REVISION_ID_MISMATCH: &str = "PolicyRevisionIdMismatch";
+
+/// The profile holds no resource policy at all, so there is none to report, to
+/// revise or to take a statement out of.
+pub const ERROR_CODE_POLICY_NOT_FOUND: &str = "PolicyNotFound";
+
+/// The refusal prose for a call that resolved the profile and found it holding
+/// no policy.
+///
+/// `profileName` is bounded by its modelled shape (`ProfileName`,
+/// `@length(2..64)`), so it is stated as it arrived.
+pub fn no_policy_message(profile_name: &str) -> String {
+    format!("No policies associated with profile {profile_name}")
+}
+
+/// The refusal prose for a write that lost the policy's optimistic-concurrency
+/// check: the revision the request carried, and the one the policy is actually
+/// at — which is what the writer has to re-issue the call against.
+///
+/// `revisionId` is a bare string in the model, so the supplied value is quoted
+/// through the one ceiling this crate states for a request value a clause
+/// carries ([`super::stated_value`]); the current revision is this service's own
+/// minted id.
+pub fn revision_mismatch_message(specified: &str, current: &str) -> String {
+    format!(
+        "Specified revisionId ({}) does not match the revisionId of the existing policy \
+         ({current})",
+        super::stated_value(specified)
+    )
+}
 
 /// The request would carry a resource past a service limit: the modelled shape's
 /// own name.
 pub const ERROR_CODE_SERVICE_LIMIT_EXCEEDED: &str = "ServiceLimitExceededException";
 
-/// The AWS Signer actions a cross-account permission may grant, sorted.
+/// The AWS Signer actions a cross-account permission may grant whatever the
+/// profile's signing platform: the two whose operations read the profile or
+/// revoke a signature rather than produce one.
 ///
 /// Not a chosen list: `AddProfilePermissionRequest$action` documents "You can
-/// designate the following actions to an account" and then names exactly these
-/// four (`smithy_query(query="doc", shape="AddProfilePermissionRequest",
-/// member="action")`), so an `action` outside this catalog is one no AWS Signer
-/// policy statement could hold.
-pub const GRANTABLE_ACTIONS: [&str; 4] = [
-    "signer:GetSigningProfile",
-    "signer:RevokeSignature",
-    "signer:SignPayload",
-    "signer:StartSigningJob",
-];
+/// designate the following actions to an account" and then names four
+/// (`smithy_query(query="doc", shape="AddProfilePermissionRequest",
+/// member="action")`) — these two, plus the SIGNING action of each of the two
+/// signing workflows, which the same documentation splits per platform (see
+/// [`grantable_actions`]).
+const PLATFORM_INDEPENDENT_ACTIONS: [&str; 2] =
+    ["signer:GetSigningProfile", "signer:RevokeSignature"];
 
-/// Whether `action` is one of the [`GRANTABLE_ACTIONS`].
-pub fn is_grantable_action(action: &str) -> bool {
-    GRANTABLE_ACTIONS.contains(&action)
+/// The actions a cross-account permission on a profile of `platform_id` may
+/// grant, the signing action of that platform's workflow first.
+///
+/// A grant names an operation a designated account may call on the profile, and
+/// a profile is signed through exactly one of Signer's two signing workflows
+/// ([`SigningWorkflow`]) — so the signing operation of the OTHER workflow is not
+/// one that profile has at all, and is not grantable on it. The model states the
+/// split per action: `signer:StartSigningJob` "isn't supported for container
+/// image workflows" and `signer:SignPayload` "isn't supported for AWS Lambda
+/// workflows".
+///
+/// A `platform_id` the catalog publishes no entry for narrows nothing: there is
+/// no workflow to read off it, so both signing actions stay grantable rather
+/// than one being refused for a split this service cannot resolve.
+pub fn grantable_actions(platform_id: &str) -> Vec<&'static str> {
+    let signing_actions: Vec<&'static str> = match super::signing_platform(platform_id) {
+        Some(entry) => vec![signing_action_of(entry.workflow)],
+        None => vec![
+            signing_action_of(SigningWorkflow::CodeSigningJob),
+            signing_action_of(SigningWorkflow::ContainerImage),
+        ],
+    };
+    signing_actions
+        .into_iter()
+        .chain(PLATFORM_INDEPENDENT_ACTIONS)
+        .collect()
 }
 
-/// The refusal prose for an `action` outside the documented catalog: the member,
-/// the value and the values the member admits, so the caller can fix the request
-/// from the text alone.
+/// The grantable action naming `workflow`'s signing operation — `signer:`
+/// followed by the operation [`SigningWorkflow::signing_operation`] names, so
+/// the action and the operation cannot drift apart.
+fn signing_action_of(workflow: SigningWorkflow) -> &'static str {
+    match workflow {
+        SigningWorkflow::CodeSigningJob => "signer:StartSigningJob",
+        SigningWorkflow::ContainerImage => "signer:SignPayload",
+    }
+}
+
+/// Whether `action` is one a grant on a profile of `platform_id` may carry.
+pub fn is_grantable_action(platform_id: &str, action: &str) -> bool {
+    grantable_actions(platform_id).contains(&action)
+}
+
+/// The refusal prose for an `action` no grant on a profile of that platform may
+/// carry: the value, the platform that narrowed the set, and the actions the set
+/// holds — so the caller can fix the request from the text alone.
 ///
 /// `action` is a bare string in the model, so it is quoted through the one
 /// ceiling this crate states for a request value a clause carries
 /// ([`super::stated_value`]).
-pub fn ungrantable_action_message(action: &str) -> String {
+pub fn ungrantable_action_message(action: &str, platform_id: &str) -> String {
     format!(
-        "action {} is not an AWS Signer action that can be granted to another account; \
-         expected one of {}",
+        "Action {} not supported for platform {}. Action must be one of [{}]",
         super::stated_value(action),
-        GRANTABLE_ACTIONS.join(", ")
+        super::stated_value(platform_id),
+        grantable_actions(platform_id).join(", ")
     )
 }
 
@@ -104,7 +175,8 @@ pub const PERMISSION_PAGE_LIMIT: usize = 25;
 pub struct ProfilePermissionRecord {
     /// The statement's unique id within the profile's policy.
     pub statement_id: String,
-    /// One of [`GRANTABLE_ACTIONS`].
+    /// One of the actions [`grantable_actions`] admits for the profile's
+    /// platform.
     pub action: String,
     /// The AWS principal the action was granted to.
     pub principal: String,
@@ -172,6 +244,13 @@ pub struct ProfilePermissionPolicy {
 }
 
 impl ProfilePermissionPolicy {
+    /// Whether this policy holds no statement at all — the state a policy is
+    /// DROPPED in rather than stored in (see
+    /// [`super::ComAmazonawsSignerWallabyserviceState::drop_profile_policy`]).
+    pub fn is_empty(&self) -> bool {
+        self.statements.is_empty()
+    }
+
     /// The policy document these statements form, in AWS's policy language, with
     /// `extra` counted as one more statement when it is given.
     ///

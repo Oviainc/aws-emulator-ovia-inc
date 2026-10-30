@@ -194,9 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // answers, so it is not the profile one.
                 DescribeSigningJobErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        // `jobId` is a bare string in the model, so the id is
-                        // quoted through the one ceiling this crate states for a
-                        // request value a clause carries.
+                        // The sentence AWS words for THIS operation's 404 — the
+                        // reader of a job and the write that revokes its
+                        // signature word the same condition differently, so each
+                        // states its own ([`crate::state::job_not_found_message`]
+                        // is the revoke's). `jobId` is a bare string in the
+                        // model, so the id is quoted through the one ceiling this
+                        // crate states for a request value a clause carries.
                         message: Some(format!(
                             "Signing job not found for id {}",
                             crate::state::stated_value(&input.job_id)

@@ -46,8 +46,9 @@ const ACCOUNT_ID: &str = "000000000000";
 /// `PutSigningProfile` call.
 const PLATFORM_ID: &str = "AWSLambda-SHA384-ECDSA";
 
-/// The error `code` a refusal of a lost optimistic-concurrency check carries.
-const ERROR_CODE_CONFLICT: &str = "ConflictException";
+/// The error `code` a refusal of a lost optimistic-concurrency check carries:
+/// the condition a writer branches on, not the modelled shape's name.
+const ERROR_CODE_CONFLICT: &str = "PolicyRevisionIdMismatch";
 
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
@@ -489,11 +490,11 @@ async fn the_same_route_with_the_parameter_supplied_is_served() {
         "case \"the current revisionId\": expected HTTP 200, got {} {:?}",
         answer.status, answer.body
     );
-    assert_ne!(
+    assert_eq!(
         answer.revision_id(),
-        current.as_str(),
-        "case \"the current revisionId\": a removal must move the policy to a fresh revision, \
-         got {:?}",
+        "",
+        "case \"the current revisionId\": a removal hands back no revision (a writer re-reads \
+         the policy for it), got {:?}",
         answer.body
     );
     assert_eq!(

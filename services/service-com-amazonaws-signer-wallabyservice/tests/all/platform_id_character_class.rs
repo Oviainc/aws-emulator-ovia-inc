@@ -214,7 +214,7 @@ fn pattern_refusal(value: &str) -> String {
 
 /// The refusal an in-class id that names no published platform takes.
 fn not_found_refusal(value: &str) -> String {
-    format!("Platform with id {value} does not exist")
+    format!("Signing platform not found for ID {value}")
 }
 
 /// The expression the service states is the published one: the refusal quotes it
@@ -374,7 +374,7 @@ async fn a_platform_id_outside_the_published_class_is_refused_for_the_constraint
             answer.message()
         );
         assert!(
-            !answer.message().contains("does not exist"),
+            !answer.message().contains("not found for ID"),
             "case {case:?}: expected the constraint refusal, not the catalog's, got {:?}",
             answer.message()
         );

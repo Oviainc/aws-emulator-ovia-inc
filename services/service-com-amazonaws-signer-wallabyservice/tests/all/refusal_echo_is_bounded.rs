@@ -19,7 +19,9 @@
 //! character.
 //!
 //! A value the model DOES bound is not part of this rule: the boundary validator
-//! refuses it before a handler sees it, so it is quoted as it arrived.
+//! refuses it before a handler sees it, so it is quoted as it arrived. Neither is
+//! a refusal that quotes NO part of the request (a tagging `resourceArn` that is
+//! no ARN at all, a `nextToken`): there is nothing for a ceiling to bound.
 
 use std::sync::Arc;
 
@@ -58,12 +60,19 @@ const SEEDED_STATEMENT_ID: &str = "Echo_Statement";
 /// independently of the service's own constant.
 const BOUND: usize = 16 * 1024;
 
-/// The actions a profile permission may grant, as
-/// `AddProfilePermissionRequest$action` documents them
-/// (`smithy_query(query="doc", shape="AddProfilePermissionRequest",
-/// member="action")`) — the set a refusal of that member lists.
-const GRANTABLE_ACTIONS: &str = "signer:GetSigningProfile, signer:RevokeSignature, \
-                                 signer:SignPayload, signer:StartSigningJob";
+/// The actions a cross-account permission may grant on a profile of
+/// [`PLATFORM_ID`], in the order a refusal lists them — the signing action of
+/// that platform's workflow, then the two every platform admits. Source:
+/// `AddProfilePermissionRequest$action` (`smithy_query(query="doc",
+/// shape="AddProfilePermissionRequest", member="action")`), which documents
+/// `signer:SignPayload` as unsupported for AWS Lambda workflows.
+const GRANTABLE_ACTIONS: &str = "signer:StartSigningJob, signer:GetSigningProfile, \
+                                 signer:RevokeSignature";
+
+/// An ACM certificate ARN a create names as its signing material, so a create
+/// reaches the platform catalog instead of being refused for the absent member.
+const CERTIFICATE_ARN: &str =
+    "arn:aws:acm:us-west-2:000000000000:certificate/12345678-1234-1234-1234-123456789012";
 
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
@@ -204,13 +213,15 @@ struct Case {
     /// The value the clause quotes, built from the filler — the filler itself for
     /// every member that carries it directly.
     carried: fn(&str) -> String,
-    /// The request that carries `carried`.
-    request: fn(&str) -> Request,
+    /// The request that carries `carried`, given the revision the seeded policy
+    /// is at (which a row naming a permission statement has to send to reach the
+    /// refusal under test).
+    request: fn(&str, &str) -> Request,
     /// The HTTP status the refusal answers with.
     status: u16,
     /// The whole message the refusal states, given the value as a clause quotes
-    /// it.
-    clause: fn(&str) -> String,
+    /// it and the revision the seeded policy is at.
+    clause: fn(&str, &str) -> String,
 }
 
 /// The filler itself: what every member that carries the value directly quotes.
@@ -240,7 +251,7 @@ fn region_filled_profile_arn(filler: &str) -> String {
 
 /// Every required `GetRevocationStatus` query parameter, with `platformId` the one
 /// under test and every other value one this endpoint serves.
-fn get_revocation_status(platform_id: &str) -> Request {
+fn get_revocation_status(platform_id: &str, _revision_id: &str) -> Request {
     let query = [
         ("signatureTimestamp", "2023-11-14T22%3A13%3A20Z".to_string()),
         ("platformId", encode(platform_id)),
@@ -271,7 +282,7 @@ fn get_revocation_status(platform_id: &str) -> Request {
     }
 }
 
-fn get_signing_platform(platform_id: &str) -> Request {
+fn get_signing_platform(platform_id: &str, _revision_id: &str) -> Request {
     Request {
         method: "GET",
         uri: format!("/signing-platforms/{}", encode(platform_id)),
@@ -279,15 +290,22 @@ fn get_signing_platform(platform_id: &str) -> Request {
     }
 }
 
-fn put_signing_profile(platform_id: &str) -> Request {
+/// A create naming the platform under test, and the signing certificate a
+/// platform the catalog does not publish is assumed to need: the member is
+/// judged before the platform is resolved, so a create that leaves it out is
+/// refused for the member rather than for the platform.
+fn put_signing_profile(platform_id: &str, _revision_id: &str) -> Request {
     Request {
         method: "PUT",
         uri: "/signing-profiles/Echo_Created_Profile".to_string(),
-        body: Some(json!({ "platformId": platform_id })),
+        body: Some(json!({
+            "platformId": platform_id,
+            "signingMaterial": { "certificateArn": CERTIFICATE_ARN },
+        })),
     }
 }
 
-fn list_tags_for_resource(resource_arn: &str) -> Request {
+fn list_tags_for_resource(resource_arn: &str, _revision_id: &str) -> Request {
     Request {
         method: "GET",
         uri: format!("/tags/{}", encode(resource_arn)),
@@ -295,15 +313,7 @@ fn list_tags_for_resource(resource_arn: &str) -> Request {
     }
 }
 
-fn tag_resource(resource_arn: &str) -> Request {
-    Request {
-        method: "POST",
-        uri: format!("/tags/{}", encode(resource_arn)),
-        body: Some(json!({ "tags": { "owner": "echo" } })),
-    }
-}
-
-fn describe_signing_job(job_id: &str) -> Request {
+fn describe_signing_job(job_id: &str, _revision_id: &str) -> Request {
     Request {
         method: "GET",
         uri: format!("/signing-jobs/{}", encode(job_id)),
@@ -311,7 +321,7 @@ fn describe_signing_job(job_id: &str) -> Request {
     }
 }
 
-fn revoke_signature(job_id: &str) -> Request {
+fn revoke_signature(job_id: &str, _revision_id: &str) -> Request {
     Request {
         method: "PUT",
         uri: format!("/signing-jobs/{}/revoke", encode(job_id)),
@@ -319,7 +329,7 @@ fn revoke_signature(job_id: &str) -> Request {
     }
 }
 
-fn add_permission_with_action(action: &str) -> Request {
+fn add_permission_with_action(action: &str, _revision_id: &str) -> Request {
     Request {
         method: "POST",
         uri: format!("/signing-profiles/{PROFILE_WITHOUT_POLICY}/permissions"),
@@ -331,10 +341,12 @@ fn add_permission_with_action(action: &str) -> Request {
     }
 }
 
-fn add_permission_with_revision(revision_id: &str) -> Request {
+/// A grant on the profile that HOLDS a policy, so the oversized `revisionId` is
+/// judged against the revision that policy is at.
+fn add_permission_with_revision(revision_id: &str, _current_revision: &str) -> Request {
     Request {
         method: "POST",
-        uri: format!("/signing-profiles/{PROFILE_WITHOUT_POLICY}/permissions"),
+        uri: format!("/signing-profiles/{PROFILE_WITH_POLICY}/permissions"),
         body: Some(json!({
             "statementId": "echo-revision",
             "action": "signer:StartSigningJob",
@@ -344,18 +356,21 @@ fn add_permission_with_revision(revision_id: &str) -> Request {
     }
 }
 
-fn remove_permission_by_statement(statement_id: &str) -> Request {
+/// A removal from the profile that HOLDS a policy, naming the revision that
+/// policy is at — so the oversized `statementId` is what the refusal is about.
+fn remove_permission_by_statement(statement_id: &str, current_revision: &str) -> Request {
     Request {
         method: "DELETE",
         uri: format!(
-            "/signing-profiles/{PROFILE_WITHOUT_POLICY}/permissions/{}?revisionId=echo",
-            encode(statement_id)
+            "/signing-profiles/{PROFILE_WITH_POLICY}/permissions/{}?revisionId={}",
+            encode(statement_id),
+            encode(current_revision)
         ),
         body: None,
     }
 }
 
-fn remove_permission_with_revision(revision_id: &str) -> Request {
+fn remove_permission_with_revision(revision_id: &str, _current_revision: &str) -> Request {
     Request {
         method: "DELETE",
         uri: format!(
@@ -367,47 +382,45 @@ fn remove_permission_with_revision(revision_id: &str) -> Request {
     }
 }
 
-fn platform_not_found(value: &str) -> String {
-    format!("Platform with id {value} does not exist")
+fn platform_not_found(value: &str, _revision_id: &str) -> String {
+    format!("Signing platform not found for ID {value}")
 }
 
-fn malformed_tagging_arn(value: &str) -> String {
-    format!("{value} is not a valid signing profile resource ARN")
-}
-
-fn no_such_tagged_profile(value: &str) -> String {
+fn no_such_tagged_profile(value: &str, _revision_id: &str) -> String {
     format!("profile with arn {value} does not exists")
 }
 
-fn job_not_found(value: &str) -> String {
+/// The sentence the job READER words for a `jobId` nothing is held under — which
+/// is not the one the revoke words (see [`revoke_job_not_found`]).
+fn describe_job_not_found(value: &str, _revision_id: &str) -> String {
     format!("Signing job not found for id {value}")
 }
 
-fn ungrantable_action(value: &str) -> String {
+/// The sentence `RevokeSignature` words for the same condition.
+fn revoke_job_not_found(value: &str, _revision_id: &str) -> String {
+    format!("Signing Job with id {value} does not exist.")
+}
+
+fn ungrantable_action(value: &str, _revision_id: &str) -> String {
     format!(
-        "action {value} is not an AWS Signer action that can be granted to another account; \
-         expected one of {GRANTABLE_ACTIONS}"
+        "Action {value} not supported for platform {PLATFORM_ID}. \
+         Action must be one of [{GRANTABLE_ACTIONS}]"
     )
 }
 
-fn stale_revision_on_plain_profile(value: &str) -> String {
+/// The refusal a `revisionId` the policy is not at takes: the value the request
+/// carried, and the revision the policy IS at.
+fn stale_revision(value: &str, current_revision: &str) -> String {
     format!(
-        "revision id {value} is not the current revision of the permissions of profile \
-         {PROFILE_WITHOUT_POLICY}"
+        "Specified revisionId ({value}) does not match the revisionId of the existing policy \
+         ({current_revision})"
     )
 }
 
-fn stale_revision_on_policy_profile(value: &str) -> String {
-    format!(
-        "revision id {value} is not the current revision of the permissions of profile \
-         {PROFILE_WITH_POLICY}"
-    )
-}
-
-fn statement_not_found(value: &str) -> String {
+fn statement_not_found(value: &str, _revision_id: &str) -> String {
     format!(
         "statement id {value} does not exist in the permissions of profile \
-         {PROFILE_WITHOUT_POLICY}"
+         {PROFILE_WITH_POLICY}"
     )
 }
 
@@ -439,22 +452,6 @@ fn cases() -> Vec<Case> {
             clause: platform_not_found,
         },
         Case {
-            name: "ListTagsForResource resourceArn that is no ARN (label)",
-            filler: Filler::Ascii,
-            carried: itself,
-            request: list_tags_for_resource,
-            status: 400,
-            clause: malformed_tagging_arn,
-        },
-        Case {
-            name: "TagResource resourceArn that is no ARN (label)",
-            filler: Filler::Ascii,
-            carried: itself,
-            request: tag_resource,
-            status: 400,
-            clause: malformed_tagging_arn,
-        },
-        Case {
             name: "ListTagsForResource resourceArn naming no profile (label)",
             filler: Filler::Ascii,
             carried: region_filled_profile_arn,
@@ -468,7 +465,7 @@ fn cases() -> Vec<Case> {
             carried: itself,
             request: describe_signing_job,
             status: 404,
-            clause: job_not_found,
+            clause: describe_job_not_found,
         },
         Case {
             name: "RevokeSignature jobId (label)",
@@ -476,7 +473,7 @@ fn cases() -> Vec<Case> {
             carried: itself,
             request: revoke_signature,
             status: 404,
-            clause: job_not_found,
+            clause: revoke_job_not_found,
         },
         Case {
             name: "AddProfilePermission action (body)",
@@ -492,7 +489,7 @@ fn cases() -> Vec<Case> {
             carried: itself,
             request: add_permission_with_revision,
             status: 409,
-            clause: stale_revision_on_plain_profile,
+            clause: stale_revision,
         },
         Case {
             name: "RemoveProfilePermission statementId (label)",
@@ -508,7 +505,7 @@ fn cases() -> Vec<Case> {
             carried: itself,
             request: remove_permission_with_revision,
             status: 409,
-            clause: stale_revision_on_policy_profile,
+            clause: stale_revision,
         },
     ]
 }
@@ -532,8 +529,9 @@ async fn seed_profile(router: &MultiServiceRouter, name: &str) {
 }
 
 /// The two profiles the permission cases need: one holding a policy with a
-/// statement, one holding no policy at all.
-async fn seed_profiles(router: &MultiServiceRouter) {
+/// statement, one holding no policy at all — and the revision that policy is at,
+/// which the rows naming a statement or a revision are judged against.
+async fn seed_profiles(router: &MultiServiceRouter) -> String {
     seed_profile(router, PROFILE_WITH_POLICY).await;
     seed_profile(router, PROFILE_WITHOUT_POLICY).await;
     let granted = call(
@@ -554,6 +552,15 @@ async fn seed_profiles(router: &MultiServiceRouter) {
         "seeding a statement on {PROFILE_WITH_POLICY}: expected HTTP 200, got {} {:?}",
         granted.status, granted.body
     );
+    granted.body["revisionId"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "seeding a statement on {PROFILE_WITH_POLICY}: expected a revisionId, got {:?}",
+                granted.body
+            )
+        })
+        .to_string()
 }
 
 /// Every refusal that quotes an unbounded request value states it up to the one
@@ -562,12 +569,12 @@ async fn seed_profiles(router: &MultiServiceRouter) {
 #[tokio::test]
 async fn every_unbounded_request_value_is_quoted_up_to_one_ceiling() {
     let router = emulator();
-    seed_profiles(&router).await;
+    let revision = seed_profiles(&router).await;
 
     for case in cases() {
         for (size, filler) in fillers(case.filler) {
             let carried = (case.carried)(&filler);
-            let request = (case.request)(&carried);
+            let request = (case.request)(&carried, &revision);
             let label = format!("{} / {size}", case.name);
             let answer = call(&router, &request).await;
 
@@ -576,7 +583,7 @@ async fn every_unbounded_request_value_is_quoted_up_to_one_ceiling() {
                 "case {label:?}: expected HTTP {}, got {} {:?}",
                 case.status, answer.status, answer.body
             );
-            let expected = (case.clause)(&quoted(&carried));
+            let expected = (case.clause)(&quoted(&carried), &revision);
             assert_eq!(
                 answer.message(),
                 expected,
@@ -595,7 +602,7 @@ async fn every_unbounded_request_value_is_quoted_up_to_one_ceiling() {
 #[tokio::test]
 async fn an_oversized_request_value_never_sizes_the_error_body() {
     let router = emulator();
-    seed_profiles(&router).await;
+    let revision = seed_profiles(&router).await;
 
     // The prose of every clause under test, plus the elision marker, is far
     // shorter than this: the point is that the message does not GROW with the
@@ -608,7 +615,7 @@ async fn an_oversized_request_value_never_sizes_the_error_body() {
                 continue;
             }
             let carried = (case.carried)(&filler);
-            let request = (case.request)(&carried);
+            let request = (case.request)(&carried, &revision);
             let label = format!("{} / {size}", case.name);
             let answer = call(&router, &request).await;
             assert!(
@@ -633,10 +640,10 @@ async fn an_oversized_request_value_never_sizes_the_error_body() {
     // is the size class the rule exists for: a megabyte of request still answers
     // one ceiling's worth of message.
     let megabyte = "a".repeat(1024 * 1024);
-    let answer = call(&router, &put_signing_profile(&megabyte)).await;
+    let answer = call(&router, &put_signing_profile(&megabyte, &revision)).await;
     assert_eq!(
         answer.message(),
-        platform_not_found(&quoted(&megabyte)),
+        platform_not_found(&quoted(&megabyte), &revision),
         "case \"a megabyte in a body member\": expected the value stated up to the ceiling, got a \
          message of {} bytes",
         answer.message().len()
@@ -663,7 +670,7 @@ async fn both_refusals_of_one_platform_id_are_bounded_alike() {
     // it instead.
     let out_of_class = format!("{in_class}!");
 
-    let catalog = call(&router, &get_revocation_status(&in_class)).await;
+    let catalog = call(&router, &get_revocation_status(&in_class, "")).await;
     assert_eq!(
         catalog.status, 400,
         "case \"an in-class value past the ceiling\": expected HTTP 400, got {} {:?}",
@@ -671,13 +678,13 @@ async fn both_refusals_of_one_platform_id_are_bounded_alike() {
     );
     assert_eq!(
         catalog.message(),
-        platform_not_found(&quoted(&in_class)),
+        platform_not_found(&quoted(&in_class), ""),
         "case \"an in-class value past the ceiling\": expected the catalog refusal to state the \
          value up to the ceiling, got a message of {} bytes",
         catalog.message().len()
     );
 
-    let class = call(&router, &get_revocation_status(&out_of_class)).await;
+    let class = call(&router, &get_revocation_status(&out_of_class, "")).await;
     assert_eq!(
         class.status, 400,
         "case \"a value the class excludes\": expected HTTP 400, got {} {:?}",

@@ -69,6 +69,9 @@
 //! * `ResourceNotFoundException` (HTTP 404) — A specified resource could not be found.
 //! * `TooManyRequestsException` (HTTP 429) — The allowed number of job-signing requests has
 //!   been exceeded. This error supersedes the error ThrottlingException.
+//! * `ValidationException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   recorded AWS answer to a cancel of a REVOKED profile, carrying the `code` that names
+//!   the status which forbade the call.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -117,17 +120,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for CancelSigningProfileOutp
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 //
-// The set is NOT widened: this operation models exactly the four errors below,
-// and a client's generated error union for it can carry no other shape, so a
-// refusal in a shape borrowed from another operation would reach that client as
-// an unknown error.
-#[smithy_macros::operation_error("com.amazonaws.signer#CancelSigningProfile")]
+// `ValidationException` — a 400 shape the SERVICE models, which this operation's
+// error list does not carry — is widened in through `extra_errors`, because the
+// RECORDED AWS answer to a cancel of a revoked profile is a 400 carrying
+// `message` and `code`, and the wire is what a client reads. The modelled shape
+// is what carries both members; the error set is not widened any further.
+#[smithy_macros::operation_error(
+    "com.amazonaws.signer#CancelSigningProfile",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum CancelSigningProfileErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServiceErrorException(InternalServiceErrorException),
     ResourceNotFoundException(ResourceNotFoundException),
     TooManyRequestsException(TooManyRequestsException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -218,16 +226,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // canceled profile is still viewable with the ListSigningProfiles
         // operation, but it cannot perform new signing jobs" — so the record
         // stays and only its status moves, and it moves only from the source
-        // status the operation documents. A profile already in a terminal,
-        // non-signing status keeps that status (a revoked profile stays
-        // `Revoked`, so the fact that its signatures are no longer trusted is
-        // not overwritten by a weaker one), and the call reports success either
-        // way: this operation's error set models no refusal for the stored
-        // status. The status read is the one the store holds NOW, not the
-        // profile's history: a later `PutSigningProfile` re-versions a canceled
-        // profile and makes it `Active` again, and then a cancel moves it once
-        // more — while a revoked one reads back `Revoked` after a re-put too,
-        // because the store carries its revocation forward.
+        // status the operation documents.
+        //
+        // A REVOKED profile is not cancellable at all: revocation is a stronger,
+        // already-final fact about the trust in its signatures, so the call is
+        // refused for that status rather than quietly moving the profile to a
+        // weaker one — which is what the recorded AWS answer to this call does
+        // (a 400 whose `code` names the status that forbade it). A profile
+        // already `Canceled` is left where it is and the call reports success,
+        // because the status it asks for is the one the profile is in. The status
+        // read is the one the store holds NOW, not the profile's history: a later
+        // `PutSigningProfile` re-versions a canceled profile and makes it
+        // `Active` again, and then a cancel moves it once more — while a revoked
+        // one reads back `Revoked` after a re-put too, because the store carries
+        // its revocation forward, and the refusal stands.
+        if profile.is_revoked() {
+            let code = crate::state::profile_status_error_code(&profile.status);
+            let message = crate::state::cancel_refused_message(&profile.profile_name);
+            return Err(CancelSigningProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                    code: Some(code),
+                },
+            )
+            .into());
+        }
         if profile.can_sign() {
             profile.status = crate::state::PROFILE_STATUS_CANCELED.to_string();
         }

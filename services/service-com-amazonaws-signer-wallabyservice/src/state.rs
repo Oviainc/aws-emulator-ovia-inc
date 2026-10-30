@@ -737,6 +737,17 @@ impl ComAmazonawsSignerWallabyserviceState {
             .get_mut(&profile_key(region, profile_name))
     }
 
+    /// Drop the permission policy of `region`'s profile of that name.
+    ///
+    /// A resource policy exists only while it holds a statement, so the write
+    /// that takes the LAST statement out leaves no policy behind rather than an
+    /// empty one — which is what makes every later read of it report the policy
+    /// as absent instead of as present and empty.
+    pub fn drop_profile_policy(&mut self, region: &str, profile_name: &str) {
+        self.profile_permissions
+            .remove(&profile_key(region, profile_name));
+    }
+
     /// [`Self::profile_policy`], for a call that CHANGES the policy, creating the
     /// empty policy when the profile holds none yet.
     pub fn profile_policy_entry(
@@ -1082,13 +1093,16 @@ impl TaggingArnProblem {
     /// through the one ceiling this crate states for a request value a clause
     /// carries ([`stated_value`]).
     pub fn message(self, resource_arn: &str) -> String {
-        let resource_arn = stated_value(resource_arn);
         match self {
-            Self::Malformed => {
-                format!("{resource_arn} is not a valid signing profile resource ARN")
-            }
+            // The label was not an ARN at all, which is a statement about its
+            // SYNTAX: the clause says so and carries none of the value, so a
+            // label nothing parsed is never reported back to the caller.
+            Self::Malformed => "Invalid input resource arn: bad syntax".to_string(),
             Self::NoSuchProfile => {
-                format!("profile with arn {resource_arn} does not exists")
+                format!(
+                    "profile with arn {} does not exists",
+                    stated_value(resource_arn)
+                )
             }
         }
     }
@@ -1178,6 +1192,19 @@ pub fn too_many_tags_message(resulting: usize) -> String {
     format!(
         "a signing profile holds at most {MAX_TAGS_PER_PROFILE} tags; this request would leave \
          it holding {resulting}"
+    )
+}
+
+/// The refusal prose for a cancel of a profile whose signatures have already
+/// been revoked.
+///
+/// Worded like the tagging refusal below it ([`tagging_refused_message`]): the
+/// profile, the call it cannot admit, and the condition of the profile that
+/// forbids it.
+pub fn cancel_refused_message(profile_name: &str) -> String {
+    format!(
+        "Signing Profile {profile_name} cannot be canceled because it has been revoked. \
+         A revoked profile cannot be canceled."
     )
 }
 
@@ -1507,7 +1534,25 @@ pub fn signing_platform(platform_id: &str) -> Option<&'static SigningPlatformEnt
 /// ([`stated_value`]), the same ceiling the syntax refusal of this very member
 /// applies.
 pub fn platform_not_found_message(platform_id: &str) -> String {
-    format!("Platform with id {} does not exist", stated_value(platform_id))
+    format!(
+        "Signing platform not found for ID {}",
+        stated_value(platform_id)
+    )
+}
+
+/// The refusal prose for a `jobId` no signing job is held under, as
+/// `RevokeSignature` words it.
+///
+/// Per OPERATION rather than per condition: the recorded 404 of the job READER
+/// (`DescribeSigningJob`) words the same condition its own way, so each states
+/// the sentence its own answer carries. `JobId` is a bare string in the model, so
+/// the id is quoted through the one ceiling this crate states for a request value
+/// a clause carries ([`stated_value`]).
+pub fn job_not_found_message(job_id: &str) -> String {
+    format!(
+        "Signing Job with id {} does not exist.",
+        stated_value(job_id)
+    )
 }
 
 /// The refusal prose for a `profileVersion` the named profile has never had.

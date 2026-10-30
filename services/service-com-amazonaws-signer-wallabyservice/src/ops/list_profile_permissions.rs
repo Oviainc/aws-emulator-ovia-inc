@@ -121,6 +121,22 @@ fn profile_not_found(profile_name: &str) -> ListProfilePermissionsError {
     .into()
 }
 
+/// The modelled 404 for a profile that holds no permission policy.
+///
+/// A resource policy exists only while it holds a statement — the write that
+/// takes the last one out leaves no policy behind — so a profile nothing has been
+/// granted on and a profile whose statements have all been removed are the SAME
+/// condition: there is no policy to report. `code` names it, so a client that
+/// removed the last statement can tell "policy gone" from "policy with no
+/// statements" and re-create it.
+fn policy_not_found(profile_name: &str) -> ListProfilePermissionsError {
+    ListProfilePermissionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::permissions::no_policy_message(profile_name)),
+        code: Some(crate::state::permissions::ERROR_CODE_POLICY_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
 /// The modelled 400 for a `nextToken` that is not one this service handed out.
 ///
 /// `code` names the condition a paginating client resets on, as the service's
@@ -195,33 +211,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(profile_not_found(&input.profile_name));
         };
 
-        // A profile nobody has granted anything on holds no policy: no revision to
-        // report, no statements, and `policySizeBytes` at the modelled default of
-        // 0 — there is no document to measure. A page of it can only be the first
-        // one, so a token against it is a token this service never handed out.
-        let Some(policy) = store.profile_policy(&region, &input.profile_name) else {
-            if input.next_token.is_some() {
-                return Err(invalid_next_token());
-            }
-            return Ok(ListProfilePermissionsOutput {
-                revision_id: None,
-                policy_size_bytes: 0,
-                // Present even when empty: a reader has to be able to tell "no
-                // permissions" from "permissions not reported".
-                permissions: Some(Vec::new()),
-                next_token: None,
-            });
-        };
-
         // `nextToken` is the statement id the next page starts at, so the only
-        // tokens this service hands out are statement ids of this policy; anything
-        // else is refused with the modelled 400 rather than silently answering an
-        // arbitrary suffix of the order.
+        // tokens this service hands out are statement ids of this profile's
+        // policy; anything else is refused with the modelled 400 rather than
+        // silently answering an arbitrary suffix of the order. Judged on the
+        // request's own value, so it is decided before the state of the policy it
+        // asks to resume — a profile holding no policy has handed out no token at
+        // all, so every token is one it never issued.
+        let policy = store.profile_policy(&region, &input.profile_name);
         if let Some(token) = input.next_token.as_deref() {
-            if !policy.statements.contains_key(token) {
+            if policy.is_none_or(|policy| !policy.statements.contains_key(token)) {
                 return Err(invalid_next_token());
             }
         }
+
+        // A policy exists only while it holds a statement, so a profile nobody
+        // has granted anything on — and one whose last statement has been removed
+        // — has no policy to report.
+        let Some(policy) = policy.filter(|policy| !policy.is_empty()) else {
+            return Err(policy_not_found(&input.profile_name));
+        };
 
         // The operation models no `maxResults`, so the page size is the service's:
         // at most `PERMISSION_PAGE_LIMIT` statements per answer, with the id the

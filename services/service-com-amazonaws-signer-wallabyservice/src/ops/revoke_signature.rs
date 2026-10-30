@@ -207,12 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised — the same settlement `DescribeSigningJob` performs, so
         // revoking never rolls a due completion back.
         let Some(job) = store.settled_job_mut(&region, &input.job_id, now) else {
-            // `jobId` is a bare string in the model, so the id is quoted through
-            // the one ceiling this crate states for a request value a clause
-            // carries.
-            return Err(job_not_found(format!(
-                "Signing job not found for id {}",
-                crate::state::stated_value(&input.job_id)
+            return Err(job_not_found(crate::state::job_not_found_message(
+                &input.job_id,
             )));
         };
 

@@ -62,6 +62,9 @@ mod put_profile_image_format_override;
 #[path = "all/put_profile_platform_validation.rs"]
 mod put_profile_platform_validation;
 
+#[path = "all/refusal_contract_wording.rs"]
+mod refusal_contract_wording;
+
 #[path = "all/refusal_echo_is_bounded.rs"]
 mod refusal_echo_is_bounded;
 

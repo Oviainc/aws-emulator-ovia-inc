@@ -157,12 +157,38 @@ fn profile_version_not_found(
     .into()
 }
 
-/// The modelled 409 for a request that lost the policy's optimistic-concurrency
-/// check or named a statement id the policy already holds.
+/// The modelled 409 for a request that named a statement id the policy already
+/// holds.
 fn conflict(message: String) -> AddProfilePermissionError {
     AddProfilePermissionErrorModeled::ConflictException(ConflictException {
         message: Some(message),
         code: Some(crate::state::permissions::ERROR_CODE_CONFLICT.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 409 for a request that lost the policy's optimistic-concurrency
+/// check: `code` names that condition rather than the shape, because it is what
+/// a writer branches on to re-read the policy and re-issue the call.
+fn revision_mismatch(specified: &str, current: &str) -> AddProfilePermissionError {
+    AddProfilePermissionErrorModeled::ConflictException(ConflictException {
+        message: Some(crate::state::permissions::revision_mismatch_message(
+            specified, current,
+        )),
+        code: Some(
+            crate::state::permissions::ERROR_CODE_POLICY_REVISION_ID_MISMATCH.to_string(),
+        ),
+    })
+    .into()
+}
+
+/// The modelled 404 for a request that names the revision of a policy the
+/// profile does not hold: a profile's resource policy exists only while it holds
+/// a statement, so there is no revision such a request could be applied against.
+fn policy_not_found(profile_name: &str) -> AddProfilePermissionError {
+    AddProfilePermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::permissions::no_policy_message(profile_name)),
+        code: Some(crate::state::permissions::ERROR_CODE_POLICY_NOT_FOUND.to_string()),
     })
     .into()
 }
@@ -227,17 +253,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // `action` is modelled as a bare `String`, so the boundary validator let
-        // any text through; the four actions a Signer grant may carry are the ones
-        // the member documents, and nothing else is a grant AWS Signer could hold.
-        if !crate::state::permissions::is_grantable_action(&input.action) {
-            return Err(validation(
-                crate::state::permissions::ungrantable_action_message(&input.action),
-            ));
-        }
         // `principal` and `statementId` are required strings the model puts no
         // length on, so an empty one reaches here: a statement with no principal
-        // grants nothing, and one with no id could never be removed again.
+        // grants nothing, and one with no id could never be removed again. Judged
+        // on the request's own values, so it is decided before anything the
+        // request names is resolved.
         for (member, value) in [
             ("principal", input.principal.as_str()),
             ("statementId", input.statement_id.as_str()),
@@ -260,25 +280,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `action` is modelled as a bare `String`, so the boundary validator let
+        // any text through. Which actions a grant may carry is a fact about the
+        // PROFILE'S signing platform — the signing operation of the workflow the
+        // other platforms are signed through is not an operation this profile has
+        // at all — so the set is resolved from the platform the profile was
+        // created on, and the refusal names that platform and that set.
+        let platform_id = profile.platform_id.clone();
+        if !crate::state::permissions::is_grantable_action(&platform_id, &input.action) {
+            return Err(validation(
+                crate::state::permissions::ungrantable_action_message(&input.action, &platform_id),
+            ));
+        }
+
         // `revisionId` is the policy's optimistic-concurrency token: a request
         // naming one is applied only while that revision is still current, so two
         // writers holding the same revision cannot both succeed and a writer
-        // holding a superseded revision is told rather than silently overwriting.
-        // A request naming none carries no precondition — the member is optional.
+        // holding a superseded revision is told — and told which revision the
+        // policy is at — rather than silently overwriting. A request naming none
+        // carries no precondition: the member is optional.
         let current_revision = store
             .profile_policy(&region, &input.profile_name)
             .map(|policy| policy.revision_id.clone());
         if let Some(named) = input.revision_id.as_deref() {
-            if current_revision.as_deref() != Some(named) {
-                // `revisionId` is a bare string in the model, so it is quoted
-                // through the one ceiling this crate states for a request value
-                // a clause carries.
-                return Err(conflict(format!(
-                    "revision id {} is not the current revision of the permissions of \
-                     profile {}",
-                    crate::state::stated_value(named),
-                    input.profile_name
-                )));
+            match current_revision.as_deref() {
+                // A profile holding no policy has no revision the precondition
+                // could be met against, which is the absent policy rather than a
+                // mismatch with one.
+                None => return Err(policy_not_found(&input.profile_name)),
+                Some(current) if current != named => {
+                    return Err(revision_mismatch(named, current))
+                }
+                Some(_) => {}
             }
         }
 

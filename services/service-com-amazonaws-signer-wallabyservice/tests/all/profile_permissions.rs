@@ -10,18 +10,21 @@
 //! `/signing-profiles/{profileName}/permissions`:
 //!
 //! * a profile's permission policy is a revision-versioned set of statements keyed
-//!   by `statementId`: `AddProfilePermission` adds one and
-//!   `RemoveProfilePermission` takes one out, each answering with the revision the
-//!   policy moved to, and `ListProfilePermissions` reports exactly the statements
-//!   the policy holds, that same revision and the byte size of the document they
-//!   form;
+//!   by `statementId`: `AddProfilePermission` adds one, answering with the
+//!   revision the policy moved to, and `RemoveProfilePermission` takes one out,
+//!   answering with no revision at all — `ListProfilePermissions` reports exactly
+//!   the statements the policy holds, the revision it is at and the byte size of
+//!   the document they form;
+//! * the policy exists only while it holds a statement, so a profile nothing has
+//!   been granted on — and one whose statements have all been removed — has no
+//!   policy to report, and a read of it is refused 404 `PolicyNotFound`;
 //! * a write naming a `revisionId` that is not the policy's current one — a
 //!   superseded revision, or one the service never issued — is refused 409
-//!   `ConflictException` and changes nothing, which is what makes two writers
-//!   holding one revision unable to both succeed;
-//! * an `action` outside the four the model documents as grantable is refused 400
-//!   `ValidationException`, and a statement id, profile or profile version that
-//!   does not exist is refused 404.
+//!   `PolicyRevisionIdMismatch` and changes nothing, which is what makes two
+//!   writers holding one revision unable to both succeed;
+//! * an `action` outside the set the profile's signing platform admits is refused
+//!   400 `ValidationException`, and a statement id, profile or profile version
+//!   that does not exist is refused 404.
 //!
 //! The cases are tables: a row per input class the rules generalise over (which
 //! grantable action, the form of the principal, whether the grant names a profile
@@ -49,22 +52,31 @@ const ERROR_CODE_PROFILE_NOT_FOUND: &str = "ProfileNotFound";
 /// modelled shape's own name.
 const ERROR_CODE_NOT_FOUND: &str = "ResourceNotFoundException";
 
-/// The error `code` a lost optimistic-concurrency check carries.
-const ERROR_CODE_CONFLICT: &str = "ConflictException";
+/// The error `code` a lost optimistic-concurrency check carries: the condition,
+/// not the modelled shape's name.
+const ERROR_CODE_CONFLICT: &str = "PolicyRevisionIdMismatch";
+
+/// The error `code` a statement id the policy already holds carries.
+const ERROR_CODE_STATEMENT_CONFLICT: &str = "ConflictException";
+
+/// The error `code` a read of a policy the profile does not hold carries.
+const ERROR_CODE_POLICY_NOT_FOUND: &str = "PolicyNotFound";
 
 /// The error `code` a refusal on the request's own values carries.
 const ERROR_CODE_VALIDATION: &str = "ValidationException";
 
-/// Every action a cross-account permission may grant, written out here rather
-/// than imported so a wrong catalog in the handlers fails this suite.
+/// Every action a cross-account permission may grant on a profile of
+/// [`PLATFORM_ID`], written out here rather than imported so a wrong catalog in
+/// the handlers fails this suite.
 ///
 /// Source: `AddProfilePermissionRequest$action` — "You can designate the
-/// following actions to an account" followed by exactly these four
+/// following actions to an account" followed by four actions
 /// (`smithy_query(query="doc", shape="AddProfilePermissionRequest",
-/// member="action")`).
-const GRANTABLE_ACTIONS: [&str; 4] = [
+/// member="action")`), of which `signer:SignPayload` "isn't supported for AWS
+/// Lambda workflows" and so is not grantable on this platform. Which action each
+/// platform admits is the subject of `profile_permission_actions_per_platform`.
+const GRANTABLE_ACTIONS: [&str; 3] = [
     "signer:StartSigningJob",
-    "signer:SignPayload",
     "signer:GetSigningProfile",
     "signer:RevokeSignature",
 ];
@@ -335,12 +347,14 @@ fn grant_cases() -> Vec<GrantCase> {
             principal: "arn:aws:iam::123456789012:role/CodeSigner",
             pin_version: true,
         },
-        // A one-character statement id, and the action that is not supported for
-        // Lambda workflows (the model documents the restriction, not a refusal of
-        // the grant).
+        // A one-character statement id, and the action the Signer
+        // cross-account tutorial grants a second account — pinned to no version.
+        // The action that is NOT grantable on this platform's workflow is a row
+        // of `profile_permission_actions_per_platform`, which drives every
+        // platform rather than this one.
         GrantCase {
             statement_id: "a",
-            action: "signer:SignPayload",
+            action: "signer:StartSigningJob",
             principal: "210987654321",
             pin_version: false,
         },
@@ -378,29 +392,24 @@ async fn every_grant_round_trips_through_list_profile_permissions() {
     let router = emulator();
     let profile_version = seed_profile(&router, "RoundTrip_Profile").await;
 
-    // A profile nobody has granted anything on holds no policy at all.
+    // A profile nobody has granted anything on holds no policy at all, and a
+    // policy that does not exist is not reported as an empty one.
     let empty = list_permissions(&router, "RoundTrip_Profile").await;
     assert_eq!(
-        empty.status, 200,
-        "empty policy: expected 200, got {} {:?}",
+        empty.status, 404,
+        "empty policy: expected 404, got {} {:?}",
         empty.status, empty.body
     );
+    assert_eq!(
+        empty.code(),
+        Some(ERROR_CODE_POLICY_NOT_FOUND),
+        "empty policy: expected code {ERROR_CODE_POLICY_NOT_FOUND}, got {:?}",
+        empty.code()
+    );
     assert!(
-        empty.permissions().is_empty(),
-        "empty policy: expected no permissions, got {:?}",
-        empty.permissions()
-    );
-    assert_eq!(
-        empty.policy_size_bytes(),
-        0,
-        "empty policy: expected policySizeBytes 0, got {}",
-        empty.policy_size_bytes()
-    );
-    assert_eq!(
-        empty.revision_id(),
-        None,
-        "empty policy: expected no revisionId, got {:?}",
-        empty.revision_id()
+        empty.message().contains("RoundTrip_Profile"),
+        "empty policy: expected the refusal to name the profile, got {:?}",
+        empty.message()
     );
 
     let mut expected: BTreeMap<String, (String, String, Option<String>)> = BTreeMap::new();
@@ -535,22 +544,32 @@ async fn removing_a_statement_takes_only_the_one_it_names() {
             "removing {}: expected 200, got {} {:?}",
             removed.statement_id, removal.status, removal.body
         );
-        let new_revision = removal
+        // The removal hands no revision back: a writer that needs the next one
+        // re-reads the policy.
+        assert_eq!(
+            removal.revision_id(),
+            None,
+            "removing {}: expected no revisionId in the removal reply, got {:?}",
+            removed.statement_id,
+            removal.body
+        );
+
+        let after = list_permissions(&router, "Remove_Profile").await;
+        let new_revision = after
             .revision_id()
             .unwrap_or_else(|| {
                 panic!(
-                    "removing {}: RemoveProfilePermission must report a revisionId, got {:?}",
-                    removed.statement_id, removal.body
+                    "removing {}: the policy must still report a revisionId, got {:?}",
+                    removed.statement_id, after.body
                 )
             })
             .to_string();
         assert_ne!(
             new_revision, revision,
-            "removing {}: expected a new revisionId, got the one the policy already had ({revision})",
+            "removing {}: expected the policy to move to a new revisionId, got the one it \
+             already had ({revision})",
             removed.statement_id
         );
-
-        let after = list_permissions(&router, "Remove_Profile").await;
         let mut expected = before.permissions();
         expected.remove(removed.statement_id);
         assert_eq!(
@@ -559,13 +578,6 @@ async fn removing_a_statement_takes_only_the_one_it_names() {
             "removing {}: expected the policy to hold {expected:?}, got {:?}",
             removed.statement_id,
             after.permissions()
-        );
-        assert_eq!(
-            after.revision_id(),
-            Some(new_revision.as_str()),
-            "removing {}: expected the list to report the revision the removal returned, got {:?}",
-            removed.statement_id,
-            after.revision_id()
         );
         assert!(
             after.policy_size_bytes() < before.policy_size_bytes(),
@@ -848,7 +860,7 @@ async fn a_statement_id_the_policy_already_holds_is_refused() {
             "a different action under the same id",
             json!({
                 "statementId": "only-one",
-                "action": GRANTABLE_ACTIONS[3],
+                "action": GRANTABLE_ACTIONS[2],
                 "principal": "123456789012",
                 "revisionId": revision,
             }),
@@ -870,8 +882,8 @@ async fn a_statement_id_the_policy_already_holds_is_refused() {
         );
         assert_eq!(
             answer.code(),
-            Some(ERROR_CODE_CONFLICT),
-            "case {case:?}: expected code {ERROR_CODE_CONFLICT}, got {:?}",
+            Some(ERROR_CODE_STATEMENT_CONFLICT),
+            "case {case:?}: expected code {ERROR_CODE_STATEMENT_CONFLICT}, got {:?}",
             answer.code()
         );
     }
@@ -896,8 +908,8 @@ async fn an_action_outside_the_documented_catalog_is_refused() {
     let router = emulator();
     seed_profile(&router, "Action_Profile").await;
 
-    // Every action the model documents as grantable is accepted — including the
-    // ones this issue's units never named.
+    // Every action the model documents as grantable ON THIS PLATFORM is
+    // accepted — including the ones this issue's units never named.
     for (index, action) in GRANTABLE_ACTIONS.iter().enumerate() {
         let answer = add_permission(
             &router,
@@ -916,10 +928,13 @@ async fn an_action_outside_the_documented_catalog_is_refused() {
         );
     }
 
-    // And one past the catalog is refused, whichever way it falls outside it: a
-    // Signer operation that is not grantable, another service's action, the
-    // action without its service prefix, a wildcard, and the empty string.
+    // And one past the set is refused, whichever way it falls outside it: the
+    // signing action of the OTHER workflow (documented as unsupported for this
+    // platform's), a Signer operation that is not grantable at all, another
+    // service's action, the action without its service prefix, a wildcard, and
+    // the empty string.
     for action in [
+        "signer:SignPayload",
         "signer:ListSigningJobs",
         "signer:PutSigningProfile",
         "s3:GetObject",
@@ -949,8 +964,9 @@ async fn an_action_outside_the_documented_catalog_is_refused() {
             answer.code()
         );
         assert!(
-            answer.message().contains("action"),
-            "action {action:?}: expected the refusal to name the member, got {:?}",
+            answer.message().contains("Action") && answer.message().contains(PLATFORM_ID),
+            "action {action:?}: expected the refusal to name the member and the platform that \
+             narrowed the set, got {:?}",
             answer.message()
         );
     }
@@ -1040,8 +1056,8 @@ async fn a_resource_no_profile_or_policy_holds_is_refused_404() {
         );
     }
 
-    // A removal against a profile that holds no policy, and one naming a
-    // statement the policy does not hold.
+    // A removal against a profile that holds no policy at all: the policy, not
+    // the statement, is what does not exist.
     let empty = remove_permission(&router, "Known_Profile", "absent", "some-revision").await;
     assert_eq!(
         empty.status, 404,
@@ -1050,8 +1066,9 @@ async fn a_resource_no_profile_or_policy_holds_is_refused_404() {
     );
     assert_eq!(
         empty.code(),
-        Some(ERROR_CODE_NOT_FOUND),
-        "removal against a profile with no policy: expected code {ERROR_CODE_NOT_FOUND}, got {:?}",
+        Some(ERROR_CODE_POLICY_NOT_FOUND),
+        "removal against a profile with no policy: expected code \
+         {ERROR_CODE_POLICY_NOT_FOUND}, got {:?}",
         empty.code()
     );
 
@@ -1374,9 +1391,15 @@ async fn a_grant_with_no_principal_or_no_statement_id_is_refused() {
     }
 
     let listed = list_permissions(&router, "Empty_Member_Profile").await;
-    assert!(
-        listed.permissions().is_empty(),
-        "expected the refused grants to store nothing, got {:?}",
-        listed.permissions()
+    assert_eq!(
+        listed.status, 404,
+        "expected the refused grants to store nothing, so no policy to read, got {} {:?}",
+        listed.status, listed.body
+    );
+    assert_eq!(
+        listed.code(),
+        Some(ERROR_CODE_POLICY_NOT_FOUND),
+        "expected the refused grants to leave no policy, got {:?}",
+        listed.body
     );
 }

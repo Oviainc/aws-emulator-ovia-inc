@@ -206,30 +206,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A profile is a template bound to one of the signing platforms the
         // service publishes, and the platform is what supplies the signing
-        // configuration a later job runs under — so the platform is resolved
-        // against the published catalog FIRST. An id the catalog holds no entry
-        // for names no platform at all, which is the same condition the platform
-        // readers report, answered with the same modelled 404 and code: nothing
-        // else in this handler can be decided without an entry, and a profile on
-        // a platform this service says does not exist must never reach the store.
-        let Some(platform) = crate::state::signing_platform(&input.platform_id) else {
-            return Err(PutSigningProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::platform_not_found_message(&input.platform_id)),
-                    code: Some(crate::state::ERROR_CODE_PLATFORM_NOT_FOUND.to_string()),
-                },
-            )
-            .into());
-        };
+        // configuration a later job runs under — so the entry is looked up in the
+        // published catalog before anything else is decided.
+        let platform = crate::state::signing_platform(&input.platform_id);
 
-        // A signing profile signs with a certificate, and which platforms hold
-        // that certificate on the profile — rather than having AWS Signer issue
-        // it — is what the platform publishes
+        // A signing profile signs with a certificate, and the request has to
+        // carry that certificate unless the platform it names is one AWS Signer
+        // issues the certificate for itself
         // ([`crate::state::SigningPlatformEntry::requires_signing_material`]),
-        // with the recorded evidence for the split. Refused HERE, before anything
-        // is written, so a profile that could not exist on AWS never reaches the
-        // store.
-        if input.signing_material.is_none() && platform.requires_signing_material {
+        // with the recorded evidence for the split. The member is judged on the
+        // REQUEST — so it is judged before the platform the request names is
+        // resolved, and only a platform the catalog publishes as issuing its own
+        // certificate waives it: an id that names no platform waives nothing, and
+        // a request that is both missing a member and naming an unknown platform
+        // is refused for the member it left out rather than reported as a missing
+        // resource. Refused HERE, before anything is written, so a profile that
+        // could not exist on AWS never reaches the store.
+        if input.signing_material.is_none()
+            && platform.is_none_or(|platform| platform.requires_signing_material)
+        {
             return Err(PutSigningProfileErrorModeled::ValidationException(
                 ValidationException {
                     message: Some("signing material cannot be null.".to_string()),
@@ -238,6 +233,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // With the request's own members judged, an id the catalog holds no entry
+        // for names no platform at all: the same condition the platform readers
+        // report, answered with the same modelled 404 and code, because nothing
+        // further in this handler can be decided without an entry and a profile on
+        // a platform this service says does not exist must never reach the store.
+        let Some(platform) = platform else {
+            return Err(PutSigningProfileErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::platform_not_found_message(&input.platform_id)),
+                    code: Some(crate::state::ERROR_CODE_PLATFORM_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        };
 
         // An override SELECTS among the algorithms the platform publishes as
         // allowed, so a value outside its `allowedValues` asks for a signing
