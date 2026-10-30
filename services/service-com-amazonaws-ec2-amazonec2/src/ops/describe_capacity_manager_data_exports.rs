@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCapacityManagerDataExports
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCapacityManagerDataExports`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the Capacity Manager data export configurations
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::capacity_manager_data_exports`] holds —
+//! every one of them unless the request narrows it by `CapacityManagerDataExportIds` or by a
+//! filter — in `CapacityManagerDataExportId` order, cut into `MaxResults`-sized pages
+//! followed by the token this service mints. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCapacityManagerDataExports::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure report: it writes nothing at all, so two calls describe one configuration
+//! identically and a reader can never change what a later caller sees.
+//! `CreateCapacityManagerDataExport` is what adds a configuration and
+//! `DeleteCapacityManagerDataExport` what removes one, so an account that holds none is
+//! answered an empty set rather than a refusal ("if not specified, all export configurations
+//! are returned").
+//!
+//! `CapacityManagerDataExportIds` names this operation's OWN resource, so it is read the way
+//! `DeleteCapacityManagerDataExport` reads the same id: something that is not an export id at
+//! all is refused `InvalidCapacityManagerDataExportId.Malformed` before any lookup, and a
+//! well-formed id the account holds no configuration for is
+//! `InvalidCapacityManagerDataExportId.NotFound` rather than an absent row. `DryRun` is
+//! answered between the two for the same reason it is there — the flag asks whether the
+//! CALLER MAY make the request, which is a question about the caller and not about the
+//! resource.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +93,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+    MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, TAG_FILTER_PREFIX,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -147,18 +168,302 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCapacityManagerDataExports` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCapacityManagerDataExportsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A data export configuration carries no Region member of its own — it is a
+        // configuration of the account's Capacity Manager — so nothing here depends on the
+        // Region the request was signed for; `ctx` carries request metadata only, and the
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // Matching cost is filters x values x value length x stored configurations, and the
+        // model bounds none of them (`FilterList` and `Filter$Values` carry no `@length`),
+        // so every request-controlled factor is capped HERE, before any work proportional
+        // to it is done and before the store is locked — the same ceilings every other
+        // describe of this crate enforces, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not answer is refused whether or not any
+        // configuration would have matched it, so an unsupported filter can never read as
+        // "no results".
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !is_documented_filter(name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is
+            // bounded here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // The id selector is caller-sized as well — `CapacityManagerDataExportIdSet` carries
+        // no modelled `@length` — and every entry is resolved against the store, so it is
+        // capped the way every other EC2 operation of this crate caps a resource-id list.
+        let requested: &[String] = input
+            .capacity_manager_data_export_ids
+            .as_deref()
+            .unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "CapacityManagerDataExportIds carries {} ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        // "The token for the next page of results" (`NextToken`) — a token this service did
+        // not mint is refused rather than read as an id, and it is refused before the store
+        // is read, so whether a bogus token is caught never depends on what the store holds.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Something that is not an export id at all is refused as malformed before there is
+        // anything to look up — one id space, one reading of it, shared with
+        // `DeleteCapacityManagerDataExport` (see the module docs).
+        for export_id in requested {
+            if !crate::state::capacity_manager_data_export_id_is_well_formed(export_id) {
+                return Err(
+                    crate::state::invalid_capacity_manager_data_export_id_malformed(export_id),
+                );
+            }
+        }
+
+        // The permission question, answered before the store is read (see the module docs).
+        if input.dry_run == Some(true) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "The IDs of the export configurations to describe"
+        // (`CapacityManagerDataExportIds`): an id the account holds no configuration for is
+        // an error, not an absent row — the answer `DeleteCapacityManagerDataExport` gives
+        // the same id. A set, so narrowing below costs one lookup per configuration rather
+        // than a scan of the asked-for list.
+        let wanted: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+        if let Some(unknown) = requested
+            .iter()
+            .find(|export_id| !store.capacity_manager_data_exports.contains_key(export_id.as_str()))
+        {
+            return Err(crate::state::invalid_capacity_manager_data_export_id_not_found(
+                unknown,
+            ));
+        }
+
+        // Every configuration unless the request narrows it: the ids named, and then every
+        // filter must hold ("if you specify multiple filters, the filters are joined with an
+        // AND" — `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCapacityManagerDataExports"))
+        // Every comparison is charged to ONE budget, so the product of stored
+        // configurations, filters, values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the store's lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&CapacityManagerDataExportResponse> = Vec::new();
+        for export in store.capacity_manager_data_exports.values() {
+            if budget.exhausted() {
+                break;
+            }
+            if !wanted.is_empty()
+                && !wanted.contains(
+                    export
+                        .capacity_manager_data_export_id
+                        .as_deref()
+                        .unwrap_or_default(),
+                )
+            {
+                continue;
+            }
+            if crate::state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(export, name)
+            }) {
+                selected.push(export);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in `CapacityManagerDataExportId` order, which the cursor below names a
+        // position in. The store is an ordered map, so its iteration order already satisfies
+        // this sort; doing it here establishes the invariant the cursor depends on at the
+        // point of use.
+        selected.sort_by(|left, right| {
+            left.capacity_manager_data_export_id
+                .cmp(&right.capacity_manager_data_export_id)
+        });
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|export| {
+                export
+                    .capacity_manager_data_export_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return in a single call. If not specified, up to
+        // 1000 results are returned" (`MaxResults`) — and the modelled `range 1..1000`
+        // publishes that same ceiling, which the boundary validator has already enforced.
+        // The clamp is applied anyway, so a page size of zero — which would mint a token for
+        // a page that carried nothing and leave a paging client in a loop that never advances
+        // — stays unreachable however the request is read.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // "The token to use to retrieve the next page of results. This value is null when
+        // there are no more results to return" (`NextToken`): a token only when a
+        // configuration follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|export| export.capacity_manager_data_export_id.as_deref())
+            .map(crate::state::encode_page_token);
+
+        Ok(DescribeCapacityManagerDataExportsOutput {
+            // "Information about the data export configurations"
+            // (`DescribeCapacityManagerDataExportsResult$CapacityManagerDataExports`): the
+            // stored shapes themselves, so every member a writer set is reported as it was
+            // stored rather than rebuilt here.
+            capacity_manager_data_exports: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|export| (*export).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The filter names this operation answers.
+///
+/// `DescribeCapacityManagerDataExportsRequest$Filters` publishes no catalog — "one or more
+/// filters to narrow the results. Supported filters include export status, creation date, and
+/// S3 bucket name"
+/// (`smithy_query(query="doc",shape="DescribeCapacityManagerDataExportsRequest",member="Filters")`)
+/// — so the names are EC2's own convention for a resource that publishes none: each member of
+/// the described shape (`CapacityManagerDataExportResponse`) under its kebab-cased name,
+/// which covers the three the member names, plus the [`TAG_FILTER_PREFIX`] and
+/// [`TAG_KEY_FILTER`] pair every EC2 describe answers. Every entry must be answered by
+/// [`filter_values`].
+const CAPACITY_MANAGER_DATA_EXPORT_FILTERS: [&str; 10] = [
+    "capacity-manager-data-export-id",
+    "create-time",
+    "latest-delivery-s3-location-uri",
+    "latest-delivery-status",
+    "latest-delivery-status-message",
+    "latest-delivery-time",
+    "output-format",
+    "s3-bucket-name",
+    "s3-bucket-prefix",
+    "schedule",
+];
+
+/// The tag filter whose values are the KEYS a configuration carries, rather than one key's
+/// value.
+const TAG_KEY_FILTER: &str = "tag-key";
+
+/// Is `name` a filter this operation answers? "Filter names are case-sensitive"
+/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no
+/// tag, so it is as undocumented as any other misspelling.
+fn is_documented_filter(name: &str) -> bool {
+    name.strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || name == TAG_KEY_FILTER
+        || CAPACITY_MANAGER_DATA_EXPORT_FILTERS.contains(&name)
+}
+
+/// The values the EC2 filter `name` compares against this data export configuration.
+///
+/// A filter naming an attribute this configuration does not carry compares against NO
+/// values, so it selects nothing — the answer for `latest-delivery-status` on a configuration
+/// no export has run for yet. A timestamp is compared in the rendering the wire carries it as
+/// ([`crate::state::filter_timestamp_values`]), which is what the caller was shown.
+fn filter_values<'a>(
+    export: &'a CapacityManagerDataExportResponse,
+    name: &str,
+) -> Vec<Cow<'a, str>> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return export
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "capacity-manager-data-export-id" => text(export.capacity_manager_data_export_id.as_deref()),
+        "create-time" => crate::state::filter_timestamp_values(export.create_time),
+        "latest-delivery-s3-location-uri" => {
+            text(export.latest_delivery_s3_location_uri.as_deref())
+        }
+        "latest-delivery-status" => text(export.latest_delivery_status.as_deref()),
+        "latest-delivery-status-message" => text(export.latest_delivery_status_message.as_deref()),
+        "latest-delivery-time" => crate::state::filter_timestamp_values(export.latest_delivery_time),
+        "output-format" => text(export.output_format.as_deref()),
+        "s3-bucket-name" => text(export.s3_bucket_name.as_deref()),
+        "s3-bucket-prefix" => text(export.s3_bucket_prefix.as_deref()),
+        "schedule" => text(export.schedule.as_deref()),
+        TAG_KEY_FILTER => export
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `is_documented_filter` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }
