@@ -303,7 +303,10 @@ async fn a_tag_selection_within_the_modelled_maximum_is_accepted() {
     }
 
     // And the create: a registration at the maximum is taken, with the tag set it carried
-    // readable through the tag surface.
+    // readable through the tag surface. Its own emulator, because the account holds ONE
+    // registration per source: the set a registration carries is the set the resource is
+    // created with only when nothing is registered for that source yet.
+    let h = harness();
     let case = format!("RegisterSubscriptionProvider with {MAX_TAG_SELECTION} tags");
     let secret = secret_arn("accepted-create");
     let reply = Selection::CreateMap

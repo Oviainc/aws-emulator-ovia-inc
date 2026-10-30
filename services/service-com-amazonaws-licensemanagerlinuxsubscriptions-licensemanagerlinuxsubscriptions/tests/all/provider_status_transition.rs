@@ -20,11 +20,14 @@
 //!    ISO-8601 UTC instant inside the window between the registration call and the read,
 //!    and it does not move on a later read or because the resource was tagged.
 //!
-//! The rows span what the rule generalises over: how many registrations the account holds,
+//! The rows span what the rule generalises over: the `SecretArn` the registration names,
 //! which of the reporting operations (`GetRegisteredSubscriptionProvider`,
 //! `ListRegisteredSubscriptionProviders`, the `@idempotent` repeat of
-//! `RegisterSubscriptionProvider`) is the one that first observes the transition, the
-//! `SecretArn` the registration names, and the Region the request is signed for.
+//! `RegisterSubscriptionProvider`) is the one that first observes the transition, and the
+//! Region the request is signed for.
+//!
+//! A row that means to be its own registration takes its own emulator ([`harness`]): one
+//! account holds one registration per `SubscriptionProviderSource`.
 
 use std::time::{Duration, SystemTime};
 
@@ -81,9 +84,9 @@ fn request(secret_arn: &str, tag_count: usize) -> Value {
 /// the registration still sees the transient status, and reading does not move it.
 #[tokio::test]
 async fn a_fresh_registration_is_pending_before_the_transition_is_due() {
-    let h = harness();
-
     for (index, secret_arn) in SECRET_ARNS.iter().enumerate() {
+        // An emulator per row, so each row's call is the one that created the registration.
+        let h = harness();
         let case = format!("register {secret_arn}");
         let registered = register(&h, &request(secret_arn, index)).await;
         assert_eq!(
@@ -122,21 +125,22 @@ async fn a_fresh_registration_is_pending_before_the_transition_is_due() {
 /// is inside the window the registration opened.
 #[tokio::test]
 async fn whichever_operation_reports_first_sees_the_registration_usable() {
-    // Rows: the operation that first observes the transition, and how many registrations
-    // the account holds while it does.
+    // Rows: the operation that first observes the transition, and the secret the
+    // registration it observes names.
     let rows: &[(FirstReporter, usize)] = &[
-        (FirstReporter::Get, 1),
-        (FirstReporter::Get, 5),
+        (FirstReporter::Get, 0),
+        (FirstReporter::Get, 4),
         (FirstReporter::List, 1),
-        (FirstReporter::List, 3),
-        (FirstReporter::RepeatedRegistration, 2),
-        (FirstReporter::RepeatedRegistration, 5),
+        (FirstReporter::List, 2),
+        (FirstReporter::RepeatedRegistration, 3),
+        (FirstReporter::RepeatedRegistration, 0),
     ];
 
-    for (reporter, providers) in rows.iter().copied() {
-        let case = format!("{providers} registration(s), first reported by {reporter:?}");
+    for (reporter, secret) in rows.iter().copied() {
+        let secret_arn = SECRET_ARNS[secret];
+        let case = format!("{secret_arn}, first reported by {reporter:?}");
         // A harness of its own per row, so each row's account holds only its own
-        // registrations.
+        // registration.
         let h = harness();
 
         // The window the retrieval time has to fall inside: from just before the
@@ -144,14 +148,7 @@ async fn whichever_operation_reports_first_sees_the_registration_usable() {
         // covers this suite rendering the bounds at whole-second precision, which is the
         // precision the member carries.
         let opened = iso8601(SystemTime::now() - Duration::from_secs(1));
-        let mut arns = Vec::new();
-        for (index, secret_arn) in SECRET_ARNS.iter().enumerate().take(providers) {
-            let case = format!("{case}, registration {index}");
-            arns.push(provider_arn(
-                &register(&h, &request(secret_arn, index)).await,
-                &case,
-            ));
-        }
+        let arn = provider_arn(&register(&h, &request(secret_arn, secret)).await, &case);
 
         // Nothing is called while the clock passes the span; the transition is owed anyway.
         wait_for_token_validation();
@@ -160,42 +157,41 @@ async fn whichever_operation_reports_first_sees_the_registration_usable() {
         // which has to materialize the transition.
         match reporter {
             FirstReporter::Get => {
-                for arn in &arns {
-                    let got = get_provider(&h, arn).await;
-                    assert_eq!(
-                        member(&got, &case, "SubscriptionProviderStatus"),
-                        Some(ACTIVE),
-                        "case {case:?}: the first read of {arn} must report {ACTIVE}, got {:?}",
-                        got.body
-                    );
-                }
+                let got = get_provider(&h, &arn).await;
+                assert_eq!(
+                    member(&got, &case, "SubscriptionProviderStatus"),
+                    Some(ACTIVE),
+                    "case {case:?}: the first read of {arn} must report {ACTIVE}, got {:?}",
+                    got.body
+                );
             }
             FirstReporter::List => {
                 let listing = list_providers(&h, &json!({})).await;
-                for (arn, _, _, status) in listed(&listing, &case) {
+                for (listed_arn, _, _, status) in listed(&listing, &case) {
                     assert_eq!(
                         status, ACTIVE,
-                        "case {case:?}: the first list must report {ACTIVE} for {arn}, got \
-                         {status:?}"
+                        "case {case:?}: the first list must report {ACTIVE} for {listed_arn}, \
+                         got {status:?}"
                     );
                 }
             }
             FirstReporter::RepeatedRegistration => {
-                for (index, arn) in arns.iter().enumerate() {
-                    let again = register(&h, &request(SECRET_ARNS[index], 0)).await;
-                    assert_eq!(
-                        provider_arn(&again, &case),
-                        *arn,
-                        "case {case:?}: a repeat must answer the registration already made"
-                    );
-                    assert_eq!(
-                        member(&again, &case, "SubscriptionProviderStatus"),
-                        Some(ACTIVE),
-                        "case {case:?}: a repeat must report the status the registration has \
-                         reached, got {:?}",
-                        again.body
-                    );
-                }
+                // The repeat names the secret the registration already holds, so it is the
+                // registration already made that it answers — with the status that one has
+                // reached.
+                let again = register(&h, &request(secret_arn, 0)).await;
+                assert_eq!(
+                    provider_arn(&again, &case),
+                    arn,
+                    "case {case:?}: a repeat must answer the registration already made"
+                );
+                assert_eq!(
+                    member(&again, &case, "SubscriptionProviderStatus"),
+                    Some(ACTIVE),
+                    "case {case:?}: a repeat must report the status the registration has \
+                     reached, got {:?}",
+                    again.body
+                );
             }
         }
 
@@ -203,8 +199,8 @@ async fn whichever_operation_reports_first_sees_the_registration_usable() {
         // status presupposes.
         let listing = list_providers(&h, &json!({})).await;
         let listed_rows = listed(&listing, &case);
-        for (index, arn) in arns.iter().enumerate() {
-            let case = format!("{case}, registration {index}");
+        {
+            let arn = arn.as_str();
             let got = get_provider(&h, arn).await;
             assert_eq!(
                 member(&got, &case, "SubscriptionProviderStatus"),
@@ -230,7 +226,7 @@ async fn whichever_operation_reports_first_sees_the_registration_usable() {
 
             let listed_row = listed_rows
                 .iter()
-                .find(|(listed_arn, _, _, _)| listed_arn == arn)
+                .find(|(listed_arn, _, _, _)| listed_arn.as_str() == arn)
                 .unwrap_or_else(|| panic!("case {case:?}: {arn} is missing from {listed_rows:?}"));
             assert_eq!(
                 listed_row.3, ACTIVE,
@@ -275,11 +271,14 @@ async fn whichever_operation_reports_first_sees_the_registration_usable() {
 /// the request that observes it was signed for.
 #[tokio::test]
 async fn the_transition_lands_for_a_registration_of_any_region() {
-    let h = harness();
     let regions = ["us-west-2", "eu-west-1", "ap-southeast-7", "us-gov-east-1"];
 
-    let mut arns = Vec::new();
+    // An emulator per Region row, because an account holds one registration per source: a
+    // second call in the same account would address the registration the row before it
+    // created rather than minting one in its own Region.
+    let mut accounts = Vec::new();
     for (index, region) in regions.iter().enumerate() {
+        let h = harness();
         let case = format!("register signed for {region}");
         let registered = call_in_region(
             &h,
@@ -294,15 +293,15 @@ async fn the_transition_lands_for_a_registration_of_any_region() {
             "case {case:?}: the registration call must report {PENDING}, got {:?}",
             registered.body
         );
-        arns.push((*region, provider_arn(&registered, &case)));
+        accounts.push((h, *region, provider_arn(&registered, &case)));
     }
 
     wait_for_token_validation();
 
-    for (region, arn) in &arns {
+    for (h, region, arn) in &accounts {
         let case = format!("read {arn} signed for {region}");
         let got = call_in_region(
-            &h,
+            h,
             region,
             "/subscription/GetRegisteredSubscriptionProvider",
             &json!({ "SubscriptionProviderArn": arn }),

@@ -16,8 +16,12 @@
 //!
 //! The registrations are seeded into the store directly ([`crate::harness::seed_provider`])
 //! because the rule under test is about the walk, not about the span a fresh registration
-//! takes to become usable; the deregistration and the registration that land mid-walk go
-//! over the wire, which is how a client writes the store.
+//! takes to become usable; the deregistration that lands mid-walk goes over the wire, which
+//! is how a client writes the store. The registration that lands mid-walk goes over the
+//! wire too — and because an account holds ONE registration per
+//! `SubscriptionProviderSource`, that call addresses the registration the account already
+//! holds rather than adding a record, so the record that APPEARS mid-walk is placed through
+//! the same seam the others were.
 
 use serde_json::{json, Value};
 
@@ -222,22 +226,32 @@ async fn a_walk_whose_remainder_is_deregistered_ends_without_a_refusal() {
 }
 
 #[tokio::test]
-async fn a_registration_created_between_two_pages_is_reported_at_most_once() {
+async fn a_registration_added_between_two_pages_is_reported_at_most_once() {
     let h = harness();
     let arns = seeded(&h);
-    let case = "a registration created mid-walk";
+    let case = "a registration added mid-walk";
+    // The two sides of the cursor: a record ordered BEFORE the seeded block and one ordered
+    // after it, so the rule is asserted for a record that appears behind the walk and for
+    // one it has not reached.
+    let added_ids = [
+        "00000000-0000-4000-8000-000000000001".to_string(),
+        format!("00000000-0000-4000-8000-{:012x}", 0x2000),
+    ];
 
     let mut walked: Vec<String> = Vec::new();
     let mut token: Option<String> = None;
     let mut pages = 0;
-    let mut created = String::new();
+    let mut added: Vec<String> = Vec::new();
     loop {
         let (reported, next) = page(&h, 2, token.as_deref(), case).await;
         walked.extend(reported);
         token = next;
         pages += 1;
         if pages == 1 {
-            created = provider_arn(
+            // The write a CALLER can make mid-walk: a registration of the source the
+            // account already holds one for, which addresses that registration — so the
+            // walk's sequence is written under it without a record being added.
+            let updated = provider_arn(
                 &register(
                     &h,
                     &json!({
@@ -249,6 +263,20 @@ async fn a_registration_created_between_two_pages_is_reported_at_most_once() {
                 .await,
                 case,
             );
+            assert!(
+                arns.contains(&updated),
+                "case {case:?}: a registration of a source the account holds must address \
+                 one of {arns:?}, got {updated:?}"
+            );
+            // And the records that APPEAR mid-walk, on either side of the cursor.
+            for id in &added_ids {
+                added.push(seed_provider(
+                    &h,
+                    id,
+                    "arn:aws:secretsmanager:us-west-2:000000000000:secret:rhel-added",
+                    &[("owner", "platform")],
+                ));
+            }
         }
         assert!(
             pages <= PROVIDERS + 2,
@@ -260,8 +288,8 @@ async fn a_registration_created_between_two_pages_is_reported_at_most_once() {
     }
 
     // Every registration that was in the store for the whole walk is reported exactly
-    // once, and the one created while the walk ran is reported at most once — never twice,
-    // whichever side of the cursor it was created on.
+    // once, and one that appeared while the walk ran is reported at most once — never
+    // twice, whichever side of the cursor it appeared on.
     for arn in &arns {
         assert_eq!(
             walked.iter().filter(|walked| *walked == arn).count(),
@@ -269,17 +297,19 @@ async fn a_registration_created_between_two_pages_is_reported_at_most_once() {
             "case {case:?}: expected {arn} reported exactly once, got {walked:?}"
         );
     }
-    assert!(
-        walked.iter().filter(|walked| **walked == created).count() <= 1,
-        "case {case:?}: expected {created} reported at most once, got {walked:?}"
-    );
+    for arn in &added {
+        assert!(
+            walked.iter().filter(|walked| *walked == arn).count() <= 1,
+            "case {case:?}: expected {arn} reported at most once, got {walked:?}"
+        );
+    }
 
-    // And a walk started after the write reports the created registration with the rest.
-    let after = "a fresh walk after the registration";
+    // And a walk started after the writes reports everything the store holds.
+    let after = "a fresh walk after the writes";
     let rows = listed(&list_providers(&h, &json!({})).await, after);
     let mut reported: Vec<String> = rows.into_iter().map(|(arn, _, _, _)| arn).collect();
     reported.sort();
-    let mut expected: Vec<String> = arns.iter().cloned().chain([created.clone()]).collect();
+    let mut expected: Vec<String> = arns.iter().chain(added.iter()).cloned().collect();
     expected.sort();
     assert_eq!(
         reported, expected,

@@ -197,8 +197,11 @@ async fn a_removal_is_reported_through_the_shared_projection() {
 /// `tag_selection_limit.rs` drive, where the set reaches the store with the resource.
 #[tokio::test]
 async fn a_registration_s_tags_are_reported_through_the_shared_projection() {
-    let h = harness();
     for (index, row) in rows().into_iter().enumerate() {
+        // An emulator per row: the account holds ONE registration per source, so the set a
+        // row's registration carries is the set it created the resource with only when the
+        // row's call is that account's first.
+        let h = harness();
         let case = format!("RegisterSubscriptionProvider carrying {}", row.case);
         let created = register(
             &h,

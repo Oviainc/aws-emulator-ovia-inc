@@ -25,12 +25,19 @@
 //! the subscription data retrieval that status reports on, which is the status a client
 //! polls for before it expects third-party subscription data.
 //!
-//! The operation is `@idempotent`: a repeat naming a (source, secret) pair this account
-//! already registered answers THAT registration rather than minting a second resource. The
-//! credential is checked on EVERY call, ahead of that repeat path, because the check is
-//! about the request's own credential rather than about what the store holds: a repeat made
-//! after the secret was deleted or rotated to a value that is not an access token no longer
-//! names a credential this service can use, and is refused like any other such call.
+//! A registration's identity is the `SubscriptionProviderSource` it is for: the account
+//! holds ONE registration per supported source, so a call naming a source it already
+//! registered addresses THAT registration — the `SubscriptionProviderArn` the first
+//! registration minted — rather than minting a second resource, and the secret the
+//! registration holds becomes the one this call named. Naming the same secret again is the
+//! `@idempotent` repeat and changes nothing; naming another one is how the stored
+//! credential is replaced, which puts the registration back in `PENDING` while the new
+//! token is validated.
+//!
+//! The credential is checked on EVERY call, ahead of that path, because the check is about
+//! the request's own credential rather than about what the store holds: a call made after
+//! the secret was deleted or rotated to a value that is not an access token no longer names
+//! a credential this service can use, and is refused like any other such call.
 //!
 //! The refusal's TEXT is this emulator's own wording: the recorded evidence for this
 //! behaviour carries the HTTP status and the error code only, so there is no AWS sentence to
@@ -224,26 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.tags.clone().unwrap_or_default(),
                 ::std::time::SystemTime::now(),
             )
-            // Each refusal carries the taxonomy that belongs to it: a resultant tag set
-            // past the limit is the tagging surface's own `BadRequestException` (the same
-            // one the boundary states for an over-limit `Tags` map), and a registration the
-            // account cannot hold is this operation's modelled `ValidationException`.
-            .map_err(|refusal| match refusal {
-                crate::state::RegisterRefusal::TagLimitExceeded => {
-                    crate::scaffolded::Scaffolded::tag_limit_exceeded()
-                }
-                crate::state::RegisterRefusal::TooManyProviders => {
-                    RegisterSubscriptionProviderErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(format!(
-                                "This account cannot have more than {} registered \
-                                 subscription providers",
-                                crate::state::MAX_REGISTERED_PROVIDERS
-                            )),
-                        },
-                    )
-                    .into()
-                }
+            // A resultant tag set past the limit is the tagging surface's own
+            // `BadRequestException` — the same refusal the request boundary states for an
+            // over-limit `Tags` map, so the condition does not acquire a second code when
+            // it is reached from here.
+            .map_err(|_: crate::state::TagLimitExceeded| {
+                crate::scaffolded::Scaffolded::tag_limit_exceeded()
             })?;
 
         // The access record for a call that CREATED a resource: which registration this
@@ -271,10 +264,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 // The registration path is implemented, so there is no blanket refusal constant here any
-// more: a registration this account may not take is refused with the taxonomy that belongs
-// to the condition (`crate::state::RegisterRefusal`), and one it may take is created and
-// becomes usable on the clock, rather than being answered with a refusal that erased the
-// resource.
+// more: a registration is created — or the account's registration for that source is
+// pointed at the secret the call named — and becomes usable on the clock, rather than being
+// answered with a refusal that erased the resource.
 
 /// What the secret a registration named holds, as far as this call can establish it.
 #[derive(Debug, PartialEq, Eq)]

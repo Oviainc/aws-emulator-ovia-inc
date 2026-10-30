@@ -244,9 +244,11 @@ async fn listed_count(h: &Harness) -> usize {
 
 #[tokio::test]
 async fn the_stored_credential_decides_whether_a_registration_is_taken() {
-    let h = harness_with_secrets_manager();
-
     for (index, case) in credential_cases().into_iter().enumerate() {
+        // An emulator per case: the account holds ONE registration per source, so a case
+        // whose credential is usable must be the call that creates it rather than one that
+        // addresses the case before it.
+        let h = harness_with_secrets_manager();
         let label = &case.label;
         let secret_arn = match &case.stored {
             Some(members) => create_secret(&h, &format!("provider-token-{index:02}"), members).await,

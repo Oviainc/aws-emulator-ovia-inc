@@ -20,21 +20,29 @@
 //!    with no `SubscriptionProviderStatusMessage` and with the
 //!    `LastSuccessfulDataRetrievalTime` that status reports on — and a read before it falls
 //!    due reports `PENDING` twice, because reading does not move it;
-//! 3. `RegisterSubscriptionProvider` is `@idempotent`: a repeat naming a (source, secret)
-//!    pair the account already registered answers THAT registration rather than minting a
-//!    second resource, while a different secret is a registration of its own;
-//! 4. the whole lifecycle closes over the created resource: tag it, read its tags, then
+//! 3. a registration's identity is the `SubscriptionProviderSource` it is for: the account
+//!    holds ONE registration per supported source, so every later registration of that
+//!    source answers THAT registration — the same `SubscriptionProviderArn`, with no second
+//!    record and no second row in the list — and the secret it holds becomes the one the
+//!    call named, however many calls arrive and whatever secrets they name;
+//! 4. pointing the registration at another secret restarts the validation of the access
+//!    token its `SubscriptionProviderStatus` reports on: back to `PENDING`, `ACTIVE` again
+//!    on the clock — while the `@idempotent` repeat, naming the secret the registration
+//!    already holds, changes nothing at all;
+//! 5. the whole lifecycle closes over the created resource: tag it, read its tags, then
 //!    deregister it and every later caller sees it gone;
-//! 5. a repeat whose RESULTANT tag set would pass the modelled `Tags` maximum is refused
-//!    with the tagging surface's `BadRequestException` and stores nothing;
-//! 6. a registration past the number of registrations an account's store holds
-//!    ([`MAX_REGISTERED_PROVIDERS`]) is refused with the operation's modelled
-//!    `ValidationException` and leaves the store as it was.
+//! 6. a call whose RESULTANT tag set would pass the modelled `Tags` maximum is refused with
+//!    the tagging surface's `BadRequestException` and writes nothing — neither the tags nor
+//!    the secret it named.
 //!
 //! The tables span what each rule generalises over: the `SecretArn` grammar (partition,
 //! empty region/account segments, the `[^/]` secret-name class), the size of the tag set
 //! (none, one, three, the modelled maximum of 50), the signed Region the ARN is minted in,
-//! and the number of registrations the account holds.
+//! and the number of registrations one account makes.
+//!
+//! A row that means to be its own resource takes its own emulator ([`harness`]): one
+//! account holds one registration per source, so two registrations of `RedHat` are two
+//! accounts.
 
 use serde_json::{json, Value};
 
@@ -43,7 +51,6 @@ use crate::harness::{
     listed, member, provider_arn, register, stored_provider_count, tag, wait_for_token_validation,
     Harness, Reply, ACCOUNT, ACTIVE, INVALID, PENDING, RED_HAT, REGION, SIGNING_NAME,
 };
-use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::MAX_REGISTERED_PROVIDERS;
 
 /// Secret ARNs spanning the modelled `SecretArn` pattern
 /// `^arn:[a-z0-9-\.]{1,63}:secretsmanager:[a-z0-9-\.]{0,63}:[a-z0-9-\.]{0,63}:secret:[^/]{1,1023}$`
@@ -75,11 +82,9 @@ fn request(secret_arn: &str, tag_count: usize) -> Value {
     body
 }
 
-/// A variant of `secret_arn` naming a DIFFERENT secret, so a table row registers a
-/// resource of its own rather than repeating the previous row's registration (which
-/// `@idempotent` answers with the registration already made —
-/// [`a_repeated_registration_is_the_same_resource`]). The suffix lands in the secret-name
-/// segment, whose modelled class is `[^/]{1,1023}`.
+/// A variant of `secret_arn` naming a DIFFERENT secret, so a row that varies the secret
+/// has one of its own. The suffix lands in the secret-name segment, whose modelled class
+/// is `[^/]{1,1023}`.
 fn distinct_secret(secret_arn: &str, suffix: usize) -> String {
     format!("{secret_arn}-{suffix}")
 }
@@ -124,13 +129,12 @@ fn matches_provider_arn_pattern(arn: &str) -> bool {
 /// Rule 1: a registration creates the resource, and every member of it is readable back.
 #[tokio::test]
 async fn a_registration_creates_a_readable_subscription_provider() {
-    let h = harness();
-    let mut created: Vec<(String, String, usize)> = Vec::new();
-
     for secret_arn in SECRET_ARNS {
         for tag_count in [0_usize, 1, 3, MAX_TAGS] {
-            // Each row registers its own secret: a repeat of one already registered is the
-            // idempotent replay, which is a rule of its own.
+            // Each row is an account of its own: an account holds one registration per
+            // source, so a second registration in the same account would address the row
+            // before it (which is rule 3).
+            let h = harness();
             let secret_arn = &distinct_secret(secret_arn, tag_count);
             let case = format!("register {secret_arn} with {tag_count} tags");
             let registered = register(&h, &request(secret_arn, tag_count)).await;
@@ -160,11 +164,6 @@ async fn a_registration_creates_a_readable_subscription_provider() {
                 "case {case:?}: a fresh registration must report {PENDING}, got {:?}",
                 registered.body
             );
-            assert!(
-                !created.iter().any(|(stored, _, _)| stored == &arn),
-                "case {case:?}: each registration must mint its own ARN, got a repeat of {arn:?}"
-            );
-
             // Read back through the implemented reader: every member is what the
             // registration persisted.
             let got = get_provider(&h, &arn).await;
@@ -211,36 +210,33 @@ async fn a_registration_creates_a_readable_subscription_provider() {
                 "case {case:?}: expected the registration's tag keys to be readable"
             );
 
-            created.push((arn, secret_arn.clone(), tag_count));
+            // And the list reports exactly the one registration this account made.
+            assert_eq!(
+                listed(&list_providers(&h, &json!({})).await, &case),
+                vec![(
+                    arn.clone(),
+                    RED_HAT.to_string(),
+                    secret_arn.clone(),
+                    PENDING.to_string(),
+                )],
+                "case {case:?}: the list must report exactly the registration made"
+            );
         }
     }
-
-    // And the list reports exactly what was registered, in registration order.
-    let case = "list every registration";
-    let rows = listed(&list_providers(&h, &json!({})).await, case);
-    assert_eq!(
-        rows.iter()
-            .map(|(arn, source, secret, _)| (arn.clone(), source.clone(), secret.clone()))
-            .collect::<Vec<_>>(),
-        created
-            .iter()
-            .map(|(arn, secret, _)| (arn.clone(), RED_HAT.to_string(), secret.clone()))
-            .collect::<Vec<_>>(),
-        "case {case:?}: the list must report exactly the created registrations, in order"
-    );
 }
 
 /// Rule 1, continued: the ARN is minted in the Region the request was signed for, so the
 /// resource a Region's caller created is the one its reads address.
 #[tokio::test]
 async fn the_minted_arn_carries_the_signed_region() {
-    let h = harness();
     // Rows spanning partitions and Region-code shapes; the signed Region is the only thing
     // that differs between them.
     for (index, region) in ["us-west-2", "eu-west-1", "ap-southeast-7", "us-gov-east-1"]
         .into_iter()
         .enumerate()
     {
+        // An account per row, so each row's call is the one that creates the resource.
+        let h = harness();
         let case = format!("register signed for {region}");
         let registered = call_in_region(
             &h,
@@ -266,12 +262,12 @@ async fn the_minted_arn_carries_the_signed_region() {
 /// and is terminal.
 #[tokio::test]
 async fn the_registration_becomes_usable_on_the_clock() {
-    let h = harness();
-
-    // One registration per `SecretArn` row: the rule holds for every registration, not
-    // for one shape of secret.
-    let mut arns = Vec::new();
+    // One account per `SecretArn` row — the rule holds for every registration, not for one
+    // shape of secret — and all of them are registered before the span is waited out, so
+    // the suite waits once rather than once per row.
+    let mut accounts: Vec<(Harness, String, &str)> = Vec::new();
     for secret_arn in SECRET_ARNS {
+        let h = harness();
         let case = format!("register {secret_arn}");
         let arn = provider_arn(&register(&h, &request(secret_arn, 2)).await, &case);
 
@@ -285,18 +281,17 @@ async fn the_registration_becomes_usable_on_the_clock() {
                 "case {case:?}: a read must not move the status"
             );
         }
-        arns.push(arn);
+        accounts.push((h, arn, secret_arn));
     }
 
     // Nothing is called while the clock passes the span; the transition is owed anyway.
     wait_for_token_validation();
 
-    let mut retrieval_times = Vec::new();
-    for arn in &arns {
+    for (h, arn, secret_arn) in &accounts {
         let mut seen: Option<String> = None;
         for attempt in 0..2 {
             let case = format!("{arn} settled, read {attempt}");
-            let got = get_provider(&h, arn).await;
+            let got = get_provider(h, arn).await;
             assert_eq!(
                 member(&got, &case, "SubscriptionProviderStatus"),
                 Some(ACTIVE),
@@ -342,88 +337,238 @@ async fn the_registration_becomes_usable_on_the_clock() {
             }
             seen = Some(retrieved);
         }
-        retrieval_times.push(seen.expect("each registration was read"));
-    }
+        let retrieved = seen.expect("each registration was read");
 
-    // The list agrees with the reads: the status and the retrieval time are properties of
-    // the stored record, not of the operation that reports it.
-    let case = "list after the registrations became usable";
-    let listing = list_providers(&h, &json!({})).await;
-    for (arn, _, _, status) in listed(&listing, case) {
+        // The list agrees with the read: the status and the retrieval time are properties
+        // of the stored record, not of the operation that reports it.
+        let case = format!("list after {arn} became usable");
+        let listing = list_providers(h, &json!({})).await;
         assert_eq!(
-            status, ACTIVE,
-            "case {case:?}: expected {ACTIVE} for {arn} from the list, got {status:?}"
+            listed(&listing, &case),
+            vec![(
+                arn.clone(),
+                RED_HAT.to_string(),
+                (*secret_arn).to_string(),
+                ACTIVE.to_string(),
+            )],
+            "case {case:?}: the list must report the registration as the read did"
+        );
+        let listed_time = listing
+            .ok(&case)
+            .get("RegisteredSubscriptionProviders")
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.first())
+            .and_then(|entry| entry.get("LastSuccessfulDataRetrievalTime"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: no retrieval time in {:?}", listing.body));
+        assert_eq!(
+            listed_time, retrieved,
+            "case {case:?}: the list must report the same retrieval time the read did"
         );
     }
-    let listed_times: Vec<String> = listing
-        .ok(case)
-        .get("RegisteredSubscriptionProviders")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("case {case:?}: no providers in {:?}", listing.body))
-        .iter()
-        .map(|entry| {
-            entry
-                .get("LastSuccessfulDataRetrievalTime")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("case {case:?}: no retrieval time in {entry:?}"))
-                .to_string()
-        })
-        .collect();
-    assert_eq!(
-        listed_times, retrieval_times,
-        "case {case:?}: the list must report the same retrieval times the reads did"
-    );
 }
 
-/// Rule 3: `@idempotent` — a repeat of the same registration is the same resource.
+/// Rule 3: identity is the source, so every later registration of it is the SAME resource,
+/// holding the secret the call named.
 #[tokio::test]
-async fn a_repeated_registration_is_the_same_resource() {
-    let h = harness();
+async fn a_registration_of_a_registered_source_is_the_same_resource() {
+    // Rows differ along the sequence of secrets one account registers: a repeat of the
+    // pair already registered, a swap to another secret, a run of distinct secrets, and a
+    // sequence that comes back to one already held.
+    let rows: &[&[&str]] = &[
+        &[SECRET_ARNS[0], SECRET_ARNS[0]],
+        &[SECRET_ARNS[0], SECRET_ARNS[1]],
+        &[SECRET_ARNS[1], SECRET_ARNS[2], SECRET_ARNS[3]],
+        &[
+            SECRET_ARNS[3],
+            SECRET_ARNS[3],
+            SECRET_ARNS[0],
+            SECRET_ARNS[3],
+        ],
+    ];
+    for (index, secrets) in rows.iter().enumerate() {
+        // One account per row: the rule is about the registrations ONE account holds.
+        let h = harness();
+        let case = format!("row {index}: registrations naming {secrets:?}");
+        let first = provider_arn(&register(&h, &request(secrets[0], 1)).await, &case);
 
-    // Each row registers the same (source, secret) pair `repeats` times; the number of
-    // repeats is what the rule generalises over.
-    for (index, repeats) in [2_usize, 3, 5].into_iter().enumerate() {
-        let secret_arn = SECRET_ARNS[index];
-        let case = format!("{repeats} registrations of {secret_arn}");
-        let first = provider_arn(&register(&h, &request(secret_arn, 1)).await, &case);
-        let before = listed(&list_providers(&h, &json!({})).await, &case).len();
-
-        for attempt in 1..repeats {
-            let case = format!("{case}, attempt {attempt}");
+        for (attempt, secret_arn) in secrets[1..].iter().enumerate() {
+            let case = format!("{case}, call {} naming {secret_arn}", attempt + 1);
             let again = register(&h, &request(secret_arn, 1)).await;
             assert_eq!(
                 provider_arn(&again, &case),
                 first,
-                "case {case:?}: a repeat must answer the registration the first call created"
+                "case {case:?}: a registration of a source the account already registered \
+                 must answer that registration"
             );
             assert_eq!(
-                listed(&list_providers(&h, &json!({})).await, &case).len(),
-                before,
-                "case {case:?}: a repeat must not add a registration"
+                stored_provider_count(&h),
+                1,
+                "case {case:?}: the account must hold ONE registration per source, got {}",
+                stored_provider_count(&h)
+            );
+            assert_eq!(
+                member(&get_provider(&h, &first).await, &case, "SecretArn"),
+                Some(*secret_arn),
+                "case {case:?}: the registration must hold the secret the call named"
+            );
+            assert_eq!(
+                listed(&list_providers(&h, &json!({})).await, &case)
+                    .iter()
+                    .map(|(arn, source, secret, _)| (arn.clone(), source.clone(), secret.clone()))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    first.clone(),
+                    RED_HAT.to_string(),
+                    (*secret_arn).to_string()
+                )],
+                "case {case:?}: the list must report one registration for the source"
             );
         }
     }
-
-    // A registration naming a different secret is a registration of its own.
-    let case = "a second secret";
-    let first = provider_arn(&register(&h, &request(SECRET_ARNS[0], 1)).await, case);
-    let other = provider_arn(&register(&h, &request(SECRET_ARNS[3], 1)).await, case);
-    assert_ne!(
-        first, other,
-        "case {case:?}: a registration of another secret must be its own resource"
-    );
-    assert_eq!(
-        member(&get_provider(&h, &other).await, case, "SecretArn"),
-        Some(SECRET_ARNS[3]),
-        "case {case:?}: the second registration must hold the secret it named"
-    );
 }
 
-/// Rule 4: the lifecycle the create path opens closes — tag, read, deregister.
+/// Rule 3, continued: the account still holds ONE registration however MANY registrations
+/// it makes — the number of calls is what this row set generalises over, and it is the
+/// count the store used to grow by.
+#[tokio::test]
+async fn many_registrations_of_one_source_leave_one_registration() {
+    let secret = |index: usize| {
+        format!("arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret:rotation-{index}")
+    };
+    for count in [2_usize, 3, 10, 101] {
+        let h = harness();
+        let case = format!("{count} registrations naming distinct secrets");
+        let first = provider_arn(&register(&h, &request(&secret(0), 0)).await, &case);
+        for index in 1..count {
+            let case = format!("{case}, call {index}");
+            assert_eq!(
+                provider_arn(&register(&h, &request(&secret(index), 0)).await, &case),
+                first,
+                "case {case:?}: every registration of the source must answer the one \
+                 registration the account holds"
+            );
+        }
+        assert_eq!(
+            stored_provider_count(&h),
+            1,
+            "case {case:?}: expected ONE stored registration, got {}",
+            stored_provider_count(&h)
+        );
+        assert_eq!(
+            listed(&list_providers(&h, &json!({})).await, &case).len(),
+            1,
+            "case {case:?}: the list must report one registration for the source"
+        );
+        assert_eq!(
+            member(&get_provider(&h, &first).await, &case, "SecretArn"),
+            Some(secret(count - 1).as_str()),
+            "case {case:?}: the registration must hold the secret the LAST call named"
+        );
+    }
+}
+
+/// Rule 4: a registration pointed at another secret has a token nothing has checked, so
+/// its validation runs again; a repeat naming the secret it already holds changes nothing.
+#[tokio::test]
+async fn another_secret_restarts_the_token_validation() {
+    // Rows differ along the secret the registration was created with and the one it is
+    // pointed at afterwards.
+    let rows: &[(&str, &str)] = &[
+        (SECRET_ARNS[0], SECRET_ARNS[1]),
+        (SECRET_ARNS[1], SECRET_ARNS[2]),
+        (SECRET_ARNS[2], SECRET_ARNS[3]),
+        (SECRET_ARNS[3], SECRET_ARNS[0]),
+    ];
+    // One account per row, all driven in step, so the suite waits out the validation span
+    // twice rather than twice per row.
+    let mut accounts: Vec<(Harness, String)> = Vec::new();
+    for (created_with, _) in rows {
+        let h = harness();
+        let case = format!("register {created_with}");
+        let arn = provider_arn(&register(&h, &request(created_with, 0)).await, &case);
+        accounts.push((h, arn));
+    }
+
+    wait_for_token_validation();
+
+    for ((h, arn), (created_with, pointed_at)) in accounts.iter().zip(rows) {
+        let case = format!("{created_with} then {pointed_at}");
+        assert_eq!(
+            member(&get_provider(h, arn).await, &case, "SubscriptionProviderStatus"),
+            Some(ACTIVE),
+            "case {case:?}: the first registration must have become {ACTIVE}"
+        );
+
+        // The `@idempotent` repeat: the same secret is the token already validated, so
+        // nothing about the registration moves.
+        let repeat = register(h, &request(created_with, 0)).await;
+        assert_eq!(
+            provider_arn(&repeat, &case),
+            *arn,
+            "case {case:?}: a repeat must answer the registration already made"
+        );
+        assert_eq!(
+            member(&repeat, &case, "SubscriptionProviderStatus"),
+            Some(ACTIVE),
+            "case {case:?}: a repeat naming the secret the registration holds must not \
+             restart the validation, got {:?}",
+            repeat.body
+        );
+
+        // Another secret is another token, and the status reports on the token the
+        // registration holds.
+        let pointed = register(h, &request(pointed_at, 0)).await;
+        assert_eq!(
+            provider_arn(&pointed, &case),
+            *arn,
+            "case {case:?}: pointing the registration at another secret must not mint a \
+             second resource"
+        );
+        assert_eq!(
+            member(&pointed, &case, "SubscriptionProviderStatus"),
+            Some(PENDING),
+            "case {case:?}: a registration holding a token nothing has checked must report \
+             {PENDING}, got {:?}",
+            pointed.body
+        );
+        let got = get_provider(h, arn).await;
+        assert_eq!(
+            member(&got, &case, "SecretArn"),
+            Some(*pointed_at),
+            "case {case:?}: the registration must hold the secret it was pointed at, got {:?}",
+            got.body
+        );
+        assert_eq!(
+            member(&got, &case, "SubscriptionProviderStatus"),
+            Some(PENDING),
+            "case {case:?}: the read must report the restarted validation, got {:?}",
+            got.body
+        );
+    }
+
+    wait_for_token_validation();
+
+    for ((h, arn), (created_with, pointed_at)) in accounts.iter().zip(rows) {
+        let case = format!("{created_with} then {pointed_at}, settled again");
+        let got = get_provider(h, arn).await;
+        assert_eq!(
+            member(&got, &case, "SubscriptionProviderStatus"),
+            Some(ACTIVE),
+            "case {case:?}: the restarted validation must land on its own, got {:?}",
+            got.body
+        );
+        assert_eq!(
+            member(&got, &case, "SecretArn"),
+            Some(*pointed_at),
+            "case {case:?}: the settled registration must still hold that secret"
+        );
+    }
+}
+
+/// Rule 5: the lifecycle the create path opens closes — tag, read, deregister.
 #[tokio::test]
 async fn the_created_resource_completes_the_tag_and_deregister_lifecycle() {
-    let h = harness();
-
     // Rows differ along the tag set the registration carried and the one a later write
     // adds, including a write that overwrites a registered key.
     let rows: &[(usize, &[(&str, &str)])] = &[
@@ -432,6 +577,9 @@ async fn the_created_resource_completes_the_tag_and_deregister_lifecycle() {
         (3, &[("key-00", "overwritten")]),
     ];
     for (index, (tag_count, written)) in rows.iter().enumerate() {
+        // An account per row: a row's registration must be the one its account's calls
+        // created, not the one the row before left behind.
+        let h = harness();
         let case = format!("lifecycle row {index}");
         let arn = provider_arn(&register(&h, &request(SECRET_ARNS[index], *tag_count)).await, &case);
 
@@ -482,8 +630,9 @@ async fn the_created_resource_completes_the_tag_and_deregister_lifecycle() {
             "case {case:?}: a deregistered registration must leave the list, got {remaining:?}"
         );
 
-        // And registering the same secret again creates a NEW resource: the ARN the
-        // deregistration freed is not handed out twice.
+        // And registering the source again creates a NEW resource: the account holds no
+        // registration of it any more, and the ARN the deregistration freed is not handed
+        // out twice.
         let again = provider_arn(&register(&h, &request(SECRET_ARNS[index], 0)).await, &case);
         assert_ne!(
             again, arn,
@@ -492,12 +641,10 @@ async fn the_created_resource_completes_the_tag_and_deregister_lifecycle() {
     }
 }
 
-/// Rule 5: a repeat whose resultant tag set would pass the modelled maximum is refused,
-/// and the stored set is left as it was.
+/// Rule 6: a call whose resultant tag set would pass the modelled maximum is refused, and
+/// the registration is left exactly as it was — its tag set AND its secret.
 #[tokio::test]
-async fn a_repeat_past_the_tag_maximum_is_refused() {
-    let h = harness();
-
+async fn a_call_past_the_tag_maximum_is_refused() {
     // Rows differ along how the two tag sets add up: exactly at the bound (accepted), one
     // past it, and well past it.
     let rows: &[(usize, usize, bool)] = &[
@@ -506,15 +653,16 @@ async fn a_repeat_past_the_tag_maximum_is_refused() {
         (MAX_TAGS, 1, false),
         (MAX_TAGS - 5, 10, false),
     ];
-    for (index, (first, extra, accepted)) in rows.iter().enumerate() {
+    for (first, extra, accepted) in rows {
+        // An account per row, so each row's account holds only its own registration.
+        let h = harness();
         let case = format!("{first} registered tags plus {extra} more");
-        // A fresh harness per row, so each row's account holds only its own registration.
-        let h = if index == 0 { &h } else { &harness() };
-        let arn = provider_arn(&register(h, &request(SECRET_ARNS[0], *first)).await, &case);
+        let arn = provider_arn(&register(&h, &request(SECRET_ARNS[0], *first)).await, &case);
 
-        // The repeat names the same (source, secret) pair with FURTHER keys, so the
-        // resultant set is the union of both.
-        let mut repeat = request(SECRET_ARNS[0], 0);
+        // The second call names ANOTHER secret with FURTHER keys, so the resultant tag set
+        // is the union of both — and what the refusal must leave untouched includes the
+        // secret the registration holds.
+        let mut repeat = request(SECRET_ARNS[1], 0);
         if *extra > 0 {
             let tags: serde_json::Map<String, Value> = (0..*extra)
                 .map(|offset| {
@@ -524,19 +672,27 @@ async fn a_repeat_past_the_tag_maximum_is_refused() {
                 .collect();
             repeat["Tags"] = Value::Object(tags);
         }
-        let reply = register(h, &repeat).await;
+        let reply = register(&h, &repeat).await;
 
-        let stored = stored_tag_keys(h, &arn, &case).await;
+        let stored = stored_tag_keys(&h, &arn, &case).await;
+        let stored_secret = member(&get_provider(&h, &arn).await, &case, "SecretArn")
+            .unwrap_or_else(|| panic!("case {case:?}: the registration reports its SecretArn"))
+            .to_string();
         if *accepted {
             assert_eq!(
                 provider_arn(&reply, &case),
                 arn,
-                "case {case:?}: a repeat within the limit must answer the same registration"
+                "case {case:?}: a call within the limit must answer the same registration"
             );
             assert_eq!(
                 stored.len(),
                 first + extra,
                 "case {case:?}: expected the union of both tag sets, got {stored:?}"
+            );
+            assert_eq!(
+                stored_secret, SECRET_ARNS[1],
+                "case {case:?}: an accepted call must leave the registration holding the \
+                 secret it named"
             );
         } else {
             reply.error(&case, 400, "BadRequestException");
@@ -549,8 +705,13 @@ async fn a_repeat_past_the_tag_maximum_is_refused() {
             assert_eq!(
                 stored.len(),
                 *first,
-                "case {case:?}: a refused repeat must leave the stored set as it was, got \
+                "case {case:?}: a refused call must leave the stored set as it was, got \
                  {stored:?}"
+            );
+            assert_eq!(
+                stored_secret, SECRET_ARNS[0],
+                "case {case:?}: a refused call must leave the stored secret as it was, got \
+                 {stored_secret:?}"
             );
         }
     }
@@ -569,69 +730,4 @@ async fn stored_tag_keys(h: &Harness, arn: &str, case: &str) -> Vec<String> {
         .collect();
     keys.sort();
     keys
-}
-
-/// Rule 6: the store does not grow past the registrations an account may hold.
-///
-/// Every registration up to the ceiling is taken; the next one is refused with the
-/// operation's modelled error and changes nothing — and a repeat of a registration the
-/// account already holds is still accepted at the ceiling, because it adds no record
-/// (rule 3). Deregistering one makes room for exactly one more.
-#[tokio::test]
-async fn a_registration_past_the_ceiling_is_refused() {
-    let h = harness();
-    let secret = |index: usize| format!("arn:aws:secretsmanager:{REGION}:{ACCOUNT}:secret:t-{index}");
-
-    let mut arns = Vec::new();
-    for index in 0..MAX_REGISTERED_PROVIDERS {
-        let case = format!("registration {index}");
-        arns.push(provider_arn(&register(&h, &request(&secret(index), 0)).await, &case));
-    }
-    assert_eq!(
-        stored_provider_count(&h),
-        MAX_REGISTERED_PROVIDERS,
-        "every registration up to the ceiling must be taken"
-    );
-
-    // Past the ceiling: refused, and nothing is written. The rows differ along the secret
-    // the refused registration names.
-    for index in [MAX_REGISTERED_PROVIDERS, MAX_REGISTERED_PROVIDERS + 7] {
-        let case = format!("registration {index}, past the ceiling");
-        let reply = register(&h, &request(&secret(index), 1)).await;
-        reply.error(&case, 400, "ValidationException");
-        assert!(
-            reply.message().contains(&MAX_REGISTERED_PROVIDERS.to_string()),
-            "case {case:?}: the refusal must state the ceiling, got {:?}",
-            reply.message()
-        );
-        assert_eq!(
-            stored_provider_count(&h),
-            MAX_REGISTERED_PROVIDERS,
-            "case {case:?}: a refused registration must leave the store as it was"
-        );
-    }
-
-    // A repeat of one the account already holds adds no record, so it is still accepted.
-    let case = "repeat at the ceiling";
-    assert_eq!(
-        provider_arn(&register(&h, &request(&secret(0), 0)).await, case),
-        arns[0],
-        "case {case:?}: a repeat must answer the registration already made"
-    );
-
-    // And deregistering one makes room for exactly one more.
-    let case = "register after a deregistration";
-    deregister(&h, &arns[0]).await.ok(case);
-    let fresh = provider_arn(
-        &register(&h, &request(&secret(MAX_REGISTERED_PROVIDERS), 0)).await,
-        case,
-    );
-    assert!(
-        !arns.contains(&fresh),
-        "case {case:?}: the registration that followed a deregistration must be its own \
-         resource, got {fresh:?}"
-    );
-    register(&h, &request(&secret(MAX_REGISTERED_PROVIDERS + 1), 0))
-        .await
-        .error(case, 400, "ValidationException");
 }

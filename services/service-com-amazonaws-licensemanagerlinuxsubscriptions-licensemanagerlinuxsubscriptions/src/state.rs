@@ -210,6 +210,29 @@ impl SubscriptionProviderRecord {
         self.status_message = None;
         self.last_successful_data_retrieval_time = Some(iso8601(due));
     }
+
+    /// Point this registration at `secret_arn` and start the token validation that change
+    /// owes.
+    ///
+    /// The `SubscriptionProviderStatus` reports on the access token License Manager holds
+    /// for the registration, so a registration pointed at another secret holds a token
+    /// nothing has checked yet: it reports [`PROVIDER_STATUS_PENDING`] again, with the
+    /// terminal status owed at `now + `[`TOKEN_VALIDATION_DELAY`] exactly as a fresh
+    /// registration's is, and with nothing to report about the new token.
+    ///
+    /// `LastSuccessfulDataRetrievalTime` is left as it stands: it reports WHEN License
+    /// Manager last retrieved subscription details from the provider, which is a retrieval
+    /// that happened and does not un-happen because the secret the next one will use
+    /// changed.
+    fn point_at_secret(&mut self, secret_arn: &str, now: SystemTime) {
+        if self.secret_arn == secret_arn {
+            return;
+        }
+        self.secret_arn = secret_arn.to_string();
+        self.status = PROVIDER_STATUS_PENDING.to_string();
+        self.status_message = None;
+        self.settles_at = Some(now + TOKEN_VALIDATION_DELAY);
+    }
 }
 
 /// The `Status` of a discovered instance that is running, and so counts towards its
@@ -304,6 +327,11 @@ pub struct ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscr
     /// Registered providers by `SubscriptionProviderArn`, which is also the order the
     /// list operation reports and pages them in.
     ///
+    /// The registrations this account holds are one per supported
+    /// `SubscriptionProviderSource`
+    /// ([`register_provider`](Self::register_provider)), so the map is keyed by the ARN
+    /// every other operation addresses a registration by rather than by the source.
+    ///
     /// The key is a TOTAL ORDER over this account's registrations, and a minted id is
     /// monotonic in registration order ([`provider_id`]), so the sequence a page is cut
     /// from is decided by the registrations themselves rather than by how many of them the
@@ -340,16 +368,21 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
 
     /// Register `source` against `secret_arn`, and answer the registration to report.
     ///
-    /// `RegisterSubscriptionProvider` is `@idempotent`, so a repeat of the same request
-    /// must leave the account with the same ONE registration it had after the first:
-    /// a request naming a (source, secret) pair this account already registered answers
-    /// THAT registration — its ARN and the status it has reached — instead of minting a
-    /// second resource. Any tags the repeat carries are merged into the registration's tag
-    /// set, exactly as `TagResource` merges them.
+    /// A registration's identity is the `SubscriptionProviderSource` it is for: an account
+    /// holds ONE registration per supported source — "Register THE supported third-party
+    /// subscription provider for your Bring Your Own License (BYOL) subscription"
+    /// (`smithy_query(query="operation",operation="RegisterSubscriptionProvider")`) — so a
+    /// call naming a source this account already registered addresses THAT registration
+    /// rather than minting a second resource: its `SubscriptionProviderArn` is the one the
+    /// first registration minted, and the secret it holds becomes the one this call named
+    /// ([`SubscriptionProviderRecord::point_at_secret`]). The `@idempotent` repeat — the
+    /// same source with the same secret — therefore changes nothing at all.
+    ///
+    /// Any tags the call carries are merged into the registration's tag set, exactly as
+    /// `TagResource` merges them.
     ///
     /// `Err` is a registration this account may not take: a resultant tag set past
-    /// [`MAX_TAGS_PER_RESOURCE`], or a registration past [`MAX_REGISTERED_PROVIDERS`].
-    /// Nothing is written in either case.
+    /// [`MAX_TAGS_PER_RESOURCE`]. Nothing is written in that case.
     pub fn register_provider(
         &mut self,
         region: &str,
@@ -357,19 +390,21 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         secret_arn: &str,
         tags: HashMap<String, String>,
         now: SystemTime,
-    ) -> Result<SubscriptionProviderRecord, RegisterRefusal> {
+    ) -> Result<SubscriptionProviderRecord, TagLimitExceeded> {
         self.settle_providers(now);
 
-        if let Some(arn) = self.registered_arn(source, secret_arn) {
+        if let Some(arn) = self.registered_arn(source) {
             let record = self
                 .providers
                 .get_mut(&arn)
                 .expect("the ARN was just read out of the same map");
-            // The repeat's pairs are merged into the registration's set under the ONE
+            // The call's pairs are merged into the registration's set under the ONE
             // resultant-set bound every tag write of this service obeys ([`merge_tags`]),
             // so this path and `TagResource` cannot disagree about either the merge or
-            // the bound; a refused repeat leaves the stored set as it was.
+            // the bound; a refused call leaves the registration exactly as it was — which
+            // is why the merge is decided BEFORE the secret is written.
             merge_tags(&mut record.tags, tags)?;
+            record.point_at_secret(secret_arn, now);
             return Ok(record.clone());
         }
 
@@ -377,11 +412,6 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         // set it is created with — and refuses it through the same bound.
         let mut fresh_tags = HashMap::new();
         merge_tags(&mut fresh_tags, tags)?;
-        // A registration this account cannot hold is refused BEFORE anything is written,
-        // so the store cannot grow past the ceiling however often a caller registers.
-        if self.providers.len() >= MAX_REGISTERED_PROVIDERS {
-            return Err(RegisterRefusal::TooManyProviders);
-        }
         self.minted_providers += 1;
         let arn = provider_arn(region, &provider_id(self.minted_providers));
         let record = SubscriptionProviderRecord::registered(
@@ -395,16 +425,16 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         Ok(record)
     }
 
-    /// The `SubscriptionProviderArn` this account already registered `source` against
-    /// `secret_arn` under, if any — the identity a repeated registration resolves to.
+    /// The `SubscriptionProviderArn` this account already registered `source` under, if
+    /// any — the identity a later registration of the same source resolves to.
     ///
-    /// The scan is over the registrations this account holds, which
-    /// [`MAX_REGISTERED_PROVIDERS`] bounds, so the work one registration costs is bounded
-    /// however many registrations have been made.
-    fn registered_arn(&self, source: &str, secret_arn: &str) -> Option<String> {
+    /// The scan is over the registrations this account holds, which is one per supported
+    /// `SubscriptionProviderSource`, so the work one registration costs is bounded however
+    /// often a caller registers.
+    fn registered_arn(&self, source: &str) -> Option<String> {
         self.providers
             .iter()
-            .find(|(_, record)| record.source == source && record.secret_arn == secret_arn)
+            .find(|(_, record)| record.source == source)
             .map(|(arn, _)| arn.clone())
     }
 
@@ -638,29 +668,6 @@ fn details_unchanged(stored: &DiscoveredInstanceRecord, found: &DiscoveredInstan
         && stored.registered_with_subscription_provider == found.registered_with_subscription_provider
 }
 
-/// Why a registration was not taken.
-///
-/// Two conditions with two different wire answers, so the handler can state each with the
-/// taxonomy that belongs to it rather than collapsing them into one code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegisterRefusal {
-    /// The resultant tag set would be larger than a resource of this service may carry
-    /// ([`MAX_TAGS_PER_RESOURCE`]).
-    ///
-    /// Reached through [`merge_tags`], the one place the bound is decided.
-    ///
-    /// Answered with the TAGGING surface's `BadRequestException`, not this service's
-    /// modelled `ValidationException`: a tag set past the limit is that surface's refusal
-    /// wherever the tag map appears, which is what the request boundary already answers
-    /// for an over-limit `Tags` map
-    /// ([`crate::scaffolded::UnmodeledRefusal::tag_limit_exceeded`]), so the same
-    /// condition reached from a handler must not acquire a second code.
-    TagLimitExceeded,
-    /// The account already holds [`MAX_REGISTERED_PROVIDERS`] registrations, so this one
-    /// cannot be taken. Answered with the operation's modelled `ValidationException`.
-    TooManyProviders,
-}
-
 /// A refused tag merge: the resultant set would be larger than
 /// [`MAX_TAGS_PER_RESOURCE`].
 ///
@@ -669,24 +676,6 @@ pub enum RegisterRefusal {
 /// bound belongs to the tag map rather than to the operation that carries it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TagLimitExceeded;
-
-impl From<TagLimitExceeded> for RegisterRefusal {
-    fn from(_: TagLimitExceeded) -> Self {
-        Self::TagLimitExceeded
-    }
-}
-
-/// The most registrations one account's provider store holds.
-///
-/// `RegisterSubscriptionProvider` is the only writer and it mints one record per distinct
-/// (source, secret) pair, with no modelled quota, no TTL and no eviction: without a
-/// ceiling a caller varying `SecretArn` grows the store — and the lookup, list and page
-/// work every later call does over it — without limit. A registration past this ceiling is
-/// refused with the operation's modelled `ValidationException` before anything is written.
-/// AWS publishes its own quota and it is not this number (the real service registers one
-/// provider per supported source); this is the emulator's own ceiling, chosen well above
-/// what a client script needs.
-pub const MAX_REGISTERED_PROVIDERS: usize = 100;
 
 /// The resource segment of a `SubscriptionProviderArn`: this service's one resource kind.
 pub const PROVIDER_RESOURCE_TYPE: &str = "subscription-provider";
@@ -776,8 +765,7 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// `stored` is left carrying the union of both sets, with the requested value for every
 /// key the request names and the value it had for every key the request does not.
 ///
-/// Every tag write of this service merges through here — `TagResource` and the
-/// `@idempotent` repeat path of
+/// Every tag write of this service merges through here — `TagResource` and
 /// [`register_provider`](ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState::register_provider)
 /// — so the bound is decided in ONE place and the two callers cannot drift apart.
 pub fn merge_tags(
