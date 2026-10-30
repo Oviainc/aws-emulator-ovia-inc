@@ -14,8 +14,12 @@
 //!   (`service_com_amazonaws_sqs_amazonsqs::state::Queue::hand_over`), the one path every
 //!   consumer of a queue goes through, so a delivery the poller makes counts exactly as a
 //!   client's `ReceiveMessage` does: the message's `ApproximateReceiveCount` rises, it is
-//!   hidden for the queue's `VisibilityTimeout` and it becomes visible again when that
-//!   lapses. A poll also applies what the queue's own `RedrivePolicy` owes first, so a
+//!   hidden while a consumer holds it and it becomes visible again when that hold lapses.
+//!   The hold covers the whole of the attempt the batch is handed to — the queue's own
+//!   `VisibilityTimeout` or the function's `Timeout`, whichever is longer, since one attempt
+//!   cannot outlast the function's — so no message is handed to a second consumer while the
+//!   first attempt at it may still be running (see [`invisible_for_seconds`]). A poll also
+//!   applies what the queue's own `RedrivePolicy` owes first, so a
 //!   message that has had every delivery that policy allows is moved to the dead-letter
 //!   queue the policy names instead of being handed over again.
 //! * FILTER. `FilterCriteria` is "an object that defines the filter criteria that determine
@@ -111,8 +115,8 @@ const SECONDS_PER_MINUTE: f64 = 60.0;
 
 /// One mapping's queue, as the poll loop reads it out of the store before it touches a
 /// queue: the mapping to record the attempt against, the queue to poll, the function the
-/// batch is handed to, how many messages one batch may hold, and what the mapping asked be
-/// filtered and metered.
+/// batch is handed to and how long it may run for, how many messages one batch may hold,
+/// and what the mapping asked be filtered and metered.
 struct PollTarget {
     /// `UUID`, which is the key the mapping is stored under and the dimension its own
     /// series are reported under.
@@ -124,6 +128,10 @@ struct PollTarget {
     region: String,
     /// `FunctionArn`: "The ARN of the Lambda function" the batch is handed to.
     function_arn: String,
+    /// That function's `Timeout`, in seconds: "the amount of time that Lambda allows a
+    /// function to run before stopping it" — so the LONGEST one attempt at this batch can
+    /// last, which is the span the batch has to stay in flight for.
+    function_timeout_seconds: i64,
     /// `BatchSize`: "the maximum number of records in each batch that Lambda pulls from
     /// your stream or queue".
     batch_size: usize,
@@ -320,6 +328,35 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
     }
 }
 
+/// How long the batch this pass hands to a function stays invisible to every other
+/// consumer of `queue_visibility_timeout_seconds`'s queue, in seconds.
+///
+/// A delivery hides a message for the queue's own `VisibilityTimeout`, which is the span a
+/// message is handed to ONE consumer for. A poller holding a batch for a function is that
+/// one consumer for as long as the attempt it handed the batch to lasts, and it keeps the
+/// batch's visibility extended for that whole span rather than letting it lapse part way
+/// through: a message that came back mid-attempt would be handed to a second consumer while
+/// the first was still working on it, which is a delivery nothing asked for. One attempt
+/// cannot outlast the function's own `Timeout` — "the amount of time that Lambda allows a
+/// function to run before stopping it" — so holding the batch for the longer of the two
+/// spans covers the attempt whatever it comes to, and leaves the queue's own timeout in
+/// charge whenever it is already the longer one. That is also what the comparison a mapping
+/// is ACCEPTED against assumes (`crate::state::queue_visibility_refusal`); the hold is what
+/// keeps it true after a client lowers the queue's timeout or raises the function's, neither
+/// of which the other service knows about.
+///
+/// Bounded by the range the attribute itself takes, since the result is how long one
+/// delivery hides a message for.
+fn invisible_for_seconds(
+    queue_visibility_timeout_seconds: i64,
+    function_timeout_seconds: i64,
+) -> i64 {
+    let (floor, ceiling) = sqs::state::integer_bounds(sqs::state::VISIBILITY_TIMEOUT);
+    queue_visibility_timeout_seconds
+        .max(function_timeout_seconds)
+        .clamp(floor, ceiling)
+}
+
 /// Take the next batch out of `target`'s queue at `now`, as the records the function would
 /// be handed them as.
 ///
@@ -352,13 +389,15 @@ fn take_batch(
     let Some(queue) = store.queue_by_arn_mut(&target.queue_arn) else {
         return Vec::new();
     };
-    // The batch is hidden for the queue's own `VisibilityTimeout`, which is the span a
-    // message is handed to ONE consumer for, and which `CreateEventSourceMapping` already
-    // held this pair to.
+    // The batch is hidden for as long as the attempt it is about to be handed to may last;
+    // see `invisible_for_seconds`.
     let handed = queue.hand_over(
         now,
         target.batch_size,
-        sqs::state::after(now, visibility_timeout),
+        sqs::state::after(
+            now,
+            invisible_for_seconds(visibility_timeout, target.function_timeout_seconds),
+        ),
     );
     handed
         .iter()
@@ -664,11 +703,15 @@ fn polling_targets(store: &ComAmazonawsLambdaAwsgirapiserviceState) -> Vec<PollT
         .filter_map(|mapping| {
             let queue_arn = queue_event_source(mapping.event_source_arn.as_deref())?;
             let region = ::service_common::arn::parse(queue_arn)?.region.to_string();
+            let function = store.functions.get(&mapping.function_name)?;
             Some(PollTarget {
                 uuid: mapping.uuid.clone(),
                 queue_arn: queue_arn.to_string(),
                 region,
                 function_arn: mapping.function_arn.clone(),
+                // How long the batch this mapping polls has to stay in flight for: one
+                // attempt at it cannot outlast the function's own `Timeout`.
+                function_timeout_seconds: i64::from(function.config.timeout),
                 // "Amazon Simple Queue Service – Default 10. For standard queues the max is
                 // 10,000": the size is the batch's ceiling, and a mapping always pulls at
                 // least one record.
@@ -776,7 +819,7 @@ fn polling_wanted_or_release(
 mod tests {
     use ::serde_json::json;
 
-    use super::{filter_event, minute_of, queue_event, PolledMessage};
+    use super::{filter_event, invisible_for_seconds, minute_of, queue_event, PolledMessage};
 
     /// One polled message carrying `body`, under the id `id`.
     fn polled(id: &str, body: &str) -> PolledMessage {
@@ -862,6 +905,32 @@ mod tests {
             assert_eq!(
                 minute, expected,
                 "case {case:?}: expected minute {expected}, got {minute}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_is_held_for_the_longer_of_the_queue_and_the_function_spans() {
+        // The rows differ along which of the two spans is the longer one, and are taken at
+        // each published bound of both members: `VisibilityTimeout` is "an integer from 0 to
+        // 43,200 (12 hours)" and a function's `Timeout` runs from one second to AWS's
+        // published Lambda quota of 900.
+        let rows = [
+            ("the queue hides nothing", 0, 5, 5),
+            ("a one second queue, an eight second function", 1, 8, 8),
+            ("a queue above the function", 30, 3, 30),
+            ("the two spans equal", 10, 10, 10),
+            ("the shortest function a queue can outlast", 1, 1, 1),
+            ("the longest function", 30, 900, 900),
+            ("the queue at its ceiling", 43_200, 900, 43_200),
+        ];
+        for (case, visibility_timeout, function_timeout, expected) in rows {
+            let held = invisible_for_seconds(visibility_timeout, function_timeout);
+            assert_eq!(
+                held, expected,
+                "case {case:?}: a batch handed to a function whose timeout is \
+                 {function_timeout}s, out of a queue hiding a delivery for \
+                 {visibility_timeout}s, must stay in flight for {expected}s, got {held}s"
             );
         }
     }

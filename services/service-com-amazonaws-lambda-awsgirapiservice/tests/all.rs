@@ -81,6 +81,8 @@ mod event_source_mapping_deletion;
 mod event_source_mapping_event_counts;
 #[path = "all/event_source_mapping_paused_state_and_response_types.rs"]
 mod event_source_mapping_paused_state_and_response_types;
+#[path = "all/event_source_mapping_processing_visibility.rs"]
+mod event_source_mapping_processing_visibility;
 #[path = "all/event_source_mapping_queue_visibility.rs"]
 mod event_source_mapping_queue_visibility;
 #[path = "all/event_source_mapping_role_access.rs"]

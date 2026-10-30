@@ -27,3 +27,22 @@ Expected: the function is invoked with the queue's messages and the messages' vi
 1. Boot the emulator and replay the behavioral suite.
 2. Create an SQS queue and a Lambda function, then CreateEventSourceMapping(EventSourceArn=<queue arn>, FunctionName=<fn>, Enabled=true) and wait for State='Enabled'.
 3. SendMessage to the queue and poll for the function's side effect and for the message's visibility timeout — neither ever changes.
+
+## Resolution (partial: the poller and the visibility hold)
+
+The poller now exists and consumes: an enabled mapping on a queue receives the queue's
+messages through the queue's own delivery bookkeeping, applies the queue's RedrivePolicy and
+the mapping's FilterCriteria, hands the admitted messages to its function as the SQS
+`Records` envelope, deletes exactly what the filter rejected or an invocation accepted, and
+meters the pass. The visibility leg named in this report is what was added last: a polled
+batch now stays invisible to every other consumer for the whole span the attempt it was
+handed to may take — the longer of the queue's `VisibilityTimeout` and the invoked
+function's `Timeout` — so no message is delivered again while the first attempt at it may
+still be running.
+
+What is NOT covered here: RUNNING the deployment package. `Invoke` still answers HTTP 501
+for `RequestResponse`, because this emulator has no in-process runtime for a zip or image
+package, so a function's own side effect never becomes observable. That is the separate open
+issue this report names — `20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md`,
+with `20261024T055421Z-lambda-opensearch-s3-lambda-invoke-cannot-execute-a-deployment-package-so.md` —
+and until one of them lands, the trace above still waits for that side effect.
