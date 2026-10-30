@@ -490,12 +490,14 @@ async fn an_unknown_function_name_is_refused_with_the_member_qualified_template(
 // 3. Every substitution token a request defines must be referenced
 // ===========================================================================
 
-/// One unused-token row: the case, the operation, the request, the member that carried
-/// the unused keys, and those keys as the message lists them.
+/// One unused-token row: the case, the operation, the request, the expression member
+/// the request states its intent through (empty when it carries none), the member that
+/// carried the unused keys, and those keys as the message lists them.
 struct UnusedRow {
     case: &'static str,
     operation: &'static str,
     request: Value,
+    expression_member: &'static str,
     member: &'static str,
     keys: &'static str,
 }
@@ -511,6 +513,7 @@ fn unused_rows() -> Vec<UnusedRow> {
                             "FilterExpression": "attribute_exists(#a)",
                             "ExpressionAttributeNames": {"#a": "status",
                                                          "#b": "category"}}),
+            expression_member: "FilterExpression",
             member: "ExpressionAttributeNames",
             keys: "#b",
         },
@@ -522,6 +525,7 @@ fn unused_rows() -> Vec<UnusedRow> {
                             "ExpressionAttributeNames": {"#a": "status",
                                                          "#b": "category",
                                                          "#c": "note"}}),
+            expression_member: "FilterExpression",
             member: "ExpressionAttributeNames",
             keys: "#b, #c",
         },
@@ -532,6 +536,7 @@ fn unused_rows() -> Vec<UnusedRow> {
                             "FilterExpression": "label = :a",
                             "ExpressionAttributeValues": {":a": {"S": "OPEN"},
                                                           ":b": {"S": "DONE"}}}),
+            expression_member: "FilterExpression",
             member: "ExpressionAttributeValues",
             keys: ":b",
         },
@@ -542,6 +547,7 @@ fn unused_rows() -> Vec<UnusedRow> {
                             "ProjectionExpression": "#a",
                             "ExpressionAttributeNames": {"#a": "status",
                                                          "#b": "category"}}),
+            expression_member: "ProjectionExpression",
             member: "ExpressionAttributeNames",
             keys: "#b",
         },
@@ -552,6 +558,7 @@ fn unused_rows() -> Vec<UnusedRow> {
                             "KeyConditionExpression": "id = :a",
                             "ExpressionAttributeValues": {":a": {"S": "one"},
                                                           ":b": {"S": "two"}}}),
+            expression_member: "KeyConditionExpression",
             member: "ExpressionAttributeValues",
             keys: ":b",
         },
@@ -560,6 +567,7 @@ fn unused_rows() -> Vec<UnusedRow> {
             operation: "GetItem",
             request: json!({"TableName": "Unused", "Key": {"id": {"S": "one"}},
                             "ExpressionAttributeNames": {"#a": "status"}}),
+            expression_member: "",
             member: "ExpressionAttributeNames",
             keys: "#a",
         },
@@ -570,6 +578,7 @@ fn unused_rows() -> Vec<UnusedRow> {
                             "ConditionExpression": "attribute_not_exists(#a)",
                             "ExpressionAttributeNames": {"#a": "status"},
                             "ExpressionAttributeValues": {":b": {"S": "DONE"}}}),
+            expression_member: "ConditionExpression",
             member: "ExpressionAttributeValues",
             keys: ":b",
         },
@@ -582,6 +591,7 @@ fn unused_rows() -> Vec<UnusedRow> {
                             "ExpressionAttributeNames": {"#a": "status",
                                                          "#b": "category"},
                             "ExpressionAttributeValues": {":a": {"S": "OPEN"}}}),
+            expression_member: "UpdateExpression",
             member: "ExpressionAttributeNames",
             keys: "#b",
         },
@@ -591,6 +601,7 @@ fn unused_rows() -> Vec<UnusedRow> {
             request: json!({"TableName": "Unused", "Key": {"id": {"S": "one"}},
                             "ConditionExpression": "attribute_exists(id)",
                             "ExpressionAttributeValues": {":a": {"S": "OPEN"}}}),
+            expression_member: "ConditionExpression",
             member: "ExpressionAttributeValues",
             keys: ":a",
         },
@@ -624,10 +635,10 @@ async fn a_substitution_token_no_expression_references_is_refused() {
              got {status} {body}",
             row.case
         );
-        let expected = format!(
-            "1 validation error detected: Value provided in {} unused in expressions: \
-             keys: {{{}}}",
-            row.member, row.keys
+        let expected = crate::undefined_expression_tokens::unused_entries(
+            row.expression_member,
+            row.member,
+            &[row.keys],
         );
         assert_eq!(
             message(&body),

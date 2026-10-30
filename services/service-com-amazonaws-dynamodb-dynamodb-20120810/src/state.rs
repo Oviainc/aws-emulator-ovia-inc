@@ -7415,17 +7415,35 @@ pub fn expression_size_exceeded(member: &str) -> RequestError {
 /// inside it, and the members a READ narrows its result with are not — the service
 /// states those on their own.
 fn invalid_expression_member(member: &str, detail: &str) -> RequestError {
-    let clause = format!("Invalid {member}: {detail}");
-    if ENVELOPED_EXPRESSION_MEMBERS.contains(&member) {
-        refused(clause)
-    } else {
-        RequestError::Validation(clause)
-    }
+    expression_refusal(
+        envelopes_expression_refusals(member),
+        format!("Invalid {member}: {detail}"),
+    )
 }
 
 /// The expression members whose refusals carry the validation envelope: the two a
 /// write states its intent through.
 const ENVELOPED_EXPRESSION_MEMBERS: [&str; 2] = ["UpdateExpression", "ConditionExpression"];
+
+/// Whether a refusal about the expressions of a request carrying `member` is stated
+/// inside the `<N> validation error(s) detected: ` envelope.
+///
+/// The ONE place that question is answered, for every refusal this service raises about
+/// a request's expressions — an unreadable expression, a token no table defines, a table
+/// entry no expression references — so the shape of the sentence follows the member the
+/// request states its intent through and not the check that happened to notice.
+fn envelopes_expression_refusals(member: &str) -> bool {
+    ENVELOPED_EXPRESSION_MEMBERS.contains(&member)
+}
+
+/// State one expression refusal, inside the envelope or on its own.
+fn expression_refusal(enveloped: bool, clause: String) -> RequestError {
+    if enveloped {
+        refused(clause)
+    } else {
+        RequestError::Validation(clause)
+    }
+}
 
 /// The clause for a `#alias` an expression dereferences and `ExpressionAttributeNames`
 /// does not define. ONE wording for that fact, whichever expression member carried the
@@ -7921,8 +7939,13 @@ impl<'a> Substitutions<'a> {
                 }
             }
         }
-        check_referenced("ExpressionAttributeNames", self.names, &names)?;
-        check_referenced("ExpressionAttributeValues", self.values, &values)
+        // The sentence follows the expression member this request states its intent
+        // through, like every other refusal raised about its expressions.
+        let enveloped = expressions.iter().any(|(member, expression)| {
+            expression.is_some() && envelopes_expression_refusals(member)
+        });
+        check_referenced("ExpressionAttributeNames", self.names, &names, enveloped)?;
+        check_referenced("ExpressionAttributeValues", self.values, &values, enveloped)
     }
 }
 
@@ -7930,13 +7953,18 @@ impl<'a> Substitutions<'a> {
 ///
 /// The keys are reported in one stable order — the order the map sorts in — so the
 /// same request earns the same message every time, and the refusal names the member
-/// that carried them. The sentence is stated inside the validation envelope
-/// ([`validation_message`]), the way the request validator states every clause it
-/// raises about an input member.
+/// that carried them.
+///
+/// This rule is the SERVICE's own, checked once the request validator has already
+/// passed a well-formed input, so the sentence is stated on its own and carries the
+/// `<N> validation error(s) detected: ` envelope only where every other refusal about
+/// this request's expressions does — `enveloped`, decided by
+/// [`envelopes_expression_refusals`] over the members the request carried.
 fn check_referenced<V>(
     member: &str,
     supplied: Option<&HashMap<String, V>>,
     referenced: &BTreeSet<String>,
+    enveloped: bool,
 ) -> Result<(), RequestError> {
     let unused: BTreeSet<&str> = supplied
         .into_iter()
@@ -7947,10 +7975,13 @@ fn check_referenced<V>(
     if unused.is_empty() {
         return Ok(());
     }
-    Err(refused(format!(
-        "Value provided in {member} unused in expressions: keys: {{{}}}",
-        unused.into_iter().collect::<Vec<&str>>().join(", ")
-    )))
+    Err(expression_refusal(
+        enveloped,
+        format!(
+            "Value provided in {member} unused in expressions: keys: {{{}}}",
+            unused.into_iter().collect::<Vec<&str>>().join(", ")
+        ),
+    ))
 }
 
 /// One step of a document path: an attribute name, or an index into a list.

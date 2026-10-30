@@ -212,8 +212,9 @@ async fn a_token_no_entry_defines_is_diagnosed_before_a_surplus_entry() {
 async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
     let router = seeded().await;
 
-    // (case, TransactItems, the table the surplus entry belongs to, its keys)
-    let rows: Vec<(&str, Value, &str, Vec<&str>)> = vec![
+    // (case, TransactItems, the expression member the keys were offered to, the table
+    // the surplus entry belongs to, its keys)
+    let rows: Vec<(&str, Value, &str, &str, Vec<&str>)> = vec![
         (
             "a surplus name entry beside a put whose condition names no token",
             json!([{"Put": {
@@ -221,6 +222,7 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                 "Item": {"pk": {"S": "item-3"}, "status": {"S": "paused"}},
                 "ConditionExpression": "attribute_not_exists(pk)",
                 "ExpressionAttributeNames": {"#other": "status"}}}]),
+            "ConditionExpression",
             "ExpressionAttributeNames",
             vec!["#other"],
         ),
@@ -233,6 +235,7 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                 "ExpressionAttributeNames": {"#s": "status"},
                 "ExpressionAttributeValues": {":v": {"S": "paused"},
                                               ":other": {"S": "active"}}}}]),
+            "UpdateExpression",
             "ExpressionAttributeValues",
             vec![":other"],
         ),
@@ -245,6 +248,7 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                 "ExpressionAttributeNames": {"#s": "status", "#b": "status",
                                              "#a": "status"},
                 "ExpressionAttributeValues": {":v": {"S": "active"}}}}]),
+            "ConditionExpression",
             "ExpressionAttributeNames",
             vec!["#a", "#b"],
         ),
@@ -258,13 +262,14 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                     "ConditionExpression": "#s = :v",
                     "ExpressionAttributeNames": {"#s": "status", "#other": "status"},
                     "ExpressionAttributeValues": {":v": {"S": "active"}}}}]),
+            "ConditionExpression",
             "ExpressionAttributeNames",
             vec!["#other"],
         ),
     ];
 
-    for (case, transact_items, member, keys) in rows {
-        let expected = unused_entries(member, &keys);
+    for (case, transact_items, expression_member, member, keys) in rows {
+        let expected = unused_entries(expression_member, member, &keys);
         let (status, body) = call(
             &router,
             "TransactWriteItems",

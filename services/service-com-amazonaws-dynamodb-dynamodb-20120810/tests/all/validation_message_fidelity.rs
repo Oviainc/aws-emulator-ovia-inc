@@ -26,8 +26,9 @@
 //!    with AWS's fixed text for that class, which does not name the path that was
 //!    read;
 //! 5. a substitution table that defines a key no expression referenced is refused
-//!    inside the same validation envelope, naming the member that carried the keys
-//!    and the keys themselves in one stable order;
+//!    naming the member that carried the keys and the keys themselves in one stable
+//!    order, inside the envelope only where the request states its intent through an
+//!    expression member whose refusals carry it;
 //! 6. a key attribute whose value is not of the type the table's
 //!    `AttributeDefinitions` declare for it is refused behind the parameter-values
 //!    clause, over the key, the declared type and the supplied one;
@@ -513,21 +514,22 @@ async fn an_update_operand_reading_a_missing_attribute_names_no_path() {
 // ===========================================================================
 
 #[tokio::test]
-async fn an_unreferenced_substitution_key_is_stated_inside_the_envelope() {
+async fn an_unreferenced_substitution_key_is_stated_as_the_service_words_it() {
     let router = seeded().await;
 
-    // Each row: the case, the operation, the request, the member that carried the
-    // surplus keys and those keys in the order the message states them. The rows
-    // span the member (names and values), the operation (an item write, an item
-    // read, a query, a scan), the expression the keys were offered to (an update, a
-    // condition, a projection, a filter, a key condition) and the number of surplus
-    // keys.
-    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+    // Each row: the case, the operation, the request, the expression member the
+    // request states its intent through, the member that carried the surplus keys
+    // and those keys in the order the message states them. The rows span the member
+    // (names and values), the operation (an item write, an item read, a query, a
+    // scan), the expression the keys were offered to (an update, a condition, a
+    // projection, a filter, a key condition) and the number of surplus keys.
+    let rows: Vec<(&str, &str, Value, &str, &str, &str)> = vec![
         (
             "a surplus value beside an update",
             "UpdateItem",
             json!({"TableName": TABLE, "Key": key(), "UpdateExpression": "SET s = :v",
                    "ExpressionAttributeValues": {":v": {"S": "new"}, ":extra": {"S": "x"}}}),
+            "UpdateExpression",
             "ExpressionAttributeValues",
             ":extra",
         ),
@@ -537,6 +539,7 @@ async fn an_unreferenced_substitution_key_is_stated_inside_the_envelope() {
             json!({"TableName": TABLE, "Key": key(), "UpdateExpression": "SET #s = :v",
                    "ExpressionAttributeNames": {"#s": "s", "#other": "n"},
                    "ExpressionAttributeValues": {":v": {"S": "new"}}}),
+            "UpdateExpression",
             "ExpressionAttributeNames",
             "#other",
         ),
@@ -546,6 +549,7 @@ async fn an_unreferenced_substitution_key_is_stated_inside_the_envelope() {
             json!({"TableName": TABLE, "Key": key(), "UpdateExpression": "SET #s = :v",
                    "ExpressionAttributeNames": {"#s": "s", "#b": "n", "#a": "l"},
                    "ExpressionAttributeValues": {":v": {"S": "new"}}}),
+            "UpdateExpression",
             "ExpressionAttributeNames",
             "#a, #b",
         ),
@@ -554,6 +558,7 @@ async fn an_unreferenced_substitution_key_is_stated_inside_the_envelope() {
             "DeleteItem",
             json!({"TableName": TABLE, "Key": key(), "ConditionExpression": "s = :v",
                    "ExpressionAttributeValues": {":v": {"S": "text"}, ":extra": {"S": "x"}}}),
+            "ConditionExpression",
             "ExpressionAttributeValues",
             ":extra",
         ),
@@ -562,6 +567,7 @@ async fn an_unreferenced_substitution_key_is_stated_inside_the_envelope() {
             "GetItem",
             json!({"TableName": TABLE, "Key": key(), "ProjectionExpression": "#s",
                    "ExpressionAttributeNames": {"#s": "s", "#other": "n"}}),
+            "ProjectionExpression",
             "ExpressionAttributeNames",
             "#other",
         ),
@@ -570,6 +576,7 @@ async fn an_unreferenced_substitution_key_is_stated_inside_the_envelope() {
             "Query",
             json!({"TableName": TABLE, "KeyConditionExpression": "pk = :p",
                    "ExpressionAttributeValues": {":p": {"S": "one"}, ":extra": {"N": "1"}}}),
+            "KeyConditionExpression",
             "ExpressionAttributeValues",
             ":extra",
         ),
@@ -578,15 +585,18 @@ async fn an_unreferenced_substitution_key_is_stated_inside_the_envelope() {
             "Scan",
             json!({"TableName": TABLE, "FilterExpression": "attribute_exists(#s)",
                    "ExpressionAttributeNames": {"#s": "s", "#other": "n"}}),
+            "FilterExpression",
             "ExpressionAttributeNames",
             "#other",
         ),
     ];
 
-    for (case, operation, request, member, keys) in rows {
-        let expected = envelope(&format!(
-            "Value provided in {member} unused in expressions: keys: {{{keys}}}"
-        ));
+    for (case, operation, request, expression_member, member, keys) in rows {
+        let expected = crate::undefined_expression_tokens::unused_entries(
+            expression_member,
+            member,
+            &[keys],
+        );
         let stated = refusal(&router, case, operation, request).await;
         assert_eq!(
             stated, expected,

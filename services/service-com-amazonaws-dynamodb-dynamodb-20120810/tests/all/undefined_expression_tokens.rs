@@ -46,25 +46,36 @@ pub(crate) fn undefined_value_clause(token: &str) -> String {
     format!("An expression attribute value used in expression is not defined; attribute value: {token}")
 }
 
+/// Whether a refusal about a request's expressions is stated inside the
+/// `<N> validation error(s) detected: ` envelope, which follows the expression member
+/// the request states its intent through: the two members a WRITE states its intent
+/// through carry it, and the members a READ narrows its result with do not.
+pub(crate) fn envelopes(expression_member: &str) -> bool {
+    expression_member == "UpdateExpression" || expression_member == "ConditionExpression"
+}
+
 /// The whole sentence for a clause the expression language raises, stated behind the
-/// member that carried it. The two members a write states its intent through are stated
-/// inside the validation envelope; the members a read narrows its result with are not.
+/// member that carried it, in or out of the envelope that member earns.
 pub(crate) fn expression_refusal(member: &str, clause: &str) -> String {
     let stated = format!("Invalid {member}: {clause}");
-    if member == "UpdateExpression" || member == "ConditionExpression" {
+    if envelopes(member) {
         return format!("1 validation error detected: {stated}");
     }
     stated
 }
 
-/// The sentence AWS states for entries of `member` that no expression referenced,
-/// inside the validation envelope the request validator states every clause in.
-pub(crate) fn unused_entries(member: &str, keys: &[&str]) -> String {
-    format!(
-        "1 validation error detected: Value provided in {member} unused in expressions: \
-         keys: {{{}}}",
+/// The sentence AWS states for entries of `table` that no expression referenced, as the
+/// request that offered them to `expression_member` earns it: the service's own rule, so
+/// the sentence stands on its own except where that member's refusals carry the envelope.
+pub(crate) fn unused_entries(expression_member: &str, table: &str, keys: &[&str]) -> String {
+    let stated = format!(
+        "Value provided in {table} unused in expressions: keys: {{{}}}",
         keys.join(", ")
-    )
+    );
+    if envelopes(expression_member) {
+        return format!("1 validation error detected: {stated}");
+    }
+    stated
 }
 
 /// Seed the table and the item every condition below is evaluated against.
@@ -210,12 +221,25 @@ async fn a_token_no_entry_defines_is_diagnosed_before_a_surplus_entry() {
     );
 }
 
+/// One surplus-entry row: the case, the operation, the request, the expression member
+/// the keys were offered to, the substitution table they belong to, and those keys in
+/// the order the message states them.
+type SurplusRow = (
+    &'static str,
+    &'static str,
+    Value,
+    &'static str,
+    &'static str,
+    Vec<&'static str>,
+);
+
 #[tokio::test]
 async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
     let router = seeded().await;
 
-    // (case, operation, request, the table the surplus entry belongs to, its keys)
-    let rows: Vec<(&str, &str, Value, &str, Vec<&str>)> = vec![
+    // (case, operation, request, the expression member the keys were offered to, the
+    // table the surplus entry belongs to, its keys)
+    let rows: Vec<SurplusRow> = vec![
         (
             "a surplus name entry beside a condition whose tokens are all defined",
             "DeleteItem",
@@ -223,6 +247,7 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                    "ConditionExpression": "#s = :v",
                    "ExpressionAttributeNames": {"#s": "status", "#other": "status"},
                    "ExpressionAttributeValues": {":v": {"S": "active"}}}),
+            "ConditionExpression",
             "ExpressionAttributeNames",
             vec!["#other"],
         ),
@@ -233,6 +258,7 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                    "ConditionExpression": "#s = :v",
                    "ExpressionAttributeNames": {"#s": "status", "#b": "status", "#a": "status"},
                    "ExpressionAttributeValues": {":v": {"S": "active"}}}),
+            "ConditionExpression",
             "ExpressionAttributeNames",
             vec!["#a", "#b"],
         ),
@@ -244,6 +270,7 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
                    "ExpressionAttributeNames": {"#s": "status"},
                    "ExpressionAttributeValues": {":v": {"S": "active"},
                                                  ":other": {"S": "paused"}}}),
+            "ConditionExpression",
             "ExpressionAttributeValues",
             vec![":other"],
         ),
@@ -253,13 +280,14 @@ async fn a_surplus_entry_is_diagnosed_once_every_referenced_token_is_defined() {
             json!({"TableName": TABLE, "Key": key(),
                    "ProjectionExpression": "#s",
                    "ExpressionAttributeNames": {"#s": "status", "#other": "status"}}),
+            "ProjectionExpression",
             "ExpressionAttributeNames",
             vec!["#other"],
         ),
     ];
 
-    for (case, operation, request, member, keys) in rows {
-        let expected = unused_entries(member, &keys);
+    for (case, operation, request, expression_member, member, keys) in rows {
+        let expected = unused_entries(expression_member, member, &keys);
         let (status, body) = call(&router, operation, request).await;
         assert_eq!(
             (status, error_code(&body).as_str()),

@@ -170,6 +170,9 @@ mod transactional_undefined_expression_tokens;
 #[path = "all/undefined_expression_tokens.rs"]
 mod undefined_expression_tokens;
 
+#[path = "all/unused_substitution_key_envelopes.rs"]
+mod unused_substitution_key_envelopes;
+
 #[path = "all/update_contributor_insights_writes.rs"]
 mod update_contributor_insights_writes;
 
