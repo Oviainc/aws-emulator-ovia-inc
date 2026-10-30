@@ -36,9 +36,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccountSettings, Group, GroupConfiguration, GroupConfigurationItem, GroupIdentifier,
-    GroupingStatusesItem, ListGroupResourcesItem, ResourceIdentifier, ResourceQuery,
-    ResourceStatus, TagSyncTaskItem, GROUP_LIFECYCLE_EVENTS_DESIRED_STATUS_VALUES,
+    AccountSettings, FailedResource, Group, GroupConfiguration, GroupConfigurationItem,
+    GroupIdentifier, GroupingStatusesItem, ListGroupResourcesItem, ResourceIdentifier,
+    ResourceQuery, ResourceStatus, TagSyncTaskItem, GROUP_LIFECYCLE_EVENTS_DESIRED_STATUS_VALUES,
     QUERY_TYPE_VALUES,
 };
 
@@ -705,6 +705,35 @@ pub const APPLICATION_TAG_KEY: &str = "awsApplication";
 /// own state, not something a refusal reports.
 pub const UNSUPPORTED_TARGET_MESSAGE: &str = "This operation does not support the target";
 
+/// The service-configuration parameter that names the resource types a group's
+/// members may have.
+///
+/// A parameter is named in the AWS "Service configurations for resource groups"
+/// reference, which is the vocabulary `GroupConfigurationParameter$Name` is
+/// documented in, and this one "specifies the types of resources that you can add
+/// to this group"; the modelled name pattern `^[a-z-]+$` admits exactly one
+/// spelling, so the comparison in
+/// [`GroupRecord::configuration_parameter_values`] is exact. Its values are
+/// CloudFormation-style type names, the same vocabulary
+/// [`resource_type_of_arn`] answers in.
+pub const ALLOWED_RESOURCE_TYPES_PARAMETER: &str = "allowed-resource-types";
+
+/// The `FailedResource$ErrorCode` a static-membership call reports for a resource
+/// ARN the addressed group does not support.
+///
+/// Fixed text for this error class — the per-resource counterpart of the modelled
+/// request-level refusals: the call itself is answered (HTTP 200) and the
+/// resources that could not be acted on are reported one by one
+/// (`smithy_query(query="shape",shape="FailedResource")`).
+pub const UNSUPPORTED_RESOURCE_ARN_ERROR_CODE: &str = "ResourceArnValidationException";
+
+/// The `FailedResource$ErrorMessage` reported beside
+/// [`UNSUPPORTED_RESOURCE_ARN_ERROR_CODE`].
+///
+/// One FIXED sentence for the class, carrying no value of its own: the entry's own
+/// `ResourceArn` already names the resource the report is about.
+pub const UNSUPPORTED_RESOURCE_ARN_MESSAGE: &str = "Unsupported resource ARN";
+
 /// One persisted resource group: its identity, its describable attributes, the
 /// query or the service configuration it was created with, its tags, and its
 /// static members.
@@ -984,15 +1013,67 @@ impl GroupRecord {
     /// A group with no configuration, an item with no parameters and a parameter
     /// with no values all set nothing.
     pub fn configuration_parameter_has_value(&self, parameter: &str, value: &str) -> bool {
+        self.configuration_parameter_values(parameter)
+            .any(|v| v == value)
+    }
+
+    /// Every value this record's stored service configuration gives `parameter`,
+    /// in configuration order.
+    ///
+    /// Read across every configuration item the group holds, because the
+    /// configuration is one document whatever item type declares the parameter,
+    /// and a parameter may carry several values. A group with no configuration,
+    /// an item with no parameters and a parameter with no values all yield
+    /// nothing.
+    pub fn configuration_parameter_values<'record>(
+        &'record self,
+        parameter: &str,
+    ) -> impl Iterator<Item = &'record str> {
+        let parameter = parameter.to_string();
         self.effective_configuration()
             .into_iter()
             .flatten()
             .filter_map(|item| item.parameters.as_ref())
             .flatten()
-            .filter(|p| p.name == parameter)
+            .filter(move |p| p.name == parameter)
             .filter_map(|p| p.values.as_ref())
             .flatten()
-            .any(|v| v == value)
+            .map(String::as_str)
+    }
+
+    /// Whether this group's stored service configuration admits a member of
+    /// `resource_type` — the CloudFormation-style type name
+    /// [`resource_type_of_arn`] answers, or `None` for an ARN whose type this
+    /// service cannot name.
+    ///
+    /// A configuration that sets [`ALLOWED_RESOURCE_TYPES_PARAMETER`] LIMITS the
+    /// group's members to the types it names, so a type the parameter does not
+    /// name is not one this group supports — and neither is a resource whose type
+    /// is unknown, since nothing shows it to be one of them. A configuration that
+    /// sets the parameter nowhere declares no such limit and admits any type.
+    ///
+    /// Judging the unknown type as unsupported is what keeps the limit a limit:
+    /// an ARN admitted here is one whose type the parameter names, so widening
+    /// the answer to a type [`resource_type_of_arn`] cannot name would let a
+    /// group limited to one type hold a resource of any other. It is also what
+    /// binds the judgement to that table: a resource of an admitted type whose
+    /// ARN form the table does not carry is reported unsupported, and the fix
+    /// for that is a row there rather than a looser rule here.
+    pub fn admits_resource_type(&self, resource_type: Option<&str>) -> bool {
+        let mut limit = self.configuration_parameter_values(ALLOWED_RESOURCE_TYPES_PARAMETER);
+        let Some(first) = limit.next() else {
+            return true;
+        };
+        resource_type.is_some_and(|declared| {
+            declared == first || limit.any(|admitted| admitted == declared)
+        })
+    }
+
+    /// Whether this group's stored service configuration admits `resource_arn` as
+    /// a member, judged on the resource type the ARN names
+    /// ([`GroupRecord::admits_resource_type`]).
+    pub fn admits_member_arn(&self, resource_arn: &str) -> bool {
+        self.admits_resource_type(resource_type_of_arn(resource_arn))
     }
 
     /// Whether this group's own stored service configuration forbids deleting it
@@ -2036,6 +2117,8 @@ const RESOURCE_TYPES: &[(&str, &str, &str)] = &[
     ("cloudformation", "stack", "AWS::CloudFormation::Stack"),
     ("cloudwatch", "alarm", "AWS::CloudWatch::Alarm"),
     ("dynamodb", "table", "AWS::DynamoDB::Table"),
+    ("ec2", "capacity-reservation", "AWS::EC2::CapacityReservation"),
+    ("ec2", "dedicated-host", "AWS::EC2::Host"),
     ("ec2", "instance", "AWS::EC2::Instance"),
     ("ec2", "security-group", "AWS::EC2::SecurityGroup"),
     ("ec2", "snapshot", "AWS::EC2::Snapshot"),
@@ -2116,6 +2199,53 @@ pub fn check_resource_arns(resource_arns: &[String]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The report a static-membership call makes for one resource ARN the addressed
+/// group does not support: the ARN from the request, under the fixed code and
+/// sentence of the class ([`UNSUPPORTED_RESOURCE_ARN_ERROR_CODE`],
+/// [`UNSUPPORTED_RESOURCE_ARN_MESSAGE`]).
+pub fn unsupported_resource_arn(resource_arn: &str) -> FailedResource {
+    FailedResource {
+        resource_arn: Some(resource_arn.to_string()),
+        error_message: Some(UNSUPPORTED_RESOURCE_ARN_MESSAGE.to_string()),
+        error_code: Some(UNSUPPORTED_RESOURCE_ARN_ERROR_CODE.to_string()),
+    }
+}
+
+/// Split one static-membership request's `ResourceArns` into the entries `group`
+/// acts on and the `Failed` reports for the entries it does not support.
+///
+/// The ONE place this service decides which resources a group admits, so the call
+/// that records memberships and the one that drops them judge the same request the
+/// same way and report a refused entry with the same code and sentence:
+///
+/// * an ARN whose resource type the group's service configuration admits
+///   ([`GroupRecord::admits_member_arn`]) is acted on;
+/// * an ARN the group already HOLDS is acted on whatever its configuration now
+///   says, because a membership already recorded is one a removal must still be
+///   able to drop — replacing a group's configuration carries its memberships
+///   nowhere;
+/// * every other ARN is reported in `Failed` and acted on in no way, once however
+///   many times one request repeats it, in the order the request names them.
+///
+/// The work is bounded by [`MAX_RESOURCE_ARNS`] request entries, each judged by
+/// BINARY SEARCH over the group's memberships ([`GroupRecord::holds_member`]).
+pub fn supported_membership_arns<'arns>(
+    group: &GroupRecord,
+    resource_arns: &'arns [String],
+) -> (Vec<&'arns str>, Vec<FailedResource>) {
+    let mut supported: Vec<&str> = Vec::new();
+    let mut failed: Vec<FailedResource> = Vec::new();
+    let mut reported: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for resource_arn in resource_arns.iter().map(String::as_str) {
+        if group.holds_member(resource_arn) || group.admits_member_arn(resource_arn) {
+            supported.push(resource_arn);
+        } else if reported.insert(resource_arn) {
+            failed.push(unsupported_resource_arn(resource_arn));
+        }
+    }
+    (supported, failed)
 }
 
 /// A reported list in the wire form a member whose modelled target declares a

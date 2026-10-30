@@ -31,6 +31,17 @@ const MEMBERS: [&str; 3] = [
     "arn:aws:dynamodb:us-east-1:000000000000:table/Orders",
 ];
 
+/// The resource types of [`MEMBERS`], for the rows whose configuration sets the
+/// `allowed-resource-types` parameter: a group's configuration admits as members
+/// only the types that parameter names (the sibling
+/// `group_resources_supported_resource_types` suite's own rule), so a row that
+/// groups these ARNs declares their types.
+const ALLOWED_TYPES: [&str; 3] = [
+    "AWS::EC2::Instance",
+    "AWS::EC2::Volume",
+    "AWS::DynamoDB::Table",
+];
+
 /// The tags every case creates its group with, so a refused delete can be shown
 /// to have destroyed none of them.
 fn tags() -> Value {
@@ -110,7 +121,7 @@ fn protection_cases() -> Vec<ProtectionCase> {
                 {
                     "Type": "AWS::ResourceGroups::Generic",
                     "Parameters": [
-                        { "Name": "allowed-resource-types", "Values": ["AWS::EC2::Host"] },
+                        { "Name": "allowed-resource-types", "Values": ALLOWED_TYPES },
                         { "Name": "deletion-protection", "Values": ["UNLESS_EMPTY"] }
                     ]
                 }
@@ -152,7 +163,7 @@ fn protection_cases() -> Vec<ProtectionCase> {
             configuration: json!([{
                 "Type": "AWS::EC2::HostManagement",
                 "Parameters": [
-                    { "Name": "allowed-resource-types", "Values": ["AWS::EC2::Instance"] }
+                    { "Name": "allowed-resource-types", "Values": ALLOWED_TYPES }
                 ]
             }]),
             protects: false,

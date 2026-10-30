@@ -324,8 +324,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_identifiers: Some(page.iter().map(|member| member.to_identifier()).collect()),
             next_token,
             // `QueryErrors` reports what went wrong while RUNNING a group's query;
-            // listing recorded memberships runs none.
-            query_errors: None,
+            // listing recorded memberships runs none. The member is always on the
+            // wire, so a listing with nothing to report says so with `[]` rather
+            // than by leaving it out: its target declares no length minimum.
+            query_errors: Some(Vec::new()),
         })
     }
 }

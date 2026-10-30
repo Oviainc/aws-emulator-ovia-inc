@@ -16,6 +16,11 @@
 //! populated from a resource query, or one that was never grouped and carries no such
 //! configuration, is refused with `BadRequestException`.
 //!
+//! Within such a group, each requested ARN is judged against the resource types that
+//! group's configuration admits ([`crate::state::supported_membership_arns`]): one it does
+//! not support, and does not hold as a member, drops nothing and is reported in `Failed`,
+//! while the rest of the request is still applied.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -241,9 +246,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports no removal, and an ARN one request repeats is reported once, by
         // the single lookup that found it.
         let mut succeeded: Vec<String> = Vec::new();
-        for arn in &input.resource_arns {
+        let (supported, failed) =
+            crate::state::supported_membership_arns(group, &input.resource_arns);
+        for arn in &supported {
             if group.remove_member(arn) {
-                succeeded.push(arn.clone());
+                succeeded.push((*arn).to_string());
             }
         }
         let members_left = group.members.len();
@@ -261,6 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group = ?key.name,
             members_requested = input.resource_arns.len(),
             members_removed = succeeded.len(),
+            members_refused = failed.len(),
             members_remaining = members_left,
             outcome = "ungrouped",
             "resources removed from a resource group",
@@ -270,11 +278,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // at one, so a call that dropped no membership cannot say so with an
             // empty list: the member is left out of the answer instead.
             succeeded: crate::state::reported_list(succeeded),
-            // A removal this emulator accepts is applied in full and immediately: no
-            // named resource is refused, so nothing failed to be removed, and none
-            // is left half-removed, so nothing is pending either. Both targets
-            // declare no length minimum, so `[]` is a value they carry.
-            failed: Some(Vec::new()),
+            // One entry per ARN the group neither holds nor supports — the only way
+            // this operation refuses a single named resource rather than the whole
+            // request. An ARN the group simply does not hold did not FAIL to be
+            // removed, so it is reported here no more than it is in `Succeeded`.
+            failed: Some(failed),
+            // A removal this emulator applies is applied by the call that asked for
+            // it, so nothing is left half-removed. The target declares no length
+            // minimum, so `[]` is a value it carries.
             pending: Some(Vec::new()),
         })
     }

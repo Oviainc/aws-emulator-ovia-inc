@@ -14,6 +14,11 @@
 //! static membership; any other group — one populated from a resource query, or one with no
 //! configuration — is refused with `BadRequestException`.
 //!
+//! Within such a group, each requested ARN is judged against the resource types that
+//! group's configuration admits ([`crate::state::supported_membership_arns`]): one it does
+//! not support records no membership and is reported in `Failed`, while the rest of the
+//! request is still applied.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -232,16 +237,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // constants and nothing else: at most `crate::state::MAX_RESOURCE_ARNS`
         // request entries, each looked up by BINARY SEARCH over the group's
         // memberships, which `add_member` keeps sorted by ARN.
-        let new_memberships: std::collections::BTreeSet<&str> = input
-            .resource_arns
+        //
+        // Judged over the entries this call will act on: an ARN the group does
+        // not support records no membership, so it is not counted against the
+        // ceiling either.
+        let (supported, failed) =
+            crate::state::supported_membership_arns(group, &input.resource_arns);
+        let new_memberships: std::collections::BTreeSet<&str> = supported
             .iter()
-            .map(String::as_str)
-            .filter(|arn| {
-                group
-                    .members
-                    .binary_search_by(|member| member.resource_arn.as_str().cmp(arn))
-                    .is_err()
-            })
+            .copied()
+            .filter(|arn| !group.holds_member(arn))
             .collect();
         if group.members.len() + new_memberships.len() > crate::state::MAX_MEMBERS_PER_GROUP {
             return Err(GroupResourcesErrorModeled::BadRequestException(BadRequestException {
@@ -262,9 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no addition, and an ARN one request repeats is reported once, by the
         // single call that recorded it.
         let mut succeeded: Vec<String> = Vec::new();
-        for arn in &input.resource_arns {
+        for arn in &supported {
             if group.add_member(arn) {
-                succeeded.push(arn.clone());
+                succeeded.push((*arn).to_string());
             }
         }
         let members_present = group.members.len();
@@ -282,6 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group = ?key.name,
             members_requested = input.resource_arns.len(),
             members_added = succeeded.len(),
+            members_refused = failed.len(),
             members_now_present = members_present,
             outcome = "grouped",
             "resources added to a resource group",
@@ -291,11 +297,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // at one, so a call that added no membership cannot say so with an
             // empty list: the member is left out of the answer instead.
             succeeded: crate::state::reported_list(succeeded),
-            // Nothing was refused, and a static membership this emulator accepts is
-            // immediate — so neither list has an entry: an ARN the group already
-            // held did not FAIL to be added, and none is left half-added. Both
-            // targets declare no length minimum, so `[]` is a value they carry.
-            failed: Some(Vec::new()),
+            // One entry per ARN the group does not support — the only way this
+            // operation refuses a single named resource rather than the whole
+            // request. An ARN the group already held did not FAIL to be added, so
+            // it is reported here no more than it is in `Succeeded`.
+            failed: Some(failed),
+            // A static membership this emulator accepts is recorded by the call
+            // that asked for it, so nothing is left half-added. The target
+            // declares no length minimum, so `[]` is a value it carries.
             pending: Some(Vec::new()),
         })
     }

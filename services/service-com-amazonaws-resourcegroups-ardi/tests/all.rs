@@ -35,6 +35,8 @@ mod group_query;
 mod group_reported_additions;
 #[path = "all/group_resources_supported_configuration.rs"]
 mod group_resources_supported_configuration;
+#[path = "all/group_resources_supported_resource_types.rs"]
+mod group_resources_supported_resource_types;
 #[path = "all/group_tags.rs"]
 mod group_tags;
 #[path = "all/group_untag.rs"]

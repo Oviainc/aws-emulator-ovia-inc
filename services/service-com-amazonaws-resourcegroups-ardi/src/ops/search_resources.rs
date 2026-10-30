@@ -308,7 +308,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
             // `QueryErrors` reports what went wrong while running the query; a tag
             // query runs over the recorded resources with nothing left to report.
-            query_errors: None,
+            // The member is always on the wire, so a search with nothing to report
+            // says so with `[]` rather than by leaving it out: its target declares
+            // no length minimum.
+            query_errors: Some(Vec::new()),
         })
     }
 }
