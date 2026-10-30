@@ -10,7 +10,11 @@
 //!    keeps an expired key for, floored to the hour — the key is kept for 60 days after
 //!    it expires, so the two members are exactly one retention span apart;
 //! 2. the derivation is the key's, not the reporting operation's: `CreateApiKey`,
-//!    `UpdateApiKey` and `ListApiKeys` all report the same `deletes` for the same key.
+//!    `UpdateApiKey` and `ListApiKeys` all report the same `deletes` for the same key;
+//! 3. rules 1 and 2 together make `deletes` a FUNCTION of the key's expiration alone:
+//!    two keys whose expirations floor to the same hour report the same deletion time,
+//!    whichever API of whichever resource family holds them, whichever call set the
+//!    expiration, and however often they are read.
 //!
 //! The rows differ along the one thing rule 1 reads — the key's expiration: each
 //! published validity bound and values well inside the window, instants on and off an
@@ -23,6 +27,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::error_contract::{call, create_api, router, Answer};
+use crate::event_api::{create_event_api, event_config};
 
 /// One hour in seconds — the granularity `ApiKey$expires` and `ApiKey$deletes` are
 /// documented with: both are "seconds since the epoch, rounded down to the nearest
@@ -66,6 +71,31 @@ fn floor_to_hour(seconds: i64) -> i64 {
 /// The deletion time the service owes a key whose expiration is `expires`: rule 1.
 fn expected_deletes(expires: i64) -> i64 {
     floor_to_hour(expires + RETENTION)
+}
+
+/// One row of the rule-3 table: its label, and the expiration it submits, as a
+/// function of the clock the row itself reads.
+type ExpirationRow = (&'static str, fn(i64) -> i64);
+
+/// Create one Event API and return the `apiId` the service minted for it — an API of
+/// the OTHER resource family whose ids share the API-key operations' `apiId` label.
+///
+/// Both the create call and the configuration it carries are the Event-API suite's
+/// (`crate::event_api`), here authorized by API key.
+async fn event_api_id(router: &MultiServiceRouter, name: &str) -> String {
+    let body = json!({
+        "name": name,
+        "eventConfig": event_config(&["API_KEY"], &["API_KEY"], &["API_KEY"], &["API_KEY"], None),
+    });
+    let answer = create_event_api(router, body).await;
+    assert_eq!(
+        answer.status, 200,
+        "case create the Event API {name:?}: expected CreateApi 200, got {answer:?}"
+    );
+    answer.body["api"]["apiId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// `CreateApiKey` under `api_id`.
@@ -298,6 +328,148 @@ async fn an_updated_key_reports_one_deletion_time_to_every_operation() {
          got {:?}",
         listed_key(&router, &api_id, &key_id).await
     );
+}
+
+/// Rule 3: the deletion time is a function of the expiration ALONE.
+///
+/// Each row submits ONE absolute expiration to keys held by three different APIs —
+/// two `GraphqlApi`s and an `Api` (an Event API), so the two resource families whose
+/// ids share the `apiId` label are both covered — and then to a key that reaches the
+/// same expiration through `UpdateApiKey` instead of `CreateApiKey`. All of them must
+/// report one expiration and one deletion time, so nothing but the expiration takes
+/// part in the derivation.
+///
+/// The rows differ along the submitted instant's position in its hour (already on the
+/// boundary, one second past it, one second short of the next one, mid-hour) and along
+/// how far out it sits, including both published validity bounds.
+#[tokio::test]
+async fn the_deletion_time_is_a_function_of_the_expiration_alone() {
+    let router = router();
+    let holders: [(&str, String); 3] = [
+        (
+            "a GraphQL API",
+            create_api(&router, "Api_key_deletes_function_first").await,
+        ),
+        (
+            "a second GraphQL API",
+            create_api(&router, "Api_key_deletes_function_second").await,
+        ),
+        (
+            "an Event API",
+            event_api_id(&router, "Api_key_deletes_function_events").await,
+        ),
+    ];
+
+    // Each row names the instant it submits as a function of the clock, so the row
+    // reads the clock itself: a row sitting just inside a validity bound must be
+    // measured from an instant close to the calls it makes, not from one the earlier
+    // rows have left behind.
+    let cases: &[ExpirationRow] = &[
+        ("an instant already on an hour boundary", |now| {
+            floor_to_hour(now + 30 * DAY)
+        }),
+        ("one second past an hour boundary", |now| {
+            floor_to_hour(now + 30 * DAY) + 1
+        }),
+        ("one second short of the next hour", |now| {
+            floor_to_hour(now + 30 * DAY) + HOUR - 1
+        }),
+        ("an instant mid-hour", |now| now + 45 * DAY + 1_234),
+        ("just inside the minimum validity", |now| {
+            now + DAY + BOUND_SLACK
+        }),
+        ("just inside the maximum validity", |now| {
+            now + 365 * DAY - BOUND_SLACK
+        }),
+    ];
+
+    for (case, instant) in cases {
+        let case = *case;
+        let now = unix_now();
+        let submitted = instant(now);
+        let owed = expected_deletes(floor_to_hour(submitted));
+
+        for (holder, api_id) in &holders {
+            let answer = create_key(
+                &router,
+                api_id,
+                json!({ "description": case, "expires": submitted }),
+            )
+            .await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?} on {holder}: expected CreateApiKey 200, got {answer:?}"
+            );
+            let created = answer.body["apiKey"].clone();
+            let key_id = created["id"].as_str().unwrap_or_default().to_string();
+            let expires = assert_retention_span(case, holder, &created);
+            assert_eq!(
+                expires,
+                floor_to_hour(submitted),
+                "case {case:?} on {holder}: expected the submitted expiration floored to \
+                 the hour, got {created:?}"
+            );
+            assert_eq!(
+                created["deletes"].as_i64(),
+                Some(owed),
+                "case {case:?} on {holder}: expected deletes {owed} for this expiration, \
+                 got {created:?}"
+            );
+
+            // Reading the key twice reports the same derived instant both times: the
+            // listing projects the stored key rather than recomputing it per call.
+            let listed = listed_key(&router, api_id, &key_id).await;
+            assert_eq!(
+                listed, created,
+                "case {case:?} on {holder}: ListApiKeys must report the key CreateApiKey \
+                 stored, got {listed:?}"
+            );
+            assert_eq!(
+                listed_key(&router, api_id, &key_id).await,
+                created,
+                "case {case:?} on {holder}: a second listing must report the same key, \
+                 got {listed:?}"
+            );
+        }
+
+        // The same expiration reached by an UPDATE derives the same deletion time: the
+        // call that set it is not part of the derivation either.
+        let (holder, api_id) = &holders[0];
+        let answer = create_key(
+            &router,
+            api_id,
+            json!({ "description": "updated later", "expires": now + 7 * DAY }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?} on {holder} before the update: expected CreateApiKey 200, \
+             got {answer:?}"
+        );
+        let key_id = answer.body["apiKey"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let answer = update_key(&router, api_id, &key_id, json!({ "expires": submitted })).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?} on {holder}: expected UpdateApiKey 200, got {answer:?}"
+        );
+        let updated = answer.body["apiKey"].clone();
+        assert_retention_span(case, "UpdateApiKey", &updated);
+        assert_eq!(
+            updated["deletes"].as_i64(),
+            Some(owed),
+            "case {case:?} on {holder}: expected an updated key to report deletes {owed}, \
+             the same value a created key with this expiration reports, got {updated:?}"
+        );
+        assert_eq!(
+            listed_key(&router, api_id, &key_id).await,
+            updated,
+            "case {case:?} on {holder}: ListApiKeys must report the key UpdateApiKey \
+             stored, got {updated:?}"
+        );
+    }
 }
 
 /// Rule 2 over a PAGED listing: every key of an API reports the deletion time its own
