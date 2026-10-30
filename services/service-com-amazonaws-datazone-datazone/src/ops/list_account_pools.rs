@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountPools
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountPools`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountPools::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account pools stored in the named domain, as the summaries the model
+//! declares, from the stored records: the listing and `GetAccountPool` read the one
+//! store, so a pool appears here as soon as it is created and goes with its domain.
+//!
+//! A reporting operation (`@readonly`): the only write it makes is the domain lifecycle
+//! settlement every handler owes the clock.
+//!
+//! `name` selects the pools stored under exactly that name, `sortBy`/`sortOrder` choose
+//! the one total order the page walk follows, and `maxResults`/`nextToken` page over it.
 //!
 //! ## Shape of an operation
 //!
@@ -147,6 +148,13 @@ impl<Eng> ListAccountPools<Eng> {
     }
 }
 
+/// The `maxResults` range the model declares for this operation (`@range` min 1, max 50
+/// on `MaxResults`). A request naming no `maxResults` gets the top of the range, and a
+/// value is clamped into it rather than trusted: a 0 would otherwise answer an empty
+/// page while the domain has account pools.
+const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = 50;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListAccountPools<Eng>
 {
@@ -164,18 +172,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountPools` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountPoolsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountPools"))
+        let _ = ctx;
+        use crate::state::{
+            decode_page_token, encode_page_token, name_sort_key, now_ms, AccountPool,
+            SORT_FIELD_NAME, SORT_ORDER_DESCENDING,
+        };
+        use std::collections::BTreeMap;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAccountPoolsErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a reporting operation makes: materialise the domain lifecycle
+        // steps the clock already owed at this instant.
+        store.settle_clock(now_ms());
+
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListAccountPoolsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                })
+            })?),
+            None => None,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(MAX_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+        let descending = input.sort_order.as_deref() == Some(SORT_ORDER_DESCENDING);
+        // `NAME` is the only field `sortBy` offers; a request naming none is answered in
+        // the order the store keys the pools under, their id.
+        let by_name = input.sort_by.as_deref() == Some(SORT_FIELD_NAME);
+
+        // This operation models no `ResourceNotFoundException`, so a domain this emulator
+        // does not hold cannot be reported as missing: it is refused as invalid input
+        // naming the member to fix, rather than answered as a domain with no pools. The
+        // liveness notion is `GetAccountPool`'s, so the listing and the reader agree on
+        // which domains still hold pools.
+        let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+            ListAccountPoolsErrorModeled::ValidationException(ValidationException {
+                message: "domainIdentifier does not name a domain in this account".to_string(),
+            })
+        })?;
+
+        // One total order over the pools the `name` filter keeps: by name when the caller
+        // sorts on NAME (two pools sharing a name ordered by id after it), else by the
+        // pool's id. Collecting into a `BTreeMap` is what sorts it, and the key is what a
+        // page's token carries, so the next page resumes exactly after the pool this one
+        // ended on however the stored map has changed.
+        let ordered: BTreeMap<String, &AccountPool> = domain
+            .account_pools
+            .values()
+            .filter(|pool| input.name.as_deref().is_none_or(|name| pool.name == name))
+            .map(|pool| {
+                let key = if by_name {
+                    name_sort_key(&pool.name, &pool.id)
+                } else {
+                    pool.id.clone()
+                };
+                (key, pool)
+            })
+            .collect();
+        let mut ordered: Vec<(String, &AccountPool)> = ordered.into_iter().collect();
+        // `DESCENDING` walks the same sequence backwards.
+        if descending {
+            ordered.reverse();
+        }
+        // Resume AFTER the key the previous page ended on, in whichever direction this
+        // page runs — located by comparison, so a pool created or deleted between two
+        // pages cannot make the next page skip or repeat a different pool.
+        let start = match resume_after.as_deref() {
+            Some(after) => ordered.partition_point(|(key, _)| {
+                if descending {
+                    key.as_str() >= after
+                } else {
+                    key.as_str() <= after
+                }
+            }),
+            None => 0,
+        };
+        let remaining = &ordered[start..];
+
+        let items: Vec<AccountPoolSummary> = remaining
+            .iter()
+            .take(page_size)
+            .map(|(_, pool)| AccountPoolSummary {
+                domain_id: Some(pool.domain_id.clone()),
+                id: Some(pool.id.clone()),
+                name: Some(pool.name.clone()),
+                resolution_strategy: Some(pool.resolution_strategy.clone()),
+                domain_unit_id: Some(pool.domain_unit_id.clone()),
+                created_by: Some(pool.created_by.clone()),
+                // Absent until something updates the pool.
+                updated_by: pool.updated_by.clone(),
+            })
+            .collect();
+        // A token only when a pool is left over, and it names the key this page ended on.
+        let next_token = remaining
+            .get(page_size)
+            .and(remaining.get(page_size - 1))
+            .map(|(key, _)| encode_page_token(key));
+
+        Ok(ListAccountPoolsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

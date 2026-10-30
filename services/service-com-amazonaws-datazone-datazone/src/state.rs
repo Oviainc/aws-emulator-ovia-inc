@@ -45,6 +45,11 @@ pub const DESIGNATION_USER_CREATED: &str = "USER_CREATED_DESIGNATION";
 /// `com.amazonaws.datazone#SortOrder`: ASCENDING | DESCENDING).
 pub const SORT_ORDER_DESCENDING: &str = "DESCENDING";
 
+/// The one field a listing's `sortBy` offers — the sole member of every `SortField*`
+/// enum this service models (`SortFieldAccountPool`, `SortFieldConnection` and
+/// `SortFieldProject` are each just NAME).
+pub const SORT_FIELD_NAME: &str = "NAME";
+
 /// The `DomainVersion` a domain gets when the request names none (model enum
 /// `com.amazonaws.datazone#DomainVersion`: V1 | V2).
 pub const DEFAULT_DOMAIN_VERSION: &str = "V1";
@@ -2853,6 +2858,18 @@ pub fn encode_page_token(last_key: &str) -> String {
 /// service issued.
 pub fn decode_page_token(token: &str) -> Option<String> {
     String::from_utf8(hex::decode(token).ok()?).ok()
+}
+
+/// The ordering key a listing sorted by [`SORT_FIELD_NAME`] uses: the resource's name,
+/// then its id.
+///
+/// A name is not unique, so the id after it is what makes the key a TOTAL order — two
+/// resources sharing a name still have one stable position each, and a page's token
+/// (which carries this key) resumes after exactly one of them. The separator is a NUL,
+/// which no name shape this service stores admits, so the key cannot be ambiguous
+/// between the two parts.
+pub fn name_sort_key(name: &str, id: &str) -> String {
+    format!("{name}\u{0}{id}")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
