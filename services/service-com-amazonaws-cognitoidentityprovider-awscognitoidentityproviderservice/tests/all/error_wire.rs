@@ -24,6 +24,10 @@
 //! shape.
 //!
 //! Every assertion names its case and reports the value it saw.
+//!
+//! The harness below (the router, the one call, and the pieces of an answer this rule is
+//! read from) is `pub(crate)` so a sibling suite asserting the SAME rule over another
+//! part of this surface drives it through this one, rather than through a second copy.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -39,22 +43,22 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host;x-amz-date, Signature=0000";
 
 /// The response header an AWS SDK resolves the concrete exception type from.
-const ERRORTYPE: &str = "x-amzn-errortype";
+pub(crate) const ERRORTYPE: &str = "x-amzn-errortype";
 
 /// The status this endpoint answers every refusal of the caller with.
-const REFUSED: u16 = 400;
+pub(crate) const REFUSED: u16 = 400;
 
 /// A pool id nothing created, in the form `UserPoolIdType`'s pattern demands
 /// (`^[\w-]+_[0-9a-zA-Z]+$`, from
 /// `smithy_query(query="operation",operation="ListUserPoolClients")`).
-const UNMINTED_POOL: &str = "us-east-1_notapool1";
+pub(crate) const UNMINTED_POOL: &str = "us-east-1_notapool1";
 
 /// An app client id nothing minted, in the form `ClientIdType`'s pattern demands
 /// (`^[\w+]+$`, from `smithy_query(query="operation",operation="DescribeUserPoolClient")`).
-const UNMINTED_CLIENT: &str = "notanappclient1234567890ab";
+pub(crate) const UNMINTED_CLIENT: &str = "notanappclient1234567890ab";
 
 /// One emulator with just this service mounted.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(cognito_idp::EmulatedService::new(engine));
@@ -64,14 +68,18 @@ fn router() -> MultiServiceRouter {
 
 /// What one call answered: its HTTP status, its `x-amzn-errortype` header and its JSON
 /// body.
-struct Answered {
-    status: u16,
-    errortype: Option<String>,
-    payload: Value,
+pub(crate) struct Answered {
+    pub(crate) status: u16,
+    pub(crate) errortype: Option<String>,
+    pub(crate) payload: Value,
 }
 
 /// Call `operation` with `body`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answered {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> Answered {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -109,7 +117,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Ans
 }
 
 /// Call `operation`, requiring success, and return its response body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let answered = call(router, operation, body).await;
     assert_eq!(
         answered.status, 200,
@@ -120,7 +128,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value
 }
 
 /// The `__type` of an error body, which is the wire error code.
-fn error_code(payload: &Value) -> &str {
+pub(crate) fn error_code(payload: &Value) -> &str {
     payload
         .get("__type")
         .and_then(Value::as_str)

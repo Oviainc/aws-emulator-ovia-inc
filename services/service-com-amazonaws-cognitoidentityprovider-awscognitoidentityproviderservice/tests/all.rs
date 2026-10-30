@@ -139,6 +139,8 @@ mod managed_login_branding_updates;
 mod log_delivery_configuration;
 #[path = "all/message_delivery_and_live_codes.rs"]
 mod message_delivery_and_live_codes;
+#[path = "all/pool_configuration_refusal_wire.rs"]
+mod pool_configuration_refusal_wire;
 #[path = "all/post_confirmation_trigger.rs"]
 mod post_confirmation_trigger;
 #[path = "all/provisioned_limits.rs"]
