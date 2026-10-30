@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContentSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContentSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContentSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: REPORTS the summary of one content of one knowledge base out of the
+//! record `CreateContent` persisted — the same stored fields `GetContent` answers with,
+//! minus the asset locator the summary shape does not carry. The operation is
+//! `@readonly`, so it writes nothing: two reads of an unchanged content answer alike.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +92,16 @@ pub enum GetContentSummaryErrorModeled {
     ValidationException(ValidationException),
 }
 
+/// The modelled `ResourceNotFoundException` (HTTP 404), naming the resource the request
+/// addressed — the member the model provides for exactly that.
+fn not_found(message: &str, resource_name: &str) -> GetContentSummaryError {
+    GetContentSummaryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message.to_string()),
+        resource_name: Some(resource_name.to_string()),
+    })
+    .into()
+}
+
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::get_content_summary::GetContentSummaryError`). Wrapping the modeled enum is what
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
@@ -148,18 +153,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetContentSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContentSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContentSummary"))
+        // Both path labels' `UuidOrArn` patterns are refused before this handler runs, so
+        // what is left here is resolving them against the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: there is nothing to report, and
+            // this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetContentSummary",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+        let state = state.lock();
+
+        // The knowledge base the route names is resolved first: a content is reachable
+        // only through the knowledge base it lives in, so a label this account holds none
+        // under is the modelled not-found.
+        let Some(knowledge_base_id) = state.resolve_knowledge_base_id(&input.knowledge_base_id)
+        else {
+            return Err(not_found(
+                crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND,
+                &input.knowledge_base_id,
+            ));
+        };
+        // A content of ANOTHER knowledge base is one this knowledge base does not hold,
+        // which is the same not-found as an id nothing was ever created under.
+        let Some(content) = state.content(&knowledge_base_id, &input.content_id) else {
+            return Err(not_found(
+                crate::state::MESSAGE_CONTENT_NOT_FOUND,
+                &input.content_id,
+            ));
+        };
+        Ok(GetContentSummaryOutput {
+            content_summary: Some(content.to_summary(now)),
+        })
     }
 }

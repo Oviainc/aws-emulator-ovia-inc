@@ -21,6 +21,8 @@ mod assistant_configuration;
 mod assistant_lifecycle;
 #[path = "all/authorization_precedence.rs"]
 mod authorization_precedence;
+#[path = "all/content_summary.rs"]
+mod content_summary;
 #[path = "all/content_upload.rs"]
 mod content_upload;
 #[path = "all/enum_value_refusal.rs"]
