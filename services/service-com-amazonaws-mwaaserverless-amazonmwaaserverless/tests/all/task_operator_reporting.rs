@@ -17,19 +17,26 @@
 //!
 //! Every test drives the real wire path through the same router the emulator boots, with
 //! the Amazon S3 service mounted beside this one on ONE shared engine, because a
-//! definition is a YAML object a run's version snapshotted out of Amazon S3. The table
-//! spans what the rule generalises over: whether an operator is declared at all, both
-//! published length bounds and one character past each of them, a declaration of several
-//! hundred characters, the same lengths written in multi-byte characters (the modelled
-//! length counts characters, not bytes), a value whose punctuation and spaces no
+//! definition is a YAML object a run's version snapshotted out of Amazon S3. The first
+//! table spans what the declared VALUE varies over: whether an operator is declared at
+//! all, both published length bounds and one character past each of them, a declaration
+//! of several hundred characters, the same lengths written in multi-byte characters (the
+//! modelled length counts characters, not bytes), a value whose punctuation and spaces no
 //! identifier would carry but the member's pattern does, and a value carrying a line
 //! break, which that pattern does not.
+//!
+//! The second table spans where that value is WRITTEN, because the rule is about the
+//! member the value is reported through and not about the spelling the definition
+//! declared it with: every key a task entry may name its operator under, crossed with
+//! every form a definition may write that entry in, each with a value the member carries
+//! and one past its maximum.
 
 use crate::run_execution_outcome::{read_task_instance, run_to_completion};
 use crate::workflow_definition_snapshot::{
     call, create_bucket, create_workflow, definition_router, stage,
 };
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
 /// The fewest characters the `GenericString` both `OperatorName` members target can
 /// carry (`smithy_query(query="shape", shape="GenericString")` declares it 1..255).
@@ -44,6 +51,17 @@ const TASK_ID: &str = "t1";
 /// The `TaskInstanceStatus` a task that ran to completion reports
 /// (`smithy_query(query="shape", shape="TaskInstanceStatus")`).
 const TASK_SUCCESS: &str = "SUCCESS";
+
+/// Every key a task entry may name its operator under, as the definition reader's own
+/// `TASK_OPERATOR_KEYS` lists them: Apache Airflow's `operator` and `operator_name` DAG
+/// vocabulary plus the shorter `type` spelling a declaration carries it under. All three
+/// feed the one member, so the rule holds whichever of them a definition writes — and
+/// only the first of them is the one the reported symptom was written against.
+const OPERATOR_KEYS: &[&str] = &["operator", "operator_name", "type"];
+
+/// An operator name well inside the modelled member, spelled as Apache Airflow spells a
+/// provider operator's class.
+const CARRIED_OPERATOR_NAME: &str = "S3ToRedshiftOperator";
 
 /// One row: the operator a definition's single task declares, and the `OperatorName` the
 /// two readers must therefore report for the instance of that task.
@@ -154,10 +172,191 @@ fn definition(row: &Row) -> String {
     }
 }
 
+/// The forms a definition may write ONE task entry in, all read by the same definition
+/// walk: an entry of a `tasks` SEQUENCE naming its own identifier, an entry of a `tasks`
+/// MAPPING named by the key it sits under, either of those nested under the `dag` key a
+/// definition may wrap its DAG-level declarations in, and the JSON spelling of the same
+/// document (YAML 1.2 is a superset of JSON).
+#[derive(Debug, Clone, Copy)]
+enum EntryForm {
+    Sequence,
+    Mapping,
+    NestedUnderDag,
+    Json,
+}
+
+impl EntryForm {
+    /// Every form, so the table below crosses all of them with every operator key.
+    const ALL: &'static [Self] = &[
+        Self::Sequence,
+        Self::Mapping,
+        Self::NestedUnderDag,
+        Self::Json,
+    ];
+
+    /// How the case names this form.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sequence => "an entry of a tasks sequence",
+            Self::Mapping => "an entry of a tasks mapping",
+            Self::NestedUnderDag => "an entry nested under the dag key",
+            Self::Json => "an entry of a document written as JSON",
+        }
+    }
+
+    /// A definition declaring one task under `TASK_ID` in this form, naming its operator
+    /// under `key` with the already-quoted scalar `scalar`.
+    fn definition(self, key: &str, scalar: &str) -> String {
+        match self {
+            Self::Sequence => format!("tasks:\n  - id: {TASK_ID}\n    {key}: {scalar}\n"),
+            Self::Mapping => format!("tasks:\n  {TASK_ID}:\n    {key}: {scalar}\n"),
+            Self::NestedUnderDag => {
+                format!("dag:\n  tasks:\n    - id: {TASK_ID}\n      {key}: {scalar}\n")
+            }
+            Self::Json => {
+                format!("{{\"tasks\": [{{\"id\": \"{TASK_ID}\", \"{key}\": {scalar}}}]}}")
+            }
+        }
+    }
+}
+
+/// One row of the second table: a whole definition, and the `OperatorName` both readers
+/// must report for the task it declares.
+struct FormRow {
+    case: String,
+    definition: String,
+    expected: Option<String>,
+}
+
+/// The second table: every operator key crossed with every entry form, each declaring a
+/// value the modelled member carries and a value one character past its maximum.
+fn form_rows() -> Vec<FormRow> {
+    let one_past_longest = repeated('A', MAX_OPERATOR_NAME_CHARS + 1);
+    let mut rows = Vec::with_capacity(OPERATOR_KEYS.len() * EntryForm::ALL.len() * 2);
+    for key in OPERATOR_KEYS {
+        for form in EntryForm::ALL {
+            rows.push(FormRow {
+                case: format!(
+                    "a name the member carries, declared under {key:?} in {}",
+                    form.label()
+                ),
+                definition: form.definition(key, &quoted(CARRIED_OPERATOR_NAME)),
+                expected: Some(CARRIED_OPERATOR_NAME.to_string()),
+            });
+            rows.push(FormRow {
+                case: format!(
+                    "a name one character past the modelled maximum, declared under \
+                     {key:?} in {}",
+                    form.label()
+                ),
+                definition: form.definition(key, &quoted(&one_past_longest)),
+                expected: None,
+            });
+        }
+    }
+    rows
+}
+
 /// The `OperatorName` a reported member holds, and `None` when the member is absent (or
 /// explicitly null, which is the same answer on the wire).
 fn reported(member: &Value) -> Option<&str> {
     member.as_str()
+}
+
+/// Stage `definition` as the object `key`, create the workflow `name` over it and start
+/// ONE run of it, answering the workflow's ARN and the run's identifier.
+///
+/// Shared by both tables so every row's run is started before any of them is polled: the
+/// executions then overlap on the one clock they all run on rather than being waited for
+/// one after another.
+async fn start_run(
+    router: &MultiServiceRouter,
+    name: &str,
+    key: &str,
+    definition: &str,
+    case: &str,
+) -> (String, String) {
+    stage(router, key, definition.as_bytes()).await;
+    let arn = create_workflow(router, name, key).await;
+    let (status, run) = call(
+        router,
+        "StartWorkflowRun",
+        json!({"WorkflowArn": arn.clone()}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected StartWorkflowRun to succeed, got {status} {run:?}"
+    );
+    let run_id = run["RunId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: a started run has a RunId"))
+        .to_string();
+    (arn, run_id)
+}
+
+/// Let the run finish and assert that BOTH readers of its single task instance report
+/// `expected` as the `OperatorName`, and that the task ran whatever the definition
+/// declared.
+async fn assert_both_readers_report(
+    router: &MultiServiceRouter,
+    arn: &str,
+    run_id: &str,
+    case: &str,
+    expected: Option<&str>,
+) {
+    run_to_completion(router, arn, run_id, case).await;
+
+    // The task ran whatever its declaration carried: an unreportable operator name
+    // refuses nothing.
+    let read = read_task_instance(router, arn, run_id, TASK_ID, case).await;
+    assert_eq!(
+        read["Status"].as_str(),
+        Some(TASK_SUCCESS),
+        "case {case:?}: the declared task must still run, got {:?}",
+        read["Status"]
+    );
+    assert_eq!(
+        read["TaskId"].as_str(),
+        Some(TASK_ID),
+        "case {case:?}: the instance must name the task it executes, got {:?}",
+        read["TaskId"]
+    );
+    assert_eq!(
+        reported(&read["OperatorName"]),
+        expected,
+        "case {case:?}: GetTaskInstance must report OperatorName {expected:?}, got {:?}",
+        read["OperatorName"]
+    );
+
+    // The listing reads the same record through the other modelled member, so it
+    // answers with the same value.
+    let (status, page) = call(
+        router,
+        "ListTaskInstances",
+        json!({"WorkflowArn": arn, "RunId": run_id}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ListTaskInstances to succeed, got {status} {page:?}"
+    );
+    let summaries = page["TaskInstances"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a TaskInstances list, got {page:?}"))
+        .clone();
+    let summary = summaries
+        .iter()
+        .find(|summary| summary["TaskInstanceId"].as_str() == Some(TASK_ID))
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected a summary for {TASK_ID:?}, got {summaries:?}")
+        });
+    assert_eq!(
+        reported(&summary["OperatorName"]),
+        expected,
+        "case {case:?}: ListTaskInstances must report OperatorName {expected:?}, got {:?}",
+        summary["OperatorName"]
+    );
 }
 
 #[tokio::test]
@@ -165,81 +364,47 @@ async fn an_instance_reports_the_declared_operator_only_when_the_modelled_member
     let router = definition_router();
     create_bucket(&router).await;
 
-    // Every run is started FIRST and polled afterwards, so the rows' executions overlap
-    // on the one clock they all run on rather than being waited for one after another.
     let rows = rows();
     let mut started = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         let key = format!("dags/operator-{index}.yaml");
-        stage(&router, &key, definition(row).as_bytes()).await;
-        let arn = create_workflow(&router, &format!("operatorName{index}"), &key).await;
-        let (status, run) = call(&router, "StartWorkflowRun", json!({"WorkflowArn": arn})).await;
-        assert_eq!(
-            status, 200,
-            "case {:?}: expected StartWorkflowRun to succeed, got {status} {run:?}",
-            row.case
-        );
-        let run_id = run["RunId"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case {:?}: a started run has a RunId", row.case))
-            .to_string();
+        let (arn, run_id) = start_run(
+            &router,
+            &format!("operatorName{index}"),
+            &key,
+            &definition(row),
+            &row.case,
+        )
+        .await;
         started.push((row, arn, run_id));
     }
 
     for (row, arn, run_id) in started {
-        let case = row.case.as_str();
-        let expected = row.expected.as_deref();
-        run_to_completion(&router, &arn, &run_id, case).await;
+        assert_both_readers_report(&router, &arn, &run_id, &row.case, row.expected.as_deref()).await;
+    }
+}
 
-        // The task ran whatever its declaration carried: an unreportable operator name
-        // refuses nothing.
-        let read = read_task_instance(&router, &arn, &run_id, TASK_ID, case).await;
-        assert_eq!(
-            read["Status"].as_str(),
-            Some(TASK_SUCCESS),
-            "case {case:?}: the declared task must still run, got {:?}",
-            read["Status"]
-        );
-        assert_eq!(
-            read["TaskId"].as_str(),
-            Some(TASK_ID),
-            "case {case:?}: the instance must name the task it executes, got {:?}",
-            read["TaskId"]
-        );
-        assert_eq!(
-            reported(&read["OperatorName"]),
-            expected,
-            "case {case:?}: GetTaskInstance must report OperatorName {expected:?}, got {:?}",
-            read["OperatorName"]
-        );
+#[tokio::test]
+async fn the_same_check_holds_for_every_operator_key_and_entry_form_a_definition_writes() {
+    let router = definition_router();
+    create_bucket(&router).await;
 
-        // The listing reads the same record through the other modelled member, so it
-        // answers with the same value.
-        let (status, page) = call(
+    let rows = form_rows();
+    let mut started = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let key = format!("dags/operator-key-{index}.yaml");
+        let (arn, run_id) = start_run(
             &router,
-            "ListTaskInstances",
-            json!({"WorkflowArn": arn, "RunId": run_id}),
+            &format!("operatorKey{index}"),
+            &key,
+            &row.definition,
+            &row.case,
         )
         .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected ListTaskInstances to succeed, got {status} {page:?}"
-        );
-        let summaries = page["TaskInstances"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {case:?}: expected a TaskInstances list, got {page:?}"))
-            .clone();
-        let summary = summaries
-            .iter()
-            .find(|summary| summary["TaskInstanceId"].as_str() == Some(TASK_ID))
-            .unwrap_or_else(|| {
-                panic!("case {case:?}: expected a summary for {TASK_ID:?}, got {summaries:?}")
-            });
-        assert_eq!(
-            reported(&summary["OperatorName"]),
-            expected,
-            "case {case:?}: ListTaskInstances must report OperatorName {expected:?}, got {:?}",
-            summary["OperatorName"]
-        );
+        started.push((row, arn, run_id));
+    }
+
+    for (row, arn, run_id) in started {
+        assert_both_readers_report(&router, &arn, &run_id, &row.case, row.expected.as_deref()).await;
     }
 }
