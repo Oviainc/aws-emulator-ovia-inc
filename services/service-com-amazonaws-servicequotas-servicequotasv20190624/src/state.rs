@@ -3015,20 +3015,8 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Branches per app", 50.0).code("BranchesPerApp"),
             ],
         ),
-        service(
-            "apigateway",
-            "Amazon API Gateway",
-            vec![
-                quota("Regional APIs per Region", 600.0),
-                quota("Edge-optimized APIs per account", 120.0),
-                quota("Stages per API", 10.0),
-            ],
-        ),
-        service(
-            "appconfig",
-            "AWS AppConfig",
-            vec![quota("Configuration profiles per application", 100.0)],
-        ),
+        service("apigateway", "Amazon API Gateway", apigateway_quotas()),
+        service("appconfig", "AWS AppConfig", appconfig_quotas()),
         service(
             "appflow",
             "Amazon AppFlow",
@@ -3037,21 +3025,10 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "application-autoscaling",
             "Application Auto Scaling",
-            vec![quota("Scalable targets per resource type", 500.0)],
+            application_autoscaling_quotas(),
         ),
-        service(
-            "appmesh",
-            "AWS App Mesh",
-            vec![
-                quota("Meshes per account", 15.0),
-                quota("Virtual services per mesh", 200.0),
-            ],
-        ),
-        service(
-            "apprunner",
-            "AWS App Runner",
-            vec![quota("Services per account", 100.0)],
-        ),
+        service("appmesh", "AWS App Mesh", appmesh_quotas()),
+        service("apprunner", "AWS App Runner", apprunner_quotas()),
         service(
             "appstream2",
             "Amazon AppStream 2.0",
@@ -3062,23 +3039,8 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "AWS AppSync",
             vec![quota("APIs per Region", 25.0)],
         ),
-        service(
-            "athena",
-            "Amazon Athena",
-            vec![
-                quota("Active DML queries", 20.0),
-                quota("Query timeout", 30.0).unit("Minutes"),
-                quota("Workgroups per Region", 1000.0),
-            ],
-        ),
-        service(
-            "autoscaling",
-            "Amazon EC2 Auto Scaling",
-            vec![
-                quota("Auto Scaling groups per Region", 200.0),
-                quota("Launch configurations per Region", 200.0),
-            ],
-        ),
+        service("athena", "Amazon Athena", athena_quotas()),
+        service("autoscaling", "Amazon EC2 Auto Scaling", autoscaling_quotas()),
         // THE EXCEPTION [`descriptive_quota_code`] names, row by row. For each pair
         // below, the recorded default-quota listing of that service carries NO row
         // under the descriptive stand-in this catalog would publish it as — the
@@ -3142,14 +3104,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             // 2, unlike the stand-in of case 3, is published even so.
             vec![quota("Customer profiles per account", 5.0).code("ProfilesPerAccount")],
         ),
-        service(
-            "backup",
-            "AWS Backup",
-            vec![
-                quota("Backup plans per account", 100.0),
-                quota("Backup vaults per account", 100.0),
-            ],
-        ),
+        service("backup", "AWS Backup", backup_quotas()),
         service(
             "batch",
             "AWS Batch",
@@ -4625,6 +4580,362 @@ fn seed_services() -> BTreeMap<String, String> {
             .or_insert_with(|| entry.name.to_string());
     }
     services
+}
+
+/// Amazon API Gateway's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `apigateway` service code
+/// (what `aws service-quotas list-aws-default-service-quotas --service-code
+/// apigateway` reports, which is the "Amazon API Gateway quotas" table of the API
+/// Gateway Developer Guide). Every row carries the `L-` code AWS publishes the quota
+/// under beside its published name, default value, unit and adjustability, so a
+/// client that read a code out of AWS's catalog resolves the same quota here.
+fn apigateway_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Regional APIs per Region", 600.0).code("L-01C8A9E0"),
+        quota("Edge-optimized APIs per account", 120.0).code("L-05295E0B"),
+        quota("Private APIs per Region", 600.0).code("L-154598D1"),
+        quota("HTTP APIs per account per Region", 500.0).code("L-1D180A63"),
+        quota("WebSocket APIs per account per Region", 600.0).code("L-20859C74"),
+        quota("Resources per API", 300.0).code("L-24E7E662"),
+        quota("Stages per API", 10.0).code("L-379E48B0"),
+        quota("Routes per HTTP API", 300.0).code("L-3A613F94"),
+        quota("Integrations per HTTP API", 300.0).code("L-45CC0E8B"),
+        quota("Authorizers per API", 10.0).code("L-46624B39"),
+        quota("Domain name access associations", 100.0)
+            .code("L-4D98A8A5")
+            .describe(
+                "The maximum number of domain name access associations that you can create \
+                 in this account in the current region",
+            ),
+        quota("API keys per account per Region", 10_000.0).code("L-5244589D"),
+        quota("Client certificates per account per Region", 60.0).code("L-608BDCD4"),
+        quota("Usage plans per account per Region", 300.0).code("L-60AC41CD"),
+        quota("Usage plans per API key", 10.0).code("L-65B5C802"),
+        quota("Custom domain names per account per Region", 120.0).code("L-668C9B28"),
+        quota("Base path mappings per domain name", 200.0).code("L-68B79FF0"),
+        quota("Documentation parts per API", 2000.0).code("L-7D4D47CD"),
+        quota("VPC links per account per Region", 20.0).code("L-824C9E42"),
+        quota("Models per API", 300.0).code("L-85120D8E"),
+        quota("Request validators per API", 20.0).code("L-8A5B8E43"),
+        // The account-level request rate and its burst allowance: a rate quota, so it
+        // carries the one-second window AWS publishes it over.
+        quota("Throttle rate", 10_000.0)
+            .code("L-8B81B02C")
+            .period(1, "SECOND"),
+        quota("Throttle burst rate", 5000.0)
+            .code("L-8C2F9A1D")
+            .fixed(),
+        quota("Integration timeout", 29_000.0)
+            .code("L-8E6A5A87")
+            .unit("Milliseconds")
+            .fixed(),
+        quota("Resource policy size", 8192.0)
+            .code("L-8F8AAAFE")
+            .unit("Bytes")
+            .fixed(),
+        quota("Stage variables per stage", 100.0).code("L-95BA6EA5"),
+        quota("Stage Variable Name Length", 64.0)
+            .code("L-985EB478")
+            .fixed(),
+        quota("Mapping template size", 300.0)
+            .code("L-9C147DE4")
+            .unit("Kilobytes")
+            .fixed(),
+        quota("WebSocket new connections rate", 500.0)
+            .code("L-9ED1E49A")
+            .period(1, "SECOND"),
+        quota("WebSocket messages per second", 500.0)
+            .code("L-A4C7274F")
+            .period(1, "SECOND"),
+        quota("WebSocket connection duration", 7200.0)
+            .code("L-A6CCE716")
+            .unit("Seconds")
+            .fixed(),
+        quota("WebSocket idle connection timeout", 600.0)
+            .code("L-A7033131")
+            .unit("Seconds")
+            .fixed(),
+        quota("WebSocket frame size", 32.0)
+            .code("L-A93447B8")
+            .unit("Kilobytes")
+            .fixed(),
+        quota("WebSocket message payload size", 128.0)
+            .code("L-A966AB5C")
+            .unit("Kilobytes")
+            .fixed(),
+        quota("Routes per WebSocket API", 300.0).code("L-A9DBC573"),
+        quota("Authorizers per HTTP API", 10.0).code("L-AA0FF27B"),
+        quota("Stage Variable Value Length", 512.0)
+            .code("L-B2CF62DC")
+            .fixed(),
+        quota("Private custom domain names per account per Region", 120.0).code("L-B4D69DB7"),
+        quota("Tags per API stage", 50.0).code("L-B97207D0").fixed(),
+        quota("Payload size", 10.0)
+            .code("L-CAEF46D2")
+            .unit("Megabytes")
+            .fixed(),
+        quota("Total combined size of all header values", 10_240.0)
+            .code("L-CC2525B6")
+            .unit("Bytes")
+            .fixed(),
+        quota("VPC links per account per Region for HTTP APIs", 10.0).code("L-CDF5615A"),
+        quota("Gateway responses per API", 20.0)
+            .code("L-E11F7D5D")
+            .fixed(),
+        quota("Documentation versions per API", 200.0).code("L-E1465507"),
+        quota("Custom authorizer result TTL", 3600.0)
+            .code("L-E5AE38E3")
+            .unit("Seconds"),
+        quota("Iterations in a mapping template loop", 1000.0)
+            .code("L-E8693075")
+            .fixed(),
+        quota("Rate of API management requests", 10.0)
+            .code("L-E9EEB922")
+            .period(1, "SECOND"),
+        quota("Maximum Logo Size", 200.0)
+            .code("L-F8A34CAF")
+            .unit("Kilobytes"),
+        quota("Integrations per API", 300.0).code("L-F8BD84D3"),
+        quota("Authorizers per WebSocket API", 10.0).code("L-FB4F0270"),
+        quota("Tags per API", 50.0).code("L-FD0EB744").fixed(),
+    ]
+}
+
+/// AWS AppConfig's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `appconfig` service code (the
+/// "AWS AppConfig quotas" table of the AWS AppConfig User Guide), whose quota names
+/// are published in the "Maximum number of …" form the rows below carry.
+fn appconfig_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Maximum number of treatments per experiment", 5.0).code("L-08D2C632"),
+        quota(
+            "Configuration size limit in AWS AppConfig hosted configuration store",
+            2048.0,
+        )
+        .code("L-48F9B951")
+        .unit("Kilobytes"),
+        // A quota AWS publishes over a DAY rather than per resource: the deployment
+        // starts an account may make in one day, metered by that API's own
+        // `AWS/Usage` `CallCount` metric.
+        quota("Maximum number of deployments per day", 100.0)
+            .code("L-A52E46BE")
+            .period(1, "DAY")
+            .metric(call_count_metric("AppConfig", "StartDeployment")),
+        quota(
+            "Maximum number of configuration profiles per application",
+            100.0,
+        )
+        .code("L-A5FC0339"),
+        quota("Maximum number of experiment definitions per application", 10.0)
+            .code("L-B858C085"),
+        quota("Maximum number of environments per application", 100.0).code("L-EEB0151E"),
+        quota("Maximum number of deployment strategies per Region", 20.0).code("L-F59D302B"),
+        quota("Maximum number of applications per Region", 100.0).code("L-FA210A1F"),
+    ]
+}
+
+/// Application Auto Scaling's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `application-autoscaling`
+/// service code. Application Auto Scaling publishes one scalable-target quota per
+/// SCALABLE SERVICE (the service whose resources it scales) beside the per-target
+/// policy and scheduled-action quotas, which is why the rows are named for the
+/// services rather than for a resource type.
+fn application_autoscaling_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Scalable targets for Comprehend", 500.0).code("L-17D5F681"),
+        quota("Scalable targets for AppStream", 500.0).code("L-1A11EB4B"),
+        quota("Scalable targets for Aurora", 500.0).code("L-1AAF0700"),
+        quota("Scalable targets for EC2", 500.0).code("L-297D9EC9"),
+        quota("Scalable targets for Custom Resource", 500.0).code("L-4A11ECEB"),
+        quota("Scalable targets for DynamoDB", 500.0).code("L-60E4E5E2"),
+        quota("Scalable targets for ECS", 500.0).code("L-782A3EE2"),
+        quota("Scalable targets for Cassandra", 500.0).code("L-799ACCDF"),
+        quota("Scalable targets for ElastiCache", 500.0).code("L-800F6F7B"),
+        quota("Scalable targets for EMR", 500.0).code("L-8998F403"),
+        quota("Scalable targets for Lambda", 500.0).code("L-95848B5F"),
+        quota("Scalable targets for MSK", 500.0).code("L-9C25247C"),
+        quota("Scalable targets for Neptune", 500.0).code("L-A1D42901"),
+        quota("Scalable targets for SageMaker", 500.0).code("L-A2AD6458"),
+        // The per-target planes AWS publishes as not adjustable.
+        quota("Scaling policies per scalable target", 50.0)
+            .code("L-B395C81B")
+            .fixed(),
+        quota("Scheduled actions per scalable target", 200.0)
+            .code("L-D75CA9D2")
+            .fixed(),
+    ]
+}
+
+/// AWS App Mesh's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `appmesh` service code (the
+/// "App Mesh service quotas" table of the AWS App Mesh User Guide).
+fn appmesh_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Connected Envoy processes per virtual gateway", 50.0).code("L-33E8F9C9"),
+        quota("Virtual routers per mesh", 200.0).code("L-50F6C35A"),
+        quota("Connected Envoy processes per virtual node", 50.0).code("L-606A910B"),
+        // The backend plane of a virtual node, which AWS publishes as fixed.
+        quota("Backends per virtual node", 50.0)
+            .code("L-8775AB18")
+            .fixed(),
+        quota("Targets per route", 10.0).code("L-87E74146"),
+        quota("Meshes per account", 15.0).code("L-AC861A39"),
+        quota("Virtual gateways per mesh", 15.0).code("L-AE1D9567"),
+        quota("Routes per virtual router", 50.0).code("L-BB90B7FF"),
+        quota("Virtual services per mesh", 200.0).code("L-DA7495A7"),
+        quota("Virtual nodes per mesh", 200.0).code("L-E043DFB4"),
+        quota("Gateway routes per virtual gateway", 10.0).code("L-F6F26D09"),
+    ]
+}
+
+/// AWS App Runner's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `apprunner` service code (the
+/// "App Runner service quotas" table of the AWS App Runner Developer Guide), whose
+/// quota names are the resource names themselves.
+fn apprunner_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("Connections", 10.0).code("L-1BDBAAB6"),
+        quota("Auto scaling configurations", 10.0).code("L-1D8C5BDD"),
+        // AWS publishes the ingress connection allowance per VPC as fixed.
+        quota("VPC ingress connections", 1.0)
+            .code("L-4064914D")
+            .fixed(),
+        quota("Services", 30.0).code("L-69F96A0C"),
+        quota("Observability configurations", 10.0).code("L-A0B46A0C"),
+        quota("VPC connectors", 10.0).code("L-F7ADEB8C"),
+    ]
+}
+
+/// The pair of quotas Athena publishes for the calls of ONE of its APIs: the
+/// REPLENISHMENT RATE of the token bucket those calls are served from (a per-second
+/// rate, metered by the API's `AWS/Usage` `CallCount` metric) and the BURST
+/// MULTIPLIER on it, which AWS publishes as not adjustable.
+fn athena_api_call_rate(
+    replenishment_code: &str,
+    rate: f64,
+    burst_code: &str,
+    burst: f64,
+    api_name: &str,
+) -> [QuotaRow; 2] {
+    [
+        quota(format!("Replenishment rate of {api_name} API calls"), rate)
+            .code(replenishment_code)
+            .period(1, "SECOND")
+            .metric(call_count_metric("Athena", api_name)),
+        quota(format!("Burst multiplier quota for {api_name} API"), burst)
+            .code(burst_code)
+            .fixed(),
+    ]
+}
+
+/// Amazon Athena's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `athena` service code (the
+/// "Service Quotas" page of the Amazon Athena User Guide): the query and workgroup
+/// quotas, plus the API call-rate pair every throttled Athena API publishes.
+fn athena_quotas() -> Vec<QuotaRow> {
+    let mut quotas = vec![
+        quota("Active DML queries", 20.0).code("L-56A94400"),
+        quota("DDL query timeout", 600.0)
+            .code("L-0F303755")
+            .unit("Minutes")
+            .fixed(),
+        quota("DML query timeout", 30.0)
+            .code("L-136E993A")
+            .unit("Minutes"),
+        quota("Workgroups per Region", 1000.0).code("L-3702C1C1"),
+        quota("Active DDL queries", 20.0).code("L-3CE0BBA0"),
+        quota("Prepared statements per workgroup", 1000.0).code("L-41075247"),
+        quota("Data catalogs per Region", 1000.0).code("L-4FF11DD3"),
+        quota("Named queries per workgroup", 1000.0).code("L-52EFA794"),
+    ];
+    for pair in [
+        athena_api_call_rate("L-076245C0", 5.0, "L-5A8D5237", 2.0, "CreateNamedQuery"),
+        athena_api_call_rate("L-70FD91F7", 5.0, "L-722F8D5C", 2.0, "GetNamedQuery"),
+        athena_api_call_rate("L-76AFE6F2", 5.0, "L-7A12A1E6", 2.0, "DeleteNamedQuery"),
+        athena_api_call_rate("L-82E47245", 100.0, "L-9D86AA19", 2.0, "GetQueryExecution"),
+        athena_api_call_rate("L-A6257554", 20.0, "L-AC64E3A0", 2.0, "BatchGetQueryExecution"),
+        athena_api_call_rate("L-07F4444F", 100.0, "L-B13EED8E", 2.0, "GetQueryResults"),
+        athena_api_call_rate("L-C60BEAE0", 20.0, "L-CC64F7CE", 2.0, "GetWorkGroup"),
+        athena_api_call_rate("L-D0D8C912", 5.0, "L-D8C0E3AF", 2.0, "ListNamedQueries"),
+        athena_api_call_rate("L-E20AD6B8", 20.0, "L-FE3693EE", 2.0, "ListQueryExecutions"),
+        athena_api_call_rate("L-E80DC288", 20.0, "L-EFB619E3", 2.0, "StartQueryExecution"),
+        athena_api_call_rate("L-FC5F6546", 20.0, "L-FD9D80C2", 2.0, "StopQueryExecution"),
+    ] {
+        quotas.extend(pair);
+    }
+    quotas
+}
+
+/// Amazon EC2 Auto Scaling's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `autoscaling` service code
+/// (the "Quotas for Amazon EC2 Auto Scaling" table of its user guide). The group
+/// count is the one quota CloudWatch publishes usage for, under the service's own
+/// `AWS/Usage` dimension.
+fn autoscaling_quotas() -> Vec<QuotaRow> {
+    vec![
+        // The per-group planes AWS publishes as fixed.
+        quota("Target groups per Auto Scaling group", 50.0)
+            .code("L-05CB8B12")
+            .fixed(),
+        quota("Lifecycle hooks per Auto Scaling group", 50.0)
+            .code("L-1312BBBF")
+            .fixed(),
+        quota("Launch configurations per region", 200.0).code("L-6B80B8FA"),
+        quota("Step adjustments per step scaling policy", 20.0)
+            .code("L-6C2A2F6E")
+            .fixed(),
+        quota("Scaling policies per Auto Scaling group", 50.0)
+            .code("L-72753F6F")
+            .fixed(),
+        quota("Auto Scaling groups per region", 500.0)
+            .code("L-CDE20ADC")
+            .metric(usage_metric(
+                "AutoScaling",
+                &[
+                    ("Class", "None"),
+                    ("Resource", "NumberOfAutoScalingGroup"),
+                    ("Type", "Resource"),
+                ],
+            )),
+        quota("Notification configurations per Auto Scaling group", 10.0).code("L-CEE5E714"),
+        quota("Scheduled actions per Auto Scaling group", 125.0).code("L-F0B00D71"),
+        quota("Classic Load Balancers per Auto Scaling group", 50.0).code("L-F786B2E5"),
+    ]
+}
+
+/// AWS Backup's published default-quota catalog.
+///
+/// SOURCE: AWS's published Service Quotas data for the `backup` service code (the
+/// "AWS Backup quotas" table of the AWS Backup Developer Guide), whose per-Region
+/// quotas are published in the "… per Region per account" form the rows below carry.
+fn backup_quotas() -> Vec<QuotaRow> {
+    vec![
+        // The rule plane of a backup plan, which AWS publishes as fixed.
+        quota("Rules per backup plan", 10.0)
+            .code("L-366B61FD")
+            .fixed(),
+        quota("Recovery points per backup vault", 1_000_000.0).code("L-514878B6"),
+        quota("Controls per framework", 50.0).code("L-7705D2CB"),
+        quota("Backup selections per backup plan", 50.0).code("L-9122A82F"),
+        // AWS publishes the framework allowance of a report plan as fixed.
+        quota("Frameworks per report plan", 1000.0)
+            .code("L-9CAF0B92")
+            .fixed(),
+        quota("Backup vaults per Region per account", 100.0).code("L-B4021FB0"),
+        quota("Backup plans per Region per account", 300.0).code("L-BD69F607"),
+        quota("Legal holds per account", 50.0).code("L-C0A8C14B"),
+        quota("Report plans per Region per account", 20.0).code("L-C296F1F5"),
+        quota("Frameworks per Region per account", 10.0).code("L-E43E0ED6"),
+        quota("Restore testing plans per Region per account", 10.0).code("L-FB1D55EC"),
+        quota("Tags per backup plan", 50.0).code("L-FFD6444F"),
+    ]
 }
 
 /// EC2's account-wide resource quotas: the published EC2 quotas that are neither
