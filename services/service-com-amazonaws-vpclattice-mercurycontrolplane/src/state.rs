@@ -549,6 +549,28 @@ pub const CONFIG_MEMBER_SUPPORT: &[(&str, &[&str])] = &[
     ("lambdaEventStructureVersion", &[TYPE_LAMBDA]),
 ];
 
+/// The `TargetGroupConfig` members a target group of each type cannot be created
+/// without, in the order a refusal lists them.
+///
+/// SOURCE: `smithy_query(query="shape",shape="TargetGroupConfig")`, where `port`,
+/// `protocol` and `vpcIdentifier` — the three members that say where the targets are
+/// reached — are each documented as "Not supported if the target group type is
+/// `LAMBDA`", together with recorded AWS behaviour, which refuses a create of a type
+/// that DOES support them whose config leaves them null. So every type routing to
+/// targets inside a VPC needs all three, and `LAMBDA`, which supports none of them,
+/// needs none. No modelled trait carries this, which is why it is checked here
+/// ([`check_target_group_config`]).
+///
+/// A member whose own documentation states a default is still satisfied by that default
+/// ([`config_member_supplied`]): `port` is "For HTTP, the default is 80. For HTTPS, the
+/// default is 443", derivable only once the protocol is known.
+pub const REQUIRED_CONFIG_MEMBERS: &[(&str, &[&str])] = &[
+    (TYPE_IP, &["port", "protocol", "vpcIdentifier"]),
+    (TYPE_INSTANCE, &["port", "protocol", "vpcIdentifier"]),
+    (TYPE_ALB, &["port", "protocol", "vpcIdentifier"]),
+    (TYPE_LAMBDA, &[]),
+];
+
 /// The `protocolVersion` a target group gets when its create omits the member: "The
 /// protocol version. The default is `HTTP1`." Filled in only for a type that supports
 /// the member at all (see [`CONFIG_MEMBER_SUPPORT`]).
@@ -660,25 +682,105 @@ fn config_member_supported(group_type: &str, member: &str) -> bool {
         .is_none_or(|(_, types)| types.contains(&group_type))
 }
 
-/// Refuse a config that sends a member the target group's TYPE does not support, as the
-/// service-rule violation it is; `Ok(())` when every sent member is supported.
+/// The config members a target group of `group_type` cannot be created without, in the
+/// order the refusal lists them; empty for a type that requires none
+/// ([`REQUIRED_CONFIG_MEMBERS`]).
+pub fn required_config_members(group_type: &str) -> &'static [&'static str] {
+    REQUIRED_CONFIG_MEMBERS
+        .iter()
+        .find(|(name, _)| *name == group_type)
+        .map(|(_, required)| *required)
+        .unwrap_or(&[])
+}
+
+/// Whether `config` leaves null any member a target group of `group_type` cannot be
+/// created without.
 ///
-/// The rule is each member's own documentation ([`CONFIG_MEMBER_SUPPORT`]), which the
-/// model carries no constraint trait for — so it is reported over the bare member the
-/// rule constrains ([`service_rule_exception`]) rather than as a constraint report.
+/// `None` is a config the create did not send at all, which supplies nothing — so a
+/// type that requires members is refused whether its config is absent or merely
+/// incomplete.
+fn config_leaves_required_members_null(
+    group_type: &str,
+    config: Option<&crate::ops::types::TargetGroupConfig>,
+) -> bool {
+    required_config_members(group_type)
+        .iter()
+        .any(|member| !config_member_supplied(config, member))
+}
+
+/// Whether the config supplies a value for `member`: sent, or filled in from the default
+/// the member's OWN documentation states for the rest of this config
+/// ([`normalized_target_group_config`] stores the same value).
+///
+/// `port` is the only required member documenting a default ("For HTTP, the default is
+/// 80. For HTTPS, the default is 443"), and that default is derivable only once the
+/// protocol the targets are reached over is known ([`default_port_for`]) — so under a
+/// protocol with no documented default an omitted port is missing.
+fn config_member_supplied(
+    config: Option<&crate::ops::types::TargetGroupConfig>,
+    member: &str,
+) -> bool {
+    let Some(config) = config else {
+        return false;
+    };
+    if config_member_sent(config, member) {
+        return true;
+    }
+    member == "port" && config.protocol.as_deref().and_then(default_port_for).is_some()
+}
+
+/// Refuse a config that sends a member the target group's TYPE does not support, or that
+/// leaves null a member that type requires, as the service-rule violation each is;
+/// `Ok(())` when every sent member is supported and every required member is supplied.
+///
+/// `config` is `None` for a create that sends no config at all: both rules still apply,
+/// since a type that requires config members is not satisfied by an absent config.
+///
+/// The rules are the members' own documentation ([`CONFIG_MEMBER_SUPPORT`],
+/// [`REQUIRED_CONFIG_MEMBERS`]), which the model carries no constraint trait for — so
+/// they are reported over the bare member each rule constrains
+/// ([`service_rule_exception`]) rather than as a constraint report.
 pub fn check_target_group_config(
     group_type: &str,
-    config: &crate::ops::types::TargetGroupConfig,
+    config: Option<&crate::ops::types::TargetGroupConfig>,
 ) -> Result<(), ServiceRuleViolation> {
-    for (member, _) in CONFIG_MEMBER_SUPPORT {
-        if config_member_sent(config, member) && !config_member_supported(group_type, member) {
-            return Err(ServiceRuleViolation {
-                member: (*member).to_string(),
-                message: unsupported_config_member_message(member, group_type),
-            });
+    if let Some(config) = config {
+        for (member, _) in CONFIG_MEMBER_SUPPORT {
+            if config_member_sent(config, member) && !config_member_supported(group_type, member) {
+                return Err(ServiceRuleViolation {
+                    member: (*member).to_string(),
+                    message: unsupported_config_member_message(member, group_type),
+                });
+            }
         }
     }
+    if config_leaves_required_members_null(group_type, config) {
+        return Err(ServiceRuleViolation {
+            // The refusal is about the `config` member as a whole, not about one of the
+            // members inside it: that is where the caller has to supply the values.
+            member: CONFIG_MEMBER.to_string(),
+            message: required_config_members_message(group_type),
+        });
+    }
     Ok(())
+}
+
+/// The input member a target group's configuration is sent at, as the model names it.
+pub const CONFIG_MEMBER: &str = "config";
+
+/// How the service refuses a config that leaves null a member the target group's type
+/// requires: the members that type demands, pipe-joined, and the type itself.
+///
+/// SOURCE: recorded AWS behaviour. The sentence is fixed text for this refusal class;
+/// its variable parts are the type's own required-member list
+/// ([`REQUIRED_CONFIG_MEMBERS`]) and the target-group type token taken from the
+/// request — it names what the type demands, not which of them this one request left
+/// out.
+pub fn required_config_members_message(group_type: &str) -> String {
+    format!(
+        "Config fields {} must not be null for {group_type} Target Group",
+        required_config_members(group_type).join("|")
+    )
 }
 
 /// How the service refuses a `TargetGroupConfig` member the target group's type does

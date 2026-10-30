@@ -47,15 +47,15 @@ const TARGET_GROUP_KIND: &str = "targetgroup";
 
 /// A VPC id of the shape `VpcId` demands (`^vpc-(([0-9a-z]{8})|([0-9a-z]{17}))$`). Which
 /// VPC it is is EC2's concern, not this slice's: the member is stored as sent.
-const A_VPC: &str = "vpc-0a1b2c3d4e5f60718";
+pub(crate) const A_VPC: &str = "vpc-0a1b2c3d4e5f60718";
 
 /// `POST /targetgroups`.
-async fn create_target_group(lattice: &Lattice, body: serde_json::Value) -> Answer {
+pub(crate) async fn create_target_group(lattice: &Lattice, body: serde_json::Value) -> Answer {
     lattice.call("POST", "/targetgroups", Some(body)).await
 }
 
 /// `GET /targetgroups/{targetGroupIdentifier}`.
-async fn get_target_group(lattice: &Lattice, identifier: &str) -> Answer {
+pub(crate) async fn get_target_group(lattice: &Lattice, identifier: &str) -> Answer {
     lattice
         .call("GET", &format!("/targetgroups/{identifier}"), None)
         .await
@@ -278,26 +278,30 @@ async fn creating_target_groups_persists_them_and_both_identifier_forms_read_the
     }
 }
 
+/// One value for each config member, so a member can be sent on its own.
+pub(crate) fn member_value(member: &str) -> serde_json::Value {
+    match member {
+        "port" => serde_json::json!(8080),
+        "protocol" => serde_json::json!("HTTP"),
+        "protocolVersion" => serde_json::json!("HTTP2"),
+        "vpcIdentifier" => serde_json::json!(A_VPC),
+        "ipAddressType" => serde_json::json!("IPV6"),
+        "healthCheck" => serde_json::json!({ "enabled": true }),
+        "lambdaEventStructureVersion" => serde_json::json!("V2"),
+        other => panic!("the support table grew a member this test has no value for: {other}"),
+    }
+}
+
 /// Rule 3, over every (type, member) pair the support table forbids, plus the pairs it
 /// allows. The table is read from the service's own catalog, so a row cannot drift from
 /// the member documentation it was built from.
+///
+/// Each row sends the member under test on top of the members its TYPE cannot do
+/// without, so the only rule it can fail is the support one; the presence rule those
+/// members come from has its own suite (`target_group_required_config`).
 #[tokio::test]
 async fn a_config_member_is_refused_for_a_type_that_does_not_support_it() {
     let lattice = Lattice::new();
-
-    /// One value for each config member, so a member can be sent on its own.
-    fn member_value(member: &str) -> serde_json::Value {
-        match member {
-            "port" => serde_json::json!(8080),
-            "protocol" => serde_json::json!("HTTP"),
-            "protocolVersion" => serde_json::json!("HTTP2"),
-            "vpcIdentifier" => serde_json::json!(A_VPC),
-            "ipAddressType" => serde_json::json!("IPV6"),
-            "healthCheck" => serde_json::json!({ "enabled": true }),
-            "lambdaEventStructureVersion" => serde_json::json!("V2"),
-            other => panic!("the support table grew a member this test has no value for: {other}"),
-        }
-    }
 
     let all_types = [
         state::TYPE_IP,
@@ -312,6 +316,9 @@ async fn a_config_member_is_refused_for_a_type_that_does_not_support_it() {
             let name = names.next().expect("the name generator is unbounded");
             let case = format!("{member} sent for a {group_type} target group");
             let mut config = serde_json::Map::new();
+            for required in crate::target_group_required_config::required_members(group_type) {
+                config.insert((*required).to_string(), member_value(required));
+            }
             config.insert((*member).to_string(), member_value(member));
             let answer = create_target_group(
                 &lattice,

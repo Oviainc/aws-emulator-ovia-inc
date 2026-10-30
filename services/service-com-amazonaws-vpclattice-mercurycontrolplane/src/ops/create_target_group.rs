@@ -242,19 +242,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A config member is supported only for the target-group types its own
-        // documentation names, and a health check's numeric members have documented
-        // ranges narrower than the modelled ones.
-        if let Some(config) = input.config.as_ref() {
-            if let Err(violation) = crate::state::check_target_group_config(&input.r#type, config)
+        // documentation names, and the members a type cannot do without have to carry a
+        // value — checked for the config as SENT, absent or not, since a type that
+        // requires members is not satisfied by a missing config either.
+        if let Err(violation) =
+            crate::state::check_target_group_config(&input.r#type, input.config.as_ref())
+        {
+            return Err(refused_by_rule(&violation));
+        }
+        // A health check's numeric members have documented ranges narrower than the
+        // modelled ones.
+        if let Some(health_check) = input
+            .config
+            .as_ref()
+            .and_then(|config| config.health_check.as_ref())
+        {
+            if let Err(violation) =
+                crate::state::check_health_check("config.healthCheck", health_check)
             {
-                return Err(refused_by_rule(&violation));
-            }
-            if let Some(health_check) = config.health_check.as_ref() {
-                if let Err(violation) =
-                    crate::state::check_health_check("config.healthCheck", health_check)
-                {
-                    return Err(invalid(violation));
-                }
+                return Err(invalid(violation));
             }
         }
 
