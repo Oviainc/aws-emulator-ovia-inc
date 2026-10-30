@@ -171,7 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        let now = crate::state::now_epoch_millis();
+        // The expiry comparison below is between a STORED instant and the clock, so it
+        // reads the clock on the timeline the stored instant came from, and records
+        // nothing of its own.
+        let now = store.current_instant_millis();
         let (code_matches, already_active, outstanding) = {
             let contact = store.contact(&input.arn).ok_or_else(|| {
                 ActivateEmailContactErrorModeled::ResourceNotFoundException(

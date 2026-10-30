@@ -506,6 +506,17 @@ impl ComAmazonawsNotificationscontactsNotificationscontactsState {
         self.last_instant_millis
     }
 
+    /// Now, in milliseconds since the Unix epoch, on the same timeline the instants
+    /// this store hands out lie on — never earlier than one of them — and RECORDING
+    /// nothing.
+    ///
+    /// Read by an operation that compares a STORED instant against the clock: a stored
+    /// instant came from [`Self::next_instant_millis`], so the elapsed span between the
+    /// two is only meaningful when both are read off that one timeline.
+    pub fn current_instant_millis(&self) -> i64 {
+        now_epoch_millis().max(self.last_instant_millis)
+    }
+
     /// `len` characters drawn from [`CONTACT_ID_ALPHABET`].
     fn draw(&mut self, len: usize) -> String {
         self.id_counter = self.id_counter.wrapping_add(1);
@@ -672,12 +683,15 @@ pub fn wire_timestamp(millis: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(millis)
 }
 
-/// Now, in whole milliseconds since the Unix epoch.
+/// Now, in whole milliseconds since the Unix epoch, straight off the system clock.
 ///
-/// Read by an operation that has to compare a stored instant against the clock
-/// WITHOUT recording a change of its own, which is what
+/// The raw reading both store accessors are built on: an operation reads the clock
+/// through the store instead —
 /// [`ComAmazonawsNotificationscontactsNotificationscontactsState::next_instant_millis`]
-/// is for.
+/// for the instant it RECORDS, and
+/// [`ComAmazonawsNotificationscontactsNotificationscontactsState::current_instant_millis`]
+/// for comparing a stored instant against the clock without recording a change of its
+/// own — so that every instant this service stamps and compares lies on one timeline.
 pub fn now_epoch_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

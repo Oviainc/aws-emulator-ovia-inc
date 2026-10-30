@@ -29,6 +29,8 @@ mod email_contacts;
 mod hand_applied_pattern_refusals;
 #[path = "all/list_email_contacts_page_token.rs"]
 mod list_email_contacts_page_token;
+#[path = "all/recorded_instants_are_monotonic.rs"]
+mod recorded_instants_are_monotonic;
 #[path = "all/resource_tag_writes.rs"]
 mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]

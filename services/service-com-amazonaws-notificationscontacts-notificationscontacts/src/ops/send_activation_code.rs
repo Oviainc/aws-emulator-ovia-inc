@@ -157,10 +157,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // A fresh code, and the instant it is issued at, are both drawn before the
         // record is borrowed mutably, since all three need the one store guard. The
-        // issue instant is what the code's documented lifetime runs from, so it is
-        // read from the clock here rather than inferred later.
+        // issue instant is what the code's documented lifetime runs from and it is
+        // PERSISTED on the record, so it comes from the store's instant accessor like
+        // every other instant this service records: strictly later than every instant
+        // the store has already handed out, so a send that lands in the same
+        // millisecond as another write is still stamped after it.
         let code = store.fresh_activation_code();
-        let issued_at = crate::state::now_epoch_millis();
+        let issued_at = store.next_instant_millis();
         let contact = store.contact_mut(&input.arn).ok_or_else(|| {
             SendActivationCodeErrorModeled::ResourceNotFoundException(
                 crate::state::contact_not_found(&input.arn),
