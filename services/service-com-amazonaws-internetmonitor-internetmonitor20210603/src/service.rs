@@ -39,6 +39,15 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! One of those seams is taken here: `override_operation` serves every routable request
+//! through [`error_code::ErrorCodeOperation`], which states the refused call's exception
+//! shape in the `code` member of the error body the framework rendered, for the one
+//! reason named in [`error_code`]: `code` belongs to the error ENVELOPE rather than to any
+//! modelled error shape, so no schema-driven error serializer can write it. Routing,
+//! status, `__type` and `message` all stay with the framework.
+
+pub mod error_code;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -52,6 +61,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The envelope wrapper every routable request is served through. Held in a field,
+    /// built once, because `override_operation` hands back a reference to it.
+    envelope: error_code::ErrorCodeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +73,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            envelope: error_code::ErrorCodeOperation,
         }
     }
 }
@@ -87,12 +100,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the generated routing table can serve is served through the
+        // envelope wrapper, which delegates to that same table entry and then names the
+        // exception shape in the `code` member of whatever error body it answered (see
+        // [`error_code`]). The routing stays the model's: a request the table cannot
+        // serve is declined here, so the framework answers it as the unroutable request
+        // it is.
+        error_code::routes(&self.entry, req).then_some(&self.envelope as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
