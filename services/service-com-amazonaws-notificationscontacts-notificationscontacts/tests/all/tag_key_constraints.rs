@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 
 use crate::email_contacts::{call, create, emulator, error_code, list, Emulator};
-use crate::resource_tag_writes::{tag, untag};
+use crate::resource_tag_writes::{tag, untag, TAG_MUTATION_SUCCESS_STATUS};
 use crate::resource_tags::{create_tagged, pair, tag_map, tags_ok, MAX_TAG_KEY_LEN};
 
 /// The fewest characters the modelled pattern's `.{1,128}` admits — `TagKey` carries no
@@ -290,7 +290,7 @@ async fn tag_resource_applies_the_modelled_tag_key_pattern() {
         let expected = if case.admitted {
             assert_eq!(
                 status,
-                200,
+                TAG_MUTATION_SUCCESS_STATUS,
                 "case {:?} ({}): a key the pattern admits must be stored, got {status} / {body:?}",
                 case.what,
                 shown(&case.key)
@@ -341,7 +341,7 @@ async fn untag_resource_applies_the_modelled_tag_key_pattern() {
         let expected = if case.admitted {
             assert_eq!(
                 status,
-                200,
+                TAG_MUTATION_SUCCESS_STATUS,
                 "case {:?} ({}): a key the pattern admits must be removable, got {status} / \
                  {body:?}",
                 case.what,
@@ -465,8 +465,9 @@ async fn a_refused_key_beside_legal_ones_persists_none_of_them() {
     let legal = tag_map([pair("team", "infra"), pair("env", "prod")]);
     let (status, body) = tag(&em, &arn, &legal).await;
     assert_eq!(
-        status, 200,
-        "case \"the same pairs without the illegal key\": expected 200, got {status} / {body:?}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case \"the same pairs without the illegal key\": expected \
+         {TAG_MUTATION_SUCCESS_STATUS}, got {status} / {body:?}"
     );
     let mut expected = start.clone();
     expected.extend(legal);
@@ -565,7 +566,7 @@ async fn a_key_the_pattern_admits_round_trips_through_every_tag_operation() {
 
         assert_eq!(
             tag(&em, &arn, &tag_map([pair(&case.key, "retagged")])).await.0,
-            200,
+            TAG_MUTATION_SUCCESS_STATUS,
             "case {:?} ({}): retagging the same key must succeed",
             case.what,
             shown(&case.key)
@@ -581,7 +582,7 @@ async fn a_key_the_pattern_admits_round_trips_through_every_tag_operation() {
 
         assert_eq!(
             untag(&em, &arn, std::slice::from_ref(&case.key)).await.0,
-            200,
+            TAG_MUTATION_SUCCESS_STATUS,
             "case {:?} ({}): removing the same key must succeed",
             case.what,
             shown(&case.key)

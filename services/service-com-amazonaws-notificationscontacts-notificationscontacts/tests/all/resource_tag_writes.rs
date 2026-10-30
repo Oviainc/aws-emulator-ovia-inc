@@ -19,6 +19,9 @@
 //! * Both are writes to the contact's tag set only: the members the `EmailContact`
 //!   shape reports — including `updateTime` — are untouched, and a well-formed ARN
 //!   naming no stored contact is the modelled 404.
+//!
+//! Both successes answer [`TAG_MUTATION_SUCCESS_STATUS`]; the suite that owns that
+//! rule, and the framing of a bodyless answer, is `tests/all/tag_mutation_success_status.rs`.
 
 use std::collections::BTreeMap;
 
@@ -32,8 +35,9 @@ use crate::resource_tags::{
 };
 
 /// Percent-encode one `@httpQuery` value: every byte outside the unreserved set
-/// travels as `%XX`, which is what an SDK writes for a `tagKeys` element.
-fn query_value(value: &str) -> String {
+/// travels as `%XX`, which is what an SDK writes for a `tagKeys` element. `pub(crate)`
+/// so the suite that owns the mutation's STATUS drives the same encoding.
+pub(crate) fn query_value(value: &str) -> String {
     value
         .bytes()
         .map(|byte| {
@@ -45,6 +49,12 @@ fn query_value(value: &str) -> String {
         })
         .collect()
 }
+
+/// The status a SUCCESSFUL tag mutation answers: 204 No Content, because both
+/// `TagResourceResponse` and `UntagResourceResponse` carry no members and so leave the
+/// caller nothing to parse. Named once here so every suite driving a tag write states
+/// the same rule; `tests/all/tag_mutation_success_status.rs` is the suite that owns it.
+pub(crate) const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
 
 /// `POST /tags/{arn}` with the tag map in the body — `TagResource`. `pub(crate)` so
 /// the sibling suite that owns the `TagKey` rule drives the same wire path.
@@ -204,8 +214,9 @@ async fn tag_resource_merges_the_request_into_the_persisted_tag_set() {
 
         let (status, answer) = tag(&em, &arn, request).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: TagResource must answer 200, got {status} / {answer:?}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: TagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, \
+             got {status} / {answer:?}"
         );
 
         let reported = tags_ok(&em, &arn).await;
@@ -217,8 +228,9 @@ async fn tag_resource_merges_the_request_into_the_persisted_tag_set() {
         // `@idempotent`: repeating the very same request lands the same set.
         let (status, answer) = tag(&em, &arn, request).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: repeating TagResource must answer 200, got {status} / {answer:?}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: repeating TagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, \
+             got {status} / {answer:?}"
         );
         let again = tags_ok(&em, &arn).await;
         assert_eq!(
@@ -330,8 +342,9 @@ async fn untag_resource_leaves_exactly_the_keys_it_does_not_name() {
 
         let (status, answer) = untag(&em, &arn, removed).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: UntagResource must answer 200, got {status} / {answer:?}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: UntagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, \
+             got {status} / {answer:?}"
         );
 
         let reported = tags_ok(&em, &arn).await;
@@ -344,8 +357,9 @@ async fn untag_resource_leaves_exactly_the_keys_it_does_not_name() {
         // succeeds with the same set.
         let (status, answer) = untag(&em, &arn, removed).await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: repeating UntagResource must answer 200, got {status} / {answer:?}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: repeating UntagResource must answer {TAG_MUTATION_SUCCESS_STATUS}, \
+             got {status} / {answer:?}"
         );
         let again = tags_ok(&em, &arn).await;
         assert_eq!(
@@ -376,12 +390,12 @@ async fn a_tag_write_lands_on_the_named_contact_only() {
         tag(&em, &arns[0], &tag_map([pair("team", "alpha-only")]))
             .await
             .0,
-        200,
+        TAG_MUTATION_SUCCESS_STATUS,
         "tagging alpha must succeed"
     );
     assert_eq!(
         untag(&em, &arns[1], &keys(&["env"])).await.0,
-        200,
+        TAG_MUTATION_SUCCESS_STATUS,
         "untagging beta must succeed"
     );
 
@@ -489,8 +503,9 @@ async fn a_merge_past_the_modelled_tag_map_maximum_is_refused_and_persists_nothi
     let replacement = tag_map([pair("stored-000", "replaced"), pair("stored-199", "replaced")]);
     let (status, answer) = tag(&em, &arn, &replacement).await;
     assert_eq!(
-        status, 200,
-        "case \"replacing values at the bound\": must answer 200, got {status} / {answer:?}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case \"replacing values at the bound\": must answer {TAG_MUTATION_SUCCESS_STATUS}, \
+         got {status} / {answer:?}"
     );
     let mut expected = full.clone();
     expected.extend(replacement);
@@ -531,13 +546,14 @@ async fn a_merge_past_the_modelled_tag_map_maximum_is_refused_and_persists_nothi
     // Freeing one slot lets exactly one new key in.
     assert_eq!(
         untag(&em, &arn, &keys(&["stored-000"])).await.0,
-        200,
+        TAG_MUTATION_SUCCESS_STATUS,
         "the removal must succeed"
     );
     let (status, answer) = tag(&em, &arn, &tag_map([pair("one-too-many", "x")])).await;
     assert_eq!(
-        status, 200,
-        "case \"a new key into the freed slot\": must answer 200, got {status} / {answer:?}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case \"a new key into the freed slot\": must answer {TAG_MUTATION_SUCCESS_STATUS}, \
+         got {status} / {answer:?}"
     );
     let reported = tags_ok(&em, &arn).await;
     assert_eq!(

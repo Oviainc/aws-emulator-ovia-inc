@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 
 use crate::email_contacts::{emulator, error_code, get_ok, unknown_arn};
-use crate::resource_tag_writes::untag;
+use crate::resource_tag_writes::{untag, TAG_MUTATION_SUCCESS_STATUS};
 use crate::resource_tags::{create_tagged, pair, tag_map, tags_ok, MAX_TAG_KEY_LEN};
 
 /// The prefix the pattern's leading `(?!aws:)` look-ahead excludes.
@@ -272,9 +272,9 @@ async fn every_tag_keys_element_is_judged_against_the_modelled_pattern() {
         if case.admitted {
             assert_eq!(
                 status,
-                200,
+                TAG_MUTATION_SUCCESS_STATUS,
                 "case {:?} ({}): a list every element of which the pattern admits must be \
-                 accepted, got {status} / {body:?}",
+                 accepted with {TAG_MUTATION_SUCCESS_STATUS}, got {status} / {body:?}",
                 case.what,
                 shown(&case.keys)
             );
@@ -364,7 +364,7 @@ async fn one_refused_element_refuses_the_whole_list() {
         // refusal above came from that element and not from the list's length or shape.
         let (status, body) = untag(&em, &arn, &legal).await;
         assert_eq!(
-            status, 200,
+            status, TAG_MUTATION_SUCCESS_STATUS,
             "case {what:?}: the same list without the refused element must be accepted, got \
              {status} / {body:?}"
         );
@@ -442,7 +442,11 @@ async fn repeating_a_request_answers_the_same_way() {
         let em = emulator();
         let arn = create_tagged(&em, &format!("repeat-{index}"), Some(&start)).await;
         let expected = surviving(&start, &case.keys, case.admitted);
-        let wanted_status = if case.admitted { 200 } else { 400 };
+        let wanted_status = if case.admitted {
+            TAG_MUTATION_SUCCESS_STATUS
+        } else {
+            400
+        };
 
         for attempt in 1..=2 {
             let (status, body) = untag(&em, &arn, &case.keys).await;

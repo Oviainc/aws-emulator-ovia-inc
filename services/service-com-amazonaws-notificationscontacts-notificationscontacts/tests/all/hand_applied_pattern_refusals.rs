@@ -34,7 +34,7 @@ use service_com_amazonaws_notificationscontacts_notificationscontacts::state::{
 };
 
 use crate::email_contacts::{create, emulator, error_code, Emulator};
-use crate::resource_tag_writes::{tag, untag};
+use crate::resource_tag_writes::{tag, untag, TAG_MUTATION_SUCCESS_STATUS};
 use crate::resource_tags::{create_tagged, pair, tag_map, tags_ok};
 
 /// What the framework's constraint clause puts between the value it echoes and the
@@ -393,9 +393,9 @@ async fn the_same_request_without_the_offending_value_is_accepted() {
 
     let (status, body) = tag(&em, &arn, &legal).await;
     assert_eq!(
-        status, 200,
-        "case \"a tag map every key of which the pattern admits\": expected 200, got \
-         {status} / {body:?}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case \"a tag map every key of which the pattern admits\": expected \
+         {TAG_MUTATION_SUCCESS_STATUS}, got {status} / {body:?}"
     );
     let mut expected = starting_tags();
     expected.extend(legal);
@@ -408,9 +408,9 @@ async fn the_same_request_without_the_offending_value_is_accepted() {
 
     let (status, body) = untag(&em, &arn, &keys(&["team", "env"])).await;
     assert_eq!(
-        status, 200,
-        "case \"a tagKeys list every element of which the pattern admits\": expected 200, \
-         got {status} / {body:?}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case \"a tagKeys list every element of which the pattern admits\": expected \
+         {TAG_MUTATION_SUCCESS_STATUS}, got {status} / {body:?}"
     );
     let reported = tags_ok(&em, &arn).await;
     assert_eq!(

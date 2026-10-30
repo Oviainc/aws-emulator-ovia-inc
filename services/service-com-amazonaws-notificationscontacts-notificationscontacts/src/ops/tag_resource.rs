@@ -14,6 +14,9 @@
 //! shape reports none of them, so tagging leaves every member of the contact itself —
 //! `status`, `creationTime`, `updateTime` — exactly as it was.
 //!
+//! The success answers 204 No Content with no body bytes: `TagResourceResponse` carries
+//! no members, so there is nothing for a caller to parse.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -141,7 +144,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful tag write answers 204 No Content: `TagResourceResponse` carries no
+    // members, so the answer has nothing for a caller to parse and the service reports
+    // that with the status that says so, rather than the 200 the protocol leaves
+    // defaulted (the model states no explicit `@http` code here, so the success status
+    // is the service's own behaviour and not the model's). `UntagResource`, the other
+    // tag mutation, answers the same way; the operations whose output DOES carry
+    // members, and the create whose `@http` code the model states, keep their own.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

@@ -76,6 +76,17 @@ fn request(method: &str, uri: &str, body: Option<&Value>) -> http::Request<bytes
     builder.body(payload).expect("a well-formed test request")
 }
 
+/// The WHOLE response of one call — status, headers and raw body bytes — for a suite
+/// that asserts on the framing of an answer rather than on a parsed body.
+pub(crate) async fn call_http(
+    em: &Emulator,
+    method: &str,
+    uri: &str,
+    body: Option<&Value>,
+) -> http::Response<bytes::Bytes> {
+    em.router.dispatch(request(method, uri, body)).await
+}
+
 /// Status and parsed body of one call. An empty body reads as `Value::Null`.
 pub(crate) async fn call(
     em: &Emulator,
@@ -83,7 +94,7 @@ pub(crate) async fn call(
     uri: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
-    let response = em.router.dispatch(request(method, uri, body)).await;
+    let response = call_http(em, method, uri, body).await;
     let status = response.status().as_u16();
     let error_type = response
         .headers()
@@ -971,15 +982,17 @@ async fn the_tagging_operations_persist_through_the_same_record() {
     // The whole tagging slice is implemented now: `TagResource` and `UntagResource`
     // write the tag set on the record and `ListTagsForResource` reports it, so none of
     // them answers the scaffold's 501 any more. The rules they follow are owned by
-    // `tests/all/resource_tags.rs` (the read) and `tests/all/resource_tag_writes.rs`
-    // (the writes); this case only pins that each one is reachable on the wire.
+    // `tests/all/resource_tags.rs` (the read), `tests/all/resource_tag_writes.rs` (the
+    // writes) and `tests/all/tag_mutation_success_status.rs` (the bodyless success
+    // status the two mutations answer); this case only pins that each one is reachable
+    // on the wire.
     for (case, method, uri, body, expected) in [
         (
             "TagResource",
             "POST",
             format!("/tags/{}", label(&arn)),
             Some(json!({ "tags": { "team": "infra" } })),
-            200,
+            crate::resource_tag_writes::TAG_MUTATION_SUCCESS_STATUS,
         ),
         (
             "ListTagsForResource",
@@ -993,7 +1006,7 @@ async fn the_tagging_operations_persist_through_the_same_record() {
             "DELETE",
             format!("/tags/{}?tagKeys=team", label(&arn)),
             None,
-            200,
+            crate::resource_tag_writes::TAG_MUTATION_SUCCESS_STATUS,
         ),
     ] {
         let (status, answer) = call(&em, method, &uri, body.as_ref()).await;

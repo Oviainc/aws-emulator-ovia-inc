@@ -11,6 +11,11 @@
 //! Tags are resource metadata held beside the contact: the modelled `EmailContact`
 //! shape reports none of them, so untagging leaves every member of the contact itself —
 //! `status`, `creationTime`, `updateTime` — exactly as it was.
+//!
+//! The success answers 204 No Content with no body bytes, the removing and the no-op
+//! case alike: `UntagResourceResponse` carries no members, so there is nothing for a
+//! caller to parse.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -140,7 +145,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful removal answers 204 No Content, the same way `TagResource` does and
+    // for the same reason: `UntagResourceResponse` carries no members, so there is
+    // nothing for a caller to parse. It holds for the no-op removal too — naming a key
+    // the contact never carried is still a success, and still a bodyless one.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
