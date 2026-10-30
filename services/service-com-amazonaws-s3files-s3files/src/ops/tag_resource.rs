@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .tags_of(&resource)
             .ok_or_else(|| {
                 TagResourceErrorModeled::ResourceNotFoundException(crate::state::not_found(
-                    format!("no {}", resource.describe()),
+                    resource.not_found_message(),
                 ))
             })?
             .to_vec();

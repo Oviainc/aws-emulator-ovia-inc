@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !store.file_systems.contains_key(&file_system_id) {
             return Err(DeleteFileSystemErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(format!("no file system {file_system_id}")),
+                crate::state::not_found(crate::state::FILE_SYSTEM_NOT_FOUND_MESSAGE),
             )
             .into());
         }

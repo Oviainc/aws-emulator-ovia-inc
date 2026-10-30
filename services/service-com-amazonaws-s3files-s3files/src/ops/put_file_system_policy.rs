@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let stored = store.file_systems.get_mut(&file_system_id).ok_or_else(|| {
             PutFileSystemPolicyErrorModeled::ResourceNotFoundException(crate::state::not_found(
-                format!("no file system {file_system_id}"),
+                crate::state::FILE_SYSTEM_NOT_FOUND_MESSAGE,
             ))
         })?;
         // "Creates or replaces": a second put is not a merge, it is a replacement, and

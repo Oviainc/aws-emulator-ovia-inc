@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let stored = store.file_systems.get(&file_system_id).ok_or_else(|| {
             GetSynchronizationConfigurationErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(format!("no file system {file_system_id}")),
+                crate::state::not_found(crate::state::FILE_SYSTEM_NOT_FOUND_MESSAGE),
             )
         })?;
 

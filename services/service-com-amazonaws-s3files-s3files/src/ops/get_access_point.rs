@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let stored = store.access_points.get(&access_point_id).ok_or_else(|| {
             GetAccessPointErrorModeled::ResourceNotFoundException(crate::state::not_found(
-                format!("no access point {access_point_id}"),
+                crate::state::ACCESS_POINT_NOT_FOUND_MESSAGE,
             ))
         })?;
 

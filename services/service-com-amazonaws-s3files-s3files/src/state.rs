@@ -196,6 +196,17 @@ impl SynchronizationConfiguration {
     }
 }
 
+/// The `message` the modelled `ConflictException` reports when `latestVersionNumber` is
+/// not the version the next write must name.
+///
+/// ONE constant remediation sentence: it tells the caller what to do about the condition
+/// (re-read the version and retry) and carries neither the submitted number nor the
+/// stored one, so optimistic-concurrency retry logic sees the same string for the
+/// condition on every file system and every call. This is the sentence S3 Files answers
+/// with.
+pub const INVALID_LATEST_VERSION_NUMBER_MESSAGE: &str =
+    "Invalid latestVersionNumber. Retrieve the most recent latestVersionNumber and retry.";
+
 /// Why `latest_version_number` is not the version the next write over `current` must
 /// name, or `None` when it is.
 ///
@@ -203,30 +214,16 @@ impl SynchronizationConfiguration {
 /// `PutSynchronizationConfigurationRequest$latestVersionNumber`: a first-time create
 /// names no version, an update names the version the stored configuration currently
 /// carries, and anything else "does not match the current configuration" and is the
-/// modelled `ConflictException`. The answer is a sentence, so a caller learns which of
-/// the two mismatches it hit.
+/// modelled `ConflictException`. Every way of naming the wrong version is that ONE
+/// condition, so they all answer [`INVALID_LATEST_VERSION_NUMBER_MESSAGE`].
 pub fn synchronization_version_rejection(
     current: Option<&SynchronizationConfiguration>,
     latest_version_number: Option<i32>,
-) -> Option<String> {
-    match (current, latest_version_number) {
-        (None, None) => None,
-        (None, Some(named)) => Some(format!(
-            "no synchronization configuration exists yet, so latestVersionNumber must be \
-             omitted; got {named}"
-        )),
-        (Some(stored), Some(named)) if named == stored.version_number => None,
-        (Some(stored), Some(named)) => Some(format!(
-            "latestVersionNumber {named} does not match the current synchronization \
-             configuration version {}",
-            stored.version_number
-        )),
-        (Some(stored), None) => Some(format!(
-            "a synchronization configuration at version {} already exists, so \
-             latestVersionNumber must name it",
-            stored.version_number
-        )),
-    }
+) -> Option<&'static str> {
+    // The version the next write must name: the stored one, or none at all when no
+    // configuration exists yet.
+    let required = current.map(|stored| stored.version_number);
+    (latest_version_number != required).then_some(INVALID_LATEST_VERSION_NUMBER_MESSAGE)
 }
 
 /// The configuration an accepted write stores: the rules it carried, at the version that
@@ -530,12 +527,13 @@ pub enum TaggedResource {
 }
 
 impl TaggedResource {
-    /// The resource named the way a `ResourceNotFoundException` message names it: the
-    /// kind of resource, then its canonical id.
-    pub fn describe(&self) -> String {
+    /// The `ResourceNotFoundException` message for this kind of resource being absent —
+    /// the same constant sentence the operation dedicated to that resource answers, so
+    /// one missing resource reads the same whichever operation looked it up.
+    pub fn not_found_message(&self) -> &'static str {
         match self {
-            Self::FileSystem(id) => format!("file system {id}"),
-            Self::AccessPoint(id) => format!("access point {id}"),
+            Self::FileSystem(_) => FILE_SYSTEM_NOT_FOUND_MESSAGE,
+            Self::AccessPoint(_) => ACCESS_POINT_NOT_FOUND_MESSAGE,
         }
     }
 }
@@ -791,6 +789,23 @@ pub fn not_found(message: impl Into<String>) -> ResourceNotFoundException {
         message: Some(message.into()),
     }
 }
+
+/// The `message` the modelled `ResourceNotFoundException` reports for a file system this
+/// service does not hold — including one a `DeleteFileSystem` has already removed.
+///
+/// ONE constant sentence naming the KIND of resource that is missing, carrying nothing
+/// from the request: the condition, not the id, is what the message states, so every
+/// operation resolving a `fileSystemId` answers the same string and a client can match
+/// on it. This is the sentence S3 Files answers with.
+pub const FILE_SYSTEM_NOT_FOUND_MESSAGE: &str = "File system does not exist.";
+
+/// The `message` the modelled `ResourceNotFoundException` reports for an access point
+/// this service does not hold — including one a `DeleteAccessPoint` has already removed,
+/// which is what makes that operation's repeat observable.
+///
+/// Same rule as [`FILE_SYSTEM_NOT_FOUND_MESSAGE`], for the other resource this service
+/// holds.
+pub const ACCESS_POINT_NOT_FOUND_MESSAGE: &str = "Access point does not exist.";
 
 /// The `message` the modelled `ResourceNotFoundException` reports for a file system
 /// that holds no IAM resource policy.

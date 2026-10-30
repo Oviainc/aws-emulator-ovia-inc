@@ -164,9 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .to_string();
 
         let stored = store.file_systems.get(&file_system_id).ok_or_else(|| {
-            GetFileSystemErrorModeled::ResourceNotFoundException(crate::state::not_found(format!(
-                "no file system {file_system_id}"
-            )))
+            GetFileSystemErrorModeled::ResourceNotFoundException(crate::state::not_found(
+                crate::state::FILE_SYSTEM_NOT_FOUND_MESSAGE,
+            ))
         })?;
 
         Ok(GetFileSystemOutput {

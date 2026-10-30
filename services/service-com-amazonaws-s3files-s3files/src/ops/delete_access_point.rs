@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if store.access_points.remove(&access_point_id).is_none() {
             return Err(DeleteAccessPointErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(format!("no access point {access_point_id}")),
+                crate::state::not_found(crate::state::ACCESS_POINT_NOT_FOUND_MESSAGE),
             )
             .into());
         }

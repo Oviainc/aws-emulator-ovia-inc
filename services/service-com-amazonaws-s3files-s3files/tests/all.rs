@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/access_point_listing.rs"]
 mod access_point_listing;
+#[path = "all/condition_error_messages.rs"]
+mod condition_error_messages;
 #[path = "all/create_file_system_bucket_must_exist.rs"]
 mod create_file_system_bucket_must_exist;
 #[path = "all/creation_token_single_use.rs"]
