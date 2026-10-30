@@ -19,6 +19,8 @@ mod cloudwatch_logs_source_gate;
 mod constraint_refusal_precedes_state;
 #[path = "all/control_plane_refusal_templates.rs"]
 mod control_plane_refusal_templates;
+#[path = "all/delivered_object_encryption.rs"]
+mod delivered_object_encryption;
 #[path = "all/delivery_stream_encryption.rs"]
 mod delivery_stream_encryption;
 #[path = "all/delivery_stream_lifecycle.rs"]

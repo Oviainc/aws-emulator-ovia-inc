@@ -45,6 +45,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) body: bytes::Bytes,
+    /// The response's own headers, which is where Amazon S3 reports what it keeps out of
+    /// the body — the encryption an object was stored under, among others.
+    pub(crate) headers: http::HeaderMap,
+}
+
+impl Answer {
+    /// The value of the response header `name`, or `None` when the response carries none.
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
 }
 
 /// Firehose and Amazon S3 on one shared engine.
@@ -142,6 +155,7 @@ impl Emulator {
         Answer {
             status: parts.status.as_u16(),
             body,
+            headers: parts.headers,
         }
     }
 

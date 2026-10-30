@@ -25,6 +25,9 @@
 //!   writing them to S3" — `ErrorOutputPrefix`).
 //! * WHAT — the buffered records' data, concatenated in arrival order, encoded as
 //!   `CompressionFormat` asks ([`compressed`]).
+//! * UNDER WHICH KEY — the `AWSKMSKeyARN` of `EncryptionConfiguration`'s
+//!   `KMSEncryptionConfig`, "the encryption key" the destination's objects are encrypted at
+//!   rest with ([`kms_key_arn`], [`object_encryption`]).
 //!
 //! ## An HTTP endpoint destination
 //!
@@ -67,7 +70,9 @@ use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_runtime_api::client::http::{HttpConnector, SharedHttpConnector};
 
-use crate::ops::types::{BufferingHints, ProcessingConfiguration, S3DestinationConfiguration};
+use crate::ops::types::{
+    BufferingHints, EncryptionConfiguration, ProcessingConfiguration, S3DestinationConfiguration,
+};
 use crate::state::{
     service_state, ComAmazonawsFirehoseFirehose20150804State, DeliveryStream,
     DestinationConfigKind, StoredRecord,
@@ -471,6 +476,10 @@ pub struct S3Target {
     /// Whether the records of one object are separated by [`RECORD_DELIMITER`], which the
     /// `AppendDelimiterToRecord` processor asks for.
     pub append_delimiter: bool,
+    /// The key an object written here is encrypted at rest with: the `AWSKMSKeyARN` of the
+    /// destination's `EncryptionConfiguration` ([`kms_key_arn`]), and `None` when the
+    /// configuration names none.
+    pub kms_key_arn: Option<String>,
 }
 
 /// One HTTP endpoint destination a stream's buffer is delivered to, with everything the
@@ -545,6 +554,9 @@ struct DeliveredObject {
     bucket: String,
     key: String,
     body: Vec<u8>,
+    /// The KMS key this object is stored encrypted with, from the destination's
+    /// `EncryptionConfiguration` ([`S3Target::kms_key_arn`]).
+    kms_key_arn: Option<String>,
 }
 
 /// The size in bytes at which a buffer with these hints is full, and the longest it is
@@ -601,7 +613,24 @@ fn plain_target(config: &S3DestinationConfiguration) -> Option<S3Target> {
         file_extension: None,
         metadata_extraction_query: None,
         append_delimiter: false,
+        kms_key_arn: kms_key_arn(config.encryption_configuration.as_ref()),
     })
+}
+
+/// The KMS key an object delivered to a location is encrypted at rest with: the
+/// `AWSKMSKeyARN` of its `EncryptionConfiguration`'s `KMSEncryptionConfig`, which is "the
+/// Amazon Resource Name (ARN) of the encryption key" the destination is encrypted under
+/// (`KMSEncryptionConfig$AWSKMSKeyARN`).
+///
+/// `None` for a configuration that names no key — one that names `NoEncryptionConfig`
+/// ("specifically override existing encryption information to ensure that no encryption is
+/// used") and one that names nothing at all, whose documented default is that same no
+/// encryption (`ExtendedS3DestinationConfiguration$EncryptionConfiguration`): the write
+/// then asks for no encryption of its own, which is what makes the destination bucket's own
+/// default encryption configuration decide, exactly as for any other write to it.
+fn kms_key_arn(config: Option<&EncryptionConfiguration>) -> Option<String> {
+    let key = &config?.kms_encryption_config.as_ref()?.awskms_key_arn;
+    (!key.is_empty()).then(|| key.clone())
 }
 
 /// The jq program the destination's enabled `MetadataExtraction` processor carries, when
@@ -687,6 +716,7 @@ pub fn s3_targets(config: &DestinationConfigKind) -> Vec<S3Target> {
                         config.processing_configuration.as_ref(),
                     ),
                     append_delimiter: appends_delimiter(config.processing_configuration.as_ref()),
+                    kms_key_arn: kms_key_arn(config.encryption_configuration.as_ref()),
                 });
             }
             if backs_up_all_records(config.s3_backup_mode.as_ref()) {
@@ -986,20 +1016,24 @@ fn stream_searches(stream: &DeliveryStream) -> Vec<SearchTarget> {
 #[must_use]
 pub fn due_at(stream: &DeliveryStream) -> Option<SystemTime> {
     let opened_at = stream.records.first()?.received_at;
+    // What the buffer HOLDS right now, which is what the size hint is about. Read off the
+    // records themselves rather than off `buffered_bytes`, which also carries the bytes of
+    // a delivery that is in flight and are no longer in this buffer (see [`take_due`]).
+    let buffered: usize = stream.records.iter().map(|record| record.data.len()).sum();
     // The destinations are a few kinds with one buffering rule between them, and the FIRST
     // buffer to come due decides when the flush happens.
     let window = stream_targets(stream)
         .iter()
-        .map(|target| delivery_window(target.hints.as_ref(), stream.buffered_bytes))
+        .map(|target| delivery_window(target.hints.as_ref(), buffered))
         .chain(
             stream_endpoints(stream)
                 .iter()
-                .map(|endpoint| delivery_window(endpoint.hints.as_ref(), stream.buffered_bytes)),
+                .map(|endpoint| delivery_window(endpoint.hints.as_ref(), buffered)),
         )
         .chain(
             stream_searches(stream)
                 .iter()
-                .map(|search| delivery_window(search.hints.as_ref(), stream.buffered_bytes)),
+                .map(|search| delivery_window(search.hints.as_ref(), buffered)),
         )
         .min()?;
     let due = opened_at + window;
@@ -1035,13 +1069,20 @@ pub enum Extractions {
 /// later caller sees. What this leaves behind — because the cap was reached, or because
 /// the caller leaves extraction-bearing deliveries to the pump — stays buffered, exactly
 /// where it was, for a later delivery.
+///
+/// The records are taken out of the buffer but their bytes stay CHARGED against the buffer
+/// budgets (`crate::state::MAX_BUFFERED_BYTES_PER_STREAM` and
+/// `crate::state::MAX_BUFFERED_BYTES`) until the delivery is settled: they are still held
+/// in this process, so a put that arrives while the delivery is in flight must not be able
+/// to fill the whole budget again beside them. [`release_budget`] releases them once they
+/// have been written; a delivery that could not be made is put back by [`restore`] with the
+/// charge it never lost.
 pub fn take_due(
     store: &mut ComAmazonawsFirehoseFirehose20150804State,
     now: SystemTime,
     extractions: Extractions,
 ) -> Vec<PendingDelivery> {
     let mut due = Vec::new();
-    let mut freed = 0usize;
     for stream in store.streams.values_mut() {
         if due.len() >= MAX_DELIVERIES_PER_CALL {
             break;
@@ -1063,10 +1104,7 @@ pub fn take_due(
             continue;
         }
         let records = ::std::mem::take(&mut stream.records);
-        let bytes: usize = records.iter().map(|record| record.data.len()).sum();
-        stream.buffered_bytes = stream.buffered_bytes.saturating_sub(bytes);
         stream.delivery_retry_at = None;
-        freed += bytes;
         due.push(PendingDelivery {
             stream: stream.name.clone(),
             source_arn: stream.arn.clone(),
@@ -1077,8 +1115,30 @@ pub fn take_due(
             searches,
         });
     }
-    store.buffered_bytes = store.buffered_bytes.saturating_sub(freed);
     due
+}
+
+/// Release the buffer budget the records of a DELIVERED buffer were charged against.
+///
+/// The counterpart of [`take_due`] keeping them charged: a byte a put accepted stays
+/// charged from the moment it is accepted until it has been written to the destination, so
+/// the bytes this process holds for one stream never exceed the one budget whatever a
+/// producer does. A stream deleted while its delivery was in flight released its whole
+/// buffer with it, so there is nothing left to release for it.
+fn release_budget(
+    store: &mut ComAmazonawsFirehoseFirehose20150804State,
+    delivery: &PendingDelivery,
+) {
+    let bytes: usize = delivery
+        .records
+        .iter()
+        .map(|record| record.data.len())
+        .sum();
+    let Some(stream) = store.streams.get_mut(&delivery.stream) else {
+        return;
+    };
+    stream.buffered_bytes = stream.buffered_bytes.saturating_sub(bytes);
+    store.buffered_bytes = store.buffered_bytes.saturating_sub(bytes);
 }
 
 /// Put a delivery that could not be made back in its stream's buffer, ahead of whatever
@@ -1087,6 +1147,10 @@ pub fn take_due(
 /// A record Firehose cannot deliver is not a record it drops: it keeps trying for the
 /// documented retention. The stream being gone (deleted while the delivery was in flight)
 /// takes its buffered data with it, so there is nothing to restore.
+///
+/// The budgets are not touched: these bytes stayed charged for the whole flight
+/// ([`take_due`]), so putting the records back where they came from leaves the charge
+/// exactly as the put that accepted them made it.
 fn restore(
     store: &mut ComAmazonawsFirehoseFirehose20150804State,
     delivery: PendingDelivery,
@@ -1095,16 +1159,9 @@ fn restore(
     let Some(stream) = store.streams.get_mut(&delivery.stream) else {
         return;
     };
-    let bytes: usize = delivery
-        .records
-        .iter()
-        .map(|record| record.data.len())
-        .sum();
     let mut records = delivery.records;
     records.append(&mut stream.records);
     stream.records = records;
-    stream.buffered_bytes = stream.buffered_bytes.saturating_add(bytes);
-    store.buffered_bytes = store.buffered_bytes.saturating_add(bytes);
     stream.delivery_retry_at = Some(now + DELIVERY_RETRY_SPAN);
 }
 
@@ -1212,6 +1269,10 @@ pub async fn deliver_due<Eng: Send + Sync + 'static>(
         };
         objects.append(&mut parked);
         if write_objects(engine, objects) {
+            // Written, so these records are no longer held anywhere in this process and
+            // the budget they were charged against is theirs no longer.
+            let mut store = state.lock();
+            release_budget(&mut store, &delivery);
             continue;
         }
         // The Amazon S3 half of this buffer could not be written, so the whole of it is
@@ -1468,6 +1529,7 @@ fn backup_object(
         bucket: target.bucket.clone(),
         key: format!("{prefix}{}{extension}", object_name(delivery, now, ordinal)),
         body,
+        kms_key_arn: target.kms_key_arn.clone(),
     })
 }
 
@@ -1670,6 +1732,7 @@ fn search_backup_object(
             object_name(delivery, now, ordinal)
         ),
         body,
+        kms_key_arn: target.kms_key_arn.clone(),
     })
 }
 
@@ -1719,6 +1782,37 @@ fn search_error_envelope(
     })
 }
 
+/// The `ServerSideEncryption` value an object encrypted with a KMS key is stored under:
+/// the single-layer one of the two values Amazon S3 publishes for KMS keys, read from that
+/// service's own set so the two can never drift.
+const SSE_KMS_ALGORITHM: &str = ::service_com_amazonaws_s3_amazons3::state::KMS_SSE_ALGORITHMS[0];
+
+/// How a delivered object is encrypted at rest.
+///
+/// A destination whose `EncryptionConfiguration` names an encryption key
+/// ([`S3Target::kms_key_arn`]) has its objects written under SSE-KMS with that key, so a
+/// later read of one reports the algorithm and the key it was stored with. A destination
+/// naming no key writes an object that asks for no encryption of its own, which is the case
+/// where the bucket's own default encryption configuration decides what it is stored under
+/// — the same rule every other write to that bucket follows.
+fn object_encryption(
+    store: &::service_com_amazonaws_s3_amazons3::state::ComAmazonawsS3Amazons3State,
+    object: &DeliveredObject,
+) -> ::service_com_amazonaws_s3_amazons3::state::ObjectEncryption {
+    match &object.kms_key_arn {
+        Some(key) => ::service_com_amazonaws_s3_amazons3::state::ObjectEncryption {
+            sse_algorithm: Some(SSE_KMS_ALGORITHM.to_string()),
+            kms_key_id: Some(key.clone()),
+            kms_encryption_context: None,
+            bucket_key_enabled: None,
+        },
+        None => store
+            .bucket(&object.bucket)
+            .map(|bucket| bucket.default_object_encryption())
+            .unwrap_or_default(),
+    }
+}
+
 /// Write `objects` into the one object store, answering whether the destination took
 /// them.
 ///
@@ -1737,6 +1831,7 @@ fn write_objects<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<Delivere
     let mut store = state.lock();
     let mut written = 0usize;
     for object in objects {
+        let encryption = object_encryption(&store, &object);
         let stored = ::service_com_amazonaws_s3_amazons3::state::Object {
             // The entity tag is computed from the bytes the object is stored with,
             // exactly as it is for an object written through `PutObject`.
@@ -1755,7 +1850,7 @@ fn write_objects<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<Delivere
             website_redirect_location: None,
             metadata: BTreeMap::new(),
             tags: Vec::new(),
-            encryption: ::service_com_amazonaws_s3_amazons3::state::ObjectEncryption::default(),
+            encryption,
             // A delivered object carries no Object Lock retention: a retention is placed
             // on a stored version afterwards, by S3's own `PutObjectRetention`.
             retention: None,
@@ -1860,6 +1955,7 @@ async fn objects_of(delivery: &PendingDelivery, now: SystemTime) -> Option<Vec<D
                 bucket: target.bucket.clone(),
                 key: format!("{prefix}{name}{extension}"),
                 body,
+                kms_key_arn: target.kms_key_arn.clone(),
             });
         }
     }
