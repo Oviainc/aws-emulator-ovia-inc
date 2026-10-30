@@ -33,6 +33,8 @@ mod db_cluster_subject_operations;
 mod db_clusters;
 #[path = "all/db_engine_version_catalog.rs"]
 mod db_engine_version_catalog;
+#[path = "all/db_engine_version_wire_members.rs"]
+mod db_engine_version_wire_members;
 #[path = "all/db_engine_versions.rs"]
 mod db_engine_versions;
 #[path = "all/db_instance_deletion.rs"]
