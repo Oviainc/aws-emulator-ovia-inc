@@ -125,9 +125,9 @@ pub const MIN_LIST_PAGE_SIZE: usize = 1;
 
 /// The largest page a listing will serve — the model's `maxResults` maximum, and
 /// also the page size used when the caller names no `maxResults`. Every page is clamped
-/// into `MIN_LIST_PAGE_SIZE..=MAX_LIST_PAGE_SIZE` in the handler rather than trusting
-/// the boundary validator alone, so one request can never materialise an unbounded
-/// response.
+/// into `MIN_LIST_PAGE_SIZE..=MAX_LIST_PAGE_SIZE` by [`list_page_size`] rather than
+/// trusting the boundary validator alone, so one request can never materialise an
+/// unbounded response.
 pub const MAX_LIST_PAGE_SIZE: usize = 50;
 
 /// How many data stores this emulator will hold at once IN ONE REGION.
@@ -2273,6 +2273,22 @@ pub fn page_token_filter_digest(canonical: &str) -> String {
     let mut digest = ::sha2::Sha256::new();
     digest.update(canonical.as_bytes());
     ::hex::encode(digest.finalize())
+}
+
+/// How many records one page of a listing holds, from the `maxResults` the caller named.
+///
+/// Lives here, like the token codec above, because every paginated listing shares it and
+/// a page-size rule spelled once per listing drifts: one clamp updated, the others left
+/// behind.
+///
+/// A value outside [`MIN_LIST_PAGE_SIZE`]`..=`[`MAX_LIST_PAGE_SIZE`] is clamped here, not
+/// merely at the boundary: one request must never be able to materialise an unbounded
+/// page. A request naming no `maxResults` gets [`MAX_LIST_PAGE_SIZE`].
+pub fn list_page_size(max_results: Option<i32>) -> usize {
+    max_results
+        .and_then(|requested| usize::try_from(requested).ok())
+        .map(|requested| requested.clamp(MIN_LIST_PAGE_SIZE, MAX_LIST_PAGE_SIZE))
+        .unwrap_or(MAX_LIST_PAGE_SIZE)
 }
 
 /// The total order a listing walks: the record's instant first (seconds, then

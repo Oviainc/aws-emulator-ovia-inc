@@ -65,6 +65,8 @@ mod import_job_listing;
 mod list_element_refusal_paths;
 #[path = "all/listing_filter_page_tokens.rs"]
 mod listing_filter_page_tokens;
+#[path = "all/listing_page_size_rule.rs"]
+mod listing_page_size_rule;
 #[path = "all/metadata_document_shape.rs"]
 mod metadata_document_shape;
 #[path = "all/metadata_document_structure.rs"]

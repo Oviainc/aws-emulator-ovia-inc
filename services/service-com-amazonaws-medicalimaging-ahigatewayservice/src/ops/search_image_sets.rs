@@ -215,18 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        let page_size = input
-            .max_results
-            .and_then(|requested| usize::try_from(requested).ok())
-            // Clamped here, not merely at the boundary: one request must never be able
-            // to materialise an unbounded page.
-            .map(|requested| {
-                requested.clamp(
-                    crate::state::MIN_LIST_PAGE_SIZE,
-                    crate::state::MAX_LIST_PAGE_SIZE,
-                )
-            })
-            .unwrap_or(crate::state::MAX_LIST_PAGE_SIZE);
+        // The page-size rule is the service's one ([`crate::state::list_page_size`]), so
+        // every listing bounds a page the same way.
+        let page_size = crate::state::list_page_size(input.max_results);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             SearchImageSetsErrorModeled::InternalServerException(InternalServerException {
