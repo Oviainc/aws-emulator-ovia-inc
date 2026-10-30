@@ -31,7 +31,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
     call, call_sqs, create_mapping, create_queue, create_timed_function, get_mapping,
-    queue_attribute, router_with_queues, MAPPINGS_URI,
+    messages_held, queue_attribute, queue_message_counts, router_with_queues, MAPPINGS_URI,
+    VISIBLE_MESSAGES,
 };
 
 /// The `State` a mapping reports once it is polling its event source.
@@ -224,32 +225,19 @@ async fn a_batch_no_consumer_processes_is_redriven_to_the_dead_letter_queue() {
         // to the dead-letter queue. The row waits for the END of that chain.
         let mut seen: BTreeMap<String, u32> = BTreeMap::new();
         let deadline = Instant::now() + DEADLINE;
-        let mut drained: Option<String> = None;
+        let mut drained: Option<(u32, u32, u32)> = None;
         while Instant::now() < deadline {
             // A long enough visibility timeout that a message counted here is not handed to
             // this loop a second time while it waits for the rest.
             for (body, count) in receive(&router, case, &dlq_url, 300).await {
                 seen.entry(body).or_insert(count);
             }
-            let visible = queue_attribute(
-                &router,
-                case,
-                &source_url,
-                "ApproximateNumberOfMessages",
-            )
-            .await;
-            let in_flight = queue_attribute(
-                &router,
-                case,
-                &source_url,
-                "ApproximateNumberOfMessagesNotVisible",
-            )
-            .await;
-            if seen.len() == row.bodies.len()
-                && visible.as_deref() == Some("0")
-                && in_flight.as_deref() == Some("0")
-            {
-                drained = visible;
+            // What the source queue holds, from ONE answer: a message the poller is holding
+            // in flight at this instant is one the queue still has, and a total assembled
+            // from counts read in SEPARATE answers would count it twice or not at all.
+            let counts = queue_message_counts(&router, case, &source_url).await;
+            if seen.len() == row.bodies.len() && messages_held(counts) == 0 {
+                drained = Some(counts);
                 break;
             }
             tokio::time::sleep(POLL).await;
@@ -282,10 +270,10 @@ async fn a_batch_no_consumer_processes_is_redriven_to_the_dead_letter_queue() {
         // And the source queue drained: the messages left it as they reached the
         // dead-letter one.
         assert_eq!(
-            drained.as_deref(),
-            Some("0"),
+            drained.map(messages_held),
+            Some(0),
             "case {case:?}: the source queue must report no messages left after the \
-             redrive, got {drained:?}"
+             redrive, got {drained:?} as (visible, in flight, delayed)"
         );
 
         // The mapping polled its queue and says what became of the batch it delivered:
@@ -371,7 +359,7 @@ async fn a_disabled_mapping_takes_nothing_out_of_its_queue() {
         "case {case:?}: nothing was delivered, so nothing can have been redriven, got \
          {dead_lettered:?}"
     );
-    let visible = queue_attribute(&router, case, &source_url, "ApproximateNumberOfMessages").await;
+    let visible = queue_attribute(&router, case, &source_url, VISIBLE_MESSAGES).await;
     assert_eq!(
         visible.as_deref(),
         Some("1"),
@@ -417,47 +405,35 @@ async fn a_queue_with_no_redrive_policy_delivers_and_keeps_the_message() {
     // after each delivery, which is what proves the delivery happened at all. The wait is
     // for that observation, not for a span: a slow machine delays it instead of weakening it.
     let deadline = Instant::now() + DEADLINE;
-    let mut in_flight = None;
+    let mut counts = (0u32, 0u32, 0u32);
     while Instant::now() < deadline {
-        in_flight = queue_attribute(
-            &router,
-            case,
-            &source_url,
-            "ApproximateNumberOfMessagesNotVisible",
-        )
-        .await;
-        if in_flight.as_deref() == Some("1") {
+        counts = queue_message_counts(&router, case, &source_url).await;
+        let (_, in_flight, _) = counts;
+        if in_flight == 1 {
             break;
         }
         tokio::time::sleep(POLL).await;
     }
+    let (_, in_flight, _) = counts;
     assert_eq!(
-        in_flight.as_deref(),
-        Some("1"),
+        in_flight, 1,
         "case {case:?}: the mapping's poller must take the message out of the queue, got \
-         {in_flight:?}"
+         {counts:?} as (visible, in flight, delayed)"
     );
 
     // Several visibility windows later the message is still THIS queue's: there is no
     // dead-letter target to move it to and no consumer deleted it, so the queue holds
-    // exactly the one message it was sent whatever the deliveries did.
+    // exactly the one message it was sent whatever the deliveries did. The counts come from
+    // ONE answer, because the poller keeps moving the message between them — it is in
+    // flight for the queue's visibility timeout after each delivery and waiting in between —
+    // so a total assembled from counts read in separate answers is of no one instant.
     tokio::time::sleep(VISIBILITY_WINDOWS).await;
-    let visible = queue_attribute(&router, case, &source_url, "ApproximateNumberOfMessages").await;
-    let not_visible = queue_attribute(
-        &router,
-        case,
-        &source_url,
-        "ApproximateNumberOfMessagesNotVisible",
-    )
-    .await;
-    let held: u32 = [&visible, &not_visible]
-        .iter()
-        .filter_map(|reported| reported.as_deref().and_then(|raw| raw.parse::<u32>().ok()))
-        .sum();
+    let counts = queue_message_counts(&router, case, &source_url).await;
     assert_eq!(
-        held, 1,
+        messages_held(counts),
+        1,
         "case {case:?}: the queue must still hold exactly the message it was sent, got \
-         {visible:?} visible and {not_visible:?} in flight"
+         {counts:?} as (visible, in flight, delayed)"
     );
 
     // A client cannot take a message out from under a running poller — the poller hands it

@@ -438,17 +438,92 @@ pub(crate) async fn queue_attribute(
     url: &str,
     name: &str,
 ) -> Option<String> {
+    let attributes = one_answer_attributes(router, case, url, &[name]).await;
+    attributes[name].as_str().map(str::to_string)
+}
+
+/// The Amazon SQS attribute counting the messages a queue can hand over right now, from
+/// `QueueAttributeName`: "ApproximateNumberOfMessages — the approximate number of
+/// visible messages in a queue".
+pub(crate) const VISIBLE_MESSAGES: &str = "ApproximateNumberOfMessages";
+
+/// The attribute counting the messages a queue has handed over and nobody has deleted yet:
+/// "ApproximateNumberOfMessagesNotVisible — the approximate number of messages that are in
+/// flight".
+pub(crate) const IN_FLIGHT_MESSAGES: &str = "ApproximateNumberOfMessagesNotVisible";
+
+/// The attribute counting the messages a queue is not handing over yet because their delay
+/// has not elapsed: "ApproximateNumberOfMessagesDelayed — the approximate number of
+/// messages in the queue that are delayed and not available for reading immediately".
+pub(crate) const DELAYED_MESSAGES: &str = "ApproximateNumberOfMessagesDelayed";
+
+/// The attributes `names` lists, from ONE `GetQueueAttributes` answer for the queue `url`
+/// addresses: the `Attributes` object exactly as the service reported it. The one call site
+/// of that operation in this harness, which every reading above goes through.
+///
+/// A queue's message counts are consistent WITH EACH OTHER only inside one answer, because
+/// each call reports what the queue held at ITS OWN instant — and a message moves between
+/// those counts whenever a delivery is made or a visibility timeout lapses. So a reader
+/// that needs more than one of them asks for them together.
+pub(crate) async fn one_answer_attributes(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    names: &[&str],
+) -> Value {
     let (status, answered) = call_sqs(
         router,
         "GetQueueAttributes",
-        &json!({ "QueueUrl": url, "AttributeNames": [name] }),
+        &json!({ "QueueUrl": url, "AttributeNames": names }),
     )
     .await;
     assert_eq!(
         status, 200,
         "case {case:?}: expected GetQueueAttributes to answer 200, got {status} {answered}"
     );
-    answered["Attributes"][name].as_str().map(str::to_string)
+    answered["Attributes"].clone()
+}
+
+/// The three message counts the queue `url` addresses reports in ONE answer, as
+/// `(visible, in flight, delayed)` — see [`one_answer_attributes`] for why they are read
+/// together.
+pub(crate) async fn queue_message_counts(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+) -> (u32, u32, u32) {
+    let attributes = one_answer_attributes(
+        router,
+        case,
+        url,
+        &[VISIBLE_MESSAGES, IN_FLIGHT_MESSAGES, DELAYED_MESSAGES],
+    )
+    .await;
+    let count = |name: &str| {
+        attributes[name]
+            .as_str()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the queue {url} reports no {name} in {attributes}")
+            })
+    };
+    (
+        count(VISIBLE_MESSAGES),
+        count(IN_FLIGHT_MESSAGES),
+        count(DELAYED_MESSAGES),
+    )
+}
+
+/// How many messages a `(visible, in flight, delayed)` reading accounts for: every message
+/// a queue holds is counted in exactly one of the three, whether it is waiting, in flight
+/// with a consumer or still delayed.
+pub(crate) fn messages_held((visible, in_flight, delayed): (u32, u32, u32)) -> u32 {
+    visible.saturating_add(in_flight).saturating_add(delayed)
+}
+
+/// How many messages the queue `url` addresses HOLDS, from one answer.
+pub(crate) async fn queue_held(router: &MultiServiceRouter, case: &str, url: &str) -> u32 {
+    messages_held(queue_message_counts(router, case, url).await)
 }
 
 /// The `CreateEventSourceMapping` body for `function` and `event_source`, plus whatever

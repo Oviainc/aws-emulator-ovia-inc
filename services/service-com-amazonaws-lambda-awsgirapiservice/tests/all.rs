@@ -167,6 +167,8 @@ mod provisioned_concurrency;
 mod provisioned_concurrency_resolution;
 #[path = "all/published_function_arn.rs"]
 mod published_function_arn;
+#[path = "all/queue_message_count_snapshot.rs"]
+mod queue_message_count_snapshot;
 #[path = "all/read_representation_and_download_plane.rs"]
 mod read_representation_and_download_plane;
 #[path = "all/refusal_message_rules.rs"]

@@ -43,7 +43,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
     call, call_sqs, create_mapping, create_queue, create_timed_function, get_mapping,
-    queue_attribute, router_on, MAPPINGS_URI,
+    queue_attribute, queue_held, router_on, IN_FLIGHT_MESSAGES, MAPPINGS_URI,
 };
 
 /// The region every call below signs for.
@@ -217,27 +217,17 @@ async fn wait_for_datapoints(
     }
 }
 
-/// How many messages the queue `url` addresses still holds, visible or in flight.
-async fn held(router: &MultiServiceRouter, case: &str, url: &str) -> u32 {
-    let mut total = 0;
-    for attribute in [
-        "ApproximateNumberOfMessages",
-        "ApproximateNumberOfMessagesNotVisible",
-    ] {
-        total += queue_attribute(router, case, url, attribute)
-            .await
-            .and_then(|raw| raw.parse::<u32>().ok())
-            .unwrap_or(0);
-    }
-    total
-}
-
 /// Wait until the queue `url` addresses holds exactly `wanted` messages, answering what it
 /// held.
+///
+/// What it holds is read from ONE `GetQueueAttributes` answer ([`queue_held`]): the poller
+/// moves a message between the visible, in-flight and delayed counts as it delivers it and
+/// as its visibility lapses, so a total assembled from counts read in separate answers
+/// belongs to no one instant.
 async fn wait_for_held(router: &MultiServiceRouter, case: &str, url: &str, wanted: u32) -> u32 {
     let deadline = Instant::now() + BUDGET;
     loop {
-        let holding = held(router, case, url).await;
+        let holding = queue_held(router, case, url).await;
         if holding == wanted || Instant::now() >= deadline {
             return holding;
         }
@@ -255,13 +245,7 @@ async fn wait_for_in_flight(
 ) -> Option<String> {
     let deadline = Instant::now() + BUDGET;
     loop {
-        let reported = queue_attribute(
-            router,
-            case,
-            url,
-            "ApproximateNumberOfMessagesNotVisible",
-        )
-        .await;
+        let reported = queue_attribute(router, case, url, IN_FLIGHT_MESSAGES).await;
         if reported.as_deref() == Some(wanted) || Instant::now() >= deadline {
             return reported;
         }
@@ -625,7 +609,7 @@ async fn an_idle_mapping_publishes_a_zero_valued_poll_count() {
             "case {case:?}: an idle mapping publishes one poll count per minute, got {point}"
         );
     }
-    let holding = held(&router, case, &url).await;
+    let holding = queue_held(&router, case, &url).await;
     assert_eq!(
         holding, 0,
         "case {case:?}: nothing was sent to the queue, so it must hold nothing, got {holding}"
