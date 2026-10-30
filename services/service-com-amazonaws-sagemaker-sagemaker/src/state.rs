@@ -3477,6 +3477,17 @@ pub const ACTION_ENTITY: &str = "Action";
 /// The entity label [`does_not_exist`] names a lineage artifact by.
 pub const ARTIFACT_ENTITY: &str = "Artifact";
 
+/// How this service states an `ArtifactName` the Region already has an artifact under:
+/// the name the request sent, then the ARN of the artifact holding it.
+///
+/// `ArtifactName` is documented unique to an account in a Region, so every call that
+/// takes a name for an artifact — the create that mints one and the update that renames
+/// one — refuses a name already taken, and they word that one fact here rather than
+/// twice.
+pub fn artifact_name_in_use(name: &str, holder_arn: &str) -> String {
+    format!("The artifact name \"{name}\" is already in use by \"{holder_arn}\".")
+}
+
 /// The entity label [`does_not_exist`] names a lineage context by.
 pub const CONTEXT_ENTITY: &str = "Context";
 

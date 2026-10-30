@@ -276,6 +276,51 @@ pub(crate) fn map_value_message<'entries>(
     ))
 }
 
+/// The validation path of the `Properties` member, as the framework's own path spelling
+/// (lowerCamel) writes it — the map a property-value refusal is stated against.
+const PROPERTIES_PATH: &str = "properties";
+
+/// The lower bound a value of the `ArtifactProperties` map must satisfy. The shape its
+/// values target (`smithy_query(query="shape",shape="ArtifactPropertyValue")`) states
+/// `@length 0..4096`, so an empty value is inside the modelled bound and outside the one
+/// the service enforces; this is that enforced minimum.
+const PROPERTY_VALUE_MIN_LENGTH: i64 = 1;
+
+/// The whole constraint set a value of the `ArtifactProperties` map must satisfy, in the
+/// order the service lists it in a refusal: the modelled maximum, the enforced minimum,
+/// then the modelled expression. Source for the two modelled entries:
+/// `smithy_query(query="shape",shape="ArtifactPropertyValue")` — `@length 0..4096`,
+/// `@pattern .*`.
+fn property_value_constraints() -> [ViolationKind; 3] {
+    [
+        ViolationKind::MaxLength(4096),
+        ViolationKind::MinLength(PROPERTY_VALUE_MIN_LENGTH),
+        ViolationKind::Pattern(".*".to_string()),
+    ]
+}
+
+/// How this service states an `ArtifactProperties` map a request may not send, or `None`
+/// when every value in it is acceptable.
+///
+/// The enforced minimum is a property of the VALUE SHAPE, not of one operation, so every
+/// operation carrying a map of `ArtifactPropertyValue`s — `CreateArtifact` and
+/// `UpdateArtifact` — refuses the same map here rather than wording it twice. The clause
+/// is stated against the MAP ([`map_value_message`]), echoing every entry of it and
+/// listing the whole constraint set a property value has to satisfy.
+pub(crate) fn artifact_properties_refusal(
+    properties: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    properties.values().any(String::is_empty).then(|| {
+        map_value_message(
+            PROPERTIES_PATH,
+            properties
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+            &property_value_constraints(),
+        )
+    })
+}
+
 /// The `ValidationException` envelope around one clause this service stated itself.
 ///
 /// Spelled exactly as [`aws_smithy_schema_server::envelope`] spells a single-violation

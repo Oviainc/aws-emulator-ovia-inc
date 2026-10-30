@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateArtifact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateArtifact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: edits the stored artifact's name and properties in `crate::state`, moves
+//! its `LastModifiedTime`, and refuses an `ArtifactArn` nothing holds with the modelled
+//! `ResourceNotFound`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateArtifact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The modelled `ConflictException` is UNREACHABLE here by design, not by omission: it
+//! reports a conflict in modifying a SageMaker entity, and nothing this emulator stores
+//! makes an artifact non-modifiable (no managed or service-owned artifacts are minted),
+//! while `Properties` overwriting the map before `PropertiesToRemove` prunes it leaves no
+//! contradictory request to arbitrate. The one conflict a request can carry — a name the
+//! Region already has an artifact under — is the constraint refusal `CreateArtifact`
+//! gives for the same fact. An operation whose model declares an error it never raises is
+//! correct; the variant stays on the generated enum for when such an artifact exists.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +149,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateArtifact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateArtifactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateArtifact"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ArtifactArn` is the identifier this operation addresses the artifact by, so the
+        // lineage family's sentence names it as the request sent it — the same refusal the
+        // artifact read and delete paths give for an ARN nothing holds.
+        let not_found = || -> Self::Error {
+            UpdateArtifactErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::does_not_exist(
+                    crate::state::ARTIFACT_ENTITY,
+                    &input.artifact_arn,
+                )),
+            })
+            .into()
+        };
+
+        let mut store = state.lock();
+        // An update of an artifact that was never created, or that has been deleted, is
+        // refused, and creates nothing as a side effect: `CreateArtifact` is the only call
+        // that mints one.
+        let Some(stored) = store.artifacts.get(&input.artifact_arn) else {
+            return Err(not_found());
+        };
+        // The Region the artifact lives in, which is the scope its name is unique within.
+        let region = stored.region.clone();
+
+        // `ArtifactName` is documented unique to an account in a Region, so a rename onto
+        // a name another artifact of that Region already answers to is refused rather than
+        // leaving two artifacts under one name — the fact `CreateArtifact` refuses, worded
+        // by the one template both share. An artifact keeping the name it already has is
+        // not a collision with itself.
+        if let Some(name) = &input.artifact_name {
+            if let Some(existing) = store.artifact_named(&region, name) {
+                if existing.arn != input.artifact_arn {
+                    let existing_arn = existing.arn.clone();
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::artifact_name_in_use(name, &existing_arn),
+                    ));
+                }
+            }
+        }
+        // The minimum an `ArtifactPropertyValue` is enforced to carry is a property of the
+        // value shape rather than of one operation, so this write path refuses the map the
+        // create path refuses, in the same words, and stores nothing when it does.
+        if let Some(properties) = &input.properties {
+            if let Some(refusal) =
+                crate::service::validation::artifact_properties_refusal(properties)
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(refusal));
+            }
+        }
+
+        // Re-reached mutably now every refusal is behind us. The store has stayed locked
+        // throughout, so this is the record resolved above; a key it somehow no longer
+        // holds takes the modelled not-found path rather than panicking a handler.
+        let Some(artifact) = store.artifacts.get_mut(&input.artifact_arn) else {
+            return Err(not_found());
+        };
+
+        if let Some(name) = input.artifact_name {
+            artifact.name = Some(name);
+        }
+        // `Properties` is documented as "the new list of properties. Overwrites the current
+        // property list" (smithy_query doc=UpdateArtifactRequest$Properties), so a supplied
+        // map REPLACES the stored one rather than merging into it — and `PropertiesToRemove`
+        // is then applied to whatever map is in force, which is how a caller drops keys
+        // without restating the ones it keeps. A key named by both is therefore removed,
+        // with no order to guess at.
+        if let Some(properties) = input.properties {
+            artifact.properties = Some(properties.into_iter().collect());
+        }
+        if let Some(to_remove) = input.properties_to_remove {
+            // Removing from an absent map leaves it absent: there is nothing to remove, and
+            // an empty map is a different answer from no map at all.
+            if let Some(properties) = artifact.properties.as_mut() {
+                for key in to_remove {
+                    properties.remove(&key);
+                }
+            }
+        }
+        // This call is a mutation, so the artifact's `LastModifiedTime` moves to now even
+        // when the request carried no member that changed a value.
+        artifact.last_modified_time = ::std::time::SystemTime::now();
+        let arn = artifact.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(UpdateArtifactOutput {
+            artifact_arn: Some(arn),
+        })
     }
 }

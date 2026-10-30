@@ -29,6 +29,8 @@ mod app_image_config_registry;
 mod artifact_deletion;
 #[path = "all/artifact_lineage.rs"]
 mod artifact_lineage;
+#[path = "all/artifact_updates.rs"]
+mod artifact_updates;
 #[path = "all/automl_job_v2_lifecycle.rs"]
 mod automl_job_v2_lifecycle;
 #[path = "all/batch_describe_model_packages.rs"]

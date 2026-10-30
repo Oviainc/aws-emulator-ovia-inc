@@ -108,28 +108,6 @@ impl From<CreateArtifactErrorModeled> for CreateArtifactError {
     }
 }
 
-/// The validation path of the `Properties` member, as the framework's own path spelling
-/// (lowerCamel) writes it — the map a property-value refusal is stated against.
-const PROPERTIES_PATH: &str = "properties";
-
-/// The lower bound a property VALUE must satisfy. The model's `ArtifactPropertyValue`
-/// states `@length 0..4096`, so an empty value is inside the modelled bound and outside
-/// the one the service enforces; this is that enforced minimum.
-const PROPERTY_VALUE_MIN_LENGTH: i64 = 1;
-
-/// The whole constraint set a property VALUE must satisfy, in the order the service
-/// lists it in a refusal: the modelled maximum, the enforced minimum, then the modelled
-/// expression. Source for the two modelled entries:
-/// `smithy_query(query="shape",shape="ArtifactPropertyValue")` — `@length 0..4096`,
-/// `@pattern .*`.
-fn property_value_constraints() -> [::aws_smithy_schema_server::ViolationKind; 3] {
-    [
-        ::aws_smithy_schema_server::ViolationKind::MaxLength(4096),
-        ::aws_smithy_schema_server::ViolationKind::MinLength(PROPERTY_VALUE_MIN_LENGTH),
-        ::aws_smithy_schema_server::ViolationKind::Pattern(".*".to_string()),
-    ]
-}
-
 /// The `CreateArtifact` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,23 +147,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
-        // A lineage-entity property VALUE must carry at least one character. The model's
-        // `ArtifactPropertyValue` states `len 0..4096`, so the boundary validator lets an
-        // empty value through and the service's own minimum is enforced here, worded by
-        // the one module that owns this service's validation dialect: the clause is
-        // stated against the MAP, echoing every entry of it and listing the whole
-        // constraint set a property value must satisfy.
+        // An `ArtifactPropertyValue` must carry at least one character. The model states
+        // `len 0..4096`, so the boundary validator lets an empty value through and the
+        // service's own minimum is enforced by the one module that owns this service's
+        // validation dialect — the same refusal every operation writing such a map gives.
         if let Some(properties) = &input.properties {
-            if properties.values().any(String::is_empty) {
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::service::validation::map_value_message(
-                        PROPERTIES_PATH,
-                        properties
-                            .iter()
-                            .map(|(key, value)| (key.as_str(), value.as_str())),
-                        &property_value_constraints(),
-                    ),
-                ));
+            if let Some(refusal) = crate::service::validation::artifact_properties_refusal(properties)
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(refusal));
             }
         }
 
@@ -211,9 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(name) = &input.artifact_name {
             if let Some(existing) = store.artifact_named(&region, name) {
                 let existing_arn = existing.arn.clone();
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "The artifact name \"{name}\" is already in use by \"{existing_arn}\"."
-                )));
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::artifact_name_in_use(name, &existing_arn),
+                ));
             }
         }
 
