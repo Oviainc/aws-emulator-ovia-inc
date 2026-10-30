@@ -20,6 +20,13 @@
 #[path = "all/query_results.rs"]
 mod query_results;
 
+// `composite_model_definition_views` is declared HERE, beside the suite above, for
+// the reason its note gives: the sorted list and the END of this file are both
+// where every concurrent iotsitewise change puts a declaration of its own. Fold it
+// into the list once the churn settles.
+#[path = "all/composite_model_definition_views.rs"]
+mod composite_model_definition_views;
+
 // `component_model_property_inheritance` is declared HERE, beside the suite above,
 // for the reason that note gives: the sorted list and the END of this file are both
 // where every concurrent iotsitewise change puts a declaration of its own. Fold it
