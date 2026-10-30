@@ -674,21 +674,37 @@ const VERSION_CASES: &[VersionCase] = &[
         provisioned: None,
     },
     // The same two branches on the other engine family whose major version is past its
-    // community end of life: every `mysql` 5.7 build, the RDS Extended Support ones
-    // included, is deprecated, so neither the family nor one of its builds can be
-    // provisioned.
+    // community end of life: the `mysql` 5.7 community release and the RDS Extended
+    // Support builds superseded before this catalogue was published are deprecated, so
+    // neither can be provisioned, while the Extended Support builds the family is still
+    // offered — the ones this report publishes as available — are provisioned like any
+    // other build, which is what Extended Support is for.
     VersionCase {
-        case: "a major version in extended support, whose builds are all deprecated",
+        case: "a major version in extended support, provisioned at its latest build",
         identifier: "emu-ver-mysql-57",
         engine: "mysql",
         requested: Some("5.7"),
-        provisioned: None,
+        provisioned: Some("5.7.44-rds.20260212"),
     },
     VersionCase {
-        case: "a deprecated extended-support build named exactly",
+        case: "an extended-support build named exactly",
         identifier: "emu-ver-mysql-5744",
         engine: "mysql",
         requested: Some("5.7.44-rds.20250213"),
+        provisioned: Some("5.7.44-rds.20250213"),
+    },
+    VersionCase {
+        case: "the deprecated community release the extended-support line continues",
+        identifier: "emu-ver-mysql-5744-community",
+        engine: "mysql",
+        requested: Some("5.7.44"),
+        provisioned: None,
+    },
+    VersionCase {
+        case: "a superseded extended-support build named exactly",
+        identifier: "emu-ver-mysql-5744-old",
+        engine: "mysql",
+        requested: Some("5.7.44-rds.20240408"),
         provisioned: None,
     },
     VersionCase {

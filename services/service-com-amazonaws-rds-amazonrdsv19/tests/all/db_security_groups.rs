@@ -20,7 +20,7 @@
 //! * the region's group quota, filled and then exceeded.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    DB_SECURITY_GROUP_QUOTA_PER_REGION, MAX_FREE_FORM_LEN, MAX_TAGS_PER_RESOURCE,
+    self, DB_SECURITY_GROUP_QUOTA_PER_REGION, MAX_FREE_FORM_LEN, MAX_TAGS_PER_RESOURCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -586,9 +586,10 @@ async fn the_describe_refuses_what_it_cannot_serve_and_pages_what_it_can() {
     );
     let marker = text(&first, "Marker");
     assert_eq!(
-        marker, names[page_size],
-        "case \"the first page\": the marker must name the group the next page starts at, \
-         got {first}"
+        marker,
+        state::encode_marker(&names[page_size]),
+        "case \"the first page\": the marker must be the opaque token for the group the \
+         next page starts at, got {first}"
     );
 
     let second = expect_ok(

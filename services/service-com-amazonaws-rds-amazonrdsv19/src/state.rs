@@ -5624,13 +5624,36 @@ pub fn check_option_list_len(member: &str, len: usize) -> Result<(), String> {
 
 /// One page of an ordered result set, plus the `Marker` to resume from.
 ///
-/// The marker is the key the next page starts AT, so resuming is a single ordered
-/// lookup and a page boundary cannot drift when a record is added or removed between
-/// calls. A marker is returned only while records remain, which is what `@paginated`
-/// callers loop on.
+/// The marker names the record the next page starts AT, so resuming is a single lookup
+/// and a page boundary cannot drift when a record is added or removed between calls. A
+/// marker is returned only while records remain, which is what `@paginated` callers loop
+/// on.
 pub struct Page<T> {
     pub items: Vec<T>,
     pub next_marker: Option<String>,
+}
+
+/// The `Marker` this front door hands a caller for the result-set key `key`.
+///
+/// A `Marker` is "an optional pagination token provided by a previous request"
+/// (`DBEngineVersionMessage$Marker` and every other paginated report of this front door):
+/// the token is OPAQUE, so a caller echoes it back verbatim and parses nothing out of it,
+/// and the service is free to carry in it whatever it needs to resume. This one carries
+/// the key of the record the next page starts at, encoded so that nothing of the result
+/// set's internal key form reaches the wire and so that a token is recognisably a token
+/// rather than a name a caller could have invented.
+///
+/// The codec is `aws_smithy_types::base64` — already in this crate's dependency tree,
+/// because it is the one the wire protocols use for a blob — rather than a hand-rolled
+/// encoder.
+pub fn encode_marker(key: &str) -> String {
+    ::aws_smithy_types::base64::encode(key)
+}
+
+/// The result-set key a `Marker` carries, or `None` when the token is not one this
+/// service issued at all.
+pub fn decode_marker(marker: &str) -> Option<String> {
+    String::from_utf8(::aws_smithy_types::base64::decode(marker).ok()?).ok()
 }
 
 /// The refusal Amazon RDS answers a `Marker` no prior page issued with. Fixed text: the
@@ -5641,15 +5664,15 @@ pub const INVALID_MARKER: &str =
      marker parameter.";
 
 /// Take the page of `records` that starts at `marker` and holds at most
-/// `page_size` items. `records` must be ordered by its key.
+/// `page_size` items. `records` must be in the order the report serves them.
 ///
-/// A `marker` is only ever a key of the result set — that is what this function
-/// returns as `next_marker` — so a marker naming no key of `records` is one no prior
-/// page can have issued. It is REFUSED (the returned message is what the caller
-/// refuses the request with) rather than resynchronised to the nearest key: a
-/// paginator that silently restarts on a cursor the service never handed out reports a
-/// page the caller cannot place, and the real service answers an invalid-parameter
-/// error instead.
+/// A `marker` is only ever a token this service issued for a key of the result set —
+/// that is what this function returns as `next_marker` — so a token that decodes to no
+/// key of `records`, or that does not decode at all, is one no prior page can have
+/// issued. It is REFUSED (the returned message is what the caller refuses the request
+/// with) rather than resynchronised to the nearest key: a paginator that silently
+/// restarts on a cursor the service never handed out reports a page the caller cannot
+/// place, and the real service answers an invalid-parameter error instead.
 pub fn paginate<T>(
     records: Vec<(String, T)>,
     marker: Option<&str>,
@@ -5657,16 +5680,15 @@ pub fn paginate<T>(
 ) -> Result<Page<T>, String> {
     let start = match marker {
         None => 0,
-        Some(marker) => records
-            .iter()
-            .position(|(key, _)| key.as_str() == marker)
+        Some(marker) => decode_marker(marker)
+            .and_then(|key| records.iter().position(|(held, _)| *held == key))
             // The wording Amazon RDS answers a marker it never issued with: it carries no
             // variable part at all — not even the token — and tells the caller the two
             // ways to ask again.
             .ok_or_else(|| INVALID_MARKER.to_string())?,
     };
     let end = start.saturating_add(page_size).min(records.len());
-    let next_marker = records.get(end).map(|(key, _)| key.clone());
+    let next_marker = records.get(end).map(|(key, _)| encode_marker(key));
     let items = records
         .into_iter()
         .skip(start)
@@ -5713,6 +5735,36 @@ pub struct CaCertificate {
     pub valid_from: &'static str,
     /// `Certificate$ValidTill`, as an ISO-8601 instant.
     pub valid_till: &'static str,
+    /// The key this authority signs with, which the identifier itself names
+    /// (`rds-ca-rsa2048-g1`, `rds-ca-ecc384-g1`).
+    pub key: CertificateKey,
+}
+
+/// The public-key algorithm a published certificate authority signs with.
+///
+/// It is a property of the authority that an ENGINE's report reads twice: an engine
+/// version publishes the authorities it can be launched under in one order — the
+/// elliptic-curve authority, then the RSA ones from the longest key to the shortest — and
+/// an engine whose endpoint serves no ECDSA certificate publishes none of the first kind
+/// (see [`ca_certificates_offered_to`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateKey {
+    /// An ECDSA authority, over a curve of this many bits.
+    EllipticCurve(u32),
+    /// An RSA authority, with a modulus of this many bits.
+    Rsa(u32),
+}
+
+impl CertificateKey {
+    /// The order an engine version publishes its supported authorities in: every
+    /// elliptic-curve authority before every RSA one, and within a kind the longest key
+    /// first.
+    fn publication_rank(self) -> (u8, std::cmp::Reverse<u32>) {
+        match self {
+            Self::EllipticCurve(bits) => (0, std::cmp::Reverse(bits)),
+            Self::Rsa(bits) => (1, std::cmp::Reverse(bits)),
+        }
+    }
 }
 
 impl CaCertificate {
@@ -5780,24 +5832,28 @@ pub const CA_CERTIFICATES: &[CaCertificate] = &[
         certificate_type: "CA",
         valid_from: "2019-08-22T00:00:00Z",
         valid_till: "2024-08-22T00:00:00Z",
+        key: CertificateKey::Rsa(2048),
     },
     CaCertificate {
         identifier: "rds-ca-ecc384-g1",
         certificate_type: "CA",
         valid_from: "2021-05-25T00:00:00Z",
         valid_till: "2121-05-25T00:00:00Z",
+        key: CertificateKey::EllipticCurve(384),
     },
     CaCertificate {
         identifier: "rds-ca-rsa2048-g1",
         certificate_type: "CA",
         valid_from: "2021-05-25T00:00:00Z",
         valid_till: "2061-05-25T00:00:00Z",
+        key: CertificateKey::Rsa(2048),
     },
     CaCertificate {
         identifier: "rds-ca-rsa4096-g1",
         certificate_type: "CA",
         valid_from: "2021-05-25T00:00:00Z",
         valid_till: "2121-05-25T00:00:00Z",
+        key: CertificateKey::Rsa(4096),
     },
 ];
 
@@ -5809,18 +5865,50 @@ pub const CA_CERTIFICATES: &[CaCertificate] = &[
 /// `DescribeCertificates` ([`CA_CERTIFICATES`]), so the two reports cannot name different
 /// certificates — minus any entry whose `ValidTill` has passed: a caller picks the
 /// `CACertificateIdentifier` of a new instance out of this list, and an expired
-/// certificate is not something it can be launched with. The catalogue is ordered, so the
-/// list is too.
+/// certificate is not something it can be launched with. The order is the one an engine
+/// version publishes its authorities in ([`CertificateKey::publication_rank`]) rather than
+/// the catalogue's own identifier order, which is what `DescribeCertificates` reports the
+/// catalogue in.
+///
+/// Which of these a given engine publishes is [`ca_certificates_offered_to`]: this is the
+/// whole set, for an engine offered every authority.
 pub fn supported_ca_certificate_identifiers() -> Vec<String> {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since_epoch| since_epoch.as_secs() as i64);
-    CA_CERTIFICATES
+    let mut launchable: Vec<&CaCertificate> = CA_CERTIFICATES
         .iter()
         .filter(|certificate| {
             catalog_instant(certificate.valid_till).is_some_and(|till| till.secs() > now)
         })
+        .collect();
+    launchable.sort_by_key(|certificate| certificate.key.publication_rank());
+    launchable
+        .into_iter()
         .map(|certificate| certificate.identifier.to_string())
+        .collect()
+}
+
+/// The authorities among `published` that a version of `engine` can be launched under, in
+/// the order `published` holds them.
+///
+/// The supported-authority list is a property of the ENGINE, not of the catalogue: the
+/// Aurora engines publish the service's elliptic-curve authority beside the RSA ones,
+/// while an engine whose endpoint serves only an RSA certificate publishes only those —
+/// which is what the recorded wire reports for the DB instance engines and for the
+/// Amazon DocumentDB cluster engine. A caller reads this list to choose the
+/// `CACertificateIdentifier` of a new instance or cluster, so naming an authority the
+/// engine cannot be launched under would be naming a value its create refuses.
+pub fn ca_certificates_offered_to(engine: &str, published: &[String]) -> Vec<String> {
+    published
+        .iter()
+        .filter(|identifier| {
+            ca_certificate(identifier).is_some_and(|certificate| match certificate.key {
+                CertificateKey::EllipticCurve(_) => is_aurora(engine),
+                CertificateKey::Rsa(_) => true,
+            })
+        })
+        .cloned()
         .collect()
 }
 

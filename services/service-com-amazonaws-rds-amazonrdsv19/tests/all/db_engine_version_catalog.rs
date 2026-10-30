@@ -35,7 +35,7 @@
 use service_com_amazonaws_rds_amazonrdsv19::state::DB_INSTANCE_ENGINES;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::db_engine_versions::{all_versions_of, versions, Version, CUSTOM_ENGINES};
+use crate::db_engine_versions::{all_versions_of, versions, walk_every_version, Version, CUSTOM_ENGINES};
 use crate::db_instances::{call, emulator, expect_ok, subtrees, text, texts};
 use crate::engine_version_families::{dated_build, is_build_date};
 
@@ -284,12 +284,10 @@ async fn every_reported_version_is_published_in_its_engine_familys_form() {
     let router = emulator();
 
     // The whole report, so an engine this suite's tables do not name is still covered:
-    // the sibling control planes' engines (`docdb`, `neptune`) are reported here too.
-    let body = expect_ok(
-        "every version",
-        call(&router, ACTION, &[("IncludeAll", "true".to_string())]).await,
-    );
-    let reported = versions(&body);
+    // the sibling control planes' engines (`docdb`, `neptune`) are reported here too. The
+    // catalogue is longer than one page, so it is WALKED rather than read from a single
+    // answer — the report's own pages, at the largest page size the member admits.
+    let reported = walk_every_version(&router, "every version", 100).await;
     assert!(
         !reported.is_empty(),
         "case \"every version\": the report must carry the catalogue, got nothing"

@@ -84,14 +84,10 @@ pub(crate) async fn call_in<N: AsRef<str>, V: AsRef<str>>(
     let mut body = format!("Action={action}&Version=2014-10-31");
     for (name, value) in params {
         let (name, value) = (name.as_ref(), value.as_ref());
-        assert!(
-            !value.contains(['&', '=', '+', '%']),
-            "test parameter {name} would need form escaping: {value:?}"
-        );
         body.push('&');
         body.push_str(name);
         body.push('=');
-        body.push_str(value);
+        body.push_str(&form_encode(value));
     }
     let request = http::Request::builder()
         .method("POST")
@@ -110,6 +106,26 @@ pub(crate) async fn call_in<N: AsRef<str>, V: AsRef<str>>(
     let status = response.status().as_u16();
     let body = String::from_utf8(response.body().to_vec()).expect("a UTF-8 response body");
     (status, body)
+}
+
+/// One form value as a client puts it in an `application/x-www-form-urlencoded` body:
+/// every byte outside the unreserved set (`A-Z`, `a-z`, `0-9`, `-`, `_`, `.`, `~`) is
+/// percent-escaped.
+///
+/// Escaping rather than refusing is what lets a row send a value whose own alphabet
+/// overlaps the body's syntax — an opaque pagination token is base64, so `+`, `/` and `=`
+/// are in it — exactly as an SDK would send it.
+fn form_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
 }
 
 /// One awsQuery call against [`REGION`].

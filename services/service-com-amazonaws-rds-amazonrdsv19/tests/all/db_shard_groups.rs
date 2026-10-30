@@ -26,7 +26,7 @@
 //! the region allowance plus one create past it, and each state a delete is answered in.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    COMPUTE_REDUNDANCY_VALUES, DB_SHARD_GROUP_QUOTA_PER_REGION, DEFAULT_COMPUTE_REDUNDANCY,
+    self, COMPUTE_REDUNDANCY_VALUES, DB_SHARD_GROUP_QUOTA_PER_REGION, DEFAULT_COMPUTE_REDUNDANCY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -676,9 +676,10 @@ async fn the_report_pages_at_max_records_and_resumes_from_its_marker() {
         "expected no marker where no record remains, got {second}"
     );
     assert_eq!(
-        second_page.first().map(String::as_str),
-        Some(marker.as_str()),
-        "expected the marker to name the key the next page starts at, got {second}"
+        second_page.first().map(|identifier| state::encode_marker(identifier)),
+        Some(marker.clone()),
+        "expected the marker to be the opaque token for the record the next page starts \
+         at, got {second}"
     );
 
     let mut expected: Vec<String> = (0..total)

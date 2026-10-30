@@ -225,22 +225,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the certificate catalogue, because they are a property of the catalogue and
         // the instant the request arrived, not of any one engine version.
         let certificates = crate::state::supported_ca_certificate_identifiers();
-        // `catalogue()` yields the rows in catalogue order, so the keys below ascend and
-        // `paginate` can cut a page from them directly.
+        // `catalogue()` yields the rows in catalogue order, which is the order this
+        // report serves them in, so `paginate` can cut a page from them directly.
         let mut matching: Vec<(String, CreateCustomDBEngineVersionOutput)> = catalogue()
             .filter(|(_, entry, _)| {
                 matches_request(&SelectableVersion::of_catalogue(entry), &input, &filters)
             })
             .map(|(index, entry, facts)| {
                 (
-                    page_key(index),
+                    page_key(entry),
                     to_wire(entry, facts, index, &input, &certificates),
                 )
             })
             .collect();
         // Then the custom engine versions this account created in this region, in stored
-        // key order — which is why their page keys sort after every catalogue key, so one
-        // total order still carries the whole report.
+        // key order — after every catalogue row, so one order carries the whole report.
         if let Some(state) = crate::state::service_state(&*self.engine) {
             let mut store = state.lock();
             // A CEV reaches `available` on its own once the media import this service owes
@@ -302,26 +301,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The pagination key of the catalogue row at `index`.
+/// The pagination key of one catalogue row.
 ///
-/// `Marker` is an opaque pagination token, so what it owes a caller is that it is STABLE
-/// and ORDERED: `paginate` resumes at the first key at or past it, so paging walks one
-/// total order and a page boundary cannot drift between calls. The catalogue POSITION is
-/// both, and it keeps the report in the catalogue's own order — grouped by engine,
-/// ascending by version — rather than in the lexicographic order of version strings,
-/// under which `10.11.9` would be reported before the EARLIER `10.5.28`. Zero-padded so
-/// that lexicographic key order is numeric position order.
-fn page_key(index: usize) -> String {
-    format!("{index:06}")
+/// `Marker` is an opaque pagination token (it reaches the wire through
+/// `crate::state::encode_marker`), so what the key behind it owes a caller is that it
+/// NAMES the entry the next page starts at: `paginate` resumes at the entry carrying this
+/// key, so a page boundary cannot drift when the result set a later call selects differs,
+/// and the report keeps the catalogue's own order — grouped by engine, ascending by
+/// version — rather than the lexicographic order of version strings, under which `10.11.9`
+/// would be reported before the EARLIER `10.5.28`. The row's `(engine, version)` identity
+/// is that name, and it is unique: no engine publishes one version twice.
+fn page_key(entry: &CatalogVersion) -> String {
+    format!("{}/{}", entry.engine, entry.engine_version)
 }
 
 /// The pagination key of one stored CUSTOM engine version.
 ///
-/// Stable and ordered for the same reason [`page_key`] is, and keyed by the record's own
-/// `(engine, version)` key so the account's CEVs are reported in the order the store
-/// holds them. The prefix is what keeps the two halves of this report in ONE total order:
-/// no digit sorts above a letter, so every custom entry follows every catalogue entry
-/// however many catalogue rows there are.
+/// Names the entry the next page starts at for the same reason [`page_key`] does, and is
+/// keyed by the record's own `(engine, version)` key so the account's CEVs are reported in
+/// the order the store holds them. The prefix is what keeps a stored record's key distinct
+/// from the catalogue key of a row of the same engine and version.
 fn custom_page_key(record: &crate::state::CustomDbEngineVersionRecord) -> String {
     format!("cev:{}", record.key())
 }
@@ -656,16 +655,32 @@ const SQLSERVER_FEATURE_NAMES: &[&str] = &["S3_INTEGRATION", "SQLSERVER_BACKUP_R
 // The version profiles: one per (engine family, capability generation)
 // ---------------------------------------------------------------------------
 
-/// RDS for MySQL 5.7: read replicas and S3 import. The zero-ETL integration members
-/// arrived with 8.0, so a 5.7 version reports none.
+/// RDS for MySQL 5.7: read replicas and a DB proxy, and no S3 integration feature.
+///
+/// The zero-ETL integration members arrived with 8.0, so a 5.7 version reports none — and
+/// so did rotating the server certificate without rebooting the DB instance, which this
+/// family's versions therefore report unsupported rather than claiming a rotation a 5.7 DB
+/// instance cannot take without a restart.
 const MYSQL_5_7: VersionProfile = VersionProfile::provisioned()
     .read_replica()
-    .certificate_rotation_without_restart()
     .rds_proxy()
     .features(NO_FEATURE_NAMES);
 
-/// RDS for MySQL 8.0 and later, which also supports a zero-ETL integration.
-const MYSQL_8: VersionProfile = MYSQL_5_7.integrations();
+/// RDS for MySQL 8.0 builds from BEFORE the generation that added the zero-ETL
+/// integration: the same capabilities a 5.7 build has.
+///
+/// A capability is the VERSION's, not the engine's, so a build published before AWS
+/// offered one reports it unsupported rather than inheriting it from later builds of the
+/// same family.
+const MYSQL_8_EARLY: VersionProfile = MYSQL_5_7;
+
+/// RDS for MySQL 8.0.32 and later: the generation that added a zero-ETL integration with
+/// Amazon Redshift ("Amazon RDS zero-ETL integrations with Amazon Redshift" requires RDS
+/// for MySQL version 8.0.32 or higher, Amazon RDS User Guide) and a server certificate the
+/// DB instance picks up without a restart.
+const MYSQL_8: VersionProfile = MYSQL_5_7
+    .integrations()
+    .certificate_rotation_without_restart();
 
 /// RDS for MariaDB: read replicas, and no S3 or Lambda integration feature.
 const MARIADB: VersionProfile = VersionProfile::provisioned()
@@ -1730,7 +1745,11 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     // Amazon RDS Extended Support, named `<version>-rds.YYYYMMDD` after the day the build
     // was cut ("Using Amazon RDS Extended Support", Amazon RDS User Guide). They are the
     // builds the family can still be created and patched with, so they are the LATER
-    // entries of it and the last of them is the family's default.
+    // entries of it, every one of them a build this service still OFFERS — `available`,
+    // not `deprecated`, which is reserved for the builds the family can no longer be
+    // created with (the community release the Extended Support line continues, and the
+    // Extended Support builds superseded before this catalogue was published) — and the
+    // last of them is the family's default.
     row(
         "mysql",
         "5.7.44-rds.20240408",
@@ -1745,9 +1764,158 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "5.7.44-rds.20250213",
         "5.7",
         "mysql5.7",
-        STATUS_DEPRECATED,
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_5_7,
+    ),
+    row(
+        "mysql",
+        "5.7.44-rds.20250508",
+        "5.7",
+        "mysql5.7",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_5_7,
+    ),
+    row(
+        "mysql",
+        "5.7.44-rds.20250818",
+        "5.7",
+        "mysql5.7",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_5_7,
+    ),
+    row(
+        "mysql",
+        "5.7.44-rds.20251212",
+        "5.7",
+        "mysql5.7",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_5_7,
+    ),
+    row(
+        "mysql",
+        "5.7.44-rds.20260212",
+        "5.7",
+        "mysql5.7",
+        STATUS_AVAILABLE,
         DefaultLevel::Major,
         &MYSQL_5_7,
+    ),
+    // The 8.0 family: the community releases of it this service publishes, ascending. A
+    // family under standard support publishes the releases a client can still create and
+    // minor-upgrade between — which is more than a sample of it, because a family that
+    // published one row would offer no minor upgrade at all — and its last row is the
+    // family's default, the build an automatic minor upgrade moves onto.
+    row(
+        "mysql",
+        "8.0.23",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8_EARLY,
+    ),
+    row(
+        "mysql",
+        "8.0.25",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8_EARLY,
+    ),
+    row(
+        "mysql",
+        "8.0.26",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8_EARLY,
+    ),
+    row(
+        "mysql",
+        "8.0.27",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8_EARLY,
+    ),
+    row(
+        "mysql",
+        "8.0.28",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8_EARLY,
+    ),
+    row(
+        "mysql",
+        "8.0.30",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8_EARLY,
+    ),
+    row(
+        "mysql",
+        "8.0.31",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8_EARLY,
+    ),
+    row(
+        "mysql",
+        "8.0.32",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8,
+    ),
+    row(
+        "mysql",
+        "8.0.33",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8,
+    ),
+    row(
+        "mysql",
+        "8.0.34",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8,
+    ),
+    row(
+        "mysql",
+        "8.0.35",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8,
+    ),
+    row(
+        "mysql",
+        "8.0.36",
+        "8.0",
+        "mysql8.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &MYSQL_8,
     ),
     row(
         "mysql",
@@ -1776,6 +1944,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         DefaultLevel::Major,
         &MYSQL_8,
     ),
+    // The 8.4 LTS family.
     row(
         "mysql",
         "8.4.3",
@@ -2109,7 +2278,9 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     // PostgreSQL 11's RDS Extended Support builds, in the same `-rds.YYYYMMDD` form as
     // the MySQL 5.7 ones above: the same rule, applied to the other family this service
-    // publishes past its community end of life.
+    // publishes past its community end of life — the build the family is still offered is
+    // `available` and is the family's default, while the build it has moved past, like the
+    // community release the line continues, is `deprecated`.
     row(
         "postgres",
         "11.22-rds.20240418",
@@ -2124,7 +2295,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "11.22-rds.20241121",
         "11",
         "postgres11",
-        STATUS_DEPRECATED,
+        STATUS_AVAILABLE,
         DefaultLevel::Major,
         &POSTGRES,
     ),
@@ -2704,11 +2875,27 @@ fn valid_upgrade_targets(
             UpgradeTarget {
                 engine: Some(target.engine.to_string()),
                 engine_version: Some(target.engine_version.to_string()),
+                // The target's own version split, reported for the same reason the entry
+                // reports its own: a client compares the minor version it runs with the
+                // one an upgrade would move it to.
+                major_engine_version: Some(target.major_engine_version.to_string()),
+                minor_engine_version: Some(minor_engine_version(
+                    target.engine_version,
+                    target.major_engine_version,
+                )),
                 description: Some(version_description(facts, target.engine_version)),
                 // An automatic MINOR upgrade only ever moves within one major version,
                 // and only onto that major version's default.
                 auto_upgrade: Some(within_one_major && target.default_level.is_major_default()),
                 is_major_version_upgrade: Some(!within_one_major),
+                // `SupportsSnapshotUpgrade` — whether a DB SNAPSHOT of this entry's
+                // version can be upgraded straight to the target rather than having to be
+                // restored and then upgraded. What "Upgrading a DB snapshot engine
+                // version" (Amazon RDS User Guide) documents being able to do to a
+                // snapshot is a MAJOR version upgrade, so that is the target kind this
+                // reports it for; restoring a snapshot into a later minor version of its
+                // own family needs no such upgrade at all.
+                supports_snapshot_upgrade: Some(!within_one_major),
                 supported_engine_modes: Some(strings(target.profile.engine_modes)),
                 supports_parallel_query: Some(target.profile.supports_parallel_query),
                 supports_global_databases: Some(target.profile.supports_global_databases),
@@ -2871,8 +3058,12 @@ fn to_wire(
         // that ONE catalogue (`crate::state::CA_CERTIFICATES`) rather than restated here,
         // and the two reports cannot name different certificates. An entry whose
         // `ValidTill` has passed is left out: an expired certificate is not one a new
-        // instance can be launched with.
-        supported_ca_certificate_identifiers: Some(certificates.to_vec()),
+        // instance can be launched with; so is an authority this ENGINE is not offered
+        // (`crate::state::ca_certificates_offered_to`).
+        supported_ca_certificate_identifiers: Some(crate::state::ca_certificates_offered_to(
+            entry.engine,
+            certificates,
+        )),
         exportable_log_types: Some(strings(facts.exportable_log_types)),
         supports_log_exports_to_cloudwatch_logs: Some(!facts.exportable_log_types.is_empty()),
         supports_read_replica: Some(profile.supports_read_replica),
@@ -3048,7 +3239,10 @@ pub(crate) fn custom_version_to_wire(
             .then(|| crate::state::MEDIA_TYPE_CUSTOMER_PROVIDED.to_string()),
         status: Some(record.status.clone()),
         tag_list: Some(record.tags.clone()),
-        supported_ca_certificate_identifiers: Some(certificates.to_vec()),
+        supported_ca_certificate_identifiers: Some(crate::state::ca_certificates_offered_to(
+            &record.engine,
+            certificates,
+        )),
         exportable_log_types: Some(strings(exportable_log_types)),
         supports_log_exports_to_cloudwatch_logs: Some(!exportable_log_types.is_empty()),
         supported_engine_modes: Some(strings(profile.engine_modes)),

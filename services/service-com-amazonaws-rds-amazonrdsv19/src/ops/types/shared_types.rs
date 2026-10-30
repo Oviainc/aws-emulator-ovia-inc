@@ -657,9 +657,12 @@ pub struct CustomDBEngineVersionAMI {
 pub struct UpgradeTarget {
     pub engine: Option<String>,
     pub engine_version: Option<String>,
+    pub major_engine_version: Option<String>,
+    pub minor_engine_version: Option<String>,
     pub description: Option<String>,
     pub auto_upgrade: Option<bool>,
     pub is_major_version_upgrade: Option<bool>,
+    pub supports_snapshot_upgrade: Option<bool>,
     pub supported_engine_modes: Option<Vec<String>>,
     pub supports_parallel_query: Option<bool>,
     pub supports_global_databases: Option<bool>,

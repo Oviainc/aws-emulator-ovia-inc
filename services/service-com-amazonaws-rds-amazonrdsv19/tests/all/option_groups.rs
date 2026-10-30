@@ -24,7 +24,7 @@
 //! scope one name resolves in.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    OPTION_GROUP_ENGINE_NAMES, OPTION_GROUP_QUOTA_PER_REGION,
+    self, OPTION_GROUP_ENGINE_NAMES, OPTION_GROUP_QUOTA_PER_REGION,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -73,14 +73,20 @@ async fn call_in(
 ) -> Answer {
     let mut body = format!("Action={action}&Version=2014-10-31");
     for (name, value) in params {
-        assert!(
-            !value.contains(['&', '=', '+', '%', ' ']),
-            "test parameter {name} would need form escaping: {value:?}"
-        );
         body.push('&');
         body.push_str(name);
         body.push('=');
-        body.push_str(value);
+        // Percent-escaped exactly as the shared harness escapes a form value, so a row
+        // can send a value whose own alphabet overlaps the body's syntax — an opaque
+        // pagination token is base64, so `+`, `/` and `=` are in it.
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    body.push(char::from(byte));
+                }
+                other => body.push_str(&format!("%{other:02X}")),
+            }
+        }
     }
     let request = http::Request::builder()
         .method("POST")
@@ -769,11 +775,15 @@ async fn describe_resumes_from_the_marker() {
         "case \"the first page\": a page that holds every group must carry no Marker: {first}"
     );
 
-    // Resuming AT a name reports that name and the ones after it: the marker is the
-    // key the next page starts at.
+    // Resuming AT the token for a name reports that name and the ones after it: the
+    // marker is the opaque token for the key the next page starts at.
     let resumed = expect_ok(
         "resume from the second name",
-        describe(&router, &[("Marker", names[1].to_string())]).await,
+        describe(
+            &router,
+            &[("Marker", state::encode_marker(names[1]))],
+        )
+        .await,
     );
     let reported = reported_names(&resumed);
     assert_eq!(

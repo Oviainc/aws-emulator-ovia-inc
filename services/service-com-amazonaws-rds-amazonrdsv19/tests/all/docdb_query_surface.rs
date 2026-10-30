@@ -39,7 +39,7 @@ use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    CA_CERTIFICATES, DEFAULT_CA_CERTIFICATE_IDENTIFIER, STATUS_TRANSITION_DELAY,
+    CertificateKey, CA_CERTIFICATES, DEFAULT_CA_CERTIFICATE_IDENTIFIER, STATUS_TRANSITION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -539,30 +539,46 @@ async fn an_engine_version_reports_the_certificates_it_can_be_launched_with() {
 
     // The rule's source is the certificate catalogue `DescribeCertificates` reports: an
     // engine version can be launched with the certificates in it that have NOT expired,
-    // so the two reports cannot name different certificates.
+    // so the two reports cannot name different certificates. WHICH of them an entry
+    // publishes is the ENGINE's: the still-valid authorities an engine is offered, the
+    // elliptic-curve one first and then the RSA ones from the longest key to the shortest,
+    // and the elliptic-curve authority only for an Aurora engine.
     let certificates = expect_ok(
         "the certificate catalogue",
         call(&router, "DescribeCertificates", &params!["MaxRecords" => 20]).await,
     );
     let reported: Vec<String> = texts(&certificates, "CertificateIdentifier");
-    let expected: Vec<String> = CA_CERTIFICATES
+    let mut still_valid: Vec<(u8, u32, String)> = CA_CERTIFICATES
         .iter()
         .filter(|certificate| !has_expired(certificate.valid_till))
-        .map(|certificate| certificate.identifier.to_string())
+        .map(|certificate| match certificate.key {
+            CertificateKey::EllipticCurve(bits) => (0, bits, certificate.identifier.to_string()),
+            CertificateKey::Rsa(bits) => (1, bits, certificate.identifier.to_string()),
+        })
         .collect();
+    still_valid.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+    let published = |engine: &str| -> Vec<String> {
+        still_valid
+            .iter()
+            .filter(|(kind, _, _)| *kind == 1 || engine.starts_with("aurora"))
+            .map(|(_, _, identifier)| identifier.clone())
+            .collect()
+    };
+    let every_authority: Vec<String> = published("aurora-mysql");
     assert!(
-        expected.len() < reported.len(),
+        every_authority.len() < reported.len(),
         "the catalogue must hold an expired certificate too, or this rule tests nothing: \
-         reported {reported:?}, still valid {expected:?}"
+         reported {reported:?}, still valid {every_authority:?}"
     );
     assert!(
-        expected.contains(&DEFAULT_CA_CERTIFICATE_IDENTIFIER.to_string()),
+        every_authority.contains(&DEFAULT_CA_CERTIFICATE_IDENTIFIER.to_string()),
         "the certificate new instances get must be one an engine version can be launched \
-         with, got {expected:?}"
+         with, got {every_authority:?}"
     );
 
     for engine in catalogue_engines(&router).await {
         let case = format!("the certificates of {engine}");
+        let expected = published(&engine);
         let body = expect_ok(
             &case,
             call(
@@ -584,8 +600,8 @@ async fn an_engine_version_reports_the_certificates_it_can_be_launched_with() {
             let listed = texts(&wrapped[0], "member");
             assert_eq!(
                 listed, expected,
-                "case {case:?}: an engine version reports the certificates the catalogue \
-                 still offers, got {listed:?}"
+                "case {case:?}: an engine version reports the certificates this engine can \
+                 be launched with, got {listed:?}"
             );
         }
     }

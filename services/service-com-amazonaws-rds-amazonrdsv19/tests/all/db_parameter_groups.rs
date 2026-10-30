@@ -24,7 +24,7 @@
 //! * pagination at the page size and across the marker.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    DOCDB_PARAMETER_GROUP_FAMILIES, MAX_FREE_FORM_LEN, MAX_PARAMETER_GROUP_NAME_LEN,
+    self, DOCDB_PARAMETER_GROUP_FAMILIES, MAX_FREE_FORM_LEN, MAX_PARAMETER_GROUP_NAME_LEN,
     MAX_TAGS_PER_RESOURCE, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -715,9 +715,10 @@ async fn the_describe_refuses_what_it_cannot_serve_and_pages_what_it_can() {
     );
     let marker = text(&first, "Marker");
     assert_eq!(
-        marker, names[page_size],
-        "case \"the first page\": the marker must name the group the next page starts at, \
-         got {first}"
+        marker,
+        state::encode_marker(&names[page_size]),
+        "case \"the first page\": the marker must be the opaque token for the group the \
+         next page starts at, got {first}"
     );
 
     let second = expect_ok(
