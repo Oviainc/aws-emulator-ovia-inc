@@ -281,9 +281,10 @@ impl ComAmazonawsEbsEbsState {
 
     /// Mint the opaque block token for `(snapshot_id, block_index)`.
     ///
-    /// Base64 of a 32-byte digest, so the value is inside both the modeled `BlockToken`
-    /// pattern `^[A-Za-z0-9+/=]+$` and the wider [`BLOCK_TOKEN_PATTERN`] the service
-    /// accepts, and inside [`BLOCK_TOKEN_LENGTH`].
+    /// A 32-byte digest rendered by [`query_safe_token_text`], so the token is inside both
+    /// the modeled `BlockToken` pattern `^[A-Za-z0-9+/=]+$` and the wider
+    /// [`BLOCK_TOKEN_PATTERN`] the service accepts, inside [`BLOCK_TOKEN_LENGTH`], and
+    /// carried in `GetSnapshotBlock`'s `blockToken` query with no escaping.
     ///
     /// The token is stored on the [`BlockEntry`] it names and NOWHERE else: there is no
     /// side table of live tokens to keep in step or to reclaim, so `GetSnapshotBlock`
@@ -296,7 +297,7 @@ impl ComAmazonawsEbsEbsState {
             b"block-token",
             &[snapshot_id.as_bytes(), &block_index.to_be_bytes()],
         );
-        ::aws_smithy_types::base64::encode(digest)
+        query_safe_token_text(&digest)
     }
 
     /// Materialise every status change the CLOCK has already made due.
@@ -510,18 +511,38 @@ pub fn expiry_from_timeout(start_time: SystemTime, timeout_minutes: i32) -> Syst
 /// `next_block_index` of `snapshot_id`.
 ///
 /// Derived, not stored: a listing is a read, so it must not write a page-token record
-/// that a later caller would observe. Base64 keeps the value inside the modeled
-/// `PageToken` pattern `^[A-Za-z0-9+/=]+$`.
+/// that a later caller would observe. [`query_safe_token_text`] keeps the value inside the
+/// modeled `PageToken` pattern `^[A-Za-z0-9+/=]+$` and carryable in the `pageToken` query
+/// with no escaping.
 pub fn encode_page_token(snapshot_id: &str, next_block_index: i32) -> String {
-    ::aws_smithy_types::base64::encode(format!("{snapshot_id}:{next_block_index}"))
+    query_safe_token_text(format!("{snapshot_id}:{next_block_index}").as_bytes())
 }
 
 /// The inverse of [`encode_page_token`]; `None` for anything this service did not mint.
 pub fn decode_page_token(token: &str) -> Option<(String, i32)> {
-    let raw = ::aws_smithy_types::base64::decode(token).ok()?;
+    let raw = hex::decode(token).ok()?;
     let text = String::from_utf8(raw).ok()?;
     let (snapshot_id, index) = text.rsplit_once(':')?;
     Some((snapshot_id.to_string(), index.parse().ok()?))
+}
+
+/// The text of a token this service mints for a caller to hand back in a URI QUERY: a
+/// `BlockToken` (`GetSnapshotBlock`'s `blockToken`) or a page token (`ListSnapshotBlocks`
+/// and `ListChangedBlocks`'s `pageToken`).
+///
+/// Lowercase hex of `bytes`, so the token is drawn from `[0-9a-f]` alone — characters RFC
+/// 3986 §2.3 leaves unreserved. A query value made only of those needs no escaping, so
+/// every client spells the token on the wire exactly as this service minted it, and the
+/// bytes a request signature is computed over are the bytes the token is read back from.
+/// A token spelt with characters a query reserves (`+`, `/`, `=`, which standard base64
+/// uses) instead travels in whichever of several forms the client chose, and the same
+/// token then arrives as different query bytes from different callers.
+///
+/// Opacity is unchanged: the caller is given a value to return verbatim, and 32 bytes of
+/// digest render as 64 characters, well inside the modelled `@length` 0..256 of both
+/// `BlockToken` and `PageToken`.
+pub fn query_safe_token_text(bytes: &[u8]) -> String {
+    hex::encode(bytes)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

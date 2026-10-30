@@ -24,7 +24,8 @@ tracing = { workspace = true }
 # SHA256 is the only checksum algorithm the EBS direct APIs model, and every block's
 # `Checksum` is computed over the bytes this service persisted.
 sha2 = { workspace = true }
-# Snapshot ids are lowercase hex (`^snap-[0-9a-f]+$`).
+# Snapshot ids are lowercase hex (`^snap-[0-9a-f]+$`), and so is every opaque token this
+# service mints for a caller to hand back in a URI query.
 hex = { workspace = true }
 
 [build-dependencies]

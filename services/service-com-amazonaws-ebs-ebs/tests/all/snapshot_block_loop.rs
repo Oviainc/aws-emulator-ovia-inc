@@ -91,7 +91,7 @@ impl Reply {
     }
 }
 
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -118,8 +118,10 @@ async fn send(
 
 /// Percent-encode a value for use inside a query string.
 ///
-/// A `BlockToken` and a `NextToken` are Base64 (`^[A-Za-z0-9+/=]+$`), and `+` in a query
-/// string means a space, so the value has to be escaped exactly as an SDK escapes it.
+/// The modelled `BlockToken` and `PageToken` pattern `^[A-Za-z0-9+/=]+$` admits `+`, `/`
+/// and `=`, which a query reserves (`+` means a space), so a value a test invents has to
+/// be escaped exactly as an SDK escapes it. A token this service MINTS needs no escaping
+/// at all — that is asserted in `minted_query_tokens.rs`.
 ///
 /// Written out rather than pulled from a crate deliberately: this is ten lines of
 /// test-only escaping, and adding a `[dev-dependencies]` entry for it is the only thing
