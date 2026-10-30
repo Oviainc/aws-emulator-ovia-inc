@@ -25,6 +25,8 @@ mod anomaly_detector_listing;
 mod anomaly_detector_update;
 #[path = "all/audit_records.rs"]
 mod audit_records;
+#[path = "all/create_on_a_workspace_whose_removal_is_owed.rs"]
+mod create_on_a_workspace_whose_removal_is_owed;
 #[path = "all/create_while_a_removal_is_owed.rs"]
 mod create_while_a_removal_is_owed;
 #[path = "all/default_scraper_configuration.rs"]

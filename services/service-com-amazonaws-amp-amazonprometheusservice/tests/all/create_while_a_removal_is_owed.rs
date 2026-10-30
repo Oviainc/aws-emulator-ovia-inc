@@ -49,7 +49,12 @@ fn stored_logging(amp: &Amp, region: &str, workspace_id: &str) -> Option<Logging
 }
 
 /// `POST /workspaces/{workspaceId}/logging/query` — CreateQueryLoggingConfiguration.
-async fn create_query_logging(
+///
+/// `pub(crate)` with [`describe_query_logging`] and [`query_body`], so the suite that
+/// pins the same rule for the PARENT's pending removal
+/// ([`crate::create_on_a_workspace_whose_removal_is_owed`]) drives this operation through
+/// the one copy of these helpers.
+pub(crate) async fn create_query_logging(
     amp: &Amp,
     region: &str,
     workspace_id: &str,
@@ -65,7 +70,7 @@ async fn create_query_logging(
 }
 
 /// `GET /workspaces/{workspaceId}/logging/query` — DescribeQueryLoggingConfiguration.
-async fn describe_query_logging(amp: &Amp, region: &str, workspace_id: &str) -> Reply {
+pub(crate) async fn describe_query_logging(amp: &Amp, region: &str, workspace_id: &str) -> Reply {
     amp.call(
         "GET",
         &format!("/workspaces/{workspace_id}/logging/query"),
@@ -88,7 +93,11 @@ async fn delete_query_logging(amp: &Amp, region: &str, workspace_id: &str) -> Re
 
 /// The `destinations` member of a query logging configuration: `LoggingDestinations` is
 /// modelled `len 1..1`, so one `cloudWatchLogs` destination with its `filters`.
-fn query_body(arn: &str, qsp_threshold: i64, client_token: Option<&str>) -> serde_json::Value {
+pub(crate) fn query_body(
+    arn: &str,
+    qsp_threshold: i64,
+    client_token: Option<&str>,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "destinations": [{
             "cloudWatchLogs": { "logGroupArn": arn },

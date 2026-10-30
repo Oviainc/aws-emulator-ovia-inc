@@ -4,7 +4,9 @@
 //! IMPLEMENTED: persists the workspace's one query logging configuration and answers
 //! from the PERSISTED record. The configuration starts in `CREATING` and the clock
 //! owes its move to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]); `clientToken` makes
-//! the call idempotent.
+//! the call idempotent. A create whose record would be dropped before the caller could
+//! read it back is refused instead of accepted: one whose own removal the clock already
+//! owes, and one on a workspace that is being deleted.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -174,10 +176,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // logging configuration for the specified workspace"), and
         // `ResourceNotFoundException` is the modelled refusal for a request that
         // "references a resources that doesn't exist" — a Region this account holds
-        // nothing in holds no workspace either, so the one refusal answers both.
-        let Some(store) = store
-            .held_region_mut(&region)
-            .filter(|store| store.workspaces.contains_key(&input.workspace_id))
+        // nothing in holds no workspace either, so the one refusal answers both. The
+        // workspace's own status comes back with the store, because what the parent is
+        // doing decides whether it can take a new configuration at all.
+        let Some((store, workspace_status)) =
+            store.held_region_mut(&region).and_then(|store| {
+                let status = store
+                    .workspaces
+                    .get(&input.workspace_id)?
+                    .status_code
+                    .clone();
+                Some((store, status))
+            })
         else {
             return Err(
                 CreateQueryLoggingConfigurationErrorModeled::ResourceNotFoundException(
@@ -190,6 +200,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // The PARENT's removal is owed on the same terms the configuration's own is:
+        // `WorkspaceStatusCode$DELETING` is "Workspace is being deleted", and
+        // `crate::state::materialize_due` drops the workspace once its due instant has
+        // passed, taking the query logging configuration it holds with it. So a create in
+        // that window could only accept the call (202) and then leave the store holding
+        // nothing for it — the outcome the configuration's own pending removal is refused
+        // for below. The parent is checked FIRST, because its removal takes the whole
+        // record with it whatever status that record is in. This operation models no
+        // `ConflictException`, so the refusal is the modelled `ValidationException` (400),
+        // request-level because no single member is at fault.
+        if workspace_status == crate::state::STATUS_DELETING {
+            return Err(
+                CreateQueryLoggingConfigurationErrorModeled::ValidationException(
+                    crate::state::request_validation_failed(
+                        crate::state::WORKSPACE_DELETING_MESSAGE,
+                    ),
+                )
+                .into(),
+            );
+        }
 
         if let Some(existing) = store.query_logging.get(&input.workspace_id) {
             // A record whose removal the clock already owes is NOT the record the create

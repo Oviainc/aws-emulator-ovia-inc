@@ -333,6 +333,20 @@ pub const QUERY_LOGGING_CONFIGURATION_DELETING_MESSAGE: &str =
     "The query logging configuration is being deleted; create it again once the deletion \
      has completed.";
 
+/// The `message` the modelled `ValidationException` reports when one of a workspace's
+/// logging configurations is asked to be CREATED while the WORKSPACE itself is being
+/// deleted.
+///
+/// `WorkspaceStatusCode$DELETING` is "Workspace is being deleted", and
+/// [`RegionalState::materialize_due`] drops every configuration a removed workspace
+/// holds along with it — so a create in that window could only be accepted and then
+/// leave the workspace holding nothing at all. One sentence for both single-valued
+/// logging children, neither of which models a `ConflictException` to refuse with;
+/// constant and id-free, like every other refusal sentence here, because the workspace
+/// a caller named is already in its own request.
+pub const WORKSPACE_DELETING_MESSAGE: &str =
+    "The workspace is being deleted; it cannot take new logging configurations.";
+
 /// The `message` the modelled `ResourceNotFoundException` reports for a workspace that
 /// holds no resource-based policy — constant and id-free for the same reason
 /// [`WORKSPACE_NOT_FOUND_MESSAGE`] is; the workspace is reported in `resourceId`.

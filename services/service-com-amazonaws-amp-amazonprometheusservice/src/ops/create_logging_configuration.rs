@@ -4,8 +4,10 @@
 //! IMPLEMENTED: persists the workspace's rules-and-alerting logging configuration and
 //! answers from the PERSISTED record. The configuration starts in `CREATING` and the
 //! clock owes its move to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]); `clientToken`
-//! makes the call idempotent, and a stored configuration whose removal the clock already
-//! owes is refused rather than answered as a replay of the create that made it.
+//! makes the call idempotent, and a create whose record would be dropped before the
+//! caller could read it back is refused rather than accepted: one whose own removal the
+//! clock already owes (so it is not answered as a replay of the create that made it),
+//! and one on a workspace that is itself being deleted.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -193,6 +195,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // The PARENT's removal is owed on the same terms the configuration's own is:
+        // `WorkspaceStatusCode$DELETING` is "Workspace is being deleted", and
+        // `crate::state::materialize_due` drops the workspace once its due instant has
+        // passed, taking the logging configuration it holds with it. So a create in that
+        // window could only accept the call (202) and then leave the store holding
+        // nothing for it — the outcome the configuration's own pending removal is
+        // refused for below. The parent is checked FIRST, because its removal takes the
+        // whole record with it whatever status that record is in, and a replay answered
+        // from a record about to be dropped is the same accepted-but-gone outcome. The
+        // sibling child-creates of this crate refuse a workspace on its way out the same
+        // way; this operation models no `ConflictException`, so the refusal is the
+        // modelled `ValidationException` (400), request-level because no single member is
+        // at fault.
+        if workspace.status_code == crate::state::STATUS_DELETING {
+            return Err(CreateLoggingConfigurationErrorModeled::ValidationException(
+                crate::state::request_validation_failed(crate::state::WORKSPACE_DELETING_MESSAGE),
+            )
+            .into());
+        }
 
         if let Some(existing) = workspace.logging_configuration.as_ref() {
             // A record whose removal the clock already owes is NOT the record the create
