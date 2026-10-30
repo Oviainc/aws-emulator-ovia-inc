@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: allocates the `(AuthenticationType, UserName)` identity in the account's
+//! user pool by persisting a [`crate::state::UserRecord`], so a later `DescribeUsers`
+//! reports that user with the ARN, `CreatedTime` and names this call stored. A second
+//! create of an identity that already exists answers `ResourceAlreadyExistsException`
+//! (HTTP 400) and leaves the stored user untouched.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `MessageAction` selects what happens to the welcome email, which this emulator has no
+//! mail plane to send, so no email action is carried out or claimed for any value of it:
+//! the member is honoured only where it constrains the REQUEST — RESEND forbids naming
+//! the user's first or last name — and a request naming an identity that already exists
+//! is still refused, whichever action it asks for, because the identity is what a create
+//! allocates.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +124,11 @@ impl From<CreateUserErrorModeled> for CreateUserError {
     }
 }
 
+/// The `MessageAction` that re-sends the welcome email of a user who already exists,
+/// one of `MESSAGE_ACTION_VALUES` (`ops/types/shared_types.rs`). It is the value whose
+/// documented rule forbids naming the user's first or last name in the same request.
+const MESSAGE_ACTION_RESEND: &str = "RESEND";
+
 /// The `CreateUser` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +165,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUser"))
+        // "The authentication type for the user. You must specify USERPOOL": the users
+        // this operation creates are the account's user pool users, so any other
+        // authentication type names identities it does not manage.
+        if input.authentication_type != crate::state::USER_POOL_AUTHENTICATION_TYPE {
+            return Err(CreateUserErrorModeled::InvalidParameterCombinationException(
+                InvalidParameterCombinationException {
+                    message: Some(crate::state::authentication_type_not_user_pool_message(
+                        &input.authentication_type,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "If you specify RESEND, do not specify the first name or last name of the
+        // user": RESEND re-sends the welcome email of a user that already exists, so a
+        // request that also carries attributes to set asks for two different things at
+        // once.
+        if input.message_action.as_deref() == Some(MESSAGE_ACTION_RESEND) {
+            if let Some(member) = [
+                input.first_name.as_ref().map(|_| "FirstName"),
+                input.last_name.as_ref().map(|_| "LastName"),
+            ]
+            .into_iter()
+            .flatten()
+            .next()
+            {
+                return Err(CreateUserErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "{member} cannot be specified while MessageAction is \
+                             {MESSAGE_ACTION_RESEND}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CreateUser"))?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        // Email addresses are case-sensitive, so the identity is the name exactly as the
+        // request spells it, under the authentication type it names.
+        let identity = (input.authentication_type.clone(), input.user_name.clone());
+        if state.users.contains_key(&identity) {
+            // The identity is already allocated, and a create cannot take it twice.
+            return Err(CreateUserErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(crate::state::USER_ALREADY_EXISTS_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The store must not grow per request without a ceiling, so a record past it is
+        // refused with the modelled error AWS uses for an account's limit.
+        if state.users.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreateUserErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::limit_exceeded_message("users")),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::UserRecord {
+            arn: crate::state::user_arn(&region, &input.authentication_type, &input.user_name),
+            user_name: input.user_name.clone(),
+            authentication_type: input.authentication_type.clone(),
+            // A created user may sign in; only `DisableUser` takes that away.
+            enabled: true,
+            // The user is created but has not confirmed it by setting a password.
+            status: crate::state::USER_STATUS_UNCONFIRMED.to_string(),
+            first_name: input.first_name,
+            last_name: input.last_name,
+            created_time: crate::state::now(),
+        };
+        state.users.insert(identity, record);
+
+        // The modelled result carries no members: what this call allocated is read back
+        // through `DescribeUsers`.
+        Ok(CreateUserOutput {})
     }
 }

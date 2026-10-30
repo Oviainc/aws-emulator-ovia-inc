@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeUsers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeUsers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeUsers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: renders the stored users of the authentication type the request names,
+//! a page at a time, from the records `CreateUser` persisted — so what it reports is
+//! what was created, and following its `NextToken` walks every stored user exactly once.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +138,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeUsers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeUsersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeUsers"))
+        // "The authentication type for the users in the user pool to describe. You must
+        // specify USERPOOL": the users this operation reports are the account's user
+        // pool users, so any other authentication type names identities it does not
+        // manage.
+        if input.authentication_type != crate::state::USER_POOL_AUTHENTICATION_TYPE {
+            return Err(
+                DescribeUsersErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(crate::state::authentication_type_not_user_pool_message(
+                            &input.authentication_type,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `MaxResults` is "the maximum size of each page of results", so a page of fewer
+        // than one record is not a size this operation can answer with.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "MaxResults must be at least 1, was {max_results}"
+                )));
+            }
+            // Clamped to this emulator's own page, so no request sizes the page it is
+            // answered with: a caller asking for more still sees every record by
+            // following the token.
+            Some(max_results) => usize::try_from(max_results)
+                .unwrap_or(crate::state::DESCRIBE_PAGE_SIZE)
+                .min(crate::state::DESCRIBE_PAGE_SIZE),
+            None => crate::state::DESCRIBE_PAGE_SIZE,
+        };
+
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("DescribeUsers"))?;
+        // A read: the guard is only ever read through, so a Describe can never change
+        // what a later caller sees.
+        let state = state.lock();
+
+        let page = state
+            .users_page(&input.authentication_type, input.next_token.as_deref(), page_size)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(
+                    "NextToken is not a pagination token this service issued",
+                )
+            })?;
+
+        Ok(DescribeUsersOutput {
+            users: Some(page.users),
+            next_token: page.next_token,
+        })
     }
 }

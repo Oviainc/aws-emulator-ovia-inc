@@ -23,3 +23,5 @@ mod state_roundtrip;
 mod update_stack;
 #[path = "all/usage_report_subscription.rs"]
 mod usage_report_subscription;
+#[path = "all/user_pool.rs"]
+mod user_pool;

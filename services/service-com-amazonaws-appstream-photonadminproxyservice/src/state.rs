@@ -14,6 +14,10 @@
 //! this struct holds and `DescribeUsageReportSubscriptions` renders that same record
 //! back.
 //!
+//! The user pool lives here as well: `CreateUser` writes a [`UserRecord`] under the
+//! `(AuthenticationType, UserName)` identity it allocates, and `DescribeUsers` renders
+//! the stored records of one authentication type back, a page at a time.
+//!
 //! Records hold the MODELLED sub-shapes (`StorageConnector`, `UserSetting`,
 //! `VpcConfig`, …) rather than copies of them, so what a Describe returns is literally
 //! what the Create persisted.
@@ -24,7 +28,7 @@ use crate::ops::types::{
     AccessEndpoint, AgentAccessConfig, ApplicationSettingsResponse, ComputeCapacityStatus,
     ContentRedirection, DomainJoinInfo, Fleet, FleetError, LastReportGenerationExecutionError,
     S3Location, Stack, StackError, StorageConnector, StreamingExperienceSettings,
-    UsageReportSubscription, UserSetting, VolumeConfig, VpcConfig,
+    UsageReportSubscription, User, UserSetting, VolumeConfig, VpcConfig,
 };
 
 /// The ARN namespace this service stamps on every resource ARN
@@ -52,16 +56,18 @@ pub const FLEET_STATE_CREATED: &str = "STOPPED";
 pub const DESCRIBE_PAGE_SIZE: usize = 50;
 
 /// The maximum number of records this emulator keeps in ANY ONE of its caller-driven
-/// stores (stacks, fleets, fleet/stack associations).
+/// stores (stacks, fleets, fleet/stack associations, user pool users).
 ///
 /// This is NOT AWS's service quota — AppStream's published stack and fleet limits are
 /// per-account and adjustable, and nothing here claims to reproduce them. It is the
-/// emulator's own memory ceiling: every successful `CreateStack`, `CreateFleet` and
-/// `AssociateFleet` inserts a record that lives until a caller deletes it, so without a
-/// ceiling a caller could grow the process until the host runs out of memory. A request
-/// that would cross it is refused with `LimitExceededException`, the modelled error AWS
-/// itself uses for "the requested limit exceeds the permitted limit for an account", so
-/// the refusal is one a real client already handles.
+/// emulator's own memory ceiling: every successful `CreateStack`, `CreateFleet`,
+/// `AssociateFleet` and `CreateUser` inserts a record that lives until a caller deletes
+/// it, so without a ceiling a caller could grow the process until the host runs out of
+/// memory. Each of those handlers checks the store it writes against this ceiling before
+/// inserting, and a request that would cross it is refused with
+/// `LimitExceededException`, the modelled error AWS itself uses for "the requested limit
+/// exceeds the permitted limit for an account", so the refusal is one a real client
+/// already handles.
 pub const MAX_RECORDS_PER_STORE: usize = 1_000;
 
 /// The message a store at [`MAX_RECORDS_PER_STORE`] refuses a new record with; `store`
@@ -79,6 +85,36 @@ pub const STACK_KIND: &str = "stack";
 
 /// The word AWS's refusal sentences use for a fleet.
 pub const FLEET_KIND: &str = "fleet";
+
+/// AWS's `ResourceAlreadyExistsException` sentence for a user pool identity that is
+/// already taken.
+///
+/// Unlike the named control-plane resources above, this sentence has no variable part:
+/// it states that the username is taken without echoing it back, so the refusal carries
+/// nothing from the request.
+pub const USER_ALREADY_EXISTS_MESSAGE: &str = "A user with that username already exists.";
+
+/// The only `AuthenticationType` the user pool operations accept: the model's docs for
+/// `CreateUser.AuthenticationType` and `DescribeUsers.AuthenticationType` both state
+/// "You must specify USERPOOL", because the users these operations manage are the
+/// account's user pool users rather than directory or API identities.
+pub const USER_POOL_AUTHENTICATION_TYPE: &str = "USERPOOL";
+
+/// The `Status` a freshly created user pool user carries. `User.Status`'s documented
+/// values include "UNCONFIRMED - The user is created but not confirmed": a user becomes
+/// CONFIRMED by setting their own password from the welcome email, which no clock makes
+/// due, so this is where a created user stays until that happens.
+pub const USER_STATUS_UNCONFIRMED: &str = "UNCONFIRMED";
+
+/// The sentence a request refused for naming an authentication type the user pool
+/// operations do not manage carries; the only variable part is the value the request
+/// asked for.
+pub fn authentication_type_not_user_pool_message(authentication_type: &str) -> String {
+    format!(
+        "AuthenticationType must be {USER_POOL_AUTHENTICATION_TYPE} for user pool \
+         operations, was {authentication_type}"
+    )
+}
 
 /// AWS's `ResourceNotFoundException` sentence for a named control-plane resource:
 /// `The <kind> <name> for account <account id> does not exist.`
@@ -149,6 +185,15 @@ pub fn stack_arn(region: &str, name: &str) -> String {
 /// `arn:aws:appstream:<region>:<account>:fleet/<name>`.
 pub fn fleet_arn(region: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("fleet/{name}"))
+}
+
+/// `arn:aws:appstream:<region>:<account>:user/<user pool type>/<user name>`.
+///
+/// AppStream's `user` resource ARN names the user pool an identity belongs to before
+/// the user's own id, and that pool segment is the authentication type in lower case.
+pub fn user_arn(region: &str, authentication_type: &str, user_name: &str) -> String {
+    let pool = authentication_type.to_lowercase();
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("user/{pool}/{user_name}"))
 }
 
 /// The S3 bucket a usage report subscription stores its generated reports in.
@@ -353,6 +398,45 @@ impl UsageReportSubscriptionRecord {
     }
 }
 
+/// A persisted user pool user.
+///
+/// The identity is the `(AuthenticationType, UserName)` pair this record is stored
+/// under: email addresses are case-sensitive, so two names differing only in
+/// capitalisation are two users.
+#[derive(Debug, Clone)]
+pub struct UserRecord {
+    pub arn: String,
+    pub user_name: String,
+    /// One of `AUTHENTICATION_TYPE_VALUES`; [`USER_POOL_AUTHENTICATION_TYPE`] for a user
+    /// this emulator created.
+    pub authentication_type: String,
+    /// Whether the user may sign in. A created user is enabled; `DisableUser` and
+    /// `EnableUser` move it.
+    pub enabled: bool,
+    /// The user's status in the user pool, one of `User.Status`'s documented values;
+    /// [`USER_STATUS_UNCONFIRMED`] for a user this emulator created.
+    pub status: String,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub created_time: ::aws_smithy_types::DateTime,
+}
+
+impl UserRecord {
+    /// Render the stored record as the modelled `User` every reader returns.
+    pub fn to_user(&self) -> User {
+        User {
+            arn: Some(self.arn.clone()),
+            user_name: Some(self.user_name.clone()),
+            enabled: Some(self.enabled),
+            status: Some(self.status.clone()),
+            first_name: self.first_name.clone(),
+            last_name: self.last_name.clone(),
+            created_time: Some(self.created_time),
+            authentication_type: self.authentication_type.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-appstream-photonadminproxyservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
@@ -365,6 +449,10 @@ pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     /// The account's usage report subscription, once one has been created; `None` while
     /// usage reporting is not enabled.
     pub usage_report_subscription: Option<UsageReportSubscriptionRecord>,
+    /// Users by `(AuthenticationType, UserName)` — the identity a user pool user is
+    /// created under. `BTreeMap` so every page of a read walks a stable order, and so
+    /// one authentication type's users form a contiguous range.
+    pub users: BTreeMap<(String, String), UserRecord>,
 }
 
 impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
@@ -386,6 +474,43 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
             .any(|(_, stack)| stack == stack_name)
     }
 
+    /// One page of this authentication type's users: the records to render, and the
+    /// token that resumes after them. `None` means `next_token` is not a token this
+    /// service minted.
+    ///
+    /// The users are read straight from the stored map in key order, so a page renders
+    /// exactly the records the store holds for that authentication type — there is no
+    /// second lookup that could miss one — and following the token walks every user
+    /// exactly once even when users are added between calls.
+    pub fn users_page(
+        &self,
+        authentication_type: &str,
+        next_token: Option<&str>,
+        page_size: usize,
+    ) -> Option<UserPage> {
+        let resume_at = match next_token {
+            Some(token) => decode_cursor(token)?,
+            None => String::new(),
+        };
+        let mut remaining = self
+            .users
+            .range((authentication_type.to_string(), resume_at)..)
+            .take_while(|((stored_type, _), _)| stored_type == authentication_type)
+            .map(|(_, record)| record);
+        // A page holds at least one record, so following the token always advances.
+        let users: Vec<User> = remaining
+            .by_ref()
+            .take(page_size.max(1))
+            .map(UserRecord::to_user)
+            .collect();
+        Some(UserPage {
+            next_token: remaining
+                .next()
+                .map(|record| encode_cursor(&record.user_name)),
+            users,
+        })
+    }
+
     /// The fleets associated with the named stack, in the stable order a page of
     /// `ListAssociatedFleets` walks.
     pub fn fleets_for_stack(&self, stack_name: &str) -> BTreeSet<String> {
@@ -405,6 +530,14 @@ impl ComAmazonawsAppstreamPhotonadminproxyserviceState {
 #[derive(Debug)]
 pub struct DescribePage {
     pub names: Vec<String>,
+    pub next_token: Option<String>,
+}
+
+/// One page of a `DescribeUsers`: the users to render, and the opaque token that resumes
+/// after them.
+#[derive(Debug)]
+pub struct UserPage {
+    pub users: Vec<User>,
     pub next_token: Option<String>,
 }
 

@@ -48,7 +48,10 @@ fn already_exists_sentence(kind: &str, name: &str) -> String {
 
 /// The `Message` of a failure body (the modelled member is `Message`; the synthetic
 /// channel spells it `message`).
-fn error_message(payload: &Value) -> String {
+///
+/// Shared with the other suites in this target (`tests/all/user_pool.rs`), so every
+/// message assertion reads the body the same way.
+pub(crate) fn error_message(payload: &Value) -> String {
     payload
         .get("Message")
         .or_else(|| payload.get("message"))
@@ -58,7 +61,7 @@ fn error_message(payload: &Value) -> String {
 }
 
 /// Send a request that must be refused with `status` and `code`, and return its message.
-async fn refusal(
+pub(crate) async fn refusal(
     emulator: &Emulator,
     case: &str,
     operation: &str,
