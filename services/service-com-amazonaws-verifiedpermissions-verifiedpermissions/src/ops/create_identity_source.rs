@@ -28,7 +28,11 @@
 //! against the pool REGISTRY: the service that owns user pools holds them in its
 //! own state in the one shared engine, and the pool the ARN names has to be in
 //! it, so an ARN naming a pool no `CreateUserPool` ever minted is refused with
-//! that same 400 rather than stored as a live reference to nothing.
+//! that same 400 rather than stored as a live reference to nothing. Such a
+//! refusal states the sentence Verified Permissions words a pool that does not
+//! exist with — `User pool <poolId> does not exist.`, the pool id read out of the
+//! request's ARN — in the exception's `message`, while `fieldList` still names
+//! the member and the segment at fault.
 //!
 //! An OIDC `issuer` is a provider OUTSIDE the emulator, and AWS resolves it by
 //! fetching `<issuer>/.well-known/openid-configuration`. This emulator makes no

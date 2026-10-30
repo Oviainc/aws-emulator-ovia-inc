@@ -24,10 +24,12 @@
 //! per-union. A pool this emulator cannot resolve
 //! ([`crate::state::resolve_user_pool_arn`]) — one outside this account, region
 //! or partition, or one no `CreateUserPool` ever minted — is therefore the same
-//! 400 `ValidationException` here as there, for the same reason, and nothing is
-//! written; only the member the `fieldList` entry addresses differs, because it
-//! is rooted at `updateConfiguration` — the member THIS operation's input
-//! declares — rather than at the create's `configuration`.
+//! 400 `ValidationException` here as there, for the same reason and with the
+//! same message — the sentence the service states for a user pool that does not
+//! exist, naming the pool id the request's ARN carried — and nothing is written;
+//! only the member the `fieldList` entry addresses differs, because it is rooted
+//! at `updateConfiguration` — the member THIS operation's input declares —
+//! rather than at the create's `configuration`.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!

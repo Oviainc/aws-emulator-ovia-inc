@@ -39,6 +39,8 @@ mod harness;
 mod idempotency_parameter_escaping;
 #[path = "all/identity_source_configuration_writers.rs"]
 mod identity_source_configuration_writers;
+#[path = "all/identity_source_pool_refusal_message.rs"]
+mod identity_source_pool_refusal_message;
 #[path = "all/identity_source_refusal_pointers.rs"]
 mod identity_source_refusal_pointers;
 #[path = "all/identity_source_user_pool_existence.rs"]

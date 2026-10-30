@@ -652,6 +652,14 @@ pub enum OpenIdConnectTokens {
 /// ([`holds_user_pool`]): a reference to a pool nothing ever created resolves to
 /// no pool, so it is refused here rather than stored and discovered later by the
 /// authorization call that needs the pool's key set.
+///
+/// An ARN whose SHAPE this emulator could serve and that still resolves to no
+/// pool is refused with the sentence the service words a pool that does not
+/// exist with, [`user_pool_does_not_exist`], naming the pool id the ARN carried:
+/// the refusal is about the pool the caller referenced, so the sentence names it
+/// rather than leaving the summary message to say nothing. An ARN that is not a
+/// user pool ARN at all carries no pool id to name — and the member's modelled
+/// pattern refuses it before this runs — so those two refusals keep the summary.
 pub fn resolve_user_pool_arn<Eng: Send + Sync + 'static>(
     engine: &Eng,
     arn: &str,
@@ -662,6 +670,14 @@ pub fn resolve_user_pool_arn<Eng: Send + Sync + 'static>(
             crate::ops::paths::COGNITO_USER_POOL_ARN_IN_CONFIGURATION,
             reason,
         )
+    };
+    // An ARN this emulator cannot resolve to a pool it holds names a pool that
+    // does not exist here, whichever segment is why, so every one of those
+    // refusals states the ONE sentence the service words that with
+    // ([`user_pool_does_not_exist`]) while `fieldList` keeps the member and the
+    // segment at fault.
+    let no_such_pool = |user_pool_id: &str, reason: String| {
+        invalid(reason).worded(user_pool_does_not_exist(user_pool_id))
     };
     let fields: Vec<&str> = arn.splitn(6, ':').collect();
     let ["arn", partition, "cognito-idp", region, account, resource] = fields[..] else {
@@ -676,40 +692,68 @@ pub fn resolve_user_pool_arn<Eng: Send + Sync + 'static>(
     // the partition is resolved like the account and the region below.
     let own_partition = emulator_partition();
     if partition != own_partition {
-        return Err(invalid(format!(
-            "no Amazon Cognito user pool {user_pool_id} exists in partition {partition}; an \
-             identity source can only reference a user pool in partition {own_partition}"
-        )));
+        return Err(no_such_pool(
+            user_pool_id,
+            format!(
+                "no Amazon Cognito user pool {user_pool_id} exists in partition {partition}; an \
+                 identity source can only reference a user pool in partition {own_partition}"
+            ),
+        ));
     }
     let own_account = ::engine::emulator_account_id();
     if account != own_account {
-        return Err(invalid(format!(
-            "no Amazon Cognito user pool {user_pool_id} exists in account {account}; an \
-             identity source can only reference a user pool in account {own_account}"
-        )));
+        return Err(no_such_pool(
+            user_pool_id,
+            format!(
+                "no Amazon Cognito user pool {user_pool_id} exists in account {account}; an \
+                 identity source can only reference a user pool in account {own_account}"
+            ),
+        ));
     }
     if region != request_region {
-        return Err(invalid(format!(
-            "no Amazon Cognito user pool {user_pool_id} exists in region {region}; an identity \
-             source can only reference a user pool in its policy store's region \
-             {request_region}"
-        )));
+        return Err(no_such_pool(
+            user_pool_id,
+            format!(
+                "no Amazon Cognito user pool {user_pool_id} exists in region {region}; an \
+                 identity source can only reference a user pool in its policy store's region \
+                 {request_region}"
+            ),
+        ));
     }
     if !user_pool_id.starts_with(&format!("{region}_")) {
-        return Err(invalid(format!(
-            "no Amazon Cognito user pool {user_pool_id} exists in region {region}; a user pool \
-             id names the region the pool was created in"
-        )));
+        return Err(no_such_pool(
+            user_pool_id,
+            format!(
+                "no Amazon Cognito user pool {user_pool_id} exists in region {region}; a user \
+                 pool id names the region the pool was created in"
+            ),
+        ));
     }
     // The last question the shape cannot answer: does the pool exist? It is
     // answered where the answer lives — the user-pool service's own state.
     if !holds_user_pool(engine, user_pool_id) {
-        return Err(invalid(format!(
-            "no Amazon Cognito user pool {user_pool_id} exists in region {region}; an identity \
-             source can only reference a user pool that exists"
-        )));
+        return Err(no_such_pool(
+            user_pool_id,
+            format!(
+                "no Amazon Cognito user pool {user_pool_id} exists in region {region}; an \
+                 identity source can only reference a user pool that exists"
+            ),
+        ));
     }
     Ok((region.to_string(), user_pool_id.to_string()))
+}
+
+/// The sentence Verified Permissions states when an identity-source write
+/// references an Amazon Cognito user pool that does not exist: `User pool
+/// <poolId> does not exist.`
+///
+/// The only variable part is the pool id, read out of the `userPoolArn` the
+/// request carried, so the sentence reports what the caller referenced and
+/// nothing of this emulator's state. ONE renderer for the rule, so both writers
+/// of an identity source ([`crate::ops::persisted_identity_source_configuration`])
+/// state it identically whichever segment of the ARN made the pool unresolvable.
+fn user_pool_does_not_exist(user_pool_id: &str) -> String {
+    format!("User pool {user_pool_id} does not exist.")
 }
 
 /// Whether the service that owns Amazon Cognito user pools holds one with

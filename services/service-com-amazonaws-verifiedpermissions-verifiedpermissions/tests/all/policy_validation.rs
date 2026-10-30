@@ -4,12 +4,15 @@
 //! the policy that is NOT refused.
 //!
 //! 1. Every request this service refuses on its own input checks answers with
-//!    the model's own `ValidationException` — HTTP 400, the fixed `message`, and
-//!    a `fieldList` whose entry names the offending member by its JSON-pointer
-//!    `path`. The table below spans the operations and the members that rule
-//!    covers, and the kinds of failure (absent, unparseable, over-long,
-//!    not-ours, out of this emulator's reach, past a bound). A refusal by the
-//!    store's SCHEMA is its own rule, pinned in
+//!    the model's own `ValidationException` — HTTP 400, a `message`, and a
+//!    `fieldList` whose entry names the offending member by its JSON-pointer
+//!    `path`. The message is the fixed summary, except for a class of refusal
+//!    the service words a sentence of its own for, which states that sentence:
+//!    an identity source's reference to a user pool that does not exist is one,
+//!    and the table below states what each row expects. The table spans the
+//!    operations and the members that rule covers, and the kinds of failure
+//!    (absent, unparseable, over-long, not-ours, out of this emulator's reach,
+//!    past a bound). A refusal by the store's SCHEMA is its own rule, pinned in
 //!    [`a_schema_refusal_reports_every_reason_at_the_validated_member`].
 //! 2. A schema-conformant static policy submitted to a `STRICT` store is STORED,
 //!    and every member of the create response comes back out of state through
@@ -100,6 +103,24 @@ fn oversized_batch() -> Value {
             .collect(),
     )
 }
+
+/// The row whose refusal the service words a sentence of its own for: a
+/// `userPoolArn` that resolves to no user pool. Named here so the loop below can
+/// state the message THAT row expects without relaxing what every other row
+/// expects.
+const UNRESOLVABLE_POOL_CASE: &str = "a Cognito user pool this emulator cannot resolve";
+
+/// The pool ARN that row carries: well formed, in another account, so it names a
+/// pool that does not exist here.
+const UNRESOLVABLE_POOL_ARN: &str =
+    "arn:aws:cognito-idp:us-east-1:123456789012:userpool/us-east-1_1a2b3c4d5";
+
+/// The sentence that row's refusal states — `User pool `, the pool id
+/// [`UNRESOLVABLE_POOL_ARN`] names, and ` does not exist.` — written out here
+/// rather than derived from the code under test. The whole class, over every
+/// reason a pool reference does not resolve and both writers, is pinned in
+/// [`crate::identity_source_pool_refusal_message`].
+const UNRESOLVABLE_POOL_MESSAGE: &str = "User pool us-east-1_1a2b3c4d5 does not exist.";
 
 /// One request of a batch whose principal carries `entity_type`, so a row can
 /// vary the principal's TYPE while keeping the batch's shared resource.
@@ -287,15 +308,17 @@ async fn a_refused_request_names_the_offending_member_in_field_list() {
         ),
         (
             // Every resource this emulator holds is in its own account, so an
-            // ARN naming another one names a pool that does not exist here.
-            "a Cognito user pool this emulator cannot resolve",
+            // ARN naming another one names a pool that does not exist here —
+            // which this service words as a sentence of its own, so this row's
+            // expected message is `UNRESOLVABLE_POOL_MESSAGE` rather than the
+            // summary.
+            UNRESOLVABLE_POOL_CASE,
             "CreateIdentitySource",
             json!({
                 "policyStoreId": off_store,
                 "configuration": {
                     "cognitoUserPoolConfiguration": {
-                        "userPoolArn":
-                            "arn:aws:cognito-idp:us-east-1:123456789012:userpool/us-east-1_1a2b3c4d5",
+                        "userPoolArn": UNRESOLVABLE_POOL_ARN,
                     },
                 },
             }),
@@ -359,6 +382,11 @@ async fn a_refused_request_names_the_offending_member_in_field_list() {
     ];
 
     for (case, operation, request, path) in &cases {
+        let expected_message = if *case == UNRESOLVABLE_POOL_CASE {
+            UNRESOLVABLE_POOL_MESSAGE
+        } else {
+            INVALID_INPUT_MESSAGE
+        };
         let (status, body) = call(&router, operation, request).await;
         assert_eq!(
             status, 400,
@@ -371,8 +399,8 @@ async fn a_refused_request_names_the_offending_member_in_field_list() {
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(INVALID_INPUT_MESSAGE),
-            "case {case:?}: expected the fixed message {INVALID_INPUT_MESSAGE:?}, got {body}"
+            Some(expected_message),
+            "case {case:?}: expected the message {expected_message:?}, got {body}"
         );
         let fields = body["fieldList"].as_array().cloned().unwrap_or_default();
         assert_eq!(

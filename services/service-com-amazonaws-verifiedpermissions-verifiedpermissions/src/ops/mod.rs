@@ -4,8 +4,8 @@
 
 include!(concat!(env!("OUT_DIR"), "/com_amazonaws_verifiedpermissions_verifiedpermissions_ops_generated.rs"));
 
-/// The sentence a `ValidationException` this service raises carries in its
-/// required `message`.
+/// The SUMMARY sentence a `ValidationException` this service raises carries in
+/// its required `message` when the refusal has no sentence of its own.
 ///
 /// It is a FIXED, identifier-free sentence on purpose: `ValidationException`'s
 /// own model documentation says "The request failed because one or more input
@@ -15,6 +15,11 @@ include!(concat!(env!("OUT_DIR"), "/com_amazonaws_verifiedpermissions_verifiedpe
 /// into prose a client can only regex. The same split is what this service's
 /// other errors do — `ResourceNotFoundException` reports the identifier in
 /// `resourceId`, not in its message.
+///
+/// A refusal the service words ITSELF is the exception: where the service states
+/// a sentence of its own for a class of refusal, that sentence is the `message`
+/// ([`InvalidInput::worded`]), because the sentence is what the API answers for
+/// that class and a client reads it.
 pub const INVALID_INPUT_MESSAGE: &str = "Invalid input";
 
 /// One offending request member: the JSON-pointer `path` of the member at fault
@@ -33,6 +38,12 @@ pub struct InvalidInput {
     /// Why the member was refused — the text that becomes
     /// `ValidationExceptionField$message`.
     pub reason: String,
+    /// The sentence the SERVICE words this whole refusal with, when the class of
+    /// refusal has one of its own: it becomes the exception's required
+    /// `message` instead of [`INVALID_INPUT_MESSAGE`]. `None` — the default —
+    /// leaves that fixed summary in place and reports the specifics in
+    /// `fieldList` alone.
+    pub message: Option<String>,
 }
 
 impl InvalidInput {
@@ -41,7 +52,21 @@ impl InvalidInput {
         Self {
             path: path.into(),
             reason: reason.into(),
+            message: None,
         }
+    }
+
+    /// This refusal, worded by the service as `message`.
+    ///
+    /// A class of refusal the service states a sentence for answers with that
+    /// sentence in the exception's `message` — the specifics a client keys on are
+    /// in the sentence itself, so the fixed summary would withhold them — while
+    /// `fieldList` still names the member and the reason as every other refusal
+    /// does. The sentence is composed where the rule lives, so one rule has one
+    /// wording wherever it is applied.
+    pub fn worded(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
     }
 
     /// This member, re-rooted under the request member whose pointer is
@@ -85,6 +110,17 @@ impl std::fmt::Display for InvalidInput {
 pub fn validation_exception(
     invalid: impl IntoIterator<Item = InvalidInput>,
 ) -> types::ValidationException {
+    let invalid: Vec<InvalidInput> = invalid.into_iter().collect();
+    // A refusal the service words itself ([`InvalidInput::worded`]) states that
+    // sentence as the exception's `message`; every other one carries the fixed
+    // summary and reports its specifics in `fieldList`. A refusal that names
+    // several members is a refusal of the request's SHAPE, which no single
+    // sentence describes, so the first worded member decides and the summary is
+    // the answer when none is worded.
+    let message = invalid
+        .iter()
+        .find_map(|field| field.message.clone())
+        .unwrap_or_else(|| INVALID_INPUT_MESSAGE.to_string());
     let field_list: Vec<types::ValidationExceptionField> = invalid
         .into_iter()
         .map(|field| types::ValidationExceptionField {
@@ -93,7 +129,7 @@ pub fn validation_exception(
         })
         .collect();
     types::ValidationException {
-        message: INVALID_INPUT_MESSAGE.to_string(),
+        message,
         // `fieldList` is optional in the model, and an error that names no field
         // is not one this service raises — every caller passes at least one — but
         // an empty list would still be a lie about the shape, so it stays absent
