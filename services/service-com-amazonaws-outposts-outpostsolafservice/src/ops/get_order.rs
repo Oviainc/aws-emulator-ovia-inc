@@ -148,10 +148,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Report the status the order holds NOW: an order submitted a moment ago is
         // still being prepared, and the move past that falls due on the clock, so the
-        // transition is materialised before the record is read. That writes only what
-        // was already owed at this same instant — nothing a later caller would not
-        // have seen anyway.
-        store.settle_orders();
+        // transition is materialised before the record is read. The step that completes
+        // an order is the one that puts the hardware it was placed for on its Outpost,
+        // and what a fulfilled line item reports as installed for it is that hardware
+        // ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::order_report`]),
+        // so the install the clock had already made due at this same instant is
+        // materialised with it — through the one helper that settles both
+        // ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::settle_outposts`]),
+        // exactly as every operation that reports installed hardware does. That writes
+        // only what was already owed at this same instant — nothing a later caller would
+        // not have seen anyway.
+        store.settle_outposts();
         // An `OrderId` is a bare id — the modelled `@httpLabel` pattern
         // (`^oo-[a-f0-9]{17}$`) admits no ARN form — so it names a stored order
         // directly. One the store holds none for is the not-found error this
@@ -159,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds none of is ([`crate::state::order_not_found`]).
         let order = store
             .order(&region, &input.order_id)
-            .map(|record| record.order.clone())
+            .map(|record| store.order_report(record))
             .ok_or_else(|| {
                 GetOrderErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::order_not_found(&input.order_id)),

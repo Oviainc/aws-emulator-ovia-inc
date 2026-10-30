@@ -414,12 +414,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // transitions it owes the clock are dated from.
         let submitted_at = std::time::SystemTime::now();
         // Each line item of the order gets its own minted `LineItemId`, and reports
-        // the catalog item and quantity the request asked for. What it does NOT
-        // report is anything that would be a claim about hardware: a
-        // `ShipmentInformation` is a carrier's tracking number for a unit in transit,
-        // an `AssetInformationList` is the hardware installed for the item, and the
-        // two `Previous…` members belong to a replacement order — none of which this
-        // request carries or this emulator records.
+        // the catalog item and quantity the request asked for. What a just-submitted
+        // item does NOT report is anything that would be a claim about hardware: a
+        // `ShipmentInformation` is a carrier's tracking number for a unit in transit
+        // and the two `Previous…` members belong to a replacement order, neither of
+        // which this request carries or this emulator records, and an
+        // `AssetInformationList` is the hardware installed for the item — nothing is
+        // installed by submitting an order, so the member stays absent until the
+        // hardware it was placed for is, exactly as `OrderFulfilledDate` does
+        // ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::order_report`]).
         let line_items: Vec<LineItem> = line_items
             .into_iter()
             .map(|requested| {

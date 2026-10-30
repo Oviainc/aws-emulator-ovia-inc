@@ -38,7 +38,8 @@ use crate::ops::types::{
     Address, AssetInfo, AssetInstance, AssetInstanceTypeCapacity, AssetLocation,
     CapacityTaskFailure, CatalogItem,
     ComputeAttributes, ConnectionDetails, DetailedInstanceTypeItem, EC2Capacity, FormFactorConfig,
-    InstanceTypeCapacity, InstanceTypeItem, InstancesToExclude, Order, OrderingRequirement,
+    InstanceTypeCapacity, InstanceTypeItem, InstancesToExclude, LineItem, LineItemAssetInformation,
+    Order, OrderingRequirement,
     Outpost, PricingOption, PrivateConnectivityConfig, Quote, QuoteCapacity, QuoteOption, Site,
     SubscriptionPricingDetails, VpcInformation,
 };
@@ -2798,6 +2799,62 @@ pub fn installed_hardware(
         .collect()
 }
 
+/// Report `assets` — the hardware standing INSTALLED on an Outpost — on the line
+/// items of an order placed on it that have been installed.
+///
+/// `LineItem$AssetInformationList` is "information about assets", the hardware
+/// installed for the item, and an item reaches [`LINE_ITEM_STATUS_INSTALLED`] exactly
+/// when the install an order's fulfilment owes has put the Outpost's configuration on
+/// it ([`installed_hardware`]) — so an installed item reports that hardware and an item
+/// that is still being prepared, built or delivered, or that a cancellation finished,
+/// had nothing installed for it and reports none.
+///
+/// An install delivers one asset per physical unit of the configuration and this
+/// service holds no record of WHICH unit a particular line item delivered, so the units
+/// are dealt out across the installed items in installation order, one unit to each item
+/// in turn: every unit the install delivered is then reported by exactly one item, and no
+/// unit is claimed by two, which filling each item up before the next would not give
+/// (the first item would hold the whole configuration and the rest nothing). A unit this
+/// service holds no `AssetId` for names no asset and is reported by none, and installed
+/// items an install delivered nothing for — an Outpost whose form factor names no
+/// configuration holds no hardware — report nothing rather than an empty list.
+///
+/// That invariant is stated of ONE order, which is the scope hardware is installed in:
+/// one configuration is installed on an Outpost once, so a second order fulfilled on an
+/// Outpost that already holds it delivered nothing new and its items report the hardware
+/// standing there — the hardware the Outpost holds, which is what every report of it
+/// answers.
+fn report_installed_assets(items: &mut [LineItem], assets: &[AssetInfo]) {
+    let installed: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.status.as_deref() == Some(LINE_ITEM_STATUS_INSTALLED))
+        .map(|(index, _)| index)
+        .collect();
+    if installed.is_empty() {
+        return;
+    }
+    let mut dealt: Vec<Vec<LineItemAssetInformation>> = vec![Vec::new(); installed.len()];
+    for (unit, asset_id) in assets
+        .iter()
+        .filter_map(|asset| asset.asset_id.clone())
+        .enumerate()
+    {
+        dealt[unit % installed.len()].push(LineItemAssetInformation {
+            asset_id: Some(asset_id),
+            // "The MAC addresses of the asset": a hardware address belongs to a network
+            // interface of a physical unit, and this service records none — no call in
+            // this API reports or accepts one, and how many interfaces a unit carries is
+            // not a fact it holds either — so the member stays absent.
+            mac_address_list: None,
+        });
+    }
+    for (slot, index) in installed.into_iter().enumerate() {
+        let reported = std::mem::take(&mut dealt[slot]);
+        items[index].asset_information_list = (!reported.is_empty()).then_some(reported);
+    }
+}
+
 /// The one `QuotePricingType` the model declares (see
 /// [`crate::ops::types::QUOTE_PRICING_TYPE_VALUES`]): the pricing of this service is
 /// the pricing of a SUBSCRIPTION on hardware, which is the kind of price a
@@ -3215,6 +3272,34 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     /// same question asked of the other resource a region's inventory holds.
     pub fn orders_in<'a>(&'a self, region: &str) -> impl Iterator<Item = &'a OrderRecord> + 'a {
         all_in_region(&self.orders, region)
+    }
+
+    /// The `Order` a read of the stored `record` answers: the order as it is persisted,
+    /// with the hardware its fulfilment installed reported on the line items that
+    /// hardware was installed for.
+    ///
+    /// A member whose fact this service only holds once a later step has happened is
+    /// absent until that step and reported from the stored fact afterwards — the rule
+    /// `OrderFulfilledDate` follows ([`Self::settle_orders`]). The hardware installed
+    /// for a line item is the one record of it this store keeps, the assets standing on
+    /// the Outpost the order was placed on ([`OutpostRecord::assets`]), so an installed
+    /// item is reported from there ([`report_installed_assets`]) and `ListAssets` and a
+    /// read of the order can never disagree about which assets are installed. An order
+    /// whose Outpost this region holds none of — one since deleted — has no installed
+    /// hardware to report.
+    pub fn order_report(&self, record: &OrderRecord) -> Order {
+        let assets = record
+            .order
+            .outpost_id
+            .as_deref()
+            .and_then(|outpost_id| self.outpost(&record.region, outpost_id))
+            .map(|outpost| outpost.assets.as_slice())
+            .unwrap_or_default();
+        let mut order = record.order.clone();
+        if let Some(items) = order.line_items.as_deref_mut() {
+            report_installed_assets(items, assets);
+        }
+        order
     }
 
     /// The hardware configuration this service publishes under the `SkuCode`

@@ -69,6 +69,8 @@ mod order_cancellation;
 mod order_catalog_item_status;
 #[path = "all/order_lifecycle.rs"]
 mod order_lifecycle;
+#[path = "all/order_line_item_assets.rs"]
+mod order_line_item_assets;
 #[path = "all/order_listing.rs"]
 mod order_listing;
 #[path = "all/order_quote_references.rs"]

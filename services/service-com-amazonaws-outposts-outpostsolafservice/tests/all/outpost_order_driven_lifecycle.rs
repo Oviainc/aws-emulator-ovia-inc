@@ -38,7 +38,7 @@ use crate::site_and_outpost_lifecycle::{deliver_orders, ids, segment, text, Outp
 /// The `CatalogItemId` every line item below names: a value of the modelled `SkuCode`
 /// form (`^OR-[A-Z0-9]{7}$`), which is all this API says about the catalog item a line
 /// item may name.
-const SKU: &str = "OR-1A2B3C4";
+pub(crate) const SKU: &str = "OR-1A2B3C4";
 
 /// The most line items one order may carry, as the modelled
 /// `LineItemRequestListDefinition` (`length(min: 1, max: 20)`) allows.
@@ -46,7 +46,7 @@ const MAX_LINE_ITEMS: usize = 20;
 
 /// One site and one Outpost on it carrying `form_factor`, as that Outpost's
 /// `(OutpostId, OutpostArn)`. An Outpost belongs to a site, so the site comes first.
-async fn an_outpost(
+pub(crate) async fn an_outpost(
     outposts: &Outposts,
     name: &str,
     form_factor: Option<&str>,
@@ -64,7 +64,11 @@ async fn an_outpost(
 
 /// `CreateOrder` for `count` line items of hardware, naming the Outpost by
 /// `identifier`, and answering the `Order` it was persisted as.
-async fn order_hardware(outposts: &Outposts, identifier: &str, count: usize) -> Value {
+pub(crate) async fn order_hardware(
+    outposts: &Outposts,
+    identifier: &str,
+    count: usize,
+) -> Value {
     let line_items: Vec<Value> = (0..count)
         .map(|_| json!({ "CatalogItemId": SKU, "Quantity": 1 }))
         .collect();
@@ -83,7 +87,7 @@ async fn order_hardware(outposts: &Outposts, identifier: &str, count: usize) -> 
 }
 
 /// `GetOrder`, answering the `Order` it reports.
-async fn get_order(outposts: &Outposts, order_id: &str) -> Value {
+pub(crate) async fn get_order(outposts: &Outposts, order_id: &str) -> Value {
     outposts
         .ok("GET", &format!("/orders/{}", segment(order_id)), None)
         .await["Order"]
@@ -91,7 +95,7 @@ async fn get_order(outposts: &Outposts, order_id: &str) -> Value {
 }
 
 /// `CancelOrder`, requiring HTTP 200.
-async fn cancel_order(outposts: &Outposts, order_id: &str) {
+pub(crate) async fn cancel_order(outposts: &Outposts, order_id: &str) {
     outposts
         .ok(
             "POST",
@@ -107,7 +111,7 @@ async fn status(outposts: &Outposts, outpost_id: &str) -> String {
 }
 
 /// The hardware `ListAssets` reports for one Outpost, in installation order.
-async fn installed(outposts: &Outposts, outpost_id: &str) -> Vec<Value> {
+pub(crate) async fn installed(outposts: &Outposts, outpost_id: &str) -> Vec<Value> {
     outposts
         .ok(
             "GET",
@@ -129,7 +133,7 @@ async fn installed(outposts: &Outposts, outpost_id: &str) -> Vec<Value> {
 /// through the same store seam the suites that age a stored resource use. What it does
 /// NOT move is the span of any step it left ahead of the order: a case about when the
 /// install falls due waits that one out on the service's own clock.
-fn bring_forward(outposts: &Outposts, order_id: &str, steps: usize, case: &str) {
+pub(crate) fn bring_forward(outposts: &Outposts, order_id: &str, steps: usize, case: &str) {
     assert!(
         steps > 0,
         "case {case:?}: bringing no step forward leaves the order where it is"
@@ -158,7 +162,7 @@ fn bring_forward(outposts: &Outposts, order_id: &str, steps: usize, case: &str) 
 }
 
 /// Every `LineItemStatus` one order reports, in the order it reports its line items.
-fn line_item_statuses(order: &Value) -> Vec<String> {
+pub(crate) fn line_item_statuses(order: &Value) -> Vec<String> {
     order
         .get("LineItems")
         .and_then(Value::as_array)

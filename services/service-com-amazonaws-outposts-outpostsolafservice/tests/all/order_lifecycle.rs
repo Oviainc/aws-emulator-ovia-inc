@@ -64,8 +64,11 @@ const SKUS: &[&str] = &["OR-1A2B3C4", "OR-ABCDEFG", "OR-0000001", "OR-ZZZZZZ9"];
 const UNREPORTED: &[&str] = &["OrderFulfilledDate"];
 
 /// The members a `LineItem` carries only for hardware in transit, hardware installed,
-/// or an order that replaces an earlier one — none of which `CreateOrder` is told
-/// about or this emulator records.
+/// or an order that replaces an earlier one — none of which a JUST-SUBMITTED order has:
+/// `CreateOrder` is told nothing of a shipment or of a replaced order, and nothing is
+/// installed by submitting an order, so the hardware a line item reports once it is
+/// installed is reported then and not here
+/// ([`crate::order_line_item_assets`]).
 const UNREPORTED_ON_ITEM: &[&str] = &[
     "ShipmentInformation",
     "AssetInformationList",
