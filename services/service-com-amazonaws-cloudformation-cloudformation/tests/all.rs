@@ -143,6 +143,8 @@ mod list_stack_set_operations;
 mod list_stack_sets;
 #[path = "all/list_types.rs"]
 mod list_types;
+#[path = "all/macro_acknowledgement_and_include_refresh.rs"]
+mod macro_acknowledgement_and_include_refresh;
 #[path = "all/nested_resource_outputs.rs"]
 mod nested_resource_outputs;
 #[path = "all/no_echo_parameters.rs"]

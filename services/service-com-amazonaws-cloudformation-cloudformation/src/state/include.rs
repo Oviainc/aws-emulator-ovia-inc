@@ -35,7 +35,13 @@
 //! (which every read of a stored body goes through, under the store lock). The operation
 //! that SUBMITS a template processes it once — [`process`] — and the processed body is
 //! what the stack deploys from ([`super::StoredStack::set_processed_template_body`]), so
-//! every later read of that stack sees the spliced template without reading S3 again.
+//! every later READ of that stack sees the spliced template without reading S3 again.
+//!
+//! What is read once is one operation's expansion, not the stack's for ever: every
+//! operation that submits a template expands it again, so the snippet a stack deploys is
+//! the object in force when that operation ran — which is why an operation comparing a
+//! submitted template with the one in force compares the EXPANDED documents, and a snippet
+//! revised between two operations is a change the later one carries out.
 //!
 //! ## Bounds
 //!
@@ -95,6 +101,14 @@ const NO_SUCH_KEY: &str = "NoSuchKey";
 /// The error code it answers for a bucket it does not hold.
 const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
+/// What CloudFormation reports a transform failed with when the object a snippet was read
+/// from holds content it cannot read as a template fragment.
+///
+/// A FIXED sentence: the failure is about the content of the object, and CloudFormation
+/// words it the same way for every object and every unreadable content — it names neither
+/// the location the template gave nor what was wrong with the bytes.
+const CONTENT_NOT_A_TEMPLATE: &str = "The specified S3 object's content should be valid Yaml/JSON";
+
 /// What processing a submitted template's `AWS::Include` transforms left.
 #[derive(Debug, Clone)]
 pub enum Processed {
@@ -107,6 +121,40 @@ pub enum Processed {
     /// Processing could not be carried out, with the reason the stack operation records:
     /// the transform failed, so nothing is provisioned.
     Failed(String),
+}
+
+/// Whether a template body INVOKES a macro with the `Fn::Transform` intrinsic — wherever
+/// the intrinsic stands in the document, and whatever macro it names.
+///
+/// `Fn::Transform` "specifies a macro to perform custom processing on part of a stack
+/// template", so a body carrying one contains a macro exactly as a `Transform` section
+/// naming one does — which is what the `CAPABILITY_AUTO_EXPAND` acknowledgement is about
+/// ([`super::missing_auto_expand_capability`]). A body this service's reader will not read
+/// invokes nothing: the operation that submitted it answers for the body on its own terms.
+pub fn body_invokes_a_macro(body: &str) -> bool {
+    super::template::document(body).is_some_and(|document| invokes_a_macro(&document))
+}
+
+/// Whether the document carries the intrinsic anywhere.
+///
+/// Iterative, with an explicit stack, for the same reason as [`locations`]: the document is
+/// caller-supplied, so a recursive walk would spend the process stack on nesting the caller
+/// chose.
+fn invokes_a_macro(document: &Value) -> bool {
+    let mut pending: Vec<&Value> = vec![document];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Array(items) => pending.extend(items.iter()),
+            Value::Object(entries) => {
+                if entries.contains_key(INTRINSIC) {
+                    return true;
+                }
+                pending.extend(entries.values());
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Process every `AWS::Include` the body names, reading each snippet from Amazon S3.
@@ -389,8 +437,8 @@ async fn snippet(
     if body.len() > MAX_SNIPPET_BYTES {
         return Err(too_large(key));
     }
-    let text = String::from_utf8(body.to_vec()).map_err(|_| not_a_snippet(key))?;
-    super::template::document(&text).ok_or_else(|| not_a_snippet(key))
+    let text = String::from_utf8(body.to_vec()).map_err(|_| not_a_snippet())?;
+    super::template::document(&text).ok_or_else(not_a_snippet)
 }
 
 /// The detail for an object past the snippet ceiling.
@@ -400,7 +448,9 @@ fn too_large(key: &str) -> String {
 
 /// The detail for an object that is not a template fragment at all: a snippet is "a
 /// template snippet … stored separately from the main CloudFormation template", so it is
-/// read the way a template body is.
-fn not_a_snippet(key: &str) -> String {
-    format!("S3 key [{key}] does not hold a JSON or YAML template snippet.")
+/// read the way a template body is — and the failure is reported with the service's own
+/// fixed sentence for unreadable snippet content ([`CONTENT_NOT_A_TEMPLATE`]), which names
+/// no object, so neither does this.
+fn not_a_snippet() -> String {
+    CONTENT_NOT_A_TEMPLATE.to_string()
 }

@@ -26,7 +26,7 @@
 use serde_json::json;
 
 use crate::stack_lifecycle::{
-    acknowledging_iam, call, create_stack, describe_stack, iam, member, router,
+    call, create_stack, describe_stack, iam, member, router,
     wait_for_the_transition, xml_text, xml_texts,
 };
 use crate::stack_resource_provisioning::s3;
@@ -44,6 +44,13 @@ fn include(location: &str) -> serde_json::Value {
 /// The S3 URI of one snippet in [`SNIPPET_BUCKET`].
 fn location(key: &str) -> String {
     format!("s3://{SNIPPET_BUCKET}/{key}")
+}
+
+/// The `Capabilities` member a request submitting a template that invokes a macro carries:
+/// "if your stack template contains one or more macros [...] you must acknowledge this
+/// capability", which an `Fn::Transform` of `AWS::Include` is.
+fn acknowledging_the_macro() -> Vec<(String, String)> {
+    vec![member("Capabilities.member.1", CAPABILITY_AUTO_EXPAND)]
 }
 
 /// Does Amazon S3 hold this bucket?
@@ -239,7 +246,8 @@ async fn an_included_snippet_is_spliced_into_the_template_before_the_resources_a
         let router = router();
         seed_snippets(&router, row.snippets).await;
 
-        let (status, created) = create_stack(&router, row.stack, &row.template, &[]).await;
+        let (status, created) =
+            create_stack(&router, row.stack, &row.template, &acknowledging_the_macro()).await;
         assert_eq!(
             status, 200,
             "case {:?}: CreateStack must answer 200, got {status} {created}",
@@ -440,7 +448,8 @@ async fn an_include_that_cannot_be_read_fails_the_stack_and_provisions_nothing()
 
         // "After the call completes successfully, the stack creation starts": the template
         // is accepted and the stack id answered — the transform's failure is the STACK's.
-        let (status, created) = create_stack(&router, row.stack, &row.template, &[]).await;
+        let (status, created) =
+            create_stack(&router, row.stack, &row.template, &acknowledging_the_macro()).await;
         assert_eq!(
             status, 200,
             "case {:?}: CreateStack must answer 200, got {status} {created}",
@@ -538,7 +547,8 @@ async fn an_update_whose_include_cannot_be_read_leaves_the_stack_as_it_was() {
         }
     })
     .to_string();
-    let (status, created) = create_stack(&router, "include-updated", &deployed, &[]).await;
+    let (status, created) =
+        create_stack(&router, "include-updated", &deployed, &acknowledging_the_macro()).await;
     assert_eq!(
         status, 200,
         "CreateStack must answer 200, got {status} {created}"
@@ -630,10 +640,13 @@ async fn an_include_that_contributes_an_iam_resource_is_held_to_the_acknowledgem
     })
     .to_string();
 
-    let (status, refused) = create_stack(&router, "include-iam", &template, &[]).await;
+    // The macro acknowledged, the IAM resource the snippet contributes NOT: the refusal is
+    // the IAM gate's, weighed over the template the include expanded to.
+    let (status, refused) =
+        create_stack(&router, "include-iam", &template, &acknowledging_the_macro()).await;
     assert_eq!(
         status, 400,
-        "a request acknowledging nothing must be refused, got {status} {refused}"
+        "a request not acknowledging the IAM resource must be refused, got {status} {refused}"
     );
     assert!(
         refused.contains("InsufficientCapabilitiesException"),
@@ -647,8 +660,18 @@ async fn an_include_that_contributes_an_iam_resource_is_held_to_the_acknowledgem
 
     // The same template, acknowledged: the snippet's resource is the stack's and IAM holds
     // it.
-    let (status, created) =
-        create_stack(&router, "include-iam", &template, &acknowledging_iam(&[])).await;
+    let (status, created) = create_stack(
+        &router,
+        "include-iam",
+        &template,
+        // Both acknowledgements, each its own member of the list: the macro the template
+        // invokes and the named IAM resource its snippet contributes.
+        &[
+            member("Capabilities.member.1", CAPABILITY_AUTO_EXPAND),
+            member("Capabilities.member.2", "CAPABILITY_NAMED_IAM"),
+        ],
+    )
+    .await;
     assert_eq!(
         status, 200,
         "an acknowledged request must be accepted, got {status} {created}"

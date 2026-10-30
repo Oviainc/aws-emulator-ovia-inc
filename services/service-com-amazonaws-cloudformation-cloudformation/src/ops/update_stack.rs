@@ -24,7 +24,7 @@
 //! ([`crate::state::settle_due_rollbacks`]). Only a caller that asked for the failed state
 //! to be kept (`DisableRollback`) stops at `UPDATE_FAILED`, which is the status
 //! `ContinueUpdateRollback` and `RollbackStack` act on. A
-//! template that declares a transform the request has not acknowledged with
+//! template that declares or INVOKES a transform the request has not acknowledged with
 //! `CAPABILITY_AUTO_EXPAND` is refused with the modelled
 //! `InsufficientCapabilitiesException`. A request whose `ClientRequestToken` an operation
 //! on that stack already claimed is refused with the modelled
@@ -36,7 +36,12 @@
 //!
 //! The template is PROCESSED before it is deployed, exactly as a create's is: an
 //! `Fn::Transform` naming `AWS::Include` is the Amazon S3 object its `Location` names,
-//! spliced into the template ([`crate::state::include`]). An include that cannot be read
+//! spliced into the template ([`crate::state::include`]). That expansion happens on THIS
+//! operation, so the snippet the update deploys is the object in force now, and the
+//! template compared with the one the stack is in force with is the EXPANDED document: a
+//! snippet revised since the stack last deployed is a change this update carries out, and
+//! only a request that would deploy the same expanded template and the same configuration
+//! is refused with "No updates are to be performed." An include that cannot be read
 //! changes nothing — the stack keeps the template, the parameters and the resources it has,
 //! and the update fails carrying the transform's own reason.
 //!
@@ -662,27 +667,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // CloudFormation refuses an update that would change nothing about the stack.
-        if Some(&template_body) == previous.template_body.as_ref()
-            && parameters == previous.parameters
-            && tags == previous.tags
-            && notification_arns == previous.notification_arns
-            && capabilities == previous.capabilities
-            && role_arn == previous.role_arn
-            && rollback_configuration == previous.rollback_configuration
-            && deployment_config == previous.deployment_config
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "No updates are to be performed.",
-            ));
-        }
-        // Everything above read the store; nothing below it does until the template has
-        // been deployed.
-        let operation_id = crate::state::new_operation_id();
         // The template this update would deploy is PROCESSED first, exactly as a create's
         // is: an `Fn::Transform` of `AWS::Include` is the Amazon S3 snippet its `Location`
         // names, read and spliced in before anything is provisioned
-        // (`crate::state::include`).
+        // (`crate::state::include`). The snippet is read HERE, on this operation, rather
+        // than taken from what an earlier one read: the template a snippet is part of is
+        // only ever the document the objects in force RIGHT NOW make, so it is also what
+        // this update is compared with below.
         let processing =
             crate::state::include::process(ctx, &request_region, &template_body).await;
         // The acknowledgement is held to the PROCESSED template, exactly as a create's is:
@@ -721,6 +712,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             _ => processed_template,
         };
+
+        // CloudFormation refuses an update that would change nothing about the stack. What
+        // decides that is the template the update would DEPLOY — the one its transforms
+        // expanded, since the stack's resources are computed from that document and not
+        // from the body that names the transform — so a snippet revised since the stack
+        // last deployed is a change the update carries out, and a body naming no transform
+        // is compared with itself exactly as the submitted text. A template whose
+        // processing FAILED is compared with nothing: the operation reports that failure
+        // rather than calling the update a no-op.
+        if !matches!(processing, crate::state::include::Processed::Failed(_))
+            && Some(&included_body) == previous.included_template_body.as_ref()
+            && parameters == previous.parameters
+            && tags == previous.tags
+            && notification_arns == previous.notification_arns
+            && capabilities == previous.capabilities
+            && role_arn == previous.role_arn
+            && rollback_configuration == previous.rollback_configuration
+            && deployment_config == previous.deployment_config
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "No updates are to be performed.",
+            ));
+        }
+        // Everything above read the store; nothing below it does until the template has
+        // been deployed.
+        let operation_id = crate::state::new_operation_id();
 
         // "Updates on the resources you specify are denied": the stack policy in force
         // governs every resource action this update plans, so it is weighed BEFORE anything

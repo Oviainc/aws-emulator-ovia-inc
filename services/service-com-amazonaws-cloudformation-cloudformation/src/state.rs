@@ -598,19 +598,25 @@ pub fn template_body_too_long() -> String {
     )
 }
 
-/// `CAPABILITY_AUTO_EXPAND` when the template declares a transform the request has not
-/// acknowledged, and nothing when it has (or when there is no transform to acknowledge).
+/// `CAPABILITY_AUTO_EXPAND` when the template names a macro the request has not
+/// acknowledged, and nothing when it has (or when there is no macro to acknowledge).
 ///
 /// `CreateStackInput$Capabilities` requires the acknowledgement for a template that
 /// "contains one or more macros", and both `CreateStack` and `UpdateStack` model
 /// `InsufficientCapabilitiesException` for the request that omits it. The IAM
 /// acknowledgements (`CAPABILITY_IAM` / `CAPABILITY_NAMED_IAM`) are a separate rule about
 /// a template's RESOURCES and are not decided here.
+///
+/// A template CONTAINS a macro in either of the two ways one is invoked: the `Transform`
+/// section naming it for the whole template, and the `Fn::Transform` intrinsic naming one
+/// for part of it ([`include::body_invokes_a_macro`]). Both hand the template to processing
+/// that may rewrite it, which is what the acknowledgement is about, so either requires it.
 pub fn missing_auto_expand_capability(
     template_body: &str,
     acknowledged: &[String],
 ) -> Vec<String> {
-    let declares_transform = !template::body_declared_transforms(template_body).is_empty();
+    let declares_transform = !template::body_declared_transforms(template_body).is_empty()
+        || include::body_invokes_a_macro(template_body);
     let acknowledged_auto_expand = acknowledged
         .iter()
         .any(|capability| capability == CAPABILITY_AUTO_EXPAND);

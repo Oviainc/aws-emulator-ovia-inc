@@ -11,8 +11,8 @@
 //! parameters, which is what `DescribeStacks` reports once the create completes. A request
 //! naming a live stack's name IN THE REGION IT IS SIGNED FOR is refused with the modelled
 //! `AlreadyExistsException` — a stack name is a per-Region namespace, so the same name in
-//! another Region is a second stack — one whose template declares a transform it has not
-//! acknowledged with `CAPABILITY_AUTO_EXPAND` with the modelled
+//! another Region is a second stack — one whose template declares or INVOKES a transform it
+//! has not acknowledged with `CAPABILITY_AUTO_EXPAND` with the modelled
 //! `InsufficientCapabilitiesException`, and one naming a `RoleARN` the account's IAM
 //! records show CloudFormation cannot assume with the
 //! service's `ValidationError` (see `crate::state::role_trust_refusal`).
@@ -45,8 +45,10 @@
 //! `Capabilities` is WEIGHED against the template's own declarations: a template declaring
 //! an IAM resource the request did not acknowledge is refused with the modelled
 //! `InsufficientCapabilitiesException`, before the stack is created — see
-//! [`crate::state::insufficient_capabilities`] — and so is one that declares a TRANSFORM
-//! without `CAPABILITY_AUTO_EXPAND`. It is weighed against the PROCESSED
+//! [`crate::state::insufficient_capabilities`] — and so is one that names a MACRO without
+//! `CAPABILITY_AUTO_EXPAND`, whether its `Transform` section names one for the whole
+//! template or an `Fn::Transform` intrinsic names one for part of it. It is weighed against
+//! the PROCESSED
 //! template too, since a resource an included snippet contributes is one this stack would
 //! deploy.
 //!
