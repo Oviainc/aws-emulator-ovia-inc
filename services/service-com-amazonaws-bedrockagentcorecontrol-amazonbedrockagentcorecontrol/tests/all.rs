@@ -31,6 +31,8 @@ mod gateway_mutation;
 mod gateway_target_listing;
 #[path = "all/gateway_wire_shape.rs"]
 mod gateway_wire_shape;
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/harness_lifecycle.rs"]
 mod harness_lifecycle;
 #[path = "all/harness_version_listing.rs"]
@@ -51,3 +53,5 @@ mod token_vault_cmk;
 mod validation_message_rendering;
 #[path = "all/workload_identity_lifecycle.rs"]
 mod workload_identity_lifecycle;
+#[path = "all/workload_identity_mutation.rs"]
+mod workload_identity_mutation;

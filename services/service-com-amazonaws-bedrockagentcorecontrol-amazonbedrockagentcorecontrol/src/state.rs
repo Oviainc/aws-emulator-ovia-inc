@@ -55,7 +55,7 @@ use crate::ops::types::{
     RuntimeMetadataConfiguration, S3Location, StreamDeliveryResources, TargetConfiguration,
     TargetSummary,
     ToolDefinition, ToolSchema,
-    CreateWorkloadIdentityOutput, GetWorkloadIdentityOutput,
+    CreateWorkloadIdentityOutput, GetWorkloadIdentityOutput, UpdateWorkloadIdentityOutput,
     UpdateGatewayOutput, ValidationException, ValidationExceptionField, WafConfiguration,
     WorkloadIdentityDetails, WorkloadIdentityType,
 };
@@ -1104,8 +1104,32 @@ pub fn harness_arn(region: &str, harness_id: &str) -> String {
 /// bound.
 pub const MAX_WORKLOAD_IDENTITIES: usize = 1_000;
 
-/// The resource noun [`resource_not_found`] names for a workload identity.
-pub const RESOURCE_WORKLOAD_IDENTITY: &str = "workload identity";
+/// How this service words the 404 for a workload identity the account does not
+/// hold: the resource type, how the route addresses the identity, and the
+/// identifier the request named.
+///
+/// The workload-identity routes do NOT take the shared [`resource_not_found`]
+/// sentence: they name the resource type and echo the `name` the caller asked
+/// for. The identifier word differs per route — the read and update routes say
+/// `id`, the delete route says `name` — so each route picks its own constructor
+/// below rather than inventing a sentence of its own.
+fn workload_identity_not_found(identifier_word: &str, name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("WorkloadIdentity with {identifier_word} {name} not found.")),
+    }
+}
+
+/// The 404 for an identity a READ or an UPDATE could not resolve.
+pub fn workload_identity_not_found_by_id(name: &str) -> ResourceNotFoundException {
+    workload_identity_not_found("id", name)
+}
+
+/// The 404 for an identity a DELETE could not resolve — including a second
+/// delete of a name an earlier delete already removed, which is refused rather
+/// than answered as a silent success.
+pub fn workload_identity_not_found_by_name(name: &str) -> ResourceNotFoundException {
+    workload_identity_not_found("name", name)
+}
 
 /// One workload identity of this account, as `CreateWorkloadIdentity`
 /// persisted it.
@@ -1162,6 +1186,31 @@ impl WorkloadIdentityRecord {
             created_time: timestamp(self.created_at),
             last_updated_time: timestamp(self.updated_at),
         }
+    }
+
+    /// This identity as `UpdateWorkloadIdentity`'s response envelope. The two
+    /// operations report the same members off the same record, so an update
+    /// answers exactly what the following read reports.
+    pub fn update_output(&self) -> UpdateWorkloadIdentityOutput {
+        let read = self.get_output();
+        UpdateWorkloadIdentityOutput {
+            name: read.name,
+            workload_identity_arn: read.workload_identity_arn,
+            allowed_resource_oauth2_return_urls: read.allowed_resource_oauth2_return_urls,
+            created_time: read.created_time,
+            last_updated_time: read.last_updated_time,
+        }
+    }
+
+    /// Apply an `UpdateWorkloadIdentity` to this record: the request's list
+    /// REPLACES the stored one ("This list replaces the existing list",
+    /// `smithy_query doc shape=UpdateWorkloadIdentityRequest
+    /// member=allowedResourceOauth2ReturnUrls`), so a request carrying no list
+    /// leaves the identity with none, and the instant the change was applied
+    /// becomes the identity's `lastUpdatedTime`.
+    pub fn apply_update(&mut self, urls: Option<Vec<String>>, now: SystemTime) {
+        self.allowed_resource_oauth2_return_urls = urls;
+        self.updated_at = now;
     }
 }
 

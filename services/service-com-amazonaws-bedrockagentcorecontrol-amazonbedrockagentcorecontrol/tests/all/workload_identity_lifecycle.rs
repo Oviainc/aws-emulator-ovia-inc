@@ -15,141 +15,21 @@
 //! order, cut into pages of at most `maxResults` entries that resume exactly where the
 //! previous page ended, and it writes nothing a later caller can see.
 
-use std::sync::Arc;
-
-use bytes::Bytes;
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::EmulatedService;
+use super::harness::{
+    create_identity, error_code, expected_arn, get_identity, list_identities, listed, listed_names,
+    router, text, MAX_RESULTS_MAX, NAME_MAX_LENGTH, NAME_MIN_LENGTH,
+};
 
-/// The region the tests sign for.
-const REGION: &str = "us-east-1";
-
-/// The account id every emulated ARN carries (`engine::mock_account_id`).
-const ACCOUNT: &str = "000000000000";
-
-/// The modelled bounds of `ListWorkloadIdentities`'s `maxResults` (range 1..20) and the
+/// The modelled minimum of `ListWorkloadIdentities`'s `maxResults` (range 1..20) and the
 /// default it carries, from `smithy_query operation=ListWorkloadIdentities`.
 const MAX_RESULTS_MIN: i64 = 1;
-const MAX_RESULTS_MAX: i64 = 20;
 const MAX_RESULTS_DEFAULT: usize = 10;
-
-/// The modelled bounds of `WorkloadIdentityNameType` (len 3..255, pattern
-/// `^[A-Za-z0-9_.-]+$`), from `smithy_query operation=CreateWorkloadIdentity`.
-const NAME_MIN_LENGTH: usize = 3;
-const NAME_MAX_LENGTH: usize = 255;
 
 /// The members `WorkloadIdentityType` carries (`smithy_query shape=WorkloadIdentityType`),
 /// which a listing must report exactly as `GetWorkloadIdentity` reports them.
 const SHARED_MEMBERS: [&str; 2] = ["name", "workloadIdentityArn"];
-
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::default();
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// A SigV4 `Authorization` header for this service, which is what the router routes on and
-/// what the handlers read the ARN region from.
-fn authorization() -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20240101/{REGION}/bedrock-agentcore/aws4_request, \
-         SignedHeaders=host, Signature=abc"
-    )
-}
-
-async fn post(router: &MultiServiceRouter, uri: &str, body: &Value) -> (u16, Value) {
-    let payload = Bytes::from(serde_json::to_vec(body).expect("the request body serializes"));
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("authorization", authorization())
-        .header("host", "bedrock-agentcore-control.amazonaws.com")
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-async fn create_identity(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
-    post(router, "/identities/CreateWorkloadIdentity", body).await
-}
-
-async fn get_identity(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
-    post(
-        router,
-        "/identities/GetWorkloadIdentity",
-        &json!({"name": name}),
-    )
-    .await
-}
-
-async fn list_identities(
-    router: &MultiServiceRouter,
-    max_results: Option<i64>,
-    next_token: Option<&str>,
-) -> (u16, Value) {
-    let mut body = json!({});
-    if let Some(max) = max_results {
-        body["maxResults"] = json!(max);
-    }
-    if let Some(token) = next_token {
-        body["nextToken"] = json!(token);
-    }
-    post(router, "/identities/ListWorkloadIdentities", &body).await
-}
-
-/// The error code `restJson1` puts in `__type` / `x-amzn-errortype`.
-fn error_code(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<no __type>")
-        .rsplit('#')
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn text(body: &Value, member: &str) -> String {
-    body.get(member)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The `workloadIdentities` of a listing response.
-fn listed(body: &Value) -> Vec<Value> {
-    body.get("workloadIdentities")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// The `name` of every entry of a listing response, in the order reported.
-fn listed_names(body: &Value) -> Vec<String> {
-    listed(body)
-        .iter()
-        .map(|entry| text(entry, "name"))
-        .collect()
-}
-
-/// The ARN an identity of this account carries: the token vault's `default`
-/// workload-identity directory, ending in the identity's own name.
-fn expected_arn(name: &str) -> String {
-    format!(
-        "arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT}:workload-identity-directory/default/\
-         workload-identity/{name}"
-    )
-}
 
 /// A create persists what the caller configured and the read reports exactly that record.
 ///

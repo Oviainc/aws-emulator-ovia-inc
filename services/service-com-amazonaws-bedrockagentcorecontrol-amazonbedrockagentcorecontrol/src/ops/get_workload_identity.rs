@@ -164,10 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let record = store.workload_identities.get(&input.name).ok_or_else(|| {
             GetWorkloadIdentityErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    crate::state::ACTION_RETRIEVE,
-                    crate::state::RESOURCE_WORKLOAD_IDENTITY,
-                ),
+                crate::state::workload_identity_not_found_by_id(&input.name),
             )
         })?;
 
