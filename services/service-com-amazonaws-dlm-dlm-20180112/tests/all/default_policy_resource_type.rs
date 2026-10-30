@@ -390,7 +390,7 @@ async fn an_update_may_not_change_a_default_policys_resource_type() {
                 }),
             )
             .await;
-            assert_refused(&case, "PolicyDetails.ResourceType", &refused);
+            assert_refused(&case, "ResourceType", &refused);
 
             // Nothing of the refused request took effect: not the type it asked
             // for, and not the configuration it carried beside it.

@@ -398,7 +398,7 @@ fn refusals(subject: &Subject) -> Vec<Refusal> {
         .filter(|stated| **stated != subject.policy_type)
     {
         refusals.push(Refusal {
-            member: "PolicyDetails.PolicyType",
+            member: "PolicyType",
             stated: (*stated).to_string(),
             stored: subject.policy_type.to_string(),
             details: stating(&subject.replacement, "PolicyType", json!(stated)),
@@ -413,11 +413,11 @@ fn refusals(subject: &Subject) -> Vec<Refusal> {
         .filter(|stated| **stated != target)
     {
         let (member, path, value) = if subject.default_policy {
-            ("ResourceType", "PolicyDetails.ResourceType", json!(stated))
+            ("ResourceType", "ResourceType", json!(stated))
         } else {
             (
                 "ResourceTypes",
-                "PolicyDetails.ResourceTypes",
+                "ResourceTypes",
                 json!([stated]),
             )
         };
@@ -476,12 +476,20 @@ async fn an_update_cannot_change_a_policys_type_or_resource_type() {
                 "case {case:?}: expected the {INVALID_PARAMETER_CODE:?} code, got {:?}",
                 at(&answer.body, "/Code")
             );
-            // The refusal is built from the request and the stored policy: the
-            // member refused, the value the policy holds and the one asked for.
-            for named in [member, stored.as_str(), stated.as_str()] {
+            // The refusal names the parameter the update may not change, and
+            // nothing of the values the request stated or the policy holds: the
+            // wording is the same for every policy, account and region.
+            let expected = format!("The following parameter(s) cannot be updated: {member}");
+            assert_eq!(
+                answer.message(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                answer.message()
+            );
+            for value in [stored.as_str(), stated.as_str()] {
                 assert!(
-                    answer.message().contains(named),
-                    "case {case:?}: the refusal must name {named:?}, got {:?}",
+                    !answer.message().contains(value),
+                    "case {case:?}: the refusal must not carry the value {value:?}, got {:?}",
                     answer.message()
                 );
             }

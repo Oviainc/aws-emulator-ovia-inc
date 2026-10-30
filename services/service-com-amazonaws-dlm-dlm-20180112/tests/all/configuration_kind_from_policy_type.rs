@@ -260,10 +260,9 @@ fn assert_requires(case: &str, answer: &Answer, members: &[&str]) {
         "case {case:?}: expected the modelled {INVALID_REQUEST_EXCEPTION}, got {:?}",
         answer.error_code()
     );
-    let mut expected: Vec<String> = members
-        .iter()
-        .map(|member| format!("PolicyDetails.{member}"))
-        .collect();
+    // An omitted parameter is named by the member's own name, which is how the
+    // refusal lists it.
+    let mut expected: Vec<String> = members.iter().map(|member| (*member).to_string()).collect();
     expected.sort();
     let reported = answer.required_parameters();
     assert_eq!(

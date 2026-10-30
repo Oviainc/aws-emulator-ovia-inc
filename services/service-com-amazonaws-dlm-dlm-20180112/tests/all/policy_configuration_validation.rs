@@ -535,7 +535,7 @@ async fn a_configuration_states_every_member_its_policy_kind_is_built_from() {
             assert_owed(
                 &case,
                 &answer,
-                &Owed::Required(vec![format!("PolicyDetails.{member}")]),
+                &Owed::Required(vec![(*member).to_string()]),
             );
             assert_eq!(
                 policy_count(&router).await,
@@ -558,12 +558,7 @@ async fn a_configuration_states_every_member_its_policy_kind_is_built_from() {
         assert_owed(
             &case,
             &answer,
-            &Owed::Required(
-                members
-                    .iter()
-                    .map(|member| format!("PolicyDetails.{member}"))
-                    .collect(),
-            ),
+            &Owed::Required(members.iter().map(|member| (*member).to_string()).collect()),
         );
     }
 }

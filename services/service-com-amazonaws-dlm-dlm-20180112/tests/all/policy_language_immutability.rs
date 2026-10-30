@@ -414,12 +414,19 @@ async fn an_update_cannot_change_the_kind_of_policy_a_record_is() {
             "case {case:?}: expected the {INVALID_PARAMETER_CODE:?} code, got {:?}",
             at(&answer.body, "/Code")
         );
-        // The refusal is built from the request and the stored policy: the member
-        // refused, the language the policy holds and the one that was asked for.
-        for named in ["PolicyDetails.PolicyLanguage", subject.language, stated] {
+        // The refusal names the parameter the update may not change, and nothing
+        // of the language the policy holds or the one that was asked for.
+        let expected = "The following parameter(s) cannot be updated: PolicyLanguage";
+        assert_eq!(
+            answer.message(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.message()
+        );
+        for value in [subject.language, stated] {
             assert!(
-                answer.message().contains(named),
-                "case {case:?}: the refusal must name {named:?}, got {:?}",
+                !answer.message().contains(value),
+                "case {case:?}: the refusal must not carry the value {value:?}, got {:?}",
                 answer.message()
             );
         }

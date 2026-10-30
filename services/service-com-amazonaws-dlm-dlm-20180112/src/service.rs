@@ -562,10 +562,7 @@ fn invalid_request(
         ));
     }
     if !omitted.is_empty() {
-        clauses.push(format!(
-            "The following parameter(s) are required: {}",
-            omitted.join(", ")
-        ));
+        clauses.push(crate::state::required_parameters_missing_message(&omitted));
     }
     let message = clauses.join(" ");
     let refused = if omitted.is_empty() {

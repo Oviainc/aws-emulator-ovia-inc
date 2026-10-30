@@ -349,7 +349,7 @@ pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
 /// submitted structure's own `PolicyLanguage` happens to say. The kind is the
 /// caller's to decide, because only the write path knows it: a create derives it
 /// from the request, and an update from the policy it addresses, whose kind it
-/// cannot change ([`policy_language_violation`]). A DEFAULT policy's
+/// cannot change ([`immutable_member_changed`]). A DEFAULT policy's
 /// configuration carries none of the custom members below; its `[Default
 /// policies only]` defaults are the documented ones, which
 /// [`LifecyclePolicyRecord::effective_policy_details`] reports from the record's
@@ -658,7 +658,7 @@ impl LifecyclePolicyRecord {
     /// than a second, independently stored value that could contradict it.
     ///
     /// The kind is decided when the policy is created and an update cannot change
-    /// it ([`policy_language_violation`]), so this is also the only language a
+    /// it ([`immutable_member_changed`]), so this is also the only language a
     /// request addressing this policy may state.
     pub fn policy_language(&self) -> &'static str {
         if self.default_policy {
@@ -1059,6 +1059,47 @@ pub fn required_parameters_omitted(
     }
 }
 
+/// How Amazon Data Lifecycle Manager says that a request left out parameters it
+/// is required to state: the fixed text below, then the omitted parameters as a
+/// brace-wrapped, comma-separated list.
+///
+/// This is the ONE place that wording lives, so every layer that refuses a
+/// request for an omitted parameter — the modelled-constraint walk ahead of a
+/// handler and the documented cross-member rules inside one — says it the same
+/// way, and a client that classifies a validation failure by that wording (or
+/// parses the name list out of it, as `RequiredParameters` lists the same names)
+/// recognises it whichever layer refused the request.
+pub fn required_parameters_missing_message(parameters: &[String]) -> String {
+    format!(
+        "The following required parameter(s) are missing: {{{}}}",
+        parameters.join(", ")
+    )
+}
+
+/// The whole `InvalidRequestException` for a request that omitted `parameters`:
+/// the wording above, and the same names in `RequiredParameters` ("the request
+/// omitted one or more required parameters").
+pub fn required_parameters_missing(parameters: Vec<String>) -> InvalidRequestException {
+    required_parameters_omitted(required_parameters_missing_message(&parameters), parameters)
+}
+
+/// How Amazon Data Lifecycle Manager says that a request asked to change
+/// `parameters` that are fixed when the policy is created: the fixed text below,
+/// then the parameters as a comma-separated list, and nothing of the values the
+/// request stated or the policy holds — so the refusal reads the same whichever
+/// policy, account or region it is answered for.
+///
+/// Carried by the message and the code alone: an immutable parameter was neither
+/// omitted (`RequiredParameters`) nor stated beside a parameter it cannot be
+/// combined with (`MutuallyExclusiveParameters`), so neither structured list
+/// names it.
+pub fn parameters_cannot_be_updated(parameters: &[&str]) -> InvalidRequestException {
+    invalid_request(format!(
+        "The following parameter(s) cannot be updated: {}",
+        parameters.join(", ")
+    ))
+}
+
 /// The prefix [`DefaultPolicyOnlyParameters::stated_names`] qualifies a member
 /// stated inside the `PolicyDetails` configuration structure with, so a refusal
 /// tells a caller WHERE it stated the parameter. The unqualified name of the
@@ -1154,7 +1195,7 @@ pub trait DefaultPolicyOnlyBody {
 /// member to read. A create states the resource type in the body as
 /// `CreateLifecyclePolicyRequest$DefaultPolicy` — also the member that MAKES the
 /// request a default-policy request, so it is read where that name belongs — and
-/// an update may not change it at all ([`resource_type_cannot_be_updated`]), so
+/// an update may not change it at all ([`immutable_member_changed`]), so
 /// a body set leaves it unset.
 macro_rules! default_policy_only_body {
     ($($request:ty),+ $(,)?) => {
@@ -1254,60 +1295,57 @@ pub const POLICY_TYPE_MEMBER: &str = "PolicyType";
 /// snapshot or AMI policy targets: `PolicyDetails$ResourceTypes`.
 pub const RESOURCE_TYPES_MEMBER: &str = "ResourceTypes";
 
-/// The `InvalidRequestException` for an update whose configuration states a
-/// value for a member of the policy's identity other than the one the policy
-/// holds.
+/// The member of the policy's identity `details` asks to CHANGE, by its own
+/// wire name, or `None` when the replacement configuration asks for no change
+/// this operation rules out.
 ///
-/// `UpdateLifecyclePolicyRequest$PolicyDetails` is "the configuration of the
-/// lifecycle policy. You cannot update the policy type or the resource type": the
-/// request states a configuration the service cannot apply to this policy, which
-/// is the "invalid parameters" the operation models `InvalidRequestException`
-/// for. The message names the member refused, the value the policy holds for it
-/// and the one the request asked for — `described` being how that member's
-/// documentation names what it states.
-pub fn configuration_member_cannot_be_updated(
-    member: &str,
-    described: &str,
-    stated: &str,
-    stored: &str,
-) -> InvalidRequestException {
-    invalid_request(format!(
-        "The parameter {POLICY_DETAILS_PREFIX}{member} cannot be updated. The policy's \
-         {described} is {stored} and {stated} was requested."
-    ))
-}
-
-/// The refusal of an update that states a resource type other than the one the
-/// policy holds, by that rule.
-pub fn resource_type_cannot_be_updated(stated: &str, stored: &str) -> InvalidRequestException {
-    configuration_member_cannot_be_updated(RESOURCE_TYPE_MEMBER, "resource type", stated, stored)
-}
-
-/// The refusal of an update whose configuration names a KIND of policy other
-/// than the one the policy addressed IS, or `None` when it names that kind or
-/// names none.
-///
-/// `PolicyDetails$PolicyLanguage` is the member that says which kind a
-/// configuration describes — `SIMPLIFIED` "To create a default policy",
-/// `STANDARD` "To create a custom policy" — so a configuration stating the other
-/// kind's language asks for the one change
-/// `UpdateLifecyclePolicyRequest$PolicyDetails` rules out: "You cannot update the
-/// policy type or the resource type". It is refused by the same rule, and for the
-/// same reason, as a configuration naming another resource type.
-pub fn policy_language_violation(
+/// The members are judged in the order `PolicyDetails` declares them, and the
+/// FIRST one the request asks to change is the parameter the refusal names: a
+/// replacement configuration that restates a whole policy of another kind
+/// carries every member of that kind consistently, so naming each of them would
+/// report the one change asked for several times over.
+fn immutable_member_changed(
     policy: &LifecyclePolicyRecord,
     details: Option<&PolicyDetails>,
-) -> Option<InvalidRequestException> {
-    let stated = details?.policy_language.as_deref()?;
-    let stored = policy.policy_language();
-    (stated != stored).then(|| {
-        configuration_member_cannot_be_updated(
-            POLICY_LANGUAGE_MEMBER,
-            "policy language",
-            stated,
-            stored,
-        )
-    })
+) -> Option<&'static str> {
+    let details = details?;
+
+    if details
+        .policy_type
+        .as_deref()
+        .is_some_and(|stated| stated != policy.policy_type())
+    {
+        return Some(POLICY_TYPE_MEMBER);
+    }
+
+    if let Some(stated) = details.resource_types.as_ref() {
+        // `ResourceTypeValuesList` is `@length(min: 1, max: 1)`, so the member
+        // states exactly one type and the lists are compared as they stand.
+        let stored = policy.target_resource_types();
+        if !stored.is_empty() && *stated != stored {
+            return Some(RESOURCE_TYPES_MEMBER);
+        }
+    }
+
+    if details
+        .policy_language
+        .as_deref()
+        .is_some_and(|stated| stated != policy.policy_language())
+    {
+        return Some(POLICY_LANGUAGE_MEMBER);
+    }
+
+    if let Some(stated) = details.resource_type.as_deref() {
+        if policy
+            .default_policy_type
+            .as_deref()
+            .is_some_and(|stored| stated != stored)
+        {
+            return Some(RESOURCE_TYPE_MEMBER);
+        }
+    }
+
+    None
 }
 
 /// Why `details` cannot be applied to `policy` as its new configuration, or
@@ -1326,7 +1364,7 @@ pub fn policy_language_violation(
 ///
 /// * `PolicyLanguage` — which KIND of policy the configuration describes,
 ///   `SIMPLIFIED` "To create a default policy" against `STANDARD` "To create a
-///   custom policy" ([`policy_language_violation`]).
+///   custom policy".
 /// * `PolicyType` — what the policy manages, "the type of policy": the policy
 ///   type the sentence names, compared against the one this policy reports
 ///   ([`LifecyclePolicyRecord::policy_type`]).
@@ -1341,51 +1379,16 @@ pub fn policy_language_violation(
 /// A policy holding no value for one of them has none to change, so a
 /// configuration stating one fills in the single stored copy instead of being
 /// refused.
+///
+/// The refusal is the service's non-updatable-parameter answer
+/// ([`parameters_cannot_be_updated`]), naming the parameter
+/// [`immutable_member_changed`] refuses on.
 pub fn immutable_configuration_violation(
     policy: &LifecyclePolicyRecord,
     details: Option<&PolicyDetails>,
 ) -> Option<InvalidRequestException> {
-    let details = details?;
-
-    if let Some(refusal) = policy_language_violation(policy, Some(details)) {
-        return Some(refusal);
-    }
-
-    if let Some(stated) = details.policy_type.as_deref() {
-        let stored = policy.policy_type();
-        if stated != stored {
-            return Some(configuration_member_cannot_be_updated(
-                POLICY_TYPE_MEMBER,
-                "policy type",
-                stated,
-                &stored,
-            ));
-        }
-    }
-
-    if let Some(stated) = details.resource_type.as_deref() {
-        if let Some(stored) = policy.default_policy_type.as_deref() {
-            if stated != stored {
-                return Some(resource_type_cannot_be_updated(stated, stored));
-            }
-        }
-    }
-
-    if let Some(stated) = details.resource_types.as_ref() {
-        // `ResourceTypeValuesList` is `@length(min: 1, max: 1)`, so the member
-        // states exactly one type and the lists are compared as they stand.
-        let stored = policy.target_resource_types();
-        if !stored.is_empty() && *stated != stored {
-            return Some(configuration_member_cannot_be_updated(
-                RESOURCE_TYPES_MEMBER,
-                "target resource type",
-                &stated.join(", "),
-                &stored.join(", "),
-            ));
-        }
-    }
-
-    None
+    immutable_member_changed(policy, details)
+        .map(|member| parameters_cannot_be_updated(&[member]))
 }
 
 /// Carry the type `policy` holds onto a replacement configuration that states
@@ -1643,8 +1646,9 @@ fn schedule_path(position: usize) -> String {
 }
 
 /// The `PolicyDetails` members a request OMITTED that the kind of policy its
-/// configuration describes cannot be built from, as the wire paths a refusal
-/// names. Empty when the configuration states every one of them.
+/// configuration describes cannot be built from, each by its own wire name, as
+/// a refusal lists an omitted parameter. Empty when the configuration states
+/// every one of them.
 ///
 /// `PolicyDetails` declares the members of every policy kind at once, so the
 /// model can mark none of them `@required`: which ones a request must carry
@@ -1689,7 +1693,7 @@ pub fn omitted_configuration_members(details: &PolicyDetails) -> Vec<String> {
     required
         .into_iter()
         .filter(|(_, stated)| !*stated)
-        .map(|(name, _)| format!("{POLICY_DETAILS_PREFIX}{name}"))
+        .map(|(name, _)| name.to_string())
         .collect()
 }
 
@@ -1701,26 +1705,15 @@ pub fn omitted_configuration_members(details: &PolicyDetails) -> Vec<String> {
 /// and `PolicyDetails`, "the configuration details of the lifecycle policy". A
 /// request carrying neither describes no policy, so there is none to create.
 pub fn no_policy_configuration() -> InvalidRequestException {
-    required_parameters_omitted(
-        "The parameter PolicyDetails is required: a lifecycle policy is configured either by \
-         DefaultPolicy or by PolicyDetails."
-            .to_string(),
-        vec!["PolicyDetails".to_string()],
-    )
+    required_parameters_missing(vec![POLICY_DETAILS_MEMBER.to_string()])
 }
 
 /// The `InvalidRequestException` for a configuration that omitted `parameters`
-/// the kind of policy it describes is built from. The message is built from the
-/// request: it names the parameters that were omitted.
+/// the kind of policy it describes is built from. The refusal is built from the
+/// request: it names the parameters that were omitted, in the service's
+/// missing-required-parameter wording.
 pub fn configuration_members_omitted(parameters: &[String]) -> InvalidRequestException {
-    let (noun, verb) = plural(parameters.len());
-    required_parameters_omitted(
-        format!(
-            "The {noun} {} {verb} required for this policy configuration.",
-            parameters.join(", ")
-        ),
-        parameters.to_vec(),
-    )
+    required_parameters_missing(parameters.to_vec())
 }
 
 /// `("parameter", "is")` or `("parameters", "are")`, so a refusal that names one

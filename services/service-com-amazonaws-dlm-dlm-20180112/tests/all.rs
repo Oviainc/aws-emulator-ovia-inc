@@ -69,3 +69,5 @@ mod tag_arn_resolution;
 mod tag_write_date_modified;
 #[path = "all/unresolvable_policy_id.rs"]
 mod unresolvable_policy_id;
+#[path = "all/validation_refusal_message_templates.rs"]
+mod validation_refusal_message_templates;
