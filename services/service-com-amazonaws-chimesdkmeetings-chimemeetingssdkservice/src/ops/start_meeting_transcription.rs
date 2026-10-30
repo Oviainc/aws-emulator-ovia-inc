@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMeetingTranscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMeetingTranscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMeetingTranscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starting transcription is a MUTATION of the meeting: the configuration this call
+//! accepts becomes the meeting's current transcription configuration, so a later call
+//! replaces it and the record lives on the meeting ([`crate::state::StoredMeeting`]) and
+//! is dropped with it.
+//!
+//! Two refusals come before that write, and neither of them touches the store:
+//!
+//! 1. a `TranscriptionConfiguration` that breaks one of the combination rules the model
+//!    documents for it is refused with the modelled `BadRequestException` (HTTP 400) —
+//!    see [`configuration_problem`];
+//! 2. a `MeetingId` that names no live meeting is refused with the modelled
+//!    `NotFoundException` (HTTP 404), worded by
+//!    [`crate::state::ComAmazonawsChimesdkmeetingsChimemeetingssdkserviceState::meeting_absent`]
+//!    so a meeting that has ENDED is reported as ended rather than as an unknown id.
+//!
+//! Nothing here starts an Amazon Transcribe stream: this emulator runs no media service,
+//! so what the operation owns is the control-plane record of the configuration in force.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +203,184 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMeetingTranscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMeetingTranscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMeetingTranscription"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartMeetingTranscriptionErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+
+        // The configuration is judged BEFORE the store is touched, so a refused call
+        // leaves the meeting transcribing exactly what it was transcribing before.
+        if let Some(problem) = configuration_problem(&input.transcription_configuration) {
+            return Err(StartMeetingTranscriptionErrorModeled::BadRequestException(
+                crate::state::bad_request(problem),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // ONE lookup: the meeting the id names is the record this call writes to, and the
+        // refusal below is reached only when there is no such record.
+        if let Some(stored) = store.meetings.get_mut(&input.meeting_id) {
+            // "The configuration for the CURRENT transcription operation": the
+            // configuration this call accepted is the one in force, so starting
+            // transcription again replaces it rather than being refused or accumulating a
+            // second one.
+            stored.transcription = Some(input.transcription_configuration);
+            return Ok(StartMeetingTranscriptionOutput);
+        }
+        Err(StartMeetingTranscriptionErrorModeled::NotFoundException(
+            store.meeting_absent(&input.meeting_id),
+        )
+        .into())
     }
+}
+
+/// The message for the first combination rule a `TranscriptionConfiguration` breaks, or
+/// `None` when it breaks none.
+///
+/// Every rule here is a sentence the model states about the member it constrains
+/// (`smithy_query(query="shape",shape="TranscriptionConfiguration")` and
+/// `shape="EngineTranscribeSettings"`), and each message names the MEMBERS the request
+/// carried rather than any value from it. Per-member constraints — the required members of
+/// the medical settings, the enums, the lengths and the patterns — are refused by the
+/// boundary validator before this handler runs, so only the cross-member rules are left.
+fn configuration_problem(configuration: &TranscriptionConfiguration) -> Option<String> {
+    match (
+        configuration.engine_transcribe_settings.as_ref(),
+        configuration.engine_transcribe_medical_settings.as_ref(),
+    ) {
+        // `TranscriptionConfiguration`: "Must contain EngineTranscribeSettings or
+        // EngineTranscribeMedicalSettings." One engine transcribes the meeting's audio,
+        // so naming both is as unserveable as naming neither.
+        (None, None) | (Some(_), Some(_)) => Some(
+            "TranscriptionConfiguration must contain either EngineTranscribeSettings or \
+             EngineTranscribeMedicalSettings"
+                .to_string(),
+        ),
+        (Some(settings), None) => transcribe_settings_problem(settings),
+        // `EngineTranscribeMedicalSettings` constrains each member on its own —
+        // `LanguageCode`, `Specialty` and `Type` are required and every member of it is an
+        // enum or a bounded string — so it has no cross-member rule left to check.
+        (None, Some(_)) => None,
+    }
+}
+
+/// The combination rules `EngineTranscribeSettings` documents, in the order they are
+/// stated on its members.
+fn transcribe_settings_problem(settings: &EngineTranscribeSettings) -> Option<String> {
+    let identify_language = settings.identify_language;
+
+    // `IdentifyLanguage`: "You must include either LanguageCode or IdentifyLanguage." —
+    // the language is either stated or identified, never both and never neither.
+    if identify_language && settings.language_code.is_some() {
+        return Some(
+            "EngineTranscribeSettings must include either LanguageCode or IdentifyLanguage, \
+             not both"
+                .to_string(),
+        );
+    }
+    if !identify_language && settings.language_code.is_none() {
+        return Some(
+            "EngineTranscribeSettings must include either LanguageCode or IdentifyLanguage"
+                .to_string(),
+        );
+    }
+
+    // `ContentIdentificationType` and `ContentRedactionType`: "You can't set
+    // ContentIdentificationType and ContentRedactionType."
+    if settings.content_identification_type.is_some() && settings.content_redaction_type.is_some() {
+        return Some(
+            "EngineTranscribeSettings can't set both ContentIdentificationType and \
+             ContentRedactionType"
+                .to_string(),
+        );
+    }
+
+    // `PiiEntityTypes`: "if you include PiiEntityTypes, you must also include
+    // ContentIdentificationType or ContentRedactionType."
+    if settings.pii_entity_types.is_some()
+        && settings.content_identification_type.is_none()
+        && settings.content_redaction_type.is_none()
+    {
+        return Some(
+            "EngineTranscribeSettings that includes PiiEntityTypes must also include \
+             ContentIdentificationType or ContentRedactionType"
+                .to_string(),
+        );
+    }
+
+    // `LanguageOptions`: "If you include LanguageOptions, you must also include
+    // IdentifyLanguage."
+    if settings.language_options.is_some() && !identify_language {
+        return Some(
+            "EngineTranscribeSettings that includes LanguageOptions must also include \
+             IdentifyLanguage"
+                .to_string(),
+        );
+    }
+
+    // `PreferredLanguage`: "You can only use this parameter if you include IdentifyLanguage
+    // and LanguageOptions" — it is a choice from the languages the request listed.
+    if settings.preferred_language.is_some()
+        && (!identify_language || settings.language_options.is_none())
+    {
+        return Some(
+            "EngineTranscribeSettings can only include PreferredLanguage together with \
+             IdentifyLanguage and LanguageOptions"
+                .to_string(),
+        );
+    }
+
+    // `IdentifyLanguage`: "Language identification can't be combined with custom language
+    // models or redaction."
+    if identify_language && settings.language_model_name.is_some() {
+        return Some(
+            "EngineTranscribeSettings can't combine IdentifyLanguage with LanguageModelName"
+                .to_string(),
+        );
+    }
+    if identify_language && settings.content_redaction_type.is_some() {
+        return Some(
+            "EngineTranscribeSettings can't combine IdentifyLanguage with ContentRedactionType"
+                .to_string(),
+        );
+    }
+
+    // The vocabulary members come in a singular and a plural spelling, and which one a
+    // request may use is decided by `IdentifyLanguage`: `VocabularyName` and
+    // `VocabularyFilterName` each document "If you include IdentifyLanguage … use the
+    // VocabularyNames/VocabularyFilterNames parameter instead", and the plural members
+    // document the converse for a request that includes no `IdentifyLanguage`.
+    if identify_language && settings.vocabulary_name.is_some() {
+        return Some(
+            "EngineTranscribeSettings that includes IdentifyLanguage must name its custom \
+             vocabularies in VocabularyNames instead of VocabularyName"
+                .to_string(),
+        );
+    }
+    if identify_language && settings.vocabulary_filter_name.is_some() {
+        return Some(
+            "EngineTranscribeSettings that includes IdentifyLanguage must name its vocabulary \
+             filters in VocabularyFilterNames instead of VocabularyFilterName"
+                .to_string(),
+        );
+    }
+    if !identify_language && settings.vocabulary_names.is_some() {
+        return Some(
+            "EngineTranscribeSettings that includes no IdentifyLanguage must name its custom \
+             vocabulary in VocabularyName instead of VocabularyNames"
+                .to_string(),
+        );
+    }
+    if !identify_language && settings.vocabulary_filter_names.is_some() {
+        return Some(
+            "EngineTranscribeSettings that includes no IdentifyLanguage must name its \
+             vocabulary filter in VocabularyFilterName instead of VocabularyFilterNames"
+                .to_string(),
+        );
+    }
+
+    None
 }

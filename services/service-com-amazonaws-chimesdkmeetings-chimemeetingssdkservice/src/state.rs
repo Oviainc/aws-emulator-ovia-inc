@@ -282,6 +282,8 @@ pub struct StoredMeeting {
     /// It is nested in the meeting rather than kept in a map beside the meetings so that
     /// it cannot outlive the meeting it belongs to: deleting the meeting drops it, and no
     /// second record can disagree about whether this meeting is being transcribed.
+    /// Reported by no operation — neither the `Meeting` shape nor any output shape of this
+    /// model carries a transcription member.
     pub transcription: Option<TranscriptionConfiguration>,
 }
 
