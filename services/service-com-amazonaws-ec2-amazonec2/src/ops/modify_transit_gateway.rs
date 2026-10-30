@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyTransitGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyTransitGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members the request carries to the stored transit gateway it
+//! names — its description and each of its options — leaving every member the request does
+//! not carry as it was, answers the gateway in the transient `modifying` state with the
+//! instant the clock owes it `available` recorded beside it, and mints the default transit
+//! gateway route table a newly enabled default role needs (see
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::modify_transit_gateway`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyTransitGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +136,223 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyTransitGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyTransitGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyTransitGateway"))
+        // `ctx` carries request metadata only; this operation reads none of it — the
+        // gateway's ARN and owning account were settled when it was created. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        let requested = input.options.as_ref();
+
+        // "The options to modify" (`Options`), read BEFORE anything is looked up or
+        // written, so a value outside a published range or enum is refused whatever the
+        // store holds — by the same readers `CreateTransitGateway` holds the same members
+        // to, so the two cannot disagree about which values an option admits. A member the
+        // request leaves out stays absent here, which is what leaves the stored value as it
+        // was.
+        let modification = state::TransitGatewayModification {
+            transit_gateway_id: input.transit_gateway_id.clone(),
+            description: input.description.clone(),
+            add_transit_gateway_cidr_blocks: state::canonical_transit_gateway_cidr_blocks(
+                requested.and_then(|options| options.add_transit_gateway_cidr_blocks.as_deref()),
+                "addTransitGatewayCidrBlocks",
+            )?,
+            remove_transit_gateway_cidr_blocks: state::canonical_transit_gateway_cidr_blocks(
+                requested.and_then(|options| options.remove_transit_gateway_cidr_blocks.as_deref()),
+                "removeTransitGatewayCidrBlocks",
+            )?,
+            // An ASN the request names is held to the two published private ranges, the one
+            // rule `CreateTransitGateway` reads the same member by; a request that names
+            // none leaves the gateway's own ASN alone rather than returning it to the
+            // published default.
+            amazon_side_asn: requested
+                .and_then(|options| options.amazon_side_asn)
+                .map(|asn| state::private_amazon_side_asn(Some(asn)))
+                .transpose()?,
+            auto_accept_shared_attachments: option_value(
+                requested.and_then(|options| options.auto_accept_shared_attachments.as_deref()),
+                "autoAcceptSharedAttachments",
+            )?,
+            default_route_table_association: option_value(
+                requested.and_then(|options| options.default_route_table_association.as_deref()),
+                "defaultRouteTableAssociation",
+            )?,
+            association_default_route_table_id: requested
+                .and_then(|options| options.association_default_route_table_id.clone()),
+            default_route_table_propagation: option_value(
+                requested.and_then(|options| options.default_route_table_propagation.as_deref()),
+                "defaultRouteTablePropagation",
+            )?,
+            propagation_default_route_table_id: requested
+                .and_then(|options| options.propagation_default_route_table_id.clone()),
+            vpn_ecmp_support: option_value(
+                requested.and_then(|options| options.vpn_ecmp_support.as_deref()),
+                "vpnEcmpSupport",
+            )?,
+            dns_support: option_value(
+                requested.and_then(|options| options.dns_support.as_deref()),
+                "dnsSupport",
+            )?,
+            security_group_referencing_support: option_value(
+                requested.and_then(|options| options.security_group_referencing_support.as_deref()),
+                "securityGroupReferencingSupport",
+            )?,
+            encryption_support: option_value(
+                requested.and_then(|options| options.encryption_support.as_deref()),
+                "encryptionSupport",
+            )?,
+        };
+
+        // A route table id the request names is read as an id of its kind before any
+        // lookup, so "not a route table id at all" is never reported as "no such route
+        // table" — the one form check every operation of this crate resolving a
+        // `TransitGatewayRouteTableId` applies.
+        let named_route_tables = [
+            modification.association_default_route_table_id.as_deref(),
+            modification.propagation_default_route_table_id.as_deref(),
+        ];
+        for route_table_id in named_route_tables.into_iter().flatten() {
+            state::require_well_formed_transit_gateway_route_table_id(route_table_id)?;
+        }
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // The clock first: what this modification is applied to is the state the gateway is
+        // ACTUALLY in rather than the one it was left in.
+        store.materialize_due_transitions();
+
+        // "The ID of the transit gateway" (`TransitGatewayId`): an id this account holds no
+        // gateway for has nothing to modify. The one refusal every reader of a
+        // `TransitGatewayId` in this crate answers, so the family reads one way.
+        let Some(current) = store
+            .transit_gateways
+            .get(&modification.transit_gateway_id)
+            .cloned()
+        else {
+            return Err(state::invalid_transit_gateway_id_not_found(
+                &modification.transit_gateway_id,
+            ));
+        };
+
+        // "The ID of the default association route table" / "The ID of the default
+        // propagation route table": a default route table of a gateway is one of THAT
+        // gateway's route tables, so an id naming a table of another gateway — or no table
+        // at all — is refused rather than stored as a role nothing holds.
+        for route_table_id in named_route_tables.into_iter().flatten() {
+            let belongs = store
+                .transit_gateway_route_tables
+                .get(route_table_id)
+                .is_some_and(|route_table| {
+                    route_table.transit_gateway_id.as_deref()
+                        == Some(modification.transit_gateway_id.as_str())
+                });
+            if !belongs {
+                return Err(state::invalid_transit_gateway_route_table_id_not_found(
+                    route_table_id,
+                ));
+            }
+        }
+
+        // "You must first delete all transit gateway attachments configured prior to
+        // modifying the ASN on the transit gateway" (`AmazonSideAsn`), for the kinds that
+        // member lists — so the request is refused for the state the GATEWAY is in rather
+        // than served a change to the ASN its attachments are already peering over.
+        if modification.amazon_side_asn.is_some() {
+            let blocking = store
+                .transit_gateway_attachments_blocking_asn_change(&modification.transit_gateway_id);
+            if !blocking.is_empty() {
+                return Err(asn_change_blocked(
+                    &modification.transit_gateway_id,
+                    &blocking,
+                ));
+            }
+        }
+
+        // What this call would leave behind, computed by the ONE definition of what a
+        // modification does to a gateway, so the figure checked here is exactly the one the
+        // write charges. The budget is asked about the NET change: this call stores no
+        // further gateway, so the gateway ceiling cannot bound it, while the description and
+        // the CIDR blocks it sets are caller-chosen text.
+        let applied = modification.applied_to(&current);
+        let refund = state::transit_gateway_payload_bytes(&current);
+        let charge = state::transit_gateway_payload_bytes(&applied);
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store this modification's {charge} bytes",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+        // A newly enabled default role has the store MINT the gateway's default route
+        // table, so the record ceiling that bounds every other route table write bounds
+        // this one too, and the refusal is the one a create of a route table answers.
+        if state::needs_default_transit_gateway_route_table(applied.options.as_ref())
+            && !store.has_transit_gateway_route_table_capacity()
+        {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} transit gateway route tables, which is as many \
+                 as it stores",
+                held = store.transit_gateway_route_tables.len(),
+            )));
+        }
+
+        // Every parameter has been read and the gateway resolved, and nothing has been
+        // written yet: "If you have the required permissions, the error response is
+        // DryRunOperation" (`DryRun`), so a request that WOULD have worked stops here, and
+        // one that would have been refused was refused above with its own reason.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Written through the store's ONE writer of a modification, so what this answers is
+        // the stored record a later `DescribeTransitGateways` of the same gateway reports.
+        let Some(transit_gateway) =
+            store.modify_transit_gateway(&modification, ::std::time::SystemTime::now())
+        else {
+            // Unreachable: the gateway was resolved above and the store is locked throughout.
+            return Err(state::internal_error(format!(
+                "the transit gateway '{}' could not be read back after its modification",
+                modification.transit_gateway_id
+            )));
+        };
+        Ok(ModifyTransitGatewayOutput {
+            transit_gateway: Some(transit_gateway),
+        })
     }
+}
+
+/// One `enable`/`disable` option a modification carries, or `None` when the request carried
+/// none — which leaves the stored value as it was rather than returning it to a default.
+///
+/// The VALUE itself is read by the one reader every one of these members goes through
+/// ([`crate::state::transit_gateway_option_value`]), so a modification and a create cannot
+/// disagree about which values an option admits.
+fn option_value(
+    requested: Option<&str>,
+    member: &str,
+) -> Result<Option<String>, ModifyTransitGatewayError> {
+    requested
+        .map(|value| crate::state::transit_gateway_option_value(value, member))
+        .transpose()
+}
+
+/// Refuse a modification of the Amazon-side ASN of a gateway that still holds an attachment
+/// of a kind the model says blocks one: HTTP 400 `IncorrectState`, naming the gateway, the
+/// attachments that block the change and what the caller has to do about them.
+///
+/// The message is built from the request and the store — the gateway the request named and
+/// the attachment ids the store holds for it — so it is the RULE that is fixed here and not
+/// any one message, and the sentence it ends with is the one
+/// `ModifyTransitGatewayOptions$AmazonSideAsn` publishes.
+fn asn_change_blocked(
+    transit_gateway_id: &str,
+    attachment_ids: &[&str],
+) -> ModifyTransitGatewayError {
+    crate::state::incorrect_state(format!(
+        "Transit Gateway {transit_gateway_id} has attachments ({attachments}). You must \
+         first delete all transit gateway attachments configured prior to modifying the ASN \
+         on the transit gateway.",
+        attachments = attachment_ids.join(", "),
+    ))
 }

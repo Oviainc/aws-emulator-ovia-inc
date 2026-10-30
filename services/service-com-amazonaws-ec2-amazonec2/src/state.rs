@@ -1503,7 +1503,7 @@ use crate::ops::types::{
     CapacityReservationCommitmentInfo, CapacityReservationInfo, CustomerGateway, ExportTask,
     FpgaImage,
     FpgaImageState, ImageUsageReport,
-    DestinationOptionsResponse, FlowLog, TagFieldSpecificationResponse,
+    DestinationOptionsResponse, EncryptionSupport, FlowLog, TagFieldSpecificationResponse,
     LoadPermission,
     CapacityReservationFleet, FleetCapacityReservation,
     StorageLocation, VolumeRecycleBinInfo,
@@ -7523,10 +7523,33 @@ impl ComAmazonawsEc2Amazonec2State {
                 // lookup per role rather than a scan of every route table the store holds.
                 let mut owed: Vec<String> = Vec::new();
                 if let Some(transit_gateway) = transit_gateways.get_mut(transit_gateway_id) {
-                    if transit_gateway.state.as_deref() == Some(TRANSIT_GATEWAY_STATE_PENDING) {
+                    // `pending` is the state a create answers with and `modifying` the one a
+                    // modification answers with: both end with the gateway usable again, so
+                    // both are owed `available` on this instant.
+                    if matches!(
+                        transit_gateway.state.as_deref(),
+                        Some(TRANSIT_GATEWAY_STATE_PENDING | TRANSIT_GATEWAY_STATE_MODIFYING)
+                    ) {
                         transit_gateway.state = Some(TRANSIT_GATEWAY_STATE_AVAILABLE.to_string());
                     }
-                    if let Some(options) = transit_gateway.options.as_ref() {
+                    if let Some(options) = transit_gateway.options.as_mut() {
+                        // VPC Encryption Control is turned on or off over the span of the
+                        // modification that asked for it, so the transient state that
+                        // modification answered with reaches its terminal one here
+                        // (`EncryptionStateValue`).
+                        if let Some(encryption) = options.encryption_support.as_mut() {
+                            match encryption.encryption_state.as_deref() {
+                                Some(ENCRYPTION_STATE_ENABLING) => {
+                                    encryption.encryption_state =
+                                        Some(ENCRYPTION_STATE_ENABLED.to_string());
+                                }
+                                Some(ENCRYPTION_STATE_DISABLING) => {
+                                    encryption.encryption_state =
+                                        Some(ENCRYPTION_STATE_DISABLED.to_string());
+                                }
+                                _ => {}
+                            }
+                        }
                         owed.extend(options.association_default_route_table_id.clone());
                         owed.extend(options.propagation_default_route_table_id.clone());
                     }
@@ -24928,22 +24951,12 @@ impl ComAmazonawsEc2Amazonec2State {
         let associates = options.default_route_table_association.as_deref() == Some(OPTION_ENABLE);
         let propagates = options.default_route_table_propagation.as_deref() == Some(OPTION_ENABLE);
         if associates || propagates {
-            let route_table_id = self.next_id(TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX);
-            self.transit_gateway_route_tables.insert(
-                route_table_id.clone(),
-                TransitGatewayRouteTable {
-                    transit_gateway_route_table_id: Some(route_table_id.clone()),
-                    transit_gateway_id: Some(transit_gateway_id.clone()),
-                    // The table comes up with its gateway, so it starts `pending` too.
-                    state: Some(TRANSIT_GATEWAY_ROUTE_TABLE_STATE_PENDING.to_string()),
-                    default_association_route_table: Some(associates),
-                    default_propagation_route_table: Some(propagates),
-                    creation_time: Some(creation_time),
-                    // Nothing tags the default route table: a `CreateTransitGateway` tag
-                    // specification tags the gateway.
-                    tags: Some(Vec::new()),
-                },
-            );
+            let route_table_id =
+                self.insert_default_transit_gateway_route_table(&transit_gateway_id, spec.created_at);
+            if let Some(route_table) = self.transit_gateway_route_tables.get_mut(&route_table_id) {
+                route_table.default_association_route_table = Some(associates);
+                route_table.default_propagation_route_table = Some(propagates);
+            }
             if associates {
                 options.association_default_route_table_id = Some(route_table_id.clone());
             }
@@ -24973,6 +24986,175 @@ impl ComAmazonawsEc2Amazonec2State {
         self.transit_gateway_available_at
             .insert(transit_gateway_id.clone(), Instant::now() + TRANSITION_DELAY);
         transit_gateway_id
+    }
+
+    /// Mint the DEFAULT transit gateway route table of `transit_gateway_id`, created at
+    /// `at`, and answer its id.
+    ///
+    /// The ONE place that table is built, for the create that owes a fresh gateway one and
+    /// for the modification that owes one to a gateway whose default role has just been
+    /// enabled. It starts `pending`, because it comes up WITH its gateway rather than on an
+    /// entry of its own ([`Self::transit_gateway_route_table_available_at`] holds only the
+    /// ADDITIONAL tables `CreateTransitGatewayRouteTable` makes), and it is created holding
+    /// neither default role: which roles it holds is read off the gateway's options by the
+    /// caller, which is the one place those roles are decided.
+    fn insert_default_transit_gateway_route_table(
+        &mut self,
+        transit_gateway_id: &str,
+        at: SystemTime,
+    ) -> String {
+        let route_table_id = self.next_id(TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX);
+        let route_table = TransitGatewayRouteTable {
+            transit_gateway_route_table_id: Some(route_table_id.clone()),
+            transit_gateway_id: Some(transit_gateway_id.to_string()),
+            state: Some(TRANSIT_GATEWAY_ROUTE_TABLE_STATE_PENDING.to_string()),
+            default_association_route_table: Some(false),
+            default_propagation_route_table: Some(false),
+            creation_time: Some(system_time_to_date_time(at)),
+            // Nothing tags a default route table: a tag specification tags the gateway.
+            tags: Some(Vec::new()),
+        };
+        self.add_stored_bytes(transit_gateway_route_table_payload_bytes(&route_table));
+        self.transit_gateway_route_tables
+            .insert(route_table_id.clone(), route_table);
+        route_table_id
+    }
+
+    /// Apply `modification` to the transit gateway it names, as of `at`, and answer the
+    /// gateway as it NOW stands — `None` when this store holds no gateway under that id.
+    ///
+    /// The one way a stored transit gateway is modified, so what `ModifyTransitGateway`
+    /// answers and what a later `DescribeTransitGateways` reports cannot differ: what it
+    /// hands back is the stored record itself. Which members the call changes is
+    /// [`TransitGatewayModification::applied_to`]'s one definition; what only this function
+    /// can decide is done here:
+    ///
+    /// * the gateway is left in the TRANSIENT [`TRANSIT_GATEWAY_STATE_MODIFYING`] state with
+    ///   the clock owing it `available` [`TRANSITION_DELAY`] later, exactly as a create
+    ///   leaves a fresh gateway `pending` — the span is never zero, so a caller acting
+    ///   straight after this call still sees the modification being carried out;
+    /// * a default role that is enabled and names no route table gets one: the table the
+    ///   gateway already holds in either role, or a freshly minted default table
+    ///   ([`needs_default_transit_gateway_route_table`]) when it holds none — so one gateway
+    ///   keeps ONE default table however its roles are moved between the two options;
+    /// * a default role that is DISABLED names no route table at all, the same reading of
+    ///   "each id is reported only for the option that is enabled" that
+    ///   [`Self::insert_transit_gateway`] applies;
+    /// * every route table of the gateway is left reporting the default roles the gateway's
+    ///   options now name it for, so the gateway's options and its tables cannot disagree
+    ///   about which table is default.
+    ///
+    /// The caller-chosen bytes are re-charged across the write — the record this replaces is
+    /// refunded and the record it becomes is charged — so a caller cannot grow the store
+    /// past [`MAX_STORED_BYTES`] by modifying one gateway repeatedly; a handler asks
+    /// [`Self::would_exceed_stored_bytes_after_refund`] about that net change first.
+    pub fn modify_transit_gateway(
+        &mut self,
+        modification: &TransitGatewayModification,
+        at: SystemTime,
+    ) -> Option<TransitGateway> {
+        let held = self
+            .transit_gateways
+            .get(&modification.transit_gateway_id)?;
+        let refund = transit_gateway_payload_bytes(held);
+        let mut view = modification.applied_to(held);
+        view.state = Some(TRANSIT_GATEWAY_STATE_MODIFYING.to_string());
+
+        let mut options = view.options.take().unwrap_or_default();
+        let associates = options.default_route_table_association.as_deref() == Some(OPTION_ENABLE);
+        let propagates = options.default_route_table_propagation.as_deref() == Some(OPTION_ENABLE);
+        // ONE table serves both default roles, so the table the gateway already holds in
+        // either role is read — and whether a fresh one is needed decided — BEFORE a
+        // disabled role's id is cleared: a call that moves the default role from one option
+        // to the other then reuses that table rather than minting a second one and leaving
+        // the first orphaned.
+        let held_default_route_table_id = options
+            .association_default_route_table_id
+            .clone()
+            .or_else(|| options.propagation_default_route_table_id.clone());
+        let mints_a_default_route_table =
+            needs_default_transit_gateway_route_table(Some(&options));
+        if !associates {
+            options.association_default_route_table_id = None;
+        }
+        if !propagates {
+            options.propagation_default_route_table_id = None;
+        }
+        let default_route_table_id = if mints_a_default_route_table {
+            Some(self.insert_default_transit_gateway_route_table(
+                &modification.transit_gateway_id,
+                at,
+            ))
+        } else {
+            held_default_route_table_id
+        };
+        if let Some(route_table_id) = default_route_table_id {
+            if associates && options.association_default_route_table_id.is_none() {
+                options.association_default_route_table_id = Some(route_table_id.clone());
+            }
+            if propagates && options.propagation_default_route_table_id.is_none() {
+                options.propagation_default_route_table_id = Some(route_table_id);
+            }
+        }
+        for (route_table_id, route_table) in &mut self.transit_gateway_route_tables {
+            if route_table.transit_gateway_id.as_deref()
+                != Some(modification.transit_gateway_id.as_str())
+            {
+                continue;
+            }
+            route_table.default_association_route_table = Some(
+                options.association_default_route_table_id.as_deref()
+                    == Some(route_table_id.as_str()),
+            );
+            route_table.default_propagation_route_table = Some(
+                options.propagation_default_route_table_id.as_deref()
+                    == Some(route_table_id.as_str()),
+            );
+        }
+        view.options = Some(options);
+
+        let charge = transit_gateway_payload_bytes(&view);
+        self.transit_gateways
+            .insert(modification.transit_gateway_id.clone(), view.clone());
+        self.release_stored_bytes(refund);
+        self.add_stored_bytes(charge);
+        // What the clock now owes this gateway: `available`, one TRANSITION_DELAY from now —
+        // the same span, off the same monotonic clock, as a create's `pending` move.
+        self.transit_gateway_available_at.insert(
+            modification.transit_gateway_id.clone(),
+            Instant::now() + TRANSITION_DELAY,
+        );
+        Some(view)
+    }
+
+    /// The attachments of `transit_gateway_id` whose KIND has to be deleted before the
+    /// gateway's Amazon-side ASN can be modified, by the attachment id each is held under.
+    ///
+    /// "The modify ASN operation is not allowed on a transit gateway if it has the following
+    /// attachments: Dynamic VPN, Static VPN, Direct Connect Gateway, Connect, VPN
+    /// Concentrator, Client VPN. You must first delete all transit gateway attachments
+    /// configured prior to modifying the ASN on the transit gateway"
+    /// (`ModifyTransitGatewayOptions$AmazonSideAsn`) — a LIST of kinds, so the kinds not on
+    /// it (a VPC attachment, a transit gateway peering) do not block the modification. An
+    /// attachment whose owner REJECTED it is configured on nothing, so it does not block one
+    /// either.
+    pub fn transit_gateway_attachments_blocking_asn_change<'a>(
+        &'a self,
+        transit_gateway_id: &str,
+    ) -> Vec<&'a str> {
+        self.transit_gateway_attachments
+            .iter()
+            .filter(|(_, record)| {
+                record.view.transit_gateway_id() == Some(transit_gateway_id)
+                    && matches!(
+                        record.view.resource_type(),
+                        TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CONNECT
+                            | TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_CLIENT_VPN
+                    )
+                    && record.view.state() != Some(record.view.states().rejected)
+            })
+            .map(|(attachment_id, _)| attachment_id.as_str())
+            .collect()
     }
 
     /// Whether another transit gateway route table fits inside the store's ceiling
@@ -26083,6 +26265,26 @@ pub const TRANSIT_GATEWAY_STATE_PENDING: &str = "pending";
 /// `available` member.
 pub const TRANSIT_GATEWAY_STATE_AVAILABLE: &str = "available";
 
+/// A transit gateway whose modification is being carried out: the `TransitGatewayState`
+/// enum's `modifying` member, which is what `ModifyTransitGateway` answers with until
+/// [`TRANSITION_DELAY`] has passed and the clock owes the gateway
+/// [`TRANSIT_GATEWAY_STATE_AVAILABLE`] again.
+pub const TRANSIT_GATEWAY_STATE_MODIFYING: &str = "modifying";
+
+/// VPC Encryption Control being turned ON for a transit gateway: the
+/// `EncryptionStateValue` enum's `enabling` member, the transient state a modification that
+/// asked for encryption support answers with.
+pub const ENCRYPTION_STATE_ENABLING: &str = "enabling";
+
+/// VPC Encryption Control in force: that enum's `enabled` member.
+pub const ENCRYPTION_STATE_ENABLED: &str = "enabled";
+
+/// VPC Encryption Control being turned OFF: that enum's `disabling` member.
+pub const ENCRYPTION_STATE_DISABLING: &str = "disabling";
+
+/// VPC Encryption Control off: that enum's `disabled` member.
+pub const ENCRYPTION_STATE_DISABLED: &str = "disabled";
+
 /// A transit gateway route table still coming up with its gateway: the
 /// `TransitGatewayRouteTableState` enum's `pending` member.
 pub const TRANSIT_GATEWAY_ROUTE_TABLE_STATE_PENDING: &str = "pending";
@@ -26242,6 +26444,44 @@ pub fn canonical_transit_gateway_cidr(value: &str) -> Result<String, CidrProblem
     Ok(canonical)
 }
 
+/// The transit gateway CIDR blocks a request asked for, each in the canonical form
+/// [`canonical_transit_gateway_cidr`] reads it into — refusing anything that is not a CIDR
+/// block at all, or that is smaller than the published minimum for its family, and naming
+/// the member the request carried it in.
+///
+/// The ONE reader of that member for every operation that carries one
+/// (`TransitGatewayRequestOptions$TransitGatewayCidrBlocks`,
+/// `ModifyTransitGatewayOptions$AddTransitGatewayCidrBlocks` and its `Remove…` twin), so a
+/// create and a modification cannot disagree about what a block is or about how one outside
+/// the published sizes is refused.
+pub fn canonical_transit_gateway_cidr_blocks<E>(
+    requested: Option<&[String]>,
+    member: &str,
+) -> Result<Vec<String>, Scaffolded<E>> {
+    let mut blocks: Vec<String> = Vec::new();
+    for requested_block in requested.unwrap_or_default() {
+        match canonical_transit_gateway_cidr(requested_block) {
+            Ok(canonical) => blocks.push(canonical),
+            Err(CidrProblem::Malformed) => {
+                return Err(invalid_parameter_value(format!(
+                    "Value ({requested_block}) for parameter {member} is \
+                     invalid. This is not a valid CIDR block."
+                )))
+            }
+            Err(CidrProblem::PrefixLength) => {
+                return Err(invalid_parameter_value(format!(
+                    "The CIDR '{requested_block}' is invalid. Must be a size \
+                     /{ipv4} CIDR block or larger for IPv4, or a size /{ipv6} CIDR block \
+                     or larger for IPv6.",
+                    ipv4 = MAX_TRANSIT_GATEWAY_IPV4_PREFIX,
+                    ipv6 = MAX_TRANSIT_GATEWAY_IPV6_PREFIX,
+                )))
+            }
+        }
+    }
+    Ok(blocks)
+}
+
 /// The options one transit gateway is created with: what the request asked for, each
 /// member it left out at the default its own documentation publishes.
 ///
@@ -26266,30 +26506,10 @@ pub fn transit_gateway_options<E>(
     requested: Option<&TransitGatewayRequestOptions>,
 ) -> Result<TransitGatewayOptions, Scaffolded<E>> {
     let asn = private_amazon_side_asn(requested.and_then(|options| options.amazon_side_asn))?;
-    let mut cidr_blocks: Vec<String> = Vec::new();
-    for requested_block in requested
-        .and_then(|options| options.transit_gateway_cidr_blocks.as_deref())
-        .unwrap_or_default()
-    {
-        match canonical_transit_gateway_cidr(requested_block) {
-            Ok(canonical) => cidr_blocks.push(canonical),
-            Err(CidrProblem::Malformed) => {
-                return Err(invalid_parameter_value(format!(
-                    "Value ({requested_block}) for parameter transitGatewayCidrBlocks is \
-                     invalid. This is not a valid CIDR block."
-                )))
-            }
-            Err(CidrProblem::PrefixLength) => {
-                return Err(invalid_parameter_value(format!(
-                    "The CIDR '{requested_block}' is invalid. Must be a size \
-                     /{ipv4} CIDR block or larger for IPv4, or a size /{ipv6} CIDR block \
-                     or larger for IPv6.",
-                    ipv4 = MAX_TRANSIT_GATEWAY_IPV4_PREFIX,
-                    ipv6 = MAX_TRANSIT_GATEWAY_IPV6_PREFIX,
-                )))
-            }
-        }
-    }
+    let cidr_blocks = canonical_transit_gateway_cidr_blocks(
+        requested.and_then(|options| options.transit_gateway_cidr_blocks.as_deref()),
+        "transitGatewayCidrBlocks",
+    )?;
     Ok(TransitGatewayOptions {
         amazon_side_asn: Some(asn),
         // "One or more IPv4 or IPv6 CIDR blocks for the transit gateway": a gateway the
@@ -26356,12 +26576,212 @@ fn transit_gateway_option<E>(
 ) -> Result<String, Scaffolded<E>> {
     match requested {
         None => Ok(default.to_string()),
-        Some(value) if value == OPTION_ENABLE || value == OPTION_DISABLE => Ok(value.to_string()),
-        Some(value) => Err(invalid_parameter_value(format!(
-            "Value ({value}) for parameter {member} is invalid. \
-             Valid values are {OPTION_ENABLE} and {OPTION_DISABLE}."
-        ))),
+        Some(value) => transit_gateway_option_value(value, member),
     }
+}
+
+/// One `enable`/`disable` transit gateway option VALUE a request carried, refused when it
+/// is neither.
+///
+/// The ONE reader of such a value, for the create that defaults an omitted member
+/// ([`transit_gateway_option`]) and for the modification that leaves an omitted member as it
+/// was alike, so the two cannot disagree about which values an option admits.
+pub fn transit_gateway_option_value<E>(value: &str, member: &str) -> Result<String, Scaffolded<E>> {
+    if value == OPTION_ENABLE || value == OPTION_DISABLE {
+        return Ok(value.to_string());
+    }
+    Err(invalid_parameter_value(format!(
+        "Value ({value}) for parameter {member} is invalid. \
+         Valid values are {OPTION_ENABLE} and {OPTION_DISABLE}."
+    )))
+}
+
+/// What `ModifyTransitGateway` asks of one stored transit gateway: the members the REQUEST
+/// carried, each absent when the request left it out — "the modified options are applied to
+/// new transit gateway attachments only" (`ModifyTransitGateway`), so a member the request
+/// does not carry leaves the stored value as it was rather than returning to a default.
+///
+/// Every value here has already been read by the readers a create holds the same members to
+/// ([`private_amazon_side_asn`], [`canonical_transit_gateway_cidr_blocks`],
+/// [`transit_gateway_option_value`]), so what reaches the store is a value the create path
+/// would have accepted too.
+#[derive(Debug, Clone, Default)]
+pub struct TransitGatewayModification {
+    /// "The ID of the transit gateway" (`ModifyTransitGatewayRequest$TransitGatewayId`).
+    pub transit_gateway_id: String,
+    /// "The description for the transit gateway"
+    /// (`ModifyTransitGatewayRequest$Description`).
+    pub description: Option<String>,
+    /// "Adds IPv4 or IPv6 CIDR blocks for the transit gateway"
+    /// (`ModifyTransitGatewayOptions$AddTransitGatewayCidrBlocks`), canonicalised.
+    pub add_transit_gateway_cidr_blocks: Vec<String>,
+    /// "Removes CIDR blocks for the transit gateway"
+    /// (`ModifyTransitGatewayOptions$RemoveTransitGatewayCidrBlocks`), canonicalised.
+    pub remove_transit_gateway_cidr_blocks: Vec<String>,
+    /// The Amazon-side ASN the request asked for.
+    pub amazon_side_asn: Option<i64>,
+    /// "Enable or disable automatic acceptance of attachment requests."
+    pub auto_accept_shared_attachments: Option<String>,
+    /// "Enable or disable automatic association with the default association route table."
+    pub default_route_table_association: Option<String>,
+    /// "The ID of the default association route table."
+    pub association_default_route_table_id: Option<String>,
+    /// Whether "resource attachments automatically propagate routes to the default
+    /// propagation route table".
+    pub default_route_table_propagation: Option<String>,
+    /// "The ID of the default propagation route table."
+    pub propagation_default_route_table_id: Option<String>,
+    /// "Enable or disable Equal Cost Multipath Protocol support."
+    pub vpn_ecmp_support: Option<String>,
+    /// "Enable or disable DNS support."
+    pub dns_support: Option<String>,
+    /// Whether a security group may be referenced "across VPCs attached to a transit
+    /// gateway".
+    pub security_group_referencing_support: Option<String>,
+    /// "Enable or disable encryption support for VPC Encryption Control"
+    /// (`ModifyTransitGatewayOptions$EncryptionSupport`), as the `enable`/`disable` value
+    /// the request asked for rather than as the state it leads to.
+    pub encryption_support: Option<String>,
+}
+
+impl TransitGatewayModification {
+    /// `transit_gateway` as this modification leaves it: every member the request carried
+    /// replaces the stored value, and every member it did not carry keeps it.
+    ///
+    /// The ONE definition of what a modification does to a gateway, so the pre-check of the
+    /// store's byte budget and
+    /// [`ComAmazonawsEc2Amazonec2State::modify_transit_gateway`]'s write cannot disagree
+    /// about the record the call leaves behind. The members only the STORE can decide are
+    /// deliberately not set here: the `modifying` state, the default route table a newly
+    /// enabled default role needs, and the id each default role ends up naming.
+    ///
+    /// The CIDR blocks are the stored set with the removals taken out and the additions put
+    /// in, in that order — "Removes CIDR blocks for the transit gateway"
+    /// (`RemoveTransitGatewayCidrBlocks`) and "Adds IPv4 or IPv6 CIDR blocks for the transit
+    /// gateway" (`AddTransitGatewayCidrBlocks`) describe the set the gateway is LEFT with,
+    /// so a block named twice is held once and a block named in both lists stays on the
+    /// gateway.
+    pub fn applied_to(&self, transit_gateway: &TransitGateway) -> TransitGateway {
+        /// Replace `stored` with the value the request carried, when it carried one.
+        fn replace(stored: &mut Option<String>, requested: &Option<String>) {
+            if let Some(value) = requested {
+                *stored = Some(value.clone());
+            }
+        }
+
+        let mut applied = transit_gateway.clone();
+        replace(&mut applied.description, &self.description);
+        let mut options = applied.options.unwrap_or_default();
+        if let Some(asn) = self.amazon_side_asn {
+            options.amazon_side_asn = Some(asn);
+        }
+        replace(
+            &mut options.auto_accept_shared_attachments,
+            &self.auto_accept_shared_attachments,
+        );
+        replace(
+            &mut options.default_route_table_association,
+            &self.default_route_table_association,
+        );
+        replace(
+            &mut options.association_default_route_table_id,
+            &self.association_default_route_table_id,
+        );
+        replace(
+            &mut options.default_route_table_propagation,
+            &self.default_route_table_propagation,
+        );
+        replace(
+            &mut options.propagation_default_route_table_id,
+            &self.propagation_default_route_table_id,
+        );
+        replace(&mut options.vpn_ecmp_support, &self.vpn_ecmp_support);
+        replace(&mut options.dns_support, &self.dns_support);
+        replace(
+            &mut options.security_group_referencing_support,
+            &self.security_group_referencing_support,
+        );
+
+        let mut blocks: Vec<String> = options.transit_gateway_cidr_blocks.unwrap_or_default();
+        // Set membership rather than a scan per block, so the work this costs grows with
+        // the number of blocks the request names rather than with its square.
+        let removals: BTreeSet<&str> = self
+            .remove_transit_gateway_cidr_blocks
+            .iter()
+            .map(String::as_str)
+            .collect();
+        blocks.retain(|block| !removals.contains(block.as_str()));
+        let mut held: BTreeSet<String> = blocks.iter().cloned().collect();
+        for block in &self.add_transit_gateway_cidr_blocks {
+            if held.insert(block.clone()) {
+                blocks.push(block.clone());
+            }
+        }
+        // A gateway that holds no block carries no member at all rather than an empty list,
+        // exactly as one created without any does.
+        options.transit_gateway_cidr_blocks = (!blocks.is_empty()).then_some(blocks);
+
+        // "Enable or disable encryption support for VPC Encryption Control"
+        // (`EncryptionSupport`): the request asks for the END state, and the gateway reports
+        // the state it is IN (`EncryptionStateValue`), so an enable starts `enabling` and a
+        // disable `disabling` — and asking for the state the gateway is already in or
+        // already reaching changes nothing.
+        if let Some(requested) = self.encryption_support.as_deref() {
+            let reached = options
+                .encryption_support
+                .as_ref()
+                .and_then(|support| support.encryption_state.as_deref());
+            let next = match (requested, reached) {
+                (
+                    OPTION_ENABLE,
+                    None | Some(ENCRYPTION_STATE_DISABLED | ENCRYPTION_STATE_DISABLING),
+                ) => Some(ENCRYPTION_STATE_ENABLING),
+                (
+                    OPTION_DISABLE,
+                    Some(ENCRYPTION_STATE_ENABLED | ENCRYPTION_STATE_ENABLING),
+                ) => Some(ENCRYPTION_STATE_DISABLING),
+                _ => None,
+            };
+            if let Some(next) = next {
+                options.encryption_support = Some(EncryptionSupport {
+                    encryption_state: Some(next.to_string()),
+                    // "A message describing the encryption state"
+                    // (`EncryptionSupport$StateMessage`): nothing has gone wrong with this
+                    // transition, so there is nothing to describe.
+                    state_message: None,
+                });
+            }
+        }
+
+        applied.options = Some(options);
+        applied
+    }
+}
+
+/// Whether `options` — the options a transit gateway is being left with — would have the
+/// store MINT the gateway's default transit gateway route table: a default role is enabled
+/// and the gateway holds no route table in EITHER role.
+///
+/// "If `defaultRouteTablePropagation` is set to `enable`, Amazon Web Services Transit
+/// Gateway will create the default transit gateway route table"
+/// (`ModifyTransitGatewayOptions$DefaultRouteTablePropagation`), and "Either
+/// `defaultRouteTableAssociation` or `defaultRouteTablePropagation` must be set to `enable`
+/// for Amazon Web Services Transit Gateway to create the default transit gateway route
+/// table" (`TransitGatewayOptions$DefaultRouteTableAssociation`) — so ONE table serves both
+/// roles, and a gateway that already holds one needs no further table whichever role holds
+/// it. The predicate is public because the handler asks it about the store's route table
+/// ceiling BEFORE the write that
+/// [`ComAmazonawsEc2Amazonec2State::modify_transit_gateway`] then makes, and both ask it
+/// rather than each deciding for itself.
+pub fn needs_default_transit_gateway_route_table(options: Option<&TransitGatewayOptions>) -> bool {
+    let Some(options) = options else {
+        return false;
+    };
+    let associates = options.default_route_table_association.as_deref() == Some(OPTION_ENABLE);
+    let propagates = options.default_route_table_propagation.as_deref() == Some(OPTION_ENABLE);
+    (associates || propagates)
+        && options.association_default_route_table_id.is_none()
+        && options.propagation_default_route_table_id.is_none()
 }
 
 /// Refuse a request that named a transit gateway id no transit gateway of the account has:

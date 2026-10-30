@@ -310,9 +310,11 @@ const ATTACHMENT_STATES_CARRYING_NO_TRAFFIC: [&str; 6] = [
 ];
 
 /// The `EncryptionStateValue` a transit gateway that supports VPC Encryption Control is
-/// in: `enabled`. The other members of that enum (`enabling`, `disabling`, `disabled`) are
-/// states in which the gateway does not yet, or no longer, carry encrypted traffic.
-const ENCRYPTION_STATE_ENABLED: &str = "enabled";
+/// in: `enabled`, from the ONE place this crate names that enum's members
+/// ([`crate::state::ENCRYPTION_STATE_ENABLED`]). The other members (`enabling`,
+/// `disabling`, `disabled`) are states in which the gateway does not yet, or no longer,
+/// carry encrypted traffic.
+use crate::state::ENCRYPTION_STATE_ENABLED;
 
 /// Every resource of the VPC `vpc_id` the store holds whose traffic VPC Encryption Control
 /// cannot encrypt — "a resource that is not compliant with VPC encryption requirements"

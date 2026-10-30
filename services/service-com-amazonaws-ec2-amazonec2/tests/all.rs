@@ -17,6 +17,12 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `ModifyTransitGateway` applies to a stored transit gateway, what it leaves alone,
+// what it refuses, and the `modifying` -> `available` move the clock owes the gateway.
+// Declared beside `prefix_lists` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/modify_transit_gateway.rs"]
+mod modify_transit_gateway;
 // The primary network interface a launch gives its instance, the subnet and VPC it puts the
 // instance in, and the filters that select on them. Declared beside `prefix_lists` for the
 // reason the note above gives: the sorted neighbourhood and the tail of this file are where
