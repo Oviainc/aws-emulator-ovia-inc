@@ -234,7 +234,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         // A job started by StartDocumentAnalysis is not readable here: this operation
-        // only knows text-detection jobs, so its id is not a valid JobId for it.
+        // only knows text-detection jobs, so its id is not a valid JobId for it. Either
+        // way the refusal is the one sentence Amazon Textract states for a JobId it never
+        // issued, which carries nothing from the request: the id the caller sent is
+        // already in its own request, and interpolating it would make this refusal a
+        // different string on every call.
         let job = store
             .jobs
             .get(&input.job_id)
@@ -242,10 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(job) = job else {
             return Err(GetDocumentTextDetectionErrorModeled::InvalidJobIdException(
                 InvalidJobIdException {
-                    message: Some(format!(
-                        "{} is not a text detection job started by this service",
-                        input.job_id
-                    )),
+                    message: Some(crate::state::INVALID_JOB_ID_MESSAGE.to_string()),
                     code: None,
                 },
             )

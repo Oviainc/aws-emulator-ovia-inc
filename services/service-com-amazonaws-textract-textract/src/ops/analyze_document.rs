@@ -357,22 +357,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modelled answer for a document whose text cannot be read.
+///
+/// A document no page can be read out of is answered `UnsupportedDocumentException` — the
+/// error this operation documents as "The format of the input document isn't supported" —
+/// whether the bytes are in no format this service reads or in an accepted one the decoder
+/// cannot read: the service draws no distinction between the two, so `BadDocumentException`
+/// is not an answer either of them gets.
 fn unreadable_error(reason: &crate::state::Unreadable) -> AnalyzeDocumentError {
     let message = Some(reason.message().to_string());
     match reason {
-        crate::state::Unreadable::UnsupportedFormat(_) => {
+        crate::state::Unreadable::UnsupportedFormat => {
             AnalyzeDocumentErrorModeled::UnsupportedDocumentException(
                 UnsupportedDocumentException {
                     message,
                     code: None,
                 },
             )
-        }
-        crate::state::Unreadable::Corrupt(_) => {
-            AnalyzeDocumentErrorModeled::BadDocumentException(BadDocumentException {
-                message,
-                code: None,
-            })
         }
         crate::state::Unreadable::S3Unreadable(_) => {
             AnalyzeDocumentErrorModeled::InvalidS3ObjectException(InvalidS3ObjectException {

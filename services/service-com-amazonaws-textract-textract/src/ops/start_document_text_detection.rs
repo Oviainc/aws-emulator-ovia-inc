@@ -418,7 +418,7 @@ fn not_taken_on(reason: &crate::state::Unreadable) -> StartDocumentTextDetection
                 },
             )
         }
-        crate::state::Unreadable::UnsupportedFormat(_) | crate::state::Unreadable::Corrupt(_) => {
+        crate::state::Unreadable::UnsupportedFormat => {
             StartDocumentTextDetectionErrorModeled::InternalServerError(InternalServerError {
                 message,
                 code: None,

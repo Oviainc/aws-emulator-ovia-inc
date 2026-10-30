@@ -33,15 +33,13 @@
 //!   the characters it measured and the confidence it measured them with, and reports
 //!   nothing for ink it could not match to a glyph. A page with no ink is a page with no
 //!   words, answered as such rather than refused;
-//! * bytes in one of those formats that the decoder cannot read (a truncated or
-//!   corrupt file) — refused as [`Unreadable::Corrupt`], which the handlers answer with
-//!   the modelled `BadDocumentException`;
-//! * bytes in no format this service reads — refused as
-//!   [`Unreadable::UnsupportedFormat`], which the handlers answer with the modelled
-//!   `UnsupportedDocumentException`. A PDF is answered there too, with a reason that says
-//!   so: Textract accepts PDF, but this emulator has no page rasteriser and parses no PDF
-//!   content stream, so it reads nothing out of one and says which part it cannot read
-//!   rather than claiming the bytes are not a document;
+//! * bytes no document can be read out of — whether they are in no format this service
+//!   reads at all, or in one of the accepted formats but truncated or otherwise
+//!   undecodable — refused as [`Unreadable::UnsupportedFormat`], which the handlers
+//!   answer with the modelled `UnsupportedDocumentException` and the one sentence Amazon
+//!   Textract states that refusal with ([`UNSUPPORTED_DOCUMENT_FORMAT_MESSAGE`]). A PDF
+//!   is answered there too: Textract accepts PDF, but this emulator has no page
+//!   rasteriser and parses no PDF content stream, so it reads nothing out of one;
 //! * an S3 object whose bytes Amazon S3 does not serve — refused as
 //!   [`Unreadable::S3Unreadable`], which the handlers answer with the modelled
 //!   `InvalidS3ObjectException`. Where Amazon S3 ESTABLISHED that it holds no such
@@ -213,6 +211,31 @@ const ADAPTER_ID_LEN: usize = 32;
 /// carries nothing from the request: the id the caller sent is already in its own request.
 /// This is the sentence Amazon Textract itself answers for an unknown `AdapterId`.
 pub const ADAPTER_NOT_FOUND_MESSAGE: &str = "Adapter Id not found.";
+
+/// The message Amazon Textract states `UnsupportedDocumentException` with, for every
+/// document it cannot read a page out of.
+///
+/// WHOLLY FIXED text for this refusal class: it names neither the format the document was
+/// sent in nor the part of it that could not be read, so nothing of the request reaches
+/// the error surface. It is also the `StatusMessage` of an asynchronous job that failed
+/// for that reason, so one document answers the same sentence on both paths.
+pub const UNSUPPORTED_DOCUMENT_FORMAT_MESSAGE: &str = "Request has unsupported document format";
+
+/// The message Amazon Textract states `InvalidParameterException` with for an input that
+/// violates a modelled constraint — an absent required member, or a value outside a
+/// declared length, pattern, range or enum.
+///
+/// WHOLLY FIXED text for this refusal class: it names neither the member nor the value,
+/// so a rejected value is never echoed back to the caller.
+pub const INVALID_PARAMETERS_MESSAGE: &str = "Request has invalid parameters";
+
+/// The message Amazon Textract states `InvalidJobIdException` with, for a `JobId` no
+/// asynchronous `Start*` of this service issued.
+///
+/// WHOLLY FIXED text for this refusal class, and the same sentence whichever `Get*`
+/// looked the job up: the id the caller sent is already in its own request, and
+/// interpolating it would make the refusal a different string on every call.
+pub const INVALID_JOB_ID_MESSAGE: &str = "Request has invalid Job Id";
 
 /// The `AdapterVersionStatus` a version reports while its creation is still owed by the
 /// clock.
@@ -1092,13 +1115,22 @@ pub fn parse_features(values: &[String]) -> Result<FeatureSet, FeatureError> {
 /// The `FeatureType` that asks for the queries `QueriesConfig` supplies.
 pub const QUERIES_FEATURE: &str = "QUERIES";
 
+/// The message Amazon Textract states `InvalidParameterException` with when
+/// `QueriesConfig` is supplied and the requested `FeatureTypes` do not ask for
+/// [`QUERIES_FEATURE`].
+///
+/// WHOLLY FIXED text for this refusal, down to its trailing period: it names the pair
+/// that must be supplied together and interpolates nothing from the request.
+pub const QUERIES_CONFIG_WITHOUT_FEATURE_MESSAGE: &str =
+    "QueriesConfig must be used with QUERIES FeatureType.";
+
 /// The queries an analysis must answer, or why the request cannot be served.
 ///
 /// AWS pairs the `QUERIES` feature with the `QueriesConfig` member: `QueriesConfig` is
 /// what the queries are supplied in and `QUERIES` is what asks for them, so one without
-/// the other violates the input constraint `InvalidParameterException` describes. The
-/// message names the member that was supplied and the one that was not, so it is derived
-/// from the request rather than recorded.
+/// the other violates the input constraint `InvalidParameterException` describes.
+/// `QueriesConfig` without the feature is answered with the sentence AWS states that
+/// refusal with ([`QUERIES_CONFIG_WITHOUT_FEATURE_MESSAGE`]).
 ///
 /// Read straight off the requested `FeatureTypes`, so the pairing is checked whatever else
 /// that list holds — including a modelled feature this emulator derives no blocks for,
@@ -1127,11 +1159,7 @@ pub fn queries_of(
             config.queries.iter().map(PreparedQuery::new).collect()
         }
         (false, None) => Ok(Vec::new()),
-        (false, Some(_)) => Err(
-            "QueriesConfig was supplied, but FeatureTypes does not contain QUERIES: \
-             QueriesConfig must be used with the QUERIES FeatureType"
-                .to_string(),
-        ),
+        (false, Some(_)) => Err(QUERIES_CONFIG_WITHOUT_FEATURE_MESSAGE.to_string()),
         (true, None) => Err(
             "FeatureTypes contains QUERIES, but no QueriesConfig was supplied: the QUERIES \
              FeatureType must be used with QueriesConfig"
@@ -1371,13 +1399,15 @@ impl DocumentContent {
 /// Why a document's text cannot be read. Each variant has exactly one modelled answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unreadable {
-    /// The bytes are not a document this emulator can extract text from.
+    /// No document can be read out of the bytes: they are in no format this emulator
+    /// reads, or in one of the accepted ones but truncated or otherwise undecodable.
     /// Answered with `UnsupportedDocumentException`.
-    UnsupportedFormat(String),
-    /// The bytes ARE a format this emulator reads, but the document itself cannot be
-    /// decoded (truncated, or otherwise corrupt).
-    /// Answered with `BadDocumentException`.
-    Corrupt(String),
+    ///
+    /// ONE variant for both, because the service draws no distinction between them: a
+    /// document whose bytes a decoder cannot read is a document in an unsupported format,
+    /// and carries no reason of its own — so this variant holds no message, and the
+    /// detail of what failed to decode is logged rather than answered.
+    UnsupportedFormat,
     /// The document is an S3 object whose bytes this emulator cannot obtain.
     /// Answered with `InvalidS3ObjectException`.
     S3Unreadable(String),
@@ -1390,10 +1420,8 @@ impl Unreadable {
     /// The reason, as a message for the modelled error or a job's `StatusMessage`.
     pub fn message(&self) -> &str {
         match self {
-            Self::UnsupportedFormat(message)
-            | Self::Corrupt(message)
-            | Self::S3Unreadable(message)
-            | Self::TooLarge(message) => message,
+            Self::UnsupportedFormat => UNSUPPORTED_DOCUMENT_FORMAT_MESSAGE,
+            Self::S3Unreadable(message) | Self::TooLarge(message) => message,
         }
     }
 }
@@ -1553,16 +1581,17 @@ pub fn read_content(
     }
     // A PDF is a document format Textract itself accepts, and this emulator reads none:
     // rendering a PDF page needs a page rasteriser it does not have, and the text a PDF
-    // carries sits in content streams nothing here parses. So the refusal names PDF as
-    // the part that is unsupported, rather than implying the bytes are not a document at
-    // all — and it is decided on the PDF header, BEFORE the text heuristic, so a PDF
-    // whose bytes happen to be printable is not read as if it were a text document.
+    // carries sits in content streams nothing here parses. So nothing is read out of one,
+    // and it is decided on the PDF header, BEFORE the text heuristic, so a PDF whose bytes
+    // happen to be printable is not read as if it were a text document. Which part of the
+    // document could not be read is logged, not answered: the refusal is the one sentence
+    // the service states for a document it cannot read.
     if bytes.starts_with(PDF_MAGIC) {
-        return Err(Unreadable::UnsupportedFormat(
-            "the document is a PDF: this emulator reads PNG, JPEG and TIFF documents and \
-             does not render or extract text from PDF pages"
-                .to_string(),
-        ));
+        ::tracing::debug!(
+            "the document is a PDF: this emulator renders no PDF page and parses no PDF \
+             content stream"
+        );
+        return Err(Unreadable::UnsupportedFormat);
     }
     if let Some(text) = decode_text(bytes) {
         // `U+000C` FORM FEED is the page break in a text document.
@@ -1572,17 +1601,13 @@ pub fn read_content(
             .map(ToString::to_string)
             .collect();
         if pages.is_empty() {
-            return Err(Unreadable::UnsupportedFormat(
-                "the document holds no text".to_string(),
-            ));
+            ::tracing::debug!("the document holds no text");
+            return Err(Unreadable::UnsupportedFormat);
         }
         return Ok(DocumentContent::read_verbatim(bounded(pages)?));
     }
-    Err(Unreadable::UnsupportedFormat(
-        "the document's bytes are not text and not a PNG, JPEG or TIFF raster, so this \
-         emulator cannot read a document out of them"
-            .to_string(),
-    ))
+    ::tracing::debug!("the document's bytes are not text and not a PNG, JPEG or TIFF raster");
+    Err(Unreadable::UnsupportedFormat)
 }
 
 /// The bytes every PDF document starts with ("%PDF-", per the PDF file header).

@@ -110,25 +110,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // declares it, so a client that catches Textract's modelled exception catches
         // the boundary's refusal too. The framework's default code,
         // `ValidationException`, is modelled on this service's adapter operations only,
-        // and a client branching on it would miss the refusal elsewhere. Both the code
-        // and the message are replaced; the message is the boundary's own, which names
-        // the member and the constraint it failed.
+        // and a client branching on it would miss the refusal elsewhere.
+        //
+        // The MESSAGE is the one sentence this service states for a constraint violation
+        // (`crate::state::INVALID_PARAMETERS_MESSAGE`), not the boundary's own report:
+        // Textract names neither the member nor the value it refused, so the violated
+        // constraint is not described back to the caller and the rejected value — which
+        // is the caller's own data — never reaches the error surface. What was violated
+        // is logged instead, where an operator reading the emulator's own log can see it.
         match refusal {
             Refusal::Invalid(violations) => {
-                let message = violations
+                let reported = violations
                     .iter()
                     .map(smithy_server_runtime::Violation::message)
-                    .collect::<Vec<_>>()
-                    .join("; ");
+                    .collect::<Vec<_>>();
+                // The caller's own values are rendered in their escaped `Debug` form, so
+                // a value carrying a newline cannot forge a log line.
+                ::tracing::debug!(
+                    violations = ?reported,
+                    "a request to Amazon Textract violated a modelled input constraint"
+                );
                 Some(Refused {
                     code: "InvalidParameterException".to_string(),
-                    message: if message.is_empty() {
-                        "An input parameter violated a constraint. Validate your parameter \
-                         before calling the API operation again."
-                            .to_string()
-                    } else {
-                        message
-                    },
+                    message: crate::state::INVALID_PARAMETERS_MESSAGE.to_string(),
                 })
             }
             // Authentication is not an input-parameter problem; the framework's own

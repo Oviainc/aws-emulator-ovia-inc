@@ -197,9 +197,7 @@ pub fn read_raster(bytes: &[u8], format: ImageFormat) -> Result<Recognised, Unre
     // emulator's ceiling is refused as too large (what it is) rather than as unreadable.
     let (width, height) = reader(bytes, format, false)
         .into_dimensions()
-        .map_err(|error| {
-            Unreadable::Corrupt(format!("the {name} document cannot be read: {error}"))
-        })?;
+        .map_err(|error| undecodable(name, &error))?;
     let pixels = u64::from(width) * u64::from(height);
     if width > MAX_RASTER_SIDE || height > MAX_RASTER_SIDE || pixels > MAX_RASTER_PIXELS {
         return Err(Unreadable::TooLarge(format!(
@@ -208,9 +206,9 @@ pub fn read_raster(bytes: &[u8], format: ImageFormat) -> Result<Recognised, Unre
         )));
     }
 
-    let decoded = reader(bytes, format, true).decode().map_err(|error| {
-        Unreadable::Corrupt(format!("the {name} document cannot be read: {error}"))
-    })?;
+    let decoded = reader(bytes, format, true)
+        .decode()
+        .map_err(|error| undecodable(name, &error))?;
     let gray = decoded.into_luma8();
     // The ceilings again, on the frame that was actually decoded: the scan, the
     // segmentation and the ink mask are all sized from THIS image, so the budget must not
@@ -252,6 +250,22 @@ pub fn read_raster(bytes: &[u8], format: ImageFormat) -> Result<Recognised, Unre
         confidence,
         lines: measured,
     })
+}
+
+/// The refusal for a document in an accepted container whose bytes the decoder cannot
+/// read (a truncated or otherwise undecodable file).
+///
+/// Such a document is one no page can be read out of, which is what
+/// [`Unreadable::UnsupportedFormat`] says, and that refusal carries no reason of its own:
+/// what the decoder tripped over is a detail of this emulator's reader, so it is logged
+/// here instead of being answered to the caller.
+fn undecodable(name: &str, error: &image::ImageError) -> Unreadable {
+    ::tracing::debug!(
+        format = name,
+        error = %error,
+        "the document's bytes could not be decoded"
+    );
+    Unreadable::UnsupportedFormat
 }
 
 fn format_name(format: ImageFormat) -> &'static str {

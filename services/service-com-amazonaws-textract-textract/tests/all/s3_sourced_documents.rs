@@ -33,7 +33,7 @@ use image::{GrayImage, ImageFormat};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::document_extraction::{assert_block_graph, blocks_of, error_code, of_type};
+use crate::document_extraction::{assert_block_graph, blocks_of, error_code, error_message, of_type};
 use crate::raster_documents::{encode, render, texts_of, Paper};
 use service_com_amazonaws_textract_textract::state;
 
@@ -158,14 +158,6 @@ fn s3_document(key: &str) -> Value {
 /// A `DocumentLocation` naming the staged object `key`.
 fn s3_location(key: &str) -> Value {
     json!({ "S3Object": { "Bucket": BUCKET, "Name": key } })
-}
-
-/// The `Message` of an error answer.
-fn error_message(body: &Value) -> String {
-    body.get("Message")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// Collapse runs of whitespace to one space.

@@ -684,7 +684,7 @@ async fn analyze_expense_refuses_a_document_it_cannot_read() {
     let router = harness();
 
     // A PNG signature followed by bytes that are not a PNG body: a document in a format
-    // Textract accepts, which cannot be decoded.
+    // Textract accepts whose bytes cannot be decoded, so no page can be read out of it.
     let truncated_png = [
         0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01, 0x02, 0xFF,
     ];
@@ -694,7 +694,7 @@ async fn analyze_expense_refuses_a_document_it_cannot_read() {
         (
             "a truncated PNG, which is a supported format this service cannot decode",
             json!({ "Bytes": aws_smithy_types::base64::encode(truncated_png) }),
-            "BadDocumentException",
+            "UnsupportedDocumentException",
         ),
         (
             "bytes that hold no text at all",

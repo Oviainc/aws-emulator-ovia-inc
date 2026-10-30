@@ -31,6 +31,8 @@ mod expense_analysis;
 mod queries_and_input_refusals;
 #[path = "all/raster_documents.rs"]
 mod raster_documents;
+#[path = "all/refusal_messages.rs"]
+mod refusal_messages;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/s3_sourced_documents.rs"]

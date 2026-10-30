@@ -409,7 +409,10 @@ struct RefusalCase {
     request: Value,
 }
 
-fn s3_location() -> Value {
+/// The S3 location the asynchronous rows submit.
+///
+/// `pub(crate)`: the refusal-wording suite starts its jobs from this same location.
+pub(crate) fn s3_location() -> Value {
     json!({ "S3Object": { "Bucket": "documents", "Name": "invoice.pdf" } })
 }
 

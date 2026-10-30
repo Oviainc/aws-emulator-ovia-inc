@@ -7,10 +7,11 @@
 //! a synchronous document operation given inline `Bytes` in a raster format Textract
 //! accepts answers HTTP 200 with the text its pixels really carry — a `PAGE` block, the
 //! `LINE` blocks of the lines of ink on the page and the `WORD` blocks of the words in
-//! them — and `UnsupportedDocumentException` is reserved for bytes in no format the
-//! service reads. The rows differ along what the rule generalises over: the format, the
-//! size the text is rendered at, where it sits on the page, the polarity and contrast of
-//! the ink, the stroke weight, and whether the page carries any text at all.
+//! them — and `UnsupportedDocumentException` answers every byte string no page can be
+//! read out of, whether it is in no format the service reads or in an accepted one its
+//! decoder cannot read. The rows differ along what the rule generalises over: the format,
+//! the size the text is rendered at, where it sits on the page, the polarity and contrast
+//! of the ink, the stroke weight, and whether the page carries any text at all.
 //!
 //! Every page here is rendered in this test from known text with the same public-domain
 //! 8x8 font the recogniser holds templates for, so the recognised characters can be
@@ -662,9 +663,11 @@ async fn two_different_pages_are_read_as_two_different_documents() {
 async fn bytes_in_no_format_this_service_reads_are_refused_as_unsupported() {
     let router = harness();
 
-    // A supported format that cannot be decoded is a BAD document; bytes in no format
-    // the service reads are an UNSUPPORTED one. Each row names the status and the code,
-    // which are the requirement; the message is not.
+    // A document no page can be read out of is answered UnsupportedDocumentException
+    // whether its bytes are in a format Textract accepts and cannot be decoded, or in no
+    // format the service reads at all: the service draws no distinction between them.
+    // Each row names the status and the code, which are the requirement; the message is
+    // asserted in `crate::refusal_messages`.
     let good = encode(
         &render(&sample_lines(), Paper { scale: 3, ..Paper::plain() }),
         ImageFormat::Png,
@@ -676,7 +679,11 @@ async fn bytes_in_no_format_this_service_reads_are_refused_as_unsupported() {
     }
 
     let cases: Vec<(&str, Vec<u8>, &str)> = vec![
-        ("a PNG cut in half", truncated, "BadDocumentException"),
+        (
+            "a PNG cut in half",
+            truncated,
+            "UnsupportedDocumentException",
+        ),
         (
             // A GIF is a real raster format, and not one Textract accepts.
             "a GIF, which Textract does not accept",
@@ -685,8 +692,8 @@ async fn bytes_in_no_format_this_service_reads_are_refused_as_unsupported() {
         ),
         (
             // Textract itself accepts PDF; this emulator renders no PDF page and parses
-            // no PDF content stream, so it reads nothing out of one and says so. The
-            // status and the code are the requirement here too, not the sentence.
+            // no PDF content stream, so it reads nothing out of one. The status and the
+            // code are the requirement here too, not the sentence.
             "a PDF, which this emulator does not decode",
             b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n%%EOF\n".to_vec(),
             "UnsupportedDocumentException",
@@ -745,9 +752,9 @@ async fn bytes_in_no_format_this_service_reads_are_refused_as_unsupported() {
     } else {
         assert_eq!(
             error_code(&body),
-            "BadDocumentException",
-            "case corrupt PNG body: a supported format that cannot be decoded is a bad \
-             document, got {status} with {body}"
+            "UnsupportedDocumentException",
+            "case corrupt PNG body: a document no page can be read out of is an \
+             unsupported document format, got {status} with {body}"
         );
     }
 }

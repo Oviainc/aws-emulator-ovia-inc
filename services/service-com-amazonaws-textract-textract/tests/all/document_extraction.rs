@@ -86,6 +86,18 @@ pub(crate) fn blocks_of(body: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// The `Message` of an error answer, in either casing the envelopes render.
+///
+/// `pub(crate)`: every suite of this target that asserts the WORDING of a refusal reads
+/// it through this one accessor.
+pub(crate) fn error_message(body: &Value) -> String {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 pub(crate) fn block_type(block: &Value) -> &str {
     block
         .get("BlockType")
@@ -511,8 +523,9 @@ async fn detect_document_text_refuses_a_document_whose_text_it_cannot_read() {
     let router = harness();
 
     // A PNG signature followed by bytes that are not a PNG body: a document in a format
-    // Textract accepts, which cannot be decoded — `BadDocumentException`, not
-    // "unsupported format".
+    // Textract accepts whose bytes cannot be decoded, which is a document no page can be
+    // read out of — `UnsupportedDocumentException`, the same answer as bytes in no format
+    // this service reads at all.
     let truncated_png = [
         0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01, 0x02, 0xFF,
     ];
@@ -524,7 +537,7 @@ async fn detect_document_text_refuses_a_document_whose_text_it_cannot_read() {
         (
             "a truncated PNG, which is a supported format this service cannot decode",
             json!({ "Bytes": aws_smithy_types::base64::encode(truncated_png) }),
-            "BadDocumentException",
+            "UnsupportedDocumentException",
         ),
         (
             "bytes in no format this service reads",

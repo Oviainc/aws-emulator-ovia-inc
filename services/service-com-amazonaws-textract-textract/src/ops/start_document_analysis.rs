@@ -479,7 +479,7 @@ fn not_taken_on(reason: &crate::state::Unreadable) -> StartDocumentAnalysisError
                 },
             )
         }
-        crate::state::Unreadable::UnsupportedFormat(_) | crate::state::Unreadable::Corrupt(_) => {
+        crate::state::Unreadable::UnsupportedFormat => {
             StartDocumentAnalysisErrorModeled::InternalServerError(InternalServerError {
                 message,
                 code: None,
