@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/association_vpc_references.rs"]
 mod association_vpc_references;
+#[path = "all/batch_firewall_rule_updates.rs"]
+mod batch_firewall_rule_updates;
 #[path = "all/batch_firewall_rules.rs"]
 mod batch_firewall_rules;
 #[path = "all/endpoint_subnet_references.rs"]

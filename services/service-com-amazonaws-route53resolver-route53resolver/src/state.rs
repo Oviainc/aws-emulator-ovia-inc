@@ -436,6 +436,15 @@ pub const RSLVR_CODE_RULE_PRIORITY_IN_USE: &str = "RSLVR-02203";
 /// See [`mutation_protection_forbids_change`].
 pub const RSLVR_CODE_ASSOCIATION_MUTATION_PROTECTED: &str = "RSLVR-02307";
 
+/// The Route 53 Resolver service error code reported when one batch carries
+/// more firewall rules than a single request may.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ASSOCIATION_PRIORITY_IN_USE`]:
+/// `LimitExceededException` states every limit of the service, so the HTTP
+/// status and the shape name alone do not say which one was exceeded. See
+/// [`firewall_rule_update_batch_too_large`].
+pub const RSLVR_CODE_FIREWALL_RULE_BATCH_TOO_LARGE: &str = "RSLVR-02052";
+
 /// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
 /// exist": the modelled shape name of a Resolver endpoint.
 pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
@@ -596,6 +605,11 @@ pub const MAX_STORED_FIREWALL_RULE_GROUPS: usize = 1_000;
 /// quota. A create past it is refused with the `LimitExceededException` that
 /// operation models and the group's rules are left exactly as they were.
 pub const MAX_RULES_PER_FIREWALL_RULE_GROUP: usize = 1_000;
+
+/// `ResourceNotFoundException$ResourceType` for one rule of a DNS Firewall rule
+/// group: the modelled shape name of the resource, as for
+/// [`RESOURCE_TYPE_RESOLVER_ENDPOINT`].
+pub const RESOURCE_TYPE_FIREWALL_RULE: &str = "FirewallRule";
 
 /// The `FirewallRuleGroupAssociationStatus` an association reports once no
 /// change to it is in flight, the model's `COMPLETE`
@@ -2512,6 +2526,387 @@ impl FirewallRuleCreateRefusal {
 /// request past it is refused WHOLE with the `LimitExceededException` the
 /// operation models, so nothing is created for any of its entries.
 pub const MAX_FIREWALL_RULE_ENTRIES_PER_BATCH: usize = 100;
+
+/// How many entries one batch update may carry.
+///
+/// `UpdateFirewallRuleEntries` declares no `@length`
+/// (`smithy_query(query="shape",shape="UpdateFirewallRuleEntries")`), so this
+/// cap is the service's own, and the service's refusal is what names it: a
+/// request has to carry FEWER entries than this number, which is how
+/// [`firewall_rule_update_batch_too_large`] — the sentence the recorded
+/// responses of this operation answer an oversized batch with — words it, so
+/// the sentence and the number it reports cannot disagree. A request that does
+/// not is refused WHOLE with the `LimitExceededException` the operation models,
+/// so not one of its entries is applied. The batch CREATE carries its own,
+/// larger bound ([`MAX_FIREWALL_RULE_ENTRIES_PER_BATCH`]), which is this
+/// emulator's own and not a limit the service states.
+pub const FIREWALL_RULE_UPDATE_BATCH_ENTRY_CAP: usize = 10;
+
+/// The `LimitExceededException` a batch update of firewall rules is refused
+/// with when it carries entries for more rules than one request may.
+///
+/// The refusal is the service's own sentence for that limit
+/// ([`RSLVR_CODE_FIREWALL_RULE_BATCH_TOO_LARGE`]), whose one variable part is
+/// the cap itself — it names neither the rules the batch asked for nor how many
+/// of them there were. `ResourceType` is the rule, which is what the request
+/// asked for too many of; the create's own limit on how many rules ONE GROUP
+/// holds names the group instead, because there it is the group that is full.
+/// The refusal is whole: the entries are not applied, not even the ones a
+/// smaller batch would have applied.
+pub fn firewall_rule_update_batch_too_large(cap: usize) -> LimitExceededException {
+    LimitExceededException {
+        message: Some(rslvr_message_sentences(
+            RSLVR_CODE_FIREWALL_RULE_BATCH_TOO_LARGE,
+            &[
+                "The number of firewall rules in the update batch exceeds the allowed maximum",
+                &format!(r#"Provide fewer than "{cap}" rules"#),
+            ],
+        )),
+        resource_type: Some(RESOURCE_TYPE_FIREWALL_RULE.to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` the rule operations answer for a rule of a
+/// group the caller cannot address, built here so every operation that resolves
+/// a rule inside a group reports the same body.
+///
+/// It carries the same coded sentence as every other resource of this service a
+/// caller names but cannot address ([`resource_not_found_message`]), with the
+/// rule's modelled shape name as the resource type and the id the request named
+/// the rule by — its match source — inside it.
+pub fn firewall_rule_not_found(match_source_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(resource_not_found_message(match_source_id)),
+        resource_type: Some(RESOURCE_TYPE_FIREWALL_RULE.to_string()),
+    }
+}
+
+/// The settings one DNS Firewall rule carries, as the operations that write one
+/// state them.
+///
+/// A create states every setting of the rule it makes; an update states the
+/// settings it changes, so what is checked for it is the stored rule with those
+/// changes applied. Both are the same question — are these settings ones the
+/// service admits — so both ask it of [`firewall_rule_settings_fault`].
+#[derive(Debug, Clone, Copy)]
+pub struct FirewallRuleSettings<'a> {
+    pub name: &'a str,
+    pub action: &'a str,
+    pub block_response: Option<&'a str>,
+    pub block_override_domain: Option<&'a str>,
+    pub block_override_dns_type: Option<&'a str>,
+    pub block_override_ttl: Option<i32>,
+    pub firewall_domain_redirection_action: Option<&'a str>,
+    pub firewall_domain_list_id: Option<&'a str>,
+    pub dns_threat_protection: Option<&'a str>,
+    pub confidence_threshold: Option<&'a str>,
+    pub firewall_rule_type: Option<&'a FirewallRuleType>,
+}
+
+impl FirewallRuleSettings<'_> {
+    /// Whether these settings describe a DNS Firewall Advanced rule: one whose
+    /// match source is a threat detector or one of the Amazon Web
+    /// Services-managed categories, rather than a domain list of the account.
+    pub fn is_advanced(&self) -> bool {
+        self.dns_threat_protection.is_some() || self.firewall_rule_type.is_some()
+    }
+}
+
+/// The `ValidationException` these rule settings are refused with, or `None`
+/// when the service admits them.
+///
+/// This is the whole of what the service requires of one rule's settings: the
+/// modelled constraints the boundary validator cannot express, the match
+/// sources that exclude one another, and the settings one `Action` and one
+/// `BlockResponse` require. Deciding it HERE is what makes a rule the create
+/// admits and the same rule an update arrives at the same rule, refused on the
+/// same grounds.
+pub fn firewall_rule_settings_fault(
+    settings: &FirewallRuleSettings<'_>,
+) -> Option<ValidationException> {
+    // `Name`'s pattern carries a negative lookahead, which is outside what the
+    // boundary validator's regex engine accepts, so the rule is enforced here.
+    if !name_satisfies_pattern(settings.name) {
+        return Some(ValidationException {
+            message: Some(name_pattern_violation(settings.name)),
+        });
+    }
+
+    // Each enum member admits exactly the values its modelled enum declares; a
+    // value outside one is refused rather than stored as if the service
+    // understood it.
+    for (member, value, values) in [
+        ("Action", Some(settings.action), crate::ops::types::ACTION_VALUES),
+        (
+            "BlockResponse",
+            settings.block_response,
+            crate::ops::types::BLOCK_RESPONSE_VALUES,
+        ),
+        (
+            "BlockOverrideDnsType",
+            settings.block_override_dns_type,
+            crate::ops::types::BLOCK_OVERRIDE_DNS_TYPE_VALUES,
+        ),
+        (
+            "FirewallDomainRedirectionAction",
+            settings.firewall_domain_redirection_action,
+            crate::ops::types::FIREWALL_DOMAIN_REDIRECTION_ACTION_VALUES,
+        ),
+        (
+            "DnsThreatProtection",
+            settings.dns_threat_protection,
+            crate::ops::types::DNS_THREAT_PROTECTION_VALUES,
+        ),
+        (
+            "ConfidenceThreshold",
+            settings.confidence_threshold,
+            crate::ops::types::CONFIDENCE_THRESHOLD_VALUES,
+        ),
+    ] {
+        if let Some(value) = value {
+            if !values.contains(&value) {
+                return Some(ValidationException {
+                    message: Some(format!("{member} must be one of {values:?}")),
+                });
+            }
+        }
+    }
+
+    // "The rule can use any one of the following match sources, and the chosen
+    // source must be supplied through the matching request field — they are
+    // mutually exclusive": `FirewallDomainListId`, `DnsThreatProtection` and
+    // `FirewallRuleType`.
+    let sources = [
+        settings.firewall_domain_list_id.is_some(),
+        settings.dns_threat_protection.is_some(),
+        settings.firewall_rule_type.is_some(),
+    ]
+    .into_iter()
+    .filter(|named| *named)
+    .count();
+    if sources != 1 {
+        return Some(ValidationException {
+            message: Some(
+                "Exactly one of FirewallDomainListId, DnsThreatProtection and \
+                 FirewallRuleType identifies the rule's match source"
+                    .to_string(),
+            ),
+        });
+    }
+
+    // "`FirewallRuleType` is a tagged union — exactly one member must be set
+    // per rule, and the member determines what the rule matches against."
+    if let Some(rule_type) = settings.firewall_rule_type {
+        let variants = [
+            rule_type.partner_threat_protection.is_some(),
+            rule_type.firewall_advanced_content_category.is_some(),
+            rule_type.firewall_advanced_threat_category.is_some(),
+            rule_type.dns_threat_protection.is_some(),
+        ]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+        if variants != 1 {
+            return Some(ValidationException {
+                message: Some(
+                    "FirewallRuleType carries exactly one of \
+                     PartnerThreatProtection, FirewallAdvancedContentCategory, \
+                     FirewallAdvancedThreatCategory and DnsThreatProtection"
+                        .to_string(),
+                ),
+            });
+        }
+        if let Some(detector) = &rule_type.dns_threat_protection {
+            for (member, value, values) in [
+                (
+                    "FirewallRuleType.DnsThreatProtection.Value",
+                    detector.value.as_str(),
+                    crate::ops::types::DNS_THREAT_PROTECTION_VALUES,
+                ),
+                (
+                    "FirewallRuleType.DnsThreatProtection.ConfidenceThreshold",
+                    detector.confidence_threshold.as_str(),
+                    crate::ops::types::CONFIDENCE_THRESHOLD_VALUES,
+                ),
+            ] {
+                if !values.contains(&value) {
+                    return Some(ValidationException {
+                        message: Some(format!("{member} must be one of {values:?}")),
+                    });
+                }
+            }
+        }
+    }
+
+    // A rule whose match source is one of the DNS Firewall Advanced kinds:
+    // `ALLOW` is "not available for DNS Firewall Advanced rules", and a
+    // `DnsThreatProtection` rule needs the confidence threshold — "you must
+    // provide this value when you create or update a DNS Firewall Advanced
+    // rule".
+    if settings.is_advanced() && settings.action == FIREWALL_RULE_ACTION_ALLOW {
+        return Some(ValidationException {
+            message: Some(format!(
+                "Action {FIREWALL_RULE_ACTION_ALLOW} is not available for DNS Firewall \
+                 Advanced rules"
+            )),
+        });
+    }
+    if settings.dns_threat_protection.is_some() && settings.confidence_threshold.is_none() {
+        return Some(ValidationException {
+            message: Some(
+                "ConfidenceThreshold is required for a rule that matches a \
+                 DnsThreatProtection detector"
+                    .to_string(),
+            ),
+        });
+    }
+
+    // "`BlockResponse` … This setting is required if the rule action setting is
+    // BLOCK", and each `BlockOverride*` member "is required if the
+    // BlockResponse setting is OVERRIDE".
+    if settings.action == FIREWALL_RULE_ACTION_BLOCK && settings.block_response.is_none() {
+        return Some(ValidationException {
+            message: Some(format!(
+                "BlockResponse is required when Action is {FIREWALL_RULE_ACTION_BLOCK}"
+            )),
+        });
+    }
+    if settings.block_response == Some(FIREWALL_RULE_BLOCK_RESPONSE_OVERRIDE) {
+        let missing = [
+            (
+                "BlockOverrideDomain",
+                settings.block_override_domain.is_none(),
+            ),
+            (
+                "BlockOverrideDnsType",
+                settings.block_override_dns_type.is_none(),
+            ),
+            ("BlockOverrideTtl", settings.block_override_ttl.is_none()),
+        ]
+        .into_iter()
+        .find_map(|(member, absent)| absent.then_some(member));
+        if let Some(member) = missing {
+            return Some(ValidationException {
+                message: Some(format!(
+                    "{member} is required when BlockResponse is \
+                     {FIREWALL_RULE_BLOCK_RESPONSE_OVERRIDE}"
+                )),
+            });
+        }
+    }
+
+    None
+}
+
+/// One DNS Firewall rule to update, as the operations that update one state it.
+///
+/// `UpdateFirewallRuleEntry` — one entry of a batch update — declares exactly
+/// the members `UpdateFirewallRuleRequest` does
+/// (`smithy_query(query="shape",shape="UpdateFirewallRuleEntry")`), so both
+/// describe the same change and both decide it through
+/// [`ComAmazonawsRoute53resolverRoute53resolverState::update_firewall_rule`]
+/// instead of each carrying its own copy of what updating a rule means.
+///
+/// `firewall_rule_group_id` and the match source NAME the rule — the match
+/// source is immutable — and every other member replaces the stored value when
+/// the request carries it and leaves it alone when it does not.
+#[derive(Debug, Clone, Copy)]
+pub struct FirewallRuleUpdate<'a> {
+    pub firewall_rule_group_id: &'a str,
+    pub firewall_domain_list_id: Option<&'a str>,
+    pub firewall_threat_protection_id: Option<&'a str>,
+    pub priority: Option<i32>,
+    pub action: Option<&'a str>,
+    pub block_response: Option<&'a str>,
+    pub block_override_domain: Option<&'a str>,
+    pub block_override_dns_type: Option<&'a str>,
+    pub block_override_ttl: Option<i32>,
+    pub name: Option<&'a str>,
+    pub firewall_domain_redirection_action: Option<&'a str>,
+    pub qtype: Option<&'a str>,
+    pub dns_threat_protection: Option<&'a str>,
+    pub confidence_threshold: Option<&'a str>,
+    pub firewall_rule_type: Option<&'a FirewallRuleType>,
+}
+
+/// Why one firewall-rule update was refused.
+///
+/// The same relation to [`FirewallRuleCreateRefusal`] that an update has to a
+/// create: an update that carries ONE rule reports it as the modelled exception
+/// it holds and the whole call fails, while a batch update decides each entry on
+/// its own and reports the same refusal in the response body — the exception's
+/// shape name as the error's `Code` ([`Self::code`]) and its sentence as the
+/// `Message`.
+#[derive(Debug, Clone)]
+pub enum FirewallRuleUpdateRefusal {
+    Validation(ValidationException),
+    ResourceNotFound(ResourceNotFoundException),
+    Conflict(ConflictException),
+}
+
+impl FirewallRuleUpdateRefusal {
+    /// The error code of this refusal: the modelled shape name of the exception
+    /// that states it, which is the code the exception carries on the wire.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Validation(_) => "ValidationException",
+            Self::ResourceNotFound(_) => "ResourceNotFoundException",
+            Self::Conflict(_) => "ConflictException",
+        }
+    }
+
+    /// The sentence this refusal states, as the exception's `Message`.
+    pub fn message(&self) -> Option<String> {
+        match self {
+            Self::Validation(error) => error.message.clone(),
+            Self::ResourceNotFound(error) => error.message.clone(),
+            Self::Conflict(error) => error.message.clone(),
+        }
+    }
+}
+
+/// The match source a `FirewallRuleType` names: the union member that is set and
+/// the value it matches against, as one string.
+///
+/// What a rule matches is fixed when the rule is made, so an update that
+/// restates the rule type has to restate the SAME source; the confidence
+/// threshold a threat detector carries is a setting of the rule and not part of
+/// what it matches, so it is left out of this. `None` for a union with no member
+/// set, which [`firewall_rule_settings_fault`] refuses in its own right.
+pub fn firewall_rule_type_match_source(rule_type: &FirewallRuleType) -> Option<String> {
+    if let Some(config) = &rule_type.partner_threat_protection {
+        return Some(format!("PartnerThreatProtection={}", config.partner));
+    }
+    if let Some(config) = &rule_type.firewall_advanced_content_category {
+        return Some(format!(
+            "FirewallAdvancedContentCategory={}",
+            config.category
+        ));
+    }
+    if let Some(config) = &rule_type.firewall_advanced_threat_category {
+        return Some(format!("FirewallAdvancedThreatCategory={}", config.category));
+    }
+    if let Some(config) = &rule_type.dns_threat_protection {
+        return Some(format!("DnsThreatProtection={}", config.value));
+    }
+    None
+}
+
+/// The `ValidationException` an update is refused with when it asks to change
+/// what the rule matches against.
+///
+/// `UpdateFirewallRule`'s doc states the rule: "The rule's `FirewallRuleType`,
+/// `FirewallDomainListId`, and top-level `DnsThreatProtection` match source
+/// cannot be changed after creation." The member the request restated
+/// differently is what the sentence names.
+pub fn firewall_rule_match_source_is_immutable(member: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "{member} identifies the rule's match source and cannot be changed after the \
+             rule is created"
+        )),
+    }
+}
 
 /// A DNS Firewall rule group, as stored.
 ///
@@ -5092,182 +5487,27 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         request: FirewallRuleCreate<'_>,
         now: Instant,
     ) -> Result<FirewallRule, FirewallRuleCreateRefusal> {
-        // `Name`'s pattern carries a negative lookahead, which is outside what
-        // the boundary validator's regex engine accepts, so the rule is enforced
-        // here.
-        if !name_satisfies_pattern(request.name) {
-            return Err(FirewallRuleCreateRefusal::Validation(ValidationException {
-                message: Some(name_pattern_violation(request.name)),
-            }));
+        // Every setting the rule is to carry has to be one the service admits,
+        // and a create states them all. The same question is asked of the
+        // settings an update arrives at, so it is answered in ONE place for
+        // both ([`firewall_rule_settings_fault`]).
+        let settings = FirewallRuleSettings {
+            name: request.name,
+            action: request.action,
+            block_response: request.block_response,
+            block_override_domain: request.block_override_domain,
+            block_override_dns_type: request.block_override_dns_type,
+            block_override_ttl: request.block_override_ttl,
+            firewall_domain_redirection_action: request.firewall_domain_redirection_action,
+            firewall_domain_list_id: request.firewall_domain_list_id,
+            dns_threat_protection: request.dns_threat_protection,
+            confidence_threshold: request.confidence_threshold,
+            firewall_rule_type: request.firewall_rule_type,
+        };
+        if let Some(fault) = firewall_rule_settings_fault(&settings) {
+            return Err(FirewallRuleCreateRefusal::Validation(fault));
         }
-
-        // Each enum member admits exactly the values its modelled enum declares;
-        // a value outside one is refused rather than stored as if the service
-        // understood it.
-        for (member, value, values) in [
-            (
-                "Action",
-                Some(request.action),
-                crate::ops::types::ACTION_VALUES,
-            ),
-            (
-                "BlockResponse",
-                request.block_response,
-                crate::ops::types::BLOCK_RESPONSE_VALUES,
-            ),
-            (
-                "BlockOverrideDnsType",
-                request.block_override_dns_type,
-                crate::ops::types::BLOCK_OVERRIDE_DNS_TYPE_VALUES,
-            ),
-            (
-                "FirewallDomainRedirectionAction",
-                request.firewall_domain_redirection_action,
-                crate::ops::types::FIREWALL_DOMAIN_REDIRECTION_ACTION_VALUES,
-            ),
-            (
-                "DnsThreatProtection",
-                request.dns_threat_protection,
-                crate::ops::types::DNS_THREAT_PROTECTION_VALUES,
-            ),
-            (
-                "ConfidenceThreshold",
-                request.confidence_threshold,
-                crate::ops::types::CONFIDENCE_THRESHOLD_VALUES,
-            ),
-        ] {
-            if let Some(value) = value {
-                if !values.contains(&value) {
-                    return Err(FirewallRuleCreateRefusal::Validation(ValidationException {
-                        message: Some(format!("{member} must be one of {values:?}")),
-                    }));
-                }
-            }
-        }
-
-        // "The rule can use any one of the following match sources, and the
-        // chosen source must be supplied through the matching request field —
-        // they are mutually exclusive": `FirewallDomainListId`,
-        // `DnsThreatProtection` and `FirewallRuleType`.
-        let sources = [
-            request.firewall_domain_list_id.is_some(),
-            request.dns_threat_protection.is_some(),
-            request.firewall_rule_type.is_some(),
-        ]
-        .into_iter()
-        .filter(|named| *named)
-        .count();
-        if sources != 1 {
-            return Err(FirewallRuleCreateRefusal::Validation(ValidationException {
-                message: Some(
-                    "Exactly one of FirewallDomainListId, DnsThreatProtection and \
-                     FirewallRuleType identifies the rule's match source"
-                        .to_string(),
-                ),
-            }));
-        }
-
-        // "`FirewallRuleType` is a tagged union — exactly one member must be set
-        // per rule, and the member determines what the rule matches against."
-        if let Some(rule_type) = request.firewall_rule_type {
-            let variants = [
-                rule_type.partner_threat_protection.is_some(),
-                rule_type.firewall_advanced_content_category.is_some(),
-                rule_type.firewall_advanced_threat_category.is_some(),
-                rule_type.dns_threat_protection.is_some(),
-            ]
-            .into_iter()
-            .filter(|set| *set)
-            .count();
-            if variants != 1 {
-                return Err(FirewallRuleCreateRefusal::Validation(ValidationException {
-                    message: Some(
-                        "FirewallRuleType carries exactly one of \
-                         PartnerThreatProtection, FirewallAdvancedContentCategory, \
-                         FirewallAdvancedThreatCategory and DnsThreatProtection"
-                            .to_string(),
-                    ),
-                }));
-            }
-            if let Some(detector) = &rule_type.dns_threat_protection {
-                for (member, value, values) in [
-                    (
-                        "FirewallRuleType.DnsThreatProtection.Value",
-                        detector.value.as_str(),
-                        crate::ops::types::DNS_THREAT_PROTECTION_VALUES,
-                    ),
-                    (
-                        "FirewallRuleType.DnsThreatProtection.ConfidenceThreshold",
-                        detector.confidence_threshold.as_str(),
-                        crate::ops::types::CONFIDENCE_THRESHOLD_VALUES,
-                    ),
-                ] {
-                    if !values.contains(&value) {
-                        return Err(FirewallRuleCreateRefusal::Validation(ValidationException {
-                            message: Some(format!("{member} must be one of {values:?}")),
-                        }));
-                    }
-                }
-            }
-        }
-
-        // A rule whose match source is one of the DNS Firewall Advanced kinds:
-        // `ALLOW` is "not available for DNS Firewall Advanced rules", and a
-        // `DnsThreatProtection` rule needs the confidence threshold — "you must
-        // provide this value when you create a DNS Firewall Advanced rule".
-        let advanced =
-            request.dns_threat_protection.is_some() || request.firewall_rule_type.is_some();
-        if advanced && request.action == FIREWALL_RULE_ACTION_ALLOW {
-            return Err(FirewallRuleCreateRefusal::Validation(ValidationException {
-                message: Some(format!(
-                    "Action {FIREWALL_RULE_ACTION_ALLOW} is not available for DNS Firewall \
-                     Advanced rules"
-                )),
-            }));
-        }
-        if request.dns_threat_protection.is_some() && request.confidence_threshold.is_none() {
-            return Err(FirewallRuleCreateRefusal::Validation(ValidationException {
-                message: Some(
-                    "ConfidenceThreshold is required for a rule that matches a \
-                     DnsThreatProtection detector"
-                        .to_string(),
-                ),
-            }));
-        }
-
-        // "`BlockResponse` … This setting is required if the rule action setting
-        // is BLOCK", and each `BlockOverride*` member "is required if the
-        // BlockResponse setting is OVERRIDE".
-        if request.action == FIREWALL_RULE_ACTION_BLOCK && request.block_response.is_none() {
-            return Err(FirewallRuleCreateRefusal::Validation(ValidationException {
-                message: Some(format!(
-                    "BlockResponse is required when Action is {FIREWALL_RULE_ACTION_BLOCK}"
-                )),
-            }));
-        }
-        if request.block_response == Some(FIREWALL_RULE_BLOCK_RESPONSE_OVERRIDE) {
-            let missing = [
-                (
-                    "BlockOverrideDomain",
-                    request.block_override_domain.is_none(),
-                ),
-                (
-                    "BlockOverrideDnsType",
-                    request.block_override_dns_type.is_none(),
-                ),
-                ("BlockOverrideTtl", request.block_override_ttl.is_none()),
-            ]
-            .into_iter()
-            .find_map(|(member, absent)| absent.then_some(member));
-            if let Some(member) = missing {
-                return Err(FirewallRuleCreateRefusal::Validation(ValidationException {
-                    message: Some(format!(
-                        "{member} is required when BlockResponse is \
-                         {FIREWALL_RULE_BLOCK_RESPONSE_OVERRIDE}"
-                    )),
-                }));
-            }
-        }
+        let advanced = settings.is_advanced();
 
         let timestamp = now_rfc3339();
 
@@ -5421,6 +5661,257 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         // The group's own `ModificationTime` moves with the rules it holds: a
         // group a rule was just added to has changed.
         group.modification_time = now_rfc3339();
+
+        Ok(reported)
+    }
+
+    /// Update one DNS Firewall rule of the group the request names, and answer
+    /// it as the operations report it as of `now`.
+    ///
+    /// This is the whole of what updating one rule means: the rule the request
+    /// NAMES (its group and its match source), the members it leaves alone, the
+    /// match source and rule type that "cannot be changed after creation", the
+    /// settings the rule has to satisfy once the change is applied, the priority
+    /// that has to stay unique in the group, and the lifecycle states a rule
+    /// cannot be updated in. Deciding it HERE is what makes a rule updated one
+    /// at a time and a rule updated as one entry of a batch the same rule,
+    /// admitted and refused on the same grounds — the relation
+    /// [`Self::create_firewall_rule`] has to the two creates. A refusal writes
+    /// nothing.
+    pub fn update_firewall_rule(
+        &mut self,
+        request: FirewallRuleUpdate<'_>,
+        now: Instant,
+    ) -> Result<FirewallRule, FirewallRuleUpdateRefusal> {
+        let Some(group) = self.firewall_rule_groups.get(request.firewall_rule_group_id) else {
+            return Err(FirewallRuleUpdateRefusal::ResourceNotFound(
+                firewall_rule_group_not_found(request.firewall_rule_group_id),
+            ));
+        };
+
+        // A rule is addressed by what it matches on: `FirewallDomainListId`
+        // names a domain-list rule and `FirewallThreatProtectionId` names a DNS
+        // Firewall Advanced rule, and the two name different rules, so an entry
+        // that carries both or neither names none.
+        let match_source_id = match (
+            request.firewall_domain_list_id,
+            request.firewall_threat_protection_id,
+        ) {
+            (Some(id), None) | (None, Some(id)) => id,
+            _ => {
+                return Err(FirewallRuleUpdateRefusal::Validation(ValidationException {
+                    message: Some(
+                        "Exactly one of FirewallDomainListId and FirewallThreatProtectionId \
+                         names the rule to update"
+                            .to_string(),
+                    ),
+                }));
+            }
+        };
+        let by_domain_list = request.firewall_domain_list_id.is_some();
+        let candidates: Vec<usize> = group
+            .rules
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                let stored = if by_domain_list {
+                    record.rule.firewall_domain_list_id.as_deref()
+                } else {
+                    record.rule.firewall_threat_protection_id.as_deref()
+                };
+                stored == Some(match_source_id)
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        let index = match candidates.as_slice() {
+            [] => {
+                return Err(FirewallRuleUpdateRefusal::ResourceNotFound(
+                    firewall_rule_not_found(match_source_id),
+                ));
+            }
+            [only] => *only,
+            // Among rules of one group that match the same source, the `Qtype`
+            // the entry names is what tells them apart — a rule that evaluates
+            // every query type stores none, so an entry that names none names
+            // that rule.
+            several => {
+                let mut evaluating_the_qtype = several.iter().copied().filter(|index| {
+                    group
+                        .rules
+                        .get(*index)
+                        .and_then(|record| record.rule.qtype.as_deref())
+                        == request.qtype
+                });
+                match (evaluating_the_qtype.next(), evaluating_the_qtype.next()) {
+                    (Some(only), None) => only,
+                    _ => {
+                        return Err(FirewallRuleUpdateRefusal::Validation(ValidationException {
+                            message: Some(format!(
+                                "More than one rule of firewall rule group {} matches \
+                                 {match_source_id}; name the Qtype of the rule to update",
+                                request.firewall_rule_group_id
+                            )),
+                        }));
+                    }
+                }
+            }
+        };
+
+        let Some(stored) = group.rules.get(index).map(|record| record.to_rule(now)) else {
+            return Err(FirewallRuleUpdateRefusal::ResourceNotFound(
+                firewall_rule_not_found(match_source_id),
+            ));
+        };
+
+        // "Rules whose Status is CREATING or CREATION_FAILED cannot be updated;
+        // remove a failed rule with DeleteFirewallRule."
+        if stored.status.as_deref().is_some_and(|status| {
+            status == FIREWALL_RULE_STATUS_CREATING || status == FIREWALL_RULE_STATUS_CREATION_FAILED
+        }) {
+            return Err(FirewallRuleUpdateRefusal::Conflict(
+                state_transition_conflict(),
+            ));
+        }
+
+        // The settings the rule carries once the change is applied: a member the
+        // request names replaces the stored value, a member it does not name
+        // keeps it, and the match source is the stored one either way. They have
+        // to be settings the service admits, exactly as for a create.
+        let settings = FirewallRuleSettings {
+            // A stored rule always carries both of these — the create requires
+            // them — so the fallbacks below stand for an impossible record
+            // rather than for a member the request may leave out.
+            name: request.name.or(stored.name.as_deref()).unwrap_or_default(),
+            action: request.action.or(stored.action.as_deref()).unwrap_or_default(),
+            block_response: request.block_response.or(stored.block_response.as_deref()),
+            block_override_domain: request
+                .block_override_domain
+                .or(stored.block_override_domain.as_deref()),
+            block_override_dns_type: request
+                .block_override_dns_type
+                .or(stored.block_override_dns_type.as_deref()),
+            block_override_ttl: request.block_override_ttl.or(stored.block_override_ttl),
+            firewall_domain_redirection_action: request
+                .firewall_domain_redirection_action
+                .or(stored.firewall_domain_redirection_action.as_deref()),
+            firewall_domain_list_id: stored.firewall_domain_list_id.as_deref(),
+            dns_threat_protection: stored.dns_threat_protection.as_deref(),
+            confidence_threshold: request
+                .confidence_threshold
+                .or(stored.confidence_threshold.as_deref()),
+            firewall_rule_type: request
+                .firewall_rule_type
+                .or(stored.firewall_rule_type.as_ref()),
+        };
+        if let Some(fault) = firewall_rule_settings_fault(&settings) {
+            return Err(FirewallRuleUpdateRefusal::Validation(fault));
+        }
+
+        // "The rule's FirewallRuleType, FirewallDomainListId, and top-level
+        // DnsThreatProtection match source cannot be changed after creation": an
+        // entry may restate the source it addressed the rule by, and a
+        // restatement that names another source is refused. The confidence
+        // threshold a threat detector carries is a setting and not part of what
+        // the rule matches, so restating a rule type with another threshold is
+        // an update of that setting.
+        if let Some(requested) = request.dns_threat_protection {
+            if stored.dns_threat_protection.as_deref() != Some(requested) {
+                return Err(FirewallRuleUpdateRefusal::Validation(
+                    firewall_rule_match_source_is_immutable("DnsThreatProtection"),
+                ));
+            }
+        }
+        if let Some(requested) = request.firewall_rule_type {
+            let stored_source = stored
+                .firewall_rule_type
+                .as_ref()
+                .and_then(firewall_rule_type_match_source);
+            if firewall_rule_type_match_source(requested) != stored_source {
+                return Err(FirewallRuleUpdateRefusal::Validation(
+                    firewall_rule_match_source_is_immutable("FirewallRuleType"),
+                ));
+            }
+        }
+
+        // "You must specify a unique priority for each rule in a rule group" —
+        // group-wide, and not scoped by the query type the rules evaluate.
+        if let Some(requested) = request.priority {
+            if group
+                .rules
+                .iter()
+                .enumerate()
+                .any(|(other, record)| other != index && record.rule.priority == Some(requested))
+            {
+                return Err(FirewallRuleUpdateRefusal::Validation(
+                    firewall_rule_priority_in_use(request.firewall_rule_group_id),
+                ));
+            }
+        }
+
+        // Moving a rule onto the query type another rule of the group evaluates
+        // would leave two rules no later request could tell apart — and cannot
+        // happen: `Qtype` both selects among the rules that match one source
+        // and states the value, so where more than one rule matches, the rule
+        // selected is the one ALREADY evaluating that query type, and where one
+        // rule matches there is no other rule to collide with.
+        let timestamp = now_rfc3339();
+        let Some(group) = self
+            .firewall_rule_groups
+            .get_mut(request.firewall_rule_group_id)
+        else {
+            return Err(FirewallRuleUpdateRefusal::ResourceNotFound(
+                firewall_rule_group_not_found(request.firewall_rule_group_id),
+            ));
+        };
+        let Some(record) = group.rules.get_mut(index) else {
+            return Err(FirewallRuleUpdateRefusal::ResourceNotFound(
+                firewall_rule_not_found(match_source_id),
+            ));
+        };
+
+        let rule = &mut record.rule;
+        if let Some(value) = request.priority {
+            rule.priority = Some(value);
+        }
+        if let Some(value) = request.action {
+            rule.action = Some(value.to_string());
+        }
+        if let Some(value) = request.block_response {
+            rule.block_response = Some(value.to_string());
+        }
+        if let Some(value) = request.block_override_domain {
+            rule.block_override_domain = Some(value.to_string());
+        }
+        if let Some(value) = request.block_override_dns_type {
+            rule.block_override_dns_type = Some(value.to_string());
+        }
+        if let Some(value) = request.block_override_ttl {
+            rule.block_override_ttl = Some(value);
+        }
+        if let Some(value) = request.name {
+            rule.name = Some(value.to_string());
+        }
+        if let Some(value) = request.firewall_domain_redirection_action {
+            rule.firewall_domain_redirection_action = Some(value.to_string());
+        }
+        if let Some(value) = request.qtype {
+            rule.qtype = Some(value.to_string());
+        }
+        if let Some(value) = request.confidence_threshold {
+            rule.confidence_threshold = Some(value.to_string());
+        }
+        // The source it matches is the one it already matched — checked above —
+        // so what this carries over is the threshold the detector reads at.
+        if let Some(value) = request.firewall_rule_type {
+            rule.firewall_rule_type = Some(value.clone());
+        }
+        rule.modification_time = Some(timestamp.clone());
+
+        let reported = record.to_rule(now);
+        // The group's own `ModificationTime` moves with the rules it holds: a
+        // group whose rule just changed has changed.
+        group.modification_time = timestamp;
 
         Ok(reported)
     }

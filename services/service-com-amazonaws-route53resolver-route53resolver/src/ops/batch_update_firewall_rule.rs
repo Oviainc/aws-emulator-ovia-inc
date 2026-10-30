@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateFirewallRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateFirewallRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateFirewallRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Each entry is decided on its own through the
+//! one firewall-rule update the store owns
+//! ([`crate::state::ComAmazonawsRoute53resolverRoute53resolverState::update_firewall_rule`]),
+//! so a rule this call changes is the rule `UpdateFirewallRule` would have
+//! changed for that entry, and an entry it cannot apply is reported in the
+//! response body instead of failing the whole call. A batch carrying more
+//! entries than one request may is refused WHOLE, before any entry is applied.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +152,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateFirewallRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateFirewallRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateFirewallRule"))
+        // The engine is reachable from `&self` (constructor-injected); a rule is
+        // not an ARN-bearing resource of its own, so this operation takes
+        // nothing from `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchUpdateFirewallRuleErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // One request carries entries for a bounded number of rules. A request
+        // that carries as many as the cap or more is refused WHOLE — the limit
+        // is a limit on the CALL, not on one of its entries — so the stored
+        // rules are left exactly as they were and not even the entries a
+        // smaller batch would have applied are applied.
+        let asked_for = input.update_firewall_rule_entries.len();
+        if asked_for >= crate::state::FIREWALL_RULE_UPDATE_BATCH_ENTRY_CAP {
+            return Err(BatchUpdateFirewallRuleErrorModeled::LimitExceededException(
+                crate::state::firewall_rule_update_batch_too_large(
+                    crate::state::FIREWALL_RULE_UPDATE_BATCH_ENTRY_CAP,
+                ),
+            )
+            .into());
+        }
+
+        let now = ::std::time::Instant::now();
+        let mut updated_firewall_rules = Vec::new();
+        let mut update_errors = Vec::new();
+        let mut store = state.lock();
+
+        // The entries are decided IN ORDER, each against the store as the
+        // entries before it left it: a priority one entry freed is a priority
+        // the next entry may take. An entry the update refuses is reported with
+        // the code and the sentence the single update answers for it, beside the
+        // entry that caused it — and the entries around it are applied all the
+        // same, which is what makes one call able to succeed in part.
+        for entry in &input.update_firewall_rule_entries {
+            let request = crate::state::FirewallRuleUpdate {
+                firewall_rule_group_id: &entry.firewall_rule_group_id,
+                firewall_domain_list_id: entry.firewall_domain_list_id.as_deref(),
+                firewall_threat_protection_id: entry.firewall_threat_protection_id.as_deref(),
+                priority: entry.priority,
+                action: entry.action.as_deref(),
+                block_response: entry.block_response.as_deref(),
+                block_override_domain: entry.block_override_domain.as_deref(),
+                block_override_dns_type: entry.block_override_dns_type.as_deref(),
+                block_override_ttl: entry.block_override_ttl,
+                name: entry.name.as_deref(),
+                firewall_domain_redirection_action: entry
+                    .firewall_domain_redirection_action
+                    .as_deref(),
+                qtype: entry.qtype.as_deref(),
+                dns_threat_protection: entry.dns_threat_protection.as_deref(),
+                confidence_threshold: entry.confidence_threshold.as_deref(),
+                firewall_rule_type: entry.firewall_rule_type.as_ref(),
+            };
+
+            match store.update_firewall_rule(request, now) {
+                Ok(rule) => updated_firewall_rules.push(rule),
+                // "The firewall rule entry that caused the error", as the
+                // request stated it.
+                Err(refusal) => update_errors.push(BatchUpdateFirewallRuleError2 {
+                    firewall_rule: Some(entry.clone()),
+                    code: Some(refusal.code().to_string()),
+                    message: refusal.message(),
+                }),
+            }
+        }
+
+        Ok(BatchUpdateFirewallRuleOutput {
+            // Both lists are reported for every call, so a caller reads the
+            // rules this request updated and the entries it could not apply
+            // from the same two members whether either is empty or not.
+            updated_firewall_rules: Some(updated_firewall_rules),
+            update_errors: Some(update_errors),
+        })
     }
 }
