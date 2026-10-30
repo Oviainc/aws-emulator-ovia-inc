@@ -86,7 +86,9 @@
 //! is the hash the read reports — and, beside that draft, every numbered version
 //! `ops/create_automated_reasoning_policy_version.rs` cuts from it, which the same read
 //! reports when the ARN it is given carries that version's number, unchanged by any later
-//! write to the draft.
+//! write to the draft. `ops/export_automated_reasoning_policy_version.rs` reads the
+//! DEFINITION of whichever of those revisions the ARN names, so what a revision was written
+//! with is what the export reports.
 //!
 //! And it holds the build workflows of those policies —
 //! `ops/start_automated_reasoning_policy_build_workflow.rs` starts them,
@@ -3919,6 +3921,25 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         }
     }
 
+    /// The `ResourceNotFoundException` message an `AutomatedReasoningPolicyArn` that
+    /// [`Self::automated_reasoning_policy_revision`] resolves to NOTHING is refused with.
+    ///
+    /// WHICH half of the ARN resolved to nothing decides the sentence: an ARN naming a
+    /// version of a policy this account DOES hold addressed a revision that policy has not
+    /// cut, so the refusal reports the missing version
+    /// ([`AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND`]) rather than the policy, which is
+    /// there. Here rather than in one handler because every operation addressed by this ARN
+    /// reports one unresolvable ARN the same way, and that wording is one rule.
+    #[must_use]
+    pub fn automated_reasoning_policy_revision_not_found_message(&self, policy_arn: &str) -> String {
+        let (base_arn, version) = automated_reasoning_policy_arn_parts(policy_arn);
+        if version.is_some() && self.automated_reasoning_policy(base_arn).is_some() {
+            AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND.to_string()
+        } else {
+            format!("no automated reasoning policy {policy_arn} exists in this account")
+        }
+    }
+
     /// Mint a fresh `AutomatedReasoningPolicyBuildWorkflowId`: the lowercase hyphenated
     /// UUIDv4 that member's pattern spells
     /// (`^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}$`),
@@ -5607,71 +5628,94 @@ pub fn policy_definition_hash(definition: Option<&AutomatedReasoningPolicyDefini
     ::hex::encode(Sha512::digest(canonical.as_bytes()))
 }
 
+/// A policy definition as its CONTENT: the format version it carries or the one the shape
+/// declares as its `@default` ([`POLICY_DEFINITION_FORMAT_VERSION`]), and each of its three
+/// lists, an absent one read as the empty list.
+///
+/// So a revision that holds NO definition, and one whose definition carries no types,
+/// variables or rules, are one definition — which is what makes [`policy_definition_hash`]
+/// a function of the definition's content alone, and what
+/// `ops/export_automated_reasoning_policy_version.rs` exports, so the definition that
+/// operation reports always hashes to the `definitionHash` the same revision reports.
+#[must_use]
+pub fn policy_definition_content(
+    definition: Option<&AutomatedReasoningPolicyDefinition>,
+) -> AutomatedReasoningPolicyDefinition {
+    AutomatedReasoningPolicyDefinition {
+        version: definition
+            .map(|definition| definition.version.clone())
+            .filter(|version| !version.is_empty())
+            .unwrap_or_else(|| POLICY_DEFINITION_FORMAT_VERSION.to_string()),
+        types: Some(
+            definition
+                .and_then(|definition| definition.types.clone())
+                .unwrap_or_default(),
+        ),
+        variables: Some(
+            definition
+                .and_then(|definition| definition.variables.clone())
+                .unwrap_or_default(),
+        ),
+        rules: Some(
+            definition
+                .and_then(|definition| definition.rules.clone())
+                .unwrap_or_default(),
+        ),
+    }
+}
+
 /// A policy definition as the one JSON value [`policy_definition_hash`] digests: every
-/// member of every element in a fixed order, with an absent list rendered as the empty
-/// list and an absent definition as the empty definition, so the rendering depends on the
-/// definition's CONTENT and on nothing else.
+/// member of every element of [`policy_definition_content`] in a fixed order, so the
+/// rendering depends on the definition's CONTENT and on nothing else.
 fn canonical_policy_definition(
     definition: Option<&AutomatedReasoningPolicyDefinition>,
 ) -> ::serde_json::Value {
-    let format_version = definition
-        .map(|definition| definition.version.as_str())
-        .filter(|version| !version.is_empty())
-        .unwrap_or(POLICY_DEFINITION_FORMAT_VERSION);
-    let types: Vec<::serde_json::Value> = definition
-        .and_then(|definition| definition.types.as_ref())
-        .map(|types| {
-            types
-                .iter()
-                .map(|declared| {
-                    ::serde_json::json!({
-                        "name": declared.name,
-                        "description": declared.description,
-                        "values": declared
-                            .values
-                            .iter()
-                            .map(|value| ::serde_json::json!({
-                                "value": value.value,
-                                "description": value.description,
-                            }))
-                            .collect::<Vec<_>>(),
-                    })
-                })
-                .collect()
+    let content = policy_definition_content(definition);
+    let types: Vec<::serde_json::Value> = content
+        .types
+        .iter()
+        .flatten()
+        .map(|declared| {
+            ::serde_json::json!({
+                "name": declared.name,
+                "description": declared.description,
+                "values": declared
+                    .values
+                    .iter()
+                    .map(|value| ::serde_json::json!({
+                        "value": value.value,
+                        "description": value.description,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
         })
-        .unwrap_or_default();
-    let variables: Vec<::serde_json::Value> = definition
-        .and_then(|definition| definition.variables.as_ref())
-        .map(|variables| {
-            variables
-                .iter()
-                .map(|variable| {
-                    ::serde_json::json!({
-                        "name": variable.name,
-                        "type": variable.r#type,
-                        "description": variable.description,
-                    })
-                })
-                .collect()
+        .collect();
+    let variables: Vec<::serde_json::Value> = content
+        .variables
+        .iter()
+        .flatten()
+        .map(|variable| {
+            ::serde_json::json!({
+                "name": variable.name,
+                "type": variable.r#type,
+                "description": variable.description,
+            })
         })
-        .unwrap_or_default();
-    let rules: Vec<::serde_json::Value> = definition
-        .and_then(|definition| definition.rules.as_ref())
-        .map(|rules| {
-            rules
-                .iter()
-                .map(|rule| {
-                    ::serde_json::json!({
-                        "id": rule.id,
-                        "expression": rule.expression,
-                        "alternateExpression": rule.alternate_expression,
-                    })
-                })
-                .collect()
+        .collect();
+    let rules: Vec<::serde_json::Value> = content
+        .rules
+        .iter()
+        .flatten()
+        .map(|rule| {
+            ::serde_json::json!({
+                "id": rule.id,
+                "expression": rule.expression,
+                "alternateExpression": rule.alternate_expression,
+            })
         })
-        .unwrap_or_default();
+        .collect();
     ::serde_json::json!({
-        "version": format_version,
+        "version": content.version,
         "types": types,
         "variables": variables,
         "rules": rules,

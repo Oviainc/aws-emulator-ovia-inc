@@ -23,6 +23,8 @@ mod automated_reasoning_policies;
 mod automated_reasoning_policy_build_workflow_deletion;
 #[path = "all/automated_reasoning_policy_build_workflows.rs"]
 mod automated_reasoning_policy_build_workflows;
+#[path = "all/automated_reasoning_policy_definition_export.rs"]
+mod automated_reasoning_policy_definition_export;
 #[path = "all/automated_reasoning_policy_test_case_deletion.rs"]
 mod automated_reasoning_policy_test_case_deletion;
 #[path = "all/automated_reasoning_policy_test_case_updates.rs"]

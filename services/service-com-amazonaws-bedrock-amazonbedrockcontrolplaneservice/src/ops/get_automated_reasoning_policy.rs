@@ -171,26 +171,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // version this policy has cut, and the unversioned ARN its working draft.
         let Some((policy, version)) = store.automated_reasoning_policy_revision(&input.policy_arn)
         else {
-            // WHICH half of the ARN resolved to nothing decides the sentence: an ARN naming
-            // a version of a policy this account DOES hold addressed a revision that policy
-            // has not cut, so the refusal reports the missing version rather than the
-            // policy, which is there.
-            let (base_arn, numbered) =
-                crate::state::automated_reasoning_policy_arn_parts(&input.policy_arn);
-            let message = if numbered.is_some()
-                && store.automated_reasoning_policy(base_arn).is_some()
-            {
-                crate::state::AUTOMATED_REASONING_POLICY_VERSION_NOT_FOUND.to_string()
-            } else {
-                format!(
-                    "no automated reasoning policy {} exists in this account",
-                    input.policy_arn
-                )
-            };
+            // One unresolvable ARN, one sentence: whether it reports the missing version or
+            // the missing policy is the store's own rule, which every read addressed by this
+            // ARN shares.
             return Err(
                 GetAutomatedReasoningPolicyErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(message),
+                        message: Some(
+                            store.automated_reasoning_policy_revision_not_found_message(
+                                &input.policy_arn,
+                            ),
+                        ),
                     },
                 )
                 .into(),
