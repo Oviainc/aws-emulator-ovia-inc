@@ -164,12 +164,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
+        // ONE reading of the clock for the whole request: the gate and the
+        // organisation's roster this page serves are both clock-derived, so they
+        // are decided from the same instant (see
+        // [`crate::state::ComAmazonawsFmsAwsfms20180101State::member_accounts`]).
+        let now = ::std::time::SystemTime::now();
         // Authorization first: a caller that is not entitled to an
         // organisation-scoped call is refused identically whatever it sent, so a
         // token this service never minted cannot turn the refusal into a
         // request-shape complaint. The refusal names the Region the request was
         // signed for, which is the Region whose association was looked for.
-        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+        crate::state::require_administrator_at(
+            &store,
+            &crate::state::request_region(ctx.parts()),
+            now,
+        )?;
 
         // A token this service did not mint, or one minted for ANOTHER
         // account-keyed collection of this service, names no boundary in the
@@ -198,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The member accounts are ordered by account id, so a page boundary is a
         // key: resume at the first id at or after the token's. With no token the
         // lower bound is the empty id, which sorts before every account id.
-        let accounts = store.member_accounts();
+        let accounts = store.member_accounts(now);
         let lower = start.unwrap_or_default();
         let mut remaining = accounts.range(lower..);
 

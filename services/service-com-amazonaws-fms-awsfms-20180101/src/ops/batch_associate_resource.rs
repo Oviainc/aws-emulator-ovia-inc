@@ -285,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } = crate::state::resource_set_batch_basis(&store, &id)
             .map_err(BatchAssociateResourceErrorModeled::ResourceNotFoundException)?;
         let partition = crate::state::emulator_partition();
-        let accounts = crate::state::organization_accounts(&store, discoverable);
+        let accounts = crate::state::organization_accounts(&store, discoverable, now);
         let mut failed_items = Vec::new();
         let mut associated = Vec::new();
         for uri in &input.items {

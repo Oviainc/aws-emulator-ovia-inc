@@ -52,7 +52,13 @@ const UNKNOWN_RESOURCE_SET_ID: &str = "0123456789AbCdEfGhIjKl";
 /// The default-administrator association as the store holds it: `role_status`
 /// with `removal_due` as the completion instant of a requested tear-down (`None`
 /// when no tear-down was asked for).
-fn association(role_status: &str, removal_due: Option<SystemTime>) -> state::AdminAccountRecord {
+///
+/// `pub(crate)` so a sibling suite in this test target seeds a tear-down in
+/// flight through this ONE builder rather than a second copy of the record.
+pub(crate) fn association(
+    role_status: &str,
+    removal_due: Option<SystemTime>,
+) -> state::AdminAccountRecord {
     state::AdminAccountRecord {
         account_id: ACCOUNT.to_string(),
         role_status: role_status.to_string(),

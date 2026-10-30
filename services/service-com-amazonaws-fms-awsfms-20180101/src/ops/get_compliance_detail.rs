@@ -177,13 +177,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
+        // ONE reading of the clock for the whole request: the gate and the
+        // policy's scope the named account is resolved against are both
+        // clock-derived, so they are decided from the same instant (see
+        // [`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_applies_to_account`]).
+        let now = ::std::time::SystemTime::now();
         // Authorization FIRST, before any identifier is looked up: this read
         // answers about an organisation member account, so a caller that is
         // neither a Firewall Manager administrator nor the organisation's
         // management account is refused identically whatever it sent — a refusal
         // that leaked whether the policy exists would tell an unauthorized
         // caller what the organisation holds.
-        crate::state::require_administrator(&store, &region)?;
+        crate::state::require_administrator_at(&store, &region, now)?;
 
         // "The ID of the policy that you want to get the details for": an id
         // naming no stored policy is the modelled not-found.
@@ -202,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // there is no compliance detail of it to report, and the pair is the same
         // modelled not-found as an unknown policy — rather than an invented
         // evaluation that would contradict the summary.
-        if !store.policy_applies_to_account(&policy.policy, &input.member_account) {
+        if !store.policy_applies_to_account(&policy.policy, &input.member_account, now) {
             return Err(GetComplianceDetailErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
             )

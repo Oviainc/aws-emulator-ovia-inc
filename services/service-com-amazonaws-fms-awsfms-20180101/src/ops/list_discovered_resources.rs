@@ -197,6 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
+        // ONE reading of the clock for the whole request: the gate and the
+        // organization's roster are both clock-derived, so they are decided from
+        // the same instant (see `crate::state::organization_accounts`).
+        let now = ::std::time::SystemTime::now();
         // The accounts the discoverable inventory reports resources in, read
         // BEFORE this service's store is locked: that read takes the locks of the
         // services that own those resources, and this service holds no lock of
@@ -210,8 +214,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // its own while it does that (see
             // `crate::state::discovered_resources`).
             let store = state.lock();
-            crate::state::require_administrator(&store, &region)?;
-            crate::state::organization_accounts(&store, discoverable)
+            crate::state::require_administrator_at(&store, &region, now)?;
+            crate::state::organization_accounts(&store, discoverable, now)
         };
 
         // "Only one account is supported per request" — `MemberAccountIds`' own

@@ -174,13 +174,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
+        // ONE reading of the clock for the whole request: the gate and the
+        // policy's scope this page is served from are both clock-derived, so they
+        // are decided from the same instant (see
+        // [`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_scope_accounts`]).
+        let now = ::std::time::SystemTime::now();
         // Authorization FIRST, before any identifier is looked up: this read
         // enumerates the organisation's member accounts, so a caller that is
         // neither a Firewall Manager administrator nor the organisation's
         // management account is refused identically whatever it sent — a refusal
         // that leaked whether the policy exists would tell an unauthorized
         // caller what the organisation holds.
-        crate::state::require_administrator(&store, &region)?;
+        crate::state::require_administrator_at(&store, &region, now)?;
 
         // "The ID of the Firewall Manager policy that you want the details for":
         // an id naming no stored policy is the modelled not-found.
@@ -223,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // page boundary is a key: resume at the first account at or after the
         // token's. With no token the lower bound is the empty id, which sorts
         // before every account id.
-        let scope = store.policy_scope_accounts(&policy.policy);
+        let scope = store.policy_scope_accounts(&policy.policy, now);
         let lower = start.unwrap_or_default();
         let mut remaining = scope.range(lower..);
 

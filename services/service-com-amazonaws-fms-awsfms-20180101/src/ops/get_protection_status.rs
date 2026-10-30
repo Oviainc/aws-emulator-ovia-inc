@@ -197,11 +197,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
+        // ONE reading of the clock for the whole request: the gate and the
+        // policy's scope both the named account and the page are resolved against
+        // are clock-derived, so they are decided from the same instant (see
+        // [`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_scope_accounts`]).
+        let now = ::std::time::SystemTime::now();
         // Authorization FIRST, before any identifier is looked up: the
         // administrator association is also what the response's
         // `AdminAccountId` reports, so a caller with no administrator has
         // nothing to be told about this policy.
-        let admin = crate::state::require_administrator(&store, &region)?;
+        let admin = crate::state::require_administrator_at(&store, &region, now)?;
 
         let Some(policy) = store.policies.get(&input.policy_id) else {
             return Err(GetProtectionStatusErrorModeled::ResourceNotFoundException(
@@ -244,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input
             .member_account_id
             .as_deref()
-            .is_some_and(|account| !store.policy_applies_to_account(&policy.policy, account))
+            .is_some_and(|account| !store.policy_applies_to_account(&policy.policy, account, now))
         {
             return Err(GetProtectionStatusErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
@@ -282,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // page goes through the same resolution the named account does, so the
         // two paths of this handler cannot disagree about one (policy, account)
         // pair — the set is also the one `ListComplianceStatus` pages over.
-        let scope = store.policy_scope_accounts(&policy.policy);
+        let scope = store.policy_scope_accounts(&policy.policy, now);
 
         // The inventory is keyed by policy, then by the instant the attack
         // started, so this policy's attacks are a contiguous range in

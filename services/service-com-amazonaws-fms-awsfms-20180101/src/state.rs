@@ -121,12 +121,6 @@ impl AdminAccountRecord {
         self.role_status != ROLE_STATUS_DELETED && self.removal_due.is_none_or(|due| now < due)
     }
 
-    /// [`Self::is_active_at`] at the current instant, for a caller that makes ONE
-    /// decision from it.
-    pub fn is_active(&self) -> bool {
-        self.is_active_at(SystemTime::now())
-    }
-
     /// Whether a disassociation of this association has been requested and has
     /// not completed yet.
     pub fn removal_pending(&self) -> bool {
@@ -1707,8 +1701,8 @@ impl ComAmazonawsFmsAwsfms20180101State {
     /// with the modelled `ResourceNotFoundException` rather than an empty page.
     ///
     /// An association `DisassociateAdminAccount` has torn down
-    /// ([`AdminAccountRecord::is_active`] is false) manages nothing any more, so
-    /// it is left out.
+    /// ([`AdminAccountRecord::is_active_at`] is false) manages nothing any more,
+    /// so it is left out.
     ///
     /// An administrator `PutAdminAccount` onboarded manages only what its
     /// `AdminScope` says it may, so it is reported here exactly when its
@@ -1766,10 +1760,15 @@ impl ComAmazonawsFmsAwsfms20180101State {
     ///
     /// An association `DisassociateAdminAccount` has torn down is not an
     /// administrator of the organization any more, so its account is only
-    /// recorded here while the association is active.
-    pub fn member_accounts(&self) -> BTreeSet<String> {
+    /// recorded here while the association is active AT `now`.
+    ///
+    /// It takes `now` for the same reason [`AdminAccountRecord::is_active_at`]
+    /// does: one request decides from ONE reading of a clock that is not
+    /// monotonic, so the roster a request classifies against cannot straddle a
+    /// settle boundary the same request's gate decided on the near side of.
+    pub fn member_accounts(&self, now: SystemTime) -> BTreeSet<String> {
         let mut accounts = BTreeSet::new();
-        if let Some(admin) = self.admin_account.as_ref().filter(|a| a.is_active()) {
+        if let Some(admin) = self.admin_account.as_ref().filter(|a| a.is_active_at(now)) {
             accounts.insert(admin.account_id.clone());
         }
         // Every account `PutAdminAccount` onboarded as an administrator: that
@@ -1823,7 +1822,11 @@ impl ComAmazonawsFmsAwsfms20180101State {
     ///
     /// A `BTreeSet` so the order is total and an account named twice is one
     /// account: a page boundary over the scope is then a key, not a cursor.
-    pub fn policy_scope_accounts(&self, policy: &Policy) -> BTreeSet<String> {
+    ///
+    /// It takes `now` because "all accounts" is read through
+    /// [`Self::member_accounts`], which is clock-derived: one request decides
+    /// from ONE reading of a clock that is not monotonic.
+    pub fn policy_scope_accounts(&self, policy: &Policy, now: SystemTime) -> BTreeSet<String> {
         /// The account ids a scope map names, or none when it names no account.
         fn scoped_accounts(
             map: Option<&HashMap<String, Vec<String>>>,
@@ -1851,7 +1854,7 @@ impl ComAmazonawsFmsAwsfms20180101State {
             return scoped_accounts(policy.include_map.as_ref());
         }
         let excluded = scoped_accounts(policy.exclude_map.as_ref());
-        self.member_accounts()
+        self.member_accounts(now)
             .into_iter()
             .filter(|account| !excluded.contains(account))
             .collect()
@@ -1865,8 +1868,18 @@ impl ComAmazonawsFmsAwsfms20180101State {
     /// an account outside that scope was never evaluated against this policy and
     /// no surface of the policy holds anything about it — which is the modelled
     /// not-found, not an empty report.
-    pub fn policy_applies_to_account(&self, policy: &Policy, account: &str) -> bool {
-        self.policy_scope_accounts(policy).contains(account)
+    ///
+    /// It takes `now` for the reason [`Self::policy_scope_accounts`] does: one
+    /// request decides from ONE reading of a clock that is not monotonic, so a
+    /// handler cannot resolve a named account against one reading and the page it
+    /// serves against another.
+    pub fn policy_applies_to_account(
+        &self,
+        policy: &Policy,
+        account: &str,
+        now: SystemTime,
+    ) -> bool {
+        self.policy_scope_accounts(policy, now).contains(account)
     }
 
     /// The `CustomerPolicyStatus` of one stored policy: SERVICE-DERIVED, from
@@ -3251,11 +3264,17 @@ fn arn_in_accounts(arn: &ParsedArn<'_>, accounts: &BTreeSet<String>) -> bool {
 /// taking this store's guard (that read takes the owning services' locks), so a
 /// resource `ListDiscoveredResources` reports as discoverable is one the batch
 /// operations accept from its account.
+///
+/// It takes `now` for the reason
+/// [`ComAmazonawsFmsAwsfms20180101State::member_accounts`] does: one request
+/// decides from ONE reading of a clock that is not monotonic, so the roster a
+/// batch classifies its items against is the one its own gate was decided from.
 pub fn organization_accounts(
     store: &ComAmazonawsFmsAwsfms20180101State,
     discoverable: BTreeSet<String>,
+    now: SystemTime,
 ) -> BTreeSet<String> {
-    let mut accounts = store.member_accounts();
+    let mut accounts = store.member_accounts(now);
     accounts.extend(discoverable);
     accounts
 }
