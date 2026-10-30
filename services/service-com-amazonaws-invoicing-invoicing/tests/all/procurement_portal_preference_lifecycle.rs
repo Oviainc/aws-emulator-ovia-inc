@@ -30,8 +30,9 @@
 //!   configuration either way — asserted over preferences differing in which portal
 //!   endpoints they configure, and over the codes a caller that never received the issued
 //!   one could submit;
-//! * repeating an update lands the same configuration, and a delete's `ClientToken`
-//!   replay answers with the ARN it removed.
+//! * repeating an update lands the same configuration, a repeat under one `ClientToken` is
+//!   replayed rather than applied again, and a delete's `ClientToken` replay answers with
+//!   the ARN it removed.
 
 use std::sync::Arc;
 
@@ -863,11 +864,13 @@ async fn a_send_issues_a_validation_code_and_confirms_what_it_can_deliver() {
 }
 
 /// RULE: an update is idempotent in its EFFECT — repeating the same request leaves the
-/// resource with exactly the configuration that request states, whether or not it carries
-/// a `ClientToken` — while the version counter counts the WRITES the resource took, so it
-/// advances once per successful call. A delete's `ClientToken` replay answers with the ARN
-/// it removed rather than reporting it missing, and a delete of a preference that is gone
-/// under any other token reports it missing.
+/// resource with exactly the configuration that request states — and a request that
+/// carries a `ClientToken` is replayed: the repeat answers what the first call answered
+/// and is applied ONCE, so the version counter, which counts the WRITES the resource took,
+/// advances once for the whole retried request. Without a token there is nothing to
+/// replay, so each call is its own write. A delete's `ClientToken` replay answers with the
+/// ARN it removed rather than reporting it missing, and a delete of a preference that is
+/// gone under any other token reports it missing.
 ///
 /// The rows differ along the token's shape, inside `BasicStringWithoutSpace`'s
 /// `@length(0..1024)` and `^\S+$` (`smithy_query(query="operation",
@@ -921,12 +924,18 @@ async fn a_repeated_update_lands_the_same_configuration_and_a_deletes_replay_ans
             );
             let reported = get_preference(&router, &arn).await;
             assert_states_were_applied(&format!("token {index} round {round}"), &update, &reported);
-            // The create left version 1, and each of these calls is one more write.
+            // The create left version 1. A token makes every repeat a replay of ONE
+            // request, so exactly one write lands for the whole round; without a token
+            // each call is its own write.
+            let expected_version = match token {
+                Some(_) => 2,
+                None => 1 + round,
+            };
             assert_eq!(
                 reported.get("Version").and_then(Value::as_i64),
-                Some(1 + round),
-                "case token {index} round {round}: expected Version {}, got {reported}",
-                1 + round
+                Some(expected_version),
+                "case token {index} round {round}: expected Version {expected_version}, got \
+                 {reported}"
             );
         }
 

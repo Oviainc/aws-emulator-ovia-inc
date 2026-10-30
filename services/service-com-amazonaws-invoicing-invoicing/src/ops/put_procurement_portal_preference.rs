@@ -21,6 +21,15 @@
 //! configuration write of a preference: a plane this write enables reports a status, and a
 //! plane it disables reports none.
 //!
+//! `@idempotent`: a replay — the same `ClientToken` against the same preference — answers
+//! with the ARN the first call returned and performs the write ONCE, through the ledger
+//! every idempotent write of this crate consults
+//! ([`crate::state::ComAmazonawsInvoicingInvoicingState::replayed_result`] /
+//! [`crate::state::ComAmazonawsInvoicingInvoicingState::record_result`]). A retry a client
+//! makes because it did not see the
+//! first answer is the same REQUEST, so `Version` — which counts the writes the resource
+//! took — and `LastUpdateDate` move once for it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -206,20 +215,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        let client_token = input.client_token.as_deref();
 
-        // `@idempotent`, and nothing is suppressed for a `ClientToken`: this request
-        // STATES the configuration it wants (every configuration member a caller sets is
-        // a member of this input), so applying it twice leaves the resource with exactly
-        // the configuration it states — which is what makes the operation idempotent. The
-        // token is what lets a client retry a write it did not see the answer to; it is
-        // not a record of a resource a retry must not create a second time, as it is for
-        // `CreateProcurementPortalPreference`.
-        let updated_at = crate::state::now();
-        // The write is one scope, so the borrow of the stored preference ends before this
-        // handler answers.
+        // The ARN has to name a preference this emulator holds: there is no configuration
+        // to write on one that does not exist. Checked BEFORE the replay, so a replay
+        // against a preference that is gone reports it gone rather than answering for it.
+        if !store
+            .procurement_portal_preferences
+            .contains_key(&input.procurement_portal_preference_arn)
         {
-            // An update acts on the resource as it is NOW: an ARN this service does not
-            // hold is the modelled 404, and nothing is written for it.
+            return Err(
+                PutProcurementPortalPreferenceErrorModeled::ResourceNotFoundException(
+                    crate::state::no_such_procurement_portal_preference(
+                        &input.procurement_portal_preference_arn,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // `@idempotent`: a replay — the same `ClientToken` against the same preference —
+        // is the SAME request, so it answers with the ARN the first call returned and the
+        // write happens ONCE. Re-applying the configuration this request states would land
+        // the same members, but it would also be another write of the resource, and the
+        // pair every applied write advances (`Version`, which counts the writes the
+        // resource took, and `LastUpdateDate`) is reported by every reader of it — so a
+        // retried write that was applied twice is observably not a replay.
+        if let Some(arn) = store.replayed_result(
+            Self::NAME,
+            &input.procurement_portal_preference_arn,
+            client_token,
+        ) {
+            return Ok(PutProcurementPortalPreferenceOutput {
+                procurement_portal_preference_arn: arn,
+            });
+        }
+
+        let updated_at = crate::state::now();
+        // The write is one scope, so the borrow of the stored preference ends before the
+        // replay record is written.
+        {
+            // The one rule about an ARN this service does not hold — the modelled 404,
+            // with nothing written for it — is already applied above, so this lookup is
+            // only how the write borrows the preference it was told exists.
             let stored = store
                 .procurement_portal_preferences
                 .get_mut(&input.procurement_portal_preference_arn)
@@ -315,6 +353,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // because it was updated.
             stored.record_write(updated_at);
         }
+
+        // What this call answered, keyed on (operation, preference, token), so the retry a
+        // client makes when it did not see this answer replays it instead of writing again.
+        store.record_result(
+            Self::NAME,
+            &input.procurement_portal_preference_arn,
+            client_token,
+            &input.procurement_portal_preference_arn,
+        );
 
         Ok(PutProcurementPortalPreferenceOutput {
             procurement_portal_preference_arn: input.procurement_portal_preference_arn,
