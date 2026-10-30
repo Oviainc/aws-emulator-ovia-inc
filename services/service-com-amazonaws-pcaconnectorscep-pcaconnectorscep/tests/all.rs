@@ -17,6 +17,8 @@ mod challenge_client_token;
 mod challenge_deletion;
 #[path = "all/challenge_metadata.rs"]
 mod challenge_metadata;
+#[path = "all/challenge_password_connector_state.rs"]
+mod challenge_password_connector_state;
 #[path = "all/connector_delete_not_found.rs"]
 mod connector_delete_not_found;
 #[path = "all/connector_deletion.rs"]

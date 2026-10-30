@@ -5,6 +5,11 @@
 //! Reads the stored challenge password back — byte for byte what `CreateChallenge`
 //! returned, because both answer from the same record.
 //!
+//! A password is handed out only while the challenge's owning connector is in the one
+//! status that lets it authenticate a certificate request with that password, which is
+//! the same precondition the sibling that mints one holds a caller to; otherwise the
+//! challenge is not a resource this read can retrieve and the answer is the modelled 404.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -159,8 +164,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a report may make: the transition the clock already owes.
         store.settle(now);
 
+        // The password is the secret a certificate request is authenticated with BY the
+        // owning connector, so it exists for a caller only while that connector is in the
+        // one status that lets it serve one. A connector in any other status — a teardown
+        // already accepted, a creation not yet landed — cannot authenticate a request with
+        // this password, so it has none to hand out, and the challenge is not a resource
+        // this read can retrieve. The same rule the sibling that MINTS a password holds a
+        // caller to (`create_challenge.rs`), through the same helper; this reader states it
+        // as the modelled 404, whose own doc covers a resource that "might have a status
+        // other than ACTIVE". Reporting the connector itself, or the challenge's metadata,
+        // keeps answering for the record — only the password does not.
+        let serving = store
+            .owning_connector(&region, &input.challenge_arn)
+            .is_some_and(crate::state::StoredConnector::is_active);
         let stored = store
             .challenge(&region, &input.challenge_arn)
+            .filter(|_| serving)
             .ok_or_else(|| not_found(&input.challenge_arn))?;
         Ok(GetChallengePasswordOutput {
             password: Some(stored.password.clone()),
@@ -168,9 +187,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// No challenge is stored under this ARN in the Region the request was signed for — HTTP 404
-/// `ResourceNotFoundException`. A read after `DeleteChallenge`, after the owning connector was
-/// deleted, or with an ARN naming another Region's challenge, lands here.
+/// This read cannot retrieve the challenge the ARN names — HTTP 404
+/// `ResourceNotFoundException`, whose own doc covers both the resource "incorrectly
+/// specified" and the one that "might have a status other than `ACTIVE`".
+///
+/// A read after `DeleteChallenge`, with an ARN naming another Region's challenge, or once the
+/// owning connector's teardown has come due and the record is gone, lands here because no
+/// record is stored; a read while that connector is not serving — its `DeleteConnector`
+/// accepted and `Status` `DELETING`, or its creation not yet landed — lands here because the
+/// connector has no password to hand out, even though the record is still reported by
+/// `GetConnector` and `GetChallengeMetadata`.
 fn not_found(challenge_arn: &str) -> GetChallengePasswordError {
     GetChallengePasswordErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: format!("Challenge {challenge_arn} could not be found"),
