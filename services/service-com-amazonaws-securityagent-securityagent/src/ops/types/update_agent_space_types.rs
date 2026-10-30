@@ -22,7 +22,20 @@ pub struct UpdateAgentSpaceInput {
     pub code_review_settings: Option<CodeReviewSettings>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#UpdateAgentSpaceOutput")]
+/// `UpdateAgentSpaceOutput`, with its schema and serializer written out instead of
+/// derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it:
+/// `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="UpdateAgentSpace",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// which the derive drops, so they would go out as epoch-second NUMBERS where the model
+/// (and every SDK's generated deserializer) requires an RFC 3339 string. The whole
+/// reason, and the vendored gap behind it, live in `super::wire_shape`.
+///
+/// The members are exactly the ones the model declares for this output, so the
+/// `recorded:` list is empty: unlike `CreateAgentSpaceOutput`, nothing beyond the model
+/// is evidenced on this operation's wire.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateAgentSpaceOutput {
     pub agent_space_id: String,
@@ -35,3 +48,28 @@ pub struct UpdateAgentSpaceOutput {
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
 
+sa_schema_and_codec!(
+    UpdateAgentSpaceOutput,
+    UPDATE_AGENT_SPACE_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#UpdateAgentSpaceOutput",
+    "com.amazonaws.securityagent",
+    "UpdateAgentSpaceOutput",
+    modelled: [
+        (M_AGENT_SPACE_ID, agent_space_id, "agentSpaceId", 0, req, string),
+        (M_NAME, name, "name", 1, req, string),
+        (M_DESCRIPTION, description, "description", 2, opt, string),
+        (M_AWS_RESOURCES, aws_resources, "awsResources", 3, opt, struct_of(AWSResources)),
+        (M_TARGET_DOMAIN_IDS, target_domain_ids, "targetDomainIds", 4, opt, list_of_string),
+        (
+            M_CODE_REVIEW_SETTINGS,
+            code_review_settings,
+            "codeReviewSettings",
+            5,
+            opt,
+            struct_of(CodeReviewSettings)
+        ),
+        (M_CREATED_AT, created_at, "createdAt", 6, opt, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 7, opt, date_time),
+    ],
+    recorded: [],
+);

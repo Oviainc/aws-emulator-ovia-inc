@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAgentSpace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAgentSpace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAgentSpace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates one stored agent space in place: every member the request carries overwrites
+//! what was stored, a member it omits is left as it was, and `updatedAt` moves to the
+//! instant the record changed. The answer is the stored record as it now stands — the
+//! same projection `CreateAgentSpace` and `BatchGetAgentSpaces` answer from — so a later
+//! read reports exactly what the caller was told. An `agentSpaceId` the store does not
+//! hold is a 404 `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +77,12 @@
 //!   associated with the agent space.
 //! * `updatedAt` (Timestamp) — The date and time the agent space was last updated, in UTC
 //!   format.
+//!
+//! ## Wire form
+//!
+//! `createdAt` and `updatedAt` are `@timestampFormat("date-time")` members, so they go out
+//! as RFC 3339 strings; the evidence, and the schema that carries the format, live on
+//! `UpdateAgentSpaceOutput` in `src/ops/types/update_agent_space_types.rs`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -91,12 +95,26 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `UpdateAgentSpaceError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#UpdateAgentSpace")]
+// here — hence the `UpdateAgentSpaceError` alias below.
+//
+// `UpdateAgentSpace` lists no errors of its own, so the three service-wide shapes this
+// handler needs are widened in with `extra_errors`: `ResourceNotFoundException` (HTTP
+// 404, the shape this model answers an unknown id with elsewhere, e.g.
+// `UpdateSecurityRequirementPack`), `ValidationException` (HTTP 400, carrying the
+// `fieldList` a real client reads) and `InternalServerException` (HTTP 500).
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#UpdateAgentSpace",
+    extra_errors = [
+        "InternalServerException",
+        "ResourceNotFoundException",
+        "ValidationException"
+    ]
+)]
 #[derive(Debug)]
 pub enum UpdateAgentSpaceErrorModeled {
+    InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,18 +168,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAgentSpace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAgentSpaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAgentSpace"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAgentSpaceErrorModeled::InternalServerException(InternalServerException {
+                message: "the agent space store is unavailable".to_string(),
+            })
+        })?;
+
+        // `agentSpaceId` is `@required` but carries no `@length` in the model, so an
+        // empty one reaches the handler. It names no agent space and never could, so it
+        // is a bad request rather than a missing resource.
+        if input.agent_space_id.is_empty() {
+            return Err(invalid("agentSpaceId", "member must not be empty"));
+        }
+
+        // A `name` that holds no non-whitespace character would leave the agent space
+        // with no name, so it is refused on the same rule `CreateAgentSpace` applies to
+        // the name it stores — never half-applied to the record.
+        if input.name.as_deref().is_some_and(|name| name.trim().is_empty()) {
+            return Err(invalid("name", "member must not be blank"));
+        }
+
+        // `targetDomainIds` carries no `@length` in the model, so a list of any size
+        // reaches the handler; every associated id is expanded into the full target
+        // domain record on every later read of the agent space, so the association this
+        // operation writes is bounded by the same cap the create applies.
+        if let Some(ids) = input.target_domain_ids.as_ref() {
+            if ids.len() > crate::state::MAX_AGENT_SPACE_TARGET_DOMAINS {
+                let limit = crate::state::MAX_AGENT_SPACE_TARGET_DOMAINS;
+                return Err(invalid(
+                    "targetDomainIds",
+                    &format!("member must have at most {limit} items"),
+                ));
+            }
+        }
+
+        let mut state = state.lock();
+        // The record is mutated in place and then CLONED out, so the projection below
+        // can read the store's target domains beside it; `AgentSpaceRecord` holds only
+        // the members of one agent space, and the association it carries is capped, so
+        // the clone is bounded.
+        let updated = {
+            let record = state
+                .agent_spaces
+                .get_mut(&input.agent_space_id)
+                .ok_or_else(|| {
+                    UpdateAgentSpaceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: format!(
+                                "No agent space found with id {}",
+                                input.agent_space_id
+                            ),
+                        },
+                    )
+                })?;
+
+            // A patch, not a replacement: each member the request carries is written to
+            // the stored record, and a member it does not carry leaves that field as it
+            // was — so an update of one member is not a clear of the others, and
+            // replaying the same request leaves the record in the same state.
+            let mut mutated = false;
+            if let Some(name) = input.name {
+                record.name = name;
+                mutated = true;
+            }
+            if let Some(description) = input.description {
+                record.description = Some(description);
+                mutated = true;
+            }
+            if let Some(aws_resources) = input.aws_resources {
+                record.aws_resources = Some(aws_resources);
+                mutated = true;
+            }
+            if let Some(target_domain_ids) = input.target_domain_ids {
+                record.target_domain_ids = Some(target_domain_ids);
+                mutated = true;
+            }
+            if let Some(code_review_settings) = input.code_review_settings {
+                record.code_review_settings = Some(code_review_settings);
+                mutated = true;
+            }
+            // `updatedAt` is when the record last CHANGED, so it moves for an update
+            // that wrote something and stays put for one that carried no mutable member
+            // at all. `createdAt` is never touched.
+            if mutated {
+                record.updated_at = ::std::time::SystemTime::now();
+            }
+            record.clone()
+        };
+
+        // The response is projected from the record that was just persisted, through the
+        // SAME projection `CreateAgentSpace` and `BatchGetAgentSpaces` answer from — so
+        // what the caller is told is exactly what a later read of the store reports,
+        // member for member, including the members an absent input left untouched.
+        let projected = updated.modelled(&state.target_domains);
+        Ok(UpdateAgentSpaceOutput {
+            agent_space_id: projected.agent_space_id,
+            name: projected.name,
+            description: projected.description,
+            aws_resources: projected.aws_resources,
+            target_domain_ids: projected.target_domain_ids,
+            code_review_settings: projected.code_review_settings,
+            created_at: projected.created_at,
+            updated_at: projected.updated_at,
+        })
     }
+}
+
+/// The modelled `ValidationException` (HTTP 400) for a request member this service
+/// refuses, naming the member in the `fieldList` a real client reads and in the message
+/// the service's own client-input refusals carry.
+fn invalid(path: &str, violation: &str) -> UpdateAgentSpaceError {
+    UpdateAgentSpaceErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "1 validation error detected: value for '{path}' failed to satisfy \
+             constraint: {violation}"
+        ),
+        field_list: Some(vec![ValidationExceptionField {
+            path: path.to_string(),
+            message: violation.to_string(),
+        }]),
+    })
+    .into()
 }

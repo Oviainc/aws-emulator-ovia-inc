@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/agent_space_lifecycle.rs"]
 mod agent_space_lifecycle;
+#[path = "all/agent_space_update.rs"]
+mod agent_space_update;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
 #[path = "all/error_message_wording.rs"]
