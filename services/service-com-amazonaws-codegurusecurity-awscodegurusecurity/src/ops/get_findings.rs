@@ -188,17 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(cursor) => Some(cursor),
                 None => {
                     return Err(GetFindingsErrorModeled::ValidationException(
-                        ValidationException {
-                            error_code: "ValidationException".to_string(),
-                            message: "nextToken is not a token this service issued".to_string(),
-                            reason: "fieldValidationFailed".to_string(),
-                            field_list: Some(vec![ValidationExceptionField {
-                                name: "nextToken".to_string(),
-                                message:
-                                    "pass back the nextToken from the previous page unchanged"
-                                        .to_string(),
-                            }]),
-                        },
+                        crate::state::page_token_refusal("nextToken"),
                     )
                     .into());
                 }

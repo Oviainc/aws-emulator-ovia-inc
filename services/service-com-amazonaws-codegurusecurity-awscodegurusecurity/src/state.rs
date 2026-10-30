@@ -1718,6 +1718,27 @@ pub fn decode_page_token(token: &str) -> Option<String> {
         .and_then(|bytes| String::from_utf8(bytes).ok())
 }
 
+/// The modelled refusal of a pagination token in member `member` that this service did
+/// not issue — one [`decode_page_token`] cannot read back: a `ValidationException`
+/// (HTTP 400) naming the member at fault and what to send instead.
+///
+/// The ONE place the contract of [`encode_page_token`] / [`decode_page_token`] is
+/// reported, so every paginated reader of this service refuses a foreign cursor the same
+/// way: a page token is opaque and only this service mints one, so a value it did not
+/// mint fails a specified constraint on the request rather than resuming a listing
+/// somewhere the caller guessed.
+pub fn page_token_refusal(member: &str) -> ValidationException {
+    ValidationException {
+        error_code: "ValidationException".to_string(),
+        message: format!("{member} is not a token this service issued"),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!("pass back the {member} from the previous page unchanged"),
+        }]),
+    }
+}
+
 /// How long after `CreateScan` a run of `scan_type` is owed its transition out of
 /// `InProgress`.
 pub fn settle_span_millis(scan_type: &str) -> i64 {

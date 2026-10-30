@@ -31,6 +31,8 @@ mod list_scans_scan_type;
 mod metrics_open_as_of;
 #[path = "all/metrics_summary.rs"]
 mod metrics_summary;
+#[path = "all/page_token_refusal.rs"]
+mod page_token_refusal;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]
