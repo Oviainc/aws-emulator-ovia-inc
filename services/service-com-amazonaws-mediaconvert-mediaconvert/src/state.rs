@@ -3763,6 +3763,11 @@ impl ListedRecord for PresetRecord {
 ///   stored under none matches no category a caller can name ("specify a ... category to
 ///   limit responses to only [the records] from that category"); a request naming no
 ///   category narrows nothing.
+///
+/// A `category` carrying no characters never reaches here: both listings refuse such a
+/// value at the door ([`blank_member_problem`]), because [`optional_free_text`] stores a
+/// category only when it carries characters, so an equality test against one could match
+/// no record and would report a narrowing to the empty set.
 pub fn records_listed_by<'a, R: ListedRecord + 'a>(
     records: impl Iterator<Item = &'a R> + 'a,
     list_by: Option<&str>,

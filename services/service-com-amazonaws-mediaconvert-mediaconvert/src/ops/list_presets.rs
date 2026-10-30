@@ -167,6 +167,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `category` is a filter member the request may leave out, so a value carrying no
+        // characters is a DIFFERENT request from omitting it: it names no category a
+        // record could be stored under, because a category is stored only when it carries
+        // characters. It is therefore refused naming the member, through the one test
+        // every filtering door of this crate applies, rather than resolved into an
+        // equality comparison whose page would report a narrowing to the empty set.
+        // `listBy` and `order` target enums and `maxResults` a bounded integer, so the
+        // boundary validator has already refused a value outside those.
+        if let Some(message) =
+            crate::state::blank_member_problem("Category", input.category.as_deref())
+        {
+            return Err(
+                ListPresetsErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into(),
+            );
+        }
+
         // A `nextToken` is decoded BEFORE the store is touched: a token this service never
         // issued is a bad request, and the same refusal every paged reader in this crate
         // answers with — the rule and its sentence live in the state module, and only the

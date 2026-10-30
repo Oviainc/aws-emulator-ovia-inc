@@ -15,6 +15,8 @@
 mod acceleration_status;
 #[path = "all/account_endpoints.rs"]
 mod account_endpoints;
+#[path = "all/blank_category_filter.rs"]
+mod blank_category_filter;
 #[path = "all/blank_delete_name.rs"]
 mod blank_delete_name;
 #[path = "all/blank_filter_value.rs"]
