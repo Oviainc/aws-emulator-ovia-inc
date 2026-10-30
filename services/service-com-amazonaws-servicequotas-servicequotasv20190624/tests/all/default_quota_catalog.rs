@@ -273,18 +273,17 @@ async fn an_aws_default_quota_arn_names_no_account_and_the_applied_one_does() {
                     .unwrap_or_else(|| panic!("case {service_code}: a quota without a code"))
                     .to_string();
                 let case = format!("{region} {service_code}/{quota_code}");
-                // A global quota is account-wide, so its ARN carries no region
-                // either; a regional one carries the caller's.
+                // An APPLIED global quota is account-wide, so its ARN carries no
+                // region; a regional one carries the caller's. An AWS DEFAULT is
+                // published per Region, so its ARN names the Region either way.
                 let global = quota["GlobalQuota"].as_bool().unwrap_or(false);
                 let arn_region = if global { "" } else { region };
 
                 assert_eq!(
                     quota["QuotaArn"].as_str(),
                     Some(
-                        format!(
-                            "arn:aws:servicequotas:{arn_region}::{service_code}/{quota_code}"
-                        )
-                        .as_str()
+                        format!("arn:aws:servicequotas:{region}::{service_code}/{quota_code}")
+                            .as_str()
                     ),
                     "case {case}: an AWS default quota's ARN carries no account, got {quota}"
                 );

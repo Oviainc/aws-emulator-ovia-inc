@@ -2019,7 +2019,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         let arn = if applied {
             quota_arn(region, service_code, quota_code, default.global_quota)
         } else {
-            default_quota_arn(region, service_code, quota_code, default.global_quota)
+            default_quota_arn(region, service_code, quota_code)
         };
         ServiceQuota {
             service_code: Some(service_code.to_string()),
@@ -2099,20 +2099,20 @@ pub fn quota_arn(region: &str, service_code: &str, quota_code: &str, global_quot
 /// EMPTY.
 ///
 /// An AWS default is published by the service, not owned by an account: the same
-/// default is the same value in every account, so its ARN names no account. That is
-/// the one difference from [`quota_arn`], and it is what distinguishes a default from
-/// the applied quota of the same pair rather than a formatting accident.
+/// default is the same value in every account, so its ARN names no account, which is
+/// what distinguishes a default from the applied quota of the same pair rather than a
+/// formatting accident.
 ///
 /// `::engine::emulator_arn` always fills the account segment with the emulator's
 /// canonical account, so the account-less form is built here; there is no account in
-/// it to disclose, and the region rule is the same as [`quota_arn`]'s.
-pub fn default_quota_arn(
-    region: &str,
-    service_code: &str,
-    quota_code: &str,
-    global_quota: bool,
-) -> String {
-    let region = if global_quota { "" } else { region };
+/// it to disclose.
+///
+/// The ARN always names the REGION the default was read at, including for a quota
+/// counted account-wide: a default is what the service publishes for a Region, and
+/// `GlobalQuota` says where the VALUE is counted rather than which Region published
+/// it. That is the one difference from [`quota_arn`], whose subject is the account's
+/// own applied quota.
+pub fn default_quota_arn(region: &str, service_code: &str, quota_code: &str) -> String {
     format!("arn:aws:{ARN_NAMESPACE}:{region}::{service_code}/{quota_code}")
 }
 
@@ -2796,6 +2796,22 @@ fn seed_default_quotas() -> Vec<DefaultQuota> {
 /// pair) — never derived from a request, and never from the clock — and it satisfies
 /// the modelled `QuotaCode` pattern `^[a-zA-Z][a-zA-Z0-9-]{1,128}$`
 /// (`smithy_query(query="shape", shape="ServiceQuota")`).
+///
+/// THE ONE RULE ABOUT A ROW'S CODE, stated here because this is where the stand-in
+/// is minted. A row is published under the code the service answers to, in this
+/// order of preference:
+///
+/// 1. AWS's own `QuotaCode`, where this catalog can cite it for that quota;
+/// 2. the code the SERVICE'S OWN API reports for the limit, where it reports one —
+///    `b2bi` and `notifications-contacts` name theirs in their
+///    `ServiceQuotaExceededException`, and the refusal that names a code has to
+///    resolve to a quota;
+/// 3. otherwise this descriptive stand-in.
+///
+/// With ONE exception, which applies to the stand-in of case 3 alone: where the
+/// recorded default-quota listing of a service shows it publishes no quota under
+/// that stand-in, the row is not published at all. [`seed_quota_catalog`] names the
+/// rows that exception covers, each with the evidence for it.
 pub fn descriptive_quota_code(quota_name: &str) -> String {
     let mut code = String::new();
     for word in quota_name.split(|char: char| !char.is_ascii_alphanumeric()) {
@@ -2841,7 +2857,13 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             // this code, which is not the console's product name.
             "Access Analyzer",
             vec![
-                quota("Analyzers per Region", 1.0).fixed(),
+                // AWS publishes this quota under a descriptive code of its own
+                // (`AnalyzersPerRegion`), which the recorded default listing for this
+                // service carries, so the code is cited here rather than left to the
+                // derivation that happens to produce the same string.
+                quota("Analyzers per Region", 1.0)
+                    .code("AnalyzersPerRegion")
+                    .fixed(),
                 quota("Archive rules per analyzer", 100.0)
                     .code("L-1E51937C")
                     // The `Description`s on the rows below are this catalog's own
@@ -2850,6 +2872,13 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                     // service's own published text is not among the data available
                     // here, and no rule in the model derives one.
                     .describe("The maximum number of archive rules per analyzer."),
+                quota("CloudTrail log files processed per policy generation", 100000.0)
+                    .code("L-5EFCE71D")
+                    .fixed()
+                    .describe(
+                        "The maximum number of CloudTrail log files that can be processed \
+                         per policy generation.",
+                    ),
                 // A quota measured in DAYS of CloudTrail history, which AWS
                 // publishes as not adjustable.
                 quota("Policy generation CloudTrail time range", 90.0)
@@ -2866,21 +2895,30 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Account access manager",
             vec![quota("Group entitlements per role", 20.0)
                 .code("L-42A1D874")
-                .describe("The maximum number of group entitlements per role.")],
+                .describe(
+                    "The maximum number of group entitlements that can be assigned to a \
+                     single role in an application.",
+                )],
         ),
         service(
             "acm",
             "AWS Certificate Manager (ACM)",
             vec![
-                quota("ACM certificates", 2500.0),
-                quota("Imported certificates", 2500.0),
+                // The codes AWS publishes these two under are descriptive ones of its
+                // own (`ACMCertificates`, `ImportedCertificates`), which the recorded
+                // default listing for this service carries.
+                quota("ACM certificates", 2500.0).code("ACMCertificates"),
+                quota("Imported certificates", 2500.0).code("ImportedCertificates"),
                 // An API REQUEST-RATE quota: AWS publishes these over a one-second
                 // window and measures them with the `AWS/Usage` `CallCount` metric
                 // of the API the quota throttles (see [`call_count_metric`]).
                 quota("Rate of ListAcmeDomainValidations API requests", 50.0)
                     .code("L-DD60D132")
                     .period(1, "SECOND")
-                    .metric(call_count_metric("ACM", "ListAcmeDomainValidations"))
+                    .metric(call_count_metric(
+                        "Certificate Manager",
+                        "ListAcmeDomainValidations",
+                    ))
                     .describe(
                         "The maximum number of ListAcmeDomainValidations API requests per \
                          second.",
@@ -2897,7 +2935,8 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                     .fixed()
                     .period(1, "SECOND")
                     .describe(
-                        "The maximum number of CreateCertificateAuthority requests per second.",
+                        "The maximum number of CreateCertificateAuthority requests that can \
+                         be performed in an account in the current Region each second.",
                     ),
             ],
         ),
@@ -2908,7 +2947,10 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 .code("L-1501440B")
                 .fixed()
                 .period(1, "SECOND")
-                .describe("The maximum number of ListAutomationRules requests per second.")],
+                .describe(
+                    "Maximum number of ListAutomationRules requests you can make per second \
+                     per account in the current region.",
+                )],
         ),
         service(
             "agent-registry",
@@ -2917,7 +2959,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 .code("L-7F384C37")
                 .unit("Count/Second")
                 .period(1, "SECOND")
-                .metric(call_count_metric("AgentRegistry", "InvokeRegistryMcp"))
+                .metric(call_count_metric("Agent Registry", "InvokeRegistryMcp"))
                 .describe("The maximum number of InvokeRegistryMcp requests per second.")],
         ),
         service(
@@ -2927,24 +2969,26 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 .code("L-4FF187E6")
                 .unit("Count")
                 .fixed()
-                .describe(
-                    "The maximum number of concurrent evaluations per agent space.",
-                )],
+                .describe("Concurrent evaluations per agent space")],
         ),
         service(
             "aiops",
             "Amazon AI Operations",
             vec![quota("Concurrent active investigations", 2.0)
                 .code("L-EF31E0C4")
+                .fixed()
                 .metric(usage_metric(
-                    "AIOps",
+                    "Amazon AI Operations",
                     &[
                         ("Class", "None"),
                         ("Resource", "ConcurrentActiveInvestigations"),
                         ("Type", "Resource"),
                     ],
                 ))
-                .describe("The maximum number of concurrent active investigations.")],
+                .describe(
+                    "The maximum number of concurrent investigations with active AI analysis \
+                     per account per region.",
+                )],
         ),
         service(
             "airflow",
@@ -2955,10 +2999,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                     10.0,
                 )
                 .code("L-67D41C6B")
-                .describe(
-                    "The maximum number of environments per account per Region for small, \
-                     medium and large environment classes.",
-                ),
+                .describe("The maximum number of environments per account per Region."),
                 quota("Web servers per environment", 5.0)
                     .code("L-52DCDA32")
                     .describe("The maximum number of web servers per environment."),
@@ -2968,8 +3009,10 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "amplify",
             "AWS Amplify",
             vec![
-                quota("Apps per Region", 25.0),
-                quota("Branches per app", 50.0),
+                // Descriptive codes AWS publishes itself, as the recorded default
+                // listing for this service carries them.
+                quota("Apps per Region", 25.0).code("AppsPerRegion"),
+                quota("Branches per app", 50.0).code("BranchesPerApp"),
             ],
         ),
         service(
@@ -3036,11 +3079,28 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Launch configurations per Region", 200.0),
             ],
         ),
-        service(
-            "autoscaling-plans",
-            "AWS Auto Scaling",
-            vec![quota("Scaling plans per Region", 5.0)],
-        ),
+        // THE EXCEPTION [`descriptive_quota_code`] names, row by row. For each pair
+        // below, the recorded default-quota listing of that service carries NO row
+        // under the descriptive stand-in this catalog would publish it as — the
+        // recording reports the emulator's row as a surplus entry — so the service
+        // publishes no quota under that code and the row is not published here:
+        // `autoscaling-plans/ScalingPlansPerRegion`, `config/DeliveryChannels`,
+        // `datasync/TasksPerAccount`, `datasync/AgentsPerAccount`,
+        // `emr-serverless/ApplicationsPerAccount`,
+        // `kinesisanalytics/ApplicationsPerRegion`,
+        // `resource-groups/ResourceGroupsPerAccount` and
+        // `shield/ProtectionsPerAccount` (that service's recorded listing carries no
+        // default quota at all). Every one of those services stays in
+        // [`SEED_SERVICE_CATALOG`], so its code still resolves; the quotas AWS
+        // publishes for it carry no name or value this catalog can source, which is
+        // why nothing replaces the dropped rows. `resource-groups` is the one of
+        // them whose AWS code IS citable (`L-2BAA18A0`, default 100): that quota is
+        // published with a usage metric, and no source available here states the
+        // metric's own dimension values, so the row is left to the
+        // default-quota-set gap rather than published without them. The surplus
+        // evidence RE-KEYED three other rows onto AWS's own codes instead of
+        // dropping them (`codecommit`, `config`, `kinesis` below), each of which AWS
+        // publishes with no usage metric or window.
         service(
             "b2bi",
             "AWS B2B Data Interchange",
@@ -3052,12 +3112,17 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             // `services/service-com-amazonaws-b2bi-b2bi/src/state.rs` (each side has a
             // test pinning it).
             //
-            // The CODE is carried here rather than derived: b2bi publishes no `L-…`
-            // code in its model, and its own `ServiceQuotaExceededException` reports
-            // `quotaCode` `ProfilesPerAccount`, so a client that reads the refusal and
-            // then looks the limit up here finds it under the code the refusal named.
-            // It satisfies the modelled `QuotaCode` pattern
-            // `^[a-zA-Z][a-zA-Z0-9-]{1,128}$`.
+            // The CODE is carried here rather than derived, under case 2 of
+            // [`descriptive_quota_code`]'s rule: b2bi publishes no `L-…` code in its
+            // model, and its own `ServiceQuotaExceededException` reports `quotaCode`
+            // `ProfilesPerAccount`, so a client that reads the refusal and then looks
+            // the limit up here finds it under the code the refusal named. It
+            // satisfies the modelled `QuotaCode` pattern
+            // `^[a-zA-Z][a-zA-Z0-9-]{1,128}$`. The recorded listing of this service
+            // carries its own codes instead (`L-05F6A9EF`, `L-19B5E505`,
+            // `L-CD5D2786`, `L-E15C983E`, none of them citable here with a name or a
+            // value), which is why the row is case 2 rather than case 1 — and case
+            // 2, unlike the stand-in of case 3, is published even so.
             vec![quota("Customer profiles per account", 5.0).code("ProfilesPerAccount")],
         ),
         service(
@@ -3136,7 +3201,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "codecommit",
             "AWS CodeCommit",
-            vec![quota("Repositories per account", 1000.0)],
+            vec![quota("Repositories per account", 5000.0).code("L-81790602")],
         ),
         service(
             "codedeploy",
@@ -3172,23 +3237,12 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "config",
             "AWS Config",
-            vec![
-                quota("Config rules per Region", 150.0),
-                quota("Delivery channels", 1.0).fixed(),
-            ],
+            vec![quota("Config rules per Region", 1000.0).code("L-0BE82991")],
         ),
         service(
             "connect",
             "Amazon Connect",
             vec![quota("Amazon Connect instances per account", 5.0)],
-        ),
-        service(
-            "datasync",
-            "AWS DataSync",
-            vec![
-                quota("Tasks per account", 100.0),
-                quota("Agents per account", 50.0),
-            ],
         ),
         service(
             "dax",
@@ -3323,11 +3377,6 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon EMR",
             vec![quota("Active clusters", 100.0)],
         ),
-        service(
-            "emr-serverless",
-            "Amazon EMR Serverless",
-            vec![quota("Applications per account", 100.0)],
-        ),
         service("es", "Amazon OpenSearch Service", es_quotas()),
         service(
             "events",
@@ -3442,12 +3491,16 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "kinesis",
             "Amazon Kinesis Data Streams",
-            vec![quota("Shards per Region", 500.0)],
-        ),
-        service(
-            "kinesisanalytics",
-            "Amazon Managed Service for Apache Flink",
-            vec![quota("Applications per Region", 50.0)],
+            vec![quota("Shards per Region", 20000.0)
+                .code("L-0918CF54")
+                .metric(usage_metric(
+                    "Kinesis Data Streams",
+                    &[
+                        ("Class", "None"),
+                        ("Resource", "ProvisionedShards"),
+                        ("Type", "Resource"),
+                    ],
+                ))],
         ),
         service(
             "kinesisvideo",
@@ -3822,11 +3875,6 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             vec![quota("Collections per Region", 1000.0)],
         ),
         service(
-            "resource-groups",
-            "AWS Resource Groups",
-            vec![quota("Resource groups per account", 1000.0)],
-        ),
-        service(
             "route53",
             "Amazon Route 53",
             vec![
@@ -3897,11 +3945,6 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Daily sending quota", 200.0),
                 quota("Sending rate", 1.0),
             ],
-        ),
-        service(
-            "shield",
-            "AWS Shield Advanced",
-            vec![quota("Protections per account", 1000.0).global()],
         ),
         service(
             "signer",
@@ -4606,14 +4649,21 @@ fn es_quotas() -> Vec<QuotaRow> {
 /// dimensions the caller names, so that one is added here rather than at each call
 /// site; `metric_name` and `statistic` are what distinguish a resource count from a
 /// call count.
+///
+/// `usage_service_name` is the service's DISPLAY name as `AWS/Usage` publishes it
+/// (`Certificate Manager`, `Kinesis Data Streams`), never its SDK/model id or its
+/// `ServiceCode`: the dimension value is the key a client puts in a
+/// `GetMetricData`/`GetMetricStatistics` query, so a metric built from the id selects
+/// no data at all. For a few services the two spellings coincide (`EC2`, `Lambda`,
+/// `DynamoDB`), and that is the published name rather than the id leaking in.
 fn aws_usage_metric(
     metric_name: &str,
     statistic: &str,
-    service: &str,
+    usage_service_name: &str,
     dimensions: &[(&str, &str)],
 ) -> MetricInfo {
     let mut metric_dimensions = std::collections::HashMap::new();
-    metric_dimensions.insert("Service".to_string(), service.to_string());
+    metric_dimensions.insert("Service".to_string(), usage_service_name.to_string());
     for (name, value) in dimensions {
         metric_dimensions.insert((*name).to_string(), (*value).to_string());
     }
@@ -4628,8 +4678,8 @@ fn aws_usage_metric(
 /// The `UsageMetric` of a quota counted as a number of RESOURCES in use: the largest
 /// count seen over the metric's period is the one that matters, so `Maximum` is the
 /// statistic recommended for it.
-fn usage_metric(service: &str, dimensions: &[(&str, &str)]) -> MetricInfo {
-    aws_usage_metric("ResourceCount", "Maximum", service, dimensions)
+fn usage_metric(usage_service_name: &str, dimensions: &[(&str, &str)]) -> MetricInfo {
+    aws_usage_metric("ResourceCount", "Maximum", usage_service_name, dimensions)
 }
 
 /// The `AWS/Usage` metric CloudWatch publishes the account's VPC count under, which is
@@ -4663,11 +4713,11 @@ pub(crate) fn vpcs_per_region_usage_metric() -> MetricInfo {
 /// publishes no class), beside the `Service` every `AWS/Usage` metric carries. Its
 /// statistic is `Sum`, because a rate is the calls ADDED UP over the quota's
 /// `Period`, not the largest one seen in it.
-fn call_count_metric(service: &str, api_name: &str) -> MetricInfo {
+fn call_count_metric(usage_service_name: &str, api_name: &str) -> MetricInfo {
     aws_usage_metric(
         "CallCount",
         "Sum",
-        service,
+        usage_service_name,
         &[
             ("Class", "None"),
             ("Resource", api_name),

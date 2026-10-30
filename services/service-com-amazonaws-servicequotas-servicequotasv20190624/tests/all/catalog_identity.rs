@@ -29,7 +29,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 use service_com_amazonaws_servicequotas_servicequotasv20190624::state::descriptive_quota_code;
 
-use crate::quota_workflow::{client, emulator, walk_pages, Client};
+// The catalog walks (`inventory`, `defaults`, `whole_catalog`) live in the shared
+// harness, so this suite and `default_quota_catalog_fidelity.rs` share one copy.
+use crate::quota_workflow::{
+    client, default_quotas as defaults, emulator, service_inventory as inventory,
+    whole_default_catalog as whole_catalog,
+};
 
 /// The `(ServiceCode, QuotaCode)` pairs this catalog CITES from AWS's own published
 /// Service Quotas data — the only quotas allowed to carry a code in AWS's minted
@@ -41,6 +46,7 @@ use crate::quota_workflow::{client, emulator, walk_pages, Client};
 /// which is the point: a code in that namespace has to be attributable.
 const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("access-analyzer", "L-1E51937C"),
+    ("access-analyzer", "L-5EFCE71D"),
     ("access-analyzer", "L-96F55078"),
     ("account-access", "L-42A1D874"),
     ("acm", "L-DD60D132"),
@@ -51,10 +57,13 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("aiops", "L-EF31E0C4"),
     ("airflow", "L-52DCDA32"),
     ("airflow", "L-67D41C6B"),
+    ("codecommit", "L-81790602"),
+    ("config", "L-0BE82991"),
     ("dynamodb", "L-F98FE922"),
     ("ec2", "L-0263D0A3"),
     ("ec2", "L-1216C47A"),
     ("ec2", "L-34B43A08"),
+    ("kinesis", "L-0918CF54"),
     ("lambda", "L-2ACBD22F"),
     ("lambda", "L-72E0D058"),
     ("lambda", "L-B2AA0F47"),
@@ -173,37 +182,6 @@ fn a_descriptive_code_is_the_quota_name_as_one_modelled_identifier() {
              pattern, got {code:?}"
         );
     }
-}
-
-/// Every `(ServiceCode, ServiceName)` pair `ListServices` reports.
-async fn inventory(client: &Client) -> Vec<Value> {
-    walk_pages(client, "ListServices", &json!({}), "Services", None).await
-}
-
-/// Every AWS default quota of `service_code`.
-async fn defaults(client: &Client, service_code: &str) -> Vec<Value> {
-    walk_pages(
-        client,
-        "ListAWSDefaultServiceQuotas",
-        &json!({"ServiceCode": service_code}),
-        "Quotas",
-        None,
-    )
-    .await
-}
-
-/// The whole catalog, as `ServiceCode -> its default quotas`.
-async fn whole_catalog(client: &Client) -> BTreeMap<String, Vec<Value>> {
-    let mut catalog = BTreeMap::new();
-    for service in inventory(client).await {
-        let code = service["ServiceCode"]
-            .as_str()
-            .unwrap_or_else(|| panic!("case ListServices: a service without a code: {service}"))
-            .to_string();
-        let quotas = defaults(client, &code).await;
-        catalog.insert(code, quotas);
-    }
-    catalog
 }
 
 /// A code in AWS's minted namespace is published only where this catalog cites it;
@@ -384,7 +362,7 @@ async fn a_cited_default_quota_reads_back_with_the_values_aws_publishes() {
             quota_name: "Concurrent active investigations",
             value: 2.0,
             unit: "None",
-            adjustable: true,
+            adjustable: false,
             period: Some((5, "MINUTE")),
         },
         // A quota the issue behind this suite never cited, carried by the catalog
@@ -542,7 +520,7 @@ async fn a_minted_code_this_catalog_does_not_cite_resolves_nothing() {
     // name, which is how a lookup like the first row used to succeed.
     for (service_code, quota_code, why) in [
         ("airflow", "L-CFEFCF95", "a code no quota of this service is published under"),
-        ("access-analyzer", "L-5EFCE71D", "an AWS code this catalog does not carry"),
+        ("access-analyzer", "L-4599575C", "an AWS code this catalog does not carry"),
         ("monitoring", "L-1216C47A", "an EC2 code under CloudWatch"),
         ("athena", "L-00000000", "a well-formed code nothing publishes"),
     ] {

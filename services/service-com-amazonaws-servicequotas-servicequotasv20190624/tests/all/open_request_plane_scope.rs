@@ -101,8 +101,8 @@ fn rows() -> Vec<Row> {
         },
         Row {
             why: "an account-wide quota of a service that publishes a single quota",
-            service_code: "shield",
-            quota_name: "Protections per account",
+            service_code: "globalaccelerator",
+            quota_name: "Accelerators per account",
             global: true,
             first_at: "eu-central-1",
             second_at: "us-east-2",

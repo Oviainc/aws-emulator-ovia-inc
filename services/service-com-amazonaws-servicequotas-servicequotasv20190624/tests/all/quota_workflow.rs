@@ -205,6 +205,41 @@ pub(crate) fn base64_of(payload: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(payload)
 }
 
+/// Every `(ServiceCode, ServiceName)` pair `ListServices` reports.
+///
+/// `pub(crate)` so the catalog suites share ONE walk of the inventory.
+pub(crate) async fn service_inventory(client: &Client) -> Vec<Value> {
+    walk_pages(client, "ListServices", &json!({}), "Services", None).await
+}
+
+/// Every AWS default quota of `service_code`.
+pub(crate) async fn default_quotas(client: &Client, service_code: &str) -> Vec<Value> {
+    walk_pages(
+        client,
+        "ListAWSDefaultServiceQuotas",
+        &json!({"ServiceCode": service_code}),
+        "Quotas",
+        None,
+    )
+    .await
+}
+
+/// The whole catalog, as `ServiceCode -> its default quotas`.
+pub(crate) async fn whole_default_catalog(
+    client: &Client,
+) -> std::collections::BTreeMap<String, Vec<Value>> {
+    let mut catalog = std::collections::BTreeMap::new();
+    for service in service_inventory(client).await {
+        let code = service["ServiceCode"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case ListServices: a service without a code: {service}"))
+            .to_string();
+        let quotas = default_quotas(client, &code).await;
+        catalog.insert(code, quotas);
+    }
+    catalog
+}
+
 /// Every listing yields ONE ordered set of items, whatever page size it is walked
 /// with, and a page size is honoured.
 #[tokio::test]
@@ -373,10 +408,12 @@ async fn a_single_quota_read_matches_the_entry_the_listing_returned() {
             // The ONE member they must NOT agree on: an AWS default is published by
             // the service and owned by no account, so its ARN's account segment is
             // empty, while the applied quota's names the account (see
-            // `quotas_catalog::an_aws_default_quota_arn_carries_no_account_id`).
+            // `quotas_catalog::an_aws_default_quota_arn_carries_no_account_id`). A
+            // default is published per Region, so its ARN names the Region even for a
+            // quota counted account-wide.
             assert_eq!(
                 default["Quota"]["QuotaArn"].as_str(),
-                Some(format!("arn:aws:servicequotas:{region}::{case}").as_str()),
+                Some(format!("arn:aws:servicequotas:us-east-1::{case}").as_str()),
                 "case {case}: an AWS default quota's ARN carries no account, got {default}"
             );
             assert_eq!(

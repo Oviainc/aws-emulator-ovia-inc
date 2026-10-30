@@ -37,6 +37,8 @@ mod context_id_domain;
 mod cross_region_settlement;
 #[path = "all/default_quota_catalog.rs"]
 mod default_quota_catalog;
+#[path = "all/default_quota_catalog_fidelity.rs"]
+mod default_quota_catalog_fidelity;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/history_filter_chain.rs"]
