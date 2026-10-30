@@ -218,22 +218,124 @@ pub fn fresh_campaign_id() -> String {
     ::hex::encode(&digest[..16])
 }
 
+/// The codec every `ListCampaigns` `nextToken` is written with: the standard base64
+/// alphabet, so the token a caller is handed back is the opaque base64 value this
+/// service's pagination token is, and a token that is not base64 at all fails to
+/// DECODE before anything is resolved from it.
+///
+/// Padding is accepted but not required on the way in, so a token whose trailing `=`
+/// a client dropped still decodes — the same latitude a decoder that pads on demand
+/// gives.
+const PAGE_TOKEN_CODEC: ::base64::engine::GeneralPurpose = ::base64::engine::GeneralPurpose::new(
+    &::base64::alphabet::STANDARD,
+    ::base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(::base64::engine::DecodePaddingMode::Indifferent),
+);
+
+/// How many hex digits the position inside a `nextToken` is written with, so every
+/// token this service mints is the same length whatever position it names.
+const PAGE_TOKEN_POSITION_DIGITS: usize = 16;
+
 /// The `ListCampaigns` `nextToken` that resumes a walk at creation counter `sequence`.
 ///
 /// A token names a POSITION in the creation order, not a campaign: deleting the campaign
 /// a page was going to start at leaves the token resumable, and the token carries no
-/// campaign id for a caller to read out of it.
+/// campaign id for a caller to read out of it. It is handed out base64-encoded, which
+/// is the form [`page_token_sequence`] decodes before it resolves anything.
 pub fn page_token(sequence: u64) -> String {
-    format!("{sequence:016x}")
+    use ::base64::Engine as _;
+
+    PAGE_TOKEN_CODEC.encode(format!("{sequence:0width$x}", width = PAGE_TOKEN_POSITION_DIGITS))
 }
 
-/// The creation counter a `nextToken` resumes at, or `None` when the token is not one
-/// [`page_token`] issued.
-pub fn page_token_sequence(token: &str) -> Option<u64> {
-    if token.len() != 16 {
-        return None;
+/// Why a `nextToken` a caller sent names no position to resume a walk from.
+///
+/// Two outcomes, because a pagination token is resolved in two steps and each is
+/// refused in its own words: a value that is not base64 does not survive the DECODE,
+/// and a value that decodes but names no position this service issued does not
+/// RESOLVE. [`Self::message`] is the one place either sentence lives, so every paged
+/// list of this service refuses alike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageTokenRejected {
+    /// The token is not a base64 value, carrying the decoder's own account of why.
+    Undecodable(String),
+    /// The token decodes, but it is not one [`page_token`] minted.
+    Unissued,
+}
+
+impl PageTokenRejected {
+    /// The sentence this rejection is refused with.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Undecodable(why) => why.clone(),
+            // This emulator's own wording, not a recorded one: a token only this
+            // emulator can mint has no recorded refusal to reproduce. It carries
+            // nothing from the request — a token a caller supplied is not echoed back
+            // into the refusal — and it is deliberately not a decode failure's
+            // sentence, which is the distinction the refusal exists to draw.
+            Self::Unissued => "nextToken is not a page token this service issued".to_string(),
+        }
     }
-    u64::from_str_radix(token, 16).ok()
+}
+
+/// How a base64 decoder reports a value carrying a character its alphabet does not
+/// hold: it stops at that character and names it by the hex code of its byte, so the
+/// sentence is composed from the token the request carried.
+pub fn illegal_base64_character_message(byte: u8) -> String {
+    format!("Illegal base64 character {byte:x}")
+}
+
+/// How a base64 decoder reports a value whose last 4-byte unit carries too few bits to
+/// decode — a dangling character left over after the whole units.
+pub const DANGLING_BASE64_UNIT_MESSAGE: &str = "Last unit does not have enough valid bits";
+
+/// How a base64 decoder reports a value whose last 4-byte unit is not one: padding
+/// where no padding belongs, or too little of it.
+pub const MALFORMED_BASE64_UNIT_MESSAGE: &str = "Input byte array has wrong 4-byte ending unit";
+
+/// The padding character of the standard base64 alphabet, which closes a value's last
+/// unit rather than carrying data — so it is not an illegal character, and a value that
+/// misplaces it is refused as a malformed unit instead.
+const BASE64_PAD: u8 = b'=';
+
+/// The bytes `token` decodes to, or why it is not a base64 value at all.
+///
+/// Every account of WHY comes from the codec's own error rather than from a second,
+/// hand-rolled pass over the token: the decoder stops at the first byte its alphabet does
+/// not hold, and that is the byte the refusal names.
+fn decode_page_token(token: &str) -> Result<Vec<u8>, PageTokenRejected> {
+    use ::base64::Engine as _;
+
+    match PAGE_TOKEN_CODEC.decode(token) {
+        Ok(bytes) => Ok(bytes),
+        Err(::base64::DecodeError::InvalidByte(_, byte)) if byte != BASE64_PAD => Err(
+            PageTokenRejected::Undecodable(illegal_base64_character_message(byte)),
+        ),
+        Err(::base64::DecodeError::InvalidLength(_)) => Err(PageTokenRejected::Undecodable(
+            DANGLING_BASE64_UNIT_MESSAGE.to_string(),
+        )),
+        Err(::base64::DecodeError::InvalidByte(..) | ::base64::DecodeError::InvalidPadding) => Err(
+            PageTokenRejected::Undecodable(MALFORMED_BASE64_UNIT_MESSAGE.to_string()),
+        ),
+        // The value decodes; only its last unit carries bits a decoder that pads on
+        // demand discards. Whatever those bytes are, they are not a token this service
+        // minted, so it is refused as one it never issued rather than as a decode
+        // failure.
+        Err(::base64::DecodeError::InvalidLastSymbol(..)) => Err(PageTokenRejected::Unissued),
+    }
+}
+
+/// The creation counter a `nextToken` resumes at, or why that token names no position.
+///
+/// The token is DECODED first — a value that is not base64 is refused as the decode
+/// failure it is — and only then resolved against the form [`page_token`] mints.
+pub fn page_token_sequence(token: &str) -> Result<u64, PageTokenRejected> {
+    let decoded = decode_page_token(token)?;
+    let position = String::from_utf8(decoded).map_err(|_| PageTokenRejected::Unissued)?;
+    if position.len() != PAGE_TOKEN_POSITION_DIGITS {
+        return Err(PageTokenRejected::Unissued);
+    }
+    u64::from_str_radix(&position, 16).map_err(|_| PageTokenRejected::Unissued)
 }
 
 /// Record one state-changing campaign operation: when (the record's own timestamp), who
@@ -261,6 +363,93 @@ pub fn audit_campaign_change(
 /// The ARN of a campaign: `arn:aws:connect-campaigns:<region>:<account>:campaign/<id>`.
 pub fn campaign_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("campaign/{id}"))
+}
+
+/// What this service answers when a well-formed campaign id names no campaign, for the
+/// operations that RESOLVE the campaign resource that id names — the describe and the
+/// delete, addressed to `/campaigns/{id}` itself.
+///
+/// Composed from the request, so the refusal names the id the caller asked for. The one
+/// text those operations share, so two of them cannot disagree about a lookup they both
+/// refuse. The operations addressed to the campaign's RUN STATE word the same miss
+/// differently and take [`campaign_absent_message`] instead.
+pub fn campaign_not_found_message(id: &str) -> String {
+    format!("CampaignId not found {id}.")
+}
+
+/// What this service answers when a well-formed campaign id names no campaign, for the
+/// operations addressed to the campaign's RUN STATE (`GetCampaignState`,
+/// `StartCampaign`, `PauseCampaign`, `StopCampaign`).
+///
+/// Also composed from the request, and deliberately NOT the sentence a campaign-resource
+/// lookup answers ([`campaign_not_found_message`]): the service words the two classes
+/// differently, so they are kept apart rather than unified. The one text those
+/// operations share.
+pub fn campaign_absent_message(id: &str) -> String {
+    format!("Campaign: {id} doesn't exist")
+}
+
+/// What this service answers when the Amazon Connect instance a request names is not one
+/// Campaigns can be used with: the account holds no instance under that id, or the
+/// instance it holds is not enabled for Campaigns.
+///
+/// A FIXED service string — it names no instance and carries nothing from the request —
+/// so every refusal of this class reads the same and the response is deterministic.
+pub const INSTANCE_NOT_USABLE_MESSAGE: &str =
+    "Connect Instance does not exist or is not enabled to use Campaigns.";
+
+/// What this service answers when the Amazon Connect instance registry — another
+/// service's store, reached through the shared engine — cannot be read at all, so the
+/// instance question has no answer here.
+pub const INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE: &str =
+    "the Amazon Connect instance registry is unavailable";
+
+/// Why the Amazon Connect instance a request names is not a campaign target, as
+/// [`connect_instance_refusal`] reports it.
+///
+/// Two outcomes, because they are answered differently: an id the account's registry
+/// does not hold is a request fault, while a registry this emulator cannot read at all
+/// is a server fault and never a reason to treat the instance as absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceRefusal {
+    /// The account holds no Connect instance under the id the request names, so there
+    /// is nothing Campaigns could be used with: the modelled `ValidationException`
+    /// (HTTP 400) carrying [`INSTANCE_NOT_USABLE_MESSAGE`].
+    NotUsable,
+    /// The registry could not be read, so the existence question has no answer: the
+    /// modelled server error carrying [`INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE`].
+    RegistryUnavailable,
+}
+
+/// Whether the Connect instance `connect_instance_id` names is one this service's
+/// operations may be used with: `None` when it is, and otherwise which refusal the
+/// caller owes.
+///
+/// Amazon Connect owns the instance registry — its `CreateInstance` is the only call
+/// that mints an instance id and its `DeleteInstance` the only one that drops it — so
+/// the answer is read from THAT service's own store through the one shared engine rather
+/// than kept a second time here: an instance created or deleted over the Connect API is
+/// a campaign target, or not, with no propagation step. It resolves by instance id
+/// alone, which is how every Connect operation that takes an instance id resolves one.
+///
+/// The one place this gate is decided, so the operations that require a usable instance
+/// cannot disagree about a request they all refuse.
+///
+/// LOCK ORDER: this takes the Connect store's lock, holds no other while it does, and
+/// hands back an owned value rather than a guard — so it is called with NO guard of this
+/// service's own store held. Keeping the cross-service read one-directional and
+/// guard-free is what makes a lock cycle between the two stores unreachable.
+pub fn connect_instance_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    connect_instance_id: &str,
+) -> Option<InstanceRefusal> {
+    let Some(state) =
+        ::service_com_amazonaws_connect_amazonconnectservice::state::service_state(engine)
+    else {
+        return Some(InstanceRefusal::RegistryUnavailable);
+    };
+    let held = state.lock().instances.contains_key(connect_instance_id);
+    (!held).then_some(InstanceRefusal::NotUsable)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

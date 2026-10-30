@@ -13,6 +13,10 @@
 // points it into `tests/all/`.
 #[path = "all/campaign_lifecycle.rs"]
 mod campaign_lifecycle;
+#[path = "all/campaign_plane_refusals.rs"]
+mod campaign_plane_refusals;
+#[path = "all/common.rs"]
+mod common;
 #[path = "all/signing_name_path_claim.rs"]
 mod signing_name_path_claim;
 #[path = "all/state_roundtrip.rs"]

@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             Err(crate::state::TransitionRefused::NoSuchCampaign) => Err(
                 StopCampaignErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("No campaign with id {} exists", input.id),
+                    message: crate::state::campaign_absent_message(&input.id),
                     x_amz_error_type: None,
                 })
                 .into(),

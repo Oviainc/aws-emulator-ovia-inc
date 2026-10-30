@@ -57,9 +57,12 @@
 //! `service-com-amazonaws-bcmpricingcalculator-awsbcmpricingcalculator`,
 //! `service-com-amazonaws-freetier-awsfreetierservice` and
 //! `service-com-amazonaws-bcmdashboards-awsbcmdashboardsservice` — the same AWS billing
-//! front door, the same `1.1` framing over an `awsJson1_0` model — each of which states
-//! only its own pair (`RESPONSE_MEDIA_TYPE`) and takes the mechanism, including
-//! [`ResponseMediaTypeOperation`], from here.
+//! front door, the same `1.1` framing over an `awsJson1_0` model — and by
+//! `service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice`, whose model
+//! declares `restJson1` and whose recorded wire announces the awsJson `1.1` media type
+//! on every reply, so it states its own pair (`application/json` → `1.1`) and takes the
+//! mechanism, including [`ResponseMediaTypeOperation`], from here. Each of them states
+//! only its own pair (`RESPONSE_MEDIA_TYPE`).
 //!
 //! STILL TO MIGRATE onto this module: `service-com-amazonaws-amp-amazonprometheusservice`
 //! (`RESPONSE_CONTENT_TYPE` in its `src/state.rs`, with the rewrite in its

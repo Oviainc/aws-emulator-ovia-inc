@@ -71,8 +71,34 @@ impl Answer {
     }
 }
 
+/// Every Amazon Connect instance the cases below name in a `connectInstanceId`.
+///
+/// `CreateCampaign` mints a campaign only for an instance the account holds, so the
+/// router these cases drive starts with each of them in Amazon Connect's own instance
+/// registry; a case that needs an id the account does NOT hold names one of its own.
+/// The last entry is `InstanceId`'s 256-character maximum, built by [`long_instance`].
+const INSTANCES: &[&str] = &[
+    "inst-1",
+    "inst-2",
+    "inst-a",
+    "inst-b",
+    "inst-full",
+    "inst-spare",
+    "a.b_c-D9",
+];
+
+/// An instance id of exactly 256 characters: `InstanceId`'s length maximum (len 0..256,
+/// pattern `^[a-zA-Z0-9_\-.]*$`).
+fn long_instance() -> String {
+    "i".repeat(256)
+}
+
 fn service_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    for instance in INSTANCES {
+        super::common::register_connect_instance(&engine, REGION, instance);
+    }
+    super::common::register_connect_instance(&engine, REGION, &long_instance());
     let mut router = MultiServiceRouter::new();
     // These tests send unsigned-but-scoped requests; the signature itself is the
     // transport's business, not this service's.
@@ -201,7 +227,8 @@ fn simple_request(name: &str, instance: &str) -> Value {
 /// rule generalises over — each dialer-config variant of the modelled `DialerConfig`
 /// union, an outbound call config with and without its optional members, a tagged and an
 /// untagged campaign, and the `name`/`connectInstanceId` length bounds the model
-/// declares (`name` 1..127, `connectInstanceId` 0..256).
+/// declares (`name` 1..127, `connectInstanceId` 0..256). Every instance named here is
+/// one the router's account holds (see [`INSTANCES`]).
 fn round_trip_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -247,10 +274,11 @@ fn round_trip_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "name at its 127-character maximum, empty connectInstanceId",
+            "name at its 127-character maximum, connectInstanceId at its 256-character \
+             maximum",
             json!({
                 "name": "n".repeat(127),
-                "connectInstanceId": "",
+                "connectInstanceId": long_instance(),
                 "dialerConfig": {
                     "agentlessDialerConfig": {"dialingCapacity": 0.25}
                 },

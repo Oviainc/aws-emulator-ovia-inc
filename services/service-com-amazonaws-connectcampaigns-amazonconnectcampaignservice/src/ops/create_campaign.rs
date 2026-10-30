@@ -5,6 +5,11 @@
 //! an initial run state of `Initialized`, and answers `id`/`arn`/`tags` read back out
 //! of the store.
 //!
+//! The create is GATED on the Amazon Connect instance it names being one Campaigns can
+//! be used with — one the account's Connect registry holds
+//! (`crate::state::connect_instance_refusal` reads it) — and answers the modelled
+//! `ValidationException` (HTTP 400) when it is not, before anything is stored.
+//!
 //! ## Idempotency
 //!
 //! The model marks this operation `@idempotent` and its documentation says "This API is
@@ -175,6 +180,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
+
+        // A campaign belongs to an Amazon Connect instance that Campaigns can be used
+        // with, and the account's Connect registry is the one record of which instances
+        // those are: an id it does not hold names nothing to create a campaign for, so
+        // the request is refused as the bad request it is and nothing is stored. Asked
+        // BEFORE this service's store is locked, which is the lock order the registry
+        // read requires; a registry that cannot be read answers the question not at all,
+        // which is a server error and never an absent instance.
+        match crate::state::connect_instance_refusal(&*self.engine, &input.connect_instance_id) {
+            None => {}
+            Some(crate::state::InstanceRefusal::NotUsable) => {
+                return Err(CreateCampaignErrorModeled::ValidationException(ValidationException {
+                    message: crate::state::INSTANCE_NOT_USABLE_MESSAGE.to_string(),
+                    x_amz_error_type: None,
+                })
+                .into())
+            }
+            Some(crate::state::InstanceRefusal::RegistryUnavailable) => {
+                return Err(CreateCampaignErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::INSTANCE_REGISTRY_UNAVAILABLE_MESSAGE.to_string(),
+                        x_amz_error_type: None,
+                    },
+                )
+                .into())
+            }
+        }
 
         // A fresh campaign id, and the ARN naming it in the region the request was
         // signed for.

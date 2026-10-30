@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = guard.campaigns.get(&input.id).ok_or_else(|| {
             DescribeCampaignError::from(DescribeCampaignErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("No campaign with id {} exists", input.id),
+                    message: crate::state::campaign_not_found_message(&input.id),
                     x_amz_error_type: None,
                 },
             ))

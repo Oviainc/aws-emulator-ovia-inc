@@ -324,6 +324,9 @@ fn the_generated_path_discriminator_covers_every_modelled_route() {
 #[tokio::test]
 async fn a_peer_route_never_reaches_this_service_while_its_own_route_is_served() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    // The create below is for an instance the account must hold: `CreateCampaign` mints
+    // a campaign only for one in Amazon Connect's own instance registry.
+    super::common::register_connect_instance(&engine, "us-east-1", "instance-1");
     let mut router = MultiServiceRouter::new();
     // Signature verification is the core's concern; the header is a routing signal here.
     router.set_request_authentication(false);

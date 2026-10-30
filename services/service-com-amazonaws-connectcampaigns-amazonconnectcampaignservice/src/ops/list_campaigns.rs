@@ -204,14 +204,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A page token names the POSITION in the creation order the next page starts at,
         // so a campaign created or deleted between two calls — including the very
         // campaign the next page was going to start at — leaves the token resumable: the
-        // walk continues at the first campaign created no earlier than that position. A
-        // token this service never issued cannot be resumed from at all.
+        // walk continues at the first campaign created no earlier than that position. The
+        // token is an opaque base64 value, so it is DECODED first and only then resolved:
+        // a value that is not base64 is refused as the decode failure it is, and one that
+        // decodes but this service never issued is refused as that instead.
         let start = match input.next_token.as_deref() {
             Some(token) => {
-                let resume_from = crate::state::page_token_sequence(token).ok_or_else(|| {
+                let resume_from = crate::state::page_token_sequence(token).map_err(|rejected| {
                     ListCampaignsError::from(ListCampaignsErrorModeled::ValidationException(
                         ValidationException {
-                            message: format!("nextToken {token} is not a valid page token"),
+                            message: rejected.message(),
                             x_amz_error_type: None,
                         },
                     ))
