@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLaunchTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLaunchTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLaunchTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the launch templates
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::launch_templates`] holds, as the modelled
+//! [`LaunchTemplate`] each record already keeps — the same value `CreateLaunchTemplate`
+//! answered with — so every member a writer stored round-trips through this read.
+//!
+//! The request only SELECTS which stored templates are reported: `LaunchTemplateIds` and
+//! `LaunchTemplateNames` narrow the account's templates to the ones they name (an entry
+//! naming none is refused, never reported as an absent row), the documented filters select
+//! on the template's own attributes and its tags, and the page is cut in launch template id
+//! order with a cursor naming the template the next page starts at.
+//!
+//! This operation only REPORTS: nothing here writes to the store, so two reads answer with
+//! the same templates.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +91,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+use std::collections::HashSet;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+    MAX_RESOURCE_IDS, MatchBudget,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +166,332 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLaunchTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLaunchTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            invalid_launch_template_name_not_found, launch_template_ids_malformed,
+            require_service_state,
+        };
+
+        // A launch template carries no Region member and this operation reads no other
+        // request metadata, so the Region the call is signed for selects only the response
+        // envelope.
+        let _ = ctx;
+
+        // Matching cost is stored templates x filters x values x value length, and the
+        // model bounds none of them (`FilterList` and `Filter$Values` carry no `@length`),
+        // so every request-chosen factor is capped HERE, before any work proportional to it
+        // is done and before the store is locked; their PRODUCT is charged to one
+        // [`MatchBudget`] below, the bound the per-factor caps cannot give.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // template would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than
+        // recompiled for every candidate template.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The token to request the next page of results"
+        // (`DescribeLaunchTemplatesRequest$NextToken`) — anything this service did not mint
+        // is refused rather than read as a position.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // The two selector lists are caller-sized as well, and every entry is resolved
+        // against the store, so they are capped the way every other describe of this crate
+        // caps a resource-id list.
+        let requested_ids: &[String] = input.launch_template_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "LaunchTemplateIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        let requested_names: &[String] = input.launch_template_names.as_deref().unwrap_or_default();
+        if requested_names.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "LaunchTemplateNames carries {} names, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_names.len()
+            )));
+        }
+        // `LaunchTemplateIdStringList`'s member targets a plain `String`, so the boundary
+        // validator enforces no shape on it; a NAME has the modelled `LaunchTemplateName`
+        // constraints, which the boundary validator has already enforced. Both lists are
+        // screened against the store below, so the store is reached first.
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "One or more launch template IDs" / "one or more launch template names"
+        // (`$LaunchTemplateIds`, `$LaunchTemplateNames`): an id or a name that names no
+        // template of the account is an error, not an absent row. Sets, so narrowing below
+        // costs one lookup per template rather than a scan of the asked-for lists.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLaunchTemplates"))
+        // An ID is SCREENED rather than merely looked up: a launch template id is one the
+        // service itself minted, so an id it did not mint is not an id of a launch template
+        // at all and EC2 answers [`crate::state::INVALID_LAUNCH_TEMPLATE_ID_MALFORMED`] for
+        // it — naming every such id of the request in one message, the member being a list —
+        // rather than reporting a resource that is merely absent. That screen subsumes the
+        // id grammar: an id the grammar rejects is one no mint could have produced, so it is
+        // not held either.
+        let wanted_ids: HashSet<&str> = requested_ids.iter().map(String::as_str).collect();
+        let malformed: Vec<&str> = requested_ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !store.launch_templates.contains_key(*id))
+            .collect();
+        if !malformed.is_empty() {
+            return Err(launch_template_ids_malformed(&malformed));
+        }
+        let wanted_names: HashSet<&str> = requested_names.iter().map(String::as_str).collect();
+        if !wanted_names.is_empty() {
+            // The names the store holds, collected ONCE rather than rescanned per name.
+            let stored_names: HashSet<&str> = store
+                .launch_templates
+                .values()
+                .map(|record| record.launch_template_name())
+                .collect();
+            if let Some(unknown) = requested_names
+                .iter()
+                .find(|name| !stored_names.contains(name.as_str()))
+            {
+                return Err(invalid_launch_template_name_not_found(unknown));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeLaunchTemplatesRequest$DryRun`). Every caller of this emulator is
+        // permitted, so a well-formed dry run reports that outcome and reports no template —
+        // but a request that is not well formed is answered with ITS OWN refusal, never
+        // getting as far as the permission check it asks about, which is why the flag is
+        // read after the request's selectors have been screened and before anything is
+        // selected. Nothing above this point writes, so a dry run leaves the store as it
+        // found it.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        // "If this parameter is set to true, the output includes resources that are managed
+        // by Amazon Web Services services, even if managed resource visibility is set to
+        // hidden" (`IncludeManagedResources`). A template is hidden only when its operator
+        // reports `HiddenByDefault`, which follows the account's managed-resource visibility
+        // settings — nothing in this emulator sets them, so no stored template is hidden and
+        // this parameter widens nothing today.
+        let include_managed = input.include_managed_resources.unwrap_or(false);
+
+        // "Describes one or more launch templates" (`DescribeLaunchTemplates`): the two
+        // selector lists narrow the store to the templates they name, and every filter must
+        // then hold ("If you specify multiple filters, the filters are joined with an AND" —
+        // `Filter`).
+        //
+        // The two lists are a UNION, not an intersection: each entry of either must resolve
+        // (an unresolved one is refused above), so a request carrying both asked for every
+        // template it named, and intersecting them would report NOTHING for a request naming
+        // one template by id and another by name.
+        //
+        // Every comparison is charged to ONE budget, so the product of stored templates,
+        // filters, values and value length is bounded however the caller combines them —
+        // which is also what bounds how long this read holds the state lock.
+        let named_any = !wanted_ids.is_empty() || !wanted_names.is_empty();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<LaunchTemplate> = Vec::new();
+        for record in store.launch_templates.values() {
+            if budget.exhausted() {
+                break;
+            }
+            if named_any
+                && !wanted_ids.contains(record.launch_template_id())
+                && !wanted_names.contains(record.launch_template_name())
+            {
+                continue;
+            }
+            let template = &record.template;
+            if !include_managed && is_hidden(template) {
+                continue;
+            }
+            if crate::state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(template, name)
+            }) {
+                selected.push(template.clone());
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report as
+        // a result: the request asked for more filtering than one call will do, and is told
+        // so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow Filters, or name fewer launch templates"
+            )));
+        }
+
+        // Page in `LaunchTemplateId` order, which the cursor below names a position in. The
+        // store is an ordered map keyed by that id, so its iteration order already satisfies
+        // this sort; doing it here establishes the invariant the cursor depends on at the
+        // point of use rather than inheriting it from the container `crate::state` holds.
+        selected.sort_by(|left, right| left.launch_template_id.cmp(&right.launch_template_id));
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|template| {
+                template.launch_template_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return in a single call. … This value can be
+        // between 1 and 200" (`MaxResults`), which the modelled
+        // `DescribeLaunchTemplatesMaxResults` `@range` has already enforced. A request that
+        // names none gets the largest page that range admits, so the `NextToken` path behaves
+        // the same whether or not a page size was asked for.
+        // A page of no templates could answer a token that never advances, so the fallback
+        // keeps its one meaning — "the caller named no page size" — for a value outside the
+        // range as much as for an absent one.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(MAX_PAGE_SIZE)
+            .min(MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeLaunchTemplatesResult$NextToken`): a token only when a template follows
+        // this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|template| template.launch_template_id.as_deref())
+            .map(crate::state::encode_page_token);
+
+        Ok(DescribeLaunchTemplatesOutput {
+            launch_templates: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
+    }
+}
+
+/// The page a request that names no `MaxResults` gets: the most the modelled
+/// `DescribeLaunchTemplatesMaxResults` admits ("This value can be between 1 and 200" —
+/// `DescribeLaunchTemplatesRequest$MaxResults`, `range 1..200`).
+const MAX_PAGE_SIZE: usize = 200;
+
+/// The filter names this operation documents, from `DescribeLaunchTemplatesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeLaunchTemplatesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`].
+const LAUNCH_TEMPLATE_FILTERS: [&str; 3] = ["create-time", "launch-template-name", "tag-key"];
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
+/// the filter value" (`DescribeLaunchTemplatesRequest$Filters`).
+const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
+/// selects on.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    LAUNCH_TEMPLATE_FILTERS.contains(&name).then_some(name)
+}
+
+/// Is this template one only a request that asks for managed resources is answered with?
+///
+/// `OperatorResponse$HiddenByDefault` is "whether the resource is hidden from public view",
+/// which is what `IncludeManagedResources` overrides — and it overrides it for a template the
+/// request named as much as for one it did not, the flag being the only thing that widens the
+/// result to a hidden template.
+fn is_hidden(template: &LaunchTemplate) -> bool {
+    template
+        .operator
+        .as_ref()
+        .and_then(|operator| operator.hidden_by_default)
+        .unwrap_or(false)
+}
+
+/// The values the EC2 filter `name` compares against this launch template.
+///
+/// A filter naming an attribute this template does not carry compares against NO values, so
+/// it selects nothing — the same answer AWS gives for `tag:Owner` on an untagged template.
+/// `name` is a name [`canonical_filter_name`] resolved.
+fn filter_values<'a>(template: &'a LaunchTemplate, name: &str) -> Vec<Cow<'a, str>> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return template
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    match name {
+        // "create-time - The time the launch template was created": the template's create
+        // time as the wire reports it, which is the text a filter value — EC2's wildcards
+        // included — is compared against.
+        "create-time" => crate::state::filter_timestamp_values(template.create_time),
+        "launch-template-name" => template
+            .launch_template_name
+            .as_deref()
+            .map(Cow::Borrowed)
+            .into_iter()
+            .collect(),
+        "tag-key" => template
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even if
+        // that check were bypassed.
+        _ => Vec::new(),
     }
 }

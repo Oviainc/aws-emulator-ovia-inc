@@ -452,6 +452,13 @@ mod delete_security_group;
 mod delete_vpc;
 #[path = "all/describe_images.rs"]
 mod describe_images;
+// What `DescribeLaunchTemplates` reports out of the launch template store: the templates a
+// create stored, the narrowing its ids, names, filters and pages do, and the refusal an id
+// the account holds no template under gets. Declared HERE, in sorted position inside the
+// long-settled block rather than at the head of the file, where every new ec2 suite inserts
+// its lines and merges contend.
+#[path = "all/describe_launch_templates.rs"]
+mod describe_launch_templates;
 // What `DescribeNetworkAcls` reports out of the network ACL store: the default ACL every VPC
 // comes with, the subnets associated with it, and the narrowing its ids, filters and pages
 // do. Declared HERE, in sorted position inside the long-settled block rather than beside

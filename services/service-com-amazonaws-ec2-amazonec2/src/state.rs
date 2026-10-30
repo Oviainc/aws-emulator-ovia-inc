@@ -6748,6 +6748,30 @@ pub fn invalid_launch_template_id_malformed<E>(
     )
 }
 
+/// Refuse the launch template ids of a request that name no launch template of the account:
+/// HTTP 400 [`INVALID_LAUNCH_TEMPLATE_ID_MALFORMED`], naming every one of them in the one
+/// message.
+///
+/// A launch template id is one the service itself minted, so an id it did not mint is not an
+/// id of a launch template at all — which is the verdict the recorded units behind
+/// `issues/.../20261022T235108Z-ec2-describelaunchtemplates-stub.md` show AWS answering for
+/// an id in the long id form that no launch template of the account carries, with the fixed
+/// text below. Beside [`invalid_launch_template_id_malformed`], which is the same refusal for
+/// an operation whose member names ONE id, so an operation taking a LIST of them does not
+/// word it a second way; each id is cut to length by [`echoed_resource_id`], the way every
+/// refusal of this crate bounds a value it repeats back.
+pub fn launch_template_ids_malformed<E>(ids: &[&str]) -> crate::scaffolded::Scaffolded<E> {
+    let named: Vec<String> = ids.iter().map(|id| echoed_resource_id(id)).collect();
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_LAUNCH_TEMPLATE_ID_MALFORMED,
+        400,
+        format!(
+            "The following launch template ids are malformed: {}",
+            named.join(", ")
+        ),
+    )
+}
+
 /// Refuse a request that named a launch template name no launch template of the account
 /// carries: HTTP 400 `InvalidLaunchTemplateName.NotFoundException`.
 pub fn invalid_launch_template_name_not_found<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
