@@ -39,6 +39,8 @@ mod capacity_task_outcome;
 mod catalog_items;
 #[path = "all/configured_instance_types.rs"]
 mod configured_instance_types;
+#[path = "all/connection_store_bound.rs"]
+mod connection_store_bound;
 #[path = "all/delete_conflicts.rs"]
 mod delete_conflicts;
 #[path = "all/dependent_resource_conflict.rs"]

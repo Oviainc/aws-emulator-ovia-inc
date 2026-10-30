@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_outposts_outpostsolafservice::state::{store_full, MAX_RESOURCES};
 
+use crate::connection_store_bound::{fill_to_ceiling, Store};
 use crate::outpost_assets::{asset, record};
 use crate::outpost_server_connection::{
     client_key, outpost_holding_all, route, start_request, START_ROUTE,
@@ -66,7 +67,7 @@ fn outpost_route(identifier: &str) -> String {
 /// The counterpart of [`outpost_holding_all`] for a case that works in a SECOND
 /// region: an Outpost can only be placed on a site of its own region, so the site is
 /// created there too.
-async fn outpost_holding_all_in(
+pub(crate) async fn outpost_holding_all_in(
     outposts: &Outposts,
     region: &str,
     name: &str,
@@ -278,9 +279,9 @@ async fn deleting_an_outpost_takes_the_connections_of_its_assets_with_it() {
 /// BACK to the store, so a delete gives the capacity to start connections again.
 ///
 /// The ceiling is `MAX_RESOURCES` entries, which no sequence of calls could fill
-/// inside a test, so this case fills the store directly — as
-/// [`crate::capacity_task_lifecycle`] and [`crate::quote_store_bound`] fill theirs —
-/// and then drives the refusal, the delete and the next start over the wire.
+/// inside a test, so this case fills the store directly — through
+/// [`crate::connection_store_bound`]'s filler, which states the rule about that
+/// bound — and then drives the refusal, the delete and the next start over the wire.
 #[tokio::test]
 async fn the_slots_a_deleted_outposts_connections_held_return_to_the_store() {
     let outposts = Outposts::new();
@@ -300,7 +301,11 @@ async fn the_slots_a_deleted_outposts_connections_held_return_to_the_store() {
         )
         .await;
     let first = text(&started, "ConnectionId");
-    fill_to_ceiling(&outposts, &first);
+    assert!(
+        !first.is_empty(),
+        "the start this row fills the store from must mint a ConnectionId, got {started}"
+    );
+    fill_to_ceiling(&outposts, Store::Connections);
     let at_ceiling = outposts.store().lock().connections.len();
     assert_eq!(
         at_ceiling, MAX_RESOURCES,
@@ -309,7 +314,9 @@ async fn the_slots_a_deleted_outposts_connections_held_return_to_the_store() {
     );
 
     // At the ceiling a start is refused — on hardware of ANOTHER Outpost, so what
-    // refuses it is the store bound and nothing about the asset.
+    // refuses it is the store bound and nothing about the asset. The bound is this
+    // emulator's own, so the refusal is the client error `StartConnection` models
+    // ([`crate::connection_store_bound`] states that rule).
     let refused = outposts
         .call(
             "POST",
@@ -319,7 +326,7 @@ async fn the_slots_a_deleted_outposts_connections_held_return_to_the_store() {
         .await;
     assert_eq!(
         (refused.status, refused.error_code.as_str()),
-        (500, "InternalServerException"),
+        (400, "ValidationException"),
         "at the ceiling a start must be refused, got {} {} {}",
         refused.status,
         refused.error_code,
@@ -357,23 +364,4 @@ async fn the_slots_a_deleted_outposts_connections_held_return_to_the_store() {
     );
 }
 
-/// Fill the store to [`MAX_RESOURCES`] connections, by copying the connection
-/// `connection_id` names under further ids of its own.
-///
-/// Every copy names the same hardware the start named, which is what makes them
-/// entries of that Outpost: they occupy slots the ceiling counts and nothing reads
-/// them, so the only thing asserted about them is how many there are.
-fn fill_to_ceiling(outposts: &Outposts, connection_id: &str) {
-    let store = outposts.store();
-    let mut store = store.lock();
-    let template = store
-        .connections
-        .get(connection_id)
-        .cloned()
-        .expect("the start persisted its connection");
-    for index in 0..MAX_RESOURCES - 1 {
-        let mut copy = template.clone();
-        copy.connection_id = format!("filler-{index:06}");
-        store.connections.insert(copy.connection_id.clone(), copy);
-    }
-}
+

@@ -204,13 +204,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        // The store grows by one connection per call and lives for the life of the
-        // process, so the growth is capped. This operation models no quota error and
-        // the ceiling is the emulator's own rather than anything about the request,
-        // so past it the server error it does model is what the caller is told.
+        // See `MAX_RESOURCES`: a connection is never released while the Outpost whose
+        // hardware it installs is held (`GetConnection` must still answer what this
+        // start minted), so the store this insert grows needs a maximum entry count.
+        // `StartConnection` models no quota error, so past the cap the request is
+        // refused as what it is from the caller's side — one this service will not
+        // accept (400 `ValidationException`) — exactly as `CreateQuote` and
+        // `CreateRenewal` report their own ceilings, and never as a server fault a
+        // client would retry a call that can only fail again.
         if store.connections.len() >= crate::state::MAX_RESOURCES {
-            return Err(StartConnectionErrorModeled::InternalServerException(
-                InternalServerException {
+            return Err(StartConnectionErrorModeled::ValidationException(
+                ValidationException {
                     message: Some(crate::state::store_full("connections")),
                 },
             )

@@ -6725,20 +6725,26 @@ pub const CONFIGURED_INSTANCE_TYPE_PAGE: &str = "outpostInstanceTypes";
 pub const MAX_RESULTS: i32 = 1000;
 
 /// The ceiling on how many sites, how many Outposts, how many quotes, how many
-/// orders, and how many capacity tasks this store holds.
+/// orders, how many capacity tasks and how many installation connections this store
+/// holds.
 ///
 /// A generated emulator keeps its resources in memory for the life of the process
 /// and a create is the only thing that adds one, so the store needs a maximum entry
 /// count: neither a TTL nor an eviction policy is available to it, because `GetSite`
 /// must still answer what `CreateSite` created, and `GetCapacityTask` must still
 /// answer a task that has long since completed. Past the cap the creating operation
-/// refuses the request rather than growing: the three creates that model
-/// `ServiceQuotaExceededException` (HTTP 402) answer it (it is modelled on exactly
-/// them and on no read), `CreateQuote`, whose model declares no quota error, refuses
-/// the create as a bad request (400 `ValidationException`) rather than inventing an
-/// error the model does not carry, and `StartCapacityTask`, which models no quota
-/// error either, answers the `ConflictException` (HTTP 409) it does model, worded by
-/// [`store_full`] so the caller can tell it from the one-active-task refusal. The
+/// refuses the request rather than growing, and because the ceiling is a condition of
+/// this emulator and not of the request, the refusal is always a CLIENT error the
+/// operation's own model declares — never a 5xx server fault, which SDK retry
+/// classifiers treat as retryable and so would have a caller repeat a call that can
+/// only fail again. The three creates that model `ServiceQuotaExceededException`
+/// (HTTP 402) answer it (it is modelled on exactly them and on no read); `CreateQuote`
+/// and `CreateRenewal`, whose models declare no quota error, refuse the create as a
+/// bad request (400 `ValidationException`) rather than inventing an error the model
+/// does not carry, and so does `StartConnection` for the connection store it grows;
+/// `StartCapacityTask`, which models no quota error either, answers the
+/// `ConflictException` (HTTP 409) it does model, worded by [`store_full`] so the
+/// caller can tell it from the one-active-task refusal. The
 /// number is the emulator's own bound, not a published AWS default (AWS publishes
 /// these quotas as adjustable, so no single value is the contract), and is set high
 /// enough that no ordinary workflow meets it.
