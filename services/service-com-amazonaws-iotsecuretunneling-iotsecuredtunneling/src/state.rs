@@ -551,15 +551,28 @@ impl ComAmazonawsIotsecuretunnelingIotsecuredtunnelingState {
     /// exactly as it is, so `false` means the resource is unchanged and its
     /// `lastUpdatedAt` has nothing to record (see
     /// [`Self::stamp_tunnel_updated`]).
+    ///
+    /// The answer is about the set this call LEAVES behind against the set the
+    /// resource carried BEFORE it, never against a value another element of this
+    /// same call wrote: a key the list names more than once is stored with its
+    /// last occurrence, so the request is collapsed per key first and each key is
+    /// then written — and compared — exactly once. A request whose net effect is
+    /// the identity therefore answers `false` however many times it names a key.
     pub fn put_tags(&mut self, arn: &str, tags: &[Tag]) -> bool {
         if tags.is_empty() {
             return false;
         }
+        // Last occurrence wins, exactly as a sequence of writes to one key
+        // leaves the last value written.
+        let mut requested: BTreeMap<&str, &str> = BTreeMap::new();
+        for tag in tags {
+            requested.insert(tag.key.as_str(), tag.value.as_str());
+        }
         let stored = self.tags.entry(arn.to_string()).or_default();
         let mut changed = false;
-        for tag in tags {
-            let previous = stored.insert(tag.key.clone(), tag.value.clone());
-            changed |= previous.as_deref() != Some(tag.value.as_str());
+        for (key, value) in requested {
+            let previous = stored.insert(key.to_string(), value.to_string());
+            changed |= previous.as_deref() != Some(value);
         }
         changed
     }

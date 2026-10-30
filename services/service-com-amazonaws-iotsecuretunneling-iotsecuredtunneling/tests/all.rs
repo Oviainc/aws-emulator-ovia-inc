@@ -29,6 +29,8 @@ mod member_update_stamp;
 mod owed_close_settled_by_every_entry_point;
 #[path = "all/record_eviction_order.rs"]
 mod record_eviction_order;
+#[path = "all/repeated_tag_key_in_one_write.rs"]
+mod repeated_tag_key_in_one_write;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/rotate_refusal_error_contract.rs"]

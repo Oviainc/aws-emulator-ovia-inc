@@ -26,6 +26,11 @@
 //!
 //! Driven over the wire through the `MultiServiceRouter` exactly as a client
 //! reaches the service (`awsJson1_1`, `POST /` with `X-Amz-Target`).
+//!
+//! This module owns the harness for the rule and the one function that asserts it
+//! over a row, [`check_case`], so the other suite holding a tag write to the same
+//! rule (`tests/all/repeated_tag_key_in_one_write.rs`) drives its own rows through
+//! this code rather than carrying a second copy of it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -45,7 +50,7 @@ const REGION: &str = "eu-west-1";
 const REWIND: Duration = Duration::from_secs(120);
 
 /// A router carrying only this service, over the engine the test also inspects.
-fn mount(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn mount(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
@@ -178,7 +183,7 @@ fn rewind(engine: &Arc<engine::InMemoryEngine>, tunnel_id: &str, case: &str) {
 
 /// The status the tunnel is in when the write under test arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Status {
+pub(crate) enum Status {
     Open,
     Closed,
 }
@@ -195,10 +200,10 @@ impl Status {
 
 /// The tag write under test.
 #[derive(Debug, Clone, Copy)]
-enum Write {
-    /// `TagResource` with these key/value pairs.
+pub(crate) enum Write {
+    /// `TagResource` with these key/value pairs, in this order.
     Tag(&'static [(&'static str, &'static str)]),
-    /// `UntagResource` with these keys.
+    /// `UntagResource` with these keys, in this order.
     Untag(&'static [&'static str]),
 }
 
@@ -226,17 +231,19 @@ impl Write {
 
 /// One row of the table.
 #[derive(Debug, Clone, Copy)]
-struct Case {
-    label: &'static str,
-    /// The tags the tunnel is opened with.
-    initial: &'static [(&'static str, &'static str)],
-    status: Status,
-    write: Write,
+pub(crate) struct Case {
+    pub(crate) label: &'static str,
+    /// The tags the tunnel is opened with, in request order.
+    pub(crate) initial: &'static [(&'static str, &'static str)],
+    pub(crate) status: Status,
+    pub(crate) write: Write,
     /// The tag set the tunnel must carry afterwards.
-    expected: &'static [(&'static str, &'static str)],
+    pub(crate) expected: &'static [(&'static str, &'static str)],
 }
 
-/// A `(key, value)` slice as the map the service reports.
+/// A `(key, value)` slice as the map the service reports: a key the slice names
+/// more than once keeps the value of its LAST occurrence, because a later
+/// element of one request overwrites an earlier one.
 fn expected_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
@@ -389,115 +396,134 @@ async fn tunnel_for(router: &MultiServiceRouter, case: &Case) -> (String, String
     (tunnel_id, arn)
 }
 
+/// Drive ONE row through the rule: open the tunnel the row asks for, rewind its
+/// timeline, run the write and hold the service to the rule — the stored set the
+/// row expects, reported identically by both readers of the tag store, and a
+/// `lastUpdatedAt` that moves exactly when that set is not the set the tunnel
+/// reported before the call.
+///
+/// The ONE place the rule is asserted, so every table of rows — this module's and
+/// [`super::repeated_tag_key_in_one_write`]'s — is held to the same conditions and
+/// the two cannot drift on what the rule says.
+pub(crate) async fn check_case(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &Case,
+) {
+    let label = case.label;
+    let (tunnel_id, arn) = tunnel_for(router, case).await;
+    // Every stamp the record carries goes into the past, so a stamp written by
+    // the call under test cannot be confused with an earlier one.
+    rewind(engine, &tunnel_id, label);
+
+    let before = reported(router, &tunnel_id, label).await;
+    let before_stamp = stored_stamp(engine, &tunnel_id, label);
+    assert_eq!(
+        before.status.as_deref(),
+        Some(case.status.wire()),
+        "case {label:?}: expected the tunnel {} before the write, got {before:?}",
+        case.status.wire()
+    );
+    // A key the opening request names more than once resolves the same way, so
+    // what the tunnel carries before the write is already the last-occurrence set.
+    assert_eq!(
+        before.tags,
+        expected_map(case.initial),
+        "case {label:?}: expected the opened tags {:?}, got {:?}",
+        expected_map(case.initial),
+        before.tags
+    );
+
+    let expected = expected_map(case.expected);
+    // The rule's condition: the stamp moves exactly when the set the tunnel
+    // reports is not the set it reported before.
+    let changes = expected != before.tags;
+
+    let (operation, input) = case.write.request(&arn);
+    let sent = SystemTime::now();
+    let (status, body) = call(router, operation, &input).await;
+    let answered = SystemTime::now();
+    assert_eq!(
+        status, 200,
+        "case {label:?}: {operation} answered {status} {body:?}"
+    );
+
+    let after = reported(router, &tunnel_id, label).await;
+    assert_eq!(
+        after.tags, expected,
+        "case {label:?}: expected the tags {expected:?}, got {:?}",
+        after.tags
+    );
+    assert_eq!(
+        listed_tags(router, &arn, label).await,
+        expected,
+        "case {label:?}: ListTagsForResource must report the same set as DescribeTunnel, \
+         expected {expected:?}"
+    );
+
+    let after_stamp = stored_stamp(engine, &tunnel_id, label);
+    if changes {
+        assert!(
+            after_stamp >= sent && after_stamp <= answered,
+            "case {label:?}: a write that changed the tag set must stamp lastUpdatedAt with \
+             the instant of the change, expected a stamp in {sent:?}..={answered:?}, got \
+             {after_stamp:?}"
+        );
+        assert!(
+            after.last_updated_at > before.last_updated_at,
+            "case {label:?}: the tunnel must report the new stamp, expected one later than \
+             {:?}, got {:?}",
+            before.last_updated_at,
+            after.last_updated_at
+        );
+    } else {
+        assert_eq!(
+            after_stamp, before_stamp,
+            "case {label:?}: a write that leaves the stored set identical must leave \
+             lastUpdatedAt alone, expected {before_stamp:?}, got {after_stamp:?}"
+        );
+        assert_eq!(
+            after.last_updated_at, before.last_updated_at,
+            "case {label:?}: the reported stamp must not move, expected {:?}, got {:?}",
+            before.last_updated_at, after.last_updated_at
+        );
+    }
+
+    // A tag write touches nothing else the tunnel reports: not when it was
+    // created, not its status, and neither end's connection state — those
+    // stamps belong to the connection transitions.
+    assert_eq!(
+        (
+            after.created_at,
+            after.status.as_deref(),
+            after.source_last_updated_at,
+            after.destination_last_updated_at
+        ),
+        (
+            before.created_at,
+            before.status.as_deref(),
+            before.source_last_updated_at,
+            before.destination_last_updated_at
+        ),
+        "case {label:?}: a tag write must leave createdAt, status and both connection \
+         states alone, expected {before:?}, got {after:?}"
+    );
+    // Both readers of the record report one stamp.
+    assert_eq!(
+        listed_last_updated_at(router, &tunnel_id).await,
+        after.last_updated_at,
+        "case {label:?}: ListTunnels must report the same lastUpdatedAt as DescribeTunnel, \
+         got {after:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_tag_write_stamps_the_tunnel_exactly_when_it_changes_what_it_reports() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = mount(&engine);
 
     for case in cases() {
-        let label = case.label;
-        let (tunnel_id, arn) = tunnel_for(&router, &case).await;
-        // Every stamp the record carries goes into the past, so a stamp written
-        // by the call under test cannot be confused with an earlier one.
-        rewind(&engine, &tunnel_id, label);
-
-        let before = reported(&router, &tunnel_id, label).await;
-        let before_stamp = stored_stamp(&engine, &tunnel_id, label);
-        assert_eq!(
-            before.status.as_deref(),
-            Some(case.status.wire()),
-            "case {label:?}: expected the tunnel {} before the write, got {before:?}",
-            case.status.wire()
-        );
-        assert_eq!(
-            before.tags,
-            expected_map(case.initial),
-            "case {label:?}: expected the opened tags {:?}, got {:?}",
-            expected_map(case.initial),
-            before.tags
-        );
-
-        let expected = expected_map(case.expected);
-        // The rule's condition: the stamp moves exactly when the set the tunnel
-        // reports is not the set it reported before.
-        let changes = expected != before.tags;
-
-        let (operation, input) = case.write.request(&arn);
-        let sent = SystemTime::now();
-        let (status, body) = call(&router, operation, &input).await;
-        let answered = SystemTime::now();
-        assert_eq!(
-            status, 200,
-            "case {label:?}: {operation} answered {status} {body:?}"
-        );
-
-        let after = reported(&router, &tunnel_id, label).await;
-        assert_eq!(
-            after.tags, expected,
-            "case {label:?}: expected the tags {expected:?}, got {:?}",
-            after.tags
-        );
-        assert_eq!(
-            listed_tags(&router, &arn, label).await,
-            expected,
-            "case {label:?}: ListTagsForResource must report the same set as DescribeTunnel"
-        );
-
-        let after_stamp = stored_stamp(&engine, &tunnel_id, label);
-        if changes {
-            assert!(
-                after_stamp >= sent && after_stamp <= answered,
-                "case {label:?}: a write that changed the tag set must stamp lastUpdatedAt with \
-                 the instant of the change, expected a stamp in {:?}..={:?}, got {after_stamp:?}",
-                sent,
-                answered
-            );
-            assert!(
-                after.last_updated_at > before.last_updated_at,
-                "case {label:?}: the tunnel must report the new stamp, expected one later than \
-                 {:?}, got {:?}",
-                before.last_updated_at,
-                after.last_updated_at
-            );
-        } else {
-            assert_eq!(
-                after_stamp, before_stamp,
-                "case {label:?}: a write that changed nothing must leave lastUpdatedAt alone, \
-                 expected {before_stamp:?}, got {after_stamp:?}"
-            );
-            assert_eq!(
-                after.last_updated_at, before.last_updated_at,
-                "case {label:?}: the reported stamp must not move, expected {:?}, got {:?}",
-                before.last_updated_at, after.last_updated_at
-            );
-        }
-
-        // A tag write touches nothing else the tunnel reports: not when it was
-        // created, not its status, and neither end's connection state — those
-        // stamps belong to the connection transitions.
-        assert_eq!(
-            (
-                after.created_at,
-                after.status.as_deref(),
-                after.source_last_updated_at,
-                after.destination_last_updated_at
-            ),
-            (
-                before.created_at,
-                before.status.as_deref(),
-                before.source_last_updated_at,
-                before.destination_last_updated_at
-            ),
-            "case {label:?}: a tag write must leave createdAt, status and both connection \
-             states alone, expected {before:?}, got {after:?}"
-        );
-        // Both readers of the record report one stamp.
-        assert_eq!(
-            listed_last_updated_at(&router, &tunnel_id).await,
-            after.last_updated_at,
-            "case {label:?}: ListTunnels must report the same lastUpdatedAt as DescribeTunnel, \
-             got {after:?}"
-        );
+        check_case(&router, &engine, &case).await;
     }
 }
 
