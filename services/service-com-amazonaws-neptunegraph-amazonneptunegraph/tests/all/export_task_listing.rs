@@ -176,7 +176,7 @@ async fn wait_until_terminal(router: &MultiServiceRouter, region: &str, task_id:
             status, 200,
             "case {task_id}: expected 200 from GetExportTask, got {status}: {body}"
         );
-        if body["status"] == json!("FAILED") {
+        if body["status"] == json!("SUCCEEDED") {
             return body;
         }
         tokio::time::sleep(EXPORT_TASK_SPAN / 4).await;

@@ -29,6 +29,8 @@ mod export_task_cancellation;
 mod export_task_lifecycle;
 #[path = "all/export_task_listing.rs"]
 mod export_task_listing;
+#[path = "all/export_task_run.rs"]
+mod export_task_run;
 #[path = "all/final_snapshot_rule.rs"]
 mod final_snapshot_rule;
 #[path = "all/full_task_store_refusals.rs"]

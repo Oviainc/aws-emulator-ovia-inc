@@ -4,11 +4,12 @@
 //! IMPLEMENTED: reports the stored export task the request names. This is the ONLY
 //! file to touch for this operation.
 //!
-//! `@readonly`, and reporting: the only write it makes is materialising the terminal
-//! status the clock already made due on the task
-//! (`crate::state::ExportTask::settle`), which was owed at that instant whether or not
-//! anybody called. `exportTaskDetails` is derived from the record and the clock — see
-//! `crate::state::ExportTask::details` for why no written-element count is reported.
+//! `@readonly`, and reporting: the only write it makes is materialising the statuses
+//! the clock already made due on the task (`crate::state::ExportTask::settle`), each of
+//! which was owed at its instant whether or not anybody called. `exportTaskDetails` is
+//! derived from the record and the clock — the progress from how far the run's span has
+//! got, and the written-element counts from the elements the export selected off the
+//! stored graph (`crate::state::ExportTask::details`).
 //!
 //! ## Shape of an operation
 //!

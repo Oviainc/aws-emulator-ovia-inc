@@ -10,10 +10,11 @@
 //!   the stored record — a minted `^t-[a-z0-9]{10}$` task id, the source graph's id,
 //!   every export parameter the request chose, and an `INITIALIZING` status — and
 //!   `GetExportTask` answers that same record.
-//! * The clock owes an accepted task a terminal status one span later. This emulator
-//!   runs no export (it holds no graph data plane and makes no connection to Amazon S3),
-//!   so that status is the modelled `FAILED` carrying a `statusReason` which says so,
-//!   never `SUCCEEDED`, and no exported-element count is ever reported.
+//! * The clock carries an accepted task through its run: `INITIALIZING` while it waits
+//!   to start, `EXPORTING` while it runs and then the terminal `SUCCEEDED`, which
+//!   carries no `statusReason` and reports the elements the export wrote — the source
+//!   graph's own stored nodes and edges, as the request's `exportFilter` selects them —
+//!   with the progress at the whole of the work.
 //! * `destination` is the Amazon S3 URI the data is written to, so a value carrying the
 //!   `s3://` scheme and a bucket is accepted and one that does not is refused
 //!   `ValidationException` (400).
@@ -31,7 +32,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
-    ARN_NAMESPACE, EXPORT_NOT_PERFORMED_REASON, EXPORT_TASK_SPAN, PROVISIONING_SPAN,
+    ARN_NAMESPACE, COMPLETE_PROGRESS_PERCENTAGE, EXPORT_TASK_SPAN, PROVISIONING_SPAN,
 };
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -189,21 +190,31 @@ async fn wait_for_graph_status(router: &MultiServiceRouter, id: &str, status: &s
     panic!("case graph {id}: never reached {status}");
 }
 
-/// Poll an export task until it has left `INITIALIZING` — the terminal status the clock
-/// owes it. Nothing in the service sleeps for that span; only this test does.
-async fn wait_until_terminal(router: &MultiServiceRouter, case: &str, task_id: &str) -> Value {
+/// Poll an export task until it reports the terminal `SUCCEEDED` its run ends in,
+/// returning every status seen on the way and the last read. Nothing in the service
+/// sleeps for those spans; only this test does.
+async fn wait_until_succeeded(
+    router: &MultiServiceRouter,
+    case: &str,
+    task_id: &str,
+) -> (Vec<String>, Value) {
+    let mut seen: Vec<String> = Vec::new();
     for _ in 0..40 {
         let (status, body) = get_export(router, task_id).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected 200 from GetExportTask, got {status}: {body}"
         );
-        if body["status"] != json!("INITIALIZING") {
-            return body;
+        let reported = body["status"].as_str().unwrap_or_default().to_string();
+        if seen.last() != Some(&reported) {
+            seen.push(reported.clone());
+        }
+        if reported == "SUCCEEDED" {
+            return (seen, body);
         }
         tokio::time::sleep(EXPORT_TASK_SPAN / 4).await;
     }
-    panic!("case {case:?}: task {task_id} never left INITIALIZING");
+    panic!("case {case:?}: task {task_id} never reached SUCCEEDED, saw {seen:?}");
 }
 
 /// Create a graph and wait it into service, returning its id.
@@ -495,14 +506,15 @@ async fn start_export_task_persists_the_record_and_reads_it_back() {
     }
 }
 
-/// The terminal status the clock owes an accepted task is `FAILED` with a reason: this
-/// emulator runs no export, so no object was written and nothing is claimed otherwise.
+/// An accepted export runs to completion: the clock carries the task from
+/// `INITIALIZING` through its run to the terminal `SUCCEEDED`, with the progress at the
+/// whole of the work, the elements it wrote reported and no reason to explain.
 #[tokio::test]
-async fn an_accepted_task_ends_failed_because_no_export_ran() {
+async fn an_accepted_task_runs_to_the_modelled_succeeded_status() {
     let router = emulator();
     let graph_id = graph_in_service(&router, "export-source").await;
 
-    // (case, format, destination) — the terminal status does not depend on either.
+    // (case, format, destination) — the progression does not depend on either.
     let cases = [
         ("CSV to a bucket root", "CSV", "s3://export-bucket"),
         (
@@ -548,23 +560,47 @@ async fn an_accepted_task_ends_failed_because_no_export_ran() {
             early["status"]
         );
 
-        let settled = wait_until_terminal(&router, case, &task_id).await;
+        let (seen, settled) = wait_until_succeeded(&router, case, &task_id).await;
         assert_eq!(
             settled["status"],
-            json!("FAILED"),
-            "case {case:?}: nothing exported the graph, so the clock owes FAILED, got {}",
+            json!("SUCCEEDED"),
+            "case {case:?}: an accepted export runs to completion, got {}",
             settled["status"]
         );
         assert_eq!(
             settled["statusReason"],
-            json!(EXPORT_NOT_PERFORMED_REASON),
-            "case {case:?}: expected the reason {EXPORT_NOT_PERFORMED_REASON:?}, got {}",
+            Value::Null,
+            "case {case:?}: a task that ran to completion has nothing to explain, got {}",
             settled["statusReason"]
         );
+        // The progression never goes backwards and never skips INITIALIZING: each status
+        // seen is the one before it or the one after it in the run's order.
+        let order = ["INITIALIZING", "EXPORTING", "SUCCEEDED"];
+        assert_eq!(
+            seen.first().map(String::as_str),
+            Some("INITIALIZING"),
+            "case {case:?}: the first read of an accepted task is INITIALIZING, saw {seen:?}"
+        );
+        let mut previous = 0;
+        for status in &seen {
+            let position = order
+                .iter()
+                .position(|known| known == status)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: {status:?} is not a status of an export's run")
+                });
+            assert!(
+                position >= previous,
+                "case {case:?}: the run went backwards from {:?} to {status:?}, saw {seen:?}",
+                order[previous]
+            );
+            previous = position;
+        }
 
-        // The details are derived from the record and the clock: a real start time, a
-        // real elapsed span, no progress and no written-element count — a count would
-        // claim a run that did not happen.
+        // The details are derived from the record, the clock and the graph the export
+        // read: a real start time, a real elapsed span, the whole of the work done and
+        // the elements written — a graph holding nothing exports nothing, so both counts
+        // are zero here and the filtered rows in `export_task_run` span the rest.
         let details = &settled["exportTaskDetails"];
         assert!(
             details["startTime"].as_f64().is_some_and(|t| t > 0.0),
@@ -580,15 +616,15 @@ async fn an_accepted_task_ends_failed_because_no_export_ran() {
         );
         assert_eq!(
             details["progressPercentage"],
-            json!(0),
-            "case {case:?}: no data was exported, so no progress was made, got {}",
+            json!(COMPLETE_PROGRESS_PERCENTAGE),
+            "case {case:?}: a completed run has done all of its work, got {}",
             details["progressPercentage"]
         );
         for member in ["numVerticesWritten", "numEdgesWritten"] {
             assert_eq!(
                 details[member],
-                Value::Null,
-                "case {case:?}: nothing was written, so {member} is not reported, got {}",
+                json!(0),
+                "case {case:?}: the source graph holds no element, so {member} is 0, got {}",
                 details[member]
             );
         }

@@ -802,29 +802,26 @@ impl ImportTask {
     }
 }
 
-/// How long after the `StartExportTask` that starts it an export task's terminal
-/// status is owed: the task answers `INITIALIZING` until this span has passed, then
-/// the next read finds the status the clock settled it into.
+/// How long each PHASE of an export task lasts: the span after which the clock owes a
+/// task the next status of its progression — `INITIALIZING` to `EXPORTING`, and
+/// `EXPORTING` to the terminal `SUCCEEDED`.
 ///
 /// The real service exports for as long as the graph's data takes; this emulator picks
 /// a span inside the emulator-wide 250ms..750ms band for a transition the clock owes,
 /// so a caller that reads the task straight after starting it still observes the
-/// transient `INITIALIZING` status. No handler ever sleeps for it — the due instant is
-/// stored and compared on read.
+/// transient `INITIALIZING` status, and one that polls the task to completion sees the
+/// run in flight before the terminal status. No handler ever sleeps for it — the due
+/// instant is stored and compared on read.
 pub const EXPORT_TASK_SPAN: Duration = Duration::from_millis(500);
 
-/// Why an export task this emulator accepts ends `FAILED`.
-///
-/// `StartExportTask` starts a RUN that reads a graph's vertices and edges and writes
-/// them, as CSV or Parquet objects encrypted with the caller's KMS key, under the
-/// Amazon S3 URI the request names. This emulator holds no graph data plane and makes
-/// no outbound connection to S3 or KMS, so nothing is ever read from the graph and no
-/// object is ever written: reporting `EXPORTING` or `SUCCEEDED` would claim a run that
-/// did not happen and objects that do not exist, so the task reaches the modelled
-/// failure status carrying this reason instead.
-pub const EXPORT_NOT_PERFORMED_REASON: &str =
-    "this emulator does not export graph data: no data was read from the graph and nothing \
-     was written to the destination";
+/// The `progressPercentage` of an export task whose run is over: all of the work the
+/// task had to do is done.
+pub const COMPLETE_PROGRESS_PERCENTAGE: i32 = 100;
+
+/// The most `progressPercentage` a task whose run is still in flight reports: a run
+/// that has not finished has not done all of its work, so it stays below
+/// [`COMPLETE_PROGRESS_PERCENTAGE`] however late into its span a read falls.
+pub const MAX_IN_FLIGHT_PROGRESS_PERCENTAGE: i32 = 99;
 
 /// The `statusReason` of an export task that stopped because it was cancelled.
 pub const EXPORT_CANCELLED_REASON: &str =
@@ -833,20 +830,25 @@ pub const EXPORT_CANCELLED_REASON: &str =
 /// The statuses this slice of the emulator puts an export task into.
 ///
 /// Every variant's wire form is a modelled `ExportTaskStatus` value
-/// (`crate::ops::types::EXPORT_TASK_STATUS_VALUES`). `EXPORTING` and `SUCCEEDED` are
-/// never produced here because no export run happens (see
-/// [`EXPORT_NOT_PERFORMED_REASON`]), and `DELETED` joins this enum with an operation
-/// that would produce it — this service models none that deletes an export task.
+/// (`crate::ops::types::EXPORT_TASK_STATUS_VALUES`). The modelled `FAILED` is not among
+/// them, and nor is `DELETED`: each joins this enum with the condition that would
+/// produce it, and this service holds neither — the elements an accepted export writes
+/// are the source graph's own stored nodes and edges, which nothing can make unreadable
+/// once the request has been accepted, and no operation deletes an export task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportTaskStatus {
-    /// `StartExportTask` has accepted the task; no data has moved yet.
+    /// `StartExportTask` has accepted the task; the run has not begun, so no element
+    /// has been written yet.
     Initializing,
+    /// The run is in flight: the elements the export selected are being written to the
+    /// destination the request named.
+    Exporting,
+    /// The run is over: every element the export selected was written.
+    Succeeded,
     /// `CancelExportTask` has accepted the cancellation; the task is winding down.
     Cancelling,
     /// The task stopped because it was cancelled ([`EXPORT_CANCELLED_REASON`]).
     Cancelled,
-    /// The task is over and nothing was exported ([`EXPORT_NOT_PERFORMED_REASON`]).
-    Failed,
 }
 
 impl ExportTaskStatus {
@@ -854,50 +856,67 @@ impl ExportTaskStatus {
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::Initializing => "INITIALIZING",
+            Self::Exporting => "EXPORTING",
+            Self::Succeeded => "SUCCEEDED",
             Self::Cancelling => "CANCELLING",
             Self::Cancelled => "CANCELLED",
-            Self::Failed => "FAILED",
         }
     }
 
     /// Whether this is a TERMINAL status: the task has stopped, so the clock owes it
     /// nothing more and its outcome can no longer change.
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Cancelled | Self::Failed)
+        matches!(self, Self::Succeeded | Self::Cancelled)
     }
 
-    /// Whether a task in this status can still be cancelled: only one whose export is
-    /// in flight. A task that has stopped has no work left to stop, and one already
-    /// `CANCELLING` is stopping already — each is a conflict rather than a second
-    /// cancellation.
+    /// Whether a task in this status can still be cancelled: only one whose export has
+    /// not finished — a task waiting to start its run, or running it. A task that has
+    /// stopped has no work left to stop, and one already `CANCELLING` is stopping
+    /// already — each is a conflict rather than a second cancellation.
     pub const fn is_cancellable(self) -> bool {
-        matches!(self, Self::Initializing)
+        matches!(self, Self::Initializing | Self::Exporting)
     }
 
     /// The status the clock owes a task currently reported in this status, if any: an
-    /// accepted task stops without exporting, and an accepted cancellation completes.
-    /// A terminal status is owed nothing.
+    /// accepted task starts its run, a run in flight finishes, and an accepted
+    /// cancellation completes. A terminal status is owed nothing.
     pub const fn settles_into(self) -> Option<Self> {
         match self {
-            Self::Initializing => Some(Self::Failed),
+            Self::Initializing => Some(Self::Exporting),
+            Self::Exporting => Some(Self::Succeeded),
             Self::Cancelling => Some(Self::Cancelled),
-            Self::Cancelled | Self::Failed => None,
+            Self::Succeeded | Self::Cancelled => None,
         }
     }
 
-    /// The `statusReason` this status carries — why the task stopped. It is a property
-    /// of the status itself, so the two can never be read apart.
+    /// How long a task stays in this status before the status it settles into
+    /// ([`Self::settles_into`]) falls due. `None` for a terminal status, which settles
+    /// into nothing.
+    ///
+    /// Holding the span beside the transition is what keeps one timeline for the whole
+    /// progression: each phase's due instant is the previous one's plus this span, so a
+    /// task read long after it started lands on the status it would have reached.
+    pub const fn settles_in(self) -> Option<Duration> {
+        match self {
+            Self::Initializing | Self::Exporting => Some(EXPORT_TASK_SPAN),
+            Self::Cancelling => Some(CANCELLATION_SPAN),
+            Self::Succeeded | Self::Cancelled => None,
+        }
+    }
+
+    /// The `statusReason` this status carries — why the task stopped early. It is a
+    /// property of the status itself, so the two can never be read apart, and a task
+    /// that ran to completion carries none: there is nothing to explain.
     pub const fn reason(self) -> Option<&'static str> {
         match self {
-            Self::Failed => Some(EXPORT_NOT_PERFORMED_REASON),
             Self::Cancelled => Some(EXPORT_CANCELLED_REASON),
-            Self::Initializing | Self::Cancelling => None,
+            Self::Initializing | Self::Exporting | Self::Succeeded | Self::Cancelling => None,
         }
     }
 }
 
 /// One stored export task: every member `GetExportTask` reports, plus the instant at
-/// which the terminal status the clock owes it becomes due.
+/// which the next status of its progression becomes due.
 ///
 /// An export task is a resource in its own right — it is addressed by its own
 /// `^t-[a-z0-9]{10}$` id and outlives the graph it reads — so it is stored beside the
@@ -924,13 +943,29 @@ pub struct ExportTask {
     pub export_filter: Option<ExportFilter>,
     pub status: ExportTaskStatus,
     pub status_reason: Option<String>,
+    /// How many of the source graph's vertices this export writes: the vertices the
+    /// request's `exportFilter` selects out of the graph's stored nodes, counted when
+    /// the task was accepted ([`exported_element_counts`]). An export reads ONE view of
+    /// the graph, so the number cannot drift with writes made to the graph after the
+    /// export was accepted.
+    pub exported_vertices: i64,
+    /// How many of the source graph's edges this export writes, counted the same way
+    /// and for the same reason as [`Self::exported_vertices`].
+    pub exported_edges: i64,
+    /// The `progressPercentage` the run had reached when a cancellation stopped it.
+    ///
+    /// `None` for a task nobody cancelled: only a run that was stopped short has a
+    /// progress that stays where it was, and the share of a run still in flight is
+    /// derived from the clock instead ([`Self::progress_percentage`]).
+    pub cancelled_progress: Option<i32>,
     pub tags: BTreeMap<String, String>,
     /// When the task was accepted: what `ExportTaskDetails$startTime` reports.
     pub start_time: SystemTime,
     /// The monotonic counterpart of [`Self::start_time`], which
     /// `ExportTaskDetails$timeElapsedSeconds` is measured from.
     pub started_at: Instant,
-    /// When the terminal status falls due. `None` once there is nothing outstanding.
+    /// When the next status of this task's progression falls due. `None` once there is
+    /// nothing outstanding.
     pub settles_at: Option<Instant>,
 }
 
@@ -944,32 +979,47 @@ impl ExportTask {
     /// Materialise the transition the clock has already made due.
     ///
     /// The same one write a reporting operation may make as [`Graph::settle`]: the task
-    /// would have ended at `settles_at` whether or not anybody called, so applying it
-    /// on read is bookkeeping rather than a state change caused by the read.
+    /// would have reached these statuses at these instants whether or not anybody
+    /// called, so applying them on read is bookkeeping rather than a state change caused
+    /// by the read.
     ///
-    /// Which status falls due is a property of the status the task is in
-    /// ([`ExportTaskStatus::settles_into`]), so an accepted task settles into the
-    /// failure no export run can avoid while an accepted cancellation settles into
-    /// `CANCELLED`.
+    /// Which status falls due, and how long after the one before it, are properties of
+    /// the status the task is in ([`ExportTaskStatus::settles_into`],
+    /// [`ExportTaskStatus::settles_in`]), so an accepted task runs and then completes
+    /// while an accepted cancellation settles into `CANCELLED`. Every status the clock
+    /// owed by `now` is applied, not just the next one: a task first read long after it
+    /// started reports the status it would have reached, never a phase it had already
+    /// left.
     pub fn settle(&mut self, now: Instant) {
-        if self.settles_at.is_none_or(|due| now < due) {
-            return;
+        while let Some(due) = self.settles_at {
+            if now < due {
+                return;
+            }
+            match self.status.settles_into() {
+                Some(settled) => {
+                    self.status = settled;
+                    self.status_reason = settled.reason().map(str::to_string);
+                    self.settles_at = settled.settles_in().map(|span| due + span);
+                }
+                None => self.settles_at = None,
+            }
         }
-        if let Some(settled) = self.status.settles_into() {
-            self.status = settled;
-            self.status_reason = settled.reason().map(str::to_string);
-        }
-        self.settles_at = None;
     }
 
     /// Accept a cancellation of this task: report the modelled `CANCELLING` status now
     /// ("The status is CANCELLING when the export task is cancelled") and let the clock
     /// owe the move to `CANCELLED` [`CANCELLATION_SPAN`] later, so a caller that reads
     /// the task straight after cancelling it still sees it winding down.
+    ///
+    /// The progress the run had reached is kept as it was at this instant: a stopped run
+    /// does no more work, so its share of the work done stops rising here.
     pub fn begin_cancellation(&mut self, now: Instant) {
+        self.cancelled_progress = Some(self.progress_percentage(now));
         self.status = ExportTaskStatus::Cancelling;
         self.status_reason = None;
-        self.settles_at = Some(now + CANCELLATION_SPAN);
+        self.settles_at = ExportTaskStatus::Cancelling
+            .settles_in()
+            .map(|span| now + span);
     }
 
     /// How long the task has been running, in whole seconds: what
@@ -979,19 +1029,57 @@ impl ExportTask {
             .unwrap_or(i64::MAX)
     }
 
-    /// The task's `ExportTaskDetails`, as of `now`.
+    /// The share of this task's work that is done, as of `now`: what
+    /// `ExportTaskDetails$progressPercentage` reports.
     ///
-    /// `progressPercentage` is zero and the written-element counts are ABSENT because
-    /// no export run happens here (see [`EXPORT_NOT_PERFORMED_REASON`]): no vertex or
-    /// edge was written, so there is no count to report rather than a count of zero
-    /// that would claim a run which wrote nothing.
+    /// The work is the RUN, so a task that has not begun its run reports none of it
+    /// done, a run in flight reports the share of its span that has elapsed — short of
+    /// the whole ([`MAX_IN_FLIGHT_PROGRESS_PERCENTAGE`]), because it has not finished —
+    /// and a completed run reports the whole of it. A run a cancellation stopped reports
+    /// where it had got to ([`Self::begin_cancellation`]).
+    pub fn progress_percentage(&self, now: Instant) -> i32 {
+        match self.status {
+            ExportTaskStatus::Initializing => 0,
+            ExportTaskStatus::Exporting => {
+                // The run begins one span after the task was accepted, which is when
+                // `INITIALIZING` falls due for `EXPORTING`.
+                let elapsed = now.saturating_duration_since(self.started_at + EXPORT_TASK_SPAN);
+                // Scaled by 100, the whole of the work ([`COMPLETE_PROGRESS_PERCENTAGE`]).
+                let share = elapsed.as_millis().saturating_mul(100)
+                    / EXPORT_TASK_SPAN.as_millis().max(1);
+                i32::try_from(share)
+                    .unwrap_or(MAX_IN_FLIGHT_PROGRESS_PERCENTAGE)
+                    .clamp(0, MAX_IN_FLIGHT_PROGRESS_PERCENTAGE)
+            }
+            ExportTaskStatus::Succeeded => COMPLETE_PROGRESS_PERCENTAGE,
+            ExportTaskStatus::Cancelling | ExportTaskStatus::Cancelled => {
+                self.cancelled_progress.unwrap_or(0)
+            }
+        }
+    }
+
+    /// The vertices and edges this task has WRITTEN, if any count can be reported yet.
+    ///
+    /// `numVerticesWritten` and `numEdgesWritten` are OPTIONAL members
+    /// (`smithy_query(query="shape",shape="ExportTaskDetails")`), so a task whose run
+    /// has not written the graph's elements — one still initializing or exporting, or
+    /// one a cancellation stopped — reports neither, rather than a zero that would claim
+    /// a completed run which wrote nothing.
+    fn written_elements(&self) -> Option<(i64, i64)> {
+        matches!(self.status, ExportTaskStatus::Succeeded)
+            .then_some((self.exported_vertices, self.exported_edges))
+    }
+
+    /// The task's `ExportTaskDetails`, as of `now`: the elements the export selected off
+    /// the stored graph, and the progress the clock has carried the run to.
     pub fn details(&self, now: Instant) -> crate::ops::types::ExportTaskDetails {
+        let written = self.written_elements();
         crate::ops::types::ExportTaskDetails {
             start_time: ::aws_smithy_types::DateTime::from(self.start_time),
             time_elapsed_seconds: self.elapsed_seconds(now),
-            progress_percentage: 0,
-            num_vertices_written: None,
-            num_edges_written: None,
+            progress_percentage: self.progress_percentage(now),
+            num_vertices_written: written.map(|(vertices, _)| vertices),
+            num_edges_written: written.map(|(_, edges)| edges),
         }
     }
 
@@ -1013,6 +1101,50 @@ impl ExportTask {
             export_filter: self.export_filter.clone(),
         }
     }
+}
+
+/// The vertices and the edges an export of `data` writes under `filter`.
+///
+/// "If the ExportFilter is not provided, then all properties for all labels will be
+/// exported. If the ExportFilter is provided but is an empty object, then no data will
+/// be exported" (`smithy_query(query="shape",shape="ExportFilter")`), and each of that
+/// shape's two members is a map keyed by LABEL, "used to specify filters on a per-label
+/// basis" for the vertices and for the edges respectively. So: an absent filter selects
+/// every element the graph holds; a supplied one selects exactly the elements carrying a
+/// label it names, which is why a filter that leaves a map out selects nothing on that
+/// side and an empty filter object exports nothing at all. A node carries several labels
+/// (openCypher allows it), so a node is selected when ANY of its labels is named.
+///
+/// The counts are what the export WRITES, so they are taken off the graph's stored data
+/// rather than guessed: an export of a graph holding nothing writes nothing, and one of
+/// a graph holding elements writes exactly those the filter admits.
+pub fn exported_element_counts(data: &GraphData, filter: Option<&ExportFilter>) -> (i64, i64) {
+    let Some(filter) = filter else {
+        return (
+            element_count(data.nodes.len()),
+            element_count(data.edges.len()),
+        );
+    };
+    let vertices = filter.vertex_filter.as_ref().map_or(0, |labels| {
+        data.nodes
+            .values()
+            .filter(|node| node.labels.iter().any(|label| labels.contains_key(label)))
+            .count()
+    });
+    let edges = filter.edge_filter.as_ref().map_or(0, |labels| {
+        data.edges
+            .values()
+            .filter(|edge| labels.contains_key(&edge.label))
+            .count()
+    });
+    (element_count(vertices), element_count(edges))
+}
+
+/// A stored element count as the modelled `Long` it is reported in. A graph's data is
+/// bounded well below `i64::MAX` ([`MAX_NODES_PER_GRAPH`], [`MAX_EDGES_PER_GRAPH`]), so
+/// the saturating fallback is unreachable rather than a choice about what to report.
+fn element_count(stored: usize) -> i64 {
+    i64::try_from(stored).unwrap_or(i64::MAX)
 }
 
 /// The `minProvisionedMemory` a request that names none gets, from the member's own
@@ -1416,7 +1548,7 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.export_tasks.insert(task.id.clone(), task);
     }
 
-    /// Apply the terminal transition the clock has made due, then borrow the export
+    /// Apply the transitions the clock has made due, then borrow the export
     /// task `id` names IN `region` — `None` when this Region holds no such task.
     pub fn settled_export_task(
         &mut self,
@@ -3804,81 +3936,113 @@ mod tests {
         }
     }
 
-    /// An export task's terminal status is owed by the CLOCK, not by the read: it
-    /// reports `INITIALIZING` until the span has passed, then `FAILED` carrying
-    /// [`EXPORT_NOT_PERFORMED_REASON`], and settling again changes nothing.
+    /// An export task's progression is owed by the CLOCK, not by the read: it reports
+    /// `INITIALIZING` until the first span has passed, `EXPORTING` while the run is in
+    /// flight, and then the terminal `SUCCEEDED` with no reason to explain — and
+    /// settling again changes nothing.
     ///
-    /// The rows span the instants a read can fall on, including the span's own bound
-    /// and one tick short of it, so the transient status cannot be skipped.
+    /// The rows span the instants a read can fall on, including each span's own bound
+    /// and one tick short of it, so no phase can be skipped, and one far beyond the last
+    /// phase, so a task first read long after it started still lands on the status it
+    /// would have reached.
     #[test]
-    fn an_export_task_settles_into_the_modelled_failure_state() {
+    fn an_export_task_settles_through_its_run_into_the_modelled_success_state() {
         let now = Instant::now();
         let tick = Duration::from_millis(1);
-        let task_at = |started: Instant| ExportTask {
-            id: "t-0123456789".to_string(),
-            arn: "arn:aws:neptune-graph:us-east-1:000000000000:export-task/t-0123456789"
-                .to_string(),
-            region: "us-east-1".to_string(),
-            source_graph_id: "g-0000000000".to_string(),
-            role_arn: "arn:aws:iam::000000000000:role/NeptuneExportRole".to_string(),
-            format: "CSV".to_string(),
-            parquet_type: None,
-            destination: "s3://export-bucket/nightly".to_string(),
-            kms_key_identifier:
-                "arn:aws:kms:us-east-1:000000000000:key/12345678-1234-1234-1234-123456789012"
-                    .to_string(),
-            export_filter: None,
-            status: ExportTaskStatus::Initializing,
-            status_reason: None,
-            tags: BTreeMap::new(),
-            start_time: SystemTime::now(),
-            started_at: started,
-            settles_at: Some(started + EXPORT_TASK_SPAN),
-        };
 
-        // (case, when the task is read, whether the terminal status is due by then)
-        let cases: &[(&str, Duration, bool)] = &[
-            ("read at once", Duration::ZERO, false),
-            ("read one tick in", tick, false),
-            ("read one tick before the span is out", EXPORT_TASK_SPAN - tick, false),
-            ("read when the span is out", EXPORT_TASK_SPAN, true),
-            ("read a span later", EXPORT_TASK_SPAN * 2, true),
+        // (case, when the task is read, the status due by then, the progress reported)
+        let cases: &[(&str, Duration, ExportTaskStatus, i32)] = &[
+            ("read at once", Duration::ZERO, ExportTaskStatus::Initializing, 0),
+            ("read one tick in", tick, ExportTaskStatus::Initializing, 0),
+            (
+                "read one tick before the run is due",
+                EXPORT_TASK_SPAN - tick,
+                ExportTaskStatus::Initializing,
+                0,
+            ),
+            (
+                "read when the run falls due",
+                EXPORT_TASK_SPAN,
+                ExportTaskStatus::Exporting,
+                0,
+            ),
+            (
+                "read halfway through the run",
+                EXPORT_TASK_SPAN + EXPORT_TASK_SPAN / 2,
+                ExportTaskStatus::Exporting,
+                50,
+            ),
+            (
+                "read one tick before the run is over",
+                EXPORT_TASK_SPAN * 2 - tick,
+                ExportTaskStatus::Exporting,
+                MAX_IN_FLIGHT_PROGRESS_PERCENTAGE,
+            ),
+            (
+                "read when the run is over",
+                EXPORT_TASK_SPAN * 2,
+                ExportTaskStatus::Succeeded,
+                COMPLETE_PROGRESS_PERCENTAGE,
+            ),
+            (
+                "read long after the run is over",
+                EXPORT_TASK_SPAN * 20,
+                ExportTaskStatus::Succeeded,
+                COMPLETE_PROGRESS_PERCENTAGE,
+            ),
         ];
-        for (case, after, terminal) in cases {
-            let mut task = task_at(now);
+        for (case, after, expected, progress) in cases {
+            let mut task = sample_export_task("t-0123456789", "g-0000000000");
+            task.started_at = now;
+            task.exported_vertices = 7;
+            task.exported_edges = 3;
+            task.settles_at = ExportTaskStatus::Initializing
+                .settles_in()
+                .map(|span| now + span);
+
             task.settle(now + *after);
-            let expected = if *terminal {
-                ExportTaskStatus::Failed
-            } else {
-                ExportTaskStatus::Initializing
-            };
             assert_eq!(
-                task.status, expected,
+                task.status, *expected,
                 "case {case:?}: expected {expected:?}, got {:?}",
                 task.status
             );
-            let expected_reason = if *terminal {
-                Some(EXPORT_NOT_PERFORMED_REASON.to_string())
+            assert_eq!(
+                task.status_reason, None,
+                "case {case:?}: a run that was not stopped short has nothing to \
+                 explain, got {:?}",
+                task.status_reason
+            );
+            let details = task.details(now + *after);
+            assert_eq!(
+                details.progress_percentage, *progress,
+                "case {case:?}: expected progressPercentage {progress}, got {}",
+                details.progress_percentage
+            );
+            // The elements are reported as WRITTEN only once the run is over.
+            let expected_counts = if *expected == ExportTaskStatus::Succeeded {
+                (Some(7), Some(3))
             } else {
-                None
+                (None, None)
             };
             assert_eq!(
-                task.status_reason, expected_reason,
-                "case {case:?}: expected the reason {expected_reason:?}, got {:?}",
-                task.status_reason
+                (details.num_vertices_written, details.num_edges_written),
+                expected_counts,
+                "case {case:?}: expected the written-element counts {expected_counts:?}, \
+                 got {:?}",
+                (details.num_vertices_written, details.num_edges_written)
             );
             assert_eq!(
                 task.elapsed_seconds(now + *after),
-                after.as_secs() as i64,
+                i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
                 "case {case:?}: expected the whole seconds since the task started, got {}",
                 task.elapsed_seconds(now + *after)
             );
 
-            // Settling again at the same instant leaves the record where it is: the
+            // Settling again at the same instant leaves the record where it is: each
             // transition is owed once, and a read never moves a record on by itself.
             task.settle(now + *after);
             assert_eq!(
-                task.status, expected,
+                task.status, *expected,
                 "case {case:?}: a second settle must not change the status, expected \
                  {expected:?}, got {:?}",
                 task.status
@@ -3886,9 +4050,9 @@ mod tests {
         }
     }
 
-    /// Which status an export task is owed, whether it can still be cancelled and the
-    /// reason it carries are all decided by the status it is in — one row per status
-    /// this slice stores.
+    /// Which status an export task is owed, how long after the status before it, whether
+    /// it can still be cancelled and the reason it carries are all decided by the status
+    /// it is in — one row per status this slice stores.
     #[test]
     fn an_export_task_status_decides_what_the_clock_still_owes_it() {
         /// One row: a stored status and everything it decides.
@@ -3897,6 +4061,7 @@ mod tests {
             cancellable: bool,
             terminal: bool,
             settles_into: Option<ExportTaskStatus>,
+            settles_in: Option<Duration>,
             reason: Option<&'static str>,
         }
 
@@ -3905,7 +4070,24 @@ mod tests {
                 status: ExportTaskStatus::Initializing,
                 cancellable: true,
                 terminal: false,
-                settles_into: Some(ExportTaskStatus::Failed),
+                settles_into: Some(ExportTaskStatus::Exporting),
+                settles_in: Some(EXPORT_TASK_SPAN),
+                reason: None,
+            },
+            Row {
+                status: ExportTaskStatus::Exporting,
+                cancellable: true,
+                terminal: false,
+                settles_into: Some(ExportTaskStatus::Succeeded),
+                settles_in: Some(EXPORT_TASK_SPAN),
+                reason: None,
+            },
+            Row {
+                status: ExportTaskStatus::Succeeded,
+                cancellable: false,
+                terminal: true,
+                settles_into: None,
+                settles_in: None,
                 reason: None,
             },
             Row {
@@ -3913,6 +4095,7 @@ mod tests {
                 cancellable: false,
                 terminal: false,
                 settles_into: Some(ExportTaskStatus::Cancelled),
+                settles_in: Some(CANCELLATION_SPAN),
                 reason: None,
             },
             Row {
@@ -3920,14 +4103,8 @@ mod tests {
                 cancellable: false,
                 terminal: true,
                 settles_into: None,
+                settles_in: None,
                 reason: Some(EXPORT_CANCELLED_REASON),
-            },
-            Row {
-                status: ExportTaskStatus::Failed,
-                cancellable: false,
-                terminal: true,
-                settles_into: None,
-                reason: Some(EXPORT_NOT_PERFORMED_REASON),
             },
         ];
         for row in cases {
@@ -3950,6 +4127,12 @@ mod tests {
                 "case {status:?}: expected it to settle into {:?}, got {actual:?}",
                 row.settles_into
             );
+            let actual = status.settles_in();
+            assert_eq!(
+                actual, row.settles_in,
+                "case {status:?}: expected it to settle in {:?}, got {actual:?}",
+                row.settles_in
+            );
             let actual = status.reason();
             assert_eq!(
                 actual, row.reason,
@@ -3960,7 +4143,7 @@ mod tests {
     }
 
     /// A cancelled export task reports the modelled transient status until the clock
-    /// makes its end due, and then stops `CANCELLED` — not the `FAILED` outcome the
+    /// makes its end due, and then stops `CANCELLED` — not the `SUCCEEDED` outcome the
     /// uncancelled task would have reached.
     ///
     /// The rows span the instants a read can fall on, including the span's own bound and
@@ -4013,6 +4196,152 @@ mod tests {
                 task.status_reason
             );
         }
+    }
+
+    /// What an export WRITES is the elements the request's filter selects out of the
+    /// source graph's stored data: all of them when no filter is supplied, exactly the
+    /// elements carrying a label the filter names when one is, and nothing when the
+    /// filter names no label on that side.
+    ///
+    /// The rows span the forms a filter takes — absent, empty, one side only, both
+    /// sides, a label the graph does not hold, a label shared by several elements — over
+    /// a graph holding multi-labelled nodes and edges of two labels.
+    #[test]
+    fn an_export_writes_the_elements_its_filter_selects_out_of_the_stored_graph() {
+        let as_of = SystemTime::UNIX_EPOCH;
+        let mut data = GraphData::empty(as_of);
+        for (id, labels) in [
+            ("n1", ["person"].as_slice()),
+            ("n2", ["person", "employee"].as_slice()),
+            ("n3", ["city"].as_slice()),
+        ] {
+            data.insert_node(
+                id,
+                GraphNode {
+                    labels: labels.iter().map(|label| (*label).to_string()).collect(),
+                    properties: BTreeMap::new(),
+                },
+                as_of,
+            )
+            .expect("the sample graph takes its nodes");
+        }
+        for (id, label, from, to) in [
+            ("e1", "knows", "n1", "n2"),
+            ("e2", "knows", "n2", "n1"),
+            ("e3", "livesIn", "n1", "n3"),
+        ] {
+            data.insert_edge(
+                id,
+                GraphEdge {
+                    label: label.to_string(),
+                    from_node: from.to_string(),
+                    to_node: to.to_string(),
+                    properties: BTreeMap::new(),
+                },
+                as_of,
+            )
+            .expect("the sample graph takes its edges");
+        }
+
+        /// A per-label filter map over `labels`, each label selecting every property of
+        /// the elements carrying it (`ExportFilterElement`'s `properties` is optional).
+        fn per_label(labels: &[&str]) -> HashMap<String, crate::ops::types::ExportFilterElement> {
+            labels
+                .iter()
+                .map(|label| {
+                    (
+                        (*label).to_string(),
+                        crate::ops::types::ExportFilterElement { properties: None },
+                    )
+                })
+                .collect()
+        }
+
+        // (case, the filter the request carries, the vertices written, the edges written)
+        let cases: Vec<(&str, Option<ExportFilter>, i64, i64)> = vec![
+            ("no filter at all exports every element", None, 3, 3),
+            (
+                "an empty filter object exports nothing",
+                Some(ExportFilter {
+                    vertex_filter: None,
+                    edge_filter: None,
+                }),
+                0,
+                0,
+            ),
+            (
+                "a vertex filter alone exports no edge",
+                Some(ExportFilter {
+                    vertex_filter: Some(per_label(&["person"])),
+                    edge_filter: None,
+                }),
+                2,
+                0,
+            ),
+            (
+                "an edge filter alone exports no vertex",
+                Some(ExportFilter {
+                    vertex_filter: None,
+                    edge_filter: Some(per_label(&["knows"])),
+                }),
+                0,
+                2,
+            ),
+            (
+                "both sides filtered on one label each",
+                Some(ExportFilter {
+                    vertex_filter: Some(per_label(&["city"])),
+                    edge_filter: Some(per_label(&["livesIn"])),
+                }),
+                1,
+                1,
+            ),
+            (
+                "a secondary label of a multi-labelled node",
+                Some(ExportFilter {
+                    vertex_filter: Some(per_label(&["employee"])),
+                    edge_filter: Some(per_label(&["knows", "livesIn"])),
+                }),
+                1,
+                3,
+            ),
+            (
+                "a label the graph does not hold selects nothing",
+                Some(ExportFilter {
+                    vertex_filter: Some(per_label(&["product"])),
+                    edge_filter: Some(per_label(&["bought"])),
+                }),
+                0,
+                0,
+            ),
+            (
+                "a filter naming no label at all selects nothing",
+                Some(ExportFilter {
+                    vertex_filter: Some(HashMap::new()),
+                    edge_filter: Some(HashMap::new()),
+                }),
+                0,
+                0,
+            ),
+        ];
+        for (case, filter, vertices, edges) in cases {
+            let actual = exported_element_counts(&data, filter.as_ref());
+            assert_eq!(
+                actual,
+                (vertices, edges),
+                "case {case:?}: expected {:?} vertices and edges written, got {actual:?}",
+                (vertices, edges)
+            );
+        }
+
+        // A graph holding nothing exports nothing, whatever the filter says.
+        let empty = GraphData::empty(as_of);
+        let actual = exported_element_counts(&empty, None);
+        assert_eq!(
+            actual,
+            (0, 0),
+            "case an empty graph: expected nothing written, got {actual:?}"
+        );
     }
 
     /// `destination` is an Amazon S3 URI: the `s3://` scheme and a bucket. The rows
@@ -5114,9 +5443,10 @@ mod tests {
         }
         for status in [
             ExportTaskStatus::Initializing,
+            ExportTaskStatus::Exporting,
+            ExportTaskStatus::Succeeded,
             ExportTaskStatus::Cancelling,
             ExportTaskStatus::Cancelled,
-            ExportTaskStatus::Failed,
         ] {
             let wire = status.as_wire();
             assert!(
@@ -5282,6 +5612,9 @@ mod tests {
             export_filter: None,
             status: ExportTaskStatus::Initializing,
             status_reason: None,
+            exported_vertices: 0,
+            exported_edges: 0,
+            cancelled_progress: None,
             tags: BTreeMap::new(),
             start_time: SystemTime::UNIX_EPOCH,
             started_at: now,

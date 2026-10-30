@@ -8,13 +8,13 @@
 //!
 //! The CONTROL plane is real: the task is a resource with a minted
 //! `^t-[a-z0-9]{10}$` id, the parameters the request chose, its tags and its status,
-//! and `GetExportTask` reads that record back. The RUN is not: an export reads a
-//! graph's vertices and edges and writes CSV or Parquet objects to Amazon S3 under the
-//! caller's KMS key, which needs a graph data plane and an outbound connection this
-//! emulator does not have. So nothing is read and nothing is written, and the clock
-//! owes the task the modelled `FAILED` status carrying
-//! [`crate::state::EXPORT_NOT_PERFORMED_REASON`] rather than a `SUCCEEDED` that would
-//! claim objects which do not exist.
+//! and `GetExportTask` reads that record back. The RUN is read off the STORED GRAPH:
+//! the elements the request's `exportFilter` selects out of the source graph's nodes
+//! and edges are counted here (`crate::state::exported_element_counts`) and reported as
+//! the written-element counts once the clock has carried the task through `EXPORTING`
+//! to `SUCCEEDED`. What this emulator does NOT do is put objects in the caller's bucket
+//! under the caller's KMS key: it makes no outbound connection, so `destination` and
+//! `kmsKeyIdentifier` are stored and reported rather than written to.
 //!
 //! ## Shape of an operation
 //!
@@ -267,6 +267,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let source_graph_id = graph.id.clone();
         let source_graph_status = graph.status;
+        // What this export writes: the elements of the source graph the request's filter
+        // selects, counted off the graph's stored data as the export is accepted, so the
+        // task reports the data it read rather than whatever the graph holds later.
+        let (exported_vertices, exported_edges) =
+            crate::state::exported_element_counts(&graph.data, input.export_filter.as_ref());
 
         // The store is shared and grows by one task per call, and a finished task stays
         // readable, so it has a ceiling (`crate::state::MAX_EXPORT_TASKS`). Checked
@@ -323,12 +328,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             destination: input.destination,
             kms_key_identifier: input.kms_key_identifier,
             export_filter: input.export_filter,
-            // No data has moved when the call returns; the clock owes the terminal
-            // status a fixed span later (`crate::state::EXPORT_TASK_SPAN`), which is
-            // `FAILED` because this emulator performs no export run.
+            // No element has been written when the call returns: the task reports the
+            // modelled `INITIALIZING` status, and the clock owes it the run
+            // (`EXPORTING`) one span later and the terminal `SUCCEEDED` a span after
+            // that, so a caller polling the export to completion observes each phase.
             status: crate::state::ExportTaskStatus::Initializing,
             status_reason: None,
-            settles_at: Some(now + crate::state::EXPORT_TASK_SPAN),
+            exported_vertices,
+            exported_edges,
+            cancelled_progress: None,
+            settles_at: crate::state::ExportTaskStatus::Initializing
+                .settles_in()
+                .map(|span| now + span),
             start_time: ::std::time::SystemTime::now(),
             started_at: now,
             tags: input.tags.unwrap_or_default().into_iter().collect(),

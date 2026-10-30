@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
 
-        // The lookup settles the transition the clock already made due first, so a task
+        // The lookup settles the transitions the clock already made due first, so a task
         // whose export has already stopped is judged on the status it stopped in rather
         // than on the status it was accepted with.
         let Some(task) = store.settled_export_task_mut(&input.task_identifier, &region, now)

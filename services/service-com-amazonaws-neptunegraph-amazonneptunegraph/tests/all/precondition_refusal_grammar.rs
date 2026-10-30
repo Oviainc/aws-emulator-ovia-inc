@@ -633,7 +633,7 @@ async fn a_record_refused_by_its_own_status_words_the_action_and_that_status() {
         &router,
         "a stopped export",
         &format!("/exporttasks/{settled_export_task}"),
-        "FAILED",
+        "SUCCEEDED",
     )
     .await;
     refuse_delete(
@@ -641,7 +641,7 @@ async fn a_record_refused_by_its_own_status_words_the_action_and_that_status() {
         "cancelling an export task that already stopped",
         &format!("/exporttasks/{settled_export_task}"),
         "cancel the export task",
-        "FAILED",
+        "SUCCEEDED",
         &[&settled_export_task, &export_graph],
     )
     .await;

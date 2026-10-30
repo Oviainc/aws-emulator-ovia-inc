@@ -347,7 +347,7 @@ async fn cancel_export_task_accepts_an_in_flight_export_and_the_clock_completes_
             started["exportFilter"], read["exportFilter"]
         );
 
-        // The clock settles the task into CANCELLED — not the FAILED outcome the
+        // The clock settles the task into CANCELLED — not the SUCCEEDED outcome the
         // uncancelled task would have reached — with a reason naming the cancellation.
         let stopped = wait_for_task_status(&router, case, &task_id, "CANCELLED").await;
         let reason = stopped["statusReason"].as_str().unwrap_or_default();
@@ -402,8 +402,8 @@ async fn cancellation_is_accepted_only_while_the_export_is_in_flight() {
             "ConflictException",
         ),
         (
-            "a task that stopped failed",
-            "FAILED",
+            "a task whose export ran to completion",
+            "SUCCEEDED",
             409,
             "ConflictException",
         ),
@@ -437,8 +437,8 @@ async fn cancellation_is_accepted_only_while_the_export_is_in_flight() {
                 }
             }
             other => {
-                assert_eq!(other, "FAILED", "case {case:?}: unknown starting status");
-                wait_for_task_status(&router, case, &task_id, "FAILED").await;
+                assert_eq!(other, "SUCCEEDED", "case {case:?}: unknown starting status");
+                wait_for_task_status(&router, case, &task_id, "SUCCEEDED").await;
             }
         }
 
@@ -573,7 +573,7 @@ async fn a_task_identifier_naming_no_export_task_of_this_region_is_refused() {
     );
     let actual = read["status"].as_str().unwrap_or_default();
     assert!(
-        ["INITIALIZING", "FAILED"].contains(&actual),
+        ["INITIALIZING", "EXPORTING", "SUCCEEDED"].contains(&actual),
         "case the stored task: a refused cancellation must leave it where the clock put \
          it, got {actual:?}"
     );
