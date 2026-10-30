@@ -15,14 +15,20 @@
 //!
 //! Every assertion goes over the router, so each case exercises routing, the handler, the
 //! persisted state and serialization — the same path a client takes. Each rule is observed
-//! where the emulator makes it observable: the `termToken` an acceptance answers, the
-//! inquiry id a create answers and the export id inside the document URL an export
-//! announces; and, for the bounded half, by what a minted id still reaches — the newest
-//! entry resolves and the oldest, released to make room for it, no longer does.
+//! where the emulator makes it observable: the inquiry id a create answers and the export
+//! id inside the document URL an export announces; and, for the bounded half, by what a
+//! caller still reaches — the newest entry resolves and the oldest, released to make room
+//! for it, no longer does.
+//!
+//! A term grant's id is minted by this rule too but is announced NOWHERE: what an
+//! acceptance answers is the grant's receipt, which is deliberately derivable from no
+//! counter (`term_grant_receipt.rs` pins that), so this suite asks the term-grant store
+//! only what a caller can observe of its ids — the order they are released in.
 //!
 //! The rows differ along what the rule generalises over: which store is keyed, its id
-//! prefix, whether that store releases an entry to make room, and how many ids are minted
-//! into it (the first few of a fresh store, every id up to its bound, and one past it).
+//! prefix, whether that store releases an entry to make room, whether a caller can observe
+//! the minted id at all, and how many ids are minted into it (the first few of a fresh
+//! store, every id up to its bound, and one past it).
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -59,23 +65,22 @@ const STORES: [Store; 3] = [Store::TermGrants, Store::Inquiries, Store::Exports]
 const BOUNDED_STORES: [Store; 2] = [Store::TermGrants, Store::Exports];
 
 impl Store {
-    /// The prefix the ids of this store carry, spelled out here rather than imported from
-    /// the crate so a changed prefix fails this suite instead of being read back out of
-    /// the code under test.
+    /// The prefix the ids of this store carry, where a caller can observe one of its ids
+    /// at all, spelled out here rather than imported from the crate so a changed prefix
+    /// fails this suite instead of being read back out of the code under test.
     ///
     /// An inquiry id's prefix is the literal part of `InquiryId`'s
     /// `^compliance-inquiry-[a-zA-Z0-9]{16}$`
     /// (`smithy_query(query="shape",shape="InquiryId")`), which the 16 hex digits
-    /// complete; a term token's is free within `GetReport$termToken`'s
-    /// `^[a-zA-Z0-9_\-\s]*$` within 1..256 bytes
-    /// (`smithy_query(query="operation",operation="GetReport")`); an export id is named
-    /// only inside the document URL an export announces, which the model constrains
-    /// nowhere.
-    fn prefix(self) -> &'static str {
+    /// complete; an export id is named only inside the document URL an export announces,
+    /// which the model constrains nowhere. A term grant's id is `None`: nothing announces
+    /// it — the `termToken` an acceptance answers is the grant's receipt and not its key —
+    /// so no fetch of this emulator can see its shape.
+    fn observable_prefix(self) -> Option<&'static str> {
         match self {
-            Store::TermGrants => "term",
-            Store::Inquiries => "compliance-inquiry",
-            Store::Exports => "export",
+            Store::TermGrants => None,
+            Store::Inquiries => Some("compliance-inquiry"),
+            Store::Exports => Some("export"),
         }
     }
 
@@ -92,9 +97,15 @@ impl Store {
     }
 }
 
-/// One id a store minted, and what the caller was handed to reach the entry it keys.
+/// One mint into a store: what the caller was handed to reach the entry, and the minted id
+/// itself where the caller can see it.
 struct Minted {
-    id: String,
+    /// What the caller presents to reach the entry: the id for a store whose key the
+    /// caller names, and the receipt for a term grant, whose key it is never told.
+    handle: String,
+    /// The minted id as the caller observes it, or `None` for a store that announces none
+    /// (see [`Store::observable_prefix`]).
+    id: Option<String>,
     /// The document URL an export was announced at; `None` for a store whose entry is
     /// reached by naming the id itself.
     url: Option<String>,
@@ -142,14 +153,19 @@ impl Fixture {
                     answer.status, answer.body
                 );
                 Minted {
-                    id: string_at(&answer, "termToken"),
+                    handle: string_at(&answer, "termToken"),
+                    id: None,
                     url: None,
                 }
             }
-            Store::Inquiries => Minted {
-                id: create_inquiry(&self.router).await,
-                url: None,
-            },
+            Store::Inquiries => {
+                let id = create_inquiry(&self.router).await;
+                Minted {
+                    handle: id.clone(),
+                    id: Some(id),
+                    url: None,
+                }
+            }
             Store::Exports => {
                 let answer = post(
                     &self.router,
@@ -163,8 +179,10 @@ impl Fixture {
                     answer.status, answer.body
                 );
                 let url = string_at(&answer, "documentPresignedUrl");
+                let id = export_id_in(&url);
                 Minted {
-                    id: export_id_in(&url),
+                    handle: id.clone(),
+                    id: Some(id),
                     url: Some(url),
                 }
             }
@@ -179,7 +197,7 @@ impl Fixture {
             Store::TermGrants => {
                 let answer = get_report(
                     &self.router,
-                    &format!("?reportId={}&termToken={}", self.report, minted.id),
+                    &format!("?reportId={}&termToken={}", self.report, minted.handle),
                 )
                 .await;
                 (answer.status, 200, 400)
@@ -189,7 +207,7 @@ impl Fixture {
                     &self.router,
                     &format!(
                         "/v1/compliance-inquiry/getMetadata?complianceInquiryId={}",
-                        minted.id
+                        minted.handle
                     ),
                 )
                 .await;
@@ -212,7 +230,7 @@ impl Fixture {
         assert_eq!(
             status, released,
             "{:?}: {:?} must either reach its entry or report it gone, got HTTP {status}",
-            self.store, minted.id
+            self.store, minted.handle
         );
         false
     }
@@ -309,40 +327,40 @@ fn is_minted_id(value: &str, prefix: &str) -> bool {
 async fn every_minted_store_id_carries_the_one_counter_shape() {
     for store in STORES {
         let fixture = fixture(store).await;
-        let prefix = store.prefix();
         let mut previous = String::new();
 
         for nth in 1..=MINTS_PER_STORE {
             let case = format!("{store:?}: mint {nth}");
             let minted = fixture.mint().await;
 
-            assert!(
-                is_minted_id(&minted.id, prefix),
-                "case {case:?}: expected {prefix:?} and 16 lower-case hex digits, got {:?}",
-                minted.id
-            );
-            assert_eq!(
-                minted.id,
-                expected_id(prefix, nth),
-                "case {case:?}: the counter advances once per mint, so the {nth} id must be \
-                 {:?}, got {:?}",
-                expected_id(prefix, nth),
-                minted.id
-            );
-            assert!(
-                minted.id > previous,
-                "case {case:?}: the ids must rise with the counter, so the store's first key \
-                 is its oldest entry; got {:?} after {previous:?}",
-                minted.id
-            );
+            // A store that announces none of its ids states this rule only through what
+            // those ids decide — the release order, below; the entry it minted must still
+            // be reachable by whatever the caller WAS handed.
+            if let (Some(prefix), Some(id)) = (store.observable_prefix(), minted.id.as_deref()) {
+                assert!(
+                    is_minted_id(id, prefix),
+                    "case {case:?}: expected {prefix:?} and 16 lower-case hex digits, got {id:?}"
+                );
+                assert_eq!(
+                    id,
+                    expected_id(prefix, nth),
+                    "case {case:?}: the counter advances once per mint, so the {nth} id must be \
+                     {:?}, got {id:?}",
+                    expected_id(prefix, nth)
+                );
+                assert!(
+                    id > previous.as_str(),
+                    "case {case:?}: the ids must rise with the counter, so the store's first key \
+                     is its oldest entry; got {id:?} after {previous:?}"
+                );
+                previous = id.to_string();
+            }
             assert!(
                 fixture.resolves(&minted).await,
                 "case {case:?}: the minted id must key the record it was minted for, and \
                  {:?} reaches none",
-                minted.id
+                minted.handle
             );
-
-            previous = minted.id;
         }
     }
 }
@@ -353,7 +371,6 @@ async fn a_bounded_store_releases_its_oldest_entry_to_make_room() {
         let capacity = store
             .capacity()
             .unwrap_or_else(|| panic!("{store:?} is a store that releases to make room"));
-        let prefix = store.prefix();
         let fixture = fixture(store).await;
 
         // Fill the store to its bound. Nothing has had to be released yet, so the first
@@ -362,43 +379,45 @@ async fn a_bounded_store_releases_its_oldest_entry_to_make_room() {
         for nth in 2..=capacity {
             let case = format!("{store:?}: mint {nth} of {capacity}");
             let minted = fixture.mint().await;
-            assert_eq!(
-                minted.id,
-                expected_id(prefix, nth),
-                "case {case:?}: expected {:?}, got {:?}",
-                expected_id(prefix, nth),
-                minted.id
-            );
+            if let (Some(prefix), Some(id)) = (store.observable_prefix(), minted.id.as_deref()) {
+                assert_eq!(
+                    id,
+                    expected_id(prefix, nth),
+                    "case {case:?}: expected {:?}, got {id:?}",
+                    expected_id(prefix, nth)
+                );
+            }
         }
         assert!(
             fixture.resolves(&oldest).await,
             "case {store:?}: a store filled to its bound has released nothing, yet {:?} \
              reaches no entry",
-            oldest.id
+            oldest.handle
         );
 
         // One mint past the bound: it is SERVED, it continues the one counter, and what it
         // cost is the OLDEST entry.
         let newest = fixture.mint().await;
         let past_the_bound = capacity + 1;
-        assert_eq!(
-            newest.id,
-            expected_id(prefix, past_the_bound),
-            "case {store:?}: reaching the bound releases rather than refuses, so mint \
-             {past_the_bound} must be {:?}, got {:?}",
-            expected_id(prefix, past_the_bound),
-            newest.id
-        );
+        if let (Some(prefix), Some(id)) = (store.observable_prefix(), newest.id.as_deref()) {
+            assert_eq!(
+                id,
+                expected_id(prefix, past_the_bound),
+                "case {store:?}: reaching the bound releases rather than refuses, so mint \
+                 {past_the_bound} must be {:?}, got {id:?}",
+                expected_id(prefix, past_the_bound)
+            );
+        }
         assert!(
             fixture.resolves(&newest).await,
             "case {store:?}: the newest entry must be held, yet {:?} reaches none",
-            newest.id
+            newest.handle
         );
         assert!(
             !fixture.resolves(&oldest).await,
             "case {store:?}: the oldest entry must have been released to make room, yet \
              {:?} still reaches one",
-            oldest.id
+            oldest.handle
         );
     }
 }

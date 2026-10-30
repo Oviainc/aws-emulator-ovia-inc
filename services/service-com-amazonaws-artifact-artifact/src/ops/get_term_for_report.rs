@@ -14,7 +14,11 @@
 //! never published.
 //!
 //! The grant store is bounded (`crate::state::TERM_GRANT_CAPACITY`), oldest released
-//! first, so repeated acceptance cannot grow the state without end. The emulator models
+//! first, so repeated acceptance cannot grow the state without end. The id that KEYS a
+//! grant is drawn from that bound's counter, but the `termToken` answered here is not: it
+//! is the receipt of this acceptance and the only thing that authorises a download of a
+//! report requiring it, so it is minted per call from a random source and a caller that
+//! accepted nothing can derive none. The emulator models
 //! no IAM, so the modelled `AccessDeniedException` is never raised here, and the grant
 //! records the term it covers rather than a principal: a pass is not a statement about
 //! an AWS-side authorisation decision.

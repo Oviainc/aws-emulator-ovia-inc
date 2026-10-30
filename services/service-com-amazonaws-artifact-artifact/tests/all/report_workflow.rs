@@ -618,7 +618,12 @@ async fn a_report_requiring_acceptance_downloads_only_under_a_term_grant_issued_
     // A token this service never issued is not a token: for a report whose acceptance
     // type requires the explicit acceptance of its term, no URL and a modelled 400.
     let gated = a_report_requiring_acceptance();
-    for bogus in ["bogus-token", "term-0000000000000000", "never_issued"] {
+    for bogus in [
+        "bogus-token",
+        "term-0000000000000000",
+        "term-0000000000000001",
+        "never_issued",
+    ] {
         let refused =
             get_report(&router, &format!("?reportId={}&termToken={bogus}", gated.id)).await;
         assert_eq!(

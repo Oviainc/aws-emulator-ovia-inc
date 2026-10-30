@@ -139,7 +139,7 @@ pub const AGREEMENT_TYPE_CUSTOM: &str = "CUSTOM";
 ///
 /// AWS publishes no bound on outstanding acceptances, so this is the emulator's OWN
 /// bound on its state rather than a claim about the service: it is what stops a caller
-/// accepting terms in a loop from growing `term_tokens` without end. It is set far above
+/// accepting terms in a loop from growing `term_grants` without end. It is set far above
 /// any workflow an emulator serves — a caller holds one grant per report version it
 /// downloads — and the seeded catalog publishes far fewer versions than this.
 pub const TERM_GRANT_CAPACITY: usize = 1_000;
@@ -711,9 +711,12 @@ impl CustomerAgreement {
 /// requested through.
 #[derive(Debug, Clone)]
 pub struct TermGrant {
-    /// The `termToken` handed to the caller. Matches `ShortStringAttribute`'s
-    /// `^[a-zA-Z0-9_\-\s]*$` within 1..256 bytes, which is what `GetReport`'s
-    /// `termToken` member admits.
+    /// The `termToken` handed to the caller: this acceptance's RECEIPT, and the one thing
+    /// that authorises a download of a report whose term it covers. Minted by the one
+    /// receipt rule ([`mint_download_receipt`]) rather than from the counter the grant's
+    /// store id comes from, so a caller that accepted nothing cannot derive it; its 32 hex
+    /// digits match `ShortStringAttribute`'s `^[a-zA-Z0-9_\-\s]*$` within 1..256 bytes,
+    /// which is what `GetReport`'s `termToken` member admits.
     pub token: String,
     /// The term document this acceptance covers, by its CONTENT digest — the grant's
     /// subject. Identity is the document's own bytes, so two reports governed by the same
@@ -1397,7 +1400,7 @@ pub struct InquiryExport {
     /// It is what the caller this export was handed to holds and nobody else does: the
     /// inquiry and export ids the URL's path names are minted from counters, so they are
     /// derivable by a caller that never called the control plane, while this is not
-    /// ([`mint_inquiry_export_token`]). Carried only inside the announced URL — whose
+    /// ([`mint_download_receipt`]). Carried only inside the announced URL — whose
     /// `PresignedUrl` shape is `@sensitive` — and never logged or answered on its own.
     pub download_token: String,
 }
@@ -1457,15 +1460,19 @@ pub struct ComAmazonawsArtifactArtifactState {
     /// The service-owned report catalog, keyed by report id. A `BTreeMap` is what gives
     /// `ListReports` the stable total order its pagination token indexes into.
     pub reports: BTreeMap<String, Report>,
-    /// Every term grant `GetTermForReport` has minted, keyed by its token.
+    /// Every term grant `GetTermForReport` has minted, keyed by the grant's own id.
     ///
-    /// A `BTreeMap` rather than a hash map because the tokens come from [`mint_counter_id`],
-    /// whose fixed-width hex ids make their lexicographic order their issue order — which
-    /// is what lets that one rule hold this map to [`TERM_GRANT_CAPACITY`] without
-    /// scanning it.
-    pub term_tokens: BTreeMap<String, TermGrant>,
-    /// The counter term tokens are minted from, so two calls never share a token.
-    pub term_token_seq: u64,
+    /// Keyed by that id and NOT by the receipt the caller was handed, exactly as
+    /// [`inquiry_exports`](Self::inquiry_exports) is: the id comes from
+    /// [`mint_counter_id`], and a `BTreeMap` rather than a hash map because that rule's
+    /// fixed-width hex ids make their lexicographic order their issue order — which is
+    /// what lets it hold this map to [`TERM_GRANT_CAPACITY`] without scanning it. A
+    /// counter-drawn value is derivable by a caller that was handed nothing, so it keys a
+    /// store and authorises nobody; what authorises a download is the receipt on the
+    /// record ([`TermGrant::token`]).
+    pub term_grants: BTreeMap<String, TermGrant>,
+    /// The counter grant ids are minted from, so two acceptances never share an id.
+    pub term_grant_seq: u64,
     /// The account's settings: what `PutAccountSettings` writes and
     /// `GetAccountSettings` reports.
     pub account_settings: AccountSettingsRecord,
@@ -1499,7 +1506,7 @@ pub struct ComAmazonawsArtifactArtifactState {
     pub customer_agreements: BTreeMap<String, CustomerAgreement>,
     /// Every document `ExportComplianceInquiry` has exported, keyed by its export id.
     ///
-    /// A `BTreeMap` for the same reason as [`term_tokens`](Self::term_tokens): the ids
+    /// A `BTreeMap` for the same reason as [`term_grants`](Self::term_grants): the ids
     /// come from [`mint_counter_id`], so the first entry is always the oldest export,
     /// which is what lets that one rule hold this map to [`INQUIRY_EXPORT_CAPACITY`]
     /// without scanning it.
@@ -1512,8 +1519,8 @@ impl Default for ComAmazonawsArtifactArtifactState {
     fn default() -> Self {
         Self {
             reports: seed_catalog(),
-            term_tokens: BTreeMap::new(),
-            term_token_seq: 0,
+            term_grants: BTreeMap::new(),
+            term_grant_seq: 0,
             account_settings: AccountSettingsRecord::default(),
             inquiries: BTreeMap::new(),
             inquiry_seq: 0,
@@ -1618,25 +1625,28 @@ impl ComAmazonawsArtifactArtifactState {
     /// The grant covers the TERM document governing `report`, so the token it returns
     /// authorises every version of every report that document governs.
     ///
-    /// The token is minted, and the store held to [`TERM_GRANT_CAPACITY`], by the one rule
-    /// ([`mint_counter_id`]): no OUTSTANDING grant ever shares a token with another —
-    /// which is what makes a grant the receipt for one acceptance — and a caller accepting
-    /// terms in a loop cannot grow this map without end, because the oldest grants are
-    /// released first.
+    /// The grant's ID is minted, and the store held to [`TERM_GRANT_CAPACITY`], by the one
+    /// rule ([`mint_counter_id`]): no OUTSTANDING grant ever shares an id with another, and
+    /// a caller accepting terms in a loop cannot grow this map without end, because the
+    /// oldest grants are released first. The TOKEN it answers with is minted separately, by
+    /// the one receipt rule ([`mint_download_receipt`]), because it is what authorises a
+    /// download: per acceptance, so a grant is the receipt for one acceptance, and drawn
+    /// from no counter, so a caller that accepted nothing cannot derive it.
     pub fn mint_term_grant(
         &mut self,
         report: &Report,
         report_version: i64,
         now: SystemTime,
     ) -> String {
-        let token = mint_counter_id(
-            &mut self.term_tokens,
-            &mut self.term_token_seq,
-            TERM_TOKEN_PREFIX,
+        let id = mint_counter_id(
+            &mut self.term_grants,
+            &mut self.term_grant_seq,
+            TERM_GRANT_ID_PREFIX,
             Some(TERM_GRANT_CAPACITY),
         );
-        self.term_tokens.insert(
-            token.clone(),
+        let token = mint_download_receipt();
+        self.term_grants.insert(
+            id,
             TermGrant {
                 token: token.clone(),
                 term_digest: report.term.digest.clone(),
@@ -1655,10 +1665,14 @@ impl ComAmazonawsArtifactArtifactState {
     /// identified by its document's CONTENT digest: the same term text, published for two
     /// reports, is one term, and two different texts are two terms whatever they are
     /// named.
+    ///
+    /// The grants are searched by the RECEIPT each holds rather than looked up by it,
+    /// because the store is keyed by the grant id its capacity rule needs
+    /// ([`term_grants`](Self::term_grants)) and a receipt is derivable from no key.
     pub fn grant_covers(&self, token: &str, report: &Report) -> bool {
-        self.term_tokens
-            .get(token)
-            .is_some_and(|grant| grant.term_digest == report.term.digest)
+        self.term_grants
+            .values()
+            .any(|grant| grant.token == token && grant.term_digest == report.term.digest)
     }
 
     /// Whether a download of `report` presenting `token` is authorised.
@@ -1767,7 +1781,7 @@ impl ComAmazonawsArtifactArtifactState {
         );
         // The receipt this export is handed out under, minted per export: two exports of
         // one inquiry are two documents, so they are authorised by two tokens.
-        let download_token = mint_inquiry_export_token();
+        let download_token = mint_download_receipt();
         self.inquiry_exports.insert(
             id.clone(),
             InquiryExport {
@@ -1802,13 +1816,19 @@ impl ComAmazonawsArtifactArtifactState {
     }
 }
 
-/// Mint the token one export's document URL carries.
+/// Mint the token one announced document URL carries.
+///
+/// The ONE place a download receipt of this service is minted, whichever plane announces
+/// the URL — the term grant a report download is authorised by and the download token an
+/// inquiry export's document is — so the two cannot disagree about what a receipt is.
 ///
 /// A receipt rather than a key into a store, so unlike [`mint_counter_id`] it is NOT drawn
 /// from a counter: a counter-minted token is derivable by a caller that was handed no URL,
 /// and a URL carrying only derivable values authorises nobody. It is a version-4 UUID's 32
-/// hex digits, which satisfy the one query-value encoding [`QUERY_VALUE`] admits unescaped.
-fn mint_inquiry_export_token() -> String {
+/// hex digits, which satisfy the one query-value encoding [`QUERY_VALUE`] admits unescaped
+/// and the `^[a-zA-Z0-9_\-\s]*$` within 1..256 bytes that `GetReport`'s `termToken` member
+/// admits.
+fn mint_download_receipt() -> String {
     ::uuid::Uuid::new_v4().simple().to_string()
 }
 
@@ -1836,10 +1856,10 @@ fn remember_token<R>(
     }
 }
 
-/// The prefix a term grant's token carries. `GetReport`'s `termToken` admits
-/// `^[a-zA-Z0-9_\-\s]*$`, which this and the hex digits [`mint_counter_id`] appends
-/// satisfy.
-const TERM_TOKEN_PREFIX: &str = "term";
+/// The prefix a term grant's ID carries — the id that KEYS the grant store, never the
+/// receipt the acceptance answers with ([`mint_download_receipt`]). The model constrains it
+/// nowhere, since nothing announces it, so it is spelled like the modelled id attributes.
+const TERM_GRANT_ID_PREFIX: &str = "term";
 
 /// The prefix a compliance inquiry's id carries — the literal part of `InquiryId`'s
 /// `^compliance-inquiry-[a-zA-Z0-9]{16}$`, which [`is_inquiry_id`] judges a value against.

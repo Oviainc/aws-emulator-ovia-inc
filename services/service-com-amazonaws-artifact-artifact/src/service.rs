@@ -114,7 +114,11 @@
 //! than to a dead locator. What the page says is the stored record and that the emulator
 //! published it — an AWS report's own contents are AWS's and are not invented here. That
 //! URL names the endpoint the CALLER reached this emulator on
-//! (`crate::state::document_url_host`), because this emulator is what serves it.
+//! (`crate::state::document_url_host`), because this emulator is what serves it. That
+//! plane is authorised by the SAME kind of receipt: the term grant's `termToken`
+//! (`crate::state::TermGrant::token`), minted per acceptance from no counter, is the one
+//! thing a caller that accepted the term holds, so a fetch of a gated document presenting
+//! anything derivable is refused `403` too.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::serde::SerializableStruct;

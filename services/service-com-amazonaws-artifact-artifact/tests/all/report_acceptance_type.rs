@@ -43,8 +43,12 @@ fn never_issued_tokens() -> Vec<(String, String)> {
     vec![
         ("a word".to_string(), "unaccepted".to_string()),
         (
-            "shaped like a minted token".to_string(),
+            "shaped like this service's counter-minted store ids".to_string(),
             "term-0000000000000000".to_string(),
+        ),
+        (
+            "the first value such a counter mints".to_string(),
+            "term-0000000000000001".to_string(),
         ),
         ("the shortest admitted".to_string(), "a".to_string()),
         ("the longest admitted".to_string(), "z".repeat(256)),
