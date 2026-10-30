@@ -97,7 +97,8 @@
 //! response unchanged). An answer served over HTTP/1.1 reaches a client WITHOUT it: the
 //! HTTP writer the vendored transport uses removes `content-length` from a `204`, which
 //! RFC 9110 §15.3.5 forbids there, and that writer is below anything this crate decides.
-//! `tests/all/empty_response_framing.rs` pins what this service states.
+//! `tests/all/empty_response_framing.rs` pins what this service states, and
+//! `tests/all/wire_probe.rs` pins what a socket then delivers.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::Schema;

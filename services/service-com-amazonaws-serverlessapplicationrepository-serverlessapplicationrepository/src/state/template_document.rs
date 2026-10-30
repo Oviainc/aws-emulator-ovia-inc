@@ -58,43 +58,65 @@ pub fn echoed(template: &Value) -> String {
     rendered
 }
 
-/// One node of the echo; see [`echoed`].
-fn render(value: &Value, out: &mut String) {
-    match value {
-        Value::Null => out.push_str("None"),
-        Value::Bool(true) => out.push_str("True"),
-        Value::Bool(false) => out.push_str("False"),
-        Value::Number(number) => out.push_str(&number.to_string()),
-        Value::String(text) => render_text(text, out),
-        Value::Array(items) => {
-            out.push('[');
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    out.push_str(", ");
+/// One step of the echo's worklist: a node still to render, a fixed piece of punctuation to
+/// emit after it, or a mapping key to quote.
+enum Step<'document> {
+    Node(&'document Value),
+    Literal(&'static str),
+    Key(&'document str),
+}
+
+/// The echo, rendered over an explicit worklist; see [`echoed`].
+///
+/// ITERATIVE, not recursive: the document is caller-supplied, so descending the tree on the
+/// call stack would spend the process stack on a depth the caller chose — and a stack
+/// overflow is not a catchable panic. The worklist holds at most a few entries per node of
+/// the document, whose node count the reader bounds before this runs, so the nesting costs
+/// heap instead.
+fn render(document: &Value, out: &mut String) {
+    let mut pending: Vec<Step<'_>> = vec![Step::Node(document)];
+    // The stack is last-in-first-out, so each node pushes what follows it BEFORE the parts
+    // of it, and its parts in reverse order.
+    while let Some(step) = pending.pop() {
+        match step {
+            Step::Literal(text) => out.push_str(text),
+            Step::Key(key) => render_text(key, out),
+            Step::Node(Value::Null) => out.push_str("None"),
+            Step::Node(Value::Bool(true)) => out.push_str("True"),
+            Step::Node(Value::Bool(false)) => out.push_str("False"),
+            Step::Node(Value::Number(number)) => out.push_str(&number.to_string()),
+            Step::Node(Value::String(text)) => render_text(text, out),
+            Step::Node(Value::Array(items)) => {
+                out.push('[');
+                pending.push(Step::Literal("]"));
+                for (index, item) in items.iter().enumerate().rev() {
+                    pending.push(Step::Node(item));
+                    if index > 0 {
+                        pending.push(Step::Literal(", "));
+                    }
                 }
-                render(item, out);
             }
-            out.push(']');
-        }
-        Value::Object(entries) => {
-            if entries.is_empty() {
-                out.push_str("OrderedDict()");
-                return;
-            }
-            // Sorted here rather than relying on the map's own iteration order, which is
-            // the one thing about the tree that depends on how `serde_json` was built.
-            let mut keyed: Vec<(&String, &Value)> = entries.iter().collect();
-            keyed.sort_by_key(|(key, _)| *key);
-            out.push_str("OrderedDict({");
-            for (index, (key, entry)) in keyed.into_iter().enumerate() {
-                if index > 0 {
-                    out.push_str(", ");
+            Step::Node(Value::Object(entries)) => {
+                if entries.is_empty() {
+                    out.push_str("OrderedDict()");
+                    continue;
                 }
-                render_text(key, out);
-                out.push_str(": ");
-                render(entry, out);
+                // Sorted here rather than relying on the map's own iteration order, which
+                // is the one thing about the tree that depends on how `serde_json` was
+                // built.
+                let mut keyed: Vec<(&String, &Value)> = entries.iter().collect();
+                keyed.sort_by_key(|(key, _)| *key);
+                out.push_str("OrderedDict({");
+                pending.push(Step::Literal("})"));
+                for (index, (key, entry)) in keyed.into_iter().enumerate().rev() {
+                    pending.push(Step::Node(entry));
+                    pending.push(Step::Literal(": "));
+                    pending.push(Step::Key(key));
+                    if index > 0 {
+                        pending.push(Step::Literal(", "));
+                    }
+                }
             }
-            out.push_str("})");
         }
     }
 }

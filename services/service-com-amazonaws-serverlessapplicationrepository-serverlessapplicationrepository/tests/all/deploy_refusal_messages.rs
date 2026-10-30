@@ -17,7 +17,13 @@
 //!    is refused 400 `BadRequestException` / `InvalidRequestException` with that path's
 //!    own FIXED sentence, which interpolates nothing from the request or the store — so
 //!    the same sentence comes back whatever application, name or region the request
-//!    carries — and the two deploy paths word it differently.
+//!    carries — and the two deploy paths word it differently;
+//! 3. a request naming a `TemplateId` no prepared template of the application carries is
+//!    refused 404 `NotFoundException` / `TemplateNotFoundException` with the sentence
+//!    "Template with id <TemplateId> can not be found." — fixed text whose ONLY variable
+//!    part is the `TemplateId` the request itself supplied, so the sentence names no other
+//!    resource — on EVERY operation that resolves a prepared template:
+//!    `GetCloudFormationTemplate` and `CreateCloudFormationChangeSet`.
 //!
 //! Only this service is mounted: every case below is refused before the handler reaches
 //! CloudFormation, so the refusal is this service's own answer.
@@ -25,6 +31,7 @@
 use serde_json::{json, Value};
 
 use crate::applications::{created, path_label, Answer, Repo};
+use crate::cloudformation_templates::read_template;
 use crate::version_templates::sam_template;
 
 /// `CreateCloudFormationChangeSet`: the fixed sentence for an application with no
@@ -347,5 +354,158 @@ async fn a_versionless_application_is_refused_with_each_deploy_paths_fixed_sente
         &json!("1.4.2"),
         "preparing a template of the latest version: expected 1.4.2, got {}",
         prepared.body
+    );
+}
+
+/// Which operation a row of RULE 3 drives. Both resolve a `TemplateId` the request names
+/// — `GetCloudFormationTemplate` reads the prepared template, `CreateCloudFormationChangeSet`
+/// deploys it — so both meet the same absence and answer it with the same sentence.
+#[derive(Debug, Clone, Copy)]
+enum TemplateReader {
+    GetCloudFormationTemplate,
+    CreateCloudFormationChangeSet,
+}
+
+/// Drive `reader` against `template_id` under `application_id`.
+async fn resolve_template(
+    repo: &Repo,
+    reader: TemplateReader,
+    application_id: &str,
+    template_id: &str,
+) -> Answer {
+    match reader {
+        TemplateReader::GetCloudFormationTemplate => {
+            read_template(repo, application_id, template_id).await
+        }
+        TemplateReader::CreateCloudFormationChangeSet => {
+            create_change_set(
+                repo,
+                application_id,
+                json!({ "stackName": "template-wording-stack", "templateId": template_id }),
+            )
+            .await
+        }
+    }
+}
+
+/// RULE 3: the 404 for a `TemplateId` no prepared template of the application carries is
+/// AWS's own fixed sentence, interpolating the requested `TemplateId` and nothing else.
+///
+/// The rows span the forms a `TemplateId` arrives in — the all-zero UUID, a UUID-shaped id
+/// this service never minted, the same id in upper case, a single character, a value that
+/// is no UUID at all, and a long one — plus the id of a template this service really DID
+/// prepare, for a different application, which is absent only in this context. Because the
+/// requested id is the sentence's only variable part, every row's message must differ from
+/// every other row's exactly as its id does, and no row's may name the application.
+#[tokio::test]
+async fn an_absent_prepared_template_is_refused_in_awss_own_words() {
+    let repo = Repo::new();
+    let application_id = created(&repo, "wording-template-app").await;
+    let published_version = repo
+        .create_version(&application_id, "1.0.0", sam_template("Queue"))
+        .await;
+    assert_eq!(
+        published_version.status, 201,
+        "publishing 1.0.0: expected 201, got {} with {}",
+        published_version.status, published_version.body
+    );
+
+    // A template this service really prepared, for ANOTHER application: a `TemplateId`
+    // that exists, and is still absent through the application below.
+    let other_id = created(&repo, "wording-other-template-app").await;
+    let other_version = repo
+        .create_version(&other_id, "1.0.0", sam_template("Queue"))
+        .await;
+    assert_eq!(
+        other_version.status, 201,
+        "publishing the other application's 1.0.0: expected 201, got {} with {}",
+        other_version.status, other_version.body
+    );
+    let other_prepared = create_template(&repo, &other_id, json!({})).await;
+    assert_eq!(
+        other_prepared.status, 201,
+        "preparing the other application's template: expected 201, got {} with {}",
+        other_prepared.status, other_prepared.body
+    );
+    let other_template_id = other_prepared
+        .at("templateId")
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // (case, the `TemplateId` the request names)
+    let ids: Vec<(&str, String)> = vec![
+        ("the all-zero UUID", "00000000-0000-0000-0000-000000000000".to_string()),
+        (
+            "a UUID-shaped id this service never minted",
+            "0ba3f2a9-1e42-4b2a-9f2a-1c0d9e7b5a31".to_string(),
+        ),
+        (
+            "that same id in upper case",
+            "0BA3F2A9-1E42-4B2A-9F2A-1C0D9E7B5A31".to_string(),
+        ),
+        ("another application's prepared template", other_template_id),
+        ("a value that is no UUID at all", "not-a-template-id".to_string()),
+        ("a single character", "7".to_string()),
+        ("a long id", "t".repeat(200)),
+    ];
+
+    let mut messages: Vec<String> = Vec::new();
+    for (row, template_id) in &ids {
+        for reader in [
+            TemplateReader::GetCloudFormationTemplate,
+            TemplateReader::CreateCloudFormationChangeSet,
+        ] {
+            let case = format!("{reader:?}: {row}");
+            let answer = resolve_template(&repo, reader, &application_id, template_id).await;
+            assert_eq!(
+                answer.status, 404,
+                "case {case:?}: expected 404, got {} with {}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.error_code(),
+                "NotFoundException",
+                "case {case:?}: expected the modelled NotFoundException, got {}",
+                answer.body
+            );
+            assert_eq!(
+                answer.at("errorCode"),
+                &json!("TemplateNotFoundException"),
+                "case {case:?}: the body's errorCode names the condition, got {}",
+                answer.body
+            );
+            let expected = format!("Template with id {template_id} can not be found.");
+            let message = answer.at("message").as_str().unwrap_or_default().to_string();
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+            // The template is the only resource the caller got wrong, so it is the only
+            // one the sentence names: neither the application it was asked for under nor
+            // any ARN belongs in it.
+            assert!(
+                !message.contains(&application_id) && !message.contains("arn:"),
+                "case {case:?}: the sentence names no resource but the template, got \
+                 {message:?}"
+            );
+            messages.push(message);
+        }
+    }
+
+    // One sentence per requested id, whichever operation answered it: the two operations
+    // that resolve a prepared template word this absence identically.
+    for pair in messages.chunks(2) {
+        assert_eq!(
+            pair.first(),
+            pair.last(),
+            "both operations word one absent template identically, got {pair:?}"
+        );
+    }
+    messages.dedup();
+    assert_eq!(
+        messages.len(),
+        ids.len(),
+        "each requested id is echoed into its own sentence, got {messages:?}"
     );
 }

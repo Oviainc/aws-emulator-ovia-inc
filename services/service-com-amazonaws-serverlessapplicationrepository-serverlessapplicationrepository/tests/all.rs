@@ -37,5 +37,7 @@ mod presigned_locators;
 mod state_roundtrip;
 #[path = "all/version_templates.rs"]
 mod version_templates;
+#[path = "all/wire_probe.rs"]
+mod wire_probe;
 #[path = "all/yaml_templates.rs"]
 mod yaml_templates;

@@ -1046,6 +1046,19 @@ pub fn version_not_found_message(application_id: &str, semantic_version: &str) -
     format!("Application {application_id} does not have a version {semantic_version}")
 }
 
+/// The wording a 404 carries for a prepared template the store does not hold, naming the
+/// `TemplateId` the caller asked for and nothing else.
+///
+/// Stated once here because every operation that resolves a prepared template —
+/// GetCloudFormationTemplate and CreateCloudFormationChangeSet — answers the same
+/// condition about the same subject: the template the request named. The fixed text is
+/// "Template with id " … " can not be found.", and the `TemplateId` the request carried in
+/// its URI or body is its ONLY variable part: no other resource is named, because no other
+/// resource is the one the caller got wrong.
+pub fn template_not_found_message(template_id: &str) -> String {
+    format!("Template with id {template_id} can not be found.")
+}
+
 /// The documented ceiling on `Labels`: "Maximum number of labels: 10"
 /// (`smithy_query(query="doc", shape="CreateApplicationRequest", member="Labels")`).
 pub const MAX_LABELS: usize = 10;
@@ -1737,8 +1750,10 @@ pub fn declares_transform(template: &::serde_json::Value) -> bool {
 /// exactly ONCE — building an identifier -> referencing-resources index that every
 /// parameter then looks itself up in. The cost is linear in the template
 /// (`O(resources + parameters)`), not the product of the two, so no accepted template
-/// can occupy a worker for longer than its own size warrants. Recursion depth is
-/// bounded by `serde_json`'s own nesting limit, which rejects the body before this runs.
+/// can occupy a worker for longer than its own size warrants. No walk over the parsed
+/// document RECURSES: every one below carries an explicit worklist, so a document's
+/// nesting costs heap (bounded by the node count the shared reader caps) rather than the
+/// process stack, whichever of the two forms the body arrived in.
 ///
 /// Both the parameters and each one's referencing resources come back sorted by name, so
 /// two reads of one stored template answer identically.
@@ -1978,25 +1993,27 @@ fn reference_index(
 /// An identifier that names something other than a parameter (a resource, a
 /// pseudo-parameter) is collected too and simply matches no parameter, which keeps this
 /// one walk independent of the parameter list.
+///
+/// The walk is ITERATIVE, over an explicit worklist: the document is caller-supplied, so
+/// recursing once per level it nests would spend the process stack on a depth the caller
+/// chose — and a stack overflow is not a catchable panic. The worklist cannot outgrow the
+/// document's node count, which the shared reader bounds before this runs.
 fn collect_references(value: &::serde_json::Value, out: &mut BTreeSet<String>) {
-    match value {
-        ::serde_json::Value::Object(fields) => {
-            if let Some(name) = fields.get("Ref").and_then(|r| r.as_str()) {
-                out.insert(name.to_string());
+    let mut pending: Vec<&::serde_json::Value> = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            ::serde_json::Value::Object(fields) => {
+                if let Some(name) = fields.get("Ref").and_then(|r| r.as_str()) {
+                    out.insert(name.to_string());
+                }
+                if let Some(substitution) = fields.get("Fn::Sub") {
+                    collect_substitutions(substitution, out);
+                }
+                pending.extend(fields.values());
             }
-            if let Some(substitution) = fields.get("Fn::Sub") {
-                collect_substitutions(substitution, out);
-            }
-            for nested in fields.values() {
-                collect_references(nested, out);
-            }
+            ::serde_json::Value::Array(elements) => pending.extend(elements.iter()),
+            _ => {}
         }
-        ::serde_json::Value::Array(elements) => {
-            for nested in elements {
-                collect_references(nested, out);
-            }
-        }
-        _ => {}
     }
 }
 

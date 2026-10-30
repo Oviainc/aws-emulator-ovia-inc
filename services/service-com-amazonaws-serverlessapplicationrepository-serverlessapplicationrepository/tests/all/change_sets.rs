@@ -997,7 +997,7 @@ async fn a_change_set_is_refused_when_no_published_version_is_named() {
             404,
             "NotFoundException",
             "TemplateNotFoundException",
-            "could not be found for application",
+            "Template with id 0ba3f2a9-1e42-4b2a-9f2a-1c0d9e7b5a31 can not be found.",
         ),
         (
             "a Capabilities value outside the documented set",

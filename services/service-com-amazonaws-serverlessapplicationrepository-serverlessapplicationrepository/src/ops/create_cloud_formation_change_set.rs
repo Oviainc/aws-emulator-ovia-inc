@@ -248,11 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     else {
                         return Err(not_found(
                             crate::state::ErrorCode::TemplateNotFound,
-                            format!(
-                                "Template with id {template_id} could not be found for \
-                                 application {}.",
-                                input.application_id
-                            ),
+                            crate::state::template_not_found_message(template_id),
                         ));
                     };
                     // Only a prepared template can be deployed: one still `PREPARING` is

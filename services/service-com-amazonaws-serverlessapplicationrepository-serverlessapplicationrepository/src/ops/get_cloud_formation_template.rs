@@ -165,10 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(template) = store.template_of(&input.application_id, &input.template_id) else {
             return Err(not_found(
                 crate::state::ErrorCode::TemplateNotFound,
-                format!(
-                    "Template with id {} could not be found for application {}.",
-                    input.template_id, input.application_id
-                ),
+                crate::state::template_not_found_message(&input.template_id),
             ));
         };
 

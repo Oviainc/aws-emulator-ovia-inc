@@ -61,7 +61,11 @@ async fn prepare(repo: &Repo, application_id: &str, semantic_version: Option<&st
 }
 
 /// Read a prepared template back.
-async fn read_template(repo: &Repo, application_id: &str, template_id: &str) -> Answer {
+///
+/// `pub(crate)` because the wording of the 404 this read answers for a template the store
+/// does not hold is a rule of its own, asserted in `deploy_refusal_messages.rs` beside the
+/// other refusal wordings rather than through a second copy of this call.
+pub(crate) async fn read_template(repo: &Repo, application_id: &str, template_id: &str) -> Answer {
     let path = format!(
         "/applications/{}/templates/{}",
         path_label(application_id),
