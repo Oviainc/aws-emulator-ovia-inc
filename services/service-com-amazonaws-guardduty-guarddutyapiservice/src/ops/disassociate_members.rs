@@ -9,10 +9,16 @@
 //! account, the delegated administrator must invoke the DeleteMembers API" (the
 //! modelled contract below).
 //!
-//! An account id the administrator is not associated with — one it holds no member
-//! record for, and one a disassociation already moved — is reported in
+//! An account id the administrator is not ASSOCIATED with — one it holds no member
+//! record for, one it has recorded and not invited yet, and one a disassociation
+//! already moved — is reported in
 //! `UnprocessedAccounts` with the reason it was not processed, which is what that
-//! member is for; the call still succeeds with HTTP 200. A value that cannot be an
+//! member is for; the call still succeeds with HTTP 200. The invitation is what
+//! associates a recorded account with its administrator: `ListMembers` narrows to
+//! "only ... associated members or ... all members (including members who haven't
+//! been invited yet or have been disassociated)"
+//! (`smithy_query(query="doc",shape="ListMembersRequest",member="OnlyAssociated")`),
+//! so those two classes are the ones there is no association to end for. A value that cannot be an
 //! account id at all, or a `DetectorId` this account/Region does not own, is a
 //! request the service does not understand and is refused with HTTP 400 under the
 //! `InvalidInputException` class.

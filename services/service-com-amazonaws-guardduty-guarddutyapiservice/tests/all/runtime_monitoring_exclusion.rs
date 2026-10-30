@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 use crate::detector_lifecycle::{
     call, create_detector, enabled_detector, error_code, error_shape, new_router, Router,
 };
-use crate::member_association::{create_members, MEMBERS};
+use crate::member_association::{create_members, invite_members, MEMBERS};
 use crate::member_detector_configuration::{get_member_detectors, update_member_detectors};
 
 /// The modelled error SHAPE every GuardDuty client rejection is enveloped in, as
@@ -237,6 +237,14 @@ async fn an_update_of_a_member_account_is_judged_on_the_configuration_it_leaves_
             "case {:?}: create-members expected 200, got {status} {body:?}",
             row.case
         );
+        // The invitation associates the accounts, which is what makes their
+        // detectors ones the administrator configures.
+        let (status, body) = invite_members(&router, &detector_id, &[member_id, other_id]).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: invite-members expected 200, got {status} {body:?}",
+            row.case
+        );
         if let Some(setup) = row.setup.as_ref() {
             // Applied to BOTH accounts the row's own call names: the call configures
             // every account it names, so it is judged against each of them.
@@ -309,6 +317,13 @@ async fn one_account_the_list_cannot_configure_refuses_the_whole_call() {
     assert_eq!(
         status, 200,
         "create-members: expected 200, got {status} {body:?}"
+    );
+    // The invitation associates the accounts, which is what makes their detectors
+    // ones the administrator configures.
+    let (status, body) = invite_members(&router, &detector_id, &[prepared_id, default_id]).await;
+    assert_eq!(
+        status, 200,
+        "invite-members: expected 200, got {status} {body:?}"
     );
 
     // Only one of the two accounts has EKS Runtime Monitoring switched off, so only

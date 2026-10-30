@@ -153,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx);
-        let administrator = crate::state::administrator_account_id();
 
         // Parameter failures first: a value that cannot be a value of its member at
         // all is refused whatever the store holds, because `UnprocessedAccounts`
@@ -188,13 +187,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             match detector.members.get(account_id) {
-                // Only an account ASSOCIATED with this administrator is monitored
-                // under it, so only that account's configuration is reported here.
+                // Only an account ASSOCIATED with this administrator has a detector
+                // the administrator maintains, so only that account's configuration
+                // is reported here.
                 Some(member) if member.is_associated() => configurations
                     .push(crate::state::member_data_source_configuration_view(member)),
                 _ => unprocessed.push(UnprocessedAccount {
                     account_id: account_id.clone(),
-                    result: crate::state::not_a_member_message(&administrator),
+                    result: crate::state::NOT_AN_ASSOCIATED_MEMBER_MESSAGE.to_string(),
                 }),
             }
         }

@@ -41,8 +41,9 @@ use crate::detector_lifecycle::{
 // The member-suite table, helpers and projections live in one place, so the member
 // suites cannot drift on what a malformed or non-member account id is.
 use crate::member_association::{
-    administrator, create_members, disassociate_members, get_members, member_of, not_a_member,
+    administrator, create_members, disassociate_members, get_members, invite_members, member_of,
     unprocessed_ids, unprocessed_result, MALFORMED_ACCOUNT_IDS, MEMBERS, NON_MEMBER_ACCOUNT_IDS,
+    NOT_AN_ASSOCIATED_MEMBER,
 };
 
 /// The modelled error SHAPE every GuardDuty client rejection is enveloped in, as
@@ -144,7 +145,9 @@ pub(crate) async fn get_member_detectors(
     .await
 }
 
-/// Create an enabled detector and record [`MEMBERS`] against it, returning the
+/// Create an enabled detector, record [`MEMBERS`] against it and INVITE them —
+/// which is what associates a recorded account with its administrator, and so what
+/// makes its detector one the administrator configures from here — returning the
 /// detector id.
 async fn detector_with_members(router: &Router) -> String {
     let detector_id = enabled_detector(router).await;
@@ -156,6 +159,16 @@ async fn detector_with_members(router: &Router) -> String {
     assert!(
         unprocessed_ids(&body).is_empty(),
         "create-members: expected every account processed, got {body:?}"
+    );
+    let ids: Vec<&str> = MEMBERS.iter().map(|(id, _)| *id).collect();
+    let (status, body) = invite_members(router, &detector_id, &ids).await;
+    assert_eq!(
+        status, 200,
+        "invite-members: expected 200, got {status} {body:?}"
+    );
+    assert!(
+        unprocessed_ids(&body).is_empty(),
+        "invite-members: expected every account processed, got {body:?}"
     );
     detector_id
 }
@@ -641,19 +654,28 @@ async fn configuring_a_member_leaves_its_member_record_alone() {
 async fn an_account_that_is_not_an_associated_member_is_reported_by_both_operations() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
-    let reason = not_a_member();
+    let reason = NOT_AN_ASSOCIATED_MEMBER;
 
     // The administrator's own account is not one of its members either, so it is a
-    // row of this table beside the ids nothing recorded, and so is a member a
-    // disassociation already moved.
+    // row of this table beside the ids nothing recorded, and so are a member a
+    // disassociation already moved and one recorded and not invited yet.
     let administrator = administrator();
     let (disassociated, _) = MEMBERS[1];
-    let (status, _) = disassociate_members(&router, &detector_id, &[disassociated]).await;
+    let (status, body) = disassociate_members(&router, &detector_id, &[disassociated]).await;
     assert_eq!(status, 200, "disassociate: expected 200, got {status}");
+    assert!(
+        unprocessed_ids(&body).is_empty(),
+        "disassociate: expected an invited member processed, got {body:?}"
+    );
+    let recorded_only = "707070707070";
+    let (status, body) =
+        create_members(&router, &detector_id, &[(recorded_only, "recorded@example.com")]).await;
+    assert_eq!(status, 200, "create-members: expected 200, got {status} {body:?}");
 
     let mut rows: Vec<(&str, &str)> = NON_MEMBER_ACCOUNT_IDS.to_vec();
     rows.push((administrator.as_str(), "the administrator's own account"));
     rows.push((disassociated, "a member a disassociation already moved"));
+    rows.push((recorded_only, "a member recorded and not invited yet"));
 
     for (account_id, why) in rows {
         for operation in ["update", "get"] {
@@ -680,7 +702,7 @@ async fn an_account_that_is_not_an_associated_member_is_reported_by_both_operati
             );
             assert_eq!(
                 unprocessed_result(&body, account_id).as_deref(),
-                Some(reason.as_str()),
+                Some(reason),
                 "case {operation} {account_id} ({why}): expected the not-a-member reason, got {body:?}"
             );
             assert!(

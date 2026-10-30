@@ -151,6 +151,8 @@ mod member_monitoring;
 mod member_monitoring_restart;
 #[path = "all/member_organization_auto_enable.rs"]
 mod member_organization_auto_enable;
+#[path = "all/member_relationship_scope.rs"]
+mod member_relationship_scope;
 #[path = "all/modeled_constraint_refusals.rs"]
 mod modeled_constraint_refusals;
 #[path = "all/negative_class_rejections.rs"]

@@ -10,14 +10,16 @@
 //! The rules under test, each asserted over a SET of inputs rather than one recorded
 //! call:
 //!
-//! 1. An account the administrator is not ASSOCIATED with is not an error: the
-//!    call answers HTTP 200 and names the account in `unprocessedAccounts` with the
-//!    reason it was not processed — once per DISTINCT id, in request order — and
-//!    persists nothing for it.
-//! 2. Disassociating a member moves only the RELATIONSHIP: the record is retained,
-//!    so `GetMembers` still reports the account and its email with
+//! 1. An account the administrator is not ASSOCIATED with — one it holds no member
+//!    record for, one it has recorded and not invited yet, and one a disassociation
+//!    already moved — is not an error: the call answers HTTP 200 and names the
+//!    account in `unprocessedAccounts` with the reason it was not processed — once
+//!    per DISTINCT id, in request order — and persists nothing for it.
+//! 2. An invitation is what associates a recorded account with its administrator,
+//!    and disassociating a member moves only the RELATIONSHIP: the record is
+//!    retained, so `GetMembers` still reports the account and its email with
 //!    `relationshipStatus` `Removed`. A second disassociation changes nothing, and
-//!    re-creating the account associates it again.
+//!    re-creating the account records it afresh.
 //! 3. A value that cannot be an account id at all, an email address breaking one of
 //!    the rules `AccountDetail.Email` documents, and a `DetectorId` this
 //!    account/Region does not own are each refused with HTTP 400 under the
@@ -79,18 +81,24 @@ pub(crate) fn administrator() -> String {
     ::engine::emulator_account_id().to_string()
 }
 
-/// The reason `GetMembers` reports an account with no member record with.
-pub(crate) fn not_a_member() -> String {
-    format!(
-        "The request is rejected because the given account ID is not an associated member of account {}.",
-        administrator()
-    )
-}
+/// The reason the member operations report an account that is not an ASSOCIATED
+/// member of the current account with — one with no member record, one recorded and
+/// not invited yet, one whose invitation the account has not answered, and one a
+/// disassociation moved.
+///
+/// GuardDuty's wording is FIXED text: it names the administrator as "the current
+/// account" and carries no account id, so the sentence is the same whatever account
+/// the emulator serves.
+pub(crate) const NOT_AN_ASSOCIATED_MEMBER: &str = "The request is rejected because the given account ID is not an associated member of the current account.";
+
+/// The reason `DeleteMembers` reports an account whose member record it did not
+/// drop with: GuardDuty's fixed text, which also carries no account id.
+pub(crate) const MEMBER_NOT_DELETED: &str = "The request is rejected because the current account cannot delete the given member account ID since it is still associated to it.";
 
 /// The reason `DisassociateMembers` reports an account that is not associated with
-/// the administrator with — one with no member record, and one a disassociation
-/// already moved.
-const NOT_ASSOCIATED: &str = "The request is rejected because the current account cannot disassociate the given member account ID since the latter is not yet associated to it.";
+/// the administrator with — one with no member record, one recorded and not invited
+/// yet, and one a disassociation already moved.
+pub(crate) const NOT_ASSOCIATED: &str = "The request is rejected because the current account cannot disassociate the given member account ID since the latter is not yet associated to it.";
 
 /// The message a value that cannot be a value of `member` is refused with.
 fn invalid_parameter(member: &str) -> String {
@@ -187,6 +195,24 @@ pub(crate) async fn disassociate_members(
     .await
 }
 
+/// `InviteMembers` over the wire, with no announcement members: the one call that
+/// moves a recorded account into a relationship with its administrator, so the
+/// suites that need an ASSOCIATED member send it from here rather than each
+/// building its own.
+pub(crate) async fn invite_members(
+    router: &Router,
+    detector_id: &str,
+    account_ids: &[&str],
+) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        &format!("/detector/{detector_id}/member/invite"),
+        Some(json!({"accountIds": account_ids})),
+    )
+    .await
+}
+
 /// The `members` entry for `account_id`, if the response carries one.
 pub(crate) fn member_of(body: &Value, account_id: &str) -> Option<Value> {
     body["members"]
@@ -229,6 +255,24 @@ async fn detector_with_members(router: &Router) -> String {
     assert!(
         unprocessed_ids(&body).is_empty(),
         "create-members: expected every account processed, got {body:?}"
+    );
+    detector_id
+}
+
+/// [`detector_with_members`] with every member INVITED, which is what associates a
+/// recorded account with its administrator: the operations that act on the
+/// association process a member only from the invitation on.
+pub(crate) async fn detector_with_invited_members(router: &Router) -> String {
+    let detector_id = detector_with_members(router).await;
+    let ids: Vec<&str> = MEMBERS.iter().map(|(id, _)| *id).collect();
+    let (status, body) = invite_members(router, &detector_id, &ids).await;
+    assert_eq!(
+        status, 200,
+        "invite-members: expected 200, got {status} {body:?}"
+    );
+    assert!(
+        unprocessed_ids(&body).is_empty(),
+        "invite-members: expected every account processed, got {body:?}"
     );
     detector_id
 }
@@ -288,6 +332,23 @@ async fn the_member_association_loop_is_observable_through_stored_state() {
         );
     }
 
+    // An invitation is what associates a recorded account with this administrator:
+    // only from there on is there an association to end.
+    let (status, invited) = invite_members(&router, &detector_id, &all_ids).await;
+    assert_eq!(
+        status, 200,
+        "invite-members: expected 200, got {status} {invited:?}"
+    );
+    assert!(
+        unprocessed_ids(&invited).is_empty(),
+        "invite-members: expected every member processed, got {invited:?}"
+    );
+    let (status, created) = get_members(&router, &detector_id, &all_ids).await;
+    assert_eq!(
+        status, 200,
+        "get-members after invite: expected 200, got {status} {created:?}"
+    );
+
     // Disassociate a strict SUBSET, so the call is observable both ways.
     let disassociated: Vec<&str> = MEMBERS.iter().take(2).map(|(id, _)| *id).collect();
     let (status, body) = disassociate_members(&router, &detector_id, &disassociated).await;
@@ -309,7 +370,7 @@ async fn the_member_association_loop_is_observable_through_stored_state() {
         let expected_status = if disassociated.contains(&account_id) {
             "Removed"
         } else {
-            "Created"
+            "Invited"
         };
         let member = member_of(&after, account_id).unwrap_or_else(|| {
             panic!("case {account_id}: expected the record to be retained, got {after:?}")
@@ -342,11 +403,15 @@ async fn the_member_association_loop_is_observable_through_stored_state() {
 #[tokio::test]
 async fn disassociating_a_member_twice_changes_nothing_more() {
     let router = new_router();
-    let detector_id = detector_with_members(&router).await;
+    let detector_id = detector_with_invited_members(&router).await;
     let (account_id, email) = MEMBERS[0];
 
-    let (status, _) = disassociate_members(&router, &detector_id, &[account_id]).await;
+    let (status, body) = disassociate_members(&router, &detector_id, &[account_id]).await;
     assert_eq!(status, 200, "first disassociate: expected 200, got {status}");
+    assert!(
+        unprocessed_ids(&body).is_empty(),
+        "first disassociate: expected an invited member processed, got {body:?}"
+    );
     let (_, once) = get_members(&router, &detector_id, &[account_id]).await;
     let first = member_of(&once, account_id)
         .unwrap_or_else(|| panic!("case {account_id}: expected a member, got {once:?}"));
@@ -376,14 +441,18 @@ async fn disassociating_a_member_twice_changes_nothing_more() {
 }
 
 #[tokio::test]
-async fn recreating_a_disassociated_account_associates_it_again() {
+async fn recreating_a_disassociated_account_records_it_again() {
     let router = new_router();
-    let detector_id = detector_with_members(&router).await;
+    let detector_id = detector_with_invited_members(&router).await;
     let (account_id, email) = MEMBERS[1];
     let new_email = "renamed@example.net";
 
-    let (status, _) = disassociate_members(&router, &detector_id, &[account_id]).await;
+    let (status, body) = disassociate_members(&router, &detector_id, &[account_id]).await;
     assert_eq!(status, 200, "disassociate: expected 200, got {status}");
+    assert!(
+        unprocessed_ids(&body).is_empty(),
+        "disassociate: expected an invited member processed, got {body:?}"
+    );
 
     // "You can create an association with these member accounts again only by
     // calling the CreateMembers API" — and the call records the details it carries,
@@ -404,7 +473,7 @@ async fn recreating_a_disassociated_account_associates_it_again() {
     assert_eq!(
         member["relationshipStatus"].as_str(),
         Some("Created"),
-        "case {account_id}: expected a re-created account to be associated again, got {member:?}"
+        "case {account_id}: expected a re-created account to be recorded afresh, got {member:?}"
     );
     assert_eq!(
         member["email"].as_str(),
@@ -421,7 +490,7 @@ async fn recreating_a_disassociated_account_associates_it_again() {
 async fn an_account_with_no_member_record_is_reported_not_refused() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
-    let reason = not_a_member();
+    let reason = NOT_AN_ASSOCIATED_MEMBER;
     // The administrator's own account is not one of its members either, so it is
     // the fifth row of this table.
     let administrator = administrator();
@@ -457,7 +526,7 @@ async fn an_account_with_no_member_record_is_reported_not_refused() {
         );
         assert_eq!(
             unprocessed_result(&read, account_id).as_deref(),
-            Some(reason.as_str()),
+            Some(reason),
             "case {account_id} ({why}): expected get-members to report it unprocessed, got {read:?}"
         );
     }
@@ -466,7 +535,7 @@ async fn an_account_with_no_member_record_is_reported_not_refused() {
 #[tokio::test]
 async fn only_the_accounts_that_are_not_members_are_reported() {
     let router = new_router();
-    let detector_id = detector_with_members(&router).await;
+    let detector_id = detector_with_invited_members(&router).await;
     let (member_id, _) = MEMBERS[2];
     let (absent_one, _) = NON_MEMBER_ACCOUNT_IDS[0];
     let (absent_two, _) = NON_MEMBER_ACCOUNT_IDS[1];
@@ -838,7 +907,7 @@ async fn members_are_scoped_to_the_detector_that_administers_them() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
     let (member_id, _) = MEMBERS[0];
-    let reason = not_a_member();
+    let reason = NOT_AN_ASSOCIATED_MEMBER;
 
     // Another Region's detector administers its own members, so this account is not
     // a member there.
@@ -868,7 +937,7 @@ async fn members_are_scoped_to_the_detector_that_administers_them() {
     );
     assert_eq!(
         unprocessed_result(&read, member_id).as_deref(),
-        Some(reason.as_str()),
+        Some(reason),
         "case {member_id}: expected another Region's detector to hold no member, got {read:?}"
     );
 
@@ -891,7 +960,7 @@ async fn members_are_scoped_to_the_detector_that_administers_them() {
     );
     assert_eq!(
         unprocessed_result(&read, member_id).as_deref(),
-        Some(reason.as_str()),
+        Some(reason),
         "case {member_id}: expected the replacement detector to hold no member, got {read:?}"
     );
 }

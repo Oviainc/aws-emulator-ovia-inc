@@ -31,7 +31,9 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{call, enabled_detector, new_router, Router};
-use crate::member_association::{create_members, get_members, member_of, DEFAULT_REGION};
+use crate::member_association::{
+    create_members, get_members, invite_members, member_of, DEFAULT_REGION,
+};
 use crate::organization_configuration::{describe_in, update_ok_in};
 
 /// Every `OrgFeature` member, in model order
@@ -81,10 +83,12 @@ pub(crate) const ADDITIONAL_CONFIGURATIONS: [(&str, &str); 4] = [
 pub(crate) const ENABLED: &str = "ENABLED";
 pub(crate) const DISABLED: &str = "DISABLED";
 
-/// The `RelationshipStatus` a recorded, un-invited member carries, read from the
-/// service so the test cannot drift from it.
-const CREATED: &str =
-    service_com_amazonaws_guardduty_guarddutyapiservice::state::RELATIONSHIP_CREATED;
+/// The `RelationshipStatus` a member the administrator has invited carries, read
+/// from the service so the test cannot drift from it: the invitation is what
+/// associates the account, and an associated member is the one whose detector this
+/// suite reads.
+const INVITED: &str =
+    service_com_amazonaws_guardduty_guarddutyapiservice::state::RELATIONSHIP_INVITED;
 
 /// Email forms the rows cycle, so a case varies along the account details as well as
 /// along the configuration.
@@ -139,7 +143,13 @@ pub(crate) fn organization_body_with_additional(
     })
 }
 
-/// `CreateMembers` for one account, asserting it processed the account.
+/// `CreateMembers` for one account followed by `InviteMembers` for it, asserting
+/// each call processed the account.
+///
+/// The invitation is what associates a recorded account with its administrator, and
+/// an associated member is the one whose detector the administrator reads and
+/// configures — so a suite that reads a member's configuration records the account
+/// this way.
 pub(crate) async fn record_member(
     router: &Router,
     detector_id: &str,
@@ -157,6 +167,17 @@ pub(crate) async fn record_member(
             .as_array()
             .is_some_and(|unprocessed| unprocessed.is_empty()),
         "case {case}: expected the account processed, got {body:?}"
+    );
+    let (status, body) = invite_members(router, detector_id, &[account_id]).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: invite-members expected 200, got {status} {body:?}"
+    );
+    assert!(
+        body["unprocessedAccounts"]
+            .as_array()
+            .is_some_and(|unprocessed| unprocessed.is_empty()),
+        "case {case}: expected the account invited, got {body:?}"
     );
 }
 
@@ -350,8 +371,8 @@ async fn an_auto_enabled_feature_reaches_an_existing_member_too() {
             );
             assert_eq!(
                 relationship_after["relationshipStatus"].as_str(),
-                Some(CREATED),
-                "case {case}: expected a recorded member, got {relationship_after:?}"
+                Some(INVITED),
+                "case {case}: expected an invited member, got {relationship_after:?}"
             );
         }
     }
@@ -479,6 +500,14 @@ async fn a_member_configuration_agrees_with_the_organization_read() {
     assert_eq!(
         status, 200,
         "case a batch under an organization: expected 200, got {status} {body:?}"
+    );
+    // The invitation associates each account of the batch, which is what makes its
+    // detector one the administrator reads.
+    let invited: Vec<&str> = ids.iter().map(|id| id.as_str()).collect();
+    let (status, body) = invite_members(&router, &detector_id, &invited).await;
+    assert_eq!(
+        status, 200,
+        "case a batch under an organization: invite expected 200, got {status} {body:?}"
     );
 
     for (account, email) in &rows_to_create {

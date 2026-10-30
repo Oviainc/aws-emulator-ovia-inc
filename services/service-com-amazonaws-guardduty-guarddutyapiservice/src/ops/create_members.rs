@@ -260,16 +260,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             match detector.members.get_mut(&detail.account_id) {
                 Some(existing) => {
-                    // Re-creating an account records its details again and
-                    // re-associates it if it was disassociated; a member that is
-                    // still associated keeps the relationship it has. `UpdatedAt`
-                    // moves only when something about the member actually changed.
+                    // Re-creating an account records its details again and records
+                    // it afresh if its association had been ended; a member whose
+                    // relationship is live keeps the relationship it has.
+                    // `UpdatedAt` moves only when something about the member
+                    // actually changed.
                     let mut changed = false;
                     if existing.email != detail.email {
                         existing.email = detail.email.clone();
                         changed = true;
                     }
-                    if !existing.is_associated() {
+                    if existing.is_disassociated() {
                         existing.relationship_status =
                             crate::state::RELATIONSHIP_CREATED.to_string();
                         changed = true;

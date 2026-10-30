@@ -40,10 +40,10 @@
 //!
 //! The rows differ along what the rule generalises over: the operation, the reason the
 //! call moves nobody (the relationship the request asks for is the one the member
-//! already holds, the account has no member record, the account's association is
-//! already ended, an invitation is still pending), the relationship the members are
-//! left in beforehand, how many accounts one call names, and whether the named id is
-//! repeated.
+//! already holds, the account has no member record, the account is not one this
+//! operation can process at all, its association is already ended), the relationship
+//! the members are left in beforehand, how many accounts one call names, and whether
+//! the named id is repeated.
 
 use serde_json::{json, Value};
 
@@ -115,7 +115,7 @@ fn rows() -> Vec<Row> {
             no_op: (START, vec![absent]),
             reported: vec![absent],
             invitations: None,
-            moving: (STOP, vec![first]),
+            moving: (INVITE, vec![first]),
             moved: first,
         },
         Row {
@@ -124,7 +124,7 @@ fn rows() -> Vec<Row> {
             no_op: (START, vec![absent, other_absent]),
             reported: vec![absent, other_absent],
             invitations: None,
-            moving: (STOP, vec![first]),
+            moving: (INVITE, vec![first]),
             moved: first,
         },
         Row {
@@ -133,43 +133,34 @@ fn rows() -> Vec<Row> {
             no_op: (START, vec![absent, absent]),
             reported: vec![absent],
             invitations: None,
-            moving: (STOP, vec![second]),
+            moving: (INVITE, vec![second]),
             moved: second,
         },
         Row {
-            case: "start monitoring members that were recorded and never stopped",
+            case: "start monitoring members the administrator has only recorded",
             seed: Vec::new(),
             no_op: (START, all.clone()),
-            reported: Vec::new(),
+            reported: all.clone(),
             invitations: None,
-            moving: (STOP, vec![third]),
+            moving: (INVITE, vec![third]),
             moved: third,
-        },
-        Row {
-            case: "start monitoring members whose monitoring was already restarted",
-            seed: vec![(STOP, all.clone()), (START, all.clone())],
-            no_op: (START, all.clone()),
-            reported: Vec::new(),
-            invitations: None,
-            moving: (STOP, vec![first]),
-            moved: first,
         },
         Row {
             case: "start monitoring members whose invitation is still outstanding",
             seed: vec![(INVITE, all.clone())],
             no_op: (START, all.clone()),
-            reported: Vec::new(),
+            reported: all.clone(),
             invitations: Some(1),
-            moving: (STOP, vec![second]),
+            moving: (DISASSOCIATE, vec![second]),
             moved: second,
         },
         Row {
-            case: "stop monitoring members whose monitoring was already stopped",
-            seed: vec![(STOP, all.clone())],
+            case: "stop monitoring members whose invitation is still outstanding",
+            seed: vec![(INVITE, all.clone())],
             no_op: (STOP, all.clone()),
-            reported: Vec::new(),
-            invitations: None,
-            moving: (START, vec![first]),
+            reported: all.clone(),
+            invitations: Some(1),
+            moving: (DISASSOCIATE, vec![first]),
             moved: first,
         },
         Row {
@@ -178,12 +169,21 @@ fn rows() -> Vec<Row> {
             no_op: (STOP, vec![other_absent]),
             reported: vec![other_absent],
             invitations: None,
-            moving: (STOP, vec![third]),
+            moving: (INVITE, vec![third]),
             moved: third,
         },
         Row {
+            case: "disassociate members the administrator has only recorded",
+            seed: Vec::new(),
+            no_op: (DISASSOCIATE, all.clone()),
+            reported: all.clone(),
+            invitations: None,
+            moving: (INVITE, vec![first]),
+            moved: first,
+        },
+        Row {
             case: "disassociate members whose association is already ended",
-            seed: vec![(DISASSOCIATE, all.clone())],
+            seed: vec![(INVITE, all.clone()), (DISASSOCIATE, all.clone())],
             no_op: (DISASSOCIATE, all.clone()),
             reported: all.clone(),
             invitations: None,
@@ -198,7 +198,7 @@ fn rows() -> Vec<Row> {
             no_op: (DISASSOCIATE, vec![absent]),
             reported: vec![absent],
             invitations: None,
-            moving: (DISASSOCIATE, vec![second]),
+            moving: (INVITE, vec![second]),
             moved: second,
         },
         Row {
@@ -209,7 +209,7 @@ fn rows() -> Vec<Row> {
             // The re-send delivers no second invitation: one is pending per inviting
             // account, and the pending one keeps the id it was handed.
             invitations: Some(1),
-            moving: (STOP, vec![third]),
+            moving: (DISASSOCIATE, vec![third]),
             moved: third,
         },
         Row {

@@ -62,15 +62,14 @@ const ORG_MEMBERS: [(&str, &str); 5] = [
 // Rule 1: the counts are the membership the store holds.
 // ---------------------------------------------------------------------------
 
-/// One row of the membership table: how many accounts were recorded, which of them were
-/// then invited, had monitoring stopped or were disassociated, and whether the
-/// administrator's own detector is left enabled. The index sets are disjoint, so each
-/// member ends in exactly one state.
+/// One row of the membership table: how many accounts were recorded, which of them
+/// were left merely RECORDED (never invited, so never associated) or disassociated,
+/// and whether the administrator's own detector is left enabled. The index sets are
+/// disjoint, so each member ends in exactly one state.
 struct Membership {
     case: &'static str,
     members: usize,
-    invited: &'static [usize],
-    stopped: &'static [usize],
+    recorded_only: &'static [usize],
     disassociated: &'static [usize],
     administrator_enabled: bool,
 }
@@ -78,78 +77,69 @@ struct Membership {
 #[tokio::test]
 async fn the_counts_are_the_membership_the_store_holds() {
     // The rows differ along the COUNT of members and along the STATE each member is
-    // left in — recorded, invited, no longer monitored, no longer associated — plus
-    // whether the administrator's own GuardDuty is on.
+    // left in — recorded, invited (which is what associates it), no longer associated
+    // — plus whether the administrator's own GuardDuty is on.
     let rows = [
         Membership {
             case: "an organization with no member account at all",
             members: 0,
-            invited: &[],
-            stopped: &[],
+            recorded_only: &[],
             disassociated: &[],
             administrator_enabled: true,
         },
         Membership {
-            case: "one recorded member",
+            case: "one invited member",
             members: 1,
-            invited: &[],
-            stopped: &[],
+            recorded_only: &[],
             disassociated: &[],
             administrator_enabled: true,
         },
         Membership {
-            case: "three recorded members",
+            case: "three invited members",
             members: 3,
-            invited: &[],
-            stopped: &[],
+            recorded_only: &[],
             disassociated: &[],
             administrator_enabled: true,
         },
         Membership {
-            case: "two of three members invited",
+            case: "two of three members only recorded",
             members: 3,
-            invited: &[0, 1],
-            stopped: &[],
+            recorded_only: &[0, 1],
             disassociated: &[],
             administrator_enabled: true,
         },
         Membership {
-            case: "one member no longer monitored",
+            case: "one member only recorded",
             members: 3,
-            invited: &[],
-            stopped: &[2],
+            recorded_only: &[2],
             disassociated: &[],
             administrator_enabled: true,
         },
         Membership {
             case: "one member disassociated",
             members: 3,
-            invited: &[],
-            stopped: &[],
+            recorded_only: &[],
             disassociated: &[1],
             administrator_enabled: true,
         },
         Membership {
             case: "a membership in every state at once",
             members: 5,
-            invited: &[1],
-            stopped: &[0, 4],
+            recorded_only: &[0, 4],
             disassociated: &[3],
             administrator_enabled: true,
         },
         Membership {
             case: "the administrator's own detector disabled",
             members: 2,
-            invited: &[],
-            stopped: &[],
+            recorded_only: &[],
             disassociated: &[],
             administrator_enabled: false,
         },
         Membership {
-            case: "a disabled administrator over a stopped member",
+            case: "a disabled administrator over an unassociated member",
             members: 2,
-            invited: &[],
-            stopped: &[1],
+            recorded_only: &[1],
             disassociated: &[],
             administrator_enabled: false,
         },
@@ -162,9 +152,14 @@ async fn the_counts_are_the_membership_the_store_holds() {
         if !recorded.is_empty() {
             create_members(&router, REGION, &detector_id, recorded, row.case).await;
         }
+        // Every member the row does not leave merely recorded is INVITED, which is
+        // what associates the account with the administrator; a disassociated one is
+        // invited first, because only an association can be ended.
+        let associated_indexes: Vec<usize> = (0..row.members)
+            .filter(|index| !row.recorded_only.contains(index))
+            .collect();
         for (action, indexes) in [
-            ("invite", row.invited),
-            ("stop", row.stopped),
+            ("invite", associated_indexes.as_slice()),
             ("disassociate", row.disassociated),
         ] {
             if indexes.is_empty() {
@@ -180,8 +175,9 @@ async fn the_counts_are_the_membership_the_store_holds() {
         // The administrator's account is one of the organization's accounts; a member
         // record is retained across a disassociation, so it still counts in the total.
         let total = row.members as i64 + 1;
-        let associated = (row.members - row.disassociated.len()) as i64;
-        let active = associated - row.stopped.len() as i64;
+        let associated =
+            (row.members - row.recorded_only.len() - row.disassociated.len()) as i64;
+        let active = associated;
         let enabled = active + i64::from(row.administrator_enabled);
 
         let statistics = organization_statistics(&router, REGION, row.case).await;
@@ -220,6 +216,17 @@ async fn count_by_feature_counts_the_active_members_holding_each_feature_enabled
     let recorded = &ORG_MEMBERS[..3];
     create_members(&router, REGION, &detector_id, recorded, "three recorded members").await;
     let all: Vec<&str> = recorded.iter().map(|(id, _)| *id).collect();
+    // The invitation associates each account, which is what makes it one of the
+    // organization's counted members.
+    member_action(
+        &router,
+        REGION,
+        &detector_id,
+        "invite",
+        &all,
+        "three recorded members",
+    )
+    .await;
 
     // The rows differ along the SWITCH they move and along how many members they move it
     // on: a feature that defaults enabled, one that defaults disabled, a feature the
@@ -285,15 +292,23 @@ async fn count_by_feature_counts_the_active_members_holding_each_feature_enabled
         assert_count_by_feature(&router, REGION, &detector_id, &all, case).await;
     }
 
-    // An account that is no longer ACTIVE leaves every count: stopping monitoring takes
-    // one member out, and so does disassociating another.
-    member_action(&router, REGION, &detector_id, "stop", &all[..1], "stopped").await;
+    // An account that is no longer ASSOCIATED leaves every count: disassociating one
+    // member takes it out, and so does disassociating another.
+    member_action(
+        &router,
+        REGION,
+        &detector_id,
+        "disassociate",
+        &all[..1],
+        "disassociated",
+    )
+    .await;
     assert_count_by_feature(
         &router,
         REGION,
         &detector_id,
         &all[1..],
-        "after one member's monitoring was stopped",
+        "after one member was disassociated",
     )
     .await;
     member_action(
@@ -302,7 +317,7 @@ async fn count_by_feature_counts_the_active_members_holding_each_feature_enabled
         &detector_id,
         "disassociate",
         &all[1..2],
-        "disassociated",
+        "disassociated again",
     )
     .await;
     assert_count_by_feature(
@@ -310,7 +325,7 @@ async fn count_by_feature_counts_the_active_members_holding_each_feature_enabled
         REGION,
         &detector_id,
         &all[2..],
-        "after one member was disassociated",
+        "after a second member was disassociated",
     )
     .await;
 }
@@ -326,6 +341,7 @@ async fn a_feature_every_member_holds_enabled_is_counted_on_every_member() {
         let recorded = &ORG_MEMBERS[..size];
         create_members(&router, REGION, &detector_id, recorded, &case).await;
         let accounts: Vec<&str> = recorded.iter().map(|(id, _)| *id).collect();
+        member_action(&router, REGION, &detector_id, "invite", &accounts, &case).await;
 
         let statistics = organization_statistics(&router, REGION, &case).await;
         // Read the feature to expect from the members themselves rather than naming one:
@@ -370,6 +386,8 @@ async fn the_organization_reported_is_the_one_the_requests_region_serves() {
         let detector_id = enabled_detector_in(&router, region).await;
         if size > 0 {
             create_members(&router, region, &detector_id, &ORG_MEMBERS[..size], region).await;
+            let accounts: Vec<&str> = ORG_MEMBERS[..size].iter().map(|(id, _)| *id).collect();
+            member_action(&router, region, &detector_id, "invite", &accounts, region).await;
         }
         detectors.insert(region, detector_id);
     }
@@ -441,6 +459,9 @@ async fn updated_at_is_the_latest_instant_a_counted_record_changed() {
         "case \"a repeated read\": reading must not move the instant, got {read_again} after {previous}"
     );
 
+    member_action(&router, REGION, &detector_id, "invite", &accounts, "invite").await;
+    previous = moved_on(&router, "InviteMembers", previous).await;
+
     update_member_detectors(
         &router,
         REGION,
@@ -451,9 +472,6 @@ async fn updated_at_is_the_latest_instant_a_counted_record_changed() {
     )
     .await;
     previous = moved_on(&router, "UpdateMemberDetectors", previous).await;
-
-    member_action(&router, REGION, &detector_id, "stop", &accounts[..1], "stop").await;
-    previous = moved_on(&router, "StopMonitoringMembers", previous).await;
 
     member_action(
         &router,
@@ -474,6 +492,15 @@ async fn the_report_changes_nothing_a_later_caller_sees() {
     let recorded = &ORG_MEMBERS[..3];
     create_members(&router, REGION, &detector_id, recorded, "three members").await;
     let accounts: Vec<&str> = recorded.iter().map(|(id, _)| *id).collect();
+    member_action(
+        &router,
+        REGION,
+        &detector_id,
+        "invite",
+        &accounts,
+        "three members",
+    )
+    .await;
 
     let before = organization_details(&router, REGION, "the first report").await;
     let members_before = list_members(&router, REGION, &detector_id, "before").await;
@@ -767,8 +794,8 @@ async fn create_members(
     );
 }
 
-/// One of the member operations that takes a plain `accountIds` list: `invite`, `stop`
-/// or `disassociate`.
+/// One of the member operations that takes a plain `accountIds` list: `invite` or
+/// `disassociate`.
 async fn member_action(
     router: &Router,
     region: &str,

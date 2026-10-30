@@ -166,7 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx);
-        let administrator = crate::state::administrator_account_id();
 
         // Parameter failures first, before anything is looked up or written: a value
         // that cannot be a value of its member at all is refused whatever the store
@@ -257,14 +256,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         now,
                     );
                 }
-                // Only an account ASSOCIATED with this administrator is monitored
-                // under it, so only that account's detector can be configured from
-                // here: an account it never recorded, and one a disassociation
-                // already moved, are both reported rather than refused — and neither
+                // Only an account ASSOCIATED with this administrator has a detector
+                // the administrator maintains, so only that account's can be
+                // configured from here: an account it never recorded, one it has
+                // recorded and not invited yet, and one a disassociation already
+                // moved are all reported rather than refused — and none of them
                 // changes any stored member.
                 _ => unprocessed.push(UnprocessedAccount {
                     account_id: account_id.clone(),
-                    result: crate::state::not_a_member_message(&administrator),
+                    result: crate::state::NOT_AN_ASSOCIATED_MEMBER_MESSAGE.to_string(),
                 }),
             }
         }

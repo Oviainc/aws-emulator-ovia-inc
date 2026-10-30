@@ -28,7 +28,9 @@ use crate::custom_detection_rule_org_configuration_update::{
 use crate::detector_lifecycle::{
     all_finding_ids, call, enabled_detector, new_router, published_rule_ids, Router,
 };
-use crate::member_association::{create_members, get_members, not_a_member, MEMBERS};
+use crate::member_association::{
+    create_members, get_members, MEMBERS, NOT_AN_ASSOCIATED_MEMBER,
+};
 
 /// The finding types the detector under test is populated with. Source: the finding
 /// types this service's sample catalogue publishes (`CreateSampleFindings`). The rule
@@ -381,7 +383,7 @@ async fn get_members_reports_a_repeated_account_id_once() {
         for entry in body["unprocessedAccounts"].as_array().cloned().unwrap_or_default() {
             assert_eq!(
                 entry["result"],
-                json!(not_a_member()),
+                json!(NOT_AN_ASSOCIATED_MEMBER),
                 "case {label:?}: expected the documented reason, got {entry:?}"
             );
         }

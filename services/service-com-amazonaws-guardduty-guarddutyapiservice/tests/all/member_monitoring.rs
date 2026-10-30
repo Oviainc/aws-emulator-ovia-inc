@@ -9,22 +9,19 @@
 //! The rules under test, each asserted over a SET of inputs rather than one recorded
 //! call:
 //!
-//! 1. Stopping monitoring moves ONLY the relationship of the named member accounts,
-//!    to `Disabled`, and retains everything else about the record — so a later
-//!    `GetMembers` still reports the account, its email and its administrator — and
-//!    leaves every member the call did not name where it was.
-//! 2. Stopping is a DESIRED STATE, not a transition: a second stop of the same
-//!    accounts answers 200, reports nothing unprocessed and changes nothing at all,
-//!    `UpdatedAt` included.
-//! 3. A stopped member is still ASSOCIATED with the administrator: `ListMembers`
-//!    with `onlyAssociated=true` still lists it, and `DisassociateMembers` still
-//!    processes it — only that operation ends the association.
-//! 4. An account the administrator is not associated with — one it holds no member
-//!    record for, and one a disassociation already moved — is not an error: the call
-//!    answers HTTP 200 and names the account in `unprocessedAccounts` with the
-//!    reason it was not processed, once per DISTINCT id in request order, and
-//!    persists nothing for it.
-//! 5. A value that cannot be an account id at all, and a `DetectorId` this
+//! 1. Monitoring is stopped only for an account GuardDuty MONITORS under this
+//!    administrator, which is an account whose own acceptance started the
+//!    monitoring. Every other account the request names — one the administrator
+//!    holds no member record for, one it has only recorded, one whose invitation
+//!    that account has not answered, and one a disassociation moved — is not an
+//!    error: the call answers HTTP 200 and names the account in
+//!    `unprocessedAccounts` with the reason it was not processed, once per DISTINCT
+//!    id in request order.
+//! 2. A reported account changes NOTHING: its stored relationship, its email and its
+//!    `UpdatedAt` are exactly what they were, and `ListMembers` still reports the
+//!    members it did before — a refused per-account stop writes no relationship
+//!    status for the account it refused.
+//! 3. A value that cannot be an account id at all, and a `DetectorId` this
 //!    account/Region does not own, are each refused with HTTP 400 under the
 //!    `InvalidInputException` class — never answered with a hollow 200.
 
@@ -37,14 +34,12 @@ use crate::detector_lifecycle::{
 };
 // The message, projection and administrator helpers the member suites share: one
 // definition, so two suites cannot drift apart on what a member read looks like.
-// The member-suite tables, helpers and projections live in one place, so the two
-// suites cannot drift on what a malformed or non-member account id is, nor on what a
-// member read looks like. `MEMBERS` is the table of accounts to record, differing
-// along the account id and the email's shape; this suite stops monitoring for them.
+// `MEMBERS` is the table of accounts to record, differing along the account id and
+// the email's shape; this suite stops monitoring for them.
 use crate::member_association::{
-    administrator, create_members, disassociate_members, get_members, member_of, not_a_member,
-    unprocessed_ids, unprocessed_result, MALFORMED_ACCOUNT_IDS, MEMBERS,
-    NON_MEMBER_ACCOUNT_IDS,
+    administrator, create_members, disassociate_members, get_members, invite_members, member_of,
+    unprocessed_ids, unprocessed_result, MALFORMED_ACCOUNT_IDS, MEMBERS, NON_MEMBER_ACCOUNT_IDS,
+    NOT_AN_ASSOCIATED_MEMBER,
 };
 
 /// The error class every GuardDuty client rejection is named by on the wire.
@@ -101,190 +96,109 @@ fn all_ids() -> Vec<&'static str> {
     MEMBERS.iter().map(|(id, _)| *id).collect()
 }
 
-// ---------------------------------------------------------------------------
-// Rules 1 and 3: stop -> read, over a subset.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn stopping_monitoring_moves_only_the_named_members_to_disabled() {
-    let router = new_router();
-    let detector_id = detector_with_members(&router).await;
-    let administrator = administrator();
-    let ids = all_ids();
-
-    let (status, created) = get_members(&router, &detector_id, &ids).await;
-    assert_eq!(
-        status, 200,
-        "get-members after create: expected 200, got {status} {created:?}"
-    );
-
-    // A strict, NON-CONTIGUOUS subset, so the call is observable both ways and the
-    // moved members are not merely a prefix of the stored order.
-    let stopped = [MEMBERS[0].0, MEMBERS[2].0];
-    let (status, body) = stop_monitoring_members(&router, &detector_id, &stopped).await;
-    assert_eq!(
-        status, 200,
-        "stop-monitoring-members: expected 200, got {status} {body:?}"
-    );
-    assert!(
-        unprocessed_ids(&body).is_empty(),
-        "stop-monitoring-members: expected every member processed, got {body:?}"
-    );
-
-    let (status, after) = get_members(&router, &detector_id, &ids).await;
-    assert_eq!(
-        status, 200,
-        "get-members after stop: expected 200, got {status} {after:?}"
-    );
-    for (account_id, email) in MEMBERS {
-        let expected_status = if stopped.contains(&account_id) {
-            "Disabled"
-        } else {
-            "Created"
-        };
-        let member = member_of(&after, account_id).unwrap_or_else(|| {
-            panic!("case {account_id}: expected the record to be retained, got {after:?}")
-        });
-        assert_eq!(
-            member["relationshipStatus"].as_str(),
-            Some(expected_status),
-            "case {account_id}: expected relationshipStatus {expected_status}, got {member:?}"
-        );
-        // Only the relationship moves: the details are RETAINED.
-        assert_eq!(
-            member["email"].as_str(),
-            Some(email),
-            "case {account_id}: expected the email to be retained, got {member:?}"
-        );
-        assert_eq!(
-            member["masterId"].as_str(),
-            Some(administrator.as_str()),
-            "case {account_id}: expected masterId to be the administrator, got {member:?}"
-        );
-        assert_eq!(
-            member["administratorId"].as_str(),
-            Some(administrator.as_str()),
-            "case {account_id}: expected administratorId to be the administrator, got {member:?}"
-        );
-        let before = member_of(&created, account_id)
-            .unwrap_or_else(|| panic!("case {account_id}: expected a member, got {created:?}"));
-        let moved = member["updatedAt"] != before["updatedAt"];
-        assert_eq!(
-            moved,
-            stopped.contains(&account_id),
-            "case {account_id}: expected updatedAt to move only for a stopped member, got {:?} then {:?}",
-            before["updatedAt"],
-            member["updatedAt"]
-        );
-    }
-
-    // Rule 3: monitoring stopped, association kept — the narrowed listing still
-    // names every member.
-    for only_associated in [true, false] {
-        let (status, listed) = list_members(&router, &detector_id, only_associated).await;
+/// Drive `account_id`'s relationship through the member requests `steps` names.
+///
+/// Each step is a path segment under `/detector/{DetectorId}/member`
+/// (`smithy_query(operation="InviteMembers,DisassociateMembers")`).
+async fn drive_relationship(router: &Router, detector_id: &str, account_id: &str, steps: &[&str]) {
+    for step in steps {
+        let (status, body) = call(
+            router,
+            "POST",
+            &format!("/detector/{detector_id}/member/{step}"),
+            Some(json!({"accountIds": [account_id]})),
+        )
+        .await;
         assert_eq!(
             status, 200,
-            "case onlyAssociated={only_associated}: expected 200, got {status} {listed:?}"
-        );
-        for account_id in &ids {
-            assert!(
-                member_of(&listed, account_id).is_some(),
-                "case onlyAssociated={only_associated} {account_id}: expected a stopped member to still be associated, got {listed:?}"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn a_stopped_member_can_still_be_disassociated() {
-    let router = new_router();
-    let detector_id = detector_with_members(&router).await;
-    let account_id = MEMBERS[1].0;
-
-    let (status, _) = stop_monitoring_members(&router, &detector_id, &[account_id]).await;
-    assert_eq!(status, 200, "stop: expected 200, got {status}");
-
-    let (status, body) = disassociate_members(&router, &detector_id, &[account_id]).await;
-    assert_eq!(
-        status, 200,
-        "disassociate: expected 200, got {status} {body:?}"
-    );
-    assert!(
-        unprocessed_ids(&body).is_empty(),
-        "case {account_id}: expected a stopped member to still be associated, got {body:?}"
-    );
-
-    let (_, read) = get_members(&router, &detector_id, &[account_id]).await;
-    let member = member_of(&read, account_id)
-        .unwrap_or_else(|| panic!("case {account_id}: expected a member, got {read:?}"));
-    assert_eq!(
-        member["relationshipStatus"].as_str(),
-        Some("Removed"),
-        "case {account_id}: expected the disassociation to move the relationship, got {member:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Rule 2: stopping is a desired state, so a repeat changes nothing.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn stopping_monitoring_again_changes_nothing() {
-    let ids = all_ids();
-    // Rows differing along the COUNT of accounts one call names: one, a few, and
-    // every member the administrator holds.
-    let batches: [&[&str]; 3] = [&ids[..1], &ids[..2], &ids[..]];
-
-    for batch in batches {
-        // A fresh engine per row: there is only one detector per account per Region,
-        // so each row gets its own emulator rather than a second detector.
-        let router = new_router();
-        let detector_id = detector_with_members(&router).await;
-        let (status, first) = stop_monitoring_members(&router, &detector_id, batch).await;
-        assert_eq!(
-            status, 200,
-            "case {batch:?}: first stop expected 200, got {status} {first:?}"
-        );
-        let (_, once) = get_members(&router, &detector_id, batch).await;
-        // The first stop must have DONE something, or the comparison below would
-        // pass over two unchanged reads.
-        for account_id in batch {
-            let member = member_of(&once, account_id).unwrap_or_else(|| {
-                panic!("case {batch:?} {account_id}: expected a member, got {once:?}")
-            });
-            assert_eq!(
-                member["relationshipStatus"].as_str(),
-                Some("Disabled"),
-                "case {batch:?} {account_id}: expected the first stop to disable monitoring, got {member:?}"
-            );
-        }
-
-        let (status, second) = stop_monitoring_members(&router, &detector_id, batch).await;
-        assert_eq!(
-            status, 200,
-            "case {batch:?}: second stop expected 200, got {status} {second:?}"
+            "member/{step} for {account_id}: expected 200, got {status} {body:?}"
         );
         assert!(
-            unprocessed_ids(&second).is_empty(),
-            "case {batch:?}: expected a stopped member to still be processed, got {second:?}"
-        );
-        let (_, twice) = get_members(&router, &detector_id, batch).await;
-        assert_eq!(
-            twice, once,
-            "case {batch:?}: expected the second stop to change nothing, got {twice:?} after {once:?}"
+            unprocessed_ids(&body).is_empty(),
+            "member/{step} for {account_id}: expected the member processed, got {body:?}"
         );
     }
 }
 
+/// Every relationship a member record reaches through the requests this
+/// administrator can send, with the requests that drive a freshly recorded account
+/// into it.
+///
+/// GuardDuty monitors a member account under its administrator only once that
+/// account has accepted the invitation — "the status of the relationship between the
+/// member and the administrator"
+/// (`smithy_query(query="doc",shape="Member",member="RelationshipStatus")`) — which
+/// is that account's own call to make, so none of these relationships is one this
+/// administrator can stop monitoring for.
+const RELATIONSHIP_STATUSES: [(&str, &[&str]); 3] = [
+    ("Created", &[]),
+    ("Invited", &["invite"]),
+    ("Removed", &["invite", "disassociate"]),
+];
+
 // ---------------------------------------------------------------------------
-// Rule 4: an account that is not an associated member is REPORTED, not refused.
+// Rules 1 and 2: every account the administrator does not monitor is reported,
+// and nothing stored for it moves.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_account_that_is_not_an_associated_member_is_reported_not_refused() {
+async fn a_member_the_administrator_does_not_monitor_is_reported_and_unchanged() {
+    for (relationship, steps) in RELATIONSHIP_STATUSES {
+        let case = format!("a member in {relationship}");
+        // One store per row: each row drives the SAME account into a different
+        // relationship, so it starts from a detector of its own.
+        let router = new_router();
+        let detector_id = detector_with_members(&router).await;
+        let (target, target_email) = MEMBERS[0];
+        drive_relationship(&router, &detector_id, target, steps).await;
+
+        // The row's premise: the record really is in the relationship it names.
+        let (_, before) = get_members(&router, &detector_id, &[target]).await;
+        let stored = member_of(&before, target)
+            .unwrap_or_else(|| panic!("case {case}: expected a member record, got {before:?}"));
+        assert_eq!(
+            stored["relationshipStatus"].as_str(),
+            Some(relationship),
+            "case {case}: expected the row's relationship, got {stored:?}"
+        );
+
+        let (status, body) = stop_monitoring_members(&router, &detector_id, &[target]).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200, got {status} {body:?}"
+        );
+        assert_eq!(
+            unprocessed_ids(&body),
+            vec![target.to_string()],
+            "case {case}: expected the account reported, got {body:?}"
+        );
+        assert_eq!(
+            unprocessed_result(&body, target).as_deref(),
+            Some(NOT_AN_ASSOCIATED_MEMBER),
+            "case {case}: expected the not-an-associated-member reason, got {body:?}"
+        );
+
+        // Rule 2: the reported account is exactly where it was — the relationship
+        // the call refused to act on is not rewritten.
+        let (_, after) = get_members(&router, &detector_id, &[target]).await;
+        let read = member_of(&after, target)
+            .unwrap_or_else(|| panic!("case {case}: expected the record retained, got {after:?}"));
+        assert_eq!(
+            read, stored,
+            "case {case}: expected a reported account to be unchanged, got {read:?} after {stored:?}"
+        );
+        assert_eq!(
+            read["email"].as_str(),
+            Some(target_email),
+            "case {case}: expected the email to be retained, got {read:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_account_with_no_member_record_is_reported_not_refused() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
-    let reason = not_a_member();
 
     // The administrator's own account is not one of its members either, so it is a
     // row of this table beside the ids nothing recorded.
@@ -305,8 +219,8 @@ async fn an_account_that_is_not_an_associated_member_is_reported_not_refused() {
         );
         assert_eq!(
             unprocessed_result(&body, account_id).as_deref(),
-            Some(reason.as_str()),
-            "case {account_id} ({why}): expected the not-a-member reason, got {body:?}"
+            Some(NOT_AN_ASSOCIATED_MEMBER),
+            "case {account_id} ({why}): expected the not-an-associated-member reason, got {body:?}"
         );
 
         // The reported account had nothing persisted for it.
@@ -323,12 +237,73 @@ async fn an_account_that_is_not_an_associated_member_is_reported_not_refused() {
 }
 
 #[tokio::test]
+async fn every_account_a_mixed_request_names_is_reported_once_in_request_order() {
+    let router = new_router();
+    let detector_id = detector_with_members(&router).await;
+    let member_id = MEMBERS[2].0;
+    let invited_id = MEMBERS[1].0;
+    let absent_one = NON_MEMBER_ACCOUNT_IDS[0].0;
+    let absent_two = NON_MEMBER_ACCOUNT_IDS[1].0;
+    drive_relationship(&router, &detector_id, invited_id, &["invite"]).await;
+
+    // A mixed request: none of these accounts is monitored under the administrator,
+    // so each is reported once, in request order, however it got into the store —
+    // and a repeated id is reported once because `AccountIds` names a SET.
+    let requested = [
+        absent_two,
+        member_id,
+        absent_one,
+        absent_two,
+        member_id,
+        invited_id,
+    ];
+    let (status, body) = stop_monitoring_members(&router, &detector_id, &requested).await;
+    assert_eq!(
+        status, 200,
+        "mixed stop: expected 200, got {status} {body:?}"
+    );
+    assert_eq!(
+        unprocessed_ids(&body),
+        vec![
+            absent_two.to_string(),
+            member_id.to_string(),
+            absent_one.to_string(),
+            invited_id.to_string(),
+        ],
+        "mixed stop: expected each distinct account once, in request order, got {body:?}"
+    );
+
+    // The records the request named are where they were, and the listing is too.
+    for (account_id, expected_status) in [(member_id, "Created"), (invited_id, "Invited")] {
+        let (_, read) = get_members(&router, &detector_id, &[account_id]).await;
+        let member = member_of(&read, account_id)
+            .unwrap_or_else(|| panic!("case {account_id}: expected a member, got {read:?}"));
+        assert_eq!(
+            member["relationshipStatus"].as_str(),
+            Some(expected_status),
+            "case {account_id}: expected the relationship to stand, got {member:?}"
+        );
+    }
+    let (status, listed) = list_members(&router, &detector_id, false).await;
+    assert_eq!(
+        status, 200,
+        "list-members: expected 200, got {status} {listed:?}"
+    );
+    for account_id in all_ids() {
+        assert!(
+            member_of(&listed, account_id).is_some(),
+            "case {account_id}: expected every record to be listed, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_disassociated_member_is_reported_and_keeps_its_relationship() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
     let (account_id, email) = MEMBERS[1];
-    let reason = not_a_member();
 
+    drive_relationship(&router, &detector_id, account_id, &["invite"]).await;
     let (status, _) = disassociate_members(&router, &detector_id, &[account_id]).await;
     assert_eq!(status, 200, "disassociate: expected 200, got {status}");
     let (_, removed) = get_members(&router, &detector_id, &[account_id]).await;
@@ -342,7 +317,7 @@ async fn a_disassociated_member_is_reported_and_keeps_its_relationship() {
     );
     assert_eq!(
         unprocessed_result(&body, account_id).as_deref(),
-        Some(reason.as_str()),
+        Some(NOT_AN_ASSOCIATED_MEMBER),
         "case {account_id}: a disassociated member is no longer associated, got {body:?}"
     );
 
@@ -361,39 +336,43 @@ async fn a_disassociated_member_is_reported_and_keeps_its_relationship() {
 }
 
 #[tokio::test]
-async fn only_the_accounts_that_are_not_members_are_reported_once_in_request_order() {
+async fn an_invited_member_is_still_listed_as_associated_after_a_reported_stop() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
-    let member_id = MEMBERS[2].0;
-    let absent_one = NON_MEMBER_ACCOUNT_IDS[0].0;
-    let absent_two = NON_MEMBER_ACCOUNT_IDS[1].0;
-
-    // A mixed request: the member is processed, the rest reported, in request order,
-    // and a repeated id is reported once because `AccountIds` names a SET.
-    let requested = [absent_two, member_id, absent_one, absent_two, member_id];
-    let (status, body) = stop_monitoring_members(&router, &detector_id, &requested).await;
+    let ids = all_ids();
+    let (status, body) = invite_members(&router, &detector_id, &ids).await;
     assert_eq!(
         status, 200,
-        "mixed stop: expected 200, got {status} {body:?}"
-    );
-    assert_eq!(
-        unprocessed_ids(&body),
-        vec![absent_two.to_string(), absent_one.to_string()],
-        "mixed stop: expected each absent account once, in request order, got {body:?}"
+        "invite-members: expected 200, got {status} {body:?}"
     );
 
-    let (_, read) = get_members(&router, &detector_id, &[member_id]).await;
-    let member = member_of(&read, member_id)
-        .unwrap_or_else(|| panic!("case {member_id}: expected a member, got {read:?}"));
+    let (status, body) = stop_monitoring_members(&router, &detector_id, &ids).await;
+    assert_eq!(status, 200, "stop: expected 200, got {status} {body:?}");
     assert_eq!(
-        member["relationshipStatus"].as_str(),
-        Some("Disabled"),
-        "case {member_id}: expected the member in a mixed request to be stopped, got {member:?}"
+        unprocessed_ids(&body),
+        ids.iter().map(|id| (*id).to_string()).collect::<Vec<String>>(),
+        "stop: expected every invited member reported, got {body:?}"
     );
+
+    // The association the invitation established is untouched by the reported stop:
+    // the narrowed listing still names every member.
+    for only_associated in [true, false] {
+        let (status, listed) = list_members(&router, &detector_id, only_associated).await;
+        assert_eq!(
+            status, 200,
+            "case onlyAssociated={only_associated}: expected 200, got {status} {listed:?}"
+        );
+        for account_id in &ids {
+            assert!(
+                member_of(&listed, account_id).is_some(),
+                "case onlyAssociated={only_associated} {account_id}: expected an invited member to be associated, got {listed:?}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Rule 5: requests the service does not understand are refused 400.
+// Rule 3: requests the service does not understand are refused 400.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -405,7 +384,7 @@ async fn a_value_that_cannot_be_an_account_id_is_refused() {
 
     for (account_id, why) in MALFORMED_ACCOUNT_IDS {
         // The whole call is refused, so a well-formed id sent alongside is not
-        // stopped either.
+        // reported either.
         let (status, body) =
             stop_monitoring_members(&router, &detector_id, &[member_id, account_id]).await;
         assert_eq!(
@@ -426,6 +405,10 @@ async fn a_value_that_cannot_be_an_account_id_is_refused() {
             body["message"].as_str(),
             Some(expected.as_str()),
             "case {account_id} ({why}): expected the parameter message, got {body:?}"
+        );
+        assert!(
+            body["unprocessedAccounts"].is_null(),
+            "case {account_id} ({why}): expected no unprocessedAccounts on a refusal, got {body:?}"
         );
 
         let (_, read) = get_members(&router, &detector_id, &[member_id]).await;

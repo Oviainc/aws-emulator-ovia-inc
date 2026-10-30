@@ -55,7 +55,7 @@ use crate::organization_configuration::{describe_in, update_ok_in};
 // member suites make, so no two suites can drift on what a member read looks like.
 use crate::member_association::{
     create_members_in, get_members_in, member_of, unprocessed_ids, MALFORMED_ACCOUNT_IDS, MEMBERS,
-    NON_MEMBER_ACCOUNT_IDS,
+    NON_MEMBER_ACCOUNT_IDS, NOT_AN_ASSOCIATED_MEMBER,
 };
 
 /// The error class every GuardDuty client rejection is named by on the wire.
@@ -116,12 +116,24 @@ impl Operation {
         }
     }
 
-    /// The `relationshipStatus` a member the call PROCESSES ends up with.
-    fn moved_to(self) -> &'static str {
+    /// The `relationshipStatus` a read reports for a member this call was allowed to
+    /// act on: the one it moved the member to, or — for a member it could not process
+    /// — the one it left standing.
+    ///
+    /// Every member of this suite is one the administrator has INVITED, which is what
+    /// associates the account with it. `DisassociateMembers` ends that association;
+    /// `StopMonitoringMembers` acts on the monitoring the member account's own answer
+    /// starts, so it reports the member and leaves the invitation standing.
+    fn relationship_after(self) -> &'static str {
         match self {
             Self::Disassociate => "Removed",
-            Self::StopMonitoring => "Disabled",
+            Self::StopMonitoring => "Invited",
         }
+    }
+
+    /// Does this call PROCESS a member whose invitation the account has not answered?
+    fn processes_an_invited_member(self) -> bool {
+        matches!(self, Self::Disassociate)
     }
 }
 
@@ -169,7 +181,9 @@ async fn call_operation_in(
     member_action_in(router, region, operation.path(), detector_id, account_ids).await
 }
 
-/// Create an enabled detector in `region` and record [`MEMBERS`] against it,
+/// Create an enabled detector in `region`, record [`MEMBERS`] against it and INVITE
+/// them — the invitation is what associates a recorded account with its
+/// administrator, so these are the members a relationship can be taken away from —
 /// returning the detector id.
 async fn detector_with_members_in(router: &Router, region: &str) -> String {
     let detector_id = enabled_detector_in(router, region).await;
@@ -182,7 +196,74 @@ async fn detector_with_members_in(router: &Router, region: &str) -> String {
         unprocessed_ids(&body).is_empty(),
         "create-members in {region}: expected every account processed, got {body:?}"
     );
+    let ids = all_ids();
+    let (status, body) = invite_members_in(router, region, &detector_id, &ids).await;
+    assert_eq!(
+        status, 200,
+        "invite-members in {region}: expected 200, got {status} {body:?}"
+    );
+    assert!(
+        unprocessed_ids(&body).is_empty(),
+        "invite-members in {region}: expected every account processed, got {body:?}"
+    );
     detector_id
+}
+
+/// `InviteMembers` through `region`'s endpoint: the call that associates a recorded
+/// account with its administrator.
+async fn invite_members_in(
+    router: &Router,
+    region: &str,
+    detector_id: &str,
+    account_ids: &[&str],
+) -> (u16, Value) {
+    member_action_in(router, region, "invite", detector_id, account_ids).await
+}
+
+/// Create an enabled detector in `region` and RECORD [`MEMBERS`] against it without
+/// inviting them, for the cases that drive each member into a relationship of their
+/// own.
+async fn detector_with_recorded_members_in(router: &Router, region: &str) -> String {
+    let detector_id = enabled_detector_in(router, region).await;
+    let (status, body) = create_members_in(router, region, &detector_id, &MEMBERS).await;
+    assert_eq!(
+        status, 200,
+        "create-members in {region}: expected 200, got {status} {body:?}"
+    );
+    assert!(
+        unprocessed_ids(&body).is_empty(),
+        "create-members in {region}: expected every account processed, got {body:?}"
+    );
+    detector_id
+}
+
+/// Assert the per-account outcome of a call the organization did NOT refuse: the
+/// members `operation` processes are reported nowhere, and the ones it cannot
+/// process are each reported with the reason it did not process them.
+fn assert_per_account_outcome(case: &str, operation: Operation, body: &Value, ids: &[&str]) {
+    if operation.processes_an_invited_member() {
+        assert!(
+            unprocessed_ids(body).is_empty(),
+            "case {case}: expected every member processed, got {body:?}"
+        );
+        return;
+    }
+    assert_eq!(
+        unprocessed_ids(body),
+        ids.iter().map(|id| (*id).to_string()).collect::<Vec<String>>(),
+        "case {case}: expected every member reported, got {body:?}"
+    );
+    for entry in body["unprocessedAccounts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        assert_eq!(
+            entry["result"].as_str(),
+            Some(NOT_AN_ASSOCIATED_MEMBER),
+            "case {case}: expected the reason it was not processed, got {entry:?}"
+        );
+    }
 }
 
 /// Every recorded account id, in the order [`MEMBERS`] lists them.
@@ -311,10 +392,7 @@ async fn only_all_refuses_a_call_that_takes_a_member_relationship_away() {
                 status, 200,
                 "case {case}: expected HTTP 200, got {status} {body:?}"
             );
-            assert!(
-                unprocessed_ids(&body).is_empty(),
-                "case {case}: expected every member processed, got {body:?}"
-            );
+            assert_per_account_outcome(&case, operation, &body, &ids);
             let (status, got) = get_members_in(&router, REGION, &detector_id, &ids).await;
             assert_eq!(
                 status, 200,
@@ -326,9 +404,9 @@ async fn only_all_refuses_a_call_that_takes_a_member_relationship_away() {
                 });
                 assert_eq!(
                     member["relationshipStatus"].as_str(),
-                    Some(operation.moved_to()),
-                    "case {case}: expected {account_id} to move to {}, got {member:?}",
-                    operation.moved_to()
+                    Some(operation.relationship_after()),
+                    "case {case}: expected {account_id} to read back as {}, got {member:?}",
+                    operation.relationship_after()
                 );
             }
         }
@@ -364,10 +442,7 @@ async fn the_deprecated_boolean_view_auto_enables_only_the_accounts_that_join() 
             status, 200,
             "case {case}: expected HTTP 200, got {status} {body:?}"
         );
-        assert!(
-            unprocessed_ids(&body).is_empty(),
-            "case {case}: expected every member processed, got {body:?}"
-        );
+        assert_per_account_outcome(&case, operation, &body, &ids);
     }
 }
 
@@ -446,10 +521,7 @@ async fn one_administrators_configuration_does_not_refuse_anothers_call() {
             status, 200,
             "case {case}: expected HTTP 200 for the detector whose organization is untouched, got {status} {body:?}"
         );
-        assert!(
-            unprocessed_ids(&body).is_empty(),
-            "case {case}: expected every member processed, got {body:?}"
-        );
+        assert_per_account_outcome(&case, operation, &body, &ids);
 
         let (status, body) =
             call_operation_in(&router, REGION, operation, &refusing, &ids).await;
@@ -552,10 +624,7 @@ async fn lifting_the_configuration_lets_the_call_through_and_restoring_it_refuse
             status, 200,
             "case {case}: expected HTTP 200, got {status} {body:?}"
         );
-        assert!(
-            unprocessed_ids(&body).is_empty(),
-            "case {case}: expected every member processed, got {body:?}"
-        );
+        assert_per_account_outcome(&case, operation, &body, &ids);
 
         // And restoring it refuses the call again, even though it would now change
         // nothing: the precondition is checked before the members are processed.
@@ -609,29 +678,23 @@ async fn a_detector_holding_no_member_is_refused_before_any_account_is_matched()
 // Rule 6: the relationship the named members are in when the call arrives.
 // ---------------------------------------------------------------------------
 
-/// Every relationship a recorded member can carry, with the member calls that put it
-/// there and the `relationshipStatus` a read then reports. The statuses are the ones
+/// Every relationship a recorded member reaches through the requests this
+/// administrator can send, with the member calls that put it there and the
+/// `relationshipStatus` a read then reports. The statuses are the ones
 /// `Member.RelationshipStatus` takes
 /// (`smithy_query(query="doc",shape="Member",member="RelationshipStatus")`), reached
 /// through the calls that move them while the organization auto-enables nothing.
 ///
-/// The last three rows are relationships where the refused call would change nothing
-/// anyway: monitoring already stopped, and an association a disassociation already
-/// ended. The precondition is on the request, not on its effect, so they are refused
-/// too.
-const PRE_STATES: [(&str, &str, &[&str]); 5] = [
+/// The last row is a relationship where the refused call would change nothing
+/// anyway: an association a disassociation already ended. The precondition is on the
+/// request, not on its effect, so it is refused too.
+const PRE_STATES: [(&str, &str, &[&str]); 3] = [
     ("Created", "recorded and not yet invited", &[]),
     ("Invited", "invited and not yet answered", &["invite"]),
-    ("Disabled", "monitoring already stopped", &["stop"]),
-    (
-        "Enabled",
-        "monitoring stopped and restarted",
-        &["stop", "start"],
-    ),
     (
         "Removed",
         "an association a disassociation already ended",
-        &["disassociate"],
+        &["invite", "disassociate"],
     ),
 ];
 
@@ -641,7 +704,9 @@ async fn the_refusal_holds_whatever_relationship_the_members_carry() {
         for operation in OPERATIONS {
             let case = format!("{operation:?} on members {why}");
             let router = new_router();
-            let detector_id = detector_with_members_in(&router, REGION).await;
+            // Recorded and NOT invited, so each row's own preparation puts the
+            // members in the relationship it names.
+            let detector_id = detector_with_recorded_members_in(&router, REGION).await;
             let ids = all_ids();
 
             // The pre-state is reached BEFORE the configuration is written, so each
@@ -696,14 +761,8 @@ async fn the_calls_that_do_not_take_a_relationship_away_still_answer_normally() 
     let router = new_router();
     let detector_id = detector_with_members_in(&router, REGION).await;
     let ids = all_ids();
+    let before = member_snapshot(&router, REGION, &detector_id).await;
 
-    // Monitoring is stopped while nothing is auto-enabled, so the restart below has
-    // something to restart once the configuration is in place.
-    let (status, body) = member_action_in(&router, REGION, "stop", &detector_id, &ids).await;
-    assert_eq!(
-        status, 200,
-        "preparing the stop: expected HTTP 200, got {status} {body:?}"
-    );
     update_ok_in(
         &router,
         REGION,
@@ -714,32 +773,32 @@ async fn the_calls_that_do_not_take_a_relationship_away_still_answer_normally() 
 
     // `StartMonitoringMembers` turns monitoring ON, which is what an organization
     // that auto-enables GuardDuty for all of its accounts holds: it documents no such
-    // refusal (`smithy_query(query="doc",shape="StartMonitoringMembers")`).
+    // refusal (`smithy_query(query="doc",shape="StartMonitoringMembers")`). So the
+    // call is answered on its own terms — each member whose account has not answered
+    // the invitation is REPORTED rather than the whole call being refused.
     let case = "start-monitoring while the organization auto-enables ALL";
     let (status, body) = member_action_in(&router, REGION, "start", &detector_id, &ids).await;
     assert_eq!(
         status, 200,
         "case {case}: expected HTTP 200, got {status} {body:?}"
     );
-    assert!(
-        unprocessed_ids(&body).is_empty(),
-        "case {case}: expected every member processed, got {body:?}"
-    );
-    let (status, got) = get_members_in(&router, REGION, &detector_id, &ids).await;
     assert_eq!(
-        status, 200,
-        "case {case}: expected get-members to answer 200, got {status} {got:?}"
+        unprocessed_ids(&body),
+        ids.iter().map(|id| (*id).to_string()).collect::<Vec<String>>(),
+        "case {case}: expected every member reported, got {body:?}"
     );
-    for account_id in &ids {
-        let member = member_of(&got, account_id).unwrap_or_else(|| {
-            panic!("case {case}: expected a member record for {account_id}, got {got:?}")
-        });
+    for entry in body["unprocessedAccounts"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
         assert_eq!(
-            member["relationshipStatus"].as_str(),
-            Some("Enabled"),
-            "case {case}: expected {account_id} to be monitored again, got {member:?}"
+            entry["result"].as_str(),
+            Some(NOT_AN_ASSOCIATED_MEMBER),
+            "case {case}: expected the reason it was not processed, got {entry:?}"
         );
     }
+    assert_members_unchanged(&router, REGION, &detector_id, case, &before).await;
 
     // `CreateMembers` adds a relationship rather than taking one away: the
     // organization's auto-enable settings are APPLIED to the accounts in the request

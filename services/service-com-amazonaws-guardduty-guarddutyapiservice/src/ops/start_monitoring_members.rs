@@ -9,17 +9,19 @@
 //! `Disabled` to the MONITORED relationship (`Enabled`) and its `UpdatedAt` moves
 //! with it; nothing else about the record changes.
 //!
-//! Monitoring is a DESIRED STATE, not a transition: an associated member whose
+//! Monitoring is a DESIRED STATE, not a transition: a MONITORED member whose
 //! monitoring is not stopped is processed again with nothing changed (its
 //! `UpdatedAt` does not move), so a retried call is indistinguishable from the
-//! first. That also covers a member whose invitation is still outstanding
-//! (`Created`, `Invited`): monitoring of such an account begins when it accepts the
-//! invitation, and restarting monitoring does not accept one on its behalf.
+//! first.
 //!
-//! An account id the administrator is not ASSOCIATED with — one it holds no member
-//! record for, and one a disassociation already moved to `Removed` — is reported in
+//! An account GuardDuty does not MONITOR under this administrator — one it holds no
+//! member record for, one it has only recorded, one whose invitation that account has
+//! not answered, and one a disassociation moved to `Removed` — is reported in
 //! `UnprocessedAccounts` with the reason it was not processed, which is what that
-//! member is for; the call still succeeds with HTTP 200. A value that cannot be an
+//! member is for; the call still succeeds with HTTP 200 and no relationship is
+//! written for it. Monitoring of such an account begins when the member ACCOUNT
+//! accepts the invitation, and restarting monitoring does not accept one on its
+//! behalf ([`crate::state::MemberRecord::is_monitored`]). A value that cannot be an
 //! account id at all, or a `DetectorId` this account/Region does not own, is a
 //! request the service does not understand and is refused with HTTP 400 under the
 //! `InvalidInputException` class.
@@ -169,7 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx);
-        let administrator = crate::state::administrator_account_id();
 
         // Parameter failures first, before anything is looked up or written: a value
         // that cannot be a value of its member at all is refused whatever the store
@@ -215,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             match detector.members.get_mut(account_id) {
-                Some(member) if member.is_associated() => {
+                Some(member) if member.is_monitored() => {
                     // Only monitoring restarts: the record and the association are
                     // untouched, so a later `GetMembers` reports the same account and
                     // the same email. Monitoring is a desired state, so only a member
@@ -231,12 +232,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 // Only an account ASSOCIATED with this administrator is monitored
                 // under it, so only that account's monitoring can be restarted: an
-                // account it never recorded, and one a disassociation already moved,
-                // are both reported rather than refused — and neither changes any
-                // stored member.
+                // account it never recorded, one it has recorded and not invited
+                // yet, and one a disassociation already moved are all reported
+                // rather than refused — and none of them changes any stored member.
                 _ => unprocessed.push(UnprocessedAccount {
                     account_id: account_id.clone(),
-                    result: crate::state::not_a_member_message(&administrator),
+                    result: crate::state::NOT_AN_ASSOCIATED_MEMBER_MESSAGE.to_string(),
                 }),
             }
         }

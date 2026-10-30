@@ -270,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // of these: it is never one of its own members.
                 None => unprocessed.push(UnprocessedAccount {
                     account_id: account_id.clone(),
-                    result: crate::state::not_a_member_message(&administrator),
+                    result: crate::state::NOT_AN_ASSOCIATED_MEMBER_MESSAGE.to_string(),
                 }),
             }
         }

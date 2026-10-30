@@ -41,8 +41,9 @@ use crate::detector_lifecycle::{
     ABSENT_DETECTOR_ID,
 };
 use crate::member_association::{
-    administrator, create_members, disassociate_members, not_a_member, unprocessed_ids,
+    administrator, create_members, disassociate_members, invite_members, unprocessed_ids,
     unprocessed_result, DEFAULT_REGION, MALFORMED_ACCOUNT_IDS, MEMBERS, NON_MEMBER_ACCOUNT_IDS,
+    NOT_AN_ASSOCIATED_MEMBER,
 };
 
 /// The error class a handler rejection carries in the body's `__type`.
@@ -455,6 +456,14 @@ async fn each_accounts_free_trial_is_counted_from_its_own_start() {
         status, 200,
         "create-members: expected 200, got {status} {body:?}"
     );
+    // An invitation is what associates a recorded account with its administrator,
+    // and only an associated member's trial is the administrator's to read.
+    let member_ids: Vec<&str> = MEMBERS.iter().map(|(id, _)| *id).collect();
+    let (status, body) = invite_members(&router, &detector_id, &member_ids).await;
+    assert_eq!(
+        status, 200,
+        "invite-members: expected 200, got {status} {body:?}"
+    );
 
     // Each account's windows are aged by a different span, the administrator's
     // included.
@@ -500,13 +509,24 @@ async fn an_account_the_detector_does_not_administer_is_reported_unprocessed() {
         status, 200,
         "create-members: expected 200, got {status} {body:?}"
     );
-    // A member a disassociation moved is no longer monitored under this
-    // administrator, so it is not processed either.
+    // A member a disassociation moved is no longer associated with this
+    // administrator, so it is not processed either — and nor is one the
+    // administrator has only recorded, which the invitation below associates.
     let (disassociated, _) = MEMBERS[0];
+    let (recorded_only, _) = MEMBERS[1];
+    let (status, body) = invite_members(&router, &detector_id, &[disassociated]).await;
+    assert_eq!(
+        status, 200,
+        "invite-members: expected 200, got {status} {body:?}"
+    );
     let (status, body) = disassociate_members(&router, &detector_id, &[disassociated]).await;
     assert_eq!(
         status, 200,
         "disassociate-members: expected 200, got {status} {body:?}"
+    );
+    assert!(
+        unprocessed_ids(&body).is_empty(),
+        "disassociate-members: expected an invited member processed, got {body:?}"
     );
 
     // The administrator's own account is the detector's own and IS processed, so the
@@ -517,6 +537,7 @@ async fn an_account_the_detector_does_not_administer_is_reported_unprocessed() {
         .filter(|(account_id, _)| *account_id != administrator)
         .collect();
     cases.push((disassociated, "a member a disassociation moved"));
+    cases.push((recorded_only, "a member recorded and not invited yet"));
     for (account_id, why) in cases {
         // The id is listed twice: `AccountIds` names a SET, so it is reported once.
         let body = free_trial_of(&router, &detector_id, &[account_id, account_id]).await;
@@ -526,8 +547,8 @@ async fn an_account_the_detector_does_not_administer_is_reported_unprocessed() {
             "case {account_id} ({why}): expected one unprocessed entry, got {body:?}"
         );
         assert_eq!(
-            unprocessed_result(&body, account_id),
-            Some(not_a_member()),
+            unprocessed_result(&body, account_id).as_deref(),
+            Some(NOT_AN_ASSOCIATED_MEMBER),
             "case {account_id} ({why}): expected the reason it was not processed, got {body:?}"
         );
         assert!(

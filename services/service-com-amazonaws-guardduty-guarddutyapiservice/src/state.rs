@@ -1703,7 +1703,7 @@ pub const ACCOUNT_ID_LEN: usize = 12;
 ///
 /// Form only: a well-formed id need not name an account this administrator has a
 /// member record for, which is a different question and a different answer (see
-/// [`not_a_member_message`]).
+/// [`NOT_AN_ASSOCIATED_MEMBER_MESSAGE`]).
 pub fn is_account_id(id: &str) -> bool {
     id.len() == ACCOUNT_ID_LEN && id.bytes().all(|b| b.is_ascii_digit())
 }
@@ -1787,21 +1787,37 @@ pub fn administrator_account_id() -> String {
 }
 
 /// `UnprocessedAccount.Result` — "a reason why the account hasn't been processed"
-/// (`smithy_query(shape="UnprocessedAccount")`) — for an account id the
-/// administrator's detector holds no member record for.
+/// (`smithy_query(shape="UnprocessedAccount")`) — for an account id that is not an
+/// ASSOCIATED member of the administrator: one it holds no member record for, and
+/// one whose record is not associated ([`MemberRecord::is_associated`]).
 ///
 /// A per-account failure is reported here rather than refusing the whole request:
 /// the operations that take an `AccountIds` list answer 200 and report the accounts
 /// they could not process, which is what `UnprocessedAccounts` is for.
-pub fn not_a_member_message(administrator_account_id: &str) -> String {
-    format!(
-        "The request is rejected because the given account ID is not an associated member of account {administrator_account_id}."
-    )
-}
+///
+/// The administrator is named as "the current account", never by its account
+/// number: the reason says WHICH account the membership is judged against, and the
+/// account a request is signed for is the one it is answered for, so the sentence
+/// is the same whatever account id this emulator serves.
+pub const NOT_AN_ASSOCIATED_MEMBER_MESSAGE: &str = "The request is rejected because the given account ID is not an associated member of the current account.";
+
+/// `UnprocessedAccount.Result` for an account `DeleteMembers` dropped no member
+/// record for.
+///
+/// Deleting is what "remove[s] the details associated with a member account" that a
+/// disassociation RETAINS (`smithy_query(query="doc",shape="DisassociateMembers")`),
+/// so the record it does not drop is the one of a member GuardDuty MONITORS under
+/// the administrator ([`MemberRecord::is_monitored`]): that member has to be
+/// disassociated first, which is what this reason states. GuardDuty answers the SAME
+/// reason for an account the administrator holds no member record for at all — there
+/// was no member record to drop in either case — so it is the one reason for the
+/// whole class, and it carries no account id.
+pub const MEMBER_NOT_DELETED_MESSAGE: &str = "The request is rejected because the current account cannot delete the given member account ID since it is still associated to it.";
 
 /// `UnprocessedAccount.Result` for an account `DisassociateMembers` was asked to
 /// disassociate that is not ASSOCIATED with the administrator — one it holds no
-/// member record for, and one whose relationship a disassociation already moved.
+/// member record for, one it has recorded and not invited yet, and one whose
+/// relationship a disassociation already moved.
 ///
 /// The condition is the association, not the record: the message states it ("the
 /// latter is not yet associated to it"), and a disassociated member keeps its
@@ -2700,11 +2716,53 @@ impl MemberRecord {
     /// Is this member currently ASSOCIATED with the administrator?
     ///
     /// "Is a member account of this administrator" and "is associated with it" are
-    /// two different questions, because the record is retained across a
-    /// disassociation (see the type's documentation): `GetMembers` answers the
-    /// first, `DisassociateMembers` acts on the second.
+    /// two different questions, because a record is held before the association
+    /// begins and retained after it ends (see the type's documentation):
+    /// `GetMembers` answers the first, and the operations that act on the
+    /// association answer the second.
+    ///
+    /// The members that are NOT associated are the two classes `ListMembers` names
+    /// when it offers "to only return associated members or to return all members
+    /// (including members who haven't been invited yet or have been disassociated)"
+    /// (`smithy_query(query="doc",shape="ListMembersRequest",member="OnlyAssociated")`):
+    /// an account the administrator has recorded and not invited yet
+    /// ([`RELATIONSHIP_CREATED`]), and one a disassociation moved
+    /// ([`RELATIONSHIP_REMOVED`]). The invitation is what associates the account, so
+    /// the relationship is an association from there on — whether or not the account
+    /// has answered it, which is the narrower [`Self::is_monitored`].
     pub fn is_associated(&self) -> bool {
-        self.relationship_status != RELATIONSHIP_REMOVED
+        self.relationship_status == RELATIONSHIP_INVITED
+            || self.relationship_status == RELATIONSHIP_ENABLED
+            || self.relationship_status == RELATIONSHIP_DISABLED
+    }
+
+    /// Is GuardDuty MONITORING this member account under the administrator?
+    ///
+    /// The association and the monitoring are two facts, and the monitoring is the
+    /// narrower one: it begins when the member ACCOUNT accepts the administrator's
+    /// invitation — [`RELATIONSHIP_ENABLED`] while it runs and
+    /// [`RELATIONSHIP_DISABLED`] while the administrator has stopped it, which is the
+    /// state `StartMonitoringMembers` turns back on ("use this operation to restart
+    /// monitoring of accounts that you stopped monitoring with the
+    /// StopMonitoringMembers operation",
+    /// `smithy_query(query="doc",shape="StartMonitoringMembers")`). An account the
+    /// administrator has recorded or invited is not monitored under it yet, whatever
+    /// else it may already be associated with it for.
+    pub fn is_monitored(&self) -> bool {
+        self.relationship_status == RELATIONSHIP_ENABLED
+            || self.relationship_status == RELATIONSHIP_DISABLED
+    }
+
+    /// Has the administrator ENDED this member's association with
+    /// `DisassociateMembers`, leaving the record it retains behind
+    /// ([`RELATIONSHIP_REMOVED`])?
+    ///
+    /// Not the complement of [`Self::is_associated`]: an account recorded and not
+    /// invited yet, and one whose invitation is still unanswered, are neither
+    /// associated nor disassociated, which is why the two questions are asked
+    /// separately.
+    pub fn is_disassociated(&self) -> bool {
+        self.relationship_status == RELATIONSHIP_REMOVED
     }
 
     /// Set one feature's status on the member account's configuration, recording

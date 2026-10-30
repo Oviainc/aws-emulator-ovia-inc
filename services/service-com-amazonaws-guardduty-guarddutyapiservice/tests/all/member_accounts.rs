@@ -33,7 +33,7 @@ use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
     ABSENT_DETECTOR_ID,
 };
-use crate::member_association::{create_members, disassociate_members};
+use crate::member_association::{create_members, disassociate_members, invite_members};
 
 /// The error class every GuardDuty client rejection is named by on the wire.
 const CLASS: &str = "InvalidInputException";
@@ -322,6 +322,19 @@ async fn only_associated_narrows_the_list_to_the_associated_members() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
     let disassociated = MEMBER_ROWS[0].0;
+    // Left merely RECORDED: "members who haven't been invited yet" are not associated
+    // members either
+    // (`smithy_query(query="doc",shape="ListMembersRequest",member="OnlyAssociated")`).
+    let recorded_only = MEMBER_ROWS[1].0;
+
+    // The invitation is what associates a recorded account with its administrator.
+    let invited: Vec<&str> = MEMBER_ROWS
+        .iter()
+        .map(|(account_id, _)| *account_id)
+        .filter(|account_id| *account_id != recorded_only)
+        .collect();
+    let (status, body) = invite_members(&router, &detector_id, &invited).await;
+    assert_eq!(status, 200, "invite-members: got {status} {body:?}");
 
     // Disassociating moves the RELATIONSHIP and retains the record, so the member is
     // still one of the administrator's members while no longer being associated with
@@ -332,7 +345,9 @@ async fn only_associated_narrows_the_list_to_the_associated_members() {
     let all = expected_order();
     let associated: Vec<String> = all
         .iter()
-        .filter(|account_id| account_id.as_str() != disassociated)
+        .filter(|account_id| {
+            account_id.as_str() != disassociated && account_id.as_str() != recorded_only
+        })
         .cloned()
         .collect();
 
@@ -373,15 +388,21 @@ async fn only_associated_narrows_the_list_to_the_associated_members() {
         "a disassociated member keeps its record, got {member:?}"
     );
 
-    // Re-creating it associates it again, so an associated-only list reports it.
+    // Re-creating it records it afresh and a fresh invitation associates it again, so
+    // an associated-only list reports it.
     let (status, body) =
         create_members(&router, &detector_id, &[(disassociated, MEMBER_ROWS[0].1)]).await;
     assert_eq!(status, 200, "re-create: got {status} {body:?}");
+    let (status, body) = invite_members(&router, &detector_id, &[disassociated]).await;
+    assert_eq!(status, 200, "re-invite: got {status} {body:?}");
     let (_, body) = list_members(&router, &detector_id, "?onlyAssociated=true").await;
+    let mut expected = associated.clone();
+    expected.push(disassociated.to_string());
+    expected.sort();
     assert_eq!(
         reported_ids("after the re-create", &body),
-        all,
-        "a re-created member is associated again, got {body:?}"
+        expected,
+        "a re-invited member is associated again, got {body:?}"
     );
 
     for (case, value) in [

@@ -45,9 +45,9 @@ use crate::detector_lifecycle::{
 // accounts to record, differing along the account id and the email's shape; this
 // suite invites them.
 use crate::member_association::{
-    administrator, create_members, disassociate_members, get_members, member_of, not_a_member,
-    unprocessed_ids, unprocessed_result, MALFORMED_ACCOUNT_IDS, MEMBERS,
-    NON_MEMBER_ACCOUNT_IDS,
+    administrator, create_members, disassociate_members, get_members, member_of, unprocessed_ids,
+    unprocessed_result, MALFORMED_ACCOUNT_IDS, MEMBERS, NON_MEMBER_ACCOUNT_IDS,
+    NOT_AN_ASSOCIATED_MEMBER,
 };
 
 /// The error class every GuardDuty client rejection is named by on the wire.
@@ -275,8 +275,10 @@ async fn inviting_moves_only_the_named_members_to_invited_and_records_when() {
             );
         }
 
-        // An invited member is ASSOCIATED with the administrator: the narrowed
-        // listing still names every member.
+        // An invited member is ASSOCIATED with the administrator and a member only
+        // recorded is not: the narrowed listing names exactly the invited ones, and
+        // the full listing every record
+        // (`smithy_query(query="doc",shape="ListMembersRequest",member="OnlyAssociated")`).
         for only_associated in [true, false] {
             let (status, listed) = list_members(&router, &detector_id, only_associated).await;
             assert_eq!(
@@ -284,9 +286,11 @@ async fn inviting_moves_only_the_named_members_to_invited_and_records_when() {
                 "case {why} onlyAssociated={only_associated}: expected 200, got {status} {listed:?}"
             );
             for account_id in &ids {
-                assert!(
+                let expected = !only_associated || invited.contains(account_id);
+                assert_eq!(
                     member_of(&listed, account_id).is_some(),
-                    "case {why} onlyAssociated={only_associated} {account_id}: expected an invited member to be associated, got {listed:?}"
+                    expected,
+                    "case {why} onlyAssociated={only_associated} {account_id}: expected listed={expected}, got {listed:?}"
                 );
             }
         }
@@ -394,10 +398,20 @@ async fn a_disassociated_member_is_invited_again_without_being_recreated() {
         let router = new_router();
         let detector_id = detector_with_members(&router).await;
 
+        // An invitation first, because only an association can be ended.
+        let (status, body) = invite(&router, &detector_id, &[account_id]).await;
+        assert_eq!(
+            status, 200,
+            "case {account_id}: the first invite expected 200, got {status} {body:?}"
+        );
         let (status, body) = disassociate_members(&router, &detector_id, &[account_id]).await;
         assert_eq!(
             status, 200,
             "case {account_id}: disassociate expected 200, got {status} {body:?}"
+        );
+        assert!(
+            unprocessed_ids(&body).is_empty(),
+            "case {account_id}: expected an invited member processed, got {body:?}"
         );
         let (_, removed) = get_members(&router, &detector_id, &[account_id]).await;
         let before = member_of(&removed, account_id).unwrap_or_else(|| {
@@ -454,7 +468,7 @@ async fn a_disassociated_member_is_invited_again_without_being_recreated() {
 async fn an_account_with_no_member_record_is_reported_not_refused() {
     let router = new_router();
     let detector_id = detector_with_members(&router).await;
-    let reason = not_a_member();
+    let reason = NOT_AN_ASSOCIATED_MEMBER;
 
     // The administrator's own account is never one of its own members, so it is a row
     // of this table beside the ids nothing recorded.
@@ -475,7 +489,7 @@ async fn an_account_with_no_member_record_is_reported_not_refused() {
         );
         assert_eq!(
             unprocessed_result(&body, account_id).as_deref(),
-            Some(reason.as_str()),
+            Some(reason),
             "case {account_id} ({why}): expected the not-a-member reason, got {body:?}"
         );
 

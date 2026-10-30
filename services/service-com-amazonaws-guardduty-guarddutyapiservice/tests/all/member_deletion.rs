@@ -12,15 +12,17 @@
 //! 1. Deleting REMOVES the stored member details a disassociation retains — "to
 //!    remove the details associated with a member account, the delegated
 //!    administrator must invoke the DeleteMembers API"
-//!    (`smithy_query(query="doc",shape="DisassociateMembers")`). The condition is the
-//!    RECORD, not the association, so a record is dropped whatever
-//!    `relationshipStatus` it carries, and afterwards neither read of a member
-//!    (`GetMembers`, `ListMembers`) reports the account at all. Every member the call
-//!    did not name is left exactly where it was.
+//!    (`smithy_query(query="doc",shape="DisassociateMembers")`). What it drops is a
+//!    record whose relationship is NOT an association, so a record is dropped in
+//!    every relationship a member reaches here, `Removed` — the state a
+//!    disassociation RETAINS the record in — included, and afterwards neither read of
+//!    a member (`GetMembers`, `ListMembers`) reports the account at all. Every member
+//!    the call did not name is left exactly where it was.
 //! 2. Deleting is idempotent in the only sense a delete can be: once the record is
-//!    gone the account is no member, so a second delete of the same id answers HTTP
-//!    200 and reports it in `unprocessedAccounts` with the reason it was not
-//!    processed, once per DISTINCT id in request order, and persists nothing for it.
+//!    gone there is no member record to drop, so a second delete of the same id
+//!    answers HTTP 200 and reports it in `unprocessedAccounts` with the reason no
+//!    record was dropped, once per DISTINCT id in request order, and persists
+//!    nothing for it.
 //! 3. The record is GONE, not emptied: re-recording the same account id with
 //!    `CreateMembers` yields a fresh record — the new email, `Created` again and no
 //!    `invitedAt` — rather than the deleted one's details.
@@ -48,8 +50,8 @@ use crate::invitation_listing::enabled_detector_in;
 // drifting apart on what a member read looks like or what a malformed account id is.
 use crate::member_association::{
     administrator, create_members, create_members_in, get_members, get_members_in, member_of,
-    not_a_member, unprocessed_ids, unprocessed_result, MALFORMED_ACCOUNT_IDS, MEMBERS,
-    NON_MEMBER_ACCOUNT_IDS,
+    unprocessed_ids, unprocessed_result, MALFORMED_ACCOUNT_IDS, MEMBERS, MEMBER_NOT_DELETED,
+    NON_MEMBER_ACCOUNT_IDS, NOT_AN_ASSOCIATED_MEMBER,
 };
 // The organization precondition's own table and message live once, in the suite that
 // owns that rule for the operations it already covered.
@@ -75,20 +77,22 @@ const REGION: &str = crate::member_association::DEFAULT_REGION;
 /// GuardDuty holds one detector per account per Region.
 const OTHER_REGION: &str = "us-west-2";
 
-/// Every `relationshipStatus` a stored member record can carry, with the member
-/// requests that drive a freshly recorded account into it — each a path segment under
+/// Every `relationshipStatus` a stored member record reaches through the requests
+/// this administrator can send, with the member requests that drive a freshly
+/// recorded account into it — each a path segment under
 /// `/detector/{DetectorId}/member` (`smithy_query(operation="InviteMembers")` and the
-/// monitoring/disassociation operations beside it).
+/// disassociation operation beside it).
 ///
 /// The rule under test generalises over the relationship, so the rows span it: a
 /// delete drops the record in every one of these states, including `Removed`, which
-/// is the state a disassociation RETAINS the record in.
-const RELATIONSHIP_STATUSES: [(&str, &[&str]); 5] = [
+/// is the state a disassociation RETAINS the record in. `Enabled` and `Disabled` are
+/// not rows: GuardDuty reaches them only once the member ACCOUNT has accepted the
+/// administrator's invitation, which is that account's call to make and not one this
+/// administrator can send.
+const RELATIONSHIP_STATUSES: [(&str, &[&str]); 3] = [
     ("Created", &[]),
     ("Invited", &["invite"]),
-    ("Disabled", &["stop"]),
-    ("Enabled", &["stop", "start"]),
-    ("Removed", &["disassociate"]),
+    ("Removed", &["invite", "disassociate"]),
 ];
 
 /// `DeleteMembers` through `region`'s endpoint.
@@ -213,7 +217,7 @@ async fn assert_no_record(router: &Router, region: &str, detector_id: &str, case
     );
     assert_eq!(
         unprocessed_result(&body, account_id),
-        Some(not_a_member()),
+        Some(NOT_AN_ASSOCIATED_MEMBER.to_string()),
         "case {case}: expected {account_id} reported as no member, got {body:?}"
     );
     let listed = listed_ids(router, region, detector_id).await;
@@ -487,8 +491,8 @@ async fn an_account_with_no_record_is_reported_rather_than_refused() {
         for account_id in &expected_unprocessed {
             assert_eq!(
                 unprocessed_result(&body, account_id),
-                Some(not_a_member()),
-                "case {case}: expected the not-a-member reason for {account_id}, got {body:?}"
+                Some(MEMBER_NOT_DELETED.to_string()),
+                "case {case}: expected the undeletable-member reason for {account_id}, got {body:?}"
             );
         }
 
@@ -538,8 +542,8 @@ async fn a_second_delete_of_the_same_accounts_reports_them_as_no_member() {
     for account_id in &ids {
         assert_eq!(
             unprocessed_result(&second, account_id),
-            Some(not_a_member()),
-            "second delete: expected the not-a-member reason for {account_id}, got {second:?}"
+            Some(MEMBER_NOT_DELETED.to_string()),
+            "second delete: expected the undeletable-member reason for {account_id}, got {second:?}"
         );
     }
 }

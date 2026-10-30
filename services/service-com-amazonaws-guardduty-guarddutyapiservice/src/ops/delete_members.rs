@@ -6,12 +6,16 @@
 //! details a disassociation RETAINS — "to remove the details associated with a member
 //! account, the delegated administrator must invoke the DeleteMembers API"
 //! (`smithy_query(query="doc",shape="DisassociateMembers")`) — so a record this call
-//! drops is gone whatever its `RelationshipStatus` was, and a later `GetMembers` /
-//! `ListMembers` no longer reports the account at all.
+//! drops is gone: a later `GetMembers` / `ListMembers` no longer reports the account
+//! at all.
 //!
-//! An account id the administrator holds NO member record for is reported in
-//! `UnprocessedAccounts` with the reason it was not processed, which is what that
-//! member is for; the call still succeeds with HTTP 200. A value that cannot be an
+//! The one record it does NOT drop is a member GuardDuty MONITORS under this
+//! administrator ([`crate::state::MemberRecord::is_monitored`]), which has to be
+//! disassociated first. That account, and an account the administrator holds no
+//! member record for at all, are each reported in `UnprocessedAccounts` with the
+//! reason the record was not dropped
+//! ([`crate::state::MEMBER_NOT_DELETED_MESSAGE`]), which is what that member is for;
+//! the call still succeeds with HTTP 200. A value that cannot be an
 //! account id at all, or a `DetectorId` this account/Region does not own, is a
 //! request the service does not understand and is refused with HTTP 400 under the
 //! `InvalidInputException` class.
@@ -170,7 +174,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let region = crate::state::request_region(ctx);
-        let administrator = crate::state::administrator_account_id();
 
         // Parameter failures first, before anything is looked up or written: a value
         // that cannot be a value of its member at all is refused whatever the store
@@ -221,17 +224,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !seen.insert(account_id.as_str()) {
                 continue;
             }
-            // The RECORD is the condition here, not the association: deleting is what
-            // removes the details a disassociation retains, so a member whose
-            // relationship a disassociation already ended is dropped like any other.
-            // An account this administrator holds no record for identifies nothing to
-            // delete, so it is reported rather than refused — and nothing stored
-            // changes for it.
-            if detector.members.remove(account_id).is_none() {
-                unprocessed.push(UnprocessedAccount {
+            // Deleting is what removes the details a disassociation RETAINS, so the
+            // member GuardDuty MONITORS under this administrator is the one that has
+            // to be disassociated first: its record is kept and it is reported with
+            // the reason the record was not dropped. Every other record the
+            // administrator holds — an account it has recorded, one whose invitation
+            // that account has not answered, and one a disassociation already moved —
+            // is dropped. An account it holds NO member record for had no record to
+            // drop either, so it is reported with that same reason, which is the one
+            // GuardDuty gives for the whole class. Nothing stored changes for either
+            // report.
+            match detector.members.get(account_id) {
+                Some(member) if member.is_monitored() => unprocessed.push(UnprocessedAccount {
                     account_id: account_id.clone(),
-                    result: crate::state::not_a_member_message(&administrator),
-                });
+                    result: crate::state::MEMBER_NOT_DELETED_MESSAGE.to_string(),
+                }),
+                Some(_) => {
+                    detector.members.remove(account_id);
+                }
+                None => unprocessed.push(UnprocessedAccount {
+                    account_id: account_id.clone(),
+                    result: crate::state::MEMBER_NOT_DELETED_MESSAGE.to_string(),
+                }),
             }
         }
 
