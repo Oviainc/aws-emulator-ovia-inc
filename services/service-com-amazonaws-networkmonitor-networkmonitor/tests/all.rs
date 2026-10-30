@@ -23,6 +23,8 @@ mod delete_probe_and_monitor_state;
 mod draining_probe_tag_mutations;
 #[path = "all/idempotent_replay_state.rs"]
 mod idempotent_replay_state;
+#[path = "all/list_monitors_no_position.rs"]
+mod list_monitors_no_position;
 #[path = "all/list_monitors_pagination.rs"]
 mod list_monitors_pagination;
 #[path = "all/monitor_and_probe.rs"]

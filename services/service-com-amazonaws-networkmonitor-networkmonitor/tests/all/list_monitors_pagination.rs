@@ -65,7 +65,7 @@ struct Case {
 
 /// The body that creates a monitor with one probe (so the monitor is stored
 /// `PENDING`), or none (so it is stored `INACTIVE`).
-fn create_body(name: &str, with_probes: bool) -> String {
+pub(crate) fn create_body(name: &str, with_probes: bool) -> String {
     if with_probes {
         format!(
             r#"{{"monitorName":"{name}","probes":[{{"sourceArn":"{}","destination":"10.0.0.1",

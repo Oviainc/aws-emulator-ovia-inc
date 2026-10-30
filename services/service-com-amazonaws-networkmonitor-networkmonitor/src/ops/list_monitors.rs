@@ -7,7 +7,9 @@
 //! opaque cursor naming the first monitor of the NEXT page, and is absent on the
 //! final page. A cursor names a position in that order rather than a particular
 //! monitor, so a resume falls forward to the first monitor at or after it and a
-//! cursor this service vended keeps working after the set has shifted.
+//! cursor this service vended keeps working after the set has shifted. A
+//! request that names no position — carrying no `nextToken`, or an empty one,
+//! which the modelled length bound admits — is served the first page.
 //!
 //! ## Shape of an operation
 //!
@@ -209,7 +211,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let start = match input.next_token.as_deref() {
+        // A request that names NO position starts at the first monitor. That is
+        // an absent `nextToken`, and equally an EMPTY one: the modelled
+        // `@length(min: 0)` admits the empty string, which carries no key and so
+        // names no position in the order — the same page as no cursor at all,
+        // rather than a bad request (`crate::state::requested_page_cursor`).
+        let start = match crate::state::requested_page_cursor(input.next_token.as_deref()) {
             None => 0,
             Some(token) => {
                 // A cursor this service vended stays usable: it names a

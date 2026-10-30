@@ -421,6 +421,20 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     decoded.strip_prefix(PAGE_TOKEN_MARKER).map(str::to_owned)
 }
 
+/// The cursor a listing was actually asked to resume from, as the request
+/// names it: `None` when the request named no position at all.
+///
+/// A `@paginated` token is an opaque name for a POSITION in the listing's key
+/// order, and `PaginationToken`'s modelled `@length(min: 0)` admits the empty
+/// string — so the boundary validator hands `""` to the operation. An empty
+/// cursor carries no key, so it names no position, which is the same request as
+/// one that carried no cursor: the FIRST page. Only a non-empty value claims to
+/// be a cursor, so only such a value is held to [`decode_page_token`] and can
+/// be refused for naming a page of no listing.
+pub fn requested_page_cursor(next_token: Option<&str>) -> Option<&str> {
+    next_token.filter(|token| !token.is_empty())
+}
+
 /// Where a listing resumes from a cursor: the index of the first item of
 /// `ordered` whose key does not sort before `cursor`.
 ///
