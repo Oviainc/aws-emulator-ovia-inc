@@ -25997,6 +25997,37 @@ pub fn network_interface_in_use<E>(network_interface_id: &str) -> Scaffolded<E> 
     )
 }
 
+// ---------------------------------------------------------------------------
+// Trunk interfaces: the account-level entitlement EC2 gates them behind
+// ---------------------------------------------------------------------------
+
+/// Refuse a branch/trunk network-interface association to a caller whose account may not
+/// use interface trunking: HTTP 400 `OperationNotPermitted`, naming the account the request
+/// was made by.
+///
+/// Joining a `branch` network interface to a `trunk` one is not part of the EC2 API every
+/// account may call: the capability is granted to an account out of band, by AWS, and an
+/// account that does not hold it is refused the OPERATION rather than told anything about
+/// the interfaces, the VLAN or the GRE key the request named. So this refusal is the answer
+/// before any member of the request is interpreted — an id the boundary validator admitted
+/// is neither resolved nor checked for shape — and a `DryRun` request reads it too: the dry
+/// run asks whether the request would have succeeded, and this one would not.
+///
+/// `User` is the account the request was made by, which for this emulator is the one account
+/// it serves ([`::engine::emulator_account_id`]) — nothing a request carries can name
+/// another, and no operation of this API grants the capability, so every caller of a trunk
+/// interface operation reads this.
+///
+/// One function rather than a literal per handler, so the three operations the capability
+/// gates — the associate, its reader and the disassociate — cannot word one refusal three
+/// ways.
+pub fn trunk_interface_not_permitted<E>() -> Scaffolded<E> {
+    Scaffolded::operation_not_permitted(format!(
+        "User {account} is not permitted to perform this operation",
+        account = ::engine::emulator_account_id(),
+    ))
+}
+
 // What one network interface is created with lives in [`NetworkInterfaceSpec`], beside the
 // writer seam [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] further up, so a
 // create and a seeded fixture ask for an interface the same way.

@@ -1025,3 +1025,8 @@ mod describe_transit_gateway_attachments;
 // as it was, what it refuses, and how one `ClientToken` bounds it to one modification.
 #[path = "all/modify_verified_access_instance.rs"]
 mod modify_verified_access_instance;
+// Appended at the END of this file, for the reason the header gives. What
+// `AssociateTrunkInterface` answers a caller whose account may not use interface trunking —
+// one refusal for every shape of request, in any Region, with nothing stored.
+#[path = "all/trunk_interface_associations.rs"]
+mod trunk_interface_associations;
