@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DataStoreResponse, MatchingResponse, ObjectTypeField, ObjectTypeKey, Profile, Readiness,
-    RuleBasedMatchingResponse,
+    ResultsSummary, RuleBasedMatchingResponse,
 };
 
 /// How long after `CreateDomain` the asynchronous work a new domain kicks off is treated
@@ -74,6 +74,22 @@ pub const MAX_PROFILES_PER_DOMAIN: usize = 10_000;
 /// checked before the insert so repeated `PutProfileObjectType` calls cannot grow the
 /// store without bound.
 pub const MAX_OBJECT_TYPES_PER_DOMAIN: usize = 1_000;
+
+/// Emulator resource guard, NOT an AWS quota: the most upload jobs this emulator stores
+/// for one domain. Set well above any realistic emulator workload, and checked before
+/// the insert so repeated `CreateUploadJob` calls cannot grow the store without bound.
+pub const MAX_UPLOAD_JOBS_PER_DOMAIN: usize = 1_000;
+
+/// The `DataExpiry` an upload job gets when the request carries none.
+/// `CreateUploadJobRequest$DataExpiry` documents it: "The expiry duration for the
+/// profiles ingested with the job. If not provided, the system default of 2 weeks is
+/// used." Two weeks, in the days the member is measured in.
+pub const DEFAULT_UPLOAD_JOB_DATA_EXPIRY_DAYS: i32 = 14;
+
+/// The `UploadJobStatus` a job is created in: "CREATED: The upload job has been created,
+/// but has not started processing yet." Nothing but a later call moves a job out of it,
+/// so it is not a clock-owed transition.
+pub const UPLOAD_JOB_CREATED: &str = "CREATED";
 
 /// `RuleBasedMatchingStatus` while the rule is being built. Its documentation: "The
 /// system is creating the rule-based matching rule." A domain created with rule-based
@@ -141,6 +157,10 @@ pub struct Domain {
     /// The domain's profile object types, keyed by `ObjectTypeName` — the name is the
     /// object type's identity (`@httpLabel` on every object-type operation).
     pub object_types: BTreeMap<String, StoredObjectType>,
+    /// The domain's upload jobs, keyed by the `JobId` `CreateUploadJob` minted — the id
+    /// is the job's identity (`@httpLabel` on every upload-job operation). A `BTreeMap`,
+    /// so a listing walks them in one stable order.
+    pub upload_jobs: BTreeMap<String, StoredUploadJob>,
     /// `KeyName` -> `Value` -> the ids of the profiles indexed under that pair. This is
     /// what `SearchProfiles` reads; [`Domain::put_profile`] fills it and
     /// [`Domain::remove_profile`] empties it. Nested rather than keyed by a
@@ -205,6 +225,67 @@ impl StoredObjectType {
     }
 }
 
+/// One stored upload job: the metadata `CreateUploadJob` persisted ("The metadata is
+/// created for the job with the provided field mapping and unique key") and the progress
+/// the service keeps for it.
+///
+/// The progress members are stored rather than derived: a job leaves
+/// [`UPLOAD_JOB_CREATED`] only when a caller starts or stops it, never because the clock
+/// moved, so a read reports exactly what the last call wrote.
+#[derive(Debug, Clone)]
+pub struct StoredUploadJob {
+    /// `JobId`, as minted (also this record's key in [`Domain::upload_jobs`]).
+    pub job_id: String,
+    /// `DisplayName`, as stored.
+    pub display_name: String,
+    /// `Fields`, as stored: "The mapping between CSV Columns and Profile Object
+    /// attributes."
+    pub fields: HashMap<String, ObjectTypeField>,
+    /// `UniqueKey`, as stored.
+    pub unique_key: String,
+    /// `DataExpiry`, as stored: the request's value, or
+    /// [`DEFAULT_UPLOAD_JOB_DATA_EXPIRY_DAYS`] when it carried none.
+    pub data_expiry: i32,
+    /// `Status`, one of the modelled `UploadJobStatus` values.
+    pub status: String,
+    /// `StatusReason`: why the job is in its current status, set only by a status that
+    /// has one.
+    pub status_reason: Option<String>,
+    /// `CreatedAt`: generated once, when the job was created, and never recomputed.
+    pub created_at: SystemTime,
+    /// `CompletedAt`: when the job finished processing, so unset until it has.
+    pub completed_at: Option<SystemTime>,
+    /// `ResultsSummary`: the records the job processed, so unset until it has processed
+    /// any.
+    pub results_summary: Option<ResultsSummary>,
+}
+
+impl StoredUploadJob {
+    /// A freshly created job: the metadata the request carried, in
+    /// [`UPLOAD_JOB_CREATED`] with nothing processed yet.
+    pub fn new(
+        job_id: String,
+        display_name: String,
+        fields: HashMap<String, ObjectTypeField>,
+        unique_key: String,
+        data_expiry: i32,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            job_id,
+            display_name,
+            fields,
+            unique_key,
+            data_expiry,
+            status: UPLOAD_JOB_CREATED.to_string(),
+            status_reason: None,
+            created_at: now,
+            completed_at: None,
+            results_summary: None,
+        }
+    }
+}
+
 /// One stored profile: the modelled shape plus the timestamps the service keeps for it.
 #[derive(Debug, Clone)]
 pub struct StoredProfile {
@@ -238,6 +319,7 @@ impl Domain {
             ready_at: now + ASYNC_WORK_SPAN,
             profiles: BTreeMap::new(),
             object_types: BTreeMap::new(),
+            upload_jobs: BTreeMap::new(),
             key_index: HashMap::new(),
         }
     }

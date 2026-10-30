@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUploadJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUploadJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUploadJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the metadata for an upload job in a stored domain and persists it, so every
+//! later read of that job answers from the record this operation wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +148,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUploadJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUploadJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUploadJob"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // Generated ONCE, here, so `CreatedAt` is the instant the job was created and
+        // every later read reports exactly that value.
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // "Domain should be exists for the upload job to be created" — a job hangs off a
+        // domain, so there is nothing to create one under when the domain is not stored.
+        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+            CreateUploadJobError::from(CreateUploadJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("The domain {} does not exist", input.domain_name)),
+                },
+            ))
+        })?;
+        // One job per request, and at most this many per domain: however many requests
+        // arrive, the domain cannot grow past the cap.
+        if domain.upload_jobs.len() >= crate::state::MAX_UPLOAD_JOBS_PER_DOMAIN {
+            return Err(CreateUploadJobErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "The maximum number of upload jobs for domain {} has been reached: {}",
+                    input.domain_name,
+                    crate::state::MAX_UPLOAD_JOBS_PER_DOMAIN
+                )),
+            })
+            .into());
+        }
+
+        let job = crate::state::StoredUploadJob::new(
+            new_job_id(),
+            input.display_name,
+            input.fields,
+            input.unique_key,
+            // "If not provided, the system default of 2 weeks is used."
+            input
+                .data_expiry
+                .unwrap_or(crate::state::DEFAULT_UPLOAD_JOB_DATA_EXPIRY_DAYS),
+            now,
+        );
+
+        // Answer with the id the stored record carries, so the response cannot name a
+        // job a later `GetUploadJob` does not find.
+        let output = CreateUploadJobOutput {
+            job_id: job.job_id.clone(),
+        };
+        domain.upload_jobs.insert(job.job_id.clone(), job);
+        Ok(output)
     }
+}
+
+/// A fresh `JobId`: the 32 lowercase hex characters the modelled pattern
+/// `^[a-f0-9]{32}$` requires, taken from a v4 UUID's simple (undashed) form.
+fn new_job_id() -> String {
+    ::uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> CreateUploadJobError {
+    CreateUploadJobErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
 }

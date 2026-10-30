@@ -21,3 +21,5 @@ mod merge_profiles;
 mod profile_object_types;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/upload_jobs.rs"]
+mod upload_jobs;
