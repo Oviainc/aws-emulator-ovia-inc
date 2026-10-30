@@ -7041,7 +7041,8 @@ pub const ADDONS_LISTING: &str = "addons";
 /// names. See [`CLUSTERS_LISTING`].
 pub const NODEGROUPS_LISTING: &str = "node-groups";
 /// The scope `ListCertificateAuthorities`'s tokens carry, over one cluster's
-/// certificate-authority ids. See [`CLUSTERS_LISTING`].
+/// certificate-authority order keys
+/// ([`CertificateAuthorityRecord::page_key`]). See [`CLUSTERS_LISTING`].
 pub const CERTIFICATE_AUTHORITIES_LISTING: &str = "certificate-authorities";
 /// The scope `ListUpdates`'s tokens carry, over the update ids of one resource
 /// of one cluster. See [`CLUSTERS_LISTING`].
@@ -7419,6 +7420,29 @@ impl CertificateAuthorityRecord {
         }
     }
 
+    /// The key this certificate authority sorts and pages under in
+    /// `ListCertificateAuthorities`, which reports a cluster's certificate
+    /// authorities most recently created FIRST.
+    ///
+    /// One definition serves both the order the listing walks
+    /// ([`ClusterRecord::certificate_authorities_newest_first`]) and the key a page
+    /// token names ([`encode_scoped_page_token`]), so a token always resumes the
+    /// order the listing walks. The key is a string whose BYTE order is the listing
+    /// order: the creation instant goes in as the complement of its nanoseconds
+    /// since the epoch, zero-padded to the 39 digits of `u128::MAX`, so a later
+    /// instant sorts earlier; the id follows it, so two certificate authorities
+    /// created within one clock tick still have a total, stable order. An instant
+    /// before the epoch has no nanoseconds since it and takes the largest
+    /// complement, which sorts it last — where the oldest creation belongs.
+    pub fn page_key(&self) -> String {
+        let nanos = self
+            .created_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|since_epoch| since_epoch.as_nanos())
+            .unwrap_or(0);
+        format!("{:039}/{}", u128::MAX - nanos, self.id)
+    }
+
     /// This record as the modelled `CertificateAuthoritySummary` shape, which the
     /// certificate-authority write operations and `ListCertificateAuthorities`
     /// answer with.
@@ -7556,6 +7580,21 @@ impl ClusterRecord {
     /// This cluster's certificate authority with `id`, if it holds one.
     pub fn certificate_authority(&self, id: &str) -> Option<&CertificateAuthorityRecord> {
         self.certificate_authorities.get(id)
+    }
+
+    /// This cluster's certificate authorities in the order
+    /// `ListCertificateAuthorities` reports them: most recently created first, ties
+    /// broken by id — [`CertificateAuthorityRecord::page_key`]'s order.
+    ///
+    /// The records are STORED in a map keyed by certificate-authority id, which is
+    /// a lookup index ([`Self::certificate_authority`]) and not a reporting order:
+    /// an id is derived from the cluster and a counter, so its byte order says
+    /// nothing about when the certificate authority was created.
+    pub fn certificate_authorities_newest_first(&self) -> Vec<&CertificateAuthorityRecord> {
+        let mut ordered: Vec<&CertificateAuthorityRecord> =
+            self.certificate_authorities.values().collect();
+        ordered.sort_by_key(|authority| authority.page_key());
+        ordered
     }
 
     /// "An object identifying the certificate authority that is currently signing

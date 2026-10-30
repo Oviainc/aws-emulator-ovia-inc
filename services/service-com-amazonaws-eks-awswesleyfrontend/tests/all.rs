@@ -49,6 +49,8 @@ mod certificate_authority_activation;
 mod certificate_authority_deletion;
 #[path = "all/certificate_authority_listing.rs"]
 mod certificate_authority_listing;
+#[path = "all/certificate_authority_listing_order.rs"]
+mod certificate_authority_listing_order;
 #[path = "all/certificate_authority_trust_list.rs"]
 mod certificate_authority_trust_list;
 #[path = "all/child_create_resolves_the_cluster_first.rs"]

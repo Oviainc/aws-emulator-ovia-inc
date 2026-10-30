@@ -3,18 +3,24 @@
 //! @op ListCertificateAuthorities
 //! IMPLEMENTED. Walks the certificate authorities one cluster holds — the stored
 //! [`crate::state::CertificateAuthorityRecord`]s on its
-//! [`crate::state::ClusterRecord`], in the certificate-authority id order they are
-//! keyed under — and reports each as the same `CertificateAuthoritySummary`
+//! [`crate::state::ClusterRecord`], most recently created FIRST
+//! ([`crate::state::ClusterRecord::certificate_authorities_newest_first`]) — and
+//! reports each as the same `CertificateAuthoritySummary`
 //! `CreateCertificateAuthority` answered with and `DescribeCertificateAuthority`
 //! reads back, so a listing never disagrees with either about a CA's signing or
-//! distribution status.
+//! distribution status. The records are keyed by certificate-authority id, which is
+//! the LOOKUP index the single-CA operations use, not this listing's order: a
+//! caller rotating a cluster CA reads the successor it must distribute off the head
+//! of the listing, so the head is the newest CA and the tail the outgoing signer.
 //!
 //! Paging follows `ListCapabilities`: a page holds at most `maxResults` summaries
 //! ([`crate::state::DEFAULT_LIST_PAGE_SIZE`] when the caller gives none, the whole page
 //! the model's 1..100 bound allows), and `nextToken` is returned only when something is
-//! left — it names the certificate authority to resume AFTER, so it stays valid across
-//! appends and deletes, and a token this listing did not mint (including one another
-//! listing issued, which is what the
+//! left — it names the newest-first order key
+//! ([`crate::state::CertificateAuthorityRecord::page_key`]) of the certificate
+//! authority to resume AFTER, so every page continues that same order and the token
+//! stays valid across appends and deletes; a token this listing did not mint
+//! (including one another listing issued, which is what the
 //! [`crate::state::CERTIFICATE_AUTHORITIES_LISTING`] token scope rules out) is an
 //! `InvalidParameterException` rather than an empty page.
 //!
@@ -260,18 +266,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         };
 
-        // The records are keyed by certificate authority id, so walking the map walks
-        // the ids in order: a total, stable order over exactly the CAs the cluster
-        // holds, which is what makes a token that names the last id returned resume
-        // the same walk after an append or a delete.
-        let mut remaining = cluster
-            .certificate_authorities
-            .values()
-            .filter(|record| {
-                resume_after
-                    .as_deref()
-                    .is_none_or(|after| record.id.as_str() > after)
-            });
+        // Materialise the cluster's certificate authorities in the order the listing
+        // reports them — newest `createdAt` first, ties broken by id — BEFORE the page
+        // is cut, so `maxResults` cuts that order rather than the id order the records
+        // happen to be keyed under. The order key is a total, stable order over
+        // exactly the CAs the cluster holds, which is what makes a token that names
+        // the last key returned resume the same walk after an append or a delete.
+        let ordered = cluster.certificate_authorities_newest_first();
+        let mut remaining = ordered.into_iter().filter(|record| {
+            resume_after
+                .as_deref()
+                .is_none_or(|after| record.page_key().as_str() > after)
+        });
         let page: Vec<&crate::state::CertificateAuthorityRecord> =
             remaining.by_ref().take(page_size).collect();
         // A token is returned only when something is left to resume from, so the last
@@ -279,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = match (remaining.next(), page.last()) {
             (Some(_), Some(last)) => Some(state::encode_scoped_page_token(
                 CERTIFICATE_AUTHORITIES_LISTING,
-                &last.id,
+                &last.page_key(),
             )),
             _ => None,
         };

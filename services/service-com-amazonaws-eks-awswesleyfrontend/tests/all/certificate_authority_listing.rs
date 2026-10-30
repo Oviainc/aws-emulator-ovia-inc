@@ -7,9 +7,13 @@
 //! The write and the single read it pages over (`CreateCertificateAuthority`,
 //! `DescribeCertificateAuthority`) are covered by `certificate_authority.rs`, whose
 //! helpers this suite reuses rather than growing a second client; this suite is
-//! about what the LISTING adds: which certificate authorities it reports, in which
-//! order, that each summary agrees with the read of the same CA, how it pages them,
-//! and what it answers for a cluster that does not exist.
+//! about what the LISTING adds: which certificate authorities it reports, that each
+//! summary agrees with the read of the same CA, how it pages them, and what it
+//! answers for a cluster that does not exist. The ORDER it reports them in — newest
+//! `createdAt` first — is the subject of
+//! `tests/all/certificate_authority_listing_order.rs`, whose rows park creation
+//! instants the calls here cannot produce; the suites below take that order as given
+//! and share this file's client.
 //!
 //! Every suite asserts a RULE over a TABLE of inputs rather than one recorded
 //! request: the rows differ along what the rule generalises over (how many
@@ -46,7 +50,7 @@ const SUMMARY_MEMBERS: &[&str] = &[
 ];
 
 /// `ListCertificateAuthorities`: `GET /clusters/{clusterName}/certificate-authorities`.
-async fn list_authorities_in(
+pub(crate) async fn list_authorities_in(
     router: &MultiServiceRouter,
     region: &str,
     cluster: &str,
@@ -61,13 +65,17 @@ async fn list_authorities_in(
     call(router, region, "GET", &uri, "").await
 }
 
-async fn list_authorities(router: &MultiServiceRouter, cluster: &str, query: &str) -> Answer {
+pub(crate) async fn list_authorities(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    query: &str,
+) -> Answer {
     list_authorities_in(router, REGION, cluster, query).await
 }
 
 /// The `certificateAuthorities` of a listing answer, as the ids it returned, in the
 /// order it returned them.
-fn listed_ids(answer: &Answer) -> Vec<String> {
+pub(crate) fn listed_ids(answer: &Answer) -> Vec<String> {
     answer.body["certificateAuthorities"]
         .as_array()
         .map(|items| {
@@ -89,7 +97,7 @@ fn summary_of<'a>(answer: &'a Answer, id: &str) -> &'a serde_json::Value {
 
 /// The id of the certificate authority the cluster reports as its signer, which is
 /// how a caller learns the id of the CA Amazon EKS provisioned with the cluster.
-async fn signer_id(router: &MultiServiceRouter, case: &str, cluster: &str) -> String {
+pub(crate) async fn signer_id(router: &MultiServiceRouter, case: &str, cluster: &str) -> String {
     let answer = describe_cluster(router, REGION, cluster).await;
     str_member(
         case,
@@ -100,7 +108,7 @@ async fn signer_id(router: &MultiServiceRouter, case: &str, cluster: &str) -> St
 
 /// An `ACTIVE` cluster, which is the precondition every certificate-authority call
 /// in this suite needs.
-async fn active_cluster(router: &MultiServiceRouter, case: &str, cluster: &str) {
+pub(crate) async fn active_cluster(router: &MultiServiceRouter, case: &str, cluster: &str) {
     let created = create_cluster(router, REGION, cluster).await;
     assert_eq!(
         created.status, 200,
@@ -111,10 +119,9 @@ async fn active_cluster(router: &MultiServiceRouter, case: &str, cluster: &str) 
 
 // ---------------------------------------------------------------------------
 // RULE: the listing reports exactly the certificate authorities the store holds
-// for the named cluster — every one of them, nothing else — in certificate
-// authority id order, each as the same summary the read of that CA answers with,
-// including the trust-distribution status the clock has reached by the time of the
-// call.
+// for the named cluster — every one of them, nothing else — most recently created
+// first, each as the same summary the read of that CA answers with, including the
+// trust-distribution status the clock has reached by the time of the call.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -166,8 +173,9 @@ async fn listing_reports_every_stored_authority_and_agrees_with_the_read() {
         let case = row.case;
         active_cluster(&router, case, row.cluster).await;
         let initial = signer_id(&router, case, row.cluster).await;
-        let mut expected: BTreeSet<String> = BTreeSet::new();
-        expected.insert(initial.clone());
+        // The order the listing must report: newest `createdAt` first, so a successor
+        // appended after the CA Amazon EKS provisioned with the cluster comes before it.
+        let mut expected: Vec<String> = vec![initial.clone()];
 
         let mut successor: Option<String> = None;
         if row.append {
@@ -181,7 +189,7 @@ async fn listing_reports_every_stored_authority_and_agrees_with_the_read() {
                 "certificateAuthority.id",
                 &appended.body["certificateAuthority"]["id"],
             );
-            expected.insert(id.clone());
+            expected.insert(0, id.clone());
             successor = Some(id);
         }
         if row.settle_distribution {
@@ -194,11 +202,10 @@ async fn listing_reports_every_stored_authority_and_agrees_with_the_read() {
             "case {case:?}: expected 200 from ListCertificateAuthorities, got {answer:?}"
         );
         let ids = listed_ids(&answer);
-        let expected_ids: Vec<String> = expected.iter().cloned().collect();
         assert_eq!(
-            ids, expected_ids,
-            "case {case:?}: expected exactly the stored certificate authorities in id \
-             order {expected_ids:?}, got {answer:?}"
+            ids, expected,
+            "case {case:?}: expected exactly the stored certificate authorities newest \
+             created first {expected:?}, got {answer:?}"
         );
         assert!(
             answer.body["nextToken"].is_null(),
@@ -291,9 +298,9 @@ async fn listing_reports_every_stored_authority_and_agrees_with_the_read() {
 
 // ---------------------------------------------------------------------------
 // RULE: whatever page size the listing is driven at, following `nextToken` to
-// exhaustion yields each certificate authority exactly once in id order and the
-// last page carries no token; a page size outside the modelled range is refused,
-// and so is a token this listing did not issue.
+// exhaustion yields each certificate authority exactly once, newest created first,
+// and the last page carries no token; a page size outside the modelled range is
+// refused, and so is a token this listing did not issue.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -313,11 +320,9 @@ async fn paging_at_any_size_yields_every_authority_exactly_once() {
         &appended.body["certificateAuthority"]["id"],
     );
     settle(CA_DISTRIBUTION_DELAY).await;
-    let stored: Vec<String> = [initial, successor.clone()]
-        .into_iter()
-        .collect::<BTreeSet<String>>()
-        .into_iter()
-        .collect();
+    // Newest created first: the successor the append minted, then the CA Amazon EKS
+    // provisioned with the cluster.
+    let stored: Vec<String> = vec![successor.clone(), initial];
 
     // Rows differ along page size: the modelled bounds (1 and 100), the size that is
     // exactly the number stored, and one above it.
@@ -360,7 +365,7 @@ async fn paging_at_any_size_yields_every_authority_exactly_once() {
         assert_eq!(
             seen, stored,
             "case maxResults={page_size}: paging must yield every certificate authority \
-             once, in id order; got {seen:?}"
+             once, newest created first; got {seen:?}"
         );
         let unique: BTreeSet<&String> = seen.iter().collect();
         assert_eq!(
