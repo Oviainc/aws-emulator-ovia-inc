@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = store.cluster_key(&input.cluster_name);
         let Some(cluster) = key.and_then(|key| store.clusters.get_mut(&key)) else {
             return Err(DescribeClusterErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Could not find cluster {}.", input.cluster_name)),
+                message: Some(crate::state::cluster_not_found(&input.cluster_name)),
             })
             .into());
         };

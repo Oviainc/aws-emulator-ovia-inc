@@ -167,9 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(job) = store.ai_benchmark_jobs.get_mut(&input.ai_benchmark_job_name) else {
             return Err(DescribeAIBenchmarkJobErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Could not find AI benchmark job \"{}\".",
-                    input.ai_benchmark_job_name
+                message: Some(crate::state::ai_benchmark_job_not_found(
+                    &input.ai_benchmark_job_name,
                 )),
             })
             .into());

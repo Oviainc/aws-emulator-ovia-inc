@@ -171,12 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // The message quotes the identifier the CALLER passed — an ARN or a source URI.
-        let Some(arn) = resolved else {
-            return Err(DeleteArtifactErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Could not find artifact \"{identifier}\".")),
+        // The refusal names the identifier the CALLER passed — an ARN or a source URI —
+        // in the lineage family's sentence, worded once so both paths that cannot reach
+        // the record answer identically.
+        let not_found = || -> Self::Error {
+            DeleteArtifactErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::does_not_exist(
+                    crate::state::ARTIFACT_ENTITY,
+                    &identifier,
+                )),
             })
-            .into());
+            .into()
+        };
+        let Some(arn) = resolved else {
+            return Err(not_found());
         };
         // A lineage entity that is still the SOURCE of an association is REFUSED rather
         // than released, exactly as the other lineage-entity deletes refuse one: deleting
@@ -189,10 +197,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let removed = store
-            .artifacts
-            .remove(&arn)
-            .expect("the artifact just resolved is still in the store under its ARN");
+        // The one write: the record leaves the store under the ARN it was resolved to.
+        // The removal is FALLIBLE rather than asserted — a request may never panic a
+        // handler, and the resolve above answers an identifier, not a borrow of the
+        // record — so a key the store no longer holds takes the same modelled not-found
+        // path the unresolved identifier does.
+        let Some(removed) = store.artifacts.remove(&arn) else {
+            return Err(not_found());
+        };
         drop(store);
 
         crate::state::record_state_change(Self::NAME, &removed.arn, ctx);

@@ -84,11 +84,11 @@ pub mod ai_recommendation_job;
 
 pub use ai_recommendation_job::{
     ai_recommendation_job_not_found, ai_recommendation_job_not_running, AIRecommendationJob,
-    AI_RECOMMENDATION_JOB_ENDS_AFTER, AI_RECOMMENDATION_JOB_KIND, AI_RECOMMENDATION_JOB_QUOTA,
-    AI_RECOMMENDATION_JOB_STOPS_AFTER, AI_RECOMMENDATION_OPTIMIZE_MODEL_DEFAULT,
-    AI_RECOMMENDATION_STATUS_FAILED, AI_RECOMMENDATION_STATUS_IN_PROGRESS,
-    AI_RECOMMENDATION_STATUS_STOPPED, AI_RECOMMENDATION_STATUS_STOPPING,
-    NO_RECOMMENDATION_RUNTIME_REASON,
+    AI_RECOMMENDATION_JOB_ENDS_AFTER, AI_RECOMMENDATION_JOB_ENTITY, AI_RECOMMENDATION_JOB_KIND,
+    AI_RECOMMENDATION_JOB_QUOTA, AI_RECOMMENDATION_JOB_STOPS_AFTER,
+    AI_RECOMMENDATION_OPTIMIZE_MODEL_DEFAULT, AI_RECOMMENDATION_STATUS_FAILED,
+    AI_RECOMMENDATION_STATUS_IN_PROGRESS, AI_RECOMMENDATION_STATUS_STOPPED,
+    AI_RECOMMENDATION_STATUS_STOPPING, NO_RECOMMENDATION_RUNTIME_REASON,
 };
 
 /// The model-customization job slice: the record `CreateJob` persists, the lookup every
@@ -3380,6 +3380,12 @@ pub fn does_not_exist(entity: &str, arn: &str) -> String {
 /// The entity label [`does_not_exist`] names a lineage action by.
 pub const ACTION_ENTITY: &str = "Action";
 
+/// The entity label [`does_not_exist`] names a lineage artifact by.
+pub const ARTIFACT_ENTITY: &str = "Artifact";
+
+/// The entity label [`does_not_exist`] names a lineage context by.
+pub const CONTEXT_ENTITY: &str = "Context";
+
 /// The entity label [`does_not_exist`] names ONE END of a lineage association by.
 ///
 /// An `AssociationEntityArn` may name any of five entity kinds (experiment,
@@ -3402,6 +3408,11 @@ pub const TRIAL_ENTITY: &str = "Trial";
 
 /// The entity label [`does_not_exist`] names an experiment by.
 pub const EXPERIMENT_ENTITY: &str = "Experiment";
+
+/// The entity label [`does_not_exist`] names an experiment trial component by — two
+/// words, as the sentence spells the kind the ARN segment hyphenates
+/// ([`TRIAL_COMPONENT_KIND`]).
+pub const TRIAL_COMPONENT_ENTITY: &str = "Trial component";
 
 /// How every operation that cannot resolve the experiment a request names states it: the
 /// [`does_not_exist`] sentence over the experiment's ARN, resolved from the requested
@@ -3435,6 +3446,22 @@ pub const TRIAL_KIND: &str = "experiment-trial";
 /// the two membership operations cannot word the same fact differently.
 pub fn trial_does_not_exist(region: &str, trial_name: &str) -> String {
     does_not_exist(TRIAL_ENTITY, &resource_arn(region, TRIAL_KIND, trial_name))
+}
+
+/// How every operation that cannot resolve the trial component a request names states it:
+/// the [`does_not_exist`] sentence over the component's ARN, resolved from the requested
+/// `TrialComponentName` against the Region the request signed for.
+///
+/// The same template as [`trial_does_not_exist`], for the same reason: a component is
+/// addressed by name (or, for the reader, by the ARN that name resolves to), so the
+/// identifier the sentence names is the one a successful call would have answered. Stated
+/// once here so the reader, the delete and the two membership operations cannot word the
+/// same fact differently.
+pub fn trial_component_does_not_exist(region: &str, trial_component_name: &str) -> String {
+    does_not_exist(
+        TRIAL_COMPONENT_ENTITY,
+        &resource_arn(region, TRIAL_COMPONENT_KIND, trial_component_name),
+    )
 }
 
 /// How the `does not exist.` sentence renders the ARN it names — the ONE thing the two
@@ -3484,6 +3511,18 @@ pub const ALGORITHM_ENTITY: &str = "Algorithm";
 /// as the service spells it there, where the group's own conflict refusal spells it out.
 pub const MODEL_PACKAGE_GROUP_ENTITY: &str = "ModelPackageGroup";
 
+/// How SageMaker states that there is no resource policy to report or release for a model
+/// group: the fixed clause, then the group's ARN BARE — no quotes around it, and no
+/// closing period.
+///
+/// A name no group is stored under and a group carrying no policy are the SAME answer —
+/// there is no policy — so the sentence names the ARN the request's `ModelPackageGroupName`
+/// resolves to in the Region it signed for rather than distinguishing the two. Stated once
+/// here so the read and the delete of a group policy word the same fact the same way.
+pub fn resource_policy_not_found(group_arn: &str) -> String {
+    format!("Cannot find resource policy for: {group_arn}")
+}
+
 /// How SageMaker's hosting operations state a resource the account does not hold: the
 /// resource kind as the service words it, then the identifier AS THE CALLER SENT IT, in
 /// double quotes.
@@ -3514,6 +3553,86 @@ pub const ENDPOINT_KIND_LABEL: &str = "endpoint";
 /// `VersionedArnOrName` form the request carried.
 pub const MODEL_PACKAGE_KIND_LABEL: &str = "model package";
 
+/// The `<Entity> '<identifier>' not found` clause SageMaker's AI benchmarking family
+/// states an unresolvable reference with, written once so the two sentences built on it
+/// cannot drift apart.
+fn not_found_clause(entity: &str, identifier: &str) -> String {
+    format!("{entity} '{identifier}' not found")
+}
+
+/// How SageMaker's AI benchmarking family states a resource the account does not hold: the
+/// entity label as the service words it, then the identifier AS THE CALLER SENT IT in
+/// single quotes, then `not found.`
+///
+/// An AI workload configuration, a benchmark job and a recommendation job are addressed by
+/// NAME (a job reference is an `AIEntityName`; a configuration reference also admits its
+/// ARN), and the recorded refusals quote the identifier the REQUEST carried — never an ARN
+/// the service synthesised from it, which is a value the caller never supplied and which a
+/// consumer extracting the offending resource from the message cannot match against what
+/// it sent.
+///
+/// Stated once here so the readers, the stops and the deletes of this family word the same
+/// fact the same way; a CREATE that cannot resolve a reference of this family states the
+/// scope it searched instead ([`ai_entity_not_found_for_account`]).
+pub fn ai_entity_not_found(entity: &str, identifier: &str) -> String {
+    format!("{}.", not_found_clause(entity, identifier))
+}
+
+/// How a CREATE of this family states a referenced resource the account does not hold: the
+/// [`ai_entity_not_found`] clause, then the scope the service searched — the account the
+/// request was signed for.
+///
+/// The extra clause is the recorded difference between resolving a reference on the way to
+/// creating something and reading the resource itself: a create's caller named a
+/// configuration it expected the account to hold, so the refusal says where it was looked
+/// for.
+pub fn ai_entity_not_found_for_account(entity: &str, identifier: &str) -> String {
+    format!("{} for this account.", not_found_clause(entity, identifier))
+}
+
+/// The internal service the AI family's DELETE operations front, as the rendering they
+/// relay names it.
+const AI_INNER_SERVICE: &str = "SageMakerLumen";
+
+/// The status that internal service raised the refusal with, as its rendering states it —
+/// the client-error status, the same one this endpoint answers the call with.
+const AI_INNER_SERVICE_STATUS: u16 = 400;
+
+/// How many attempts the relayed call took: one. A client error is not retried, so the
+/// attempt that raised it is the only one the rendering can count.
+const AI_INNER_SERVICE_ATTEMPTS: u8 = 1;
+
+/// How the AI family's DELETE operations state a resource the account does not hold: the
+/// family's [`ai_entity_not_found`] sentence, then the tail that names where the failure
+/// came from.
+///
+/// These deletes front an internal service, and what they report is THAT service's own
+/// rendering of the failure — the sentence, the service it was raised by, the status it was
+/// raised with, the request id of that inner call and how many attempts it took. The
+/// family's reads and creates answer the bare sentence, so the tail belongs to the deletes
+/// alone.
+///
+/// The request id is the only per-run field: it is minted per call from the emulator's one
+/// request-id mint (`service_common::query_error_envelope::new_request_id`, a fresh v4
+/// UUID), because nothing in the request carries one to echo and the inner call is this
+/// call's own — so it is indistinguishable from the id the framework's own renderers
+/// report, and no value of one recorded run is baked in.
+pub fn ai_entity_not_found_relayed(entity: &str, identifier: &str) -> String {
+    format!(
+        "{} (Service: {AI_INNER_SERVICE}, Status Code: {AI_INNER_SERVICE_STATUS}, \
+         Request ID: {}) (SDK Attempt Count: {AI_INNER_SERVICE_ATTEMPTS})",
+        ai_entity_not_found(entity, identifier),
+        ::service_common::query_error_envelope::new_request_id(),
+    )
+}
+
+/// The entity label the AI family's not-found sentences name an AI workload configuration
+/// by — one word, as the service spells the resource in these messages.
+pub const AI_WORKLOAD_CONFIG_ENTITY: &str = "AIWorkloadConfig";
+
+/// The entity label the AI family's not-found sentences name an AI benchmark job by.
+pub const AI_BENCHMARK_JOB_ENTITY: &str = "AIBenchmarkJob";
+
 /// How SageMaker's training-job readers state a job this account does not hold.
 ///
 /// A FIXED sentence naming no identifier at all — the recorded wording for this resource,
@@ -3533,16 +3652,30 @@ pub fn tuning_job_not_found(name: &str) -> String {
     format!("Amazon SageMaker can't find a tuning job called {name}. Type another name.")
 }
 
-/// How SageMaker words a HyperPod cluster this account does not hold.
+/// How SageMaker words a HyperPod cluster this account does not hold, for the operations
+/// whose SUBJECT is something other than the cluster itself — a node of it, or a policy
+/// hanging off it.
 ///
-/// A FIXED sentence carrying NOTHING from the request: the recorded refusals of the
-/// cluster operations state the condition and no identifier, so no refusal leaks an ARN
-/// the caller never supplied or a name it can only match against its own input. The
-/// sentence is the whole message — the class of the failure travels in the error CODE, so
-/// no name of a condition or type is prefixed onto it. Stated once here so every
-/// cluster-scoped operation, including the ones that address one node of a cluster, words
-/// the same fact the same way.
+/// A FIXED sentence carrying NOTHING from the request: the recorded refusals of those
+/// operations state the condition and no identifier, so no refusal leaks an ARN the caller
+/// never supplied or a name it can only match against its own input. The sentence is the
+/// whole message — the class of the failure travels in the error CODE, so no name of a
+/// condition or type is prefixed onto it. Stated once here so every one of them words the
+/// same fact the same way. The operations whose subject IS the cluster name it instead
+/// ([`cluster_not_found`]).
 pub const CLUSTER_NOT_FOUND: &str = "Specified cluster not found";
+
+/// How SageMaker words a HyperPod cluster this account does not hold, for the operations
+/// that address the cluster ITSELF: the identifier the request carried, unquoted, inside
+/// the recorded sentence — which ends with no period.
+///
+/// `ClusterName` is a `ClusterNameOrArn`, so the identifier is whichever form arrived,
+/// echoed rather than resolved: a caller reading the refusal matches it against what it
+/// sent. Stated once here so the reader and the delete of a cluster cannot word the same
+/// fact differently.
+pub fn cluster_not_found(identifier: &str) -> String {
+    format!("Cluster with name {identifier} not found")
+}
 
 /// How the HyperPod node lookup words a node the named cluster does not own.
 ///
@@ -4940,11 +5073,23 @@ pub const AI_WORKLOAD_CONFIG_KIND: &str = "ai-workload-config";
 /// what `CreateAIWorkloadConfig` answers `ResourceLimitExceeded` past.
 pub const AI_WORKLOAD_CONFIG_QUOTA: usize = 1_000;
 
-/// Why a reader or the delete could not resolve an AI workload configuration, named once
-/// here so `DescribeAIWorkloadConfig` and `DeleteAIWorkloadConfig` refuse an unknown name
-/// with the same sentence, naming the ARN they could not resolve.
-pub fn ai_workload_config_not_found(arn: &str) -> String {
-    format!("Could not find AI workload config \"{arn}\".")
+/// Why a reader could not resolve an AI workload configuration, named once here so every
+/// operation that READS one refuses an unknown name with the same sentence: the family's
+/// [`ai_entity_not_found`], quoting the identifier the request presented. The delete
+/// relays the inner service's rendering of it instead
+/// ([`ai_entity_not_found_relayed`]).
+pub fn ai_workload_config_not_found(identifier: &str) -> String {
+    ai_entity_not_found(AI_WORKLOAD_CONFIG_ENTITY, identifier)
+}
+
+/// Why a create that references an AI workload configuration could not resolve it: the
+/// family's [`ai_entity_not_found_for_account`], quoting the
+/// `AIWorkloadConfigIdentifier` the request presented.
+///
+/// Named once here so `CreateAIBenchmarkJob` and `CreateAIRecommendationJob` refuse an
+/// unresolvable reference with the same sentence.
+pub fn ai_workload_config_not_found_for_account(identifier: &str) -> String {
+    ai_entity_not_found_for_account(AI_WORKLOAD_CONFIG_ENTITY, identifier)
 }
 
 /// An AI workload configuration created by `CreateAIWorkloadConfig`, as
@@ -4993,6 +5138,14 @@ pub const AI_BENCHMARK_JOB_KIND: &str = "ai-benchmark-job";
 /// See [`MODEL_QUOTA`]. Bounds the AI benchmark job store the same way, and is what
 /// `CreateAIBenchmarkJob` answers `ResourceLimitExceeded` past.
 pub const AI_BENCHMARK_JOB_QUOTA: usize = 1_000;
+
+/// Why a reader could not resolve an AI benchmark job: the family's
+/// [`ai_entity_not_found`], quoting the name the request presented. Named once here so
+/// every operation that resolves a benchmark-job reference words the same fact the same
+/// way.
+pub fn ai_benchmark_job_not_found(name: &str) -> String {
+    ai_entity_not_found(AI_BENCHMARK_JOB_ENTITY, name)
+}
 
 /// `AIBenchmarkJobStatus`'s members this emulator moves a benchmark job through
 /// (`smithy_query(query="shape",shape="AIBenchmarkJobStatus")` answers `InProgress`,
@@ -5996,15 +6149,6 @@ impl ComAmazonawsSagemakerSagemakerState {
 /// (`^arn:aws[a-z\-]*:sagemaker:[a-z0-9\-]*:[0-9]{12}:experiment-trial-component/`), and
 /// named once here so the create and the describe mint and match the same ARN.
 pub const TRIAL_COMPONENT_KIND: &str = "experiment-trial-component";
-
-/// The kind label [`could_not_find`] names a trial component by.
-///
-/// The trial-component operations quote the identifier RESOLVED TO ITS ARN rather than the
-/// name the caller sent, the way the lineage family does ([`does_not_exist`]), so every
-/// operation that cannot resolve a component reports the identifier a successful call
-/// would have answered. Stated once here so the reader, the disassociate and the delete
-/// cannot word the same fact differently.
-pub const TRIAL_COMPONENT_KIND_LABEL: &str = "trial component";
 
 /// See [`MODEL_QUOTA`]. Bounds the trial-component store the same way, and is what
 /// `CreateTrialComponent` answers `ResourceLimitExceeded` past.

@@ -149,9 +149,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A name nothing created names no resource, so the delete is REFUSED with the
         // not-found failure this operation models rather than answered 200: a caller
         // reading a 200 here would be told a configuration it never created had just been
-        // released. The ARN that refusal names is the one this name WOULD carry, minted
-        // from the Region the request signed for, because there is no stored record to
-        // read one from.
+        // released. The refusal names the configuration the way the request did, since
+        // there is no stored record to read any other identifier from.
         //
         // The operation's other modelled failure, `ResourceInUse`, guards a configuration
         // "referenced by an active benchmark job" — the only referent the operation's
@@ -163,14 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ai_workload_configs
             .remove(&input.ai_workload_config_name)
         else {
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                crate::state::AI_WORKLOAD_CONFIG_KIND,
-                &input.ai_workload_config_name,
-            );
             return Err(DeleteAIWorkloadConfigErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(crate::state::ai_workload_config_not_found(&arn)),
+                    message: Some(crate::state::ai_entity_not_found_relayed(
+                        crate::state::AI_WORKLOAD_CONFIG_ENTITY,
+                        &input.ai_workload_config_name,
+                    )),
                 },
             )
             .into());

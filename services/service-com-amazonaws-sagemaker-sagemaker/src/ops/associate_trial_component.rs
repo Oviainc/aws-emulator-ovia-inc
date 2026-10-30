@@ -174,14 +174,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let component_key = crate::state::entity_key(&input.trial_component_name);
         let Some(component) = store.trial_components.get(&component_key) else {
+            // The component-not-found sentence is the slice's own, so every reader of a
+            // missing component words it the same way and resolves the same ARN.
             return Err(AssociateTrialComponentErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Could not find trial component \"{}\".",
-                    crate::state::resource_arn(
-                        &region,
-                        crate::state::TRIAL_COMPONENT_KIND,
-                        &input.trial_component_name,
-                    )
+                message: Some(crate::state::trial_component_does_not_exist(
+                    &region,
+                    &input.trial_component_name,
                 )),
             })
             .into());

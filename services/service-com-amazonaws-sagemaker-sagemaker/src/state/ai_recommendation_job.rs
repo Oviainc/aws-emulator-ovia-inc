@@ -86,13 +86,19 @@ pub const NO_RECOMMENDATION_RUNTIME_REASON: &str =
     "This emulator serves no inference data plane and runs no model optimization or \
      benchmarking tool, so the recommendation job's run was never started";
 
-/// Why a reader, the stop or the delete could not resolve an AI recommendation job, named
-/// once here so `DescribeAIRecommendationJob`, `StopAIRecommendationJob` and
-/// `DeleteAIRecommendationJob` refuse an unknown name with the same sentence: the one the
-/// service words for a job it cannot resolve, quoting the name the request presented.
+/// Why a reader or the stop could not resolve an AI recommendation job, named
+/// once here so `DescribeAIRecommendationJob` and `StopAIRecommendationJob` refuse an
+/// unknown name with the same sentence: the AI family's [`super::ai_entity_not_found`],
+/// quoting the name the request presented. `DeleteAIRecommendationJob` relays the inner
+/// service's rendering of it instead ([`super::ai_entity_not_found_relayed`]).
 pub fn ai_recommendation_job_not_found(name: &str) -> String {
-    format!("Job '{name}' not found.")
+    super::ai_entity_not_found(AI_RECOMMENDATION_JOB_ENTITY, name)
 }
+
+/// The entity label the AI family's not-found sentence names a recommendation job by — the
+/// bare kind, as the service words this one, where its sibling resources are named by their
+/// API spelling.
+pub const AI_RECOMMENDATION_JOB_ENTITY: &str = "Job";
 
 /// Why a stop of a job that is no longer running is refused, naming the job and the
 /// status it had already reached.

@@ -204,13 +204,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolves).
         if !store.ai_workload_configs.contains_key(&workload_config_name) {
             return Err(CreateAIBenchmarkJobErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Could not find AI workload configuration \"{}\".",
-                    crate::state::resource_arn(
-                        &region,
-                        crate::state::AI_WORKLOAD_CONFIG_KIND,
-                        &workload_config_name,
-                    )
+                // The reference as the REQUEST named it (a name or the configuration's
+                // ARN), in the sentence a create of this family words: the caller expected
+                // the account it signed for to hold it.
+                message: Some(crate::state::ai_workload_config_not_found_for_account(
+                    &input.ai_workload_config_identifier,
                 )),
             })
             .into());

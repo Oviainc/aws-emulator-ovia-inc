@@ -145,6 +145,8 @@ mod notebook_instance_lifecycle;
 mod notebook_instance_stop;
 #[path = "all/notebook_lifecycle_config.rs"]
 mod notebook_lifecycle_config;
+#[path = "all/not_found_message_fidelity.rs"]
+mod not_found_message_fidelity;
 #[path = "all/partner_app_creation.rs"]
 mod partner_app_creation;
 #[path = "all/partner_apps.rs"]

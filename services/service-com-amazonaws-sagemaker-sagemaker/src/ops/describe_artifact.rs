@@ -156,9 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let artifact = store.artifacts.get(&input.artifact_arn).ok_or_else(|| {
             DescribeArtifactErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!(
-                    "Could not find artifact \"{}\".",
-                    input.artifact_arn
+                // `ArtifactArn` is the identifier this operation addresses the artifact
+                // by, so the lineage family's sentence names it as the request sent it.
+                message: Some(crate::state::does_not_exist(
+                    crate::state::ARTIFACT_ENTITY,
+                    &input.artifact_arn,
                 )),
             })
         })?;

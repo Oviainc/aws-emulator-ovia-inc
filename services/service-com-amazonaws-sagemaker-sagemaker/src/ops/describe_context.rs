@@ -162,7 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Never a 200 with empty members: a caller cannot tell that from a context
             // that exists and carries nothing.
             return Err(DescribeContextErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Context {key} does not exist.")),
+                message: Some(crate::state::does_not_exist(
+                    crate::state::CONTEXT_ENTITY,
+                    &key,
+                )),
             })
             .into());
         };

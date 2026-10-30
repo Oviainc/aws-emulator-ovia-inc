@@ -160,7 +160,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DeleteAIRecommendationJobErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(crate::state::ai_recommendation_job_not_found(
+                    message: Some(crate::state::ai_entity_not_found_relayed(
+                        crate::state::AI_RECOMMENDATION_JOB_ENTITY,
                         &input.ai_recommendation_job_name,
                     )),
                 },

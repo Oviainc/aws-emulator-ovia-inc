@@ -155,13 +155,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(arn) = store.trial_components.get(&key).map(|component| component.arn.clone())
         else {
             return Err(DeleteTrialComponentErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::could_not_find(
-                    crate::state::TRIAL_COMPONENT_KIND_LABEL,
-                    &crate::state::resource_arn(
-                        &region,
-                        crate::state::TRIAL_COMPONENT_KIND,
-                        &input.trial_component_name,
-                    ),
+                message: Some(crate::state::trial_component_does_not_exist(
+                    &region,
+                    &input.trial_component_name,
                 )),
             })
             .into());

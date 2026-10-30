@@ -155,9 +155,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "model-package-group",
                 name,
             );
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Cannot find resource policy for: \"{arn}\"."
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::resource_policy_not_found(&arn),
+            ));
         };
 
         Ok(GetModelPackageGroupPolicyOutput { resource_policy })

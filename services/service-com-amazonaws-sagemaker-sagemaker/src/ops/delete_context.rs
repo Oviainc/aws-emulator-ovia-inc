@@ -140,13 +140,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = crate::state::context_key(ctx, &input.context_name);
 
         let mut store = state.lock();
-        if !store.contexts.contains_key(&key) {
-            // A delete of something that was never created is refused, so a caller
-            // cannot read a 200 as "it used to exist".
-            return Err(DeleteContextErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Context {key} does not exist.")),
+        // A delete of something that was never created is refused, so a caller
+        // cannot read a 200 as "it used to exist".
+        let not_found = || -> Self::Error {
+            DeleteContextErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::does_not_exist(
+                    crate::state::CONTEXT_ENTITY,
+                    &key,
+                )),
             })
-            .into());
+            .into()
+        };
+        if !store.contexts.contains_key(&key) {
+            return Err(not_found());
         }
 
         // A lineage entity that is still the SOURCE of an association is REFUSED rather
@@ -160,10 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let context = store
-            .contexts
-            .remove(&key)
-            .expect("the context just resolved is still in the store under its ARN");
+        // The one write: the record leaves the store under the ARN it is keyed by. The
+        // removal is FALLIBLE rather than asserted — a request may never panic a handler —
+        // so a key the store no longer holds takes the same modelled not-found path the
+        // name nothing created does.
+        let Some(context) = store.contexts.remove(&key) else {
+            return Err(not_found());
+        };
         drop(store);
 
         crate::state::record_state_change(Self::NAME, &context.arn, ctx);

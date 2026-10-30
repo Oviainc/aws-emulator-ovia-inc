@@ -141,7 +141,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
@@ -153,15 +153,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             // Never a 200 with empty fields: a caller cannot tell that from a
             // configuration that exists and carries nothing. `ResourceNotFound` is the
-            // not-found failure this operation models.
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                crate::state::AI_WORKLOAD_CONFIG_KIND,
-                &input.ai_workload_config_name,
-            );
+            // not-found failure this operation models, and it names the configuration the
+            // way the request did.
             return Err(DescribeAIWorkloadConfigErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(crate::state::ai_workload_config_not_found(&arn)),
+                    message: Some(crate::state::ai_workload_config_not_found(
+                        &input.ai_workload_config_name,
+                    )),
                 },
             )
             .into());

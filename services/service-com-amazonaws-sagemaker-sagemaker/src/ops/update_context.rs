@@ -161,7 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An update of something that was never created is refused, and creates
             // nothing as a side effect: `CreateContext` is the only call that mints one.
             return Err(UpdateContextErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(format!("Context {key} does not exist.")),
+                message: Some(crate::state::does_not_exist(
+                    crate::state::CONTEXT_ENTITY,
+                    &key,
+                )),
             })
             .into());
         };

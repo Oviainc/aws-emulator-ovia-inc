@@ -169,14 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name the component or pass its ARN; both denote the one stored entity, while an
         // ARN of another service, account, region or entity kind denotes none of them.
         let region = crate::state::request_region(ctx);
-        let not_found = |identifier: &str| -> Self::Error {
+        let not_found = |message: String| -> Self::Error {
             // Never a 200 with empty members: a caller cannot tell that from a component
             // that exists and carries nothing.
             DescribeTrialComponentErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::could_not_find(
-                    crate::state::TRIAL_COMPONENT_KIND_LABEL,
-                    identifier,
-                )),
+                message: Some(message),
             })
             .into()
         };
@@ -185,17 +182,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             crate::state::TRIAL_COMPONENT_KIND,
         ) else {
-            return Err(not_found(&input.trial_component_name));
+            // An identifier this resolver rejects is an ARN naming another entity kind,
+            // account or Region, so there is no name to resolve to one: the refusal names
+            // it as it arrived, which is already the ARN form the sentence reports.
+            return Err(not_found(crate::state::does_not_exist(
+                crate::state::TRIAL_COMPONENT_ENTITY,
+                &input.trial_component_name,
+            )));
         };
 
         let store = state.lock();
         // The name "is not case-sensitive" (`TrialComponentName`'s model doc), so the
         // lookup goes through the same case-folded key the create stored the record under.
         let Some(component) = store.trial_components.get(&crate::state::entity_key(name)) else {
-            return Err(not_found(&crate::state::resource_arn(
-                &region,
-                crate::state::TRIAL_COMPONENT_KIND,
-                name,
+            return Err(not_found(crate::state::trial_component_does_not_exist(
+                &region, name,
             )));
         };
 
