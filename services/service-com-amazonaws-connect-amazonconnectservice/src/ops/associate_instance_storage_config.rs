@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateInstanceStorageConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateInstanceStorageConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateInstanceStorageConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +160,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateInstanceStorageConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateInstanceStorageConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateInstanceStorageConfig"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateInstanceStorageConfigErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Amazon Connect store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // Minted before the instance is borrowed, so the borrow below is the only one.
+        // Identifiers need not be contiguous: a refused association simply leaves its
+        // id unused.
+        let association_id = store.mint_resource_id();
+        let instance = store
+            .instances
+            .get_mut(&input.instance_id)
+            .ok_or_else(|| {
+                AssociateInstanceStorageConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Instance not found: {}", input.instance_id)),
+                    },
+                )
+            })?;
+
+        // The association does not create the storage resource, so nothing about the
+        // bucket or stream it names is checked — but the configuration still has to
+        // describe the storage type it declares.
+        if let Some(problem) = crate::state::storage_config_problem(&input.storage_config) {
+            return Err(
+                AssociateInstanceStorageConfigErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(problem),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `ClientToken` is `@idempotencyToken`: the call that carried it already
+        // associated this resource type, so the retry — the same configuration under
+        // the same token — reports that association rather than minting a second id
+        // for it. A token reused for a DIFFERENT configuration is not that retry, and
+        // falls through to the conflict below: the resource type is taken, and the
+        // emulator stores neither configuration twice nor the second one silently.
+        let client_token = input.client_token.filter(|token| !token.is_empty());
+        if let Some(existing) = client_token.as_deref().and_then(|token| {
+            instance.storage_config_associated_with_token(token, &input.resource_type)
+        }) {
+            if existing.describes(&input.storage_config) {
+                return Ok(AssociateInstanceStorageConfigOutput {
+                    association_id: Some(existing.association_id.clone()),
+                });
+            }
+        }
+
+        // An instance stores one resource type's data in one place: a resource type
+        // that is already associated is not being associated for the first time, and
+        // associating it again would give it a second storage configuration.
+        if let Some(existing) = instance.storage_config_for_resource_type(&input.resource_type) {
+            return Err(
+                AssociateInstanceStorageConfigErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        message: Some(format!(
+                            "A storage config for resource type {} already exists for instance \
+                             {} under association {}",
+                            input.resource_type, input.instance_id, existing.association_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut config = input.storage_config;
+        // The association id the response reports is the one the stored configuration
+        // carries, whatever `AssociationId` the request's own configuration held.
+        config.association_id = Some(association_id.clone());
+        instance.storage_configs.insert(
+            association_id.clone(),
+            crate::state::StorageConfigRecord {
+                association_id: association_id.clone(),
+                resource_type: input.resource_type,
+                config,
+                client_token,
+            },
+        );
+
+        Ok(AssociateInstanceStorageConfigOutput {
+            association_id: Some(association_id),
+        })
     }
 }

@@ -117,6 +117,7 @@ fn register_connect_instance(engine: &engine::InMemoryEngine, instance: &str) {
             queues: BTreeMap::new(),
             contact_flows: BTreeMap::new(),
             hours_of_operations: BTreeMap::new(),
+            storage_configs: BTreeMap::new(),
         },
     );
 }

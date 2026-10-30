@@ -244,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             queues: ::std::collections::BTreeMap::new(),
             contact_flows: ::std::collections::BTreeMap::new(),
             hours_of_operations: ::std::collections::BTreeMap::new(),
+            storage_configs: ::std::collections::BTreeMap::new(),
         };
 
         store.instances.insert(id.clone(), record);

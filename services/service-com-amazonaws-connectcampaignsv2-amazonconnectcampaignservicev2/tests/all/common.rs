@@ -127,6 +127,7 @@ pub fn register_connect_instance(
             queues: BTreeMap::new(),
             contact_flows: BTreeMap::new(),
             hours_of_operations: BTreeMap::new(),
+            storage_configs: BTreeMap::new(),
         },
     );
 }

@@ -26,8 +26,9 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     AvailableNumberSummary, ClaimedPhoneNumberSummary, ContactFlow, ContactFlowSummary,
     HoursOfOperation, HoursOfOperationConfig, HoursOfOperationSummary, HoursOfOperationTimeSlice,
-    HoursOfOperationsIdentifier, Instance, InstanceSummary, OutboundCallerConfig,
-    OutboundEmailConfig, PhoneNumberStatus, Queue, QueueSummary, PHONE_NUMBER_TYPE_VALUES,
+    HoursOfOperationsIdentifier, Instance, InstanceStorageConfig, InstanceSummary,
+    OutboundCallerConfig, OutboundEmailConfig, PhoneNumberStatus, Queue, QueueSummary,
+    PHONE_NUMBER_TYPE_VALUES,
 };
 
 /// The region an unsigned request is served in. The emulator's own shared AWS config
@@ -877,6 +878,15 @@ pub struct InstanceRecord {
     /// why the default queue's hours live here rather than beside it. Bounded by
     /// [`HOURS_OF_OPERATIONS_PER_INSTANCE_QUOTA`].
     pub hours_of_operations: BTreeMap<String, HoursOfOperationRecord>,
+    /// This instance's storage configurations, keyed by association id — the one
+    /// record `AssociateInstanceStorageConfig` writes and
+    /// `DescribeInstanceStorageConfig` projects.
+    ///
+    /// Bounded without a quota of its own: an instance holds at most one
+    /// configuration per `InstanceStorageResourceType` (see
+    /// [`Self::storage_config_for_resource_type`]) and that enum is finite, so this
+    /// map cannot grow past it.
+    pub storage_configs: BTreeMap<String, StorageConfigRecord>,
 }
 
 impl InstanceRecord {
@@ -990,6 +1000,134 @@ impl InstanceRecord {
             return None;
         }
         self.contact_flows.get(id)
+    }
+
+    /// This instance's storage configuration for `resource_type`, if it has one.
+    ///
+    /// One configuration per resource type is what makes a second association of the
+    /// same resource type a conflict rather than a second configuration.
+    pub fn storage_config_for_resource_type(
+        &self,
+        resource_type: &str,
+    ) -> Option<&StorageConfigRecord> {
+        self.storage_configs
+            .values()
+            .find(|record| record.resource_type == resource_type)
+    }
+
+    /// This instance's storage configuration `association_id` names, but only when it
+    /// stores `resource_type`.
+    ///
+    /// An association identifies one resource type's configuration, so an association
+    /// id paired with another resource type names nothing.
+    pub fn storage_config(
+        &self,
+        association_id: &str,
+        resource_type: &str,
+    ) -> Option<&StorageConfigRecord> {
+        self.storage_configs
+            .get(association_id)
+            .filter(|record| record.resource_type == resource_type)
+    }
+
+    /// The storage configuration this instance's association with `client_token`
+    /// produced for `resource_type`, if that token already made one.
+    pub fn storage_config_associated_with_token(
+        &self,
+        client_token: &str,
+        resource_type: &str,
+    ) -> Option<&StorageConfigRecord> {
+        self.storage_configs.values().find(|record| {
+            record.client_token.as_deref() == Some(client_token)
+                && record.resource_type == resource_type
+        })
+    }
+}
+
+/// One storage configuration associated with an instance.
+#[derive(Debug, Clone)]
+pub struct StorageConfigRecord {
+    /// The association identifier the association minted, which is what
+    /// `DescribeInstanceStorageConfig` and `DisassociateInstanceStorageConfig` name
+    /// this configuration by.
+    pub association_id: String,
+    /// The `InstanceStorageResourceType` whose data this configuration stores.
+    pub resource_type: String,
+    /// The configuration as associated, carrying [`Self::association_id`] in its own
+    /// `AssociationId` member.
+    pub config: InstanceStorageConfig,
+    /// The `ClientToken` the association carried, when it carried one — what makes a
+    /// retry of that same association report it rather than make a second one.
+    pub client_token: Option<String>,
+}
+
+impl StorageConfigRecord {
+    /// The modelled `InstanceStorageConfig` shape `DescribeInstanceStorageConfig`
+    /// returns and `ListInstanceStorageConfigs` lists.
+    pub fn to_storage_config(&self) -> InstanceStorageConfig {
+        let mut config = self.config.clone();
+        config.association_id = Some(self.association_id.clone());
+        config
+    }
+
+    /// Whether `config` describes the same storage resource this record already
+    /// holds: every `InstanceStorageConfig` member but the association id, which the
+    /// association mints rather than the caller.
+    pub fn describes(&self, config: &InstanceStorageConfig) -> bool {
+        let mut candidate = config.clone();
+        candidate.association_id = Some(self.association_id.clone());
+        candidate == self.config
+    }
+}
+
+/// Which `InstanceStorageConfig` member each `StorageType` names, from
+/// `com.amazonaws.connect#StorageType` and the members of
+/// `com.amazonaws.connect#InstanceStorageConfig`: the storage type says which one of
+/// the four configuration members carries that storage resource's settings.
+///
+/// Each entry carries the member's name and the predicate that reads it, so an entry
+/// added for a new storage type cannot be read against the wrong member.
+pub type StorageTypeConfigMember = (&'static str, &'static str, fn(&InstanceStorageConfig) -> bool);
+
+/// See [`StorageTypeConfigMember`].
+pub const STORAGE_TYPE_CONFIG_MEMBERS: [StorageTypeConfigMember; 4] = [
+    ("S3", "S3Config", |config| config.s3_config.is_some()),
+    (
+        "KINESIS_VIDEO_STREAM",
+        "KinesisVideoStreamConfig",
+        |config| config.kinesis_video_stream_config.is_some(),
+    ),
+    ("KINESIS_STREAM", "KinesisStreamConfig", |config| {
+        config.kinesis_stream_config.is_some()
+    }),
+    ("KINESIS_FIREHOSE", "KinesisFirehoseConfig", |config| {
+        config.kinesis_firehose_config.is_some()
+    }),
+];
+
+/// Why `config` is not a usable storage configuration, or `None` when it is.
+///
+/// A storage configuration carries the settings of the storage type it names, so the
+/// member [`STORAGE_TYPE_CONFIG_MEMBERS`] pairs with its `StorageType` has to be
+/// there; a configuration without it names a storage resource it does not describe.
+pub fn storage_config_problem(config: &InstanceStorageConfig) -> Option<String> {
+    let Some((_, member, carried)) = STORAGE_TYPE_CONFIG_MEMBERS
+        .iter()
+        .copied()
+        .find(|(storage_type, _, _)| *storage_type == config.storage_type)
+    else {
+        return Some(format!(
+            "StorageType {} is not a supported storage type",
+            config.storage_type
+        ));
+    };
+    if carried(config) {
+        None
+    } else {
+        Some(format!(
+            "StorageConfig for StorageType {} must carry {member}",
+            config.storage_type
+        ))
     }
 }
 

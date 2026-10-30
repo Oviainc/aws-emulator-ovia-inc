@@ -119,7 +119,7 @@ pub struct ConditionalOperationFailedException {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.connect#InstanceStorageConfig")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InstanceStorageConfig {
     pub association_id: Option<String>,
     pub storage_type: String,
@@ -130,7 +130,7 @@ pub struct InstanceStorageConfig {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.connect#S3Config")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct S3Config {
     pub bucket_name: String,
     pub bucket_prefix: String,
@@ -138,14 +138,14 @@ pub struct S3Config {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.connect#EncryptionConfig")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EncryptionConfig {
     pub encryption_type: String,
     pub key_id: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.connect#KinesisVideoStreamConfig")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KinesisVideoStreamConfig {
     pub prefix: String,
     pub retention_period_hours: i32,
@@ -153,13 +153,13 @@ pub struct KinesisVideoStreamConfig {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.connect#KinesisStreamConfig")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KinesisStreamConfig {
     pub stream_arn: String,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.connect#KinesisFirehoseConfig")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KinesisFirehoseConfig {
     pub firehose_arn: String,
 }
