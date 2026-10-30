@@ -2,8 +2,8 @@
 
 //! @op GetLinks
 //! Reports the stored links of a global network: refuses an unknown `GlobalNetworkId`
-//! with `ResourceNotFoundException` (404), refuses `SiteId` combined with `Type` or
-//! `Provider` (the model documents them as mutually exclusive) with
+//! with `ResourceNotFoundException` (404), refuses a `SiteId` that names a site combined
+//! with `Type` or `Provider` (the model documents them as mutually exclusive) with
 //! `ValidationException` (400), otherwise filters the stored records by every filter the
 //! request carries and pages them. Reads only. This is the ONLY file to touch for this
 //! operation.
@@ -146,11 +146,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // `SiteId` is an OPTIONAL reference member, so what it names is read the way every
+        // other reader and writer of an optional reference reads it
+        // ([`crate::state::optional_reference`]): the empty string names no resource, so it
+        // is the absence of the reference — both for the mutual exclusion below and for the
+        // narrowing further down. `Type` and `Provider` are DESCRIPTIVE members whose
+        // writers store what the request spells verbatim, the empty string included, so
+        // those stay specified whenever the request carries them and keep matching
+        // literally.
+        let site_filter = crate::state::optional_reference(input.site_id.as_deref());
+
         // "If you specify the site ID, you cannot specify the type or provider in the
         // same request. You can specify the type and provider in the same request."
         // (`smithy_query query="doc" shape="GetLinks"`) — a rule the model cannot
-        // express as a constraint, so it is refused here.
-        if input.site_id.is_some() {
+        // express as a constraint, so it is refused here. It is decided on what the
+        // request SPECIFIES, which for this member is what it resolves to above: a site
+        // the request does not name cannot conflict with anything.
+        if site_filter.is_some() {
             let conflicting: Vec<&str> = [("Type", &input.r#type), ("Provider", &input.provider)]
                 .into_iter()
                 .filter(|(_, value)| value.is_some())
@@ -163,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "SiteId cannot be combined with {} in the same request",
                             conflicting.join(" or ")
                         ),
-                        reason: Some("FieldValidationFailed".to_string()),
+                        reason: Some(crate::state::REASON_FIELD_VALIDATION_FAILED.to_string()),
                         fields: Some(
                             conflicting
                                 .into_iter()
@@ -208,14 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             None => None,
         };
-
-        // `SiteId` is an OPTIONAL reference member, so what it names is read the way every
-        // other reader and writer of an optional reference reads it
-        // ([`crate::state::optional_reference`]): the empty string names no resource, so it
-        // is the absence of the filter. `Type` and `Provider` are DESCRIPTIVE members whose
-        // writers store what the request spells verbatim, the empty string included, so
-        // those keep matching literally.
-        let site_filter = crate::state::optional_reference(input.site_id.as_deref());
 
         // Every filter the request carries narrows the global network's links; an absent
         // one matches everything, and `LinkIds` filters on the ids it names.
