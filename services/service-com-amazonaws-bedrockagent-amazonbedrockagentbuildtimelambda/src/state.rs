@@ -9,18 +9,19 @@
 //! ([`AgentRecord::to_agent`], [`AgentRecord::to_summary`]) live here so no two
 //! handlers can project the same record differently.
 //!
-//! The flow lifecycle (`CreateFlow`, `GetFlow`) is backed by the
+//! The flow lifecycle (`CreateFlow`, `UpdateFlow`, `GetFlow`) is backed by the
 //! [`flows`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::flows)
 //! map the same way, with [`FlowRecord::to_create_output`] /
-//! [`FlowRecord::to_get_output`] as its single projections.
+//! [`FlowRecord::to_update_output`] / [`FlowRecord::to_get_output`] as its single
+//! projections.
 //!
-//! The knowledge-base lifecycle (`CreateKnowledgeBase`, `GetKnowledgeBase`) is
-//! backed by the
+//! The knowledge-base lifecycle (`CreateKnowledgeBase`, `UpdateKnowledgeBase`,
+//! `GetKnowledgeBase`) is backed by the
 //! [`knowledge_bases`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::knowledge_bases)
 //! map, with [`KnowledgeBaseRecord::to_knowledge_base`] as its single projection.
 //!
-//! A knowledge base's data sources (`CreateDataSource`, `GetDataSource`) are
-//! backed by the
+//! A knowledge base's data sources (`CreateDataSource`, `UpdateDataSource`,
+//! `GetDataSource`) are backed by the
 //! [`data_sources`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::data_sources)
 //! map, keyed by `dataSourceId` and carrying the `knowledgeBaseId` it belongs
 //! to, with [`DataSourceRecord::to_data_source`] as its single projection.
@@ -44,7 +45,8 @@ use crate::ops::types::{
     DataSourceConfiguration, FlowDefinition, FlowValidation, GetFlowOutput,
     GuardrailConfiguration, IngestionJob, IngestionJobStatistics, KnowledgeBase,
     KnowledgeBaseConfiguration, MemoryConfiguration, PromptOverrideConfiguration,
-    ServerSideEncryptionConfiguration, StorageConfiguration, VectorIngestionConfiguration,
+    ServerSideEncryptionConfiguration, StorageConfiguration, UpdateFlowOutput,
+    VectorIngestionConfiguration,
 };
 
 /// The region an ARN carries when the request is unsigned, so it names no
@@ -304,6 +306,25 @@ impl FlowRecord {
         }
     }
 
+    /// This record as the `UpdateFlow` response. `UpdateFlowResponse` carries the
+    /// same members as `CreateFlowResponse`, and like it every one comes from the
+    /// stored record the update has just written, never from the request.
+    pub fn to_update_output(&self) -> UpdateFlowOutput {
+        UpdateFlowOutput {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            execution_role_arn: self.execution_role_arn.clone(),
+            customer_encryption_key_arn: self.customer_encryption_key_arn.clone(),
+            id: self.flow_id.clone(),
+            arn: self.arn.clone(),
+            status: self.status.as_wire().to_string(),
+            created_at: to_date_time(self.created_at),
+            updated_at: to_date_time(self.updated_at),
+            version: self.version.clone(),
+            definition: self.definition.clone(),
+        }
+    }
+
     /// This record as the `GetFlow` response. `with_definition` is false for a
     /// metadata-only read, which drops the flow definition and nothing else;
     /// `validations` is reported only while the flow actually carries findings.
@@ -333,6 +354,16 @@ pub const FLOW_IDENTIFIER_PATTERN: &str =
 /// Whether `value` is a modelled `FlowId` (`^[0-9a-zA-Z]{10}$`).
 fn is_flow_id(value: &str) -> bool {
     value.len() == ID_LEN && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// The `ValidationException` message a flow operation answers when
+/// `flowIdentifier` is neither form the modelled shape admits: it names the
+/// member and the constraint the value failed, with the value from the request.
+pub fn flow_identifier_pattern_message(identifier: &str) -> String {
+    format!(
+        "Value '{identifier}' at 'flowIdentifier' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern: {FLOW_IDENTIFIER_PATTERN}"
+    )
 }
 
 /// The `flowId` a modelled `FlowIdentifier` names, or `None` when the value is
@@ -367,6 +398,19 @@ pub fn flow_id_from_identifier(identifier: &str) -> Option<&str> {
         }
     };
     is_flow_id(id).then_some(id)
+}
+
+/// The `ResourceNotFoundException` message a flow operation answers when the
+/// flow the request names is not stored.
+///
+/// The sentence is the flow family's, with `operation` — the operation the caller
+/// invoked — filling its one variable part; the requested identifier is not part
+/// of it.
+pub fn flow_not_found_message(operation: &str) -> String {
+    format!(
+        "Couldn't perform {operation} operation. Failed to retrieve resource type \
+         Flow because it doesn't exist. Check the resource ID and retry your request."
+    )
 }
 
 /// The most knowledge bases this store holds; past it `CreateKnowledgeBase`
@@ -568,6 +612,13 @@ impl KnowledgeBaseRecord {
     }
 }
 
+/// The `ResourceNotFoundException` message a knowledge-base operation answers
+/// when the knowledge base the request names is not stored: the id the request
+/// carried fills the one variable part.
+pub fn knowledge_base_not_found_message(knowledge_base_id: &str) -> String {
+    format!("KnowledgeBase with id {knowledge_base_id} is not found.")
+}
+
 /// The most data sources one knowledge base holds; past it `CreateDataSource`
 /// answers the modelled `ServiceQuotaExceededException` instead of growing.
 ///
@@ -756,6 +807,14 @@ impl DataSourceRecord {
                 .then(|| self.failure_reasons.clone()),
         }
     }
+}
+
+/// The `ResourceNotFoundException` message a data-source operation answers when
+/// the data source the request names is not stored: the id the request carried
+/// fills the one variable part, and the enclosing knowledge base is not part of
+/// the sentence.
+pub fn data_source_not_found_message(data_source_id: &str) -> String {
+    format!("DataSource with id {data_source_id} is not found.")
 }
 
 /// The most ingestion jobs one data source holds; past it `StartIngestionJob`
@@ -1073,6 +1132,19 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     ) -> Option<&DataSourceRecord> {
         self.data_sources
             .get(data_source_id)
+            .filter(|record| record.knowledge_base_id == knowledge_base_id)
+    }
+
+    /// The same record as [`Self::data_source_of`], for an operation that writes
+    /// it: the pair still selects it, so an update never reaches a data source of
+    /// another knowledge base.
+    pub fn data_source_of_mut(
+        &mut self,
+        knowledge_base_id: &str,
+        data_source_id: &str,
+    ) -> Option<&mut DataSourceRecord> {
+        self.data_sources
+            .get_mut(data_source_id)
             .filter(|record| record.knowledge_base_id == knowledge_base_id)
     }
 

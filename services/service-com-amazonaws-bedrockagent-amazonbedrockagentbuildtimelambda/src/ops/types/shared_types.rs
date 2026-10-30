@@ -1347,7 +1347,14 @@ pub struct EnrichmentStrategyConfiguration {
     pub method: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#DataSource")]
+/// `DataSource`. Its schema and codec come from [`bedrock_agent_schema_and_codec!`]
+/// rather than `#[smithy_macros::smithy(shape = ...)]` because `createdAt` and
+/// `updatedAt` target `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="DataSource")`), and the derive does not put that
+/// trait on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct DataSource {
     pub knowledge_base_id: String,
@@ -1363,6 +1370,75 @@ pub struct DataSource {
     pub updated_at: ::aws_smithy_types::DateTime,
     pub failure_reasons: Option<Vec<String>>,
 }
+
+bedrock_agent_schema_and_codec!(
+    DataSource,
+    DATA_SOURCE_SCHEMA,
+    "com.amazonaws.bedrockagent#DataSource",
+    "com.amazonaws.bedrockagent",
+    "DataSource",
+    (
+        M_KNOWLEDGE_BASE_ID,
+        knowledge_base_id,
+        "knowledgeBaseId",
+        0,
+        req,
+        string
+    ),
+    (
+        M_DATA_SOURCE_ID,
+        data_source_id,
+        "dataSourceId",
+        1,
+        req,
+        string
+    ),
+    (M_NAME, name, "name", 2, req, string),
+    (M_STATUS, status, "status", 3, req, string),
+    (M_DESCRIPTION, description, "description", 4, opt, string),
+    (
+        M_DATA_SOURCE_CONFIGURATION,
+        data_source_configuration,
+        "dataSourceConfiguration",
+        5,
+        req,
+        struct_of(DataSourceConfiguration)
+    ),
+    (
+        M_SERVER_SIDE_ENCRYPTION_CONFIGURATION,
+        server_side_encryption_configuration,
+        "serverSideEncryptionConfiguration",
+        6,
+        opt,
+        struct_of(ServerSideEncryptionConfiguration)
+    ),
+    (
+        M_VECTOR_INGESTION_CONFIGURATION,
+        vector_ingestion_configuration,
+        "vectorIngestionConfiguration",
+        7,
+        opt,
+        struct_of(VectorIngestionConfiguration)
+    ),
+    (
+        M_DATA_DELETION_POLICY,
+        data_deletion_policy,
+        "dataDeletionPolicy",
+        8,
+        opt,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 9, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 10, req, date_time),
+    (
+        M_FAILURE_REASONS,
+        failure_reasons,
+        "failureReasons",
+        11,
+        opt,
+        list_of_string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#FlowAliasRoutingConfigurationListItem")]
 #[derive(Debug, Clone, Default)]
@@ -1782,7 +1858,14 @@ pub struct S3VectorsConfiguration {
     pub index_name: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#KnowledgeBase")]
+/// `KnowledgeBase`. Its schema and codec come from [`bedrock_agent_schema_and_codec!`]
+/// for the reason [`DataSource`]'s do: `createdAt` and `updatedAt` target
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="KnowledgeBase")`), and the derive does not put
+/// that trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct KnowledgeBase {
     pub knowledge_base_id: String,
@@ -1797,6 +1880,60 @@ pub struct KnowledgeBase {
     pub updated_at: ::aws_smithy_types::DateTime,
     pub failure_reasons: Option<Vec<String>>,
 }
+
+bedrock_agent_schema_and_codec!(
+    KnowledgeBase,
+    KNOWLEDGE_BASE_SCHEMA,
+    "com.amazonaws.bedrockagent#KnowledgeBase",
+    "com.amazonaws.bedrockagent",
+    "KnowledgeBase",
+    (
+        M_KNOWLEDGE_BASE_ID,
+        knowledge_base_id,
+        "knowledgeBaseId",
+        0,
+        req,
+        string
+    ),
+    (M_NAME, name, "name", 1, req, string),
+    (
+        M_KNOWLEDGE_BASE_ARN,
+        knowledge_base_arn,
+        "knowledgeBaseArn",
+        2,
+        req,
+        string
+    ),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (M_ROLE_ARN, role_arn, "roleArn", 4, req, string),
+    (
+        M_KNOWLEDGE_BASE_CONFIGURATION,
+        knowledge_base_configuration,
+        "knowledgeBaseConfiguration",
+        5,
+        req,
+        struct_of(KnowledgeBaseConfiguration)
+    ),
+    (
+        M_STORAGE_CONFIGURATION,
+        storage_configuration,
+        "storageConfiguration",
+        6,
+        opt,
+        struct_of(StorageConfiguration)
+    ),
+    (M_STATUS, status, "status", 7, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 8, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 9, req, date_time),
+    (
+        M_FAILURE_REASONS,
+        failure_reasons,
+        "failureReasons",
+        10,
+        opt,
+        list_of_string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#PromptVariant")]
 #[derive(Debug, Clone)]

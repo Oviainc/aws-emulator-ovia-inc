@@ -312,11 +312,21 @@ async fn created_flows_round_trip_through_get_flow() {
             "NotPrepared",
             "case {case}: a newly created flow has not been prepared"
         );
-        assert!(
-            created.member(&["createdAt"]).is_number() && created.member(&["updatedAt"]).is_number(),
-            "case {case}: createdAt/updatedAt must be populated, got {:?}",
-            created.body
-        );
+        // `createdAt`/`updatedAt` target `DateTimestamp`, which carries
+        // `@timestampFormat("date-time")`
+        // (`smithy_query(query="shape", shape="CreateFlowResponse")`), so each one is
+        // populated AND carried as an RFC-3339 string rather than an epoch number.
+        for member in ["createdAt", "updatedAt"] {
+            let at = created.member(&[member]);
+            let text = at.as_str().unwrap_or_else(|| {
+                panic!("case {case}: expected {member} to be a date-time string, got {at:?}")
+            });
+            assert!(
+                text.contains('T') && text.ends_with('Z'),
+                "case {case}: expected {member} in the modelled date-time wire form, \
+                 got {text:?}"
+            );
+        }
 
         // The round trip: the stored record, read back through GetFlow.
         let fetched = emulator.get_flow(&flow_id, None).await;

@@ -196,11 +196,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bad request it is, rather than reported as a missing flow.
         let Some(flow_id) = crate::state::flow_id_from_identifier(&input.flow_identifier) else {
             return Err(GetFlowErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "Value '{}' at 'flowIdentifier' failed to satisfy constraint: \
-                     Member must satisfy regular expression pattern: {}",
-                    input.flow_identifier,
-                    crate::state::FLOW_IDENTIFIER_PATTERN
+                message: Some(crate::state::flow_identifier_pattern_message(
+                    &input.flow_identifier,
                 )),
                 field_list: None,
             })

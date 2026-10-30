@@ -351,11 +351,21 @@ async fn created_knowledge_bases_round_trip_through_get_knowledge_base() {
             "case {case}: creation is asynchronous (202 Accepted), so a freshly created \
              knowledge base reports the transient CREATING status, got {created:?}"
         );
-        assert!(
-            created.kb("createdAt").is_number() && created.kb("updatedAt").is_number(),
-            "case {case}: createdAt/updatedAt must be populated, got {:?}",
-            created.body
-        );
+        // `createdAt`/`updatedAt` target `DateTimestamp`, which carries
+        // `@timestampFormat("date-time")`
+        // (`smithy_query(query="shape", shape="KnowledgeBase")`), so each one is
+        // populated AND carried as an RFC-3339 string rather than an epoch number.
+        for member in ["createdAt", "updatedAt"] {
+            let at = created.kb(member);
+            let text = at.as_str().unwrap_or_else(|| {
+                panic!("case {case}: expected {member} to be a date-time string, got {at:?}")
+            });
+            assert!(
+                text.contains('T') && text.ends_with('Z'),
+                "case {case}: expected {member} in the modelled date-time wire form, \
+                 got {text:?}"
+            );
+        }
         assert!(
             created.kb("failureReasons").is_null(),
             "case {case}: nothing has failed on a knowledge base just created, got {:?}",

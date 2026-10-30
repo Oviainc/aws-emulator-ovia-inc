@@ -23,3 +23,5 @@ mod ingestion_job_lifecycle;
 mod knowledge_base_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_round_trip.rs"]
+mod update_round_trip;

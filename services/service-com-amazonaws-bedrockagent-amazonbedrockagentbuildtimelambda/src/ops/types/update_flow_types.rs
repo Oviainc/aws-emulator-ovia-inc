@@ -22,7 +22,16 @@ pub struct UpdateFlowInput {
     pub flow_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#UpdateFlowResponse")]
+/// `UpdateFlowResponse`. Its schema and codec come from
+/// [`bedrock_agent_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `createdAt` and `updatedAt` target
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="UpdateFlowResponse")`), and the derive does not
+/// put that trait on a member schema — see `types/date_time_wire.rs` for that whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct UpdateFlowOutput {
     pub name: String,
@@ -37,4 +46,44 @@ pub struct UpdateFlowOutput {
     pub version: String,
     pub definition: Option<FlowDefinition>,
 }
+
+bedrock_agent_schema_and_codec!(
+    UpdateFlowOutput,
+    UPDATE_FLOW_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagent#UpdateFlowResponse",
+    "com.amazonaws.bedrockagent",
+    "UpdateFlowResponse",
+    (M_NAME, name, "name", 0, req, string),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (
+        M_EXECUTION_ROLE_ARN,
+        execution_role_arn,
+        "executionRoleArn",
+        2,
+        req,
+        string
+    ),
+    (
+        M_CUSTOMER_ENCRYPTION_KEY_ARN,
+        customer_encryption_key_arn,
+        "customerEncryptionKeyArn",
+        3,
+        opt,
+        string
+    ),
+    (M_ID, id, "id", 4, req, string),
+    (M_ARN, arn, "arn", 5, req, string),
+    (M_STATUS, status, "status", 6, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 7, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 8, req, date_time),
+    (M_VERSION, version, "version", 9, req, string),
+    (
+        M_DEFINITION,
+        definition,
+        "definition",
+        10,
+        opt,
+        struct_of(FlowDefinition)
+    ),
+);
 
