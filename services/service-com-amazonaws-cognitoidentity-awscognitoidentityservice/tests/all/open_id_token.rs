@@ -19,7 +19,7 @@
 //!   `GetId` presenting one resolves to the same identity and a reader reports it;
 //! * an identity this service does not hold (the modelled `ResourceNotFoundException`), a
 //!   login the identity's pool does not
-//!   accept (403) and a login already linked to another identity (409) are each refused
+//!   accept and a login of another identity are each refused `NotAuthorizedException`
 //!   and change nothing.
 //!
 //! The harness is `identity_pool_flow`'s: one shared engine behind the same
@@ -31,6 +31,7 @@ use serde_json::{json, Map, Value};
 
 use crate::developer_identity_tokens::{jws_header_and_claims, listed_logins};
 use crate::identity_pool_flow::{cognito_trust_policy, error_code, seeded_role_arn, Emulator};
+use crate::mapped_role_resolution::identity_token;
 
 /// The operation under test, spelled once.
 const OPERATION: &str = "GetOpenIdToken";
@@ -71,11 +72,25 @@ const OIDC_PROVIDER_NAME: &str = "accounts.example.com";
 /// One `Logins` entry as a row carries it: the provider name and the token it carries.
 type Login<'a> = (&'a str, &'a str);
 
+/// The identity token `issuer` issues: the value a `Logins` entry whose provider's logins
+/// ARE OpenID Connect identity tokens — an Amazon Cognito user pool, an OpenID Connect
+/// issuer — has to carry, naming that issuer in its `iss` claim. It names no audience: what
+/// a token was issued for is decided against the client ids the pool's provider is
+/// registered with, which `super::iam_oidc_federation` owns.
+fn id_token_of(issuer: &str) -> String {
+    identity_token(&json!({
+        "iss": format!("https://{issuer}"),
+        "sub": format!("subject-of-{issuer}"),
+        "token_use": "id",
+        "exp": 4_102_444_800u64,
+    }))
+}
+
 /// A row of the minting table: the case name, the logins presented to `GetOpenIdToken`,
-/// and whether `GetId` had already linked them (the classic flow, where the same logins
-/// are presented twice) or they reach this identity for the first time here (the implicit
-/// link this operation documents).
-type MintingCase<'a> = (&'a str, Vec<Login<'a>>, bool);
+/// and the logins `GetId` had already linked the identity through — a row presenting one of
+/// those beside a login the identity did not carry is the implicit link this operation
+/// documents, and an empty set is an unauthenticated (guest) identity.
+type MintingCase<'a> = (&'a str, Vec<Login<'a>>, Vec<Login<'a>>);
 
 /// The `GetOpenIdToken` request for one case. `Logins` is sent only when the row carries
 /// entries, so a row with none exercises the member's ABSENCE.
@@ -165,59 +180,73 @@ fn expected_methods(providers: &[String]) -> BTreeSet<String> {
 async fn a_token_is_minted_from_the_stored_identity_it_names() {
     let emulator = Emulator::new();
 
+    let mut minted_tokens: BTreeSet<String> = BTreeSet::new();
+    // The identity tokens the user-pool and OpenID Connect rows present, held here so the
+    // rows can borrow them.
+    let user_pool_token = id_token_of(TRUSTED_USER_POOL_PROVIDER);
+    let oidc_token = id_token_of(OIDC_PROVIDER_NAME);
+
     // The rows differ along what the rule generalises over: how many logins are presented,
     // what KIND of provider each names (a public provider, the pool's own Amazon Cognito
-    // user pool, an OIDC issuer), and whether the identity already carried them.
+    // user pool, an OIDC issuer), and how many of them the identity already carried — none
+    // (a guest identity, which presents none here), every one, or all but the one this call
+    // links on top.
     let cases: Vec<MintingCase<'_>> = vec![
-        ("no logins at all, an unauthenticated identity", vec![], false),
         (
-            "one public provider, presented for the first time here",
+            "no logins at all, an unauthenticated identity",
+            vec![],
+            vec![],
+        ),
+        (
+            "one public provider, the identity's own",
             vec![("graph.facebook.com", "a-facebook-access-token")],
-            false,
+            vec![("graph.facebook.com", "a-facebook-access-token")],
         ),
         (
             "one public provider the identity was minted for",
             vec![("accounts.google.com", "a-google-id-token")],
-            true,
+            vec![("accounts.google.com", "a-google-id-token")],
         ),
         (
-            "two public providers, an implicit link between them",
+            "two public providers, both the identity's own",
             vec![
                 ("graph.facebook.com", "another-facebook-access-token"),
                 ("www.amazon.com", "an-amazon-access-token"),
             ],
-            false,
+            vec![
+                ("graph.facebook.com", "another-facebook-access-token"),
+                ("www.amazon.com", "an-amazon-access-token"),
+            ],
+        ),
+        (
+            "a login of the identity beside one it did not carry: the implicit link",
+            vec![
+                ("graph.facebook.com", "a-third-facebook-access-token"),
+                ("www.amazon.com", "another-amazon-access-token"),
+            ],
+            vec![("graph.facebook.com", "a-third-facebook-access-token")],
         ),
         (
             "the pool's own Amazon Cognito user pool",
-            vec![(TRUSTED_USER_POOL_PROVIDER, "a-user-pool-id-token")],
-            true,
+            vec![(TRUSTED_USER_POOL_PROVIDER, user_pool_token.as_str())],
+            vec![(TRUSTED_USER_POOL_PROVIDER, user_pool_token.as_str())],
         ),
         (
-            "an OIDC issuer beside a public provider",
+            "an OIDC issuer beside a public provider the call links",
             vec![
-                (OIDC_PROVIDER_NAME, "an-oidc-id-token"),
-                ("graph.facebook.com", "a-third-facebook-access-token"),
+                (OIDC_PROVIDER_NAME, oidc_token.as_str()),
+                ("graph.facebook.com", "a-fourth-facebook-access-token"),
             ],
-            false,
+            vec![(OIDC_PROVIDER_NAME, oidc_token.as_str())],
         ),
     ];
-
-    let mut minted_tokens: BTreeSet<String> = BTreeSet::new();
 
     for (index, (case, logins, linked_by_get_id)) in cases.into_iter().enumerate() {
         // The pool NAME is modelled `[\w\s+=,.@-]+`, so it is the row's index rather than
         // its prose case name.
         let pool_id = pool_trusting_providers(&emulator, &format!("minted-token-{index}")).await;
         let identity_id = emulator
-            .identity(
-                &pool_id,
-                if linked_by_get_id {
-                    logins_map(&logins)
-                } else {
-                    None
-                },
-            )
+            .identity(&pool_id, logins_map(&linked_by_get_id))
             .await;
 
         let answered = emulator.ok(OPERATION, &token_request(&identity_id, &logins)).await;
@@ -351,6 +380,9 @@ async fn a_call_this_service_cannot_serve_is_refused_and_changes_nothing() {
         .await;
 
     let before = listed_logins(&emulator, &pool_id, &identity_id).await;
+    // The user-pool rows present the identity token that user pool issues, so what they
+    // vary is the user pool it was issued BY.
+    let foreign_user_pool_token = id_token_of(FOREIGN_USER_POOL_PROVIDER);
 
     // One row per reason the call cannot be served: the identity, the logins it presents,
     // and the status and error code owed.
@@ -372,8 +404,8 @@ async fn a_call_this_service_cannot_serve_is_refused_and_changes_nothing() {
         (
             "a login minted by an Amazon Cognito user pool this pool does not trust",
             identity_id.as_str(),
-            vec![(FOREIGN_USER_POOL_PROVIDER, "a-foreign-user-pool-id-token")],
-            403,
+            vec![(FOREIGN_USER_POOL_PROVIDER, foreign_user_pool_token.as_str())],
+            400,
             "NotAuthorizedException",
         ),
         (
@@ -381,17 +413,17 @@ async fn a_call_this_service_cannot_serve_is_refused_and_changes_nothing() {
             identity_id.as_str(),
             vec![
                 ("www.amazon.com", "an-amazon-access-token"),
-                (FOREIGN_USER_POOL_PROVIDER, "another-foreign-id-token"),
+                (FOREIGN_USER_POOL_PROVIDER, foreign_user_pool_token.as_str()),
             ],
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
             "a login already linked to another identity of the pool",
             identity_id.as_str(),
             vec![other_login],
-            409,
-            "ResourceConflictException",
+            400,
+            "NotAuthorizedException",
         ),
     ];
 
@@ -458,6 +490,7 @@ async fn the_methods_a_token_names_are_the_ones_a_trust_policy_decides_on() {
 
     // One row per exchange: the login presented, whether the conditioned role admits it,
     // and the method the token must name for that decision to be the policy's own.
+    let user_pool_token = id_token_of(TRUSTED_USER_POOL_PROVIDER);
     let rows: Vec<(&str, Option<Login<'_>>, bool)> = vec![
         (
             "the provider the condition names",
@@ -471,7 +504,7 @@ async fn the_methods_a_token_names_are_the_ones_a_trust_policy_decides_on() {
         ),
         (
             "the pool's own user pool",
-            Some((TRUSTED_USER_POOL_PROVIDER, "a-user-pool-id-token")),
+            Some((TRUSTED_USER_POOL_PROVIDER, user_pool_token.as_str())),
             false,
         ),
         ("no login at all", None, true),

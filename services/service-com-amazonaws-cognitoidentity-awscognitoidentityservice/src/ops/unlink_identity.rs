@@ -251,32 +251,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
         };
         let identity_pool_id = identity.identity_pool_id.clone();
 
-        // An identity an unlink already left linked to NO provider can no longer be reached
-        // through a login of a provider: nothing resolves to it there, so there is no link of
-        // it left to forget. What can still name it is a token THIS service minted for it,
-        // which IS a login of that identity. The record is still read by the pool's
-        // administrative reads — that is how an operator sees the disabled identity.
-        if identity.is_disabled()
-            && !input.logins.is_empty()
-            && !store.logins_name_identity(
-                &identity_pool_id,
-                &input.identity_id,
-                &input.logins,
-                now,
-            )
-        {
+        // This operation takes LINKED LOGINS off an identity, and an UNAUTHENTICATED (guest)
+        // identity — the one `GetId` mints for a call presenting no login at all — has never
+        // had one: there is nothing of it to unlink, whatever the call presents.
+        if !identity.has_been_linked() {
             return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
                 NotAuthorizedException {
-                    message: Some(crate::state::UNMATCHED_LOGINS_MESSAGE.to_string()),
+                    message: Some(
+                        crate::state::CANNOT_UNLINK_UNAUTHENTICATED_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
         }
 
         // A `Logins` entry is decided by the pool the identity belongs to, exactly as it is
-        // wherever else this service is handed one: the entry carries its issuer in the
-        // provider name, so the trust that pool states for the issuer — and the audience
-        // that trust accepts — decides it.
+        // wherever else this service is handed one: the TOKEN it presents first — a value
+        // that is not the kind of token its provider issues, and one issued by someone other
+        // than the provider it is presented under, authorize nothing — and then the trust
+        // that pool states for the token's issuer, with the audience that trust accepts.
         let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
             return Err(UnlinkIdentityErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -285,7 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
             )
             .into());
         };
-        if let Some(refusal) = pool.login_trust(&registered).refuse(&input.logins) {
+        if let Some(refusal) = pool.refuse_logins(&registered, &input.logins) {
             return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
                 NotAuthorizedException {
                     message: Some(refusal.message().to_string()),
@@ -294,36 +287,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
             .into());
         }
 
-        // This operation detaches PUBLIC-provider logins: a developer login is detached
-        // through `UnlinkDeveloperIdentity`, which is the operation that takes a
-        // `DeveloperProviderName`. A `Logins` map naming no public provider at all —
-        // carrying only the pool's own developer provider, or nothing — therefore presents
-        // nothing this operation can act for, which is a bad input parameter.
-        if !pool.logins_name_a_public_provider(&input.logins) {
-            return Err(UnlinkIdentityErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(crate::state::NO_PUBLIC_PROVIDER_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
-
-        // Being an unsigned public API, the call carries no credential of this service: the
-        // TOKEN each `Logins` entry presents is the whole authorization for it, so a token
-        // that is not the kind of token its provider issues authorizes nothing and the call
-        // is refused before any index or record is touched. A provider whose logins are
-        // OpenID Connect identity tokens is the case this service can decide from the
-        // presented value alone.
-        if pool.presents_unreadable_identity_token(&input.logins) {
-            return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
-                NotAuthorizedException {
-                    message: Some(
-                        crate::state::INVALID_OPEN_ID_CONNECT_TOKEN_MESSAGE.to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
         // A token presented under this service's OWN provider name names an issuance this
         // service recorded, so its validity is readable here exactly as it is at the
         // credential exchange: one outside the window its issuance recorded, one this
@@ -335,6 +298,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
             return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
                 NotAuthorizedException {
                     message: Some(refusal.message().to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Being an unsigned public API, the call carries no credential of this service: a
+        // LOGIN of the identity it names is the whole authorization for it, so a call
+        // presenting none at all — and one presenting only logins of some other user — is
+        // refused before any index or record is touched.
+        if let Some(refusal) = store.refuse_identity_access(identity, &input.logins, now) {
+            return Err(UnlinkIdentityErrorModeled::NotAuthorizedException(
+                NotAuthorizedException {
+                    message: Some(refusal.message(&input.identity_id)),
+                },
+            )
+            .into());
+        }
+
+        // This operation detaches PUBLIC-provider logins: a developer login is detached
+        // through `UnlinkDeveloperIdentity`, which is the operation that takes a
+        // `DeveloperProviderName`. A `Logins` map naming no public provider at all —
+        // carrying only the pool's own developer provider — therefore presents nothing this
+        // operation can act for, which is a bad input parameter.
+        if !pool.logins_name_a_public_provider(&input.logins) {
+            return Err(UnlinkIdentityErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::NO_PUBLIC_PROVIDER_MESSAGE.to_string()),
                 },
             )
             .into());

@@ -243,7 +243,12 @@ async fn the_basic_flow_is_served_only_while_the_pool_serves_it() {
         let name = format!("classic-flow-{index}");
         let pool_id = pool_with_flag(&emulator, case, &name, *created_with).await;
         let login = format!("a-facebook-token-{index}");
-        let identity_id = emulator.identity(&pool_id, None).await;
+        // The identity is reached through the very login the call below presents: an
+        // identity is reached by a login OF it, so what each row varies is the pool's
+        // configuration and nothing else.
+        let identity_id = emulator
+            .identity(&pool_id, Some(json!({LOGIN_PROVIDER: &login})))
+            .await;
         if let Some(updated_to) = updated_to {
             update_flag(&emulator, case, &pool_id, &name, *updated_to).await;
         }
@@ -299,18 +304,14 @@ async fn the_basic_flow_is_served_only_while_the_pool_serves_it() {
              {described:?}"
         );
 
-        // The served call LINKS the login it presented to the identity; the refused call
-        // must have written nothing, so the login resolves to that identity only where the
-        // flow was served.
+        // The identity was reached THROUGH that login, so it carries it either way: what a
+        // refusal must not do is change that, and what a served call adds is nothing more —
+        // the login it presented is the one the identity already had.
         let logins = listed_logins(&emulator, &pool_id, &identity_id).await;
-        let expected: Vec<String> = if refusal.is_none() {
-            vec![LOGIN_PROVIDER.to_string()]
-        } else {
-            Vec::new()
-        };
         assert_eq!(
-            logins, expected,
-            "case {case:?}: expected the identity's logins to be {expected:?}, got {logins:?}"
+            logins,
+            vec![LOGIN_PROVIDER.to_string()],
+            "case {case:?}: expected the identity's logins to be unchanged, got {logins:?}"
         );
     }
 }
@@ -324,7 +325,11 @@ async fn a_pool_that_forbids_the_flow_still_serves_the_enhanced_one() {
     let case = "a pool created forbidding the classic flow";
     let name = "classic-flow-enhanced";
     let pool_id = pool_with_flag(&emulator, case, name, Some(false)).await;
-    let identity_id = emulator.identity(&pool_id, None).await;
+    // Reached through the login the classic-flow call below presents, which is what makes
+    // that call one the identity's own login authorizes.
+    let identity_id = emulator
+        .identity(&pool_id, Some(json!({LOGIN_PROVIDER: "a-facebook-token"})))
+        .await;
 
     let (status, refused) = get_open_id_token(&emulator, &identity_id, "a-facebook-token").await;
     assert_eq!(
@@ -338,7 +343,10 @@ async fn a_pool_that_forbids_the_flow_still_serves_the_enhanced_one() {
     let (status, vend) = emulator
         .call(
             "GetCredentialsForIdentity",
-            &json!({"IdentityId": &identity_id}),
+            &json!({
+                "IdentityId": &identity_id,
+                "Logins": {LOGIN_PROVIDER: "a-facebook-token"},
+            }),
         )
         .await;
     let code = error_code(&vend);

@@ -19,10 +19,10 @@
 //!   idempotent;
 //! * a call the store cannot act on is refused with the modelled error for what is wrong
 //!   with it — an identity this service does not hold is the modelled
-//!   `ResourceNotFoundException`, a login already linked to
-//!   another identity is a 409, a `Logins` entry the pool does not accept is a 403 — and a
+//!   `ResourceNotFoundException`, a login of another identity and a `Logins` entry the pool
+//!   does not accept are each a `NotAuthorizedException` — and a
 //!   value outside a constraint the MODEL states is refused ahead of the operation with a
-//!   400 `ValidationException`.
+//!   `ValidationException`, every one of them HTTP 400.
 //!
 //! The harness is `identity_pool_flow`'s: one shared engine behind the same
 //! `MultiServiceRouter` the production router builds.
@@ -529,14 +529,17 @@ async fn a_call_the_store_cannot_act_on_is_refused() {
             "ResourceNotFoundException",
         ),
         (
+            // The caller presented a login of ANOTHER identity and none of this one's, so it
+            // has proven nothing about the identity it named: an authorization failure
+            // rather than a state conflict.
             "a login already linked to another identity",
             unlink_request(
                 Some(&identity_id),
                 Some(logins_map(&other_login)),
                 Some(one_provider.clone()),
             ),
-            409,
-            "ResourceConflictException",
+            400,
+            "NotAuthorizedException",
         ),
         (
             "a Logins entry naming a user pool this pool does not configure",
@@ -545,7 +548,7 @@ async fn a_call_the_store_cannot_act_on_is_refused() {
                 Some(foreign_user_pool),
                 Some(one_provider.clone()),
             ),
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (

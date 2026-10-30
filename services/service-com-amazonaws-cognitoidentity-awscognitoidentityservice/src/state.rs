@@ -193,6 +193,17 @@ impl IdentityPool {
         self.developer_provider_name.as_deref() == Some(provider_name)
     }
 
+    /// Whether `provider_name` is one of this pool's `SamlProviderARNs`: a SAML identity
+    /// provider, whose `Logins` entry is keyed by the provider's own ARN ("A list of the
+    /// SAML provider ARNs", this service's model) and whose assertion is what carries the
+    /// roles the user may assume.
+    pub fn names_saml_provider(&self, provider_name: &str) -> bool {
+        self.saml_provider_arns
+            .iter()
+            .flatten()
+            .any(|arn| arn == provider_name)
+    }
+
     /// Whether `logins` carries at least one entry made in the name of a PUBLIC provider —
     /// any provider that is not this pool's own developer one.
     pub fn logins_name_a_public_provider(&self, logins: &HashMap<String, String>) -> bool {
@@ -201,9 +212,30 @@ impl IdentityPool {
             .any(|provider| !self.names_developer_provider(provider))
     }
 
-    /// Whether `logins` presents, for a provider of this pool that issues OpenID Connect
-    /// identity tokens ([`IdentityPool::issues_open_id_connect_tokens`]), a value that is
-    /// not such a token at all.
+    /// Whether a `Logins` entry made in the name of `provider_name` carries an OpenID
+    /// Connect IDENTITY TOKEN whose own claims this service reads before anything else is
+    /// decided about it.
+    ///
+    /// Two kinds of provider name say so: one of this pool's configured OpenID Connect
+    /// providers ([`IdentityPool::issues_open_id_connect_tokens`]), and ANY name that names
+    /// an Amazon Cognito user pool ([`names_cognito_user_pool`]) — the
+    /// `cognito-idp.<region>.amazonaws.com/<UserPoolId>` form is a user pool's issuer
+    /// whether or not this pool was configured with it, and a user pool's login is always
+    /// that pool's id token. Every other provider name carries a provider-specific
+    /// credential this service cannot read.
+    fn presents_identity_token(&self, provider_name: &str) -> bool {
+        self.issues_open_id_connect_tokens(provider_name) || names_cognito_user_pool(provider_name)
+    }
+
+    /// Why the `Logins` map of a request authorizes nothing, if so: what the PRESENTED
+    /// TOKENS themselves say, and then what this pool's stored configuration trusts
+    /// ([`PoolLoginTrust::refuse`]).
+    ///
+    /// The entries are decided in a stable order, so a map that breaks the rule in two
+    /// places is refused the same way every time, and the token's own form and issuer are
+    /// decided BEFORE the pool's configuration: a value that is not the kind of token its
+    /// provider issues, or that was issued by someone other than the provider it is
+    /// presented under, authorizes nothing whatever the pool trusts.
     ///
     /// The reading is [`::service_common::jwt::read`], the tree's one bounded reading of a
     /// compact JWS, through the reader a service presented ANOTHER party's token calls: a
@@ -212,11 +244,61 @@ impl IdentityPool {
     /// the issuer's published verification key, which this emulator makes no outbound
     /// connection to fetch — so what is decided here is decided from the presented value
     /// alone, and only ever to REFUSE it.
-    pub fn presents_unreadable_identity_token(&self, logins: &HashMap<String, String>) -> bool {
-        logins.iter().any(|(provider, token)| {
-            self.issues_open_id_connect_tokens(provider)
-                && ::service_common::jwt::read(token).is_err()
-        })
+    pub fn refuse_logins(
+        &self,
+        registered: &RegisteredOidcProviders,
+        logins: &HashMap<String, String>,
+    ) -> Option<LoginProviderRefusal> {
+        let mut presented: Vec<(&String, &String)> = logins.iter().collect();
+        presented.sort();
+        presented
+            .into_iter()
+            .find_map(|(provider_name, token)| self.refuse_presented_token(provider_name, token))
+            .or_else(|| self.login_trust(registered).refuse(logins))
+    }
+
+    /// Why the value presented for ONE login is not the token its provider issues, if so.
+    ///
+    /// A provider whose logins are OpenID Connect identity tokens
+    /// ([`IdentityPool::presents_identity_token`]) has to be presented with one: a value
+    /// whose `iss` claim — "the principal that issued the JWT" (RFC 7519 §4.1.1), which an
+    /// OpenID Connect provider's URL is — names an issuer other than the provider the entry
+    /// is made under, and a value that is no such token at all, are each refused. The two
+    /// names are compared like for like, as the issuer form a provider name carries
+    /// ([`login_provider_issuer`]).
+    ///
+    /// The ISSUER is decided first, and from the claim set alone
+    /// ([`::service_common::jwt::read_unsecured`], the reading that leaves the signature
+    /// judgement out): a value that says who issued it is answered for the issuer it names
+    /// whatever else is wrong with it. What is left — a value carrying no readable claim set,
+    /// or one nothing signed ([`::service_common::jwt::read`], the reading a service
+    /// presented ANOTHER party's token makes) — is no identity token. A claim set carrying
+    /// no `iss` at all is not refused for the issuer: there is none to compare, and what
+    /// such a token says is the issuing provider's to decide.
+    ///
+    /// The signature itself is never verified — that needs the issuer's published
+    /// verification key, which this emulator makes no outbound connection to fetch — so what
+    /// is decided here is decided from the presented value alone, and only ever to REFUSE
+    /// it.
+    fn refuse_presented_token(
+        &self,
+        provider_name: &str,
+        token: &str,
+    ) -> Option<LoginProviderRefusal> {
+        if !self.presents_identity_token(provider_name) {
+            return None;
+        }
+        let claimed_issuer = ::service_common::jwt::read_unsecured(token)
+            .ok()
+            .and_then(|read| read.claim_str(ISSUER_CLAIM).map(ToString::to_string));
+        if let Some(issuer) = claimed_issuer {
+            if login_provider_issuer(&issuer) != login_provider_issuer(provider_name) {
+                return Some(LoginProviderRefusal::IssuerMismatch);
+            }
+        }
+        ::service_common::jwt::read(token)
+            .err()
+            .map(|_| LoginProviderRefusal::NotAnIdentityToken)
     }
 }
 
@@ -417,11 +499,17 @@ impl PoolLoginTrust {
     }
 }
 
-/// Why a presented `Logins` entry authorizes nothing against the identity pool's trust for
-/// its issuer. Both are answered with the operation's modelled `NotAuthorizedException`
-/// (HTTP 403).
+/// Why a presented `Logins` entry authorizes nothing: what the token itself says, and what
+/// the identity pool's trust for its issuer says. Each is answered with the operation's
+/// modelled `NotAuthorizedException`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginProviderRefusal {
+    /// The value presented for a provider whose logins are OpenID Connect identity tokens
+    /// is not such a token at all.
+    NotAnIdentityToken,
+    /// It is one, and it was issued by another issuer than the provider name it is
+    /// presented under.
+    IssuerMismatch,
     /// The pool states no trust for the token's issuer.
     UnsupportedProvider,
     /// It states one, and the token names an audience that trust does not accept.
@@ -432,11 +520,18 @@ impl LoginProviderRefusal {
     /// The message the refusal carries.
     pub fn message(self) -> &'static str {
         match self {
+            Self::NotAnIdentityToken => INVALID_OPEN_ID_CONNECT_TOKEN_MESSAGE,
+            Self::IssuerMismatch => MISMATCHED_TOKEN_ISSUER_MESSAGE,
             Self::UnsupportedProvider => UNSUPPORTED_LOGIN_PROVIDER_MESSAGE,
             Self::IncorrectAudience => INCORRECT_TOKEN_AUDIENCE_MESSAGE,
         }
     }
 }
+
+/// The claim naming "the principal that issued the JWT" (RFC 7519 §4.1.1), which an OpenID
+/// Connect ID token carries the issuing provider's URL in — and which [`open_id_token`]
+/// writes this service's own issuer into.
+const ISSUER_CLAIM: &str = "iss";
 
 /// The claim naming who a token was issued FOR (RFC 7519 §4.1.3), which an OpenID Connect
 /// ID token carries the client id in — for a provider that issues tokens to an app client,
@@ -500,6 +595,51 @@ const OIDC_PROVIDER_ARN_RESOURCE_PREFIX: &str = "oidc-provider/";
 /// providers it is configured with.
 pub const INVALID_OPEN_ID_CONNECT_TOKEN_MESSAGE: &str =
     "Invalid login token. Not a valid OpenId Connect identity token.";
+
+/// How AWS words the refusal of an identity token whose `iss` claim names an issuer other
+/// than the provider name the `Logins` entry presents it under: the entry says who issued
+/// the token, and the token says so too, so a request whose two answers differ presents a
+/// token of someone else's.
+///
+/// Fixed text, for the same reason as [`INVALID_OPEN_ID_CONNECT_TOKEN_MESSAGE`]: it names
+/// neither the issuer the token claimed nor the provider it was presented under.
+pub const MISMATCHED_TOKEN_ISSUER_MESSAGE: &str =
+    "Invalid login token. Issuer doesn't match providerName";
+
+/// How AWS words the refusal of an UNAUTHENTICATED call — one presenting no login at all —
+/// to a pool whose `AllowUnauthenticatedIdentities` does not admit one: "identities from
+/// this identity pool and the associated IAM roles can only be used with authenticated
+/// identity providers" (`CreateIdentityPoolInput$AllowUnauthenticatedIdentities`, this
+/// service's model).
+///
+/// Fixed text with no request- or state-derived part, so it names neither the pool the call
+/// addressed nor the identity it was made for.
+pub const UNAUTHENTICATED_ACCESS_MESSAGE: &str =
+    "Unauthenticated access is not supported for this identity pool.";
+
+/// How AWS words the refusal of an unlink of an identity no login has ever been linked to —
+/// an UNAUTHENTICATED (guest) identity, which `GetId` mints for a call presenting no login
+/// at all. Such an identity is reached through its id alone and has no linked login to
+/// detach, so there is nothing this operation can take off it.
+pub const CANNOT_UNLINK_UNAUTHENTICATED_MESSAGE: &str = "Cannot unlink unauthenticated user.";
+
+/// How AWS words the refusal of a request that would link logins naming MORE THAN ONE
+/// account: a developer user identifier and a federated login that another identity has
+/// already been proven by cannot become one user by being presented together.
+///
+/// Fixed text, naming neither the logins presented nor the identities they resolve to: the
+/// caller is told that these logins cannot be linked, which is what it has to act on.
+pub const CANNOT_LINK_LOGINS_MESSAGE: &str = "Cannot link these logins.";
+
+/// How AWS words the refusal of a call that names an identity the caller has not proven it
+/// may act for: one already linked to a login, reached with no login of it at all.
+///
+/// The one part taken from the request is the `IdentityId` it named, which the caller sent
+/// itself, so the refusal discloses nothing the caller did not already hold. Shared, so
+/// every operation that decides access to an identity answers alike.
+pub fn forbidden_identity_message(identity_id: &str) -> String {
+    format!("Access to Identity '{identity_id}' is forbidden.")
+}
 
 /// How AWS words the refusal of a `Logins` map that names no PUBLIC provider at all — one
 /// carrying only the pool's own developer provider, or nothing. Public providers are what
@@ -849,6 +989,22 @@ impl IdentityPoolRoles {
         unresolved.unwrap_or(MappedRole::Unmapped)
     }
 
+    /// Whether this configuration holds a `RoleMappings` entry for the identity provider
+    /// `provider_name`.
+    ///
+    /// A mapping is keyed by the identity provider's own identifier, which for a provider
+    /// that issues its tokens to an APP CLIENT carries that client after the provider's name
+    /// (`<provider name>:<client id>`, [`mapping_key_names_provider`]), so a key naming this
+    /// provider for any of its clients is one of the provider's.
+    pub fn maps_provider(&self, provider_name: &str) -> bool {
+        self.role_mappings.iter().flatten().any(|(key, _)| {
+            key == provider_name
+                || key
+                    .strip_prefix(provider_name)
+                    .is_some_and(|rest| rest.starts_with(PROVIDER_CLIENT_SEPARATOR))
+        })
+    }
+
     /// Whether this configuration names `role_arn` — as one of the pool's two roles, or
     /// as the role a mapping rule resolves to. This is the set of roles the pool can vend
     /// credentials for, which is what a `CustomRoleArn` has to be drawn from.
@@ -886,6 +1042,38 @@ impl IdentityPoolRoles {
                 .any(|claimed| claimed == role_arn)
     }
 }
+
+/// Whether an exchange presenting `logins` against `pool`, configured with `roles`, may name
+/// a `CustomRoleArn` AT ALL — "Only SAML providers and providers with RoleMappings support
+/// custom role ARN", which is how the service words the refusal of one that may not.
+///
+/// The member substitutes one of the SEVERAL roles the identity provider's own answer
+/// offered ("the role to be assumed when multiple roles were received in the token from the
+/// identity provider", `GetCredentialsForIdentityInput$CustomRoleArn`), and two kinds of
+/// provider offer such a choice: a SAML provider, whose assertion carries the roles the user
+/// may assume ([`IdentityPool::names_saml_provider`]), and a provider the pool holds a
+/// `RoleMappings` entry for, which is what picks a role from the token's claims
+/// ([`IdentityPoolRoles::maps_provider`]). An exchange whose presented logins are of neither
+/// kind — a pool with no role mapping for the provider the login was made under, and an
+/// exchange presenting no login at all — had one role to assume and nothing to choose
+/// between, so naming another is a bad input parameter rather than a choice.
+pub fn custom_role_arn_is_supported(
+    pool: &IdentityPool,
+    roles: Option<&IdentityPoolRoles>,
+    logins: &HashMap<String, String>,
+) -> bool {
+    logins.keys().any(|provider| {
+        pool.names_saml_provider(provider)
+            || roles.is_some_and(|roles| roles.maps_provider(provider))
+    })
+}
+
+/// How AWS words the refusal of a `CustomRoleArn` an exchange may not name at all
+/// ([`custom_role_arn_is_supported`]). Fixed text: it states which providers support the
+/// member, naming neither the role the request asked for nor the providers the pool is
+/// configured with.
+pub const CUSTOM_ROLE_ARN_UNSUPPORTED_MESSAGE: &str =
+    "Only SAML providers and providers with RoleMappings support custom role ARN.";
 
 /// The roles the tokens `logins` presents received from the identity provider that issued
 /// them: the values of the two claims a Cognito identity-provider token carries roles in
@@ -1169,6 +1357,17 @@ impl Identity {
         }
         self.logins.clone()
     }
+
+    /// Whether a login has ever been linked to this identity: one it still carries, or one
+    /// an unlink or a merge has since taken off it (which is what leaves it DISABLED).
+    ///
+    /// Such an identity is a FEDERATED user's, so what authorizes a call naming it is a
+    /// login of it. An identity this is false for is an UNAUTHENTICATED (guest) one — the
+    /// identity `GetId` mints for a call presenting no login at all — which no login reaches
+    /// and whose id is the whole of what names it.
+    pub fn has_been_linked(&self) -> bool {
+        self.disabled || !self.logins.is_empty()
+    }
 }
 
 /// The one element the `Logins` list of a DISABLED identity carries: a fixed sentinel,
@@ -1188,6 +1387,27 @@ pub const DISABLED_LOGIN_PROJECTION: &str = "DISABLED";
 /// states what it has to send and nothing about the identity or what the pool holds for it.
 pub const UNMATCHED_LOGINS_MESSAGE: &str = "Logins don't match. Please include at least one \
                                             valid login for this identity or identity pool.";
+
+/// Why a call naming an identity is not one its caller has proven it may make
+/// ([`ComAmazonawsCognitoidentityAwscognitoidentityserviceState::refuse_identity_access`]).
+/// Each is answered with the modelled `NotAuthorizedException`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityAccessRefusal {
+    /// The call presented no login at all for an identity a login has been linked to.
+    NoLoginPresented,
+    /// It presented logins, and none of them is one of that identity's.
+    LoginsDontMatch,
+}
+
+impl IdentityAccessRefusal {
+    /// The message the refusal carries for a call that named `identity_id`.
+    pub fn message(self, identity_id: &str) -> String {
+        match self {
+            Self::NoLoginPresented => forbidden_identity_message(identity_id),
+            Self::LoginsDontMatch => UNMATCHED_LOGINS_MESSAGE.to_string(),
+        }
+    }
+}
 
 /// The most OpenID Connect tokens this emulator holds outstanding at once. Not an AWS
 /// quota: THIS emulator's own ceiling on a store that grows by one record per successful
@@ -1703,11 +1923,43 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         }
     }
 
-    /// Whether `logins` presents at least one login OF `identity_id`: a `(provider, login)`
-    /// this pool has indexed against that identity, or a token this service minted naming it
-    /// ([`Self::resolve_login_token`], the entry made under this service's own provider
-    /// name). A login of any other kind names some other identity, or none at all, so it is
-    /// not one of this identity's.
+    /// Every identity a presented `Logins` map PROVES, each once, in the provider-name order
+    /// the entries are considered in.
+    ///
+    /// A login proves the identity it names: a `(provider, login)` this pool has indexed
+    /// against one ([`Self::linked_identity`]), and — for the entry made under this service's
+    /// own provider name — the identity the token it carries was minted FOR, while that
+    /// token's window is still open ([`Self::resolve_login_token`]). A login of any other
+    /// kind names some identity of the provider that issued it and none of this pool's, so it
+    /// proves nothing here.
+    pub fn identities_proven_by(
+        &self,
+        identity_pool_id: &str,
+        logins: &HashMap<String, String>,
+        now: SystemTime,
+    ) -> Vec<String> {
+        let mut presented: Vec<(&String, &String)> = logins.iter().collect();
+        presented.sort();
+        let mut proven: Vec<String> = Vec::new();
+        for (provider, login) in presented {
+            let named = if provider.as_str() == COGNITO_IDENTITY_LOGIN_PROVIDER {
+                self.resolve_login_token(login, now)
+                    .ok()
+                    .map(|issued| issued.identity_id.clone())
+            } else {
+                self.linked_identity(identity_pool_id, provider, login)
+                    .cloned()
+            };
+            if let Some(named) = named.filter(|named| !proven.contains(named)) {
+                proven.push(named);
+            }
+        }
+        proven
+    }
+
+    /// Whether `logins` presents at least one login OF `identity_id`: one of the identities
+    /// the map proves ([`Self::identities_proven_by`]) is that identity. A login of any other
+    /// kind names some other identity, or none at all, so it is not one of this identity's.
     pub fn logins_name_identity(
         &self,
         identity_pool_id: &str,
@@ -1715,15 +1967,39 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         logins: &HashMap<String, String>,
         now: SystemTime,
     ) -> bool {
-        logins.iter().any(|(provider, login)| {
-            if provider.as_str() == COGNITO_IDENTITY_LOGIN_PROVIDER {
-                self.resolve_login_token(login, now)
-                    .is_ok_and(|issued| issued.identity_id == identity_id)
-            } else {
-                self.linked_identity(identity_pool_id, provider, login)
-                    .is_some_and(|linked| linked == identity_id)
-            }
-        })
+        self.identities_proven_by(identity_pool_id, logins, now)
+            .iter()
+            .any(|proven| proven == identity_id)
+    }
+
+    /// Why a call naming `identity` is not one its caller has proven it may make, if so.
+    ///
+    /// An identity a login has ever been linked to ([`Identity::has_been_linked`]) is a
+    /// federated user's, and what authorizes a call for it is a login OF it
+    /// ([`Self::logins_name_identity`]): a call presenting none at all has proven nothing
+    /// about who it is for, and one presenting logins none of which is that identity's has
+    /// proven only that it holds some OTHER user's login. An UNAUTHENTICATED (guest)
+    /// identity has no login to present, so its id alone is what names it and no call for it
+    /// is refused here.
+    pub fn refuse_identity_access(
+        &self,
+        identity: &Identity,
+        logins: &HashMap<String, String>,
+        now: SystemTime,
+    ) -> Option<IdentityAccessRefusal> {
+        if !identity.has_been_linked() {
+            return None;
+        }
+        if logins.is_empty() {
+            return Some(IdentityAccessRefusal::NoLoginPresented);
+        }
+        (!self.logins_name_identity(
+            &identity.identity_pool_id,
+            &identity.identity_id,
+            logins,
+            now,
+        ))
+        .then_some(IdentityAccessRefusal::LoginsDontMatch)
     }
 
     /// The authentication methods an exchange presenting `logins` is made under: the values
@@ -2119,10 +2395,6 @@ fn minted_token_claims(token: &str) -> Option<::serde_json::Map<String, ::serde_
     let read = ::service_common::jwt::read_unsecured(token).ok()?;
     (read.claim_str(ISSUER_CLAIM) == Some(OIDC_TOKEN_ISSUER)).then_some(read.claims)
 }
-
-/// The claim naming who issued a token (RFC 7519 §4.1.1), which [`open_id_token`] writes
-/// this service's own issuer into.
-const ISSUER_CLAIM: &str = "iss";
 
 /// The claim naming the instant a token's validity window closes (RFC 7519 §4.1.4).
 const EXPIRATION_CLAIM: &str = "exp";

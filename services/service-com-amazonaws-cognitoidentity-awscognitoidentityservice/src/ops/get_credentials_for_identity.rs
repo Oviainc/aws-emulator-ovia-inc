@@ -296,48 +296,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                 .into());
             };
             let identity_pool_id = identity.identity_pool_id.clone();
-            let identity_is_disabled = identity.is_disabled();
+            let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
+                return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
+                    },
+                )
+                .into());
+            };
+            let pool_admits_unauthenticated = pool.allow_unauthenticated_identities;
 
             // "Any provided logins will be validated against supported login providers"
             // (this operation's own doc): a `Logins` entry carries its issuer in the
             // provider name, so the stored trust the identity's OWN pool states for that
             // issuer decides it — a `CognitoIdentityProviders` entry, or an
             // `OpenIdConnectProviderARNs` entry that still resolves to an IAM OIDC
-            // provider — together with the audience that trust accepts.
+            // provider — together with the audience that trust accepts, and the token the
+            // entry presents is decided before either.
             let logins = input.logins.clone().unwrap_or_default();
             if !logins.is_empty() {
-                // An identity an unlink left linked to NO provider can no longer be reached
-                // through a login of a provider: nothing resolves to it there. What can
-                // still name it is a token THIS service minted for it, which IS a login of
-                // that identity — so a vend presenting one is served, and one presenting
-                // nothing of this identity's is refused. A vend presenting no login at all
-                // asks nothing of a login: it is the unauthenticated exchange, which the
-                // identity's id is all of.
-                if identity_is_disabled
-                    && !store.logins_name_identity(
-                        &identity_pool_id,
-                        &input.identity_id,
-                        &logins,
-                        now,
-                    )
-                {
-                    return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
-                        NotAuthorizedException {
-                            message: Some(crate::state::UNMATCHED_LOGINS_MESSAGE.to_string()),
-                        },
-                    )
-                    .into());
-                }
-
-                let Some(pool) = store.identity_pools.get(&identity_pool_id) else {
-                    return Err(GetCredentialsForIdentityErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
-                        },
-                    )
-                    .into());
-                };
-                if let Some(refusal) = pool.login_trust(&registered).refuse(&logins) {
+                if let Some(refusal) = pool.refuse_logins(&registered, &logins) {
                     return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
                         NotAuthorizedException {
                             message: Some(refusal.message().to_string()),
@@ -370,6 +348,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                     .into());
                 }
             }
+
+            // An identity a login has been linked to is a federated user's, and the
+            // credentials this operation vends are that user's: what authorizes the vend is
+            // therefore a LOGIN of the identity it names — one the pool resolves to it, or a
+            // token this service minted for it, which is what still reaches an identity an
+            // unlink or a merge left linked to no provider. A vend presenting none at all,
+            // and one presenting only some other user's login, have authorized the vend for
+            // that identity in no way: the first is refused access to the identity it named,
+            // the second the login mismatch it is, and both before any role is resolved.
+            //
+            // A vend presenting no login at all IS the unauthenticated exchange, and only a
+            // pool whose `AllowUnauthenticatedIdentities` admits one serves it — "identities
+            // from this identity pool and the associated IAM roles can only be used with
+            // authenticated identity providers" otherwise
+            // (`CreateIdentityPoolInput$AllowUnauthenticatedIdentities`, this service's
+            // model) — so for a pool that does not, no identity of it is reached that way,
+            // and the refusal says so in the words that case has rather than in the words of
+            // an identity the caller may not use.
+            if let Some(refusal) = store.refuse_identity_access(identity, &logins, now) {
+                return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
+                    NotAuthorizedException {
+                        message: Some(refusal.message(&input.identity_id)),
+                    },
+                )
+                .into());
+            }
+            if logins.is_empty() && !pool_admits_unauthenticated {
+                return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
+                    NotAuthorizedException {
+                        message: Some(crate::state::UNAUTHENTICATED_ACCESS_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
             let providers: Vec<String> = logins.keys().cloned().collect();
             // The methods the exchange is made under, which is what the trust-policy
             // decision below publishes: a token this service minted carries the providers
@@ -393,6 +405,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
             // refused with `NotAuthorizedException` rather than falling back to a role the
             // mapping refused.
             let configured = store.identity_pool_roles.get(&identity_pool_id);
+            // Naming a `CustomRoleArn` at all is something only an exchange whose identity
+            // provider offered SEVERAL roles may do — "Only SAML providers and providers
+            // with RoleMappings support custom role ARN"
+            // ([`crate::state::custom_role_arn_is_supported`]) — so an exchange of any other
+            // provider is refused the bad parameter it sent, before the roles that exchange
+            // could have resolved are considered at all.
+            if input.custom_role_arn.is_some()
+                && !crate::state::custom_role_arn_is_supported(pool, configured, &logins)
+            {
+                return Err(GetCredentialsForIdentityErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::CUSTOM_ROLE_ARN_UNSUPPORTED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
             let role_arn = match &input.custom_role_arn {
                 Some(custom_role_arn) => configured
                     .filter(|configured| {

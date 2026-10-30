@@ -373,7 +373,7 @@ async fn every_failure_names_its_exception_shape_in_the_error_type_header() {
             operation: "GetId",
             request: json!({ "IdentityPoolId": closed_pool_id }),
             shape: "NotAuthorizedException",
-            status: Some(403),
+            status: Some(CLIENT_ERROR_STATUS),
         },
         Refusal {
             case: "a resource that is not there",

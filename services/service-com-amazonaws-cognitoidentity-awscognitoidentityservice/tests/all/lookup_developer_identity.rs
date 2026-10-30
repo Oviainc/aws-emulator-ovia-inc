@@ -320,9 +320,10 @@ async fn an_identity_answers_every_identifier_linked_to_it_one_page_at_a_time() 
 
 /// RULE: a request the mapping cannot answer is refused with the modelled error for what
 /// is wrong with it — a pair the store does not link is a conflict, a resource this service
-/// does not hold is not found, an identifier the pool holds no mapping for, an identity
-/// of another pool and an identity every login has been taken off are forbidden, and an
-/// input the operation cannot act on is a bad parameter.
+/// does not hold is not found, an identifier the pool holds no mapping for, an IDENTITY the
+/// pool has registered no identifier against, an identity of another pool and an identity
+/// every login has been taken off are forbidden, and an input the operation cannot act on is
+/// a bad parameter.
 #[tokio::test]
 async fn a_request_the_mapping_cannot_answer_is_refused() {
     let emulator = Emulator::new();
@@ -389,43 +390,49 @@ async fn a_request_the_mapping_cannot_answer_is_refused() {
         (
             "an identifier that is not registered",
             lookup_request(&pool_id, None, Some("never-registered"), None, None),
-            403,
+            400,
+            "NotAuthorizedException",
+        ),
+        (
+            "an identity the pool has registered no developer identifier against",
+            lookup_request(&pool_id, Some(&bare), None, None, None),
+            400,
             "NotAuthorizedException",
         ),
         (
             "an identifier of a pool that names no developer provider",
             lookup_request(&no_developer_provider, None, Some("user-1"), None, None),
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
             "an identity of ANOTHER pool",
             lookup_request(&pool_id, Some(&foreign), None, None, None),
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
             "an identity an unlink left linked to no login provider",
             lookup_request(&pool_id, Some(&disabled), None, None, None),
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
             "an identity an unlink disabled, named beside an identifier of another user",
             lookup_request(&pool_id, Some(&disabled), Some("user-1"), None, None),
-            409,
+            400,
             "ResourceConflictException",
         ),
         (
             "a pair the store does not link",
             lookup_request(&pool_id, Some(&bare), Some("user-1"), None, None),
-            409,
+            400,
             "ResourceConflictException",
         ),
         (
             "a pair whose identifier is not registered at all",
             lookup_request(&pool_id, Some(&registered), Some("never-registered"), None, None),
-            409,
+            400,
             "ResourceConflictException",
         ),
         (
@@ -484,18 +491,19 @@ async fn a_request_the_mapping_cannot_answer_is_refused() {
         );
     }
 
-    // An identity of a pool that holds no mapping for it is not a refusal: it simply has
-    // no developer user identifier.
-    let empty = emulator
-        .ok(
-            OPERATION,
-            &lookup_request(&pool_id, Some(&bare), None, None, None),
-        )
+    // That refusal wrote nothing either: the identity the pool holds no mapping for is
+    // still stored, exactly as it was.
+    let listed = emulator
+        .ok("ListIdentities", &json!({"IdentityPoolId": &pool_id, "MaxResults": 60}))
         .await;
-    assert_eq!(
-        listed_identifiers("an identity with no developer identifier", &empty),
-        Vec::<String>::new(),
-        "an identity with no developer identifier answers an empty list, got {empty}"
+    let holds_bare = listed["Identities"]
+        .as_array()
+        .expect("ListIdentities returns Identities")
+        .iter()
+        .any(|identity| identity["IdentityId"] == json!(bare));
+    assert!(
+        holds_bare,
+        "the refused lookup left the identity it named stored, got {listed}"
     );
 }
 
@@ -548,7 +556,7 @@ async fn a_lookup_changes_nothing_a_later_caller_sees() {
         )
         .await;
     assert_eq!(
-        status, 403,
+        status, 400,
         "a lookup of an unregistered identifier is refused, got {status}"
     );
 

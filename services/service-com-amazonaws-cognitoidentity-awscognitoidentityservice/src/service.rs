@@ -77,6 +77,11 @@
 
 pub mod error_type_header;
 
+/// The table of the status rule [`crate::scaffolded::wire_status`] states — test-only, the
+/// rule itself living beside the error channel it renders.
+#[cfg(test)]
+mod modeled_error_status;
+
 use error_type_header::{ErrorTypeHeaderDefinition, ErrorTypeHeaderOperation};
 use service_common::query_error_envelope::{RequestIdEnvelopeDefinition, RequestIdHeaderOperation};
 use smithy_server_runtime::{

@@ -306,9 +306,9 @@ async fn a_merge_leaves_the_merged_away_identity_stored_as_a_disabled_one() {
             )
             .await;
         assert_eq!(
-            status, 403,
+            status, 400,
             "case {case:?}: expected the lookup of the merged-away {merged_away} to be refused \
-             with HTTP 403, got {status} with {body}"
+             with HTTP 400, got {status} with {body}"
         );
         let code = error_code(&body);
         assert!(

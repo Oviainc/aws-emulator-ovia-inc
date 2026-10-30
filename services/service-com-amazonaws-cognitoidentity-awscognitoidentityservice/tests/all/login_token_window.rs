@@ -8,7 +8,7 @@
 //! request naming none) — so presenting it to `GetCredentialsForIdentity` under this
 //! service's own provider name buys a credential only INSIDE that window: once the clock
 //! has closed it the exchange is refused with the modelled `NotAuthorizedException`
-//! (HTTP 403) and no credential, and a token this service cannot resolve at all buys
+//! (HTTP 400) and no credential, and a token this service cannot resolve at all buys
 //! nothing either. The refusal is answered before any role is resolved and before any
 //! session is minted or handed back, so a session the identity already holds does not
 //! outlive the token it was vended for.
@@ -155,8 +155,8 @@ fn assert_served_credentials(case: &str, identity_id: &str, body: &Value) {
 /// Assert that `body` is the refusal `message` words, with no credential in it.
 fn assert_refused(case: &str, status: u16, body: &Value, message: &str) {
     assert_eq!(
-        status, 403,
-        "case {case:?}: expected the HTTP 403 of a refused exchange, got {status} with {body}"
+        status, 400,
+        "case {case:?}: expected the HTTP 400 of a refused exchange, got {status} with {body}"
     );
     let code = error_code(body);
     assert!(

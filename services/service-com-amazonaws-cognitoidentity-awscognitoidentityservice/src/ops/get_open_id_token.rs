@@ -269,22 +269,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
         };
         let identity_pool_id = identity.identity_pool_id.clone();
 
-        // An identity an unlink left linked to NO provider can no longer be reached through a
-        // login of a provider: nothing resolves to it there. What can still name it is a
-        // token THIS service minted for it, which IS a login of that identity. A call
-        // presenting no login at all asks nothing of a login, so it is not this refusal's.
-        if identity.is_disabled()
-            && !logins.is_empty()
-            && !store.logins_name_identity(&identity_pool_id, &input.identity_id, &logins, now)
-        {
-            return Err(GetOpenIdTokenErrorModeled::NotAuthorizedException(
-                NotAuthorizedException {
-                    message: Some(crate::state::UNMATCHED_LOGINS_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
-
         // A `Logins` entry is decided by the pool the identity belongs to, exactly as it is
         // wherever else this service is handed one: the entry carries its issuer in the
         // provider name, so the trust that pool states for the issuer — and the audience
@@ -313,10 +297,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
             )
             .into());
         }
-        if let Some(refusal) = pool.login_trust(&registered).refuse(&logins) {
+        if let Some(refusal) = pool.refuse_logins(&registered, &logins) {
             return Err(GetOpenIdTokenErrorModeled::NotAuthorizedException(
                 NotAuthorizedException {
                     message: Some(refusal.message().to_string()),
+                },
+            )
+            .into());
+        }
+
+        // An identity is reached by a LOGIN OF IT: the logins this call presents are
+        // "additional logins for the identity" it already names, so one of them has to be a
+        // login of that identity — one the pool has indexed against it, or a token THIS
+        // service minted for it, which is what still reaches an identity an unlink left
+        // linked to no provider. A call presenting only logins of some other user, or logins
+        // of no user of this pool at all, has proven nothing about the identity it named. A
+        // call presenting no login at all asks nothing of a login and is not this refusal's.
+        if !logins.is_empty()
+            && !store.logins_name_identity(&identity_pool_id, &input.identity_id, &logins, now)
+        {
+            return Err(GetOpenIdTokenErrorModeled::NotAuthorizedException(
+                NotAuthorizedException {
+                    message: Some(crate::state::UNMATCHED_LOGINS_MESSAGE.to_string()),
                 },
             )
             .into());

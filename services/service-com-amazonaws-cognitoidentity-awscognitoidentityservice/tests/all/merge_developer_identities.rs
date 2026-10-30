@@ -19,10 +19,11 @@
 //!   it and writes nothing: a pool this service does not hold is the modelled
 //!   `ResourceNotFoundException`, a developer user
 //!   identifier the pool has not registered (or a developer provider that is not the pool's)
-//!   is a 403, two users reached through one public provider are a 409, a pair whose linked
-//!   logins together pass the service's documented limit is a 400 `InvalidParameterException`,
+//!   is a `NotAuthorizedException`, two users reached through one public provider are a
+//!   `ResourceConflictException`, a pair whose linked
+//!   logins together pass the service's documented limit is an `InvalidParameterException`,
 //!   and a value outside a constraint the MODEL states is refused ahead of the operation with
-//!   a 400 `ValidationException`.
+//!   a `ValidationException` — every one of them HTTP 400.
 //!
 //! The harness is `identity_pool_flow`'s: one shared engine behind the same
 //! `MultiServiceRouter` the production router builds.
@@ -534,25 +535,25 @@ async fn a_merge_the_pool_cannot_act_on_is_refused_and_writes_nothing() {
         (
             "a developer provider name that is not this pool's",
             Broken::OtherDeveloperProvider,
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
             "a source identifier that was never registered",
             Broken::AbsentSourceIdentifier,
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
             "a destination identifier that was never registered",
             Broken::AbsentDestinationIdentifier,
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
             "two users reached through one public provider",
             Broken::SharedPublicProvider,
-            409,
+            400,
             "ResourceConflictException",
         ),
         (
@@ -720,7 +721,7 @@ async fn a_merge_the_pool_cannot_act_on_is_refused_and_writes_nothing() {
             error_code(&body).contains(expected_code),
             "case {case:?}: expected {expected_code}, got {body}"
         );
-        if *expected_status == 403 {
+        if *expected_code == "NotAuthorizedException" {
             assert_eq!(
                 error_message(case, &body),
                 NO_ACCESS_MESSAGE,

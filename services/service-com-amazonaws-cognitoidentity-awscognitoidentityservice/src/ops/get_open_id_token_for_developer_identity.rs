@@ -8,10 +8,19 @@
 //! was created with) and, as its value, the developer user identifier the backend
 //! authenticated. That pair is one login of the pool, held in the same login index
 //! `GetId` keys a federated login by, so the operation is idempotent per developer user
-//! identifier: the identifier already linked to an identity resolves to that identity, a
-//! fresh one mints a new identity in the pool, and an identifier linked to an identity
-//! OTHER than the one the request names is refused with the modelled
-//! `DeveloperUserAlreadyRegisteredException`.
+//! identifier: the identifier already linked to an identity resolves to that identity, and
+//! a fresh one mints a new identity in the pool.
+//!
+//! The logins one call presents name ONE account, and the call links every one of them to
+//! it. So a presented login the pool has already PROVEN for another identity is no login of
+//! this account: where the request NAMES an identity, it has presented a login that is not
+//! that identity's and is refused as the authorization failure that is — before what the
+//! pool holds for that login is reported, so the refusal names no other identity — and
+//! where the identity is resolved from the logins themselves, logins proving different
+//! accounts cannot be linked. An identity an identity PROVIDER's login already proves is
+//! that provider's user, into which a developer user is not joined either; an
+//! unauthenticated (guest) identity and an identity of the same backend's other developer
+//! user identifiers are what the `IdentityId` member links a new one to.
 //!
 //! The token is minted from the stored identity (see [`crate::state::open_id_token`]) and
 //! recorded in `open_id_tokens`, so the service can later say which identity a token it
@@ -348,12 +357,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // "When you want to associate a new login with an existing authenticated/
         // unauthenticated identity, you can do so by providing the existing IdentityId" —
         // an identity of THIS pool, since an identity never moves between pools.
+        let mut named_identity_is_idp_proven = false;
         if let Some(identity_id) = &input.identity_id {
-            let belongs_to_pool = store
+            let Some(identity) = store
                 .identities
                 .get(identity_id)
-                .is_some_and(|identity| identity.identity_pool_id == input.identity_pool_id);
-            if !belongs_to_pool {
+                .filter(|identity| identity.identity_pool_id == input.identity_pool_id)
+            else {
                 return Err(
                     GetOpenIdTokenForDeveloperIdentityErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
@@ -365,7 +375,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                     )
                     .into(),
                 );
-            }
+            };
+            // Whether the identity the request names is one an IDENTITY PROVIDER's login
+            // already proves: a provider it is linked to that is not the pool's own
+            // developer provider is a provider whose own user it is.
+            named_identity_is_idp_proven = identity
+                .logins
+                .iter()
+                .any(|provider| *provider != developer_provider);
         }
 
         let registered_to = store
@@ -378,59 +395,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
 
         // The identity this call is about: the one the request names, else the one the
         // developer user identifier is already registered under (which is what makes the
-        // operation idempotent per identifier), else the one another presented login
-        // already resolves to, else none yet — a new identity.
+        // operation idempotent per identifier), else none yet — a new identity.
         let resolved = input
             .identity_id
             .clone()
-            .or_else(|| registered_to.clone())
-            .or_else(|| {
-                presented.iter().find_map(|(provider, login)| {
-                    store
-                        .linked_identity(&input.identity_pool_id, provider, login)
-                        .cloned()
-                })
-            });
+            .or_else(|| registered_to.clone());
 
-        // "The provided developer user identifier is already registered with Cognito under
-        // a different identity ID" is exactly this: the identifier is held by an identity
-        // other than the one this call is about.
-        if let (Some(resolved), Some(registered_to)) = (&resolved, &registered_to) {
-            if resolved != registered_to {
+        // Every login the call presents belongs to the ONE account this call is about, and
+        // the call links every one of them to it. Two things break that, and the pool's own
+        // index is what says so ([`identities_proven_by`]: the logins it has indexed against
+        // an identity, the developer user identifiers registered to one, and the identity a
+        // token this service minted was minted for):
+        //
+        // * a presented login the pool has already PROVEN for another identity is no login
+        //   of this account;
+        // * the identity the request NAMES is one an identity PROVIDER's login already
+        //   proves, and the developer user identifier presented is not one already
+        //   registered against it — so linking it would join a developer user to an account
+        //   that is already that provider's user. An UNAUTHENTICATED (guest) identity no
+        //   login proves is the case the member exists for, another developer user
+        //   identifier of a developer identity is one more login of the same backend's user,
+        //   and a developer login the pool has already registered against the named identity
+        //   is that identity's own, so none of those is refused here.
+        let proven = store.identities_proven_by(&input.identity_pool_id, &input.logins, now);
+        let proves_another_account = proven
+            .iter()
+            .any(|named| Some(named) != resolved.as_ref());
+        let would_join_a_proven_identity = input.identity_id.as_deref().is_some_and(|named| {
+            named_identity_is_idp_proven && registered_to.as_deref() != Some(named)
+        });
+        if proves_another_account || would_join_a_proven_identity {
+            // A request that names an `IdentityId` and presents a developer user identifier
+            // the pool has registered against ANOTHER identity presented a login that is
+            // not one of that identity's, which is the authorization failure the
+            // unmatched-logins refusal states — and it is decided before what the pool holds
+            // for that identifier is reported, so such a caller is never told which other
+            // identity holds it. Every other case is logins that cannot be linked into one
+            // account, which is what the modelled `ResourceConflictException` states ("a
+            // user tries to use a login which is already linked to another account").
+            if input.identity_id.is_some() && registered_to.is_some() {
                 return Err(
-                    GetOpenIdTokenForDeveloperIdentityErrorModeled::DeveloperUserAlreadyRegisteredException(
-                        DeveloperUserAlreadyRegisteredException {
-                            message: Some(format!(
-                                "The developer user identifier '{developer_user_identifier}' is \
-                                 already registered under identity '{registered_to}'."
-                            )),
+                    GetOpenIdTokenForDeveloperIdentityErrorModeled::NotAuthorizedException(
+                        NotAuthorizedException {
+                            message: Some(crate::state::UNMATCHED_LOGINS_MESSAGE.to_string()),
                         },
                     )
                     .into(),
                 );
             }
-        }
-
-        // Logins presented together name ONE account, so a login already linked to a
-        // different identity cannot be part of it — "a user tries to use a login which is
-        // already linked to another account".
-        if let Some(resolved) = &resolved {
-            for (provider, login) in &presented {
-                let linked = store.linked_identity(&input.identity_pool_id, provider, login);
-                if let Some(linked) = linked.filter(|linked| *linked != resolved) {
-                    return Err(
-                        GetOpenIdTokenForDeveloperIdentityErrorModeled::ResourceConflictException(
-                            ResourceConflictException {
-                                message: Some(format!(
-                                    "The login for provider '{provider}' is already linked to \
-                                     identity '{linked}'."
-                                )),
-                            },
-                        )
-                        .into(),
-                    );
-                }
-            }
+            return Err(
+                GetOpenIdTokenForDeveloperIdentityErrorModeled::ResourceConflictException(
+                    ResourceConflictException {
+                        message: Some(crate::state::CANNOT_LINK_LOGINS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
         }
 
         // The stores this call grows carry THIS emulator's own ceilings (`crate::state`),

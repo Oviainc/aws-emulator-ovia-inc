@@ -11,7 +11,7 @@
 //!   configuration states a trust for the entry's issuer — a `CognitoIdentityProviders`
 //!   entry naming it, or an `OpenIdConnectProviderARNs` entry, whose ARN names the issuer
 //!   and whose IAM registration holds the client ids ("audiences") that trust accepts —
-//!   and refuses it `NotAuthorizedException` (HTTP 403) when the presented token names an
+//!   and refuses it `NotAuthorizedException` (HTTP 400) when the presented token names an
 //!   audience that trust does not accept. A trust whose accepted audiences this emulator
 //!   cannot know constrains none: another account's provider ARN, and a user pool named by
 //!   `CognitoIdentityProviders`, whose own token validation is not this rule. An issuer the
@@ -287,6 +287,10 @@ const NOT_AUTHORIZED: &str = "NotAuthorizedException";
 const UNSUPPORTED_PROVIDER_MESSAGE: &str =
     "Token is not from a supported provider of this identity pool.";
 const INCORRECT_AUDIENCE_MESSAGE: &str = "Invalid login token. Incorrect token audience.";
+/// The sentence a refusal of a value that is no identity token at all carries, pinned here
+/// for the same reason.
+const NOT_AN_IDENTITY_TOKEN_MESSAGE: &str =
+    "Invalid login token. Not a valid OpenId Connect identity token.";
 
 /// Present `logins` to `GetId` and assert the pool admits it, then exchange the identity it
 /// answers for credentials with the same logins and assert the vend is served. Answers the
@@ -345,7 +349,7 @@ async fn admitted(emulator: &Emulator, case: &str, pool_id: &str, logins: &Value
 }
 
 /// Present `logins` to `GetId` and to `GetCredentialsForIdentity` for `identity_id`, and
-/// assert both are refused 403 `NotAuthorizedException` with `message`.
+/// assert both are refused 400 `NotAuthorizedException` with `message`.
 async fn refused(
     emulator: &Emulator,
     case: &str,
@@ -367,8 +371,8 @@ async fn refused(
         let (status, payload) = emulator.call(operation, &body).await;
         assert_eq!(
             (status, error_code(&payload).as_str()),
-            (403, NOT_AUTHORIZED),
-            "case {case:?} on {operation}: expected (403, {NOT_AUTHORIZED}), got ({status}, \
+            (400, NOT_AUTHORIZED),
+            "case {case:?} on {operation}: expected (400, {NOT_AUTHORIZED}), got ({status}, \
              {payload})"
         );
         assert_eq!(
@@ -513,7 +517,7 @@ async fn a_login_is_admitted_by_the_pools_trust_for_its_issuer_and_the_audience_
             refusal: Some(UNSUPPORTED_PROVIDER_MESSAGE),
         },
         Row {
-            case: "a trusted issuer, presenting a value that names no audience at all",
+            case: "a trusted issuer, presenting an identity token that names no audience",
             issuer: federated_pool.clone(),
             audience: None,
             refusal: None,
@@ -523,9 +527,9 @@ async fn a_login_is_admitted_by_the_pools_trust_for_its_issuer_and_the_audience_
     for row in &rows {
         let token = match &row.audience {
             Some(audience) => id_token(&row.issuer, audience.clone()),
-            // Whether a token this emulator cannot read is a valid one is the ISSUER's
-            // judgement, which it does not reach, so the pool's trust alone admits it.
-            None => "an-opaque-provider-token".to_string(),
+            // An identity token carrying no `aud` claim names no audience to decide it on,
+            // so the pool's trust for its issuer alone admits it.
+            None => id_token(&row.issuer, Value::Null),
         };
         let logins = json!({ row.issuer.as_str(): token });
         match row.refusal {
@@ -545,6 +549,19 @@ async fn a_login_is_admitted_by_the_pools_trust_for_its_issuer_and_the_audience_
             }
         }
     }
+
+    // The ISSUER of these logins issues identity tokens, so a value that is no such token
+    // at all is refused on the token itself, before the pool's trust for its issuer is
+    // consulted — whatever that trust accepts.
+    refused(
+        &emulator,
+        "a trusted issuer, presenting a value that is no identity token",
+        &pool_id,
+        &identity_id,
+        &json!({ federated_pool.as_str(): "an-opaque-provider-token" }),
+        NOT_AN_IDENTITY_TOKEN_MESSAGE,
+    )
+    .await;
 }
 
 /// RULE, as the IAM registration changes under a live pool: what the pool's provider ARN
@@ -764,8 +781,8 @@ async fn the_audience_refusal_answers_get_open_id_token_and_unlink_identity_alik
         let (status, payload) = emulator.call(operation, body).await;
         assert_eq!(
             (status, error_code(&payload).as_str()),
-            (403, NOT_AUTHORIZED),
-            "case {operation}: expected (403, {NOT_AUTHORIZED}), got ({status}, {payload})"
+            (400, NOT_AUTHORIZED),
+            "case {operation}: expected (400, {NOT_AUTHORIZED}), got ({status}, {payload})"
         );
         assert_eq!(
             payload["message"].as_str(),

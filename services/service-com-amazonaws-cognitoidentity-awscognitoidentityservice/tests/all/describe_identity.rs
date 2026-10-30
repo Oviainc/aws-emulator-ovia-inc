@@ -78,9 +78,11 @@ async fn a_describe_reports_the_stored_identity_and_changes_nothing() {
     let pool_id = pool(&emulator, "described-identities").await;
 
     // One row: the case, the logins `GetId` presented (none for an unauthenticated
-    // identity) and the provider a later `GetOpenIdToken` links to it on top (`None` for a
-    // row that links nothing more).
-    type Row<'a> = (&'a str, Vec<(&'a str, &'a str)>, Option<(&'a str, &'a str)>);
+    // identity) and the logins a later `GetOpenIdToken` presents to link another provider
+    // on top (`None` for a row that links nothing more). The implicit link is authorized by
+    // a login of the identity itself, so such a row presents the login it was minted with
+    // beside the one it adds.
+    type Row<'a> = (&'a str, Vec<(&'a str, &'a str)>, Option<Vec<(&'a str, &'a str)>>);
     let rows: Vec<Row<'_>> = vec![
         ("an unauthenticated identity", vec![], None),
         (
@@ -99,7 +101,10 @@ async fn a_describe_reports_the_stored_identity_and_changes_nothing() {
         (
             "an identity that gained a provider through the implicit link",
             vec![(FIRST_PROVIDER, "facebook-user-3")],
-            Some((SECOND_PROVIDER, "amazon-user-3")),
+            Some(vec![
+                (FIRST_PROVIDER, "facebook-user-3"),
+                (SECOND_PROVIDER, "amazon-user-3"),
+            ]),
         ),
     ];
 
@@ -156,13 +161,19 @@ async fn a_describe_reports_the_stored_identity_and_changes_nothing() {
         // Linking another provider IS a change to the identity, and the describe reports
         // it: the new provider is listed and the last-modified instant has moved, while the
         // creation instant has not.
-        if let Some((provider, login)) = linked_later {
+        if let Some(presented_later) = linked_later {
+            let logins_map: Value = Value::Object(
+                presented_later
+                    .iter()
+                    .map(|(provider, login)| ((*provider).to_string(), json!(login)))
+                    .collect(),
+            );
             emulator
                 .ok(
                     "GetOpenIdToken",
                     &json!({
                         "IdentityId": &identity_id,
-                        "Logins": {provider: login},
+                        "Logins": logins_map,
                     }),
                 )
                 .await;
@@ -178,8 +189,10 @@ async fn a_describe_reports_the_stored_identity_and_changes_nothing() {
                 .map(|value| value.as_str().unwrap_or_default().to_string())
                 .collect();
             assert!(
-                linked.contains(&provider.to_string()),
-                "case {case:?}: expected the linked provider {provider:?} to be reported, got \
+                presented_later
+                    .iter()
+                    .all(|(provider, _)| linked.contains(&(*provider).to_string())),
+                "case {case:?}: expected every presented provider to be reported, got \
                  {linked:?}"
             );
             assert_eq!(

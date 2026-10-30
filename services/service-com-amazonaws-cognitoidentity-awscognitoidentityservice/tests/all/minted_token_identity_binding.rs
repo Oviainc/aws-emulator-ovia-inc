@@ -7,7 +7,7 @@
 //! the appropriate role for the token" (`GetCredentialsForIdentity`, this service's model),
 //! and the issuance records which identity that is — so presenting it under this service's
 //! own provider name is a login of THAT identity and of no other: a request naming any other
-//! identity is refused with the modelled `NotAuthorizedException` (HTTP 403) and vends
+//! identity is refused with the modelled `NotAuthorizedException` (HTTP 400) and vends
 //! nothing, and an identity belonging to the pool that minted it, that is also what keeps a
 //! token minted in one identity pool out of every other pool's identities. The refusal is
 //! answered before any role is resolved and before any session is minted, and it costs the
@@ -166,8 +166,8 @@ fn assert_served(case: &str, identity_id: &str, status: u16, body: &Value) {
 /// credential in the answer.
 fn assert_refused(case: &str, status: u16, body: &Value) {
     assert_eq!(
-        status, 403,
-        "case {case:?}: expected the HTTP 403 of a refused exchange, got {status} with {body}"
+        status, 400,
+        "case {case:?}: expected the HTTP 400 of a refused exchange, got {status} with {body}"
     );
     let code = error_code(body);
     assert!(

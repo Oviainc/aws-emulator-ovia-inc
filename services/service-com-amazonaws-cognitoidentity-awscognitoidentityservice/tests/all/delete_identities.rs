@@ -447,11 +447,16 @@ async fn a_deleted_identity_can_no_longer_be_issued_credentials_or_a_token() {
     let (deleted, kept) = (minted[0].clone(), minted[1].clone());
 
     // Both identities are issued what the pool issues BEFORE the delete, so the refusals
-    // below are the delete's work and not a pool that never issued anything.
-    for identity_id in [&deleted, &kept] {
+    // below are the delete's work and not a pool that never issued anything. Each call
+    // presents the identity's own federated login, which is what authorizes a call naming
+    // an identity a login has been linked to.
+    for (index, identity_id) in [&deleted, &kept].into_iter().enumerate() {
         for operation in ["GetCredentialsForIdentity", "GetOpenIdToken"] {
             let (status, body) = emulator
-                .call(operation, &json!({ "IdentityId": identity_id }))
+                .call(
+                    operation,
+                    &json!({ "IdentityId": identity_id, "Logins": login_of(index) }),
+                )
                 .await;
             assert_eq!(
                 status, 200,
@@ -470,7 +475,10 @@ async fn a_deleted_identity_can_no_longer_be_issued_credentials_or_a_token() {
 
     for operation in ["GetCredentialsForIdentity", "GetOpenIdToken"] {
         let (status, body) = emulator
-            .call(operation, &json!({ "IdentityId": &deleted }))
+            .call(
+                operation,
+                &json!({ "IdentityId": &deleted, "Logins": login_of(0) }),
+            )
             .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
@@ -478,7 +486,10 @@ async fn a_deleted_identity_can_no_longer_be_issued_credentials_or_a_token() {
             "case {operation:?}: a deleted identity is issued nothing, got {status} with {body}"
         );
         let (status, body) = emulator
-            .call(operation, &json!({ "IdentityId": &kept }))
+            .call(
+                operation,
+                &json!({ "IdentityId": &kept, "Logins": login_of(1) }),
+            )
             .await;
         assert_eq!(
             status, 200,

@@ -33,6 +33,7 @@ use service_com_amazonaws_cognitoidentity_awscognitoidentityservice::EmulatedSer
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::identity_pool_flow::{cognito_trust_policy, error_code, seed_role, seeded_role_arn};
+use crate::mapped_role_resolution::identity_token;
 
 /// This service's SigV4 signing name, the 4th field of a credential scope.
 const SIGNING_NAME: &str = "cognito-identity";
@@ -163,6 +164,23 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value
 /// (`GetId.Logins` in this service's model).
 fn user_pool_provider(user_pool_id: &str) -> String {
     format!("cognito-idp.us-east-1.amazonaws.com/{user_pool_id}")
+}
+
+/// The value a `Logins` entry for `provider` carries: the identity token that provider
+/// issues, whose `iss` claim names it, for a provider whose logins ARE OpenID Connect
+/// identity tokens (an Amazon Cognito user pool, an OpenID Connect issuer), and the opaque
+/// credential its own provider issues for any other. What each row varies is the PROVIDER,
+/// so every row presents the kind of value that provider really issues.
+fn login_for(provider: &str) -> String {
+    if provider.starts_with("cognito-idp.") || provider == OIDC_PROVIDER_NAME {
+        identity_token(&json!({
+            "iss": format!("https://{provider}"),
+            "sub": "federated-user-1",
+            "token_use": "id",
+        }))
+    } else {
+        "an-opaque-provider-credential".to_string()
+    }
 }
 
 /// The provider name of the pool the fixture pool below DOES trust, and of one it does
@@ -383,7 +401,7 @@ async fn a_login_provider_the_pool_does_not_trust_is_not_authorized() {
             "GetId",
             &json!({
                 "IdentityPoolId": pool_id,
-                "Logins": { provider.as_str(): "a.token.value" },
+                "Logins": { provider.as_str(): login_for(provider) },
             }),
         )
         .await;
@@ -400,8 +418,8 @@ async fn a_login_provider_the_pool_does_not_trust_is_not_authorized() {
         } else {
             assert_eq!(
                 (status, error_code(&payload).as_str()),
-                (403, "NotAuthorizedException"),
-                "case {case:?} ({provider}): expected (403, NotAuthorizedException), got \
+                (400, "NotAuthorizedException"),
+                "case {case:?} ({provider}): expected (400, NotAuthorizedException), got \
                  ({status}, {payload})"
             );
             // The caller of this refusal holds no credential, so the refusal reports
@@ -515,7 +533,7 @@ async fn credentials_for_an_identity_validate_the_logins_they_are_presented_with
         let body = match provider {
             Some(provider) => json!({
                 "IdentityId": identity_id,
-                "Logins": { provider.as_str(): "a.token.value" },
+                "Logins": { provider.as_str(): login_for(provider) },
             }),
             None => json!({ "IdentityId": identity_id }),
         };
@@ -533,8 +551,8 @@ async fn credentials_for_an_identity_validate_the_logins_they_are_presented_with
         } else {
             assert_eq!(
                 (status, error_code(&payload).as_str()),
-                (403, "NotAuthorizedException"),
-                "case {case:?}: expected (403, NotAuthorizedException), got ({status}, {payload})"
+                (400, "NotAuthorizedException"),
+                "case {case:?}: expected (400, NotAuthorizedException), got ({status}, {payload})"
             );
         }
     }

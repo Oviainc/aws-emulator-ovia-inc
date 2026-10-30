@@ -12,16 +12,17 @@
 //!   presenting the unlinked identifier again is seen as a NEW identity;
 //! * the identity record survives, keeping the developer provider only while it still has
 //!   an identifier registered under it, and keeping every federated login it had;
-//! * a call naming a developer provider that is not the pool's configured one is a 400
+//! * a call naming a developer provider that is not the pool's configured one is an
 //!   `InvalidParameterException` — a bad input parameter, not an access decision — while
-//!   one naming an identifier the pool has registered against no identity is a 403
+//!   one naming an identifier the pool has registered against no identity is a
 //!   `NotAuthorizedException`,
-//!   one naming a mapping held against another identity is a 409
+//!   one naming a mapping held against another identity is a
 //!   `ResourceConflictException`, one naming a pool or an identity this service does not
 //!   hold is the modelled `ResourceNotFoundException`, one naming an identity of ANOTHER
 //!   pool is a
-//!   403 `NotAuthorizedException`, and a value outside a constraint the MODEL states is
-//!   refused ahead of the operation with a 400 `ValidationException` — and every refusal
+//!   `NotAuthorizedException`, and a value outside a constraint the MODEL states is
+//!   refused ahead of the operation with a `ValidationException` — every one of them HTTP
+//!   400, and every refusal
 //!   writes nothing;
 //! * the call is therefore not idempotent in its answer but is in its effect: repeating it
 //!   is refused as a mapping this pool no longer holds and leaves the pool exactly as the
@@ -114,9 +115,13 @@ fn unlink_request(
 
 /// Every developer user identifier `LookupDeveloperIdentity` reports for one identity, in
 /// the order it reports them — the read-back path for what this operation wrote.
+///
+/// An identity the pool has registered NO identifier against resolves no developer-identity
+/// mapping at all, which that lookup answers as access the caller does not have, so it is
+/// read here as the empty list it stands for.
 async fn identifiers_of(emulator: &Emulator, pool_id: &str, identity_id: &str) -> Vec<String> {
-    let looked_up = emulator
-        .ok(
+    let (status, looked_up) = emulator
+        .call(
             "LookupDeveloperIdentity",
             &json!({
                 "IdentityPoolId": pool_id,
@@ -125,6 +130,13 @@ async fn identifiers_of(emulator: &Emulator, pool_id: &str, identity_id: &str) -
             }),
         )
         .await;
+    if status != 200 {
+        assert!(
+            error_code(&looked_up).contains("NotAuthorizedException"),
+            "a lookup of {identity_id} answered {status} with {looked_up}"
+        );
+        return Vec::new();
+    }
     looked_up["DeveloperUserIdentifierList"]
         .as_array()
         .unwrap_or_else(|| panic!("LookupDeveloperIdentity answers a list: {looked_up}"))
@@ -329,7 +341,7 @@ async fn an_unlinked_developer_identifier_is_forgotten_and_seen_as_new_next_time
                 )
                 .await;
             assert_eq!(
-                status, 403,
+                status, 400,
                 "case {case:?}: the unlinked identifier {identifier:?} resolves nothing, got \
                  {status} with {body}"
             );
@@ -394,26 +406,35 @@ async fn unlinking_a_developer_identifier_leaves_the_federated_logins_linked() {
     ];
 
     for (row, (case, federated)) in cases.iter().enumerate() {
-        let logins: Map<String, Value> = federated
-            .iter()
-            .map(|(provider, token)| ((*provider).to_string(), json!(format!("{token}-{row}"))))
-            .collect();
-        let identity_id = emulator
-            .identity(&pool_id, Some(Value::Object(logins.clone())))
-            .await;
+        // One call carries the developer login and the federated ones together — "supplying
+        // multiple logins will create an implicit linked account" — which is how one
+        // identity comes to be reached through both kinds of login: a developer user is not
+        // joined to an identity an identity provider's login already proves.
         let identifier = format!("user-{row}");
-        let registered = register(
-            &emulator,
-            &pool_id,
-            developer_provider,
-            &identifier,
-            Some(&identity_id),
-        )
-        .await;
-        assert_eq!(
-            registered, identity_id,
-            "case {case:?}: the identifier registers under the identity the call named"
+        let values: Vec<(String, String)> = federated
+            .iter()
+            .map(|(provider, token)| ((*provider).to_string(), format!("{token}-{row}")))
+            .collect();
+        let mut presented: Vec<(&str, &str)> = vec![(developer_provider, identifier.as_str())];
+        presented.extend(
+            values
+                .iter()
+                .map(|(provider, token)| (provider.as_str(), token.as_str())),
         );
+        let minted = emulator
+            .ok(
+                "GetOpenIdTokenForDeveloperIdentity",
+                &token_request(&pool_id, &presented, None, None),
+            )
+            .await;
+        let identity_id = minted["IdentityId"]
+            .as_str()
+            .expect("GetOpenIdTokenForDeveloperIdentity returns an IdentityId")
+            .to_string();
+        let logins: Map<String, Value> = values
+            .iter()
+            .map(|(provider, token)| (provider.clone(), json!(token)))
+            .collect();
 
         emulator
             .ok(
@@ -507,7 +528,7 @@ async fn a_call_the_mapping_cannot_act_on_is_refused() {
                 Some(developer_provider),
                 Some("never-registered"),
             ),
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
@@ -540,7 +561,7 @@ async fn a_call_the_mapping_cannot_act_on_is_refused() {
                 Some(developer_provider),
                 Some("user-2"),
             ),
-            409,
+            400,
             "ResourceConflictException",
         ),
         (
@@ -551,7 +572,7 @@ async fn a_call_the_mapping_cannot_act_on_is_refused() {
                 Some(developer_provider),
                 Some("user-1"),
             ),
-            403,
+            400,
             "NotAuthorizedException",
         ),
         (
@@ -739,7 +760,7 @@ async fn repeating_the_call_forgets_nothing_more() {
 
     let (status, body) = emulator.call(OPERATION, &request).await;
     assert_eq!(
-        status, 403,
+        status, 400,
         "the mapping the first call forgot is gone, so the second is refused, got {status} with \
          {body}"
     );

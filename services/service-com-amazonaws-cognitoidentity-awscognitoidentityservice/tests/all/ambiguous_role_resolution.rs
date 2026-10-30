@@ -11,7 +11,7 @@
 //! (`RoleMapping$AmbiguousRoleResolution`, this service's model): the `AuthenticatedRole`
 //! value falls the exchange back to the pool's own `authenticated` role, and the `Deny`
 //! value refuses the exchange, so `GetCredentialsForIdentity` answers the modelled
-//! `NotAuthorizedException` (HTTP 403) and vends nothing. That refusal is an authorization
+//! `NotAuthorizedException` (HTTP 400) and vends nothing. That refusal is an authorization
 //! decision about the token presented, not a report that the pool is misconfigured —
 //! `InvalidIdentityPoolConfigurationException` is for a pool that "has no authenticated role
 //! configured, or STS returned an error response" (that error's own doc), which a pool whose
@@ -121,8 +121,8 @@ async fn assert_outcome(
             }
             let (status, body) = emulator.call("GetCredentialsForIdentity", &request).await;
             assert_eq!(
-                status, 403,
-                "case {case:?}: expected the HTTP 403 of a denied vend, got {status} with \
+                status, 400,
+                "case {case:?}: expected the HTTP 400 of a denied vend, got {status} with \
                  {body}"
             );
             let code = body["__type"].as_str().unwrap_or_default();

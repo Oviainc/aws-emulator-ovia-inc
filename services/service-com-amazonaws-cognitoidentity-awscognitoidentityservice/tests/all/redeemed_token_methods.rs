@@ -146,15 +146,28 @@ async fn mint(emulator: &Emulator, pool_id: &str, case: &str, login: Login, valu
                 .await
         }
         Login::Federated(provider) => {
+            // A provider whose logins ARE OpenID Connect identity tokens has to be
+            // presented with one, naming that provider as its issuer; any other provider
+            // issues an opaque credential of its own.
+            let value = if provider.starts_with("cognito-idp.") {
+                crate::mapped_role_resolution::identity_token(&json!({
+                    "iss": format!("https://{provider}"),
+                    "sub": value,
+                    "token_use": "id",
+                    "exp": 4_102_444_800u64,
+                }))
+            } else {
+                value.to_string()
+            };
             let identity_id = emulator
-                .identity(pool_id, Some(json!({provider: value})))
+                .identity(pool_id, Some(json!({provider: &value})))
                 .await;
             emulator
                 .ok(
                     "GetOpenIdToken",
                     &json!({
                         "IdentityId": identity_id,
-                        "Logins": {provider: value},
+                        "Logins": {provider: &value},
                     }),
                 )
                 .await

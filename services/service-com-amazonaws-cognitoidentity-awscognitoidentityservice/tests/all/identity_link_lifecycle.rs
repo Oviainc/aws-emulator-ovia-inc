@@ -41,6 +41,10 @@ const DISABLED: &str = "DISABLED";
 /// when the presented value is not one. Fixed text, asserted against the literal.
 const INVALID_TOKEN_MESSAGE: &str = "Invalid login token. Not a valid OpenId Connect identity token.";
 
+/// The message an identity token whose `iss` claim names another issuer than the provider
+/// name it is presented under is refused with. Fixed text, asserted against the literal.
+const MISMATCHED_ISSUER_MESSAGE: &str = "Invalid login token. Issuer doesn't match providerName";
+
 /// The message a call that must be authorized by a login of the identity it names is
 /// refused with when none of the logins it presents is one of that identity's — which is
 /// every such call for an identity an unlink left linked to nothing. Fixed text, asserted
@@ -204,17 +208,17 @@ fn segment(value: &str) -> String {
 }
 
 /// An identity token as an OpenID Connect provider issues one: a compact JWS whose header
-/// names a signing algorithm, whose payload is a claim set and whose signature segment is
-/// not empty (RFC 7515 §3.1, RFC 7519 §3). The signature cannot be verified by anything in
-/// this emulator — that needs the issuer's published key — so what a presented token is
-/// decided by is this form.
-fn identity_token(subject: &str) -> String {
+/// names a signing algorithm, whose payload is a claim set naming `issuer` as the principal
+/// that issued it, and whose signature segment is not empty (RFC 7515 §3.1, RFC 7519 §3).
+/// The signature cannot be verified by anything in this emulator — that needs the issuer's
+/// published key — so what a presented token is decided by is this form and these claims.
+fn identity_token_of(issuer: &str, subject: &str) -> String {
     format!(
         "{}.{}.{}",
         segment(r#"{"alg":"RS256","kid":"kid-1","typ":"JWT"}"#),
         segment(
             &json!({
-                "iss": "https://issuer.example.com",
+                "iss": format!("https://{issuer}"),
                 "sub": subject,
                 "aud": "client-1",
                 "token_use": "id",
@@ -379,7 +383,7 @@ async fn an_unlink_that_takes_the_last_login_off_an_identity_disables_it() {
             .await;
         if kept.is_empty() {
             assert_eq!(
-                status, 403,
+                status, 400,
                 "case {case:?}: expected the repeat on a disabled identity to be refused, got \
                  {status} with {body}"
             );
@@ -405,8 +409,9 @@ async fn an_unlink_that_takes_the_last_login_off_an_identity_disables_it() {
 
 /// RULE: the call is unsigned, so the token each `Logins` entry presents is the whole
 /// authorization for it — a value presented for a provider of the pool whose logins are
-/// OpenID Connect identity tokens, and that is not such a token at all, is refused with a
-/// 403 `NotAuthorizedException` and removes nothing, while a login whose provider issues no
+/// OpenID Connect identity tokens, and that is not such a token at all or was issued by
+/// another issuer than the provider it is presented under, is refused with a 400
+/// `NotAuthorizedException` and removes nothing, while a login whose provider issues no
 /// identity token is decided by that provider and is honoured.
 #[tokio::test]
 async fn a_login_token_that_is_not_an_identity_token_authorizes_nothing() {
@@ -417,100 +422,111 @@ async fn a_login_token_that_is_not_an_identity_token_authorizes_nothing() {
     // presented for (the pool's Amazon Cognito user pool, its OpenID Connect issuer, a
     // public provider whose login is no identity token) and the FORM of the presented value
     // — each row a different way of not being a compact JWS carrying a signed claim set
-    // (RFC 7515 §3.1), plus the forms that are one.
-    // (case, provider, the value presented, whether the call must be served)
+    // (RFC 7515 §3.1), one that is such a token of the wrong issuer, plus the forms that are
+    // the token the provider issues.
+    // (case, provider, the value presented, the message it is refused with if any)
     let claims = segment(r#"{"sub":"user-1"}"#);
     let header = segment(r#"{"alg":"RS256"}"#);
     let signature = segment("a-signature");
-    let cases: Vec<(&str, &str, String, bool)> = vec![
+    let cases: Vec<(&str, &str, String, Option<&str>)> = vec![
         (
             "an opaque value that is no token at all",
             USER_POOL_PROVIDER,
             "not-a-valid-jwt-token".to_string(),
-            false,
+            Some(INVALID_TOKEN_MESSAGE),
         ),
         (
             "two segments instead of three",
             USER_POOL_PROVIDER,
             format!("{header}.{claims}"),
-            false,
+            Some(INVALID_TOKEN_MESSAGE),
         ),
         (
             "four segments instead of three",
             USER_POOL_PROVIDER,
             format!("{header}.{claims}.{signature}.{signature}"),
-            false,
+            Some(INVALID_TOKEN_MESSAGE),
         ),
         (
             "a header segment that is not base64url",
             USER_POOL_PROVIDER,
             format!("@@@@.{claims}.{signature}"),
-            false,
+            Some(INVALID_TOKEN_MESSAGE),
         ),
         (
             "a header segment that is not a JSON object",
             USER_POOL_PROVIDER,
             format!("{}.{claims}.{signature}", segment(r#"["RS256"]"#)),
-            false,
+            Some(INVALID_TOKEN_MESSAGE),
         ),
         (
             "a header naming no signing algorithm",
             USER_POOL_PROVIDER,
             format!("{}.{claims}.{signature}", segment(r#"{"typ":"JWT"}"#)),
-            false,
+            Some(INVALID_TOKEN_MESSAGE),
         ),
         (
             "a payload segment that is not JSON",
             USER_POOL_PROVIDER,
             format!("{header}.{}.{signature}", segment("not json")),
-            false,
+            Some(INVALID_TOKEN_MESSAGE),
         ),
         (
             "the unsecured algorithm, so nothing signed it",
             USER_POOL_PROVIDER,
             format!("{}.{claims}.{signature}", segment(r#"{"alg":"none"}"#)),
-            false,
+            Some(INVALID_TOKEN_MESSAGE),
         ),
         (
             "an empty signature segment, so nothing signed it",
             USER_POOL_PROVIDER,
             format!("{header}.{claims}."),
-            false,
+            Some(INVALID_TOKEN_MESSAGE),
         ),
         (
             "an opaque value presented for the pool's OpenID Connect issuer",
             OIDC_PROVIDER,
             "an-opaque-value".to_string(),
-            false,
+            Some(INVALID_TOKEN_MESSAGE),
+        ),
+        (
+            // The entry says who issued the token and the token says so too: a request
+            // whose two answers differ presents someone else's token.
+            "an identity token of another issuer presented for the pool's user pool",
+            USER_POOL_PROVIDER,
+            identity_token_of(OIDC_PROVIDER, "user-pool-user"),
+            Some(MISMATCHED_ISSUER_MESSAGE),
         ),
         (
             "an identity token presented for the pool's user pool",
             USER_POOL_PROVIDER,
-            identity_token("user-pool-user"),
-            true,
+            identity_token_of(USER_POOL_PROVIDER, "user-pool-user"),
+            None,
         ),
         (
             "an identity token presented for the pool's OpenID Connect issuer",
             OIDC_PROVIDER,
-            identity_token("oidc-user"),
-            true,
+            identity_token_of(OIDC_PROVIDER, "oidc-user"),
+            None,
         ),
         (
             "an opaque access token presented for a public provider that issues one",
             PUBLIC_PROVIDER,
             "an-oauth-access-token".to_string(),
-            true,
+            None,
         ),
     ];
 
-    for (row, (case, provider, presented, served)) in cases.iter().enumerate() {
-        // Each row gets its own identity, linked through the row's provider with a login the
-        // provider itself would have issued, so what the row varies is the value the UNLINK
-        // presents.
-        let linked_login = if *provider == PUBLIC_PROVIDER {
+    for (row, (case, provider, presented, refusal)) in cases.iter().enumerate() {
+        // Each row gets its own identity, linked through the row's provider with the login
+        // that identity is reached by: a row the call must be SERVED for presents that very
+        // login, so what the refused rows vary is the value presented for it.
+        let linked_login = if refusal.is_none() {
+            (*presented).clone()
+        } else if *provider == PUBLIC_PROVIDER {
             format!("an-oauth-access-token-{row}")
         } else {
-            identity_token(&format!("linked-user-{row}"))
+            identity_token_of(provider, &format!("linked-user-{row}"))
         };
         let identity_id = emulator
             .identity(&pool_id, Some(logins_map(&[(provider, linked_login.clone())])))
@@ -527,7 +543,7 @@ async fn a_login_token_that_is_not_an_identity_token_authorizes_nothing() {
             )
             .await;
 
-        if *served {
+        if refusal.is_none() {
             assert_eq!(
                 status, 200,
                 "case {case:?}: expected the unlink to be served, got {status} with {body}"
@@ -543,18 +559,18 @@ async fn a_login_token_that_is_not_an_identity_token_authorizes_nothing() {
         }
 
         assert_eq!(
-            status, 403,
-            "case {case:?}: expected HTTP 403 for a value that is no identity token, got \
-             {status} with {body}"
+            status, 400,
+            "case {case:?}: expected HTTP 400 for a value that is not the token its provider \
+             issues, got {status} with {body}"
         );
         assert!(
             error_code(&body).contains("NotAuthorizedException"),
             "case {case:?}: expected NotAuthorizedException, got {body}"
         );
         assert_eq!(
-            error_message(case, &body),
-            INVALID_TOKEN_MESSAGE,
-            "case {case:?}: expected the fixed invalid-token message, got {body}"
+            Some(error_message(case, &body).as_str()),
+            *refusal,
+            "case {case:?}: expected the fixed refusal message {refusal:?}, got {body}"
         );
 
         // The refusal wrote nothing: the identity still carries its provider, and the login
@@ -577,10 +593,11 @@ async fn a_login_token_that_is_not_an_identity_token_authorizes_nothing() {
     }
 }
 
-/// RULE: the public-provider unlink acts for PUBLIC providers, so a `Logins` map naming none
-/// of them — only the pool's own developer provider, or nothing at all — is refused as a bad
-/// input parameter and the developer login it names survives; a map that does name one is
-/// served.
+/// RULE: the public-provider unlink acts for PUBLIC providers, so a `Logins` map naming
+/// only the pool's own developer provider presents nothing it can act for and is refused as
+/// a bad input parameter, while a map presenting NO login at all has not authorized the call
+/// for the identity it names and is refused as the access decision that is — and either way
+/// the developer login it named survives; a map that does name a public provider is served.
 #[tokio::test]
 async fn an_unlink_presenting_no_public_provider_is_refused() {
     let emulator = Emulator::new();
@@ -590,35 +607,36 @@ async fn an_unlink_presenting_no_public_provider_is_refused() {
     // the `Logins` map the call presents: only the developer provider, nothing at all, or a
     // public provider beside the developer one.
     let at_max_provider = "d".repeat(128);
-    // (case, the pool's developer provider, the Logins entries, whether the call is served)
-    let cases: Vec<(&str, &str, Vec<&str>, bool)> = vec![
+    // (case, the pool's developer provider, the Logins entries, the error code the call is
+    // refused with — none for a call that is served)
+    let cases: Vec<(&str, &str, Vec<&str>, Option<&str>)> = vec![
         (
             "only the pool's developer provider",
             "login.example.app",
             vec!["login.example.app"],
-            false,
+            Some("InvalidParameterException"),
         ),
         (
             "only a developer provider at the maximum modelled length",
             at_max_provider.as_str(),
             vec![at_max_provider.as_str()],
-            false,
+            Some("InvalidParameterException"),
         ),
         (
             "no entry at all",
             "backend_1.example-app",
             vec![],
-            false,
+            Some("NotAuthorizedException"),
         ),
         (
             "a public provider beside the developer one",
             "login.example.app",
             vec!["login.example.app", PUBLIC_PROVIDER],
-            true,
+            None,
         ),
     ];
 
-    for (row, (case, developer_provider, presented, served)) in cases.iter().enumerate() {
+    for (row, (case, developer_provider, presented, refused_with)) in cases.iter().enumerate() {
         let pool_id = pool_with_developer_provider(
             &emulator,
             &format!("public-provider-{row}"),
@@ -657,27 +675,32 @@ async fn an_unlink_presenting_no_public_provider_is_refused() {
             )
             .await;
 
-        if *served {
-            assert_eq!(
+        match refused_with {
+            None => assert_eq!(
                 status, 200,
                 "case {case:?}: a map naming a public provider is served, got {status} with \
                  {body}"
-            );
-        } else {
-            assert_eq!(
-                status, 400,
-                "case {case:?}: expected HTTP 400 for a map naming no public provider, got \
-                 {status} with {body}"
-            );
-            assert!(
-                error_code(&body).contains("InvalidParameterException"),
-                "case {case:?}: expected InvalidParameterException, got {body}"
-            );
-            assert_eq!(
-                error_message(case, &body),
-                NO_PUBLIC_PROVIDER_MESSAGE,
-                "case {case:?}: expected the fixed public-provider message, got {body}"
-            );
+            ),
+            Some(code) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400, got {status} with {body}"
+                );
+                assert!(
+                    error_code(&body).contains(code),
+                    "case {case:?}: expected {code}, got {body}"
+                );
+                let expected = if *code == "InvalidParameterException" {
+                    NO_PUBLIC_PROVIDER_MESSAGE.to_string()
+                } else {
+                    format!("Access to Identity '{identity_id}' is forbidden.")
+                };
+                assert_eq!(
+                    error_message(case, &body),
+                    expected,
+                    "case {case:?}: expected the fixed message {expected:?}, got {body}"
+                );
+            }
         }
 
         // Either way the developer login is untouched: this operation never detaches one.
@@ -704,9 +727,9 @@ async fn an_unlink_presenting_no_public_provider_is_refused() {
 
 /// RULE: the developer unlink decides the `DeveloperProviderName` against the pool's
 /// configured one first — a provider the pool does not support is a bad input parameter the
-/// caller has to correct (400 `InvalidParameterException`), which is a different answer from
-/// the access decision an identifier the pool has registered against no identity gets (403
-/// `NotAuthorizedException`) — and every refusal leaves the mapping registered.
+/// caller has to correct (`InvalidParameterException`), which is a different answer from the
+/// access decision an identifier the pool has registered against no identity gets
+/// (`NotAuthorizedException`) — and every refusal leaves the mapping registered.
 #[tokio::test]
 async fn an_unsupported_developer_provider_is_a_bad_parameter_not_an_access_decision() {
     let emulator = Emulator::new();
@@ -783,7 +806,7 @@ async fn an_unsupported_developer_provider_is_a_bad_parameter_not_an_access_deci
             identity: identity_id.as_str(),
             provider: developer_provider,
             identifier: "never-registered",
-            status: 403,
+            status: 400,
             code: "NotAuthorizedException",
             message: NO_ACCESS_MESSAGE,
         },
@@ -844,7 +867,7 @@ async fn an_unsupported_developer_provider_is_a_bad_parameter_not_an_access_deci
         )
         .await;
     assert_eq!(
-        status, 403,
+        status, 400,
         "the served unlink forgot the mapping, so a lookup of it resolves nothing, got {status} \
          with {body}"
     );
@@ -853,9 +876,9 @@ async fn an_unsupported_developer_provider_is_a_bad_parameter_not_an_access_deci
 /// RULE: an identity an unlink left linked to no provider can no longer be reached THROUGH
 /// A LOGIN — "removing the last linked login will make this identity inaccessible" — so a
 /// call that presents one for it presents a login that is not its own and is refused with a
-/// 403 `NotAuthorizedException` naming the login mismatch; a call that presents none asks
-/// nothing of a login (the unauthenticated exchange, the pool's administrative reads) and
-/// still answers for the record.
+/// 400 `NotAuthorizedException` naming the login mismatch, while a call that presents none
+/// has authorized itself for the identity in no way at all and is refused as the forbidden
+/// access that is; the pool's administrative reads still answer for the record.
 #[tokio::test]
 async fn a_disabled_identity_can_no_longer_be_reached_through_a_login() {
     let emulator = Emulator::new();
@@ -865,18 +888,25 @@ async fn a_disabled_identity_can_no_longer_be_reached_through_a_login() {
         .identity(&pool_id, Some(logins_map(&[(PUBLIC_PROVIDER, token.clone())])))
         .await;
 
-    // While the identity still carries its provider, each of these is served: what the rows
-    // below change is only that the unlink takes its last login off.
+    // While the identity still carries its provider, each of these is served, presenting
+    // the login the identity was minted with: what the rows below change is only that the
+    // unlink takes its last login off.
     for (case, operation, request) in [
         (
             "a basic-flow token for a linked identity",
             "GetOpenIdToken",
-            json!({"IdentityId": &identity_id}),
+            json!({
+                "IdentityId": &identity_id,
+                "Logins": logins_map(&[(PUBLIC_PROVIDER, token.clone())]),
+            }),
         ),
         (
             "a credential vend for a linked identity",
             "GetCredentialsForIdentity",
-            json!({"IdentityId": &identity_id}),
+            json!({
+                "IdentityId": &identity_id,
+                "Logins": logins_map(&[(PUBLIC_PROVIDER, token.clone())]),
+            }),
         ),
     ] {
         let (status, body) = emulator.call(operation, &request).await;
@@ -948,8 +978,8 @@ async fn a_disabled_identity_can_no_longer_be_reached_through_a_login() {
     for (case, operation, request) in &cases {
         let (status, body) = emulator.call(operation, request).await;
         assert_eq!(
-            status, 403,
-            "case {case:?}: expected HTTP 403 for {operation} on a disabled identity, got \
+            status, 400,
+            "case {case:?}: expected HTTP 400 for {operation} on a disabled identity, got \
              {status} with {body}"
         );
         assert!(
@@ -963,21 +993,31 @@ async fn a_disabled_identity_can_no_longer_be_reached_through_a_login() {
         );
     }
 
-    // A call that presents NO login is unaffected: it asks nothing of a login, so the vend
-    // assumes the pool's unauthenticated role for the identity id and the basic flow still
-    // mints a token for it, and the administrative reads still report the record — which is
-    // how an operator sees a disabled identity at all.
-    let vended = emulator
-        .ok(
+    // A vend that presents NO login has not authorized itself for this identity at all:
+    // nothing is linked to it any more, so there is no login of it to present and the vend
+    // is refused as forbidden access to the identity rather than served as the
+    // unauthenticated exchange a guest identity's id is all of.
+    let (status, refused_vend) = emulator
+        .call(
             "GetCredentialsForIdentity",
             &json!({"IdentityId": &identity_id}),
         )
         .await;
     assert_eq!(
-        vended["IdentityId"],
-        json!(identity_id),
-        "the unauthenticated vend still answers for the disabled identity, got {vended}"
+        (status, error_code(&refused_vend).as_str()),
+        (400, "NotAuthorizedException"),
+        "a vend presenting no login for a disabled identity is refused, got {status} with \
+         {refused_vend}"
     );
+    assert_eq!(
+        error_message("a vend presenting no login", &refused_vend),
+        format!("Access to Identity '{identity_id}' is forbidden."),
+        "expected the forbidden-identity message, got {refused_vend}"
+    );
+
+    // The basic flow asks nothing of a login for the identity it already names, so a token
+    // is still minted for the record — which is how a client holding the id reaches it at
+    // all — and the administrative reads still report it.
     let minted = emulator
         .ok("GetOpenIdToken", &json!({"IdentityId": &identity_id}))
         .await;

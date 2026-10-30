@@ -621,8 +621,8 @@ fn group_precedence_and_role_mapping_select_the_vended_role() {
                     Outcome::Denied => {
                         assert_eq!(
                             vended.status,
-                            403,
-                            "case {case:?}: a denied exchange is an HTTP 403, got {} with \
+                            400,
+                            "case {case:?}: a denied exchange is an HTTP 400, got {} with \
                              {:?}",
                             vended.status,
                             vended.text()

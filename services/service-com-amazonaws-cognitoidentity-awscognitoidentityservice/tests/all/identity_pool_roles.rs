@@ -505,7 +505,11 @@ async fn a_roles_key_that_is_not_a_role_kind_is_refused() {
 async fn a_custom_role_arn_is_resolved_against_the_pools_stored_roles() {
     let emulator = Emulator::new();
     let pool_id = emulator.pool("roles-custom", true).await;
-    let identity_id = emulator.identity(&pool_id, None).await;
+    // Naming a `CustomRoleArn` is something only an exchange whose provider offered several
+    // roles may do, so the identity below is reached through the provider the pool holds a
+    // role mapping for, and every vend presents that login.
+    let logins = json!({"accounts.google.com": "a-google-access-token"});
+    let identity_id = emulator.identity(&pool_id, Some(logins.clone())).await;
 
     // A vend is a session of the role it resolves, so every role the rows below name is
     // seeded in the IAM store of the same engine, trusting this pool's users.
@@ -551,7 +555,11 @@ async fn a_custom_role_arn_is_resolved_against_the_pools_stored_roles() {
         let issued = emulator
             .ok(
                 "GetCredentialsForIdentity",
-                &json!({"IdentityId": &identity_id, "CustomRoleArn": &custom_role_arn}),
+                &json!({
+                    "IdentityId": &identity_id,
+                    "Logins": &logins,
+                    "CustomRoleArn": &custom_role_arn,
+                }),
             )
             .await;
         assert_eq!(
@@ -568,7 +576,11 @@ async fn a_custom_role_arn_is_resolved_against_the_pools_stored_roles() {
         let (status, body) = emulator
             .call(
                 "GetCredentialsForIdentity",
-                &json!({"IdentityId": &identity_id, "CustomRoleArn": &custom_role_arn}),
+                &json!({
+                    "IdentityId": &identity_id,
+                    "Logins": &logins,
+                    "CustomRoleArn": &custom_role_arn,
+                }),
             )
             .await;
         assert_eq!(

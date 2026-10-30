@@ -350,8 +350,11 @@ async fn a_vend_is_a_session_of_the_role_the_pool_resolves() {
             "vend-auth",
         ),
         (
+            // Naming a `CustomRoleArn` is something only an exchange whose provider offered
+            // several roles may do, so this row presents a login of the provider the pool
+            // holds a role mapping for.
             "a CustomRoleArn naming the pool's authenticated role",
-            None,
+            Some(json!({"accounts.google.com": "t4"})),
             Some(&authenticated),
             "vend-auth",
         ),

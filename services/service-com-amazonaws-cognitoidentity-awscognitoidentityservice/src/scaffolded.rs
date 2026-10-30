@@ -263,23 +263,30 @@ impl SerializableStruct for AccessDeniedException {
 /// refusal agree.
 pub const CLIENT_ERROR_STATUS: u16 = 400;
 
-/// The status the shape annotation [`wire_status`] rewrites: the one 4xx an `awsJson`
-/// transport claims for itself.
-const TRANSPORT_NOT_FOUND_STATUS: u16 = 404;
+/// The statuses the shape annotation [`wire_status`] rewrites: every `@httpError` this
+/// model annotates a CLIENT error with that is not the status this service answers on the
+/// wire (`smithy_query(query="shape",shape="ResourceNotFoundException,NotAuthorizedException,ResourceConflictException")`
+/// reports 404, 403 and 409).
+///
+/// The recorded responses of this service answer each of them HTTP 400, the error class
+/// travelling in the body's `__type` and in the `x-amzn-errortype` header beside it: the
+/// 404 is the one 4xx an `awsJson` transport claims for itself, and a client classifying by
+/// status would read a transport or routing failure, a credential it must re-acquire or a
+/// state conflict it should retry where the service reported a bad request.
+const RESTATED_CLIENT_ERROR_STATUSES: [u16; 3] = [404, 403, 409];
 
 /// The status a modeled error travels with on this service's wire, given the `@httpError`
 /// status its shape is annotated with.
 ///
-/// A client error annotated [`TRANSPORT_NOT_FOUND_STATUS`] — `ResourceNotFoundException`,
-/// the only shape of this model that carries it — collapses onto
-/// [`CLIENT_ERROR_STATUS`], because a client classifying by HTTP status would otherwise
-/// read a transport or routing failure where the service reported a modelled API error.
-/// Every other status is left exactly as the model annotates it, so the refusals this
-/// service does answer with their own status — a 403 for a caller it does not authorize, a
-/// 409 for a login already claimed, a 5xx server fault — keep it, and a retry classifier
-/// still tells a server fault from a client one.
+/// A client error annotated with one of [`RESTATED_CLIENT_ERROR_STATUSES`] collapses onto
+/// [`CLIENT_ERROR_STATUS`], which is the status this service's recorded responses carry for
+/// every modelled client error, and the one its boundary validator already refuses a
+/// malformed request with, so a handler-returned client error and a boundary refusal agree.
+/// Every other status is left exactly as the model annotates it, so a throttle keeps its own
+/// and a 5xx server fault keeps its, and a retry classifier still tells a server fault from
+/// a client one.
 pub fn wire_status(modeled_status: u16) -> u16 {
-    if modeled_status == TRANSPORT_NOT_FOUND_STATUS {
+    if RESTATED_CLIENT_ERROR_STATUSES.contains(&modeled_status) {
         CLIENT_ERROR_STATUS
     } else {
         modeled_status
@@ -293,8 +300,8 @@ pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the status [`wire_status`]
-    /// gives it — this service's client-error status for a shape the model annotates with
-    /// the transport's 404, the shape's own status otherwise.
+    /// gives it — this service's client-error status for a shape the model annotates with a
+    /// status this service does not answer, the shape's own status otherwise.
     Modeled(E),
     /// The caller's identity-based policies do not allow this operation's action on what
     /// the request names. Renders at [`ACCESS_DENIED_STATUS`] with the error code
@@ -412,8 +419,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed. A modeled
-    /// error goes through [`wire_status`], which puts a refusal the model annotates with
-    /// the transport's 404 on this service's own [`CLIENT_ERROR_STATUS`]; every other
+    /// error goes through [`wire_status`], which puts a refusal the model annotates with a
+    /// status this service does not answer on its own [`CLIENT_ERROR_STATUS`]; every other
     /// modelled status is the model's.
     fn http_status(&self) -> u16 {
         match self {

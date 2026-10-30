@@ -257,7 +257,9 @@ async fn a_developer_login_resolves_one_identity_and_mints_a_token_per_call() {
                 "SetIdentityPoolRoles",
                 &json!({
                     "IdentityPoolId": &pool_id,
-                    "Roles": {"unauthenticated": role_arn},
+                    // Both roles, so the vend below — made with the identity's developer
+                    // login, which is an AUTHENTICATED exchange — resolves one.
+                    "Roles": {"authenticated": &role_arn, "unauthenticated": &role_arn},
                 }),
             )
             .await;
@@ -407,11 +409,16 @@ async fn a_developer_login_resolves_one_identity_and_mints_a_token_per_call() {
             "case {case:?}: asking twice must not mint a second identity"
         );
 
-        // And the identity it resolved is a real one: credentials can be vended for it.
+        // And the identity it resolved is a real one: credentials can be vended for it,
+        // presented with the token this call minted — a login of that identity, which is
+        // what authorizes the exchange for it.
         let credentials = emulator
             .ok(
                 "GetCredentialsForIdentity",
-                &json!({"IdentityId": identity_id}),
+                &json!({
+                    "IdentityId": identity_id,
+                    "Logins": { "cognito-identity.amazonaws.com": &token },
+                }),
             )
             .await;
         assert_eq!(
@@ -426,9 +433,11 @@ async fn a_developer_login_resolves_one_identity_and_mints_a_token_per_call() {
     }
 }
 
-/// RULE: a developer user identifier belongs to ONE identity — presenting it for another
-/// identity of the pool is refused with 400 `DeveloperUserAlreadyRegisteredException` and
-/// changes nothing, whatever that other identity was created by.
+/// RULE: a developer user identifier belongs to ONE identity, and this call links only
+/// logins the pool has proven for no identity — so presenting an identifier already
+/// registered under another identity for the identity the request names is refused 400
+/// `NotAuthorizedException`, naming the login mismatch rather than the identity that holds
+/// it, and changes nothing.
 #[tokio::test]
 async fn a_developer_identifier_registered_under_another_identity_is_refused() {
     let emulator = Emulator::new();
@@ -506,8 +515,16 @@ async fn a_developer_identifier_registered_under_another_identity_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            "DeveloperUserAlreadyRegisteredException",
-            "case {case:?}: expected DeveloperUserAlreadyRegisteredException, got {body}"
+            "NotAuthorizedException",
+            "case {case:?}: expected NotAuthorizedException, got {body}"
+        );
+        assert!(
+            !body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(registered_identity.as_str()),
+            "case {case:?}: the refusal must not name the identity holding the identifier, \
+             got {body}"
         );
         assert_eq!(
             identity_count(&emulator, &pool_id).await,
@@ -658,18 +675,25 @@ async fn a_pool_or_identity_this_service_does_not_hold_is_not_found() {
 
 /// RULE: naming an existing identity links the developer user identifier to THAT identity
 /// — "you can do so by providing the existing IdentityId" — so the identifier resolves to
-/// it afterwards, and the identity keeps the logins it already had.
+/// it afterwards, and the identity keeps the logins it already had. An identity an identity
+/// PROVIDER's login already proves is that provider's user, so a developer user is not
+/// joined to it this way: such a call is refused `ResourceConflictException`, and the
+/// identity is left exactly as it was.
 #[tokio::test]
 async fn naming_an_existing_identity_links_the_developer_login_to_it() {
     let emulator = Emulator::new();
     let developer_provider = "login.example.app";
 
-    // The rows differ in what the existing identity already carries.
-    let cases: Vec<(&str, Option<Value>)> = vec![
-        ("an unauthenticated identity", None),
+    // The rows differ in what the existing identity already carries: nothing (the guest
+    // identity the member exists for), another developer user identifier of the same
+    // backend, and one and two logins of a public provider.
+    // (case, the logins the identity carries, whether the link is served)
+    let cases: Vec<(&str, Option<Value>, bool)> = vec![
+        ("an unauthenticated identity", None, true),
         (
             "an identity already linked to one public provider",
             Some(json!({"graph.facebook.com": "a-facebook-token"})),
+            false,
         ),
         (
             "an identity already linked to two public providers",
@@ -677,14 +701,53 @@ async fn naming_an_existing_identity_links_the_developer_login_to_it() {
                 "graph.facebook.com": "another-facebook-token",
                 "accounts.google.com": "a-google-token",
             })),
+            false,
         ),
     ];
 
-    for (case, existing_logins) in cases {
+    for (case, existing_logins, served) in cases {
         let pool_id =
             pool_with_developer_provider(&emulator, case, Some(developer_provider)).await;
         let existing = emulator.identity(&pool_id, existing_logins.clone()).await;
         let identifier = "a-backend-user";
+
+        if !served {
+            let (status, body) = emulator
+                .call(
+                    OPERATION,
+                    &token_request(
+                        &pool_id,
+                        &[(developer_provider, identifier)],
+                        Some(&existing),
+                        None,
+                    ),
+                )
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400 for a developer login joined to a \
+                 provider-proven identity, got {status} with {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceConflictException",
+                "case {case:?}: expected ResourceConflictException, got {body}"
+            );
+            // The refusal wrote nothing: the identity still carries exactly its own logins.
+            let mut expected: Vec<String> = existing_logins
+                .as_ref()
+                .and_then(Value::as_object)
+                .map(|logins| logins.keys().cloned().collect())
+                .unwrap_or_default();
+            expected.sort();
+            let mut actual = listed_logins(&emulator, &pool_id, &existing).await;
+            actual.sort();
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: a refused link leaves the logins {expected:?}, got {actual:?}"
+            );
+            continue;
+        }
 
         let answered = emulator
             .ok(

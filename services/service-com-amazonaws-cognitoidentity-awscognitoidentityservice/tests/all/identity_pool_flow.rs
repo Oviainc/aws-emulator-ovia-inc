@@ -568,7 +568,7 @@ async fn get_id_is_idempotent_per_login_and_fresh_per_unauthenticated_call() {
 }
 
 /// RULE: a pool that does not allow unauthenticated identities refuses a `GetId` carrying
-/// no login (403 `NotAuthorizedException`), and allows one that carries a login.
+/// no login (400 `NotAuthorizedException`), and allows one that carries a login.
 #[tokio::test]
 async fn get_id_refuses_an_unauthenticated_call_when_the_pool_forbids_it() {
     let emulator = Emulator::new();
@@ -583,8 +583,8 @@ async fn get_id_refuses_an_unauthenticated_call_when_the_pool_forbids_it() {
         }
         let (status, body) = emulator.call("GetId", &Value::Object(request)).await;
         assert_eq!(
-            status, 403,
-            "case {case:?}: expected HTTP 403 for an unauthenticated GetId, got {status} with {body}"
+            status, 400,
+            "case {case:?}: expected HTTP 400 for an unauthenticated GetId, got {status} with {body}"
         );
         assert!(
             error_code(&body).contains("NotAuthorizedException"),
@@ -636,13 +636,15 @@ async fn credentials_are_per_identity_and_stable_while_valid() {
     let mut access_keys = HashSet::new();
     let mut secrets = HashSet::new();
     for (case, logins) in cases {
-        let identity_id = emulator.identity(&pool_id, logins).await;
-        let issued = emulator
-            .ok(
-                "GetCredentialsForIdentity",
-                &json!({"IdentityId": &identity_id}),
-            )
-            .await;
+        let identity_id = emulator.identity(&pool_id, logins.clone()).await;
+        // A vend for an identity a login has been linked to is authorized by a login of it,
+        // so each row presents the very logins it was minted with; a guest identity has
+        // none, and its id is the whole of the unauthenticated exchange.
+        let vend = match &logins {
+            Some(logins) => json!({"IdentityId": &identity_id, "Logins": logins}),
+            None => json!({"IdentityId": &identity_id}),
+        };
+        let issued = emulator.ok("GetCredentialsForIdentity", &vend).await;
         assert_eq!(
             issued["IdentityId"].as_str(),
             Some(identity_id.as_str()),
@@ -679,12 +681,7 @@ async fn credentials_are_per_identity_and_stable_while_valid() {
         );
 
         // Asked again inside the validity window, the identity has the same session.
-        let again = emulator
-            .ok(
-                "GetCredentialsForIdentity",
-                &json!({"IdentityId": &identity_id}),
-            )
-            .await;
+        let again = emulator.ok("GetCredentialsForIdentity", &vend).await;
         assert_eq!(
             again, issued,
             "case {case:?}: a second call inside the validity window answered {again}, expected {issued}"
@@ -803,7 +800,7 @@ async fn list_identities_pages_through_every_identity_exactly_once() {
 
 /// RULE: logins presented together name one account — every one of them is linked to the
 /// identity resolved for the call — and logins already linked to different identities
-/// cannot be merged by presenting them together (409 `ResourceConflictException`).
+/// cannot be merged by presenting them together (`ResourceConflictException`).
 #[tokio::test]
 async fn logins_presented_together_are_linked_to_one_identity() {
     let emulator = Emulator::new();
@@ -970,8 +967,8 @@ async fn logins_presented_together_are_linked_to_one_identity() {
         )
         .await;
     assert_eq!(
-        status, 409,
-        "merging two linked identities expected HTTP 409, got {status} with {body}"
+        status, 400,
+        "merging two linked identities expected HTTP 400, got {status} with {body}"
     );
     assert!(
         error_code(&body).contains("ResourceConflictException"),
@@ -980,9 +977,9 @@ async fn logins_presented_together_are_linked_to_one_identity() {
 }
 
 /// RULE: a request this slice cannot answer faithfully is refused with the modelled
-/// error, never with a session that ignores the member — a `CustomRoleArn` the pool does
-/// not name, and a pool that names no role at all, leave the vend no role it could be a
-/// session of.
+/// error, never with a session that ignores the member — a `CustomRoleArn` named by an
+/// exchange whose identity provider offered no choice of role is a bad input parameter, and
+/// a pool that names no role at all leaves the vend no role it could be a session of.
 #[tokio::test]
 async fn a_custom_role_arn_is_refused_while_the_pool_has_no_roles() {
     let emulator = Emulator::new();
@@ -1009,9 +1006,18 @@ async fn a_custom_role_arn_is_refused_while_the_pool_has_no_roles() {
             status, 400,
             "case {case:?}: expected HTTP 400 for a CustomRoleArn, got {status} with {body}"
         );
+        // This pool holds no role mapping and no SAML provider, and the exchange presents
+        // no login at all, so there were never several roles to choose between: naming one
+        // is the bad parameter the service says it is.
         assert!(
-            error_code(&body).contains("InvalidIdentityPoolConfigurationException"),
-            "case {case:?}: expected InvalidIdentityPoolConfigurationException, got {body}"
+            error_code(&body).contains("InvalidParameterException"),
+            "case {case:?}: expected InvalidParameterException, got {body}"
+        );
+        assert_eq!(
+            member(&body, "message").and_then(|message| message.as_str().map(str::to_string)),
+            Some("Only SAML providers and providers with RoleMappings support custom role ARN."
+                .to_string()),
+            "case {case:?}: expected the fixed custom-role message, got {body}"
         );
     }
 

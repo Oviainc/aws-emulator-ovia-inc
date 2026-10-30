@@ -255,12 +255,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetId<Eng> {
         };
 
         // "Any provided logins will be validated against supported login providers"
-        // (`GetCredentialsForIdentity` in this service's model): a `Logins` entry carries
-        // its issuer in the provider name, so this pool's stored trust for that issuer —
-        // a `CognitoIdentityProviders` entry, or an `OpenIdConnectProviderARNs` entry that
-        // still resolves to an IAM OIDC provider — decides it, together with the audience
+        // (`GetCredentialsForIdentity` in this service's model): the TOKEN each entry
+        // presents is decided first — a value that is not the kind of token its provider
+        // issues, and one issued by someone other than the provider it is presented under,
+        // authorize nothing — and then this pool's stored trust for that token's issuer,
+        // which a `Logins` entry carries in the provider name, together with the audience
         // that trust accepts.
-        if let Some(refusal) = pool.login_trust(&registered).refuse(&logins) {
+        if let Some(refusal) = pool.refuse_logins(&registered, &logins) {
             return Err(GetIdErrorModeled::NotAuthorizedException(NotAuthorizedException {
                 message: Some(refusal.message().to_string()),
             })
@@ -271,10 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetId<Eng> {
         // may have an identity at all.
         if logins.is_empty() && !pool.allow_unauthenticated_identities {
             return Err(GetIdErrorModeled::NotAuthorizedException(NotAuthorizedException {
-                message: Some(format!(
-                    "Unauthenticated access is not supported for the identity pool '{}'.",
-                    input.identity_pool_id
-                )),
+                message: Some(crate::state::UNAUTHENTICATED_ACCESS_MESSAGE.to_string()),
             })
             .into());
         }

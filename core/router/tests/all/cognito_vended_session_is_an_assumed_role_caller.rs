@@ -212,6 +212,35 @@ struct Row<'a> {
     role: &'a SeededRole,
 }
 
+/// The identity token an Amazon Cognito user pool issues, as the `Logins` entry made under
+/// its provider name carries it: a compact JWS whose header names a signing algorithm, whose
+/// claim set names that provider as the issuer (`iss`) and a user as the subject, and whose
+/// signature segment is filled (RFC 7515 §3.1, RFC 7519 §4.1). Nothing in the emulator
+/// verifies the signature — that needs the issuer's published key — so what a presented
+/// login is decided by is this form and these claims.
+fn id_token_of(provider_name: &str) -> String {
+    let segment = |value: &str| {
+        aws_smithy_types::base64::encode(value.as_bytes())
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_")
+    };
+    format!(
+        "{}.{}.{}",
+        segment(r#"{"alg":"RS256","kid":"kid-1","typ":"JWT"}"#),
+        segment(
+            &json!({
+                "iss": format!("https://{provider_name}"),
+                "sub": "a-user-of-the-pool",
+                "token_use": "id",
+                "exp": 4_102_444_800u64,
+            })
+            .to_string()
+        ),
+        segment("a-signature-nothing-here-verifies")
+    )
+}
+
 /// `iam:CreateRole` with a trust policy admitting `audience`'s users.
 fn create_role(
     router: &MultiServiceRouter,
@@ -364,7 +393,11 @@ fn set_identity_pool_roles(
             "RoleMappings": {
                 provider_name: {
                     "Type": "Rules",
-                    "AmbiguousRoleResolution": "Deny",
+                    // A token whose claims match no rule falls to the pool's own
+                    // authenticated role, which is the role the flow resolves for an
+                    // authenticated exchange — so what the rows below vary is the flow and
+                    // the `CustomRoleArn`, not whether a rule happened to match.
+                    "AmbiguousRoleResolution": "AuthenticatedRole",
                     "RulesConfiguration": {"Rules": [{
                         "Claim": "custom:tier",
                         "MatchType": "Equals",
@@ -506,10 +539,11 @@ fn a_vended_session_resolves_to_its_assumed_role_caller() {
                 &mapped.arn,
             );
 
-            // The `Logins` entry the authenticated rows present: one token, under the
-            // user pool's own provider name.
+            // The `Logins` entry the authenticated rows present: the identity token that
+            // user pool issues, under the user pool's own provider name — a compact JWS
+            // naming that provider as its issuer, which is what a login of a user pool is.
             let provider = provider_name.clone();
-            let login = json!({provider: "a.user-pool.token"});
+            let login = json!({provider: id_token_of(&provider_name)});
             // The rows differ along what the rule generalises over: which role the pool
             // resolves for the request — the flow it is in, and whether it names a
             // `CustomRoleArn` among the roles the pool holds — and the form of that role's

@@ -291,9 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> LookupDeveloperId
                 return Err(
                     LookupDeveloperIdentityErrorModeled::NotAuthorizedException(
                         NotAuthorizedException {
-                            message: Some(format!(
-                                "Access to Identity '{identity_id}' is forbidden."
-                            )),
+                            message: Some(crate::state::forbidden_identity_message(identity_id)),
                         },
                     )
                     .into(),
@@ -348,7 +346,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> LookupDeveloperId
                 (identity_id, vec![identifier])
             }
             (Some(identity_id), None) => {
+                // The lookup resolves a developer-identity MAPPING of the pool. An identity
+                // the pool has registered no developer user identifier for names no such
+                // mapping, so there is nothing of its developer identity to report, and
+                // resolving one is an authorization question rather than the lookup of a
+                // resource the request already names: it is refused as access this caller
+                // does not have, exactly as an identifier the pool has registered against no
+                // identity is.
                 let identifiers = identifiers_of(&identity_id);
+                if identifiers.is_empty() {
+                    return Err(
+                        LookupDeveloperIdentityErrorModeled::NotAuthorizedException(
+                            NotAuthorizedException {
+                                message: Some(
+                                    crate::state::DEVELOPER_IDENTIFIER_FORBIDDEN_MESSAGE
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
                 (identity_id, identifiers)
             }
             (None, Some(identifier)) => {
