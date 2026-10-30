@@ -598,6 +598,8 @@ mod import_task_cancellation;
 mod instance_connect_endpoints;
 #[path = "all/instance_event_notification_attributes.rs"]
 mod instance_event_notification_attributes;
+#[path = "all/instance_event_window_associations.rs"]
+mod instance_event_window_associations;
 #[path = "all/instance_event_windows.rs"]
 mod instance_event_windows;
 #[path = "all/instance_lifecycle.rs"]

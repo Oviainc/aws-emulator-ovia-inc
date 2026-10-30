@@ -329,10 +329,12 @@ async fn a_created_window_round_trips_through_the_describe() {
             case = case.case
         );
         // "When you create the event window, targets (instance IDs, Dedicated Host IDs, or
-        // tags) are not yet associated with it" (`CreateInstanceEventWindow`).
+        // tags) are not yet associated with it" (`CreateInstanceEventWindow`): the window
+        // carries an association target holding an EMPTY set of each of the three kinds of
+        // target, which is what the create reports.
         assert_eq!(
-            element(&body, "associationTarget"),
-            None,
+            super::instance_event_window_associations::reported_target(case.case, &body),
+            Some(super::instance_event_window_associations::Target::default()),
             "case {case:?}: a fresh window is associated with nothing, got body {body}",
             case = case.case
         );

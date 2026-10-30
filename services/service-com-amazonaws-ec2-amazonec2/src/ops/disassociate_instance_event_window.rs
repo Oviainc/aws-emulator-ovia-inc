@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateInstanceEventWindow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateInstanceEventWindow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes the targets a request names off one event window, and reports the window the store
+//! now holds — `DescribeInstanceEventWindows` reports the same one, because both read the
+//! record this writes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateInstanceEventWindow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Which targets a window may carry is the rule this and `AssociateInstanceEventWindow`
+//! share, so it is read in one place ([`crate::state::require_event_window_targets_named`]):
+//! a request names at least one TYPE of target — the instances, the instance tags or the
+//! Dedicated Hosts. The window is handed back `disassociating`, and the clock, not a caller,
+//! moves it to `active`.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +137,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateInstanceEventWindow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateInstanceEventWindowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateInstanceEventWindow"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            event_window_association_target, require_event_window_target_id_count,
+            require_event_window_targets_named, require_service_state,
+            unresolvable_instance_event_window_id, validate_event_window_target_tags,
+            without_target_ids, without_target_tags, INSTANCE_EVENT_WINDOW_STATE_DISASSOCIATING,
+            TRANSITION_DELAY,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — an event
+        // window carries no ARN and no Availability Zone, so nothing about it is derived
+        // from the Region the call was signed for. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+
+        let window_id = input.instance_event_window_id.as_str();
+        let requested = &input.association_target;
+        let instance_ids = requested.instance_ids.as_deref().unwrap_or_default();
+        let instance_tags = requested.instance_tags.as_deref().unwrap_or_default();
+        let dedicated_host_ids = requested.dedicated_host_ids.as_deref().unwrap_or_default();
+
+        // The same reading of which targets a request named that the association of a window
+        // takes ([`crate::state::require_event_window_targets_named`]): a request that names
+        // an empty set of each names no target to disassociate at all. Only the ASSOCIATION
+        // of a window is documented to take one type of target at a time, so a request that
+        // names several kinds to let go of is served rather than refused here.
+        require_event_window_targets_named(instance_ids, instance_tags, dedicated_host_ids)?;
+        // How many targets one call may name is bounded before anything proportional to it
+        // is done, the way the association of a window bounds the same three lists.
+        require_event_window_target_id_count("InstanceIds", instance_ids)?;
+        require_event_window_target_id_count("DedicatedHostIds", dedicated_host_ids)?;
+        validate_event_window_target_tags(instance_tags)?;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        let record = store
+            .instance_event_windows
+            .get(window_id)
+            .ok_or_else(|| unresolvable_instance_event_window_id(window_id))?;
+        let held = record.view.association_target.clone().unwrap_or_default();
+
+        // "Disassociates one or more targets from an event window": what is left is what the
+        // window carried MINUS what the request named. A target the window does not carry
+        // takes nothing off it — the request asks for that target not to be one of the
+        // window's, which is what it is either way — and nothing here resolves the named ids
+        // against the store, so a window can let go of an instance or a host that has since
+        // been terminated or released.
+        let remaining = event_window_association_target(
+            without_target_ids(
+                held.instance_ids.as_deref().unwrap_or_default(),
+                instance_ids,
+            ),
+            without_target_tags(held.tags.as_deref().unwrap_or_default(), instance_tags),
+            without_target_ids(
+                held.dedicated_host_ids.as_deref().unwrap_or_default(),
+                dedicated_host_ids,
+            ),
+        );
+
+        // DryRun sits AFTER every parameter has been validated and the window resolved, and
+        // BEFORE the first write: the flag asks whether the request WOULD have worked, so
+        // one that would have been refused is refused with that reason instead, and one that
+        // would have succeeded leaves the store untouched. This call can only SHRINK what
+        // the store holds, so there is no byte budget to ask about.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let now = ::std::time::Instant::now();
+        // EC2 hands the window back without the targets, in `disassociating`, and it reaches
+        // `active` without anybody asking — the same clock-owed span as every other move of
+        // a window in this crate.
+        if !store.set_instance_event_window_association(
+            window_id,
+            remaining,
+            INSTANCE_EVENT_WINDOW_STATE_DISASSOCIATING,
+            now + TRANSITION_DELAY,
+        ) {
+            return Err(Scaffolded::internal_error(format!(
+                "the event window '{window_id}' could not be written"
+            )));
+        }
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // DescribeInstanceEventWindows will see rather than the request object.
+        store
+            .instance_event_windows
+            .get(window_id)
+            .map(|record| DisassociateInstanceEventWindowOutput {
+                instance_event_window: Some(record.view_at(now)),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the event window '{window_id}' could not be read back"
+                ))
+            })
     }
 }

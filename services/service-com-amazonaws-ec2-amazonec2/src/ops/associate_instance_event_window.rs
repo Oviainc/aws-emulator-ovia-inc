@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateInstanceEventWindow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateInstanceEventWindow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Gives one event window the targets a request names, and reports the window the store now
+//! holds — `DescribeInstanceEventWindows` reports the same one, because both read the record
+//! this writes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateInstanceEventWindow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Which targets a window may carry is the rule this and `DisassociateInstanceEventWindow`
+//! share, so it is read in one place ([`crate::state::require_one_event_window_target_kind`]):
+//! only one TYPE of target — the instances, the instance tags or the Dedicated Hosts — can be
+//! associated with a window. The window is handed back `associating`, and the clock, not a
+//! caller, moves it to `active`.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +138,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateInstanceEventWindow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateInstanceEventWindowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateInstanceEventWindow"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            event_window_association_target, instance_event_window_limit_exceeded,
+            instance_event_window_payload_bytes, require_event_window_target_capacity,
+            require_event_window_target_id_count, require_known_instance,
+            require_one_event_window_target_kind, require_service_state, unresolvable_host_id,
+            unresolvable_instance_event_window_id, validate_event_window_target_tags,
+            with_target_ids, with_target_tags, EventWindowTargetKind,
+            INSTANCE_EVENT_WINDOW_STATE_ASSOCIATING, MAX_STORED_BYTES, ONE_TARGET_TYPE_MESSAGE,
+            TRANSITION_DELAY,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — an event
+        // window carries no ARN and no Availability Zone, so nothing about it is derived
+        // from the Region the call was signed for. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+
+        let window_id = input.instance_event_window_id.as_str();
+        let requested = &input.association_target;
+        let instance_ids = requested.instance_ids.as_deref().unwrap_or_default();
+        let instance_tags = requested.instance_tags.as_deref().unwrap_or_default();
+        let dedicated_host_ids = requested.dedicated_host_ids.as_deref().unwrap_or_default();
+
+        // "Only one type of target (instance ID, instance tag, or Dedicated Host ID) can be
+        // associated with an event window" (`InstanceEventWindowAssociationRequest`), and a
+        // request that names an empty set of each names no target to associate at all.
+        let kind =
+            require_one_event_window_target_kind(instance_ids, instance_tags, dedicated_host_ids)?;
+        // How many targets one call may name is bounded before anything proportional to it
+        // is done: the model declares no `@length` on any of the three lists, so without
+        // this one request could hand the store a list as long as its body allows.
+        require_event_window_target_id_count("InstanceIds", instance_ids)?;
+        require_event_window_target_id_count("DedicatedHostIds", dedicated_host_ids)?;
+        validate_event_window_target_tags(instance_tags)?;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        let record = store
+            .instance_event_windows
+            .get(window_id)
+            .ok_or_else(|| unresolvable_instance_event_window_id(window_id))?;
+        let held = record.view.association_target.clone().unwrap_or_default();
+
+        // "Only one type of target ... can be associated with an event window" is a rule
+        // about the WINDOW and not only about one request, so a window already associated
+        // with targets of another type cannot take on these ones beside them — the same
+        // refusal, worded the same way, as a request that names two types at once.
+        if EventWindowTargetKind::held_by(&held)
+            .into_iter()
+            .any(|held_kind| held_kind != kind)
+        {
+            return Err(Scaffolded::invalid_parameter_combination(
+                ONE_TARGET_TYPE_MESSAGE,
+            ));
+        }
+
+        // "Associates one or more targets with an event window": the call ADDS to the
+        // targets the window already carries, and a target it already carries is already
+        // associated, so naming it again changes nothing.
+        let associated = event_window_association_target(
+            with_target_ids(held.instance_ids.as_deref().unwrap_or_default(), instance_ids),
+            with_target_tags(held.tags.as_deref().unwrap_or_default(), instance_tags),
+            with_target_ids(
+                held.dedicated_host_ids.as_deref().unwrap_or_default(),
+                dedicated_host_ids,
+            ),
+        );
+
+        // The ids and tags of a target are caller-chosen bytes the store keeps for as long
+        // as the window does, and this call can only GROW them, so both ceilings on what one
+        // window may hold are asked about the target it WOULD leave — the count first, then
+        // the NET byte change, counted by the one definition of that charge over the record
+        // as it would be — before anything is written.
+        require_event_window_target_capacity(&associated)?;
+        let refund = instance_event_window_payload_bytes(&record.view);
+        let charge = instance_event_window_payload_bytes(&InstanceEventWindow {
+            association_target: Some(associated.clone()),
+            ..record.view.clone()
+        });
+
+        // A target is a REFERENCE to a resource of this account, so one this service cannot
+        // resolve is refused rather than stored: a window associated with an instance that
+        // was never launched would report a target no scheduled event could ever belong to.
+        for instance_id in instance_ids {
+            require_known_instance(&store, instance_id)?;
+        }
+        for host_id in dedicated_host_ids {
+            if !store.dedicated_hosts.contains_key(host_id) {
+                return Err(unresolvable_host_id(host_id));
+            }
+        }
+
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(instance_event_window_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store the {charge} bytes the event \
+                 window '{window_id}' would hold",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named resource
+        // resolved, and BEFORE the first write: the flag asks whether the request WOULD have
+        // worked, so one that would have been refused is refused with that reason instead,
+        // and one that would have succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let now = ::std::time::Instant::now();
+        // EC2 hands the window back carrying the target, in `associating`, and it reaches
+        // `active` without anybody asking — the same clock-owed span as the `creating` ->
+        // `active` move of a freshly created window.
+        if !store.set_instance_event_window_association(
+            window_id,
+            associated,
+            INSTANCE_EVENT_WINDOW_STATE_ASSOCIATING,
+            now + TRANSITION_DELAY,
+        ) {
+            return Err(Scaffolded::internal_error(format!(
+                "the event window '{window_id}' could not be written"
+            )));
+        }
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // DescribeInstanceEventWindows will see rather than the request object.
+        store
+            .instance_event_windows
+            .get(window_id)
+            .map(|record| AssociateInstanceEventWindowOutput {
+                instance_event_window: Some(record.view_at(now)),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the event window '{window_id}' could not be read back"
+                ))
+            })
     }
 }

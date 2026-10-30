@@ -397,10 +397,6 @@ fn canonical_filter_name(name: &str) -> Option<&str> {
 /// How the `instance-tag` filter names one tag of an associated target: "the specified tag
 /// and value" (`DescribeInstanceEventWindowsRequest$Filters`), which EC2 spells
 /// `<key>=<value>` — the same spelling its `instance-tag` filters take elsewhere.
-///
-/// Nothing can carry an association target until `AssociateInstanceEventWindow` is
-/// implemented, so no stored window exercises this yet; the spelling is worth re-checking,
-/// with a test over a tagged target, when that operation lands.
 const INSTANCE_TAG_SEPARATOR: char = '=';
 
 /// The values the EC2 filter `name` compares against this event window, as
@@ -409,8 +405,8 @@ const INSTANCE_TAG_SEPARATOR: char = '=';
 ///
 /// A filter naming an attribute this window does not carry compares against NO values, so
 /// it selects nothing — which is the answer for every `instance-*` and `dedicated-host-id`
-/// filter on a window nothing is associated with, a freshly created window having no
-/// association target. `name` is a name [`canonical_filter_name`] resolved.
+/// filter on a window nothing is associated with, whose association target holds an empty
+/// set of each kind of target. `name` is a name [`canonical_filter_name`] resolved.
 fn filter_values<'a>(
     window: &'a InstanceEventWindow,
     name: &str,

@@ -18,6 +18,14 @@
 //! the one reading of the constraints `CreateInstanceEventWindowRequest$CronExpression`
 //! documents.
 //!
+//! What a window is TARGETED at is a rule the association and the disassociation of one
+//! share, so it lives here too: [`require_one_event_window_target_kind`] is the one reading
+//! of "only one type of target ... can be associated with an event window",
+//! [`event_window_association_target`] the one constructor of a stored target, and
+//! [`ComAmazonawsEc2Amazonec2State::set_instance_event_window_association`] the one writer
+//! of one — so neither call can keep a target, charge its bytes or report the state the
+//! clock owes it differently.
+//!
 //! A child module of [`crate::state`] rather than more lines in it: everything here belongs
 //! to one resource and reaches the rest of the store through `use super::*`, so the state
 //! module keeps only the field the windows live in and the writers that mint one.
@@ -25,7 +33,8 @@
 use std::time::Instant;
 
 use crate::ops::types::{
-    InstanceEventWindow, InstanceEventWindowTimeRange, InstanceEventWindowTimeRangeRequest,
+    InstanceEventWindow, InstanceEventWindowAssociationTarget, InstanceEventWindowTimeRange,
+    InstanceEventWindowTimeRangeRequest,
 };
 
 use super::*;
@@ -46,6 +55,23 @@ pub const INSTANCE_EVENT_WINDOW_STATE_CREATING: &str = "creating";
 /// The state the clock moves a newly created event window to: the
 /// `InstanceEventWindowState` member `active`.
 pub const INSTANCE_EVENT_WINDOW_STATE_ACTIVE: &str = "active";
+
+/// The state a window reports while targets it was asked to take on are being attached to
+/// it, from the call that asks until the clock has finished the work.
+///
+/// EC2 answers `AssociateInstanceEventWindow` with the window already carrying the target
+/// and this word for its state, then reaches
+/// [`INSTANCE_EVENT_WINDOW_STATE_ACTIVE`] without anybody asking — the same shape the
+/// `creating` -> `active` move has. The model's `InstanceEventWindowState` enum lists the
+/// four states a window RESTS in (`crate::ops::types::INSTANCE_EVENT_WINDOW_STATE_VALUES`)
+/// and names neither in-flight word, so the two live here beside the moves that report
+/// them.
+pub const INSTANCE_EVENT_WINDOW_STATE_ASSOCIATING: &str = "associating";
+
+/// The state a window reports while targets it was asked to let go of are being detached
+/// from it — the other direction of [`INSTANCE_EVENT_WINDOW_STATE_ASSOCIATING`], reported
+/// by `DisassociateInstanceEventWindow` until the clock has finished the work.
+pub const INSTANCE_EVENT_WINDOW_STATE_DISASSOCIATING: &str = "disassociating";
 
 /// `instance-event-window`, the `ResourceType` member that names an event window — the one
 /// resource `CreateInstanceEventWindow`'s `TagSpecifications` may tag.
@@ -135,8 +161,8 @@ pub const MAX_EVENT_WINDOW_CRON_BYTES: usize = 256;
 pub const CRON_FIELDS: usize = 5;
 
 /// One stored instance event window: the modelled [`InstanceEventWindow`] every operation
-/// that reports one answers with, plus the instant the clock owes it its `creating` ->
-/// `active` move.
+/// that reports one answers with, plus the instant the clock owes it its move to `active`
+/// and the word it reports until then.
 ///
 /// The view holds no `State`: the state is a fact of the window's age, so
 /// [`InstanceEventWindowRecord::view_at`] derives it rather than letting two writers store
@@ -145,10 +171,18 @@ pub const CRON_FIELDS: usize = 5;
 pub struct InstanceEventWindowRecord {
     /// The window as the model shapes it, with `State` left for `view_at` to fill.
     pub view: InstanceEventWindow,
-    /// The instant from which this window's `creating` -> `active` move is due.
+    /// The instant from which this window's move to `active` is due.
     /// Monotonic ([`Instant`]), because it is only ever compared against the clock and
     /// never reported, so a wall-clock adjustment cannot move a window back to `creating`.
     pub active_at: Instant,
+    /// The `InstanceEventWindowState` this window reports until [`Self::active_at`]: the
+    /// word for the work the last call to change it started — `creating` for the window a
+    /// create minted, [`INSTANCE_EVENT_WINDOW_STATE_ASSOCIATING`] or
+    /// [`INSTANCE_EVENT_WINDOW_STATE_DISASSOCIATING`] for a change of its targets. Every
+    /// one of those calls hands the window back BEFORE the clock has finished the work, so
+    /// which word is owed is a fact of what was asked for and not of the window's age,
+    /// while WHEN it gives way to `active` is a fact of the clock alone.
+    pub in_flight_state: &'static str,
 }
 
 impl InstanceEventWindowRecord {
@@ -160,10 +194,12 @@ impl InstanceEventWindowRecord {
         view
     }
 
-    /// The window's `InstanceEventWindowState` at `now`.
+    /// The window's `InstanceEventWindowState` at `now`: the word the call that last
+    /// changed it left owed, until the clock reaches the instant that call made the move
+    /// due, and `active` from then on.
     pub fn state_at(&self, now: Instant) -> &'static str {
         if now < self.active_at {
-            INSTANCE_EVENT_WINDOW_STATE_CREATING
+            self.in_flight_state
         } else {
             INSTANCE_EVENT_WINDOW_STATE_ACTIVE
         }
@@ -229,9 +265,13 @@ impl ComAmazonawsEc2Amazonec2State {
             time_ranges: spec.time_ranges,
             // "When you create the event window, targets (instance IDs, Dedicated Host IDs,
             // or tags) are not yet associated with it" (`CreateInstanceEventWindow`), so a
-            // fresh window targets nothing; `AssociateInstanceEventWindow` is the operation
-            // that gives it a target.
-            association_target: None,
+            // fresh window holds an EMPTY set of each of the three kinds of target;
+            // `AssociateInstanceEventWindow` is the operation that puts one in.
+            association_target: Some(event_window_association_target(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )),
             // Derived from `active_at` on every read.
             state: None,
             tags: Some(spec.tags),
@@ -242,16 +282,48 @@ impl ComAmazonawsEc2Amazonec2State {
             InstanceEventWindowRecord {
                 view,
                 active_at: spec.active_at,
+                in_flight_state: INSTANCE_EVENT_WINDOW_STATE_CREATING,
             },
         );
         Some(instance_event_window_id)
     }
+
+    /// Write one stored window's association target, leave it reporting `in_flight_state`
+    /// until `active_at`, and answer whether a window of that id was there to write.
+    ///
+    /// The ONE writer of a window's targets, shared by the association and the
+    /// disassociation of one, so the two cannot keep the target or the byte charge
+    /// differently. The bytes the record held are given back and the bytes it now holds are
+    /// charged, by the one definition of that charge
+    /// ([`instance_event_window_payload_bytes`]) — a caller that could GROW the charge asks
+    /// [`Self::would_exceed_stored_bytes_after_refund`] about the net change first, the way
+    /// every other replacement path of this store does.
+    pub fn set_instance_event_window_association(
+        &mut self,
+        instance_event_window_id: &str,
+        association_target: InstanceEventWindowAssociationTarget,
+        in_flight_state: &'static str,
+        active_at: Instant,
+    ) -> bool {
+        let Some(record) = self.instance_event_windows.get_mut(instance_event_window_id) else {
+            return false;
+        };
+        let refund = instance_event_window_payload_bytes(&record.view);
+        record.view.association_target = Some(association_target);
+        record.in_flight_state = in_flight_state;
+        record.active_at = active_at;
+        let charge = instance_event_window_payload_bytes(&record.view);
+        self.release_stored_bytes(refund);
+        self.add_stored_bytes(charge);
+        true
+    }
 }
 
 /// The caller-chosen bytes one stored event window holds — its tags, its name, the cron
-/// expression the request named and the time ranges it named — plus the fixed cost of the
-/// record itself ([`INSTANCE_EVENT_WINDOW_RECORD_BYTES`]), so no window is free. The id and
-/// the state are derived by this module.
+/// expression the request named, the time ranges it named and the targets it is associated
+/// with — plus the fixed cost of the record itself
+/// ([`INSTANCE_EVENT_WINDOW_RECORD_BYTES`]), so no window is free. The id and the state are
+/// derived by this module.
 ///
 /// A time range is a fixed-size element, but the LIST of them is as long as the caller made
 /// it, so each one is charged — the bytes of the two week-day words it stores plus the
@@ -280,6 +352,30 @@ pub fn instance_event_window_payload_bytes(window: &InstanceEventWindow) -> usiz
         .saturating_add(window.name.as_deref().map_or(0, str::len))
         .saturating_add(window.cron_expression.as_deref().map_or(0, str::len))
         .saturating_add(time_range_bytes)
+        .saturating_add(
+            window
+                .association_target
+                .as_ref()
+                .map_or(0, event_window_association_target_bytes),
+        )
+}
+
+/// The caller-chosen bytes one stored association target holds: every id and every tag the
+/// calls that built it named, each of which the store keeps for as long as the window does.
+///
+/// Part of [`instance_event_window_payload_bytes`] rather than a charge of its own, so a
+/// window is charged once wherever its target came from; the count of each set is bounded
+/// independently ([`MAX_RESOURCE_IDS`], [`MAX_EVENT_WINDOW_TARGET_TAGS`]), and neither bound
+/// is the other.
+pub fn event_window_association_target_bytes(
+    target: &InstanceEventWindowAssociationTarget,
+) -> usize {
+    let id_bytes = |ids: Option<&Vec<String>>| -> usize {
+        ids.into_iter().flatten().map(String::len).sum()
+    };
+    id_bytes(target.instance_ids.as_ref())
+        .saturating_add(id_bytes(target.dedicated_host_ids.as_ref()))
+        .saturating_add(tag_list_bytes(target.tags.as_deref().unwrap_or_default()))
 }
 
 /// The fixed overhead one stored event window costs whatever it carries: the modelled
@@ -303,13 +399,19 @@ pub fn instance_event_window_id_is_well_formed(id: &str) -> bool {
 
 /// Refuse a request that named an event window id the account holds no such window for:
 /// HTTP 400 `InvalidInstanceEventWindowId.NotFound`.
+///
+/// Worded by [`id_not_found`], the one template this service refuses an id it holds no
+/// resource for with, and naming the resource the way EC2's own `ResourceType` member for it
+/// does ([`RESOURCE_TYPE_INSTANCE_EVENT_WINDOW`]) — the spelling the refusals of the other
+/// resource families whose ids carry a type token take
+/// ([`invalid_capacity_reservation_id_not_found`]).
 pub fn invalid_instance_event_window_id_not_found<E>(
     instance_event_window_id: &str,
 ) -> Scaffolded<E> {
-    Scaffolded::service_error(
+    id_not_found(
         INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND,
-        400,
-        format!("The event window ID '{instance_event_window_id}' does not exist"),
+        &format!("{RESOURCE_TYPE_INSTANCE_EVENT_WINDOW} ID"),
+        instance_event_window_id,
     )
 }
 
@@ -331,6 +433,269 @@ pub fn unresolvable_instance_event_window_id<E>(instance_event_window_id: &str) 
 /// byte budget: HTTP 400 `InstanceEventWindowLimitExceeded`.
 pub fn instance_event_window_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
     Scaffolded::service_error(INSTANCE_EVENT_WINDOW_LIMIT_EXCEEDED, 400, message)
+}
+
+/// How many instance tags one event window's association target may name.
+///
+/// A STORE-PROTECTION ceiling this emulator chose, not a modelled `@length`: the model
+/// declares none on `TagList`, so without it one request could hand the store a list as long
+/// as the request body allows and keep it for the process's lifetime. A target's tags select
+/// instances the way a resource's own tags are selected, so it takes the same count EC2
+/// documents for those ([`MAX_TAGS_PER_RESOURCE`]); the ids of a target are bounded by
+/// [`MAX_RESOURCE_IDS`], the ceiling every id list of this service takes.
+pub const MAX_EVENT_WINDOW_TARGET_TAGS: usize = MAX_TAGS_PER_RESOURCE;
+
+/// Which of the three kinds of target one request named for an event window.
+///
+/// "Only one *type* of target (instance ID, instance tag, or Dedicated Host ID) can be
+/// associated with an event window" (`InstanceEventWindowAssociationRequest`), so a request
+/// names exactly one of them — this is which, as
+/// [`require_one_event_window_target_kind`] reads it off the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventWindowTargetKind {
+    /// `InstanceIds`: "The IDs of the instances".
+    InstanceIds,
+    /// `InstanceTags`: "The instance tags".
+    InstanceTags,
+    /// `DedicatedHostIds`: "The IDs of the Dedicated Hosts".
+    DedicatedHostIds,
+}
+
+impl EventWindowTargetKind {
+    /// The request member this kind of target is named by, for a refusal that has to say
+    /// which one it means.
+    pub fn member_name(self) -> &'static str {
+        match self {
+            Self::InstanceIds => "InstanceIds",
+            Self::InstanceTags => "InstanceTags",
+            Self::DedicatedHostIds => "DedicatedHostIds",
+        }
+    }
+
+    /// The kinds of target `target` currently holds something of — none for a window
+    /// nothing is associated with, and (by the rule above) one for every other window.
+    pub fn held_by(target: &InstanceEventWindowAssociationTarget) -> Vec<Self> {
+        let mut held = Vec::new();
+        if target.instance_ids.as_deref().is_some_and(|ids| !ids.is_empty()) {
+            held.push(Self::InstanceIds);
+        }
+        if target.tags.as_deref().is_some_and(|tags| !tags.is_empty()) {
+            held.push(Self::InstanceTags);
+        }
+        if target
+            .dedicated_host_ids
+            .as_deref()
+            .is_some_and(|ids| !ids.is_empty())
+        {
+            held.push(Self::DedicatedHostIds);
+        }
+        held
+    }
+}
+
+/// The ONE reading of which targets a request named for an event window, shared by the
+/// association and the disassociation of a window's targets: the kinds of target it named,
+/// refusing one that named none at all.
+///
+/// A target is a required member of both requests, so a request reaching here carries the
+/// structure — but each of its three sets is optional, and an EMPTY set names no target, so
+/// an empty one counts as unspecified rather than as a kind the request asked about.
+pub fn require_event_window_targets_named<E>(
+    instance_ids: &[String],
+    instance_tags: &[Tag],
+    dedicated_host_ids: &[String],
+) -> Result<Vec<EventWindowTargetKind>, Scaffolded<E>> {
+    let named: Vec<EventWindowTargetKind> = [
+        (!instance_ids.is_empty()).then_some(EventWindowTargetKind::InstanceIds),
+        (!instance_tags.is_empty()).then_some(EventWindowTargetKind::InstanceTags),
+        (!dedicated_host_ids.is_empty()).then_some(EventWindowTargetKind::DedicatedHostIds),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if named.is_empty() {
+        return Err(Scaffolded::missing_parameter(
+            "One of InstanceIds, InstanceTags or DedicatedHostIds must be specified",
+        ));
+    }
+    Ok(named)
+}
+
+/// The refusal both calls that change a window's targets answer a request that breaks the
+/// one-type rule with: "Only one *type* of target (instance ID, instance tag, or Dedicated
+/// Host ID) can be associated with an event window"
+/// (`InstanceEventWindowAssociationRequest`), which is the rule itself as the documented
+/// sentence states it — one wording, whether the request named two types at once or named
+/// one the window cannot hold beside the type it already holds, because the rule broken is
+/// the same.
+pub const ONE_TARGET_TYPE_MESSAGE: &str = "Only one type of target (instance ID, instance \
+                                           tag, or Dedicated Host ID) can be associated \
+                                           with an event window";
+
+/// The one kind of target a request named, for the call the rule "Only one type of target
+/// (instance ID, instance tag, or Dedicated Host ID) can be associated with an event window"
+/// (`InstanceEventWindowAssociationRequest`) is stated for: a request naming more than one
+/// kind is refused, as is one naming none ([`require_event_window_targets_named`]).
+pub fn require_one_event_window_target_kind<E>(
+    instance_ids: &[String],
+    instance_tags: &[Tag],
+    dedicated_host_ids: &[String],
+) -> Result<EventWindowTargetKind, Scaffolded<E>> {
+    let named =
+        require_event_window_targets_named(instance_ids, instance_tags, dedicated_host_ids)?;
+    match named.as_slice() {
+        [one] => Ok(*one),
+        _ => Err(Scaffolded::invalid_parameter_combination(
+            ONE_TARGET_TYPE_MESSAGE,
+        )),
+    }
+}
+
+/// Refuse an id list longer than this service serves, naming the member it came from —
+/// the ceiling [`MAX_RESOURCE_IDS`] every id list of this service takes, read in one place
+/// for both of the calls that change a window's targets.
+pub fn require_event_window_target_id_count<E>(
+    member: &str,
+    ids: &[String],
+) -> Result<(), Scaffolded<E>> {
+    if ids.len() > MAX_RESOURCE_IDS {
+        return Err(Scaffolded::invalid_parameter_value(format!(
+            "{member} carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+            ids.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a target this store will not HOLD: more ids than [`MAX_RESOURCE_IDS`] or more
+/// tags than [`MAX_EVENT_WINDOW_TARGET_TAGS`] on one window.
+///
+/// The per-request bounds above cap ONE call, which is not the same thing: an association
+/// adds to the targets a window already carries, so without this, repeated calls would grow
+/// a stored target — and the work of merging into it — past the ceiling one call is held to.
+/// Asked of the target an association WOULD leave on the window, before anything is written.
+pub fn require_event_window_target_capacity<E>(
+    target: &InstanceEventWindowAssociationTarget,
+) -> Result<(), Scaffolded<E>> {
+    let ids = |held: Option<&Vec<String>>| held.map_or(0, Vec::len);
+    for (member, count) in [
+        ("instance", ids(target.instance_ids.as_ref())),
+        ("Dedicated Host", ids(target.dedicated_host_ids.as_ref())),
+    ] {
+        if count > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The event window would be associated with {count} {member} ids, above the \
+                 maximum of {MAX_RESOURCE_IDS}"
+            )));
+        }
+    }
+    let tags = target.tags.as_ref().map_or(0, Vec::len);
+    if tags > MAX_EVENT_WINDOW_TARGET_TAGS {
+        return Err(Scaffolded::invalid_parameter_value(format!(
+            "The event window would be associated with {tags} instance tags, above the \
+             maximum of {MAX_EVENT_WINDOW_TARGET_TAGS}"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a target tag list this service will not store: more tags than
+/// [`MAX_EVENT_WINDOW_TARGET_TAGS`], or one whose key or value is longer than EC2 documents
+/// ([`validate_tag_size`]) — the bound asked BEFORE the per-tag one, so the work is
+/// proportional to a length this service serves rather than to one the caller chose.
+pub fn validate_event_window_target_tags<E>(tags: &[Tag]) -> Result<(), Scaffolded<E>> {
+    if tags.len() > MAX_EVENT_WINDOW_TARGET_TAGS {
+        return Err(Scaffolded::invalid_parameter_value(format!(
+            "InstanceTags carries {} tags, above the maximum of \
+             {MAX_EVENT_WINDOW_TARGET_TAGS}",
+            tags.len()
+        )));
+    }
+    for tag in tags {
+        validate_tag_size(
+            tag.key.as_deref().unwrap_or_default(),
+            tag.value.as_deref().unwrap_or_default(),
+        )?;
+    }
+    Ok(())
+}
+
+/// One stored association target, with each of its three sets PRESENT: an empty one for a
+/// kind of target nothing is associated with.
+///
+/// A window that has been asked to take on or let go of targets reports the structure
+/// whatever is left in it, so a caller reads the set it asked about rather than inferring
+/// from an absent element whether the window has targets of that kind. The ONE constructor
+/// of a stored target, so the association and the disassociation of a window cannot report
+/// its sets differently.
+pub fn event_window_association_target(
+    instance_ids: Vec<String>,
+    instance_tags: Vec<Tag>,
+    dedicated_host_ids: Vec<String>,
+) -> InstanceEventWindowAssociationTarget {
+    InstanceEventWindowAssociationTarget {
+        instance_ids: Some(instance_ids),
+        tags: Some(instance_tags),
+        dedicated_host_ids: Some(dedicated_host_ids),
+    }
+}
+
+/// `held` with every id of `added` it does not already carry appended, in the order the
+/// request named them.
+///
+/// Associating a target a window already carries changes nothing: a target is a SET of
+/// resources, so one id is one target of the window however many calls named it.
+pub fn with_target_ids(held: &[String], added: &[String]) -> Vec<String> {
+    let mut union: Vec<String> = held.to_vec();
+    for id in added {
+        if !union.iter().any(|kept| kept == id) {
+            union.push(id.clone());
+        }
+    }
+    union
+}
+
+/// `held` without any id `removed` names.
+///
+/// An id the window does not carry removes nothing rather than failing: the request asks for
+/// the id not to be a target of the window, which is what it is afterwards either way.
+pub fn without_target_ids(held: &[String], removed: &[String]) -> Vec<String> {
+    held.iter()
+        .filter(|id| !removed.iter().any(|dropped| dropped == *id))
+        .cloned()
+        .collect()
+}
+
+/// A tag target as the pair it selects instances by: its key and its value, either of which
+/// a request may leave unset.
+fn tag_target(tag: &Tag) -> (Option<&str>, Option<&str>) {
+    (tag.key.as_deref(), tag.value.as_deref())
+}
+
+/// `held` with every tag of `added` it does not already carry appended, compared as the
+/// key/value pair each one selects instances by — the tag equivalent of
+/// [`with_target_ids`].
+pub fn with_target_tags(held: &[Tag], added: &[Tag]) -> Vec<Tag> {
+    let mut union: Vec<Tag> = held.to_vec();
+    for tag in added {
+        if !union.iter().any(|kept| tag_target(kept) == tag_target(tag)) {
+            union.push(tag.clone());
+        }
+    }
+    union
+}
+
+/// `held` without any tag `removed` names, compared as the key/value pair each one selects
+/// instances by — the tag equivalent of [`without_target_ids`].
+pub fn without_target_tags(held: &[Tag], removed: &[Tag]) -> Vec<Tag> {
+    held.iter()
+        .filter(|tag| {
+            !removed
+                .iter()
+                .any(|dropped| tag_target(dropped) == tag_target(tag))
+        })
+        .cloned()
+        .collect()
 }
 
 /// The calendar index of the `WeekDay` member `day` — `sunday` is 0 and `saturday` is 6 —
