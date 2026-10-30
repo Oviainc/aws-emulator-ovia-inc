@@ -109,6 +109,8 @@ mod list_tags_for_resource;
 mod mandatory_control_is_the_services;
 #[path = "all/manifest_region_names.rs"]
 mod manifest_region_names;
+#[path = "all/minted_arn_region_segment.rs"]
+mod minted_arn_region_segment;
 #[path = "all/one_enabled_control_per_target.rs"]
 mod one_enabled_control_per_target;
 #[path = "all/reserved_tag_keys.rs"]
