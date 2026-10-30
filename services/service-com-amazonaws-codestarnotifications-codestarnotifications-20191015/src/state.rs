@@ -167,8 +167,9 @@ impl ComAmazonawsCodestarnotificationsCodestarnotifications20191015State {
     ///
     /// Dropping the empty entry is what keeps the registry bounded: without it, a
     /// caller could grow `targets` without limit by subscribing new addresses and
-    /// deleting the rules again. `DeleteTarget`, when it is implemented, removes a
-    /// target that rules DO still subscribe to (with `ForceUnsubscribeAll`).
+    /// deleting the rules again. `DeleteTarget` removes a target that rules DO still
+    /// subscribe to (with `ForceUnsubscribeAll`), one subscription at a time, so the
+    /// entry leaves with the last of them.
     pub fn unregister_target(&mut self, rule_arn: &str, address: &str) {
         if let Some(entry) = self.targets.get_mut(address) {
             entry.subscribed_rules.remove(rule_arn);
@@ -176,6 +177,23 @@ impl ComAmazonawsCodestarnotificationsCodestarnotifications20191015State {
                 self.targets.remove(address);
             }
         }
+    }
+
+    /// The ARNs of the rules of THIS REGION that subscribe to `address`.
+    ///
+    /// The registry entry itself is account-wide, so it cannot answer this: a target of
+    /// one region is addressed through that region's endpoint only, like every rule.
+    pub fn rules_subscribed_to(&self, region: &str, address: &str) -> Vec<String> {
+        self.rules
+            .values()
+            .filter(|rule| rule.region == region)
+            .filter(|rule| {
+                rule.targets
+                    .iter()
+                    .any(|target| target.target_address == address)
+            })
+            .map(|rule| rule.arn.clone())
+            .collect()
     }
 
     /// The rule `arn` names, if this REGION holds it. A rule is addressed through a

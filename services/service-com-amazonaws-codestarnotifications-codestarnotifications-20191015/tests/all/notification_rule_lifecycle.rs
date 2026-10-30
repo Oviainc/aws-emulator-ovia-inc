@@ -104,6 +104,16 @@ pub(crate) fn string(body: &Value, member: &str) -> String {
         .to_string()
 }
 
+/// The `Message` member of an error body. restJson1 renders it under the modelled member
+/// name; a client that lowercases it is served by the second lookup.
+pub(crate) fn message(body: &Value) -> String {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn number(body: &Value, member: &str) -> f64 {
     body.get(member).and_then(Value::as_f64).unwrap_or(f64::NAN)
 }

@@ -27,7 +27,7 @@
 
 use serde_json::{json, Value};
 
-use crate::notification_rule_lifecycle::{error_code, string, Emulator};
+use crate::notification_rule_lifecycle::{error_code, message, string, Emulator};
 
 /// The one text this service states for a rule-name conflict, whichever operation
 /// refuses: it states the name-uniqueness rule and interpolates nothing.
@@ -36,16 +36,6 @@ const TAKEN_NAME_TEXT: &str = "The notification rule was not created because ano
                               Notification rule names must be unique within an AWS \
                               account. This helps prevent exceeding the maximum allowed \
                               number of notification rules.";
-
-/// The `Message` member of an error body. restJson1 renders it under the modelled member
-/// name; a client that lowercases it is served by the second lookup.
-fn message(body: &Value) -> String {
-    body.get("Message")
-        .or_else(|| body.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
 
 /// A well-formed `CreateNotificationRule` body, which each row then breaks in ONE place.
 fn create_body(name: &str) -> Value {
