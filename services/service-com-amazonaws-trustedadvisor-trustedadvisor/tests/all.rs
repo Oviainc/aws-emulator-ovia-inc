@@ -19,6 +19,8 @@ mod account_scoped_recommendation_list;
 mod batch_exclusion_unique_arns;
 #[path = "all/cost_optimizing_aggregates.rs"]
 mod cost_optimizing_aggregates;
+#[path = "all/cursor_scope_encoding.rs"]
+mod cursor_scope_encoding;
 #[path = "all/localized_text.rs"]
 mod localized_text;
 #[path = "all/organization_member_set.rs"]

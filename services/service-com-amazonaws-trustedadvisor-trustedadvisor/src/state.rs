@@ -1108,14 +1108,11 @@ pub struct Page<T> {
 #[derive(Debug)]
 pub struct MalformedToken;
 
-/// The separator between a cursor's scope and its key. ASCII unit separator: no
-/// id, ARN or scope this service builds can contain it, so the split is
-/// unambiguous.
+/// The separator between a cursor's scope and its key. ASCII unit separator: a
+/// key this service pages on is a stored id or ARN, which cannot contain it, and
+/// a scope is JSON ([`list_scope`]), whose serializer escapes every control
+/// character — so the split is unambiguous.
 const TOKEN_SEPARATOR: char = '\u{1f}';
-
-/// The separator between the parts of a scope. ASCII record separator, for the
-/// same reason.
-const SCOPE_SEPARATOR: char = '\u{1e}';
 
 /// The cursor scope for one read of a filtered list: the list's name (and, for a
 /// sub-resource list, the parent it was taken under) plus every filter in force,
@@ -1127,17 +1124,35 @@ const SCOPE_SEPARATOR: char = '\u{1e}';
 /// tokens would not see every entry exactly once. Such a token is refused as
 /// malformed instead. `maxResults` is deliberately NOT part of the scope: the
 /// page size may change between pages without changing the sequence.
+///
+/// That refusal holds only while the scope identifies the read UNIQUELY, and a
+/// filter value is request text: the model constrains some filters to an enum or
+/// a digit string, but leaves others a plain string, or an ARN whose pattern ends
+/// in a free-form tail, so a value may carry ANY character — including whatever
+/// characters an encoding of its own might delimit on. The scope is therefore
+/// built as a JSON document through this crate's serializer rather than by
+/// concatenation: the list and the name/value pair of each filter in force are
+/// its elements, so one document comes from exactly one list and filter set and
+/// no value can spell out the encoding of another read.
 pub fn list_scope(list: &str, filters: &[(&str, Option<&str>)]) -> String {
-    let mut scope = list.to_string();
-    for (name, value) in filters {
-        if let Some(value) = value {
-            scope.push(SCOPE_SEPARATOR);
-            scope.push_str(name);
-            scope.push('=');
-            scope.push_str(value);
-        }
-    }
-    scope
+    let in_force: Vec<::serde_json::Value> = filters
+        .iter()
+        .filter_map(|(name, value)| {
+            value.map(|value| {
+                ::serde_json::Value::Array(vec![
+                    ::serde_json::Value::String((*name).to_string()),
+                    ::serde_json::Value::String(value.to_string()),
+                ])
+            })
+        })
+        .collect();
+    // `Value`'s own rendering, which is infallible: no map key, float or byte
+    // string this builds could fail to serialize.
+    ::serde_json::Value::Array(vec![
+        ::serde_json::Value::String(list.to_string()),
+        ::serde_json::Value::Array(in_force),
+    ])
+    .to_string()
 }
 
 /// The cursor for a page of `scope` that ended on `last_key`: base64 of the
