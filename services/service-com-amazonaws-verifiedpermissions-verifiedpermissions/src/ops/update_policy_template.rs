@@ -269,6 +269,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(refused)?;
         }
 
+        // "If you specify a name that is already associated with another policy
+        // template in the policy store, you receive a ConflictException error" —
+        // another template: a request repeating this template's own name changes
+        // nothing, and one assigning no name ([`crate::state::assigned_name`])
+        // collides with nothing.
+        //
+        // Decided BEFORE the store's capacity below, as it is in every writer of
+        // this service that takes a unique name: the name a request asks for is
+        // already taken whatever room the store has left, so the caller is told
+        // the name is taken rather than being told the store is full and left to
+        // discover the collision after making room.
+        if let Some(name) = crate::state::assigned_name(input.name.as_deref()) {
+            if let Some(clash) = store.policy_templates.values().find(|other| {
+                other.name.as_deref() == Some(name) && other.policy_template_id != template_id
+            }) {
+                return Err(UpdatePolicyTemplateErrorModeled::ConflictException(
+                    crate::ops::conflict([crate::ops::resource_conflict(
+                        &clash.policy_template_id,
+                        crate::state::RESOURCE_TYPE_POLICY_TEMPLATE,
+                    )]),
+                )
+                .into());
+            }
+        }
+
         // The store's Cedar-text budget, which a replacement can grow: the bytes
         // this template already contributes come out and the replacement's go in,
         // so an update is held to the same bound a create is. This operation
@@ -286,25 +311,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::MAX_POLICY_BYTES_PER_STORE
                 ),
             )));
-        }
-
-        // "If you specify a name that is already associated with another policy
-        // template in the policy store, you receive a ConflictException error" —
-        // another template: a request repeating this template's own name changes
-        // nothing, and one assigning no name ([`crate::state::assigned_name`])
-        // collides with nothing.
-        if let Some(name) = crate::state::assigned_name(input.name.as_deref()) {
-            if let Some(clash) = store.policy_templates.values().find(|other| {
-                other.name.as_deref() == Some(name) && other.policy_template_id != template_id
-            }) {
-                return Err(UpdatePolicyTemplateErrorModeled::ConflictException(
-                    crate::ops::conflict([crate::ops::resource_conflict(
-                        &clash.policy_template_id,
-                        crate::state::RESOURCE_TYPE_POLICY_TEMPLATE,
-                    )]),
-                )
-                .into());
-            }
         }
 
         let store = state

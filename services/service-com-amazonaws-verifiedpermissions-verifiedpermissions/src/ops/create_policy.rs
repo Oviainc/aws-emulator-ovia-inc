@@ -386,6 +386,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
+        // "If you specify a name that is already associated with another policy
+        // in the policy store, you receive a ConflictException error"
+        // (`CreatePolicyInput$name`) — a policy name is unique within its store,
+        // among the policies that were ASSIGNED a name, so a request assigning
+        // none collides with nothing ([`crate::state::assigned_name`]).
+        //
+        // Decided BEFORE the store's capacity below, as it is in every writer of
+        // this service that takes a unique name: the name a request asks for is
+        // already taken whatever room the store has left, so the caller is told
+        // the name is taken rather than being told the store is full and left to
+        // discover the collision after making room.
+        if let Some(name) = crate::state::assigned_name(input.name.as_deref()) {
+            if let Some(clash) = store
+                .policies
+                .values()
+                .find(|p| p.name.as_deref() == Some(name))
+            {
+                return Err(CreatePolicyErrorModeled::ConflictException(
+                    crate::ops::conflict([crate::ops::resource_conflict(
+                        &clash.policy_id,
+                        crate::state::RESOURCE_TYPE_POLICY,
+                    )]),
+                )
+                .into());
+            }
+        }
+
         if store.policies.len() >= crate::state::MAX_POLICIES_PER_STORE
             || store.cedar_bytes() + statement.as_ref().map_or(0, String::len)
                 > crate::state::MAX_POLICY_BYTES_PER_STORE
@@ -404,25 +431,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
-
-        // A policy name is unique within its store — among the policies that
-        // were ASSIGNED a name, so a request assigning none collides with
-        // nothing ([`crate::state::assigned_name`]).
-        if let Some(name) = crate::state::assigned_name(input.name.as_deref()) {
-            if let Some(clash) = store
-                .policies
-                .values()
-                .find(|p| p.name.as_deref() == Some(name))
-            {
-                return Err(CreatePolicyErrorModeled::ConflictException(
-                    crate::ops::conflict([crate::ops::resource_conflict(
-                        &clash.policy_id,
-                        crate::state::RESOURCE_TYPE_POLICY,
-                    )]),
-                )
-                .into());
-            }
         }
 
         let store = state

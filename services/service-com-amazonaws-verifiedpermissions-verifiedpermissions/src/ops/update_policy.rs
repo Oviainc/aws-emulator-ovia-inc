@@ -343,32 +343,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .map_err(refused)?;
                 }
 
-                // The store's Cedar-text budget, which a replacement can grow:
-                // the bytes this policy already contributes come out and the
-                // replacement's go in, so an update is held to the same bound
-                // `CreatePolicy` holds a create to — the bound every later
-                // authorization request parses within.
-                let without_this_policy = store
-                    .cedar_bytes()
-                    .saturating_sub(policy.statement.as_ref().map_or(0, String::len));
-                if without_this_policy + def.statement.len()
-                    > crate::state::MAX_POLICY_BYTES_PER_STORE
-                {
-                    return Err(UpdatePolicyErrorModeled::ServiceQuotaExceededException(
-                        ServiceQuotaExceededException {
-                            message: format!(
-                                "policy store {store_id} is at its limit of {} bytes of Cedar \
-                                 text",
-                                crate::state::MAX_POLICY_BYTES_PER_STORE
-                            ),
-                            resource_id: Some(store_id.clone()),
-                            resource_type: crate::state::RESOURCE_TYPE_POLICY.to_string(),
-                            ..Default::default()
-                        },
-                    )
-                    .into());
-                }
-
                 Some((def.clone(), scope))
             }
         };
@@ -390,6 +364,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::RESOURCE_TYPE_POLICY,
                     )],
                 ))
+                .into());
+            }
+        }
+
+        // The store's Cedar-text budget, which a replacement can grow: the bytes
+        // this policy already contributes come out and the replacement's go in,
+        // so an update is held to the same bound `CreatePolicy` holds a create to
+        // — the bound every later authorization request parses within.
+        //
+        // Decided AFTER the name conflict above, as it is in every writer of this
+        // service that takes a unique name: the name a request asks for is
+        // already taken whatever room the store has left, so the caller is told
+        // the name is taken rather than being told the store is full and left to
+        // discover the collision after making room.
+        if let Some((def, _)) = replacement.as_ref() {
+            let without_this_policy = store
+                .cedar_bytes()
+                .saturating_sub(policy.statement.as_ref().map_or(0, String::len));
+            if without_this_policy + def.statement.len()
+                > crate::state::MAX_POLICY_BYTES_PER_STORE
+            {
+                return Err(UpdatePolicyErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "policy store {store_id} is at its limit of {} bytes of Cedar text",
+                            crate::state::MAX_POLICY_BYTES_PER_STORE
+                        ),
+                        resource_id: Some(store_id.clone()),
+                        resource_type: crate::state::RESOURCE_TYPE_POLICY.to_string(),
+                        ..Default::default()
+                    },
+                )
                 .into());
             }
         }

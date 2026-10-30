@@ -57,6 +57,8 @@ mod list_pagination_rule;
 mod list_policy_store_aliases;
 #[path = "all/list_policy_templates.rs"]
 mod list_policy_templates;
+#[path = "all/name_conflict_precedes_capacity.rs"]
+mod name_conflict_precedes_capacity;
 #[path = "all/not_found_precedes_payload_refusal.rs"]
 mod not_found_precedes_payload_refusal;
 #[path = "all/policy_store_alias.rs"]
