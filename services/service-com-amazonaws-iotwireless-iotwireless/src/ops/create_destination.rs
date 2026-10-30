@@ -273,17 +273,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The create parameters, the token excluded, as one comparable string — what decides
 /// whether a replayed `ClientRequestToken` carries "the same parameters".
-///
-/// Tags are sorted because a tag set is unordered on the wire, so two requests that
-/// differ only in tag order carry the same parameters.
 fn fingerprint(input: &CreateDestinationInput) -> String {
-    let mut tags: Vec<(&str, &str)> = input
-        .tags
-        .iter()
-        .flatten()
-        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
-        .collect();
-    tags.sort_unstable();
+    let tags = crate::state::sorted_tag_pairs(input.tags.as_deref().unwrap_or_default());
     format!(
         "{:?}|{:?}|{:?}|{:?}|{:?}|{tags:?}",
         input.name, input.expression_type, input.expression, input.description, input.role_arn,

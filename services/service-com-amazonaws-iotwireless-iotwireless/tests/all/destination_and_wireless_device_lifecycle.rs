@@ -32,10 +32,10 @@ use service_com_amazonaws_iotwireless_iotwireless::state::{
 };
 
 /// The region the test's SigV4 credential scope names; every minted ARN must carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account segment every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// `ExpressionType`'s modelled values — the model-generated constant the handlers
 /// validate against, so the suite and the service cannot drift apart.
@@ -55,7 +55,7 @@ const WIRELESS_DEVICE_ID_TYPES: &[&str] =
 const MAX_RESULTS_MIN: i64 = 0;
 const MAX_RESULTS_MAX: i64 = 250;
 
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -68,7 +68,7 @@ fn router() -> MultiServiceRouter {
 /// A request that routes to this service. `scope_region` is the region its SigV4
 /// credential scope names; `None` leaves the request unsigned, so it routes by its
 /// host-style endpoint and a minted ARN falls back to [`DEFAULT_REGION`].
-fn request_signed_for(
+pub(crate) fn request_signed_for(
     scope_region: Option<&str>,
     method: Method,
     uri: &str,
@@ -107,7 +107,7 @@ fn request(method: Method, uri: &str, body: Option<Value>) -> http::Request<Byte
 
 /// Dispatch one call and return its status plus its parsed JSON body (`Value::Null`
 /// for an empty body, which is what a 204 carries).
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: Method,
     uri: &str,
@@ -125,7 +125,7 @@ async fn call(
 }
 
 /// The wire error code of a failure body (`__type`), or `"<no __type>"`.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("<no __type>")
 }
 
@@ -1479,7 +1479,7 @@ async fn the_destination_store_is_bounded() {
 /// what `WirelessDeviceId` carries.
 /// Source: `smithy_query(query="operation", operation="CreateWirelessDevice")` —
 /// `Id` targets `WirelessDeviceId`, documented as the device's uuid.
-fn is_uuid_shaped(candidate: &str) -> bool {
+pub(crate) fn is_uuid_shaped(candidate: &str) -> bool {
     let groups: Vec<&str> = candidate.split('-').collect();
     groups.len() == 5
         && [8, 4, 4, 4, 12]

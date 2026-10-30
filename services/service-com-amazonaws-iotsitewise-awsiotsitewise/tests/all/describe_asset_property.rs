@@ -1054,6 +1054,151 @@ async fn a_property_a_composite_model_contributes_is_described_however_it_declar
     );
 }
 
+/// A definition added to a `COMPONENT_MODEL` reaches the assets of EVERY asset
+/// model that reuses it, and only those: what a composite model contributes is
+/// read from the component model's stored record, so a change to that record is a
+/// change to what each reusing model's assets carry.
+///
+/// Asserted over a set rather than one host model: two models reusing the same
+/// component model (one of them twice, under two composite models), each with two
+/// assets, plus a model that reuses nothing — which must not gain the property.
+#[tokio::test]
+async fn a_definition_added_to_a_component_model_reaches_every_model_that_reuses_it() {
+    let router = router();
+
+    let component = create_typed_model(
+        &router,
+        "SharedComponent",
+        "COMPONENT_MODEL",
+        json!([
+            {"name": "Speed", "dataType": "DOUBLE", "unit": "m/s", "type": {"measurement": {}}},
+        ]),
+    )
+    .await;
+
+    // Each host reuses the component model a different number of times, so the
+    // rule is asserted over hosts that differ in how they reuse it.
+    struct Host {
+        case: &'static str,
+        composites: &'static [&'static str],
+        assets: &'static [&'static str],
+    }
+    let hosts = [
+        Host {
+            case: "OneReuse",
+            composites: &["Drive"],
+            assets: &["OneReuse-1"],
+        },
+        Host {
+            case: "TwoReuses",
+            composites: &["Left", "Right"],
+            assets: &["TwoReuses-1", "TwoReuses-2"],
+        },
+    ];
+
+    let mut hosted: Vec<(&Host, String, Vec<String>, Vec<String>)> = Vec::new();
+    for host in &hosts {
+        let model_id = create_typed_model(
+            &router,
+            host.case,
+            "ASSET_MODEL",
+            json!([{"name": "Serial", "dataType": "STRING", "type": {"attribute": {}}}]),
+        )
+        .await;
+        let mut composite_ids = Vec::new();
+        for composite in host.composites {
+            composite_ids.push(
+                add_composite_model(
+                    &router,
+                    &model_id,
+                    json!({
+                        "assetModelCompositeModelName": composite,
+                        "assetModelCompositeModelType": "CUSTOM",
+                        "composedAssetModelId": &component,
+                    }),
+                )
+                .await,
+            );
+        }
+        let mut asset_ids = Vec::new();
+        for asset in host.assets {
+            asset_ids.push(create_asset(&router, asset, &model_id).await);
+        }
+        hosted.push((host, model_id, composite_ids, asset_ids));
+    }
+
+    // A model that reuses nothing, and an asset of it: the propagation must not
+    // reach an asset whose model does not carry the component model.
+    let unrelated_model = create_typed_model(
+        &router,
+        "ReusesNothing",
+        "ASSET_MODEL",
+        json!([{"name": "Serial", "dataType": "STRING", "type": {"attribute": {}}}]),
+    )
+    .await;
+    let unrelated_asset = create_asset(&router, "ReusesNothing-1", &unrelated_model).await;
+    let unrelated_before = describe_asset(&router, &unrelated_asset).await["assetProperties"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default();
+
+    // The component model gains a definition AFTER every composite model and asset
+    // above already exists.
+    let mut definitions = describe_model(&router, &component).await["assetModelProperties"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no assetModelProperties on {component}"))
+        .clone();
+    definitions.push(json!({
+        "name": "Torque", "dataType": "DOUBLE", "unit": "Nm", "type": {"measurement": {}},
+    }));
+    let (status, updated) = call(
+        &router,
+        "PUT",
+        &format!("/asset-models/{component}"),
+        Some(json!({
+            "assetModelName": "SharedComponent",
+            "assetModelProperties": definitions,
+        })),
+    )
+    .await;
+    assert_eq!(status, 202, "UpdateAssetModel: got {status} {updated}");
+
+    for (host, model_id, composite_ids, asset_ids) in &hosted {
+        for composite_id in composite_ids {
+            let added = property_id(
+                &describe_model_composite(&router, model_id, composite_id).await
+                    ["assetModelCompositeModelProperties"],
+                "Torque",
+            );
+            for asset_id in asset_ids {
+                let (status, body) = describe_property(&router, asset_id, &added).await;
+                assert_eq!(
+                    status, 200,
+                    "case {:?}: the added definition must be a property of asset {asset_id}, \
+                     got {status} {body}",
+                    host.case
+                );
+                assert_eq!(
+                    body["compositeModel"]["assetProperty"]["unit"].as_str(),
+                    Some("Nm"),
+                    "case {:?}: expected the added definition's unit Nm on {asset_id}, got {body}",
+                    host.case
+                );
+            }
+        }
+    }
+
+    let unrelated_after = describe_asset(&router, &unrelated_asset).await["assetProperties"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default();
+    assert_eq!(
+        unrelated_after, unrelated_before,
+        "an asset of a model that reuses no component model must be untouched: \
+         {unrelated_before} properties before, {unrelated_after} after"
+    );
+}
+
 #[tokio::test]
 async fn a_label_that_names_no_stored_property_is_a_modelled_refusal() {
     let router = router();

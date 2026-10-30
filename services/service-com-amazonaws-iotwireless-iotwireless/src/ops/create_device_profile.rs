@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeviceProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeviceProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeviceProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: persists a device profile, minting its `Id` and ARN. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +155,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeviceProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeviceProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeviceProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDeviceProfileError::from(
+                CreateDeviceProfileErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // `Name`'s model doc excludes a fixed set of special characters, which no
+        // modelled trait carries, so it is checked here.
+        if let Some(name) = input.name.as_deref() {
+            if let Some(rejected) = crate::state::forbidden_name_char(name) {
+                return Err(CreateDeviceProfileErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "Name must not contain any of {:?}, got {rejected:?} in {name:?}",
+                            crate::state::FORBIDDEN_NAME_CHARS
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A device profile is of exactly ONE `DeviceProfileType`, named by the
+        // technology member the request carries: `Sidewalk` when it carries the Sidewalk
+        // settings, `LoRaWAN` otherwise. A request carrying BOTH names two types for one
+        // resource, which no single profile can be.
+        let profile_type = match (&input.lo_ra_wan, &input.sidewalk) {
+            (Some(_), Some(_)) => {
+                return Err(CreateDeviceProfileErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "a device profile is of exactly one of {:?}: LoRaWAN and Sidewalk \
+                             cannot both be specified",
+                            crate::state::DEVICE_PROFILE_TYPES
+                        )),
+                    },
+                )
+                .into());
+            }
+            (_, Some(_)) => "Sidewalk",
+            // Neither member: the model marks both optional, so a create naming no
+            // technology is a profile with no settings rather than a bad request, and
+            // `LoRaWAN` is the type its absent settings belong to.
+            _ => "LoRaWAN",
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let fingerprint = fingerprint(&input);
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is an `@idempotencyToken`: replaying it with the same
+        // parameters completes successfully and returns the id the first call minted;
+        // replaying it with different parameters is an HTTP 409.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(prior) = store.device_profile_token(token) {
+                if prior.fingerprint != fingerprint {
+                    return Err(CreateDeviceProfileErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "ClientRequestToken {token} was already used with different \
+                                 parameters"
+                            )),
+                            resource_id: Some(prior.resource_key.clone()),
+                            resource_type: Some("DeviceProfile".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                if let Some(existing) = store.device_profiles.get(&prior.resource_key) {
+                    return Ok(CreateDeviceProfileOutput {
+                        arn: Some(existing.arn.clone()),
+                        id: Some(existing.id.clone()),
+                    });
+                }
+                // The profile this token minted has since been deleted, so there is
+                // nothing to replay: fall through and create a new one.
+            }
+        }
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap without
+        // bound: the profile map by this ceiling, and the idempotency ledger a
+        // successful create also writes by `MAX_DEVICE_PROFILE_TOKENS` with
+        // oldest-entry eviction inside `record_device_profile_token`. This operation
+        // models no quota error, so a full store is a `ValidationException` naming the
+        // ceiling it hit.
+        if store.device_profiles.len() >= crate::state::MAX_DEVICE_PROFILES {
+            return Err(CreateDeviceProfileErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "this emulator stores at most {} device profiles; delete one \
+                         before creating another",
+                        crate::state::MAX_DEVICE_PROFILES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_device_profile_id();
+        let profile = crate::state::DeviceProfile {
+            arn: crate::state::device_profile_arn(&region, &id),
+            id: id.clone(),
+            name: input.name.clone(),
+            profile_type: profile_type.to_string(),
+            lorawan: input.lo_ra_wan.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+        };
+        let output = CreateDeviceProfileOutput {
+            arn: Some(profile.arn.clone()),
+            id: Some(profile.id.clone()),
+        };
+        store.device_profiles.insert(id.clone(), profile);
+        if let Some(token) = input.client_request_token.clone() {
+            store.record_device_profile_token(
+                token,
+                crate::state::IdempotentCreate {
+                    resource_key: id,
+                    fingerprint,
+                },
+            );
+        }
+        Ok(output)
     }
+}
+
+/// The create parameters, the token excluded, as one comparable string — what decides
+/// whether a replayed `ClientRequestToken` carries "the same parameters".
+fn fingerprint(input: &CreateDeviceProfileInput) -> String {
+    let tags = crate::state::sorted_tag_pairs(input.tags.as_deref().unwrap_or_default());
+    format!(
+        "{:?}|{:?}|{:?}|{tags:?}",
+        input.name, input.lo_ra_wan, input.sidewalk,
+    )
 }

@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::SystemTime;
 
-use crate::ops::types::{LoRaWANDevice, SidewalkDevice, Tag};
+use crate::ops::types::{LoRaWANDevice, LoRaWANDeviceProfile, SidewalkDevice, Tag};
 
 /// The ARN service namespace (`arn:aws:iotwireless:...`) and the SigV4 signing name
 /// this service publishes.
@@ -37,6 +37,11 @@ pub fn wireless_device_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("WirelessDevice/{id}"))
 }
 
+/// `arn:aws:iotwireless:<region>:<account>:DeviceProfile/<id>`.
+pub fn device_profile_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("DeviceProfile/{id}"))
+}
+
 /// `ExpressionType`'s modelled values, as the model-generated
 /// [`crate::ops::types::EXPRESSION_TYPE_VALUES`] lists them.
 pub use crate::ops::types::EXPRESSION_TYPE_VALUES as EXPRESSION_TYPES;
@@ -52,6 +57,20 @@ pub use crate::ops::types::WIRELESS_DEVICE_ID_TYPE_VALUES as WIRELESS_DEVICE_ID_
 /// `PositioningConfigStatus`'s modelled values, as the model-generated
 /// [`crate::ops::types::POSITIONING_CONFIG_STATUS_VALUES`] lists them.
 pub use crate::ops::types::POSITIONING_CONFIG_STATUS_VALUES as POSITIONING_CONFIG_STATUSES;
+
+/// `DeviceProfileType`'s modelled values, as the model-generated
+/// [`crate::ops::types::DEVICE_PROFILE_TYPE_VALUES`] lists them.
+pub use crate::ops::types::DEVICE_PROFILE_TYPE_VALUES as DEVICE_PROFILE_TYPES;
+
+/// The characters a resource name may not carry, as every `Name` member's model doc
+/// states it ("The following special characters aren't accepted: <>^#~$").
+pub const FORBIDDEN_NAME_CHARS: &[char] = &['<', '>', '^', '#', '~', '$'];
+
+/// The first character of `name` this service refuses, or `None` when every character
+/// is accepted.
+pub fn forbidden_name_char(name: &str) -> Option<char> {
+    name.chars().find(|c| FORBIDDEN_NAME_CHARS.contains(c))
+}
 
 /// The marker every `NextToken` this service mints carries, so a well-formed string a
 /// client made up cannot pass as a resume point.
@@ -89,6 +108,22 @@ pub struct Destination {
     pub expression_type: String,
     pub description: Option<String>,
     pub role_arn: String,
+    pub tags: Vec<Tag>,
+}
+
+/// A device profile: the radio parameters a wireless device of one technology shares.
+///
+/// `profile_type` is what `DeviceProfileType` names, derived from which technology
+/// member the create carried; `SidewalkCreateDeviceProfile` models no members, so a
+/// Sidewalk profile's only stored settings are that it IS a Sidewalk profile.
+#[derive(Debug, Clone)]
+pub struct DeviceProfile {
+    pub id: String,
+    pub arn: String,
+    pub name: Option<String>,
+    /// `DeviceProfileType`: `LoRaWAN` | `Sidewalk`.
+    pub profile_type: String,
+    pub lorawan: Option<LoRaWANDeviceProfile>,
     pub tags: Vec<Tag>,
 }
 
@@ -142,6 +177,21 @@ pub struct IdempotentCreate {
     pub fingerprint: String,
 }
 
+/// A tag set as one comparable, order-independent sequence of `(key, value)` pairs.
+///
+/// Every `@idempotencyToken` create fingerprints its parameters to decide whether a
+/// replayed token carries "the same parameters", and a tag set is unordered on the wire,
+/// so two requests that differ only in tag order carry the same parameters. One
+/// function, so every create orders them the same way.
+pub fn sorted_tag_pairs(tags: &[Tag]) -> Vec<(&str, &str)> {
+    let mut pairs: Vec<(&str, &str)> = tags
+        .iter()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    pairs
+}
+
 /// The most destinations this emulator stores.
 ///
 /// A ceiling, not a guess at AWS's published quota: it exists so a create loop cannot
@@ -155,6 +205,13 @@ pub const MAX_DESTINATIONS: usize = 100;
 /// [`MAX_DESTINATIONS`].
 pub const MAX_WIRELESS_DEVICES: usize = 250;
 
+/// The most device profiles this emulator stores. A ceiling, for the same reason as
+/// [`MAX_DESTINATIONS`]; `CreateDeviceProfile` models no quota error either
+/// (`smithy_query(query="operation", operation="CreateDeviceProfile")` lists
+/// AccessDenied / Conflict / InternalServer / Throttling / Validation), so a full store
+/// refuses with `ValidationException`.
+pub const MAX_DEVICE_PROFILES: usize = 100;
+
 /// The most `ClientRequestToken` entries kept for `CreateDestination` idempotency.
 ///
 /// At most one token is recorded per stored destination and a token is dropped with the
@@ -167,24 +224,32 @@ pub const MAX_DESTINATION_TOKENS: usize = MAX_DESTINATIONS;
 /// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
 pub const MAX_WIRELESS_DEVICE_TOKENS: usize = MAX_WIRELESS_DEVICES;
 
+/// The most `ClientRequestToken` entries kept for `CreateDeviceProfile` idempotency.
+/// Bounded for the same reason as [`MAX_DESTINATION_TOKENS`].
+pub const MAX_DEVICE_PROFILE_TOKENS: usize = MAX_DEVICE_PROFILES;
+
 /// Per-service state for com-amazonaws-iotwireless-iotwireless. A handler reaches it through [`service_state`].
 ///
 /// The resource maps are `BTreeMap`s so every list enumerates in one stable, sorted key
 /// order — which is what makes a pagination token that names the last key returned
 /// resume exactly where the previous page stopped.
 ///
-/// Every store here is BOUNDED: the two resource maps by [`MAX_DESTINATIONS`] /
-/// [`MAX_WIRELESS_DEVICES`] (the creates refuse once full), `dev_eui_index` by one entry
-/// per stored device, and the two token maps by [`MAX_DESTINATION_TOKENS`] /
-/// [`MAX_WIRELESS_DEVICE_TOKENS`] with oldest-entry eviction. The token maps are private
+/// Every store here is BOUNDED: the resource maps by [`MAX_DESTINATIONS`] /
+/// [`MAX_WIRELESS_DEVICES`] / [`MAX_DEVICE_PROFILES`] (the creates refuse once full),
+/// `dev_eui_index` by one entry per stored device, and the token maps by
+/// [`MAX_DESTINATION_TOKENS`] / [`MAX_WIRELESS_DEVICE_TOKENS`] /
+/// [`MAX_DEVICE_PROFILE_TOKENS`] with oldest-entry eviction. The token maps are private
 /// so every write goes through [`Self::record_destination_token`] /
-/// [`Self::record_wireless_device_token`] and cannot bypass the cap.
+/// [`Self::record_wireless_device_token`] / [`Self::record_device_profile_token`] and
+/// cannot bypass the cap.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotwirelessIotwirelessState {
     /// Destinations by `Name`. Bounded by [`MAX_DESTINATIONS`].
     pub destinations: BTreeMap<String, Destination>,
     /// Wireless devices by `Id`. Bounded by [`MAX_WIRELESS_DEVICES`].
     pub wireless_devices: BTreeMap<String, WirelessDevice>,
+    /// Device profiles by `Id`. Bounded by [`MAX_DEVICE_PROFILES`].
+    pub device_profiles: BTreeMap<String, DeviceProfile>,
     /// `DevEui` -> device id, so `GetWirelessDevice?identifierType=DevEui` resolves
     /// without scanning and a duplicate `DevEui` is refusable. At most one entry per
     /// stored device, and the entry is released when the device is deleted.
@@ -201,6 +266,11 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
     wireless_device_tokens: HashMap<String, IdempotentCreate>,
     /// Write order for [`Self::wireless_device_tokens`].
     wireless_device_token_order: VecDeque<String>,
+    /// `CreateDeviceProfile` client request tokens, bounded by
+    /// [`MAX_DEVICE_PROFILE_TOKENS`]. Private, like the destination tokens.
+    device_profile_tokens: HashMap<String, IdempotentCreate>,
+    /// Write order for [`Self::device_profile_tokens`].
+    device_profile_token_order: VecDeque<String>,
 }
 
 /// Record `token` in `tokens`, evicting the oldest recorded token first if that would
@@ -249,19 +319,29 @@ fn forget_tokens_for(
     order.retain(|token| live.contains_key(token));
 }
 
+/// A fresh v4 uuid `existing` does not already hold.
+///
+/// Every resource id this service mints (`WirelessDeviceId`, `DeviceProfileId`) is a
+/// uuid, so they all come from the `uuid` crate's v4 generator through here; the loop
+/// re-draws rather than ever handing back an id already in the store.
+fn mint_unused_uuid<T>(existing: &BTreeMap<String, T>) -> String {
+    loop {
+        let id = ::uuid::Uuid::new_v4().to_string();
+        if !existing.contains_key(&id) {
+            return id;
+        }
+    }
+}
+
 impl ComAmazonawsIotwirelessIotwirelessState {
     /// Mint a fresh, unused `WirelessDeviceId`.
-    ///
-    /// AWS's `WirelessDeviceId` is a uuid, so it comes from the `uuid` crate's v4
-    /// generator; the loop re-draws rather than ever handing back an id already in the
-    /// store.
     pub fn mint_wireless_device_id(&mut self) -> String {
-        loop {
-            let id = ::uuid::Uuid::new_v4().to_string();
-            if !self.wireless_devices.contains_key(&id) {
-                return id;
-            }
-        }
+        mint_unused_uuid(&self.wireless_devices)
+    }
+
+    /// Mint a fresh, unused `DeviceProfileId`.
+    pub fn mint_device_profile_id(&mut self) -> String {
+        mint_unused_uuid(&self.device_profiles)
     }
 
     /// What a `CreateDestination` `ClientRequestToken` already minted, if anything.
@@ -315,6 +395,24 @@ impl ComAmazonawsIotwirelessIotwirelessState {
             &mut self.wireless_device_tokens,
             &mut self.wireless_device_token_order,
             id,
+        );
+    }
+
+    /// What a `CreateDeviceProfile` `ClientRequestToken` already minted, if anything.
+    pub fn device_profile_token(&self, token: &str) -> Option<&IdempotentCreate> {
+        self.device_profile_tokens.get(token)
+    }
+
+    /// Record `token` as having minted the device profile named by `record`, evicting
+    /// the oldest token first if that would push the map past
+    /// [`MAX_DEVICE_PROFILE_TOKENS`].
+    pub fn record_device_profile_token(&mut self, token: String, record: IdempotentCreate) {
+        record_token(
+            &mut self.device_profile_tokens,
+            &mut self.device_profile_token_order,
+            MAX_DEVICE_PROFILE_TOKENS,
+            token,
+            record,
         );
     }
 
