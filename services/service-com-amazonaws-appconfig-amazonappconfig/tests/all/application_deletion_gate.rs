@@ -28,6 +28,7 @@ use crate::appconfig_workflow::{
     account, create_application, create_environment, create_profile, json_call, router, send,
     Answer,
 };
+use crate::resource_deletes::{assert_deleted, assert_gated};
 
 /// One predefined deployment strategy id: AppConfig's `AppConfig.*` strategies are
 /// deployable as shipped.
@@ -38,44 +39,9 @@ async fn delete(router: &MultiServiceRouter, uri: &str) -> Answer {
     send(router, "DELETE", uri, "application/json", Vec::new(), &[]).await
 }
 
-/// A delete that must have succeeded: the modelled 204 with no body.
-fn assert_deleted(case: &str, operation: &str, answer: &Answer) {
-    assert_eq!(
-        answer.status,
-        204,
-        "case {case:?}: {operation} must answer the modelled 204, got {} / {}",
-        answer.status,
-        String::from_utf8_lossy(&answer.body)
-    );
-    assert!(
-        answer.body.is_empty(),
-        "case {case:?}: {operation} answers no body, got {:?}",
-        String::from_utf8_lossy(&answer.body)
-    );
-}
-
-/// A delete that must have been refused by the child gate: the modelled
-/// `BadRequestException` (HTTP 400) carrying `expected` as its `Message`.
-fn assert_gated(case: &str, operation: &str, answer: &Answer, expected: &str) {
-    assert_eq!(
-        answer.status,
-        400,
-        "case {case:?}: {operation} must answer 400 while children exist, got {} / {}",
-        answer.status,
-        String::from_utf8_lossy(&answer.body)
-    );
-    assert!(
-        answer.error_code().contains("BadRequestException"),
-        "case {case:?}: {operation} must answer BadRequestException, got {:?}",
-        answer.error_code()
-    );
-    assert_eq!(
-        answer.string("Message").as_deref(),
-        Some(expected),
-        "case {case:?}: {operation} must answer the child-gate template, got {}",
-        answer.json()
-    );
-}
+// A delete that must have been refused by the child gate, and one that must have
+// succeeded, are asserted by the shared helpers in `resource_deletes`, so every suite
+// driving a container's delete states the same expectations.
 
 /// The ids one application's `ListEnvironments` serves.
 async fn listed_environments(router: &MultiServiceRouter, application: &str) -> Vec<String> {

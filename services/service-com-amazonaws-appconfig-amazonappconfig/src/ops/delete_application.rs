@@ -5,13 +5,14 @@
 //! every later reader and writer of that id misses on it, and refuses the delete while
 //! the application still holds children.
 //!
-//! The refusal is the gate AppConfig puts on a CONTAINER resource: while an environment or
-//! a configuration profile still exists under the application the delete is a
-//! `BadRequestException` (HTTP 400) naming the child kind in the way, and the application
-//! and its children are left exactly as they were — the same rule a configuration
-//! profile's own delete applies to the hosted versions it owns, one level down the same
-//! tree. The gate is on child EXISTENCE and not on deployment state, so a deployment in
-//! flight neither blocks this call nor excuses it.
+//! The refusal is the gate AppConfig puts on a CONTAINER resource: while an environment, a
+//! configuration profile or an experiment definition still exists under the application the
+//! delete is a `BadRequestException` (HTTP 400) naming the child kind in the way, and the
+//! application and its children are left exactly as they were — the same rule a
+//! configuration profile's own delete applies to the hosted versions it owns, one level
+//! down the same tree. The gate is on child EXISTENCE and not on deployment state or on a
+//! child's own status, so a deployment in flight neither blocks this call nor excuses it,
+//! and an archived experiment definition is still a record in the way.
 //!
 //! ## Shape of an operation
 //!
@@ -194,22 +195,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // An application OWNS the environments and the configuration profiles created
-        // under it, and AppConfig does not cascade that ownership away: while a child of
-        // either kind is still there the delete is a bad request naming that kind, and the
-        // caller is told to remove the children first — the same gate
-        // `DeleteConfigurationProfile` applies to the hosted versions it owns, one level
-        // down the same tree. The refusal is taken BEFORE anything is removed, so it
-        // changes nothing a later caller sees: the application stays readable and
-        // listable, and its children stay listed under it.
+        // An application OWNS the environments, the configuration profiles and the
+        // experiment definitions created under it, and AppConfig does not cascade that
+        // ownership away: while a child of ANY of those kinds is still there the delete is
+        // a bad request naming that kind, and the caller is told to remove the children
+        // first — the same gate `DeleteConfigurationProfile` applies to the hosted versions
+        // it owns, one level down the same tree. The refusal is taken BEFORE anything is
+        // removed, so it changes nothing a later caller sees: the application stays
+        // readable and listable, and its children stay listed under it.
         //
-        // The gate is on child EXISTENCE, not on deployment state: a deployment in flight
-        // neither blocks this delete nor is what blocks it, and an environment is
-        // deletable while one is running.
+        // The gate is on child EXISTENCE, not on deployment state or on a child's own
+        // status: a deployment in flight neither blocks this delete nor is what blocks it,
+        // an environment is deletable while one is running, and an archived experiment
+        // definition is still a stored, readable record and so still in the way.
         let blocking_children = if !application.environments.is_empty() {
             Some(crate::state::ENVIRONMENTS)
         } else if !application.profiles.is_empty() {
             Some(crate::state::CONFIGURATION_PROFILES)
+        } else if !application.experiment_definitions.is_empty() {
+            Some(crate::state::EXPERIMENT_DEFINITIONS)
         } else {
             None
         };
@@ -220,6 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 application_id = input.application_id.as_str(),
                 environments = application.environments.len(),
                 configuration_profiles = application.profiles.len(),
+                experiment_definitions = application.experiment_definitions.len(),
                 blocking_children = children,
                 "refused an application delete"
             );
@@ -236,10 +241,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The delete IS the removal of the stored record. The application holds no
-        // environment and no configuration profile (the refusal above), so what goes with
-        // it is the record itself and the experiment definitions written under it, which
-        // are held INSIDE it: once this answers 204, `GetApplication`,
+        // The delete IS the removal of the stored record. The application is a LEAF by the
+        // refusal above — it holds no environment, no configuration profile and no
+        // experiment definition — so what goes with it is the record itself and nothing a
+        // caller could still address: once this answers 204, `GetApplication`,
         // `UpdateApplication`, `ListApplications`, the tagging operations and every
         // operation addressed through this application id all miss on it, because each of
         // them reads the map this took it out of.

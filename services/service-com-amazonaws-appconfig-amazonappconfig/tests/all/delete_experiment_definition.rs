@@ -2,9 +2,10 @@
 
 //! `DeleteExperimentDefinition`: the two deletions the operation offers.
 //!
-//! The rule under test, in one sentence: a delete that asks for the archiving
-//! `DeleteType` keeps the stored definition and moves its status to the archived one,
-//! while any other delete removes the record outright — and either way the call answers
+//! The rule under test, in one sentence: a delete that asks for the permanent
+//! `DeleteType` removes the stored record outright, while a delete that asks for the
+//! archiving one — or names no type at all — keeps the record and moves its status to the
+//! archived one — and either way the call answers
 //! the modelled 204 with no body, resolves each path identifier by the resource's ID or
 //! its name, and refuses with `ResourceNotFoundException` (HTTP 404) when either
 //! identifier resolves to nothing, writing nothing when it refuses.
@@ -18,7 +19,8 @@
 //! still running — the state the definition reports as `ACTIVE` — the call is refused
 //! HTTP 400 `BadRequestException` and writes nothing, whichever `DeleteType` it asked
 //! for, so the live experiment and its run history survive it; once no run of the
-//! definition is running the identical delete succeeds and takes the run history with it.
+//! definition is running the identical delete succeeds, and a permanent one takes the run
+//! history with it.
 //!
 //! Every case drives real HTTP requests through the router the emulator's front door
 //! uses, and every delete is read back through `GetExperimentDefinition`, so what is
@@ -243,7 +245,8 @@ fn assert_preserved(case: &str, before: &Value, after: &Value, moved: &[&str]) {
 }
 
 /// An archiving delete keeps the definition and moves it to the archived status: it stays
-/// readable, with every other member exactly as it was.
+/// readable, with every other member exactly as it was. A request that names no
+/// `DeleteType` at all asks for that same preserving deletion.
 #[tokio::test]
 async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() {
     const LABEL: &str = "archive";
@@ -252,17 +255,23 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
     let scope = scope(&router, LABEL).await;
     let application_name = application_name(LABEL);
 
-    // Rows differ along the shape of the definition being archived (treatment count across
-    // the modelled 1..5, descriptions present or absent), the status the record holds when
+    // Rows differ along which request asks for the preserving deletion (the archiving
+    // `DeleteType`, and the request that names none), the shape of the definition being
+    // archived (treatment count across the modelled 1..5, descriptions present or absent),
+    // the status the record holds when
     // the delete arrives (the statuses a delete is accepted in: idle, and one already
     // archived, which is what makes the call idempotent — a definition whose experiment is
     // still running is refused instead, which
     // `a_delete_while_an_experiment_is_running_is_refused_and_writes_nothing` covers),
     // whether the definition has an experiment behind it already, and whether the request
     // addresses the application and the definition by id or by name.
-    for (index, (case, treatments, descriptions, status_before, finished_run, by_name)) in [
+    for (
+        index,
+        (case, delete_type, treatments, descriptions, status_before, finished_run, by_name),
+    ) in [
         (
             "one treatment, no descriptions, idle, addressed by id",
+            Some(state::DELETE_TYPE_ARCHIVE),
             1,
             false,
             state::EXPERIMENT_DEFINITION_IDLE,
@@ -271,6 +280,7 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
         ),
         (
             "three treatments and every description, idle, addressed by name",
+            Some(state::DELETE_TYPE_ARCHIVE),
             3,
             true,
             state::EXPERIMENT_DEFINITION_IDLE,
@@ -279,6 +289,7 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
         ),
         (
             "five treatments, the modelled maximum, idle, addressed by id",
+            Some(state::DELETE_TYPE_ARCHIVE),
             5,
             false,
             state::EXPERIMENT_DEFINITION_IDLE,
@@ -287,6 +298,7 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
         ),
         (
             "a definition whose experiment has already finished, addressed by id",
+            Some(state::DELETE_TYPE_ARCHIVE),
             2,
             true,
             state::EXPERIMENT_DEFINITION_IDLE,
@@ -295,6 +307,35 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
         ),
         (
             "a definition that is already archived, addressed by name",
+            Some(state::DELETE_TYPE_ARCHIVE),
+            1,
+            false,
+            state::EXPERIMENT_DEFINITION_ARCHIVED,
+            false,
+            true,
+        ),
+        (
+            "no DeleteType at all, idle, addressed by id",
+            None,
+            2,
+            true,
+            state::EXPERIMENT_DEFINITION_IDLE,
+            false,
+            false,
+        ),
+        (
+            "no DeleteType at all on a definition whose experiment has finished, addressed \
+             by name",
+            None,
+            4,
+            false,
+            state::EXPERIMENT_DEFINITION_IDLE,
+            true,
+            true,
+        ),
+        (
+            "no DeleteType at all on an already archived definition, addressed by name",
+            None,
             1,
             false,
             state::EXPERIMENT_DEFINITION_ARCHIVED,
@@ -327,13 +368,7 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
             before.get("Status")
         );
 
-        let archived = delete_definition(
-            &router,
-            &application,
-            &definition,
-            Some(state::DELETE_TYPE_ARCHIVE),
-        )
-        .await;
+        let archived = delete_definition(&router, &application, &definition, delete_type).await;
         assert_deleted(case, "DeleteExperimentDefinition", &archived);
 
         let after = read_definition(&router, case, &scope.application, &id).await;
@@ -356,13 +391,7 @@ async fn an_archiving_delete_preserves_the_definition_and_reports_it_archived() 
 
         // The operation is idempotent: archiving an archived definition answers the same
         // 204 and leaves the same record behind.
-        let again = delete_definition(
-            &router,
-            &application,
-            &definition,
-            Some(state::DELETE_TYPE_ARCHIVE),
-        )
-        .await;
+        let again = delete_definition(&router, &application, &definition, delete_type).await;
         assert_deleted(case, "a repeated archiving DeleteExperimentDefinition", &again);
         let twice = read_definition(&router, case, &scope.application, &id).await;
         assert_eq!(
@@ -386,13 +415,14 @@ async fn a_permanent_delete_removes_the_definition() {
     let scope = scope(&router, LABEL).await;
     let application_name = application_name(LABEL);
 
-    // Rows differ along whether the request names the destroying `DeleteType` or names
-    // none at all (the member is optional and carries no modelled default), the status the
+    // Rows differ along the status the
     // record holds when the delete arrives (the statuses a delete is accepted in: a
     // definition whose experiment is still running is refused instead), whether the
     // definition has an experiment behind it already — the run history the removal takes
     // with it — the shape of the definition, and whether the request addresses the
-    // resources by id or by name.
+    // resources by id or by name. Every row NAMES the permanent `DeleteType`: a request
+    // that names none asks for the preserving deletion instead, which
+    // `an_archiving_delete_preserves_the_definition_and_reports_it_archived` covers.
     for (
         index,
         (case, delete_type, treatments, descriptions, status_before, finished_run, by_name),
@@ -407,8 +437,9 @@ async fn a_permanent_delete_removes_the_definition() {
             false,
         ),
         (
-            "no DeleteType at all, idle, addressed by id",
-            None,
+            "the destroying DeleteType, two treatments and every description, idle, \
+             addressed by id",
+            Some(state::DELETE_TYPE_DESTROY),
             2,
             true,
             state::EXPERIMENT_DEFINITION_IDLE,
@@ -426,8 +457,8 @@ async fn a_permanent_delete_removes_the_definition() {
             true,
         ),
         (
-            "no DeleteType at all on an already archived definition, addressed by name",
-            None,
+            "the destroying DeleteType on an already archived definition, addressed by name",
+            Some(state::DELETE_TYPE_DESTROY),
             1,
             false,
             state::EXPERIMENT_DEFINITION_ARCHIVED,
@@ -859,7 +890,7 @@ async fn a_delete_while_an_experiment_is_running_is_refused_and_writes_nothing()
             "DeleteExperimentDefinition once no experiment is running",
             &accepted,
         );
-        if delete_type == Some(state::DELETE_TYPE_ARCHIVE) {
+        if delete_type != Some(state::DELETE_TYPE_DESTROY) {
             let archived = read_definition(&router, case, &scope.application, &id).await;
             assert_eq!(
                 archived.get("Status").and_then(Value::as_str),

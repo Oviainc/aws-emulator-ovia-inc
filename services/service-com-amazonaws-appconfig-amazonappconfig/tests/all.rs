@@ -17,6 +17,8 @@ mod account_settings_document;
 mod appconfig_workflow;
 #[path = "all/application_deletion_gate.rs"]
 mod application_deletion_gate;
+#[path = "all/application_experiment_definition_gate.rs"]
+mod application_experiment_definition_gate;
 #[path = "all/application_name_uniqueness.rs"]
 mod application_name_uniqueness;
 #[path = "all/aws_authored_extensions.rs"]

@@ -110,10 +110,13 @@ pub const EXPERIMENT_RUN_DONE: &str = "DONE";
 /// `ARCHIVE` | `DESTROY`).
 ///
 /// Archiving preserves the definition's record and moves it to
-/// [`EXPERIMENT_DEFINITION_ARCHIVED`]; destroying removes the record outright. The
-/// member is optional and carries no modelled default, and the operation is documented
-/// as deleting the definition with archiving as the alternative a caller asks for, so a
-/// request naming no type is a [`DELETE_TYPE_DESTROY`].
+/// [`EXPERIMENT_DEFINITION_ARCHIVED`]; destroying removes the record outright. The member
+/// is optional and carries no modelled default, and a delete that names no type PRESERVES
+/// the record: a definition deleted that way is still stored afterwards, which the
+/// recorded refusal of the delete of its APPLICATION shows — the application is still
+/// held to have experiment definitions under it. So the default is
+/// [`DELETE_TYPE_ARCHIVE`], the deletion the operation documents as "hide but preserve",
+/// and only a request that ASKS for the permanent one gets the record removed.
 pub const DELETE_TYPE_ARCHIVE: &str = "ARCHIVE";
 /// See [`DELETE_TYPE_ARCHIVE`].
 pub const DELETE_TYPE_DESTROY: &str = "DESTROY";
@@ -3030,6 +3033,11 @@ pub fn configuration_profile_still_has_hosted_versions(configuration_profile_id:
 pub const ENVIRONMENTS: &str = "environments";
 /// See [`ENVIRONMENTS`].
 pub const CONFIGURATION_PROFILES: &str = "configuration profiles";
+/// See [`ENVIRONMENTS`]. An experiment definition is a child of the application exactly as
+/// the other two kinds are — [`Application::experiment_definitions`] holds it — so it gates
+/// the application's delete in the same way, and an archived definition is still a stored
+/// record and still gates it.
+pub const EXPERIMENT_DEFINITIONS: &str = "experiment definitions";
 
 /// `Message` for a delete refused because the addressed application still holds child
 /// resources of the kind `children` names.

@@ -107,6 +107,39 @@ pub(crate) fn assert_not_found(case: &str, operation: &str, answer: &Answer) {
     );
 }
 
+/// A delete that must have been refused by the gate AppConfig puts on a CONTAINER
+/// resource: the modelled `BadRequestException`, HTTP 400, with the error type on the wire
+/// where an SDK classifies it from and `expected` as the body's `Message`. `pub(crate)`
+/// because every container in this service's tree is gated the same way, so each suite
+/// that drives one asserts the refusal identically.
+pub(crate) fn assert_gated(case: &str, operation: &str, answer: &Answer, expected: &str) {
+    assert_eq!(
+        answer.status,
+        400,
+        "case {case:?}: {operation} must answer 400 while children exist, got {} / {}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(
+        answer.error_code().contains("BadRequestException"),
+        "case {case:?}: {operation} must answer BadRequestException, got {:?}",
+        answer.error_code()
+    );
+    assert!(
+        answer
+            .header("x-amzn-errortype")
+            .is_some_and(|value| value.contains("BadRequestException")),
+        "case {case:?}: {operation} must set x-amzn-errortype, got {:?}",
+        answer.header("x-amzn-errortype")
+    );
+    assert_eq!(
+        answer.string("Message").as_deref(),
+        Some(expected),
+        "case {case:?}: {operation} must answer the child-gate template, got {}",
+        answer.json()
+    );
+}
+
 /// `GET` one deployment strategy.
 async fn get_strategy(router: &MultiServiceRouter, id: &str) -> Answer {
     json_call(router, "GET", &format!("{STRATEGIES}/{id}"), &Value::Null).await

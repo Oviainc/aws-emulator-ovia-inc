@@ -6,12 +6,11 @@
 //! definition is still running, which refuses the call and leaves the definition and its
 //! runs exactly as they were.
 //!
-//! `DeleteType` is optional and the model documents no default for it, so which deletion
-//! a request that names none asks for is read off the operation itself: it is documented
-//! as deleting the definition, with archiving offered as the alternative a caller may ask
-//! for, so naming no type removes the record. Should a recording ever show AppConfig
-//! preserving a definition for a request that named no type, this is the one decision to
-//! revisit — the handler's two branches and the test table already cover both readings.
+//! `DeleteType` is optional and the model documents no default for it, and the deletion a
+//! request that names none gets is the PRESERVING one: a definition deleted without a type
+//! is still stored afterwards, which is why the delete of its application is still refused
+//! for the experiment definitions under it. Only a request that ASKS for the permanent
+//! deletion removes the record and the run history with it.
 //!
 //! ## Shape of an operation
 //!
@@ -183,14 +182,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which deletion this request asks for: archiving "hide[s] it from the active list
         // while preserving it for future reference" and the other kind deletes it
         // "permanently … along with all associated run history" (this operation's own
-        // documentation). The member is optional and the model gives it no default, while
-        // the operation itself is documented as deleting the definition and offers
-        // archiving as the softer thing a caller may ASK for — so a request naming no type
-        // gets the delete the operation is named for: the removal of the record.
+        // documentation). The member is optional and the model gives it no default, and the
+        // delete a request naming none gets is the PRESERVING one: the record of a
+        // definition deleted without a type is still stored afterwards, which is why the
+        // delete of its application is still refused for the definitions under it. Only a
+        // request that asks for the permanent deletion loses the record and its run
+        // history.
         let delete_type = input
             .delete_type
             .as_deref()
-            .unwrap_or(crate::state::DELETE_TYPE_DESTROY);
+            .unwrap_or(crate::state::DELETE_TYPE_ARCHIVE);
         if !DELETE_TYPE_VALUES.contains(&delete_type) {
             return Err(DeleteExperimentDefinitionErrorModeled::BadRequestException(
                 BadRequestException {

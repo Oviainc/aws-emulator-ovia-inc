@@ -9,6 +9,11 @@
 //! the hosted-content budget the versions under it held is given back, while an application
 //! id the account does not hold is refused the same 404 and removes nothing.
 //!
+//! A delete only reaches that record once the application is a LEAF, so every row here
+//! tears its children down first — the hosted versions, the profiles, the environments and
+//! the experiment definition — and what the delete is asserted on is the application
+//! itself.
+//!
 //! An application that still holds children is not deletable at all: that gate, and the
 //! refusal it answers with, is pinned by `application_deletion_gate`, so every row here
 //! tears the children down first — bottom-up, as AppConfig's ordering contract asks — and
@@ -372,8 +377,8 @@ fn reads(built: &Built) -> Vec<(String, String)> {
 }
 
 /// Delete every child the row built, bottom-up — the hosted versions, then the profiles
-/// that held them, then the environments — so the application is the leaf its own delete
-/// needs it to be.
+/// that held them, then the environments, then the experiment definition — so the
+/// application is the leaf its own delete needs it to be.
 ///
 /// Each of these deletes is itself owed its modelled 204, which is what makes the teardown
 /// AppConfig's documented way out: the gate on the application's delete is child existence,
@@ -417,6 +422,22 @@ async fn teardown_children(router: &MultiServiceRouter, case: &str, built: &Buil
         )
         .await;
         assert_deleted(case, "DeleteEnvironment", &answer);
+    }
+    if let Some(definition) = &built.definition {
+        // A delete that names no `DeleteType` PRESERVES the record, which would still gate
+        // the application, so the teardown asks for the permanent one.
+        let answer = send(
+            router,
+            "DELETE",
+            &format!(
+                "/applications/{application}/experimentdefinitions/{definition}?delete_type=DESTROY"
+            ),
+            "application/json",
+            Vec::new(),
+            &[],
+        )
+        .await;
+        assert_deleted(case, "DeleteExperimentDefinition", &answer);
     }
 }
 
