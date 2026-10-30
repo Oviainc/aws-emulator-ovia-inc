@@ -483,19 +483,22 @@ async fn updated_data_sources_round_trip_through_get_data_source() {
             }),
         ),
         (
-            "a new name, a different bucket and a vector ingestion configuration",
+            "a new name, a different bucket and a parsing configuration",
             json!({
                 "name": "renamed-round-trip-source",
-                "description": "a source with an ingestion configuration",
+                "description": "a source with a parsing configuration",
                 "dataSourceConfiguration": s3_configuration("update-round-trip-other-docs"),
+                // `vectorIngestionConfiguration` varies here through
+                // `parsingConfiguration`, NOT through `chunkingConfiguration`:
+                // the chunking configuration is the one member this operation
+                // documents as unchangeable once the connector exists, and this
+                // data source was created without one, so a row that supplied
+                // one would be refused (see
+                // `immutable_configuration_members.rs`). `SMART_PARSING` is a
+                // modelled `ParsingStrategy` value
+                // (`smithy_query(query="shape",shape="ParsingStrategy")`).
                 "vectorIngestionConfiguration": {
-                    "chunkingConfiguration": {
-                        "chunkingStrategy": "FIXED_SIZE",
-                        "fixedSizeChunkingConfiguration": {
-                            "maxTokens": 300,
-                            "overlapPercentage": 20,
-                        },
-                    },
+                    "parsingConfiguration": { "parsingStrategy": "SMART_PARSING" },
                 },
                 "dataDeletionPolicy": "DELETE",
             }),

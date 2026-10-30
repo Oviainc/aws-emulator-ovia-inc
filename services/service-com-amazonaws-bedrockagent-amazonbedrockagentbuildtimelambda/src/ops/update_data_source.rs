@@ -7,6 +7,10 @@
 //! stored record — so the following `GetDataSource` reports exactly what the update
 //! supplied.
 //!
+//! `chunkingConfiguration` is the exception: this operation documents it as unchangeable
+//! once the connector exists, so an update that would leave a different one on the data
+//! source is refused with the modelled `ValidationException` and writes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -220,6 +224,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // `chunkingConfiguration` is the one member of this resource that this
+        // operation's own contract documents as unchangeable once the connector
+        // exists ("You can't change the chunkingConfiguration after you create
+        // the data source connector. Specify the existing
+        // chunkingConfiguration"), so an update that would leave a different one
+        // there is a bad request and nothing is written. Every OTHER member of
+        // `vectorIngestionConfiguration`, and the connector configuration
+        // itself, this operation does change.
+        let stored_chunking = record
+            .vector_ingestion_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.chunking_configuration.as_ref());
+        let requested_chunking = input
+            .vector_ingestion_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.chunking_configuration.as_ref());
+        match crate::state::immutable_member_verdict(
+            "vectorIngestionConfiguration.chunkingConfiguration",
+            &ChunkingConfiguration::SCHEMA,
+            stored_chunking,
+            requested_chunking,
+        ) {
+            crate::state::ImmutableMemberVerdict::Unchanged => {}
+            crate::state::ImmutableMemberVerdict::Changed(message) => {
+                return Err(UpdateDataSourceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                        field_list: None,
+                    },
+                )
+                .into());
+            }
+            crate::state::ImmutableMemberVerdict::NotComparable => {
+                return Err(UpdateDataSourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the stored chunkingConfiguration could not be compared with \
+                             the one the request carries"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
 
         // The update replaces the data source's mutable members: this operation's
         // own contract tells the caller to "specify the existing

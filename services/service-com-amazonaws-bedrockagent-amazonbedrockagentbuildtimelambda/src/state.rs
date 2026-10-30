@@ -26,6 +26,11 @@
 //! map, keyed by `dataSourceId` and carrying the `knowledgeBaseId` it belongs
 //! to, with [`DataSourceRecord::to_data_source`] as its single projection.
 //!
+//! Both `UpdateDataSource` and `UpdateKnowledgeBase` hold members their own
+//! contracts document as unchangeable once the resource exists; the one rule
+//! behind those refusals lives here, in [`immutable_member_verdict`] and
+//! [`immutable_member_message`], so neither handler can decide it differently.
+//!
 //! A data source's ingestion jobs (`StartIngestionJob`, `GetIngestionJob`) are
 //! backed by the
 //! [`ingestion_jobs`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::ingestion_jobs)
@@ -1284,6 +1289,101 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         self.client_tokens.retain(|_, id| id != agent_id);
         Some(record)
     }
+}
+
+/// The `ValidationException` message an update answers when it would leave a
+/// different value in a member its own contract documents as unchangeable once
+/// the resource exists.
+///
+/// The member path the request carries is the one variable part, so one template
+/// serves every such member: `UpdateDataSource` documents "You can't change the
+/// chunkingConfiguration after you create the data source connector. Specify the
+/// existing chunkingConfiguration", and `UpdateKnowledgeBase` documents the same
+/// of `knowledgeBaseConfiguration` and `storageConfiguration`
+/// (`smithy_query(query="doc",shape="UpdateDataSource")` /
+/// `smithy_query(query="doc",shape="UpdateKnowledgeBase")`).
+pub fn immutable_member_message(member: &str) -> String {
+    format!("{member} cannot be updated once created.")
+}
+
+/// What an update does to a member that cannot change once the resource exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImmutableMemberVerdict {
+    /// The update leaves the member exactly as the resource holds it, so it is
+    /// served.
+    Unchanged,
+    /// The update would leave a different value there: a bad request, answered
+    /// with the modelled `ValidationException` carrying this message.
+    Changed(String),
+    /// The codec could not render one of the two values, so they cannot be
+    /// compared at all: a server fault rather than something to blame the
+    /// request for.
+    NotComparable,
+}
+
+/// One modelled shape as the JSON `Value` this service's own codec renders for
+/// it.
+///
+/// Rendering through the codec is what makes two shapes comparable at all: the
+/// generated shapes carry no `PartialEq`, and a `Debug` rendering would depend
+/// on the field order of the Rust struct rather than on the model. A
+/// `serde_json::Value` then supplies the equality, by member rather than by
+/// text, so two values that differ only in which optional members are absent
+/// still compare unequal exactly when the model says they differ.
+///
+/// A value the codec cannot render answers `None`, so the comparison is reported
+/// impossible rather than silently false.
+fn rendered_shape(
+    schema: &::aws_smithy_schema::Schema,
+    value: &dyn ::aws_smithy_schema::serde::SerializableStruct,
+) -> Option<::serde_json::Value> {
+    use ::aws_smithy_schema::codec::Codec;
+    use ::aws_smithy_schema::serde::ShapeSerializer;
+
+    let mut serializer =
+        ::aws_smithy_schema_server::json::JsonCodec::rest_json().create_serializer();
+    if let Err(error) = serializer.write_struct(schema, value) {
+        ::tracing::warn!(
+            %error,
+            "the JSON codec could not render a stored shape, so two configurations cannot be compared"
+        );
+        return None;
+    }
+    match ::serde_json::from_str::<::serde_json::Value>(&serializer.into_string()) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            ::tracing::warn!(
+                %error,
+                "the JSON this service renders for a stored shape did not parse back"
+            );
+            None
+        }
+    }
+}
+
+/// Whether an update would change `member` — a member its operation documents as
+/// unchangeable once the resource exists — from the value `stored` the resource
+/// holds to the value `requested` the update would leave there. `member` is the
+/// member's path as the request carries it, which is what the refusal names.
+///
+/// Absence counts: a member the resource holds and the update would drop, or one
+/// the resource lacks and the update would add, is as much a change as a
+/// different value, because the update writes whatever it carries.
+pub fn immutable_member_verdict<T: ::aws_smithy_schema::serde::SerializableStruct>(
+    member: &str,
+    schema: &::aws_smithy_schema::Schema,
+    stored: Option<&T>,
+    requested: Option<&T>,
+) -> ImmutableMemberVerdict {
+    let stored = stored.map(|value| rendered_shape(schema, value));
+    let requested = requested.map(|value| rendered_shape(schema, value));
+    if matches!(stored, Some(None)) || matches!(requested, Some(None)) {
+        return ImmutableMemberVerdict::NotComparable;
+    }
+    if stored == requested {
+        return ImmutableMemberVerdict::Unchanged;
+    }
+    ImmutableMemberVerdict::Changed(immutable_member_message(member))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

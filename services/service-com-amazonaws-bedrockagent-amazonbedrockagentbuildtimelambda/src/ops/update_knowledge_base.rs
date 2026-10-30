@@ -7,6 +7,11 @@
 //! that stored record — so the following `GetKnowledgeBase` reports exactly what the
 //! update supplied.
 //!
+//! `knowledgeBaseConfiguration` and `storageConfiguration` are the exceptions: this
+//! operation documents both as unchangeable once the knowledge base exists, so an update
+//! that would leave a different one on the record is refused with the modelled
+//! `ValidationException` and writes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -209,6 +214,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // `knowledgeBaseConfiguration` and `storageConfiguration` are the
+        // members this operation's own contract documents as unchangeable once
+        // the knowledge base exists ("You can't change the
+        // knowledgeBaseConfiguration or storageConfiguration fields, so you must
+        // specify the same configurations as when you created the knowledge
+        // base"), so an update that would leave a different one there is a bad
+        // request and nothing is written. `name`, `description` and `roleArn` are
+        // the ones it does change.
+        let immutable = [
+            crate::state::immutable_member_verdict(
+                "knowledgeBaseConfiguration",
+                &KnowledgeBaseConfiguration::SCHEMA,
+                Some(&record.knowledge_base_configuration),
+                Some(&input.knowledge_base_configuration),
+            ),
+            crate::state::immutable_member_verdict(
+                "storageConfiguration",
+                &StorageConfiguration::SCHEMA,
+                record.storage_configuration.as_ref(),
+                input.storage_configuration.as_ref(),
+            ),
+        ];
+        for verdict in immutable {
+            match verdict {
+                crate::state::ImmutableMemberVerdict::Unchanged => {}
+                crate::state::ImmutableMemberVerdict::Changed(message) => {
+                    return Err(UpdateKnowledgeBaseErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(message),
+                            field_list: None,
+                        },
+                    )
+                    .into());
+                }
+                crate::state::ImmutableMemberVerdict::NotComparable => {
+                    return Err(UpdateKnowledgeBaseErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(
+                                "the stored configuration could not be compared with the \
+                                 one the request carries"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
 
         // The update replaces the knowledge base's mutable members: this
         // operation's own contract is that "all fields will be overwritten, you
