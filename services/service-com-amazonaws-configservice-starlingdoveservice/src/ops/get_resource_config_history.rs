@@ -6,7 +6,9 @@
 //!
 //! The items come from the inventory the recorder writes
 //! (`crate::state::recording`), so a resource the recorder never observed is answered
-//! `ResourceNotDiscoveredException` rather than with an empty history.
+//! `ResourceNotDiscoveredException` rather than with an empty history. That key is what
+//! the read refuses about: the inventory outlives the recorder that wrote it, so the
+//! recorders the account holds now decide nothing here.
 //!
 //! ## Shape of an operation
 //!
@@ -273,23 +275,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the inventory, and nothing is written.
         let store = state.lock();
 
-        // The configuration items of a resource are what a CUSTOMER MANAGED
-        // configuration recorder captured, so reporting them needs one to exist: a
-        // service-linked recorder records for the service it is linked to and does not
-        // stand in for one.
-        if !store.has_customer_managed_recorder() {
-            return Err(
-                GetResourceConfigHistoryErrorModeled::NoAvailableConfigurationRecorderException(
-                    NoAvailableConfigurationRecorderException {
-                        message: Some(
-                            crate::state::NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-
+        // What this read answers about is the RESOURCE KEY the request named: Config
+        // keeps the configuration items it captured for a resource and reports them
+        // whatever the account's recorders are doing now — deleting a recorder deletes
+        // no history — so a key the inventory holds no item for is the one thing this
+        // read refuses about, and whether the account currently holds a customer
+        // managed recorder decides nothing here.
         let key = (input.resource_type.clone(), input.resource_id.clone());
         let Some(entry) = store.discovered_resources.get(&key) else {
             return Err(

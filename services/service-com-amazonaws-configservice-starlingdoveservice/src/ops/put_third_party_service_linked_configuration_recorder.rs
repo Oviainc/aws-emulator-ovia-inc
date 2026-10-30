@@ -252,18 +252,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The connector carries the connection to the third-party cloud service
-        // provider whose resources the recorder records, so it has to exist before a
-        // recorder can be linked to it, and the provider the recorder reports is the
-        // one that connector was created for.
+        // provider whose resources the recorder records, so the recorder cannot exist
+        // without it: with no connector of this Region behind the ARN, the service
+        // principal resolves no third-party service-linked configuration recorder at
+        // all, and Config states that refusal the way it states every service principal
+        // it cannot resolve a recorder from — about the service principal, quoting
+        // nothing of the request.
         let Some(provider) = store
             .connectors
             .get(&connector_arn)
             .filter(|_| serves_region)
             .map(|connector| connector.provider.clone())
         else {
-            return Err(validation(crate::state::no_such_connector_message(
-                &connector_arn,
-            )));
+            return Err(validation(
+                crate::state::UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE.to_string(),
+            ));
         };
 
         // A service Config links a configuration recorder to has ONE: the recorder is

@@ -260,9 +260,10 @@ pub fn supports_service_linked_recording(service_principal: &str) -> bool {
     SERVICE_LINKED_PRINCIPALS.contains(&service_principal)
 }
 
-/// How Config words `ValidationException` for a `ServicePrincipal` that names no
-/// service Config links a configuration recorder to — whether the value is no service
-/// principal at all or names a service that owns no such recorder.
+/// How Config words `ValidationException` for a `ServicePrincipal` whose service-linked
+/// configuration recorder it cannot resolve — whether the principal names no service
+/// Config links a recorder to, or the third-party recorder it names has no connector to
+/// record through.
 ///
 /// The model states the condition (`ValidationException`: "You have provided a service
 /// principal for service-linked configuration recorder that is not valid") and Config
@@ -270,8 +271,9 @@ pub fn supports_service_linked_recording(service_principal: &str) -> bool {
 /// uses for a configuration recorder it cannot find
 /// ([`no_such_configuration_recorder_message`]) — so the text is request-independent: it
 /// quotes nothing the caller sent, and it names the DIMENSION the request selected the
-/// recorder by. Every operation that takes a `ServicePrincipal` refuses an unrecognised
-/// one this way.
+/// recorder by. Every operation that resolves a recorder from a `ServicePrincipal`
+/// refuses an unresolvable one this way; `NoSuchConfigurationRecorderException` is left
+/// for a recorder Config COULD resolve the principal to and this account does not hold.
 pub const UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE: &str =
     "The service principal of the configuration recorder you entered cannot be found. \
      Verify the configuration recorder service principal, and try again.";
@@ -453,6 +455,19 @@ pub const DEFAULT_EVENT_BUS_NAME: &str = "default";
 /// (`com.amazonaws.configservice#ResourceConfigurationSchemaType`), and so the schema
 /// type a resource definition is read as when the request names none.
 pub const RESOURCE_CONFIGURATION_SCHEMA_TYPE_CFN: &str = "CFN_RESOURCE_SCHEMA";
+
+/// How Config words `InvalidParameterValueException` for a resource definition that is
+/// not the JSON document a resource configuration is.
+///
+/// `ResourceDetails$ResourceConfiguration` is "the resource definition to be evaluated
+/// as per the resource configuration schema type", whose instances are JSON documents,
+/// so a body that is not one cannot be evaluated against any schema. The sentence is
+/// FIXED and request-independent: it quotes neither the body sent nor the member it was
+/// sent at, because what the caller has to provide — valid JSON — is the whole of what
+/// it says.
+pub const RESOURCE_CONFIGURATION_NOT_JSON_MESSAGE: &str =
+    "The provided resource configuration is not a valid JSON. Provide a valid JSON and \
+     try again.";
 
 /// `Owner` value for a Custom Lambda rule, whose evaluation Config performs by
 /// invoking the caller's Lambda function (`com.amazonaws.configservice#Owner`).
@@ -4448,19 +4463,16 @@ pub fn connector_arn_parts(arn: &str) -> Option<(&str, &str)> {
 /// deliberate: there the `ConnectorArn` is a reference to a dependency the recorder
 /// needs, so the refusal says which value could not name one. The operations whose
 /// `Arn` IS the connector they act on answer the single
-/// [`CONNECTOR_ARN_NOT_VALID_MESSAGE`] instead.
+/// [`CONNECTOR_ARN_NOT_VALID_MESSAGE`] instead. A well-formed ARN that names no
+/// connector is not this refusal: there the recorder the service principal names
+/// cannot be resolved at all, which is
+/// [`UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE`].
 pub fn invalid_connector_arn_message(arn: &str) -> String {
     format!(
         "The Arn '{arn}' provided in the request is not a valid connector ARN. Please \
          provide an ARN of the form \
          arn:aws:{ARN_SERVICE}:<region>:<account>:{CONNECTOR_ARN_RESOURCE_TYPE}/<name>."
     )
-}
-
-/// How this service words a connector that no longer, or never did, exist. Built
-/// from the request for the same reason as [`invalid_connector_arn_message`].
-pub fn no_such_connector_message(arn: &str) -> String {
-    format!("The connector '{arn}' provided in the request does not exist.")
 }
 
 /// The ONE text an operation whose `Arn` names the connector it acts on refuses that
@@ -5735,15 +5747,16 @@ pub const RESOURCE_NOT_IDENTIFIED_MESSAGE: &str =
 pub const RESOURCE_TYPE_REQUIRED_MESSAGE: &str =
     "If you specify a resource ID, you must also specify a type for ResourceType.";
 
-/// How Config words `NoSuchConfigRuleException` for a request that named ONE rule
-/// this account does not hold, through a single-name member (`ConfigRuleName`).
+/// How Config words `NoSuchConfigRuleException` for a request that named a rule this
+/// account does not hold.
 ///
 /// The message is BUILT FROM THE REQUEST — it quotes the name the caller sent and
-/// names the member to check — so every operation that looks a rule up by a single
-/// name words it the same way. An operation that looks rules up through a LIST
-/// member words it as [`NO_SUCH_CONFIG_RULES`] instead: the message follows
-/// the shape of the member that named the rule, and a list cannot be quoted back as
-/// one name.
+/// names the member to check — so every operation that resolves a rule it is to ACT on
+/// words it the same way, naming the one name it could not resolve however many the
+/// request carried: a caller that submitted several learns which of them to fix. The
+/// LIST-wide form [`NO_SUCH_CONFIG_RULES`] belongs to the reads that answer about the
+/// list as a whole (`DescribeConfigRules`, `DescribeComplianceByConfigRule`), which
+/// report on every name at once and so name none of them.
 pub fn no_such_config_rule_message(name: &str) -> String {
     format!(
         "The ConfigRule '{name}' provided in the request is invalid. Please check the \
@@ -5766,14 +5779,14 @@ pub fn unsupported_evaluation_mode_message(requested: &str) -> String {
     )
 }
 
-/// How Config words `NoSuchConfigRuleException` for a request that named rules
-/// through a LIST member (`ConfigRuleNames`), one of which this account does not
-/// hold.
+/// How Config words `NoSuchConfigRuleException` for a READ that answers about a list of
+/// rules (`ConfigRuleNames`), one of which this account does not hold.
 ///
-/// A list-shaped lookup reports the plural form and quotes no name: the refusal is
-/// about the list as a whole, so it names the member to check and leaves the caller
-/// to compare the list it sent against the rules it holds. See
-/// [`no_such_config_rule_message`] for the single-name form.
+/// Such a read reports on every name at once, so its refusal is about the list as a
+/// whole: it reports the plural form, names the member to check and quotes no name,
+/// leaving the caller to compare the list it sent against the rules it holds. An
+/// operation that resolves the rules it is to ACT on names the one it could not resolve
+/// instead — see [`no_such_config_rule_message`].
 pub const NO_SUCH_CONFIG_RULES: &str = "One or more ConfigRules provided in the request are \
                                         invalid. Please check the configRule names.";
 

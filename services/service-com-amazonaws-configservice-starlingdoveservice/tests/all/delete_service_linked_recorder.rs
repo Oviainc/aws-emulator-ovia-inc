@@ -15,10 +15,12 @@
 //!    while every other recorder the account holds is left alone;
 //! 2. the service can be linked again afterwards, getting a recorder of its own with a
 //!    new identity, so the delete really released the name;
-//! 3. a selector that names no service-linked recorder — a service nothing is linked
-//!    to, an ARN no recorder carries, the ARN of the customer managed recorder, or a
-//!    recorder this operation already deleted — is the modelled
-//!    `NoSuchConfigurationRecorderException` and removes nothing;
+//! 3. a selector that names no service-linked recorder Config COULD have linked — a
+//!    supported service nothing is linked to, an ARN no recorder carries, the ARN of
+//!    the customer managed recorder, or a recorder this operation already deleted — is
+//!    the modelled `NoSuchConfigurationRecorderException` and removes nothing, while a
+//!    `ServicePrincipal` naming a service Config links no recorder to at all resolves
+//!    no recorder and is the modelled `ValidationException`;
 //! 4. a request carrying both selectors, or neither, is the modelled
 //!    `ValidationException` ("You must specify exactly one of Arn or
 //!    ServicePrincipal") and removes nothing;
@@ -49,6 +51,13 @@ const LINKED: &str = SERVICE_LINKED_PRINCIPALS[0];
 /// Another such service, whose recorder every case leaves alone, so each delete is
 /// shown to remove the ONE recorder it names and no other.
 const BYSTANDER: &str = SERVICE_LINKED_PRINCIPALS[1];
+
+/// The sentence Config answers a `ServicePrincipal` it can resolve no service-linked
+/// configuration recorder from, spelled out here rather than read from the handler's own
+/// constant so this suite pins the text instead of restating it.
+const UNRESOLVABLE_PRINCIPAL_MESSAGE: &str =
+    "The service principal of the configuration recorder you entered cannot be found. \
+     Verify the configuration recorder service principal, and try again.";
 
 /// The supported service principal that is NOT `service_principal`, so a case can hold
 /// a second recorder the delete must leave alone whichever row it is running.
@@ -424,14 +433,10 @@ async fn a_selector_that_names_no_service_linked_recorder_is_refused() {
         &emulator.region,
         "configuration-recorder/AWSConfigurationRecorderForGhost/cr-ghost",
     );
-    let cases: [(&str, Value); 6] = [
+    let cases: [(&str, Value); 5] = [
         (
             "a service nothing is linked to",
             json!({ "ServicePrincipal": BYSTANDER }),
-        ),
-        (
-            "a service Config links no recorder to",
-            json!({ "ServicePrincipal": "backup.amazonaws.com" }),
         ),
         ("an ARN no recorder carries", json!({ "Arn": ghost_arn })),
         (
@@ -453,6 +458,53 @@ async fn a_selector_that_names_no_service_linked_recorder_is_refused() {
         .await;
 
         // The refusal removed nothing: both recorders are still exactly as they were.
+        assert_eq!(
+            described_recorders(&emulator).await,
+            before,
+            "case {case:?}: a refused delete must leave the store alone"
+        );
+    }
+
+    // A `ServicePrincipal` naming a service Config links NO configuration recorder to
+    // resolves no recorder at all — not one this account could hold and does not — so
+    // it is a request to correct rather than a missing resource, worded for the
+    // dimension the request selected by and quoting nothing of the value. Every row is
+    // a well-formed service principal (it is the catalogue that refuses them, not the
+    // form), differing along the service named: another Amazon Web Services service,
+    // the service Config links a recorder to only through a CONNECTOR, and a near-miss
+    // of a supported principal carrying one label too many.
+    let unresolvable: [(&str, String); 3] = [
+        (
+            "another Amazon Web Services service",
+            "backup.amazonaws.com".to_string(),
+        ),
+        (
+            "a service linked only through a connector",
+            "securityhub.amazonaws.com".to_string(),
+        ),
+        (
+            "one label too many on a supported principal",
+            format!("telemetry.{LINKED}"),
+        ),
+    ];
+
+    for (case, service_principal) in unresolvable {
+        let message = refused_with(
+            &emulator,
+            case,
+            DELETE,
+            &json!({ "ServicePrincipal": &service_principal }),
+            "ValidationException",
+        )
+        .await;
+        assert_eq!(
+            message, UNRESOLVABLE_PRINCIPAL_MESSAGE,
+            "case {case:?}: expected {UNRESOLVABLE_PRINCIPAL_MESSAGE:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(&service_principal),
+            "case {case:?}: the refusal quotes nothing of the value, got {message:?}"
+        );
         assert_eq!(
             described_recorders(&emulator).await,
             before,

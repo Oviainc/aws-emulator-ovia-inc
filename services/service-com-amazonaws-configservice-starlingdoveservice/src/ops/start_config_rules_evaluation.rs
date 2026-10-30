@@ -236,16 +236,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A name that names no rule is a failure for the request as a whole: nothing
-        // is evaluated, so no named rule's pass starts. The refusal is worded for a
-        // LIST-shaped lookup, which is how this operation names its rules.
-        if names
+        // is evaluated, so no named rule's pass starts. Config states the one name it
+        // could not resolve — the first of the list — so a caller that submitted
+        // several learns WHICH of them it has to fix, which is what the single-name
+        // wording carries.
+        let absent = names
             .iter()
-            .any(|name| !store.config_rules.contains_key(name))
-        {
+            .find(|name| !store.config_rules.contains_key(name.as_str()));
+        if let Some(name) = absent {
             return Err(
                 StartConfigRulesEvaluationErrorModeled::NoSuchConfigRuleException(
                     NoSuchConfigRuleException {
-                        message: Some(crate::state::NO_SUCH_CONFIG_RULES.to_string()),
+                        message: Some(crate::state::no_such_config_rule_message(name)),
                     },
                 )
                 .into(),

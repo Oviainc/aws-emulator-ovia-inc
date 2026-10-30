@@ -58,7 +58,11 @@
 //! 4. a value is stated against EVERY constraint of its member it broke, one clause
 //!    each, including the length an account id's twelve digits fix
 //!    ([`implied_account_id_length`]) — so a member can account for more than one of
-//!    the validation errors the envelope counts.
+//!    the validation errors the envelope counts;
+//! 5. a value outside the modelled `ResourceType` value set is refused with Config's
+//!    own fixed sentence about a resource type it does not support
+//!    ([`UNSUPPORTED_RESOURCE_TYPE_MESSAGE`]) instead of a clause enumerating that
+//!    set, wherever a member targeting that shape carries it ([`resource_type_values`]).
 //!
 //! The status (400) and the error code ([`VALIDATION_EXCEPTION`]) are the framework's
 //! own choice for a constraint failure and are unchanged; only the sentence differs.
@@ -66,7 +70,7 @@
 //! class states — is read back off the framework's own rendering ([`requirement`]),
 //! so a constraint class cannot arrive here with wording of its own.
 
-use aws_smithy_schema_server::constraints::path;
+use aws_smithy_schema_server::constraints::{path, EnumTrait};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
@@ -385,9 +389,94 @@ fn constraint_clauses(violation: &Violation) -> Option<Vec<String>> {
     Some(clauses)
 }
 
+/// How Config refuses a value that is no resource type it supports.
+///
+/// Config records the resource types its published catalogue covers and that catalogue
+/// GROWS, so the service does not read its current value set back to the caller: the
+/// sentence is FIXED and request-independent — it quotes neither the value sent nor the
+/// types Config supports — and tells the caller to verify the type it named. Recorded on
+/// the resource-type association path and stated for the shape rather than for one
+/// operation, so it holds wherever a member targeting `ResourceType` carries a value
+/// outside it.
+const UNSUPPORTED_RESOURCE_TYPE_MESSAGE: &str =
+    "The resource type you specified is not supported by AWS Config. Verify the resource \
+     type, and try again.";
+
+/// The members of this model that carry ONE resource type, as the model declares them:
+/// where the `ResourceType` value set can be read at runtime.
+///
+/// Several of them, from unrelated operations, because this is how the set is reached at
+/// all: a member targeting an enumerated shape carries that shape's value set as the
+/// constraint the validating walk checks against, so the set is available through the
+/// members that target it and not through the shape on its own. Listing more than one
+/// means a member renamed or retargeted upstream cannot silently take the rule with it
+/// — the others still name the set, and the unit test holds all of them to the same one.
+static RESOURCE_TYPE_MEMBERS: &[(&::aws_smithy_schema::Schema, &str)] = &[
+    (
+        crate::ops::types::GET_RESOURCE_CONFIG_HISTORY_INPUT_SCHEMA,
+        "resourceType",
+    ),
+    (
+        crate::ops::types::LIST_DISCOVERED_RESOURCES_INPUT_SCHEMA,
+        "resourceType",
+    ),
+    (
+        crate::ops::types::LIST_AGGREGATE_DISCOVERED_RESOURCES_INPUT_SCHEMA,
+        "ResourceType",
+    ),
+];
+
+/// The value set the member `member_name` of `schema` admits, as the model's own schema
+/// carries it, or `None` when the model declares no such member or attaches no
+/// enumerated constraint to it.
+fn enum_values(
+    schema: &'static ::aws_smithy_schema::Schema,
+    member_name: &str,
+) -> Option<&'static [&'static str]> {
+    let member = schema
+        .members()
+        .iter()
+        .copied()
+        .find(|member| member.member_name() == Some(member_name))?;
+    let enumerated = member.traits()?.get(&EnumTrait::TRAIT_ID)?;
+    Some(enumerated.as_any().downcast_ref::<EnumTrait>()?.values)
+}
+
+/// The value set the modelled `ResourceType` admits, read off the model's OWN schemas
+/// rather than copied here. `None` when no listed member names it, which leaves the
+/// framework's clause standing (the fail-safe direction).
+fn resource_type_values() -> Option<&'static [&'static str]> {
+    RESOURCE_TYPE_MEMBERS
+        .iter()
+        .find_map(|(schema, member_name)| enum_values(schema, member_name))
+}
+
+/// Whether `violation` is a value outside the modelled `ResourceType` value set.
+///
+/// Keyed on the SET the violation reports rather than on the member it sits at, because
+/// that set identifies the shape the value failed: a resource type reaches an input
+/// directly (`resourceType`) and as an element of a list (`resourceTypes.1.member`), and
+/// both are the same shape with the same refusal.
+fn is_unsupported_resource_type(violation: &Violation) -> bool {
+    let ViolationKind::EnumValue(reported) = &violation.kind else {
+        return false;
+    };
+    resource_type_values().is_some_and(|values| {
+        reported
+            .iter()
+            .map(String::as_str)
+            .eq(values.iter().copied())
+    })
+}
+
 /// The `ValidationException` message for a refusal: the AWS envelope over one clause
-/// per violated constraint, in the order the validating walk found them.
+/// per violated constraint, in the order the validating walk found them — except for a
+/// resource type Config does not support, whose own fixed sentence replaces the whole
+/// envelope.
 fn constraint_envelope(violations: &[Violation]) -> Option<String> {
+    if violations.iter().any(is_unsupported_resource_type) {
+        return Some(UNSUPPORTED_RESOURCE_TYPE_MESSAGE.to_string());
+    }
     let clauses: Vec<String> = violations
         .iter()
         .map(constraint_clauses)
@@ -466,8 +555,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // pattern verbatim, a member whose value Config does not echo back
         // ([`WITHHELD_MEMBERS`]) states the position and the constraint alone, and a
         // value that broke several of its member's constraints states one clause for
-        // each of them. The code stays `ValidationException` (HTTP 400) — what the
-        // framework would have answered — so only the wording changes.
+        // each of them. A value outside the modelled `ResourceType` set is the one
+        // refusal Config does not state as a clause at all: it answers its own fixed
+        // sentence ([`UNSUPPORTED_RESOURCE_TYPE_MESSAGE`]). The code stays
+        // `ValidationException` (HTTP 400) — what the framework would have answered —
+        // so only the wording changes.
         //
         // An authentication refusal is not an input-constraint failure and keeps
         // the framework's wording.
@@ -853,6 +945,102 @@ mod tests {
                 declared.regex
             );
         }
+    }
+
+    /// A value outside the modelled `ResourceType` set is refused with Config's own
+    /// fixed sentence wherever that member sits, and another shape's value set keeps
+    /// the framework's clause.
+    #[test]
+    fn an_unsupported_resource_type_is_refused_with_configs_own_sentence() {
+        let resource_types: Vec<String> = resource_type_values()
+            .expect("the model declares the ResourceType value set")
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        assert!(
+            resource_types.iter().any(|value| value == "AWS::S3::Bucket"),
+            "the set read off the model carries Config's published types, got {} entries",
+            resource_types.len()
+        );
+
+        // Every member the rule is reached through names the SAME set, so a member
+        // renamed or retargeted upstream shows up here rather than silently taking the
+        // rule with it.
+        for (schema, member_name) in RESOURCE_TYPE_MEMBERS {
+            let values = enum_values(schema, member_name).unwrap_or_else(|| {
+                panic!(
+                    "case {member_name:?} of {:?}: the model declares the member and its \
+                     value set",
+                    schema.shape_id().shape_name()
+                )
+            });
+            assert!(
+                values.iter().copied().eq(resource_types.iter().map(String::as_str)),
+                "case {member_name:?} of {:?}: expected the same ResourceType set, got {} \
+                 entries against {}",
+                schema.shape_id().shape_name(),
+                values.len(),
+                resource_types.len()
+            );
+        }
+
+        // Rows differ along WHERE the value sits and along the value sent: a member an
+        // input carries directly, two positions of a resource-type list, and a
+        // position inside a wrapper the input carries.
+        let rows: [(&str, &str, &str); 4] = [
+            (
+                "a single resource-type member",
+                "resourceType",
+                "AWS::NotAReal::ResourceType",
+            ),
+            (
+                "the first element of a list",
+                "resourceTypes.1.member",
+                "AWS::EC2::NotAThing",
+            ),
+            (
+                "a later element of a list",
+                "resourceTypes.3.member",
+                "not-a-resource-type",
+            ),
+            (
+                "a position inside a wrapper",
+                "recordingGroup.resourceTypes.2.member",
+                "",
+            ),
+        ];
+
+        for (case, violation_path, value) in rows {
+            let found = Violation {
+                path: violation_path.to_string(),
+                kind: ViolationKind::EnumValue(resource_types.clone()),
+                value: Some(value.to_string()),
+            };
+            let stated = constraint_envelope(std::slice::from_ref(&found))
+                .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
+            assert_eq!(
+                stated, UNSUPPORTED_RESOURCE_TYPE_MESSAGE,
+                "case {case:?}: expected {UNSUPPORTED_RESOURCE_TYPE_MESSAGE:?}, got \
+                 {stated:?}"
+            );
+        }
+
+        // Another shape's value set is still stated as a clause enumerating it: the
+        // sentence above belongs to the resource-type shape alone.
+        let other = Violation {
+            path: "chronologicalOrder".to_string(),
+            kind: ViolationKind::EnumValue(vec!["Forward".to_string(), "Reverse".to_string()]),
+            value: Some("Sideways".to_string()),
+        };
+        let stated =
+            constraint_envelope(std::slice::from_ref(&other)).expect("an enum states a clause");
+        let expected = "1 validation error detected: Value 'Sideways' at \
+                        'chronologicalOrder' failed to satisfy constraint: Member must \
+                        satisfy enum value set: [Forward, Reverse]";
+        assert_eq!(
+            stated, expected,
+            "case \"another shape's value set\": expected {expected:?}, got {stated:?}"
+        );
     }
 
     /// Nothing to word is no refusal: a request that breaks no constraint is not

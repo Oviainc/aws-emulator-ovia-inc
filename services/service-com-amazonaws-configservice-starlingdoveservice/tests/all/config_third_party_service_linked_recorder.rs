@@ -18,7 +18,9 @@
 //!    linked service sets, and the scope of third-party resources the request asked
 //!    for, all read back out of state;
 //! 3. the scope configuration must satisfy its own published constraints;
-//! 4. the connector the recorder is linked to must exist;
+//! 4. the connector the recorder records through must exist, and an ARN that names
+//!    none resolves no recorder for the principal, so Config words that refusal about
+//!    the service principal;
 //! 5. a repeat call for the same principal and connector updates the scope, while a
 //!    different connector for the same principal conflicts;
 //! 6. a service-linked recorder is always recording and is not this account's
@@ -489,25 +491,36 @@ async fn the_connector_the_recorder_is_linked_to_must_exist() {
     let scope = json!({ "scopeType": "subscription", "allRegions": true });
 
     // Rows differ in the FORM of a connector ARN this account does not hold: a
-    // well-formed connector ARN of another account, one of another Region, one of
-    // another service, and a string that is no ARN at all.
+    // well-formed connector ARN of another account, one of another Region, one of this
+    // account that was never created, and a string that is no ARN at all. A well-formed
+    // ARN that names no connector resolves no third-party recorder for the principal at
+    // all, so the refusal is the service-principal sentence, quoting nothing of the
+    // request; a value that is no connector ARN is the member's own form, which Config
+    // states against the value sent.
     let absent = [
         (
             "a connector of another account",
             "arn:aws:config:us-east-1:999999999999:connector/0123456789abcdef".to_string(),
+            UNRECOGNIZED_PRINCIPAL_MESSAGE.to_string(),
         ),
         (
             "a connector of another Region",
             state::connector_arn("eu-west-1", "azure-tenant-elsewhere"),
+            UNRECOGNIZED_PRINCIPAL_MESSAGE.to_string(),
         ),
         (
             "a connector of this account that was never created",
             state::connector_arn(&emulator.region, "azure-tenant-never-created"),
+            UNRECOGNIZED_PRINCIPAL_MESSAGE.to_string(),
         ),
-        ("no ARN at all", "connector-1".to_string()),
+        (
+            "no ARN at all",
+            "connector-1".to_string(),
+            state::invalid_connector_arn_message("connector-1"),
+        ),
     ];
 
-    for (case, connector_arn) in &absent {
+    for (case, connector_arn, expected) in &absent {
         let message = refused_with(
             &emulator,
             case,
@@ -516,10 +529,9 @@ async fn the_connector_the_recorder_is_linked_to_must_exist() {
             "ValidationException",
         )
         .await;
-        assert!(
-            message.contains(connector_arn),
-            "case {case:?}: the refusal names the connector the request asked for, got \
-             {message:?}"
+        assert_eq!(
+            &message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
         let recorders = described_recorders(&emulator).await;
         assert!(

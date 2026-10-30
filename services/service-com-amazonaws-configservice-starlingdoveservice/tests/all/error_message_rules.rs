@@ -312,9 +312,9 @@ async fn an_absent_configuration_recorder_names_the_selector_the_request_used() 
     }
 }
 
-/// `NoSuchConfigRuleException` follows the SHAPE of the member that named the rule: a
-/// list-shaped lookup reports the plural form and quotes no name, a single-name member
-/// the singular form quoting the name it carried.
+/// `NoSuchConfigRuleException` follows the operation's relation to the rules named: a
+/// read that answers about a LIST of rules at once reports the plural form and quotes no
+/// name, while an operation that resolves one rule to act on names the name it carried.
 #[tokio::test]
 async fn an_absent_config_rule_is_worded_for_the_member_that_named_it() {
     const PLURAL: &str = "One or more ConfigRules provided in the request are invalid. \

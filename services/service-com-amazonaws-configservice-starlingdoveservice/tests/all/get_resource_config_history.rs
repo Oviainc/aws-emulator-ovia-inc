@@ -10,9 +10,9 @@
 //! `limit` items (ten when the request asks for none, a hundred at most) followed by a
 //! `nextToken` that resumes AFTER the last item the page reported — present exactly
 //! while items remain. It refuses a resource key the inventory holds no configuration
-//! item for with `ResourceNotDiscoveredException` worded as Config words it, an account
-//! with no customer managed configuration recorder with
-//! `NoAvailableConfigurationRecorderException`, a window whose earlier end is not
+//! item for with `ResourceNotDiscoveredException` worded as Config words it — the one
+//! thing it refuses about, whatever recorders the account holds, since the inventory
+//! outlives the recorder that wrote it — a window whose earlier end is not
 //! chronologically before its later end with `InvalidTimeRangeException`, and a token it
 //! did not issue with `InvalidNextTokenException`. Being a report, it writes nothing: a
 //! second read answers what the first one did.
@@ -444,63 +444,74 @@ async fn a_resource_key_the_inventory_holds_nothing_for_is_refused_as_config_wor
 }
 
 #[tokio::test]
-async fn a_history_read_needs_a_customer_managed_configuration_recorder() {
-    // Rows differ along the key asked for, so the refusal is about the account holding
-    // no customer managed recorder rather than about what the request named.
-    let cases: [(&str, &str, &str); 3] = [
-        ("a resource the inventory holds", EC2_VOLUME, RESOURCE_ID),
-        ("a resource the inventory does not hold", EC2_VOLUME, "vol-00000000000000404"),
-        ("a type nothing was recorded for", SQS_QUEUE, "a-queue"),
+async fn a_history_read_answers_about_the_key_asked_for_whatever_recorders_exist() {
+    // Config keeps the configuration items it captured for a resource — deleting a
+    // recorder deletes no history — so what this read answers is decided by the KEY the
+    // request named and not by the recorders the account holds when it is called.
+    //
+    // Rows differ along the key asked for, and each row is read in three account states
+    // in turn: no configuration recorder at all, a service-linked recorder only (which
+    // records for the service it is linked to), and the account's customer managed
+    // recorder.
+    let cases: [(&str, &str, &str, bool); 3] = [
+        ("a resource the inventory holds", EC2_VOLUME, RESOURCE_ID, true),
+        (
+            "a resource the inventory does not hold",
+            EC2_VOLUME,
+            "vol-00000000000000404",
+            false,
+        ),
+        ("a type nothing was recorded for", SQS_QUEUE, "a-queue", false),
     ];
 
-    for (case, resource_type, resource_id) in cases {
+    for (case, resource_type, resource_id, held) in cases {
         let emulator = Emulator::new();
         record_states(&emulator, EC2_VOLUME, RESOURCE_ID, 2);
         let body = request(resource_type, resource_id, json!({}));
 
-        let (status, code) = emulator.refused(HISTORY, &body).await;
-        assert_eq!(
-            (status, code.as_str()),
-            (400, "NoAvailableConfigurationRecorderException"),
-            "case {case:?}: with no configuration recorder the read is refused 400 \
-             NoAvailableConfigurationRecorderException, got {status} {code}"
-        );
+        for account_state in ["no recorder", "a service-linked recorder", "a customer managed recorder"]
+        {
+            match account_state {
+                "a service-linked recorder" => {
+                    emulator
+                        .ok(
+                            "PutServiceLinkedConfigurationRecorder",
+                            &json!({ "ServicePrincipal": SERVICE_LINKED_PRINCIPALS[0] }),
+                        )
+                        .await;
+                }
+                "a customer managed recorder" => {
+                    emulator
+                        .ok(
+                            "PutConfigurationRecorder",
+                            &recorder_request(json!({ "roleARN": ROLE_ARN })),
+                        )
+                        .await;
+                }
+                _ => {}
+            }
 
-        // A SERVICE-LINKED recorder records for the service it is linked to, so it does
-        // not stand in for a customer managed one.
-        emulator
-            .ok(
-                "PutServiceLinkedConfigurationRecorder",
-                &json!({ "ServicePrincipal": SERVICE_LINKED_PRINCIPALS[0] }),
-            )
-            .await;
-        let (status, code) = emulator.refused(HISTORY, &body).await;
-        assert_eq!(
-            (status, code.as_str()),
-            (400, "NoAvailableConfigurationRecorderException"),
-            "case {case:?}: a service-linked recorder is no customer managed recorder, so \
-             the read is still refused 400 NoAvailableConfigurationRecorderException, got \
-             {status} {code}"
-        );
-
-        // With a customer managed recorder the read answers about the key itself.
-        emulator
-            .ok(
-                "PutConfigurationRecorder",
-                &recorder_request(json!({ "roleARN": ROLE_ARN })),
-            )
-            .await;
-        let (status, parsed) = emulator.call(HISTORY, &body).await;
-        let answered = if resource_id == RESOURCE_ID && resource_type == EC2_VOLUME {
-            200
-        } else {
-            400
-        };
-        assert_eq!(
-            status, answered,
-            "case {case:?}: with a recorder the read answers about the key asked for, \
-             expected HTTP {answered}, got {status} with {parsed}"
-        );
+            let row = format!("{case} with {account_state}");
+            if held {
+                let reported = emulator.ok(HISTORY, &body).await;
+                assert_eq!(
+                    captured_at(&row, &reported).len(),
+                    2,
+                    "case {row:?}: the two recorded states are reported, got {reported}"
+                );
+            } else {
+                let message =
+                    refusal(&row, &emulator, &body, "ResourceNotDiscoveredException").await;
+                let expected = format!(
+                    "Resource {resource_id} of resourceType:{resource_type} is unknown or \
+                     has not been discovered"
+                );
+                assert_eq!(
+                    message, expected,
+                    "case {row:?}: expected the message {expected:?}, got {message:?}"
+                );
+            }
+        }
     }
 }
 

@@ -189,19 +189,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resource definition is evaluated "as per the resource configuration
         // schema type", and the only published schema type is a CloudFormation
         // resource schema, whose instances are JSON objects of the resource's
-        // properties: a body that is not one cannot be evaluated against it.
+        // properties: a body that is not one cannot be evaluated against it, and Config
+        // refuses it for the JSON it is not.
         let configuration: Option<serde_json::Value> =
             serde_json::from_str(&input.resource_details.resource_configuration).ok();
         if !configuration.is_some_and(|parsed| parsed.is_object()) {
             return Err(
                 StartResourceEvaluationErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(format!(
-                            "The ResourceDetails.ResourceConfiguration provided in the \
-                             request is invalid. It must be the resource definition as a \
-                             JSON object, as per the {} resource configuration schema type.",
-                            crate::state::RESOURCE_CONFIGURATION_SCHEMA_TYPE_CFN,
-                        )),
+                        message: Some(
+                            crate::state::RESOURCE_CONFIGURATION_NOT_JSON_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

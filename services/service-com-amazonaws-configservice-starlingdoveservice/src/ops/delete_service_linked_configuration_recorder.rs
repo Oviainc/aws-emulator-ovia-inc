@@ -209,6 +209,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // Config resolves ONE service-linked configuration recorder from the service
+        // principal the request carried, and a principal it links no recorder to
+        // resolves none at all: neither a service this account can ask Config for a
+        // recorder for ([`crate::state::supports_service_linked_recording`]) nor one a
+        // recorder this account holds was created for. That is a request to correct
+        // rather than a recorder this account could hold and does not, so it is refused
+        // the way the model states it (`ValidationException`: "You have provided a
+        // service principal for service-linked configuration recorder that is not
+        // valid") with the sentence worded for the DIMENSION the request selected by —
+        // which quotes nothing of the value. A lookup by ARN is unaffected: an ARN names
+        // a recorder rather than a service, so its absence is the recorder Config cannot
+        // find.
+        if let Selector::ServicePrincipal(service_principal) = &selector {
+            let links_a_recorder = crate::state::supports_service_linked_recording(
+                service_principal,
+            ) || store.recorders.values().any(|recorder| {
+                recorder.service_principal.as_deref() == Some(service_principal.as_str())
+            });
+            if !links_a_recorder {
+                return Err(validation(
+                    crate::state::UNRECOGNIZED_RECORDER_SERVICE_PRINCIPAL_MESSAGE.to_string(),
+                ));
+            }
+        }
+
         // The recorder this request names, among the SERVICE-LINKED ones: the
         // account's customer managed recorder is deleted by
         // `DeleteConfigurationRecorder`, so its ARN names nothing here — and neither

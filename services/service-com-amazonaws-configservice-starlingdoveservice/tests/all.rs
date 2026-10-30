@@ -176,3 +176,5 @@ mod unrecorded_resource_keys;
 mod config_refusal_identifier_and_position;
 #[path = "all/refusals_that_share_an_error_code.rs"]
 mod refusals_that_share_an_error_code;
+#[path = "all/config_refusal_class_and_wording.rs"]
+mod config_refusal_class_and_wording;
