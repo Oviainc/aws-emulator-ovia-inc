@@ -11,9 +11,9 @@
 //! The tests assert RULES over tables of inputs rather than one recorded case:
 //! tagging is an upsert on the tag set the resource already carries, whatever
 //! kind of resource the ARN names; untagging removes exactly the named keys and
-//! is idempotent; a call that would carry a resource past the modelled maximum
-//! of 50 tags is refused with the error the operation declares for exceeding the
-//! tag limit and stores nothing; and a page sequence partitions the listing.
+//! is idempotent; a call that would carry a resource past the QUOTA of 50 tags
+//! per resource is refused as the quota breach it is and stores nothing; and a
+//! page sequence partitions the listing.
 
 use std::collections::BTreeMap;
 
@@ -370,12 +370,12 @@ impl CapCase {
     }
 }
 
-/// Drive one row of the tag-maximum table against `resource_arn` and assert the
-/// whole rule on it: the answer the row expects, a refusal that is the modelled
-/// 400 `TooManyTagsException` carrying the modelled message and a code the
-/// operation DECLARES, and the set the resource is left holding, read back
-/// through `ListTagsForResource` so a refused call is proven to have stored
-/// nothing. The one assertion block both tables below drive.
+/// Drive one row of the tag-quota table against `resource_arn` and assert the
+/// whole rule on it: the answer the row expects, a refusal that is the
+/// `ServiceQuotaExceededException` (HTTP 402) the service models for a quota
+/// breach, carrying an empty message, and the set the resource is left holding,
+/// read back through `ListTagsForResource` so a refused call is proven to have
+/// stored nothing. The one assertion block both tables below drive.
 async fn assert_cap_case(emulator: &Emulator, case: &str, resource_arn: &str, row: &CapCase) {
     if !row.stored.is_empty() {
         assert_eq!(
@@ -414,19 +414,19 @@ async fn assert_cap_case(emulator: &Emulator, case: &str, resource_arn: &str, ro
         );
         let code = resp.error_type.clone().unwrap_or_default();
         assert!(
-            TAG_RESOURCE_MODELED_ERRORS.contains(&code.as_str()),
-            "case {case:?}: expected one of the declared errors \
-             {TAG_RESOURCE_MODELED_ERRORS:?}, got {resp:?}"
+            TAG_RESOURCE_REFUSAL_CODES.contains(&code.as_str()),
+            "case {case:?}: expected one of the refusals this service answers \
+             {TAG_RESOURCE_REFUSAL_CODES:?}, got {resp:?}"
         );
         assert_eq!(
             (resp.status, code.as_str()),
-            (400, "TooManyTagsException"),
-            "case {case:?}: expected a 400 TooManyTagsException, got {resp:?}"
+            (402, "ServiceQuotaExceededException"),
+            "case {case:?}: expected a 402 ServiceQuotaExceededException, got {resp:?}"
         );
         assert_eq!(
             resp.member("message").as_str(),
-            Some(TOO_MANY_TAGS_MESSAGE),
-            "case {case:?}: expected the modelled tag-limit message, got {resp:?}"
+            Some(QUOTA_EXCEEDED_MESSAGE),
+            "case {case:?}: expected the quota refusal's empty message, got {resp:?}"
         );
     }
 
@@ -438,12 +438,11 @@ async fn assert_cap_case(emulator: &Emulator, case: &str, resource_arn: &str, ro
 }
 
 /// RULE: a `TagResource` call is accepted exactly while the tag set it would
-/// leave on the resource is within the maximum of 50 tags per resource
-/// ([`MAX_TAGS_PER_RESOURCE`]); otherwise it is refused with the error the
-/// operation models for exceeding the tag limit — HTTP 400
-/// `TooManyTagsException` — and stores nothing. Rewriting the value of
-/// a key the resource already carries never grows the set, so it is accepted
-/// even at the maximum.
+/// leave on the resource is within the quota of 50 tags per resource
+/// ([`MAX_TAGS_PER_RESOURCE`]); otherwise it is refused as the QUOTA breach it is
+/// — HTTP 402 `ServiceQuotaExceededException` — and stores nothing. Rewriting the
+/// value of a key the resource already carries never grows the set, so it is
+/// accepted even at the quota.
 ///
 /// The rows differ along how full the resource is and how many of the request's
 /// keys are new — including both sides of the boundary and one past it.
@@ -515,20 +514,22 @@ async fn tagging_past_the_maximum_is_refused_and_stores_nothing() {
     }
 }
 
-/// The message the modelled `TooManyTagsException` carries, written out here so
-/// the WORDING is a check that can fail: it is the sentence the model states for
-/// this error class
-/// (`smithy_query(query="shape",shape="TooManyTagsException")`).
-const TOO_MANY_TAGS_MESSAGE: &str = "The number of tags exceeds the limit.";
+/// The message the quota refusal carries, written out here so the WORDING is a
+/// check that can fail: a breach of the per-resource tag quota names no value of
+/// the request, so the message is empty.
+const QUOTA_EXCEEDED_MESSAGE: &str = "";
 
-/// The error codes `TagResource` declares, from
-/// `smithy_query(query="operation",operation="TagResource")`: the refusal of a
-/// request to this operation is always one of these, never a code the operation
-/// does not declare.
-const TAG_RESOURCE_MODELED_ERRORS: [&str; 3] = [
+/// The error codes a refusal of `TagResource` is one of: the three the operation
+/// declares (`smithy_query(query="operation",operation="TagResource")`) plus the
+/// `ServiceQuotaExceededException` this SERVICE models (HTTP 402, declared by
+/// `UpdateComponentType`) and answers for a breach of the per-resource tag
+/// quota, and the `ValidationException` it answers for a reserved tag key.
+const TAG_RESOURCE_REFUSAL_CODES: [&str; 5] = [
     "AccessDeniedException",
     "ResourceNotFoundException",
+    "ServiceQuotaExceededException",
     "TooManyTagsException",
+    "ValidationException",
 ];
 
 /// One taggable resource of `kind`, carrying no tags, and the ARN that names it.
@@ -584,21 +585,23 @@ async fn taggable_resource(emulator: &Emulator, kind: &str, case: &str) -> Strin
     }
 }
 
-/// RULE: a refusal of `TagResource` is one of the error codes the operation
-/// DECLARES, and the one it answers for a call that would leave a resource past
-/// the per-resource tag maximum is the error modelled for exceeding the tag
-/// limit — HTTP 400 `TooManyTagsException`, carrying the message the model
-/// states for that error class — whatever kind of resource
-/// the ARN names and however far past the maximum the call reaches.
+/// RULE: a refusal of `TagResource` is one of the CODES THIS SERVICE ANSWERS for
+/// it ([`TAG_RESOURCE_REFUSAL_CODES`] — the three the operation declares plus the
+/// two the service models and this operation raises), and the one it answers for
+/// a call that would leave a resource past the per-resource tag QUOTA is
+/// `ServiceQuotaExceededException` (HTTP 402), carrying an empty message —
+/// whatever kind of resource the ARN names and however far past the quota the
+/// call reaches. The set is a CONTAINMENT guard, not a model-conformance check:
+/// the quota code AWS answers here is one TagResource's own error list omits.
 ///
 /// The rows differ along how full the resource already is, how many of the
-/// request's keys are new, how far past the maximum the resulting set would
+/// request's keys are new, how far past the quota the resulting set would
 /// reach (both sides of the boundary, one past it and three past it) and, in the
-/// outer loop, the kind of resource the ARN names. The not-found row is the
-/// second declared code, so the rule is checked on a refusal the tag maximum has
+/// outer loop, the kind of resource the ARN names. The not-found row is another
+/// of the codes, so the rule is checked on a refusal the tag quota has
 /// nothing to do with.
 #[tokio::test]
-async fn a_tag_refusal_is_an_error_the_operation_declares() {
+async fn a_tag_refusal_is_one_of_the_codes_this_service_answers() {
     let cap = MAX_TAGS_PER_RESOURCE;
 
     let rows: Vec<CapCase> = vec![
@@ -653,9 +656,9 @@ async fn a_tag_refusal_is_an_error_the_operation_declares() {
         }
     }
 
-    // The other declared refusal: an ARN of the right shape that names no
-    // stored resource. Its code is in the same declared set, and the tag
-    // maximum has nothing to do with it.
+    // Another of the refusals: an ARN of the right shape that names no
+    // stored resource. Its code is in the same set, and the tag quota has
+    // nothing to do with it.
     let emulator = Emulator::new();
     let absent = workspace_arn("neverCreated");
     let resp = emulator
@@ -663,9 +666,9 @@ async fn a_tag_refusal_is_an_error_the_operation_declares() {
         .await;
     let code = resp.error_type.clone().unwrap_or_default();
     assert!(
-        TAG_RESOURCE_MODELED_ERRORS.contains(&code.as_str()),
-        "case \"absentResource\": expected one of the declared errors \
-         {TAG_RESOURCE_MODELED_ERRORS:?}, got {resp:?}"
+        TAG_RESOURCE_REFUSAL_CODES.contains(&code.as_str()),
+        "case \"absentResource\": expected one of the refusals this service answers \
+         {TAG_RESOURCE_REFUSAL_CODES:?}, got {resp:?}"
     );
     assert_eq!(
         (resp.status, code.as_str()),

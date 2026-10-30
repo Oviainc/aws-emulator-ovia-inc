@@ -17,8 +17,9 @@
 //! whose instances across the workspace's entities come back as a TABLE, a row
 //! per instance. `tabularConditions` is what asks for that table: its
 //! `propertyFilters` select its rows and its `orderBy` orders them. An unknown
-//! workspace, entity, component, component type or property group is a
-//! `ResourceNotFoundException`; a selected property that is none of the
+//! workspace, entity, component type or property group is a
+//! `ResourceNotFoundException`; a component an EXISTING entity does not have, a
+//! selected property that is none of the
 //! addressed component's, a selection outside a named `propertyGroupName`, a
 //! request that addresses nothing and a filter this service does not recognise
 //! are `ValidationException`s. Either answer is PAGED: `maxResults` caps it and
@@ -454,18 +455,19 @@ fn resolve_query<'a>(
         ) {
             (Some(component_path), _) => {
                 component_at_path(entity, component_path).ok_or_else(|| {
-                    not_found(format!(
-                        "entity {entity_id} of workspace {} has no component at componentPath \
-                         {component_path}",
-                        input.workspace_id
+                    invalid(crate::state::component_not_found_message(
+                        &input.workspace_id,
+                        entity_id,
+                        component_path,
                     ))
                 })?
             }
             (None, Some(component_name)) => {
                 let Some(component) = entity.components.get(component_name) else {
-                    return Err(not_found(format!(
-                        "entity {entity_id} of workspace {} has no component {component_name}",
-                        input.workspace_id
+                    return Err(invalid(crate::state::component_not_found_message(
+                        &input.workspace_id,
+                        entity_id,
+                        component_name,
                     )));
                 };
                 scoped_component(&entity.entity_id, component)

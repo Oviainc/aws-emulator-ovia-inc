@@ -21,7 +21,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::Emulator;
+use crate::harness::{data_writer_functions, Emulator};
 
 /// The workspace every case below reads.
 const WORKSPACE: &str = "ctscope";
@@ -216,13 +216,22 @@ async fn seed(emulator: &Emulator) {
     );
 
     let component_types: Vec<(&str, Value)> = vec![
-        (LEAF, json!({"propertyDefinitions": property_definitions()})),
+        (
+            LEAF,
+            json!({
+                "propertyDefinitions": property_definitions(),
+                // The write connector the seeded values are set THROUGH;
+                // DERIVED inherits it through `extendsFrom`.
+                "functions": data_writer_functions(),
+            }),
+        ),
         (DERIVED, json!({"extendsFrom": [LEAF]})),
         (
             NEST,
             json!({
                 "propertyDefinitions": property_definitions(),
                 "compositeComponentTypes": {"deeper": {"componentTypeId": LEAF}},
+                "functions": data_writer_functions(),
             }),
         ),
         (
@@ -230,6 +239,7 @@ async fn seed(emulator: &Emulator) {
             json!({
                 "propertyDefinitions": property_definitions(),
                 "compositeComponentTypes": {"inner": {"componentTypeId": NEST}},
+                "functions": data_writer_functions(),
             }),
         ),
         (

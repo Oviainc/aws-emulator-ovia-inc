@@ -140,6 +140,9 @@ mod property_value_read;
 #[path = "all/property_value_write_order.rs"]
 mod property_value_write_order;
 
+#[path = "all/refusal_classes_and_wording.rs"]
+mod refusal_classes_and_wording;
+
 #[path = "all/refusal_constructions.rs"]
 mod refusal_constructions;
 

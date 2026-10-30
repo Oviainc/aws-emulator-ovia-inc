@@ -25,7 +25,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::Emulator;
+use crate::harness::{data_writer_functions, Emulator};
 
 /// The workspace every case below reads and writes.
 const WORKSPACE: &str = "writeorder";
@@ -126,6 +126,9 @@ async fn seed(emulator: &Emulator) {
                         "defaultValue": {"stringValue": "unset-label"},
                     },
                 },
+                // The write connector the time-series writes below are set
+                // THROUGH.
+                "functions": data_writer_functions(),
             }),
         ),
         (

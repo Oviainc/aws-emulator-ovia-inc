@@ -12,7 +12,10 @@
 //! the modelled `ValidationException` (HTTP 400) rather than deleted out from
 //! under them.
 //! [`crate::state::Workspace::component_type_references`] is the one place that
-//! says what counts as a reference.
+//! says what counts as a reference, and
+//! [`crate::state::ComponentTypeReferences::in_use_message`] the one place the
+//! refusal is worded: it names the ids of the resources that have to be deleted
+//! first and nothing else of the service's state.
 //!
 //! A component type the SERVICE ships is not a caller's to delete: a workspace
 //! is provisioned with the built-ins
@@ -232,17 +235,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // What is built on the component type is deleted before the component
         // type itself, so nothing stored is left instantiating or extending a
-        // type the store no longer holds.
+        // type the store no longer holds. The refusal names as many ids as
+        // reference it, so it is stated within the bound the member it travels
+        // on declares ([`crate::state::clamped_message`]), as every other
+        // refusal of this service is.
         let references = workspace.component_type_references(&input.component_type_id);
-        if !references.is_empty() {
+        if let Some(message) = references.in_use_message(&input.component_type_id) {
             return Err(DeleteComponentTypeErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!(
-                        "ComponentType {} in workspace {} is still referenced by {}: {}",
-                        input.component_type_id,
-                        input.workspace_id,
-                        references.len(),
-                        references.join(", ")
+                    message: Some(crate::state::clamped_message(
+                        message,
+                        crate::state::ERROR_MESSAGE_MAX_CHARS,
                     )),
                 },
             )

@@ -292,31 +292,36 @@ pub const MAX_PROPERTIES_RETURNED: usize = 800;
 /// reader of the flag decides it.
 pub const MAX_PROPERTY_VALUES_RETURNED: usize = 50;
 
-/// The most tags one taggable resource of this service carries.
+/// The most tags one taggable resource of this service carries: the service's
+/// "Tags per resource" QUOTA, which is not adjustable.
 ///
-/// Taken from the model, not chosen here: `TagMap` is `@length(min: 0, max:
-/// 50)` (`smithy_query(query="shape",shape="TagMap")`), so fifty entries is the
-/// largest tag set any of this service's shapes can carry on a resource. A
-/// `TagResource` call that would leave a resource past it is refused with the
-/// `TooManyTagsException` (HTTP 400) that operation models.
+/// A cumulative breach of it — a call whose tags, added to the ones the resource
+/// already carries, would leave it past this many — is a quota refusal
+/// ([`tags_per_resource_quota_exceeded`]), reported as
+/// `ServiceQuotaExceededException` (HTTP 402). That is a different failure from
+/// the per-CALL bound the `TagMap` shape states
+/// ([`MAX_TAGS_PER_CALL`]).
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
-/// The message the modelled `TooManyTagsException` carries for a tagging call
-/// that would leave a resource past [`MAX_TAGS_PER_RESOURCE`], or `None` while
-/// `resulting` — the size of the tag set the call would leave on the resource —
-/// is within it.
+/// Whether a tagging call would leave a resource past the per-resource tag
+/// quota, `resulting` being the size of the tag set it would be left holding.
 ///
-/// The message is the sentence the model states for this error class, with
-/// nothing added: `TooManyTagsException`'s documentation is "The number of tags
-/// exceeds the limit."
-/// (`smithy_query(query="shape",shape="TooManyTagsException")`), which names no
-/// value of the request, so the refusal names none either. The decision and the
-/// message are ONE function, so no caller can refuse on one count and report
-/// another.
-pub fn too_many_tags_violation(resulting: usize) -> Option<String> {
-    (resulting > MAX_TAGS_PER_RESOURCE)
-        .then(|| "The number of tags exceeds the limit.".to_string())
+/// The decision is ONE function, so no caller can refuse on one count and report
+/// another. The refusal it drives carries an EMPTY message: the quota breach
+/// names no value of the request.
+pub fn tags_per_resource_quota_exceeded(resulting: usize) -> bool {
+    resulting > MAX_TAGS_PER_RESOURCE
 }
+
+/// The most tags ONE tagging call carries, from the model rather than chosen
+/// here: `TagMap` is `@length(min: 0, max: 50)`
+/// (`smithy_query(query="shape",shape="TagMap")`), so a request naming more
+/// entries than this is outside the shape itself and is refused by the
+/// centralized request walk's boundary validation before any handler runs. It is
+/// a DIFFERENT failure from the per-resource quota
+/// [`MAX_TAGS_PER_RESOURCE`] states, which is about what the resource would be
+/// left holding and is decided by the handler.
+pub const MAX_TAGS_PER_CALL: usize = 50;
 
 /// The tag-key prefix Amazon Web Services reserves for the tags it applies
 /// itself.
@@ -1300,8 +1305,8 @@ impl Workspace {
     }
 
     /// Everything stored in this workspace that still REFERENCES the component
-    /// type `component_type_id`, each as a short description of where the
-    /// reference lives, in a stable (id-ordered) order.
+    /// type `component_type_id`, as the IDS of the resources the reference lives
+    /// on, each listed once and in id order.
     ///
     /// A stored reference to a component type is one of:
     ///
@@ -1330,22 +1335,17 @@ impl Workspace {
     /// Derived on every call rather than kept as a count beside the component
     /// type, so a reference created or dropped afterwards cannot leave it stale
     /// — the same choice [`has_child_entities`](Self::has_child_entities) makes.
-    pub fn component_type_references(&self, component_type_id: &str) -> Vec<String> {
-        let mut references = Vec::new();
+    pub fn component_type_references(&self, component_type_id: &str) -> ComponentTypeReferences {
+        let mut entity_ids = BTreeSet::new();
+        let mut referencing_type_ids = BTreeSet::new();
         for entity in self.entities.values() {
             for component in entity.components.values() {
                 if component.component_type_id.as_deref() == Some(component_type_id) {
-                    references.push(format!(
-                        "entity {} component {}",
-                        entity.entity_id, component.component_name
-                    ));
+                    entity_ids.insert(entity.entity_id.clone());
                 }
                 for composite in component.composite_components.values() {
                     if composite.component_type_id == component_type_id {
-                        references.push(format!(
-                            "entity {} compositeComponent {}",
-                            entity.entity_id, composite.component_path
-                        ));
+                        entity_ids.insert(entity.entity_id.clone());
                     }
                 }
             }
@@ -1361,21 +1361,18 @@ impl Workspace {
                 .iter()
                 .any(|parent| parent == component_type_id)
             {
-                references.push(format!(
-                    "componentType {} extendsFrom",
-                    component_type.component_type_id
-                ));
+                referencing_type_ids.insert(component_type.component_type_id.clone());
             }
-            for (composite_name, composite) in &component_type.composite_component_types {
+            for composite in component_type.composite_component_types.values() {
                 if composite.component_type_id.as_deref() == Some(component_type_id) {
-                    references.push(format!(
-                        "componentType {} compositeComponentTypes.{composite_name}",
-                        component_type.component_type_id
-                    ));
+                    referencing_type_ids.insert(component_type.component_type_id.clone());
                 }
             }
         }
-        references
+        ComponentTypeReferences {
+            entity_ids: entity_ids.into_iter().collect(),
+            component_type_ids: referencing_type_ids.into_iter().collect(),
+        }
     }
 
     /// Whether a declared reference to the component type `component_type_id`
@@ -2581,8 +2578,61 @@ pub const DATA_CONNECTOR_FUNCTION_NAMES: &[&str] = &[
     "dataReader",
     "dataReaderByEntity",
     "dataReaderByComponentType",
-    "dataWriter",
+    DATA_WRITER_FUNCTION,
 ];
+
+/// The name under which a component type's `functions` map carries the data
+/// connector that WRITES the values of its properties — the one of
+/// [`DATA_CONNECTOR_FUNCTION_NAMES`] the time-series write path needs, since the
+/// values of a component type's properties are set THROUGH it.
+pub const DATA_WRITER_FUNCTION: &str = "dataWriter";
+
+/// Whether the component type `component_type_id` has a WRITE connector — a
+/// [`DATA_WRITER_FUNCTION`] entry in its `functions`, its own or one it inherits
+/// from a component type it extends ([`Workspace::component_type_chain`]).
+///
+/// A component type that declares none has no way to set the values of its
+/// properties, so a write addressed to one of them is refused rather than
+/// recorded. `None` — a component instantiating no component type at all —
+/// declares no connector either.
+pub fn component_type_has_data_writer(
+    workspace: &Workspace,
+    component_type_id: Option<&str>,
+) -> bool {
+    component_type_id.is_some_and(|component_type_id| {
+        workspace
+            .component_type_chain(component_type_id)
+            .iter()
+            .any(|component_type| component_type.functions.contains_key(DATA_WRITER_FUNCTION))
+    })
+}
+
+/// The message a refusal carries for a write to a property whose component type
+/// declares no write connector ([`component_type_has_data_writer`]).
+///
+/// Built from the request and from stored state: the property and the component
+/// the write addressed, and the connector that would have to serve it — naming
+/// the connector is what tells the caller the component type, not the request,
+/// is what has to change.
+///
+/// Only that NAMING is established for this class: the service's own refusal
+/// restates the connector request it could not make, of which the connector's
+/// name is the one part that is a property of the request rather than of one
+/// invocation. The rest of the sentence is therefore this service's own wording,
+/// and a later reading of the refusal can tighten it without changing which
+/// requests earn it.
+pub fn missing_data_writer_message(
+    workspace_id: &str,
+    entity_id: &str,
+    component: &str,
+    property_name: &str,
+) -> String {
+    format!(
+        "No {DATA_WRITER_FUNCTION} connector is defined for component {component} of Entity \
+         {entity_id} in workspace {workspace_id}, so the values of property {property_name} \
+         cannot be set."
+    )
+}
 
 /// Whether `definition` declares a property whose values live OUTSIDE this
 /// service — `isStoredExternally`, "a Boolean value that specifies whether the
@@ -4534,10 +4584,79 @@ pub fn entity_not_found_message(workspace_id: &str, entity_id: &str) -> String {
 }
 
 /// The message for a component type the workspace the request named does not
-/// hold. Built from the request, naming what was looked for and where, the same
-/// construction as [`entity_not_found_message`] one resource across.
+/// hold. Built from the request, naming what was looked for and where, in the
+/// sentence the service itself answers for that miss: "Cannot find component
+/// type ", " in workspace " and the trailing period are fixed, and the two ids
+/// come from the request.
 pub fn component_type_not_found_message(workspace_id: &str, component_type_id: &str) -> String {
-    format!("ComponentType {component_type_id} in workspace {workspace_id} not found.")
+    format!("Cannot find component type {component_type_id} in workspace {workspace_id}.")
+}
+
+/// What still references a component type, as the ids of the resources the
+/// references live on: the answer
+/// [`Workspace::component_type_references`] gives, and what the in-use refusal
+/// of a delete is built from.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ComponentTypeReferences {
+    /// The ids of the entities one of whose components — top-level or composite
+    /// — instantiates the component type, each listed once however many of its
+    /// components do, in id order.
+    pub entity_ids: Vec<String>,
+    /// The ids of the other component types that extend the component type or
+    /// name it in their composite declarations, each listed once, in id order.
+    pub component_type_ids: Vec<String>,
+}
+
+impl ComponentTypeReferences {
+    /// Whether nothing stored references the component type, which is what makes
+    /// it deletable.
+    pub fn is_empty(&self) -> bool {
+        self.entity_ids.is_empty() && self.component_type_ids.is_empty()
+    }
+
+    /// The message a delete blocked by these references is refused with, or
+    /// `None` when there are none.
+    ///
+    /// The refusal names the RESOURCES that have to go first, as a bracketed,
+    /// comma-separated list of their ids, and asks for them to be deleted: that
+    /// is what lets a caller drive the remediation off the refusal. Entities come
+    /// first where both kinds reference the type, so the caller is asked for one
+    /// kind at a time; nothing else of the service's state is named.
+    pub fn in_use_message(&self, component_type_id: &str) -> Option<String> {
+        if !self.entity_ids.is_empty() {
+            return Some(format!(
+                "Component type {component_type_id} is being used by entities [{}], please \
+                 delete the entities first.",
+                self.entity_ids.join(", ")
+            ));
+        }
+        if !self.component_type_ids.is_empty() {
+            return Some(format!(
+                "Component type {component_type_id} is being used by component types [{}], \
+                 please delete the component types first.",
+                self.component_type_ids.join(", ")
+            ));
+        }
+        None
+    }
+}
+
+/// The message for a component an entity the request named does not have —
+/// whichever member addressed it, the `componentName` it is called by or the
+/// `componentPath` it would sit at, since either way the value names the
+/// component that could not be resolved.
+///
+/// Built from the request, naming the component, the entity it was looked for on
+/// and the workspace that entity lives in. This is the ONE construction for
+/// "the entity is there, the component on it is not", which is a different miss
+/// from [`entity_not_found_message`]'s and is reported as a bad reference rather
+/// than as a missing resource.
+pub fn component_not_found_message(
+    workspace_id: &str,
+    entity_id: &str,
+    component: &str,
+) -> String {
+    format!("Component {component} of Entity {entity_id} in workspace {workspace_id} not found.")
 }
 
 /// The message for a scene the workspace the request named does not hold.

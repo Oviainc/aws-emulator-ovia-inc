@@ -260,8 +260,8 @@ async fn a_composite_component_keeps_the_component_type_it_instantiates_undeleta
             .unwrap_or_default()
             .to_string();
         assert!(
-            message.contains(depth.path()) && message.contains(ENTITY),
-            "case {case:?}: the refusal must name the composite component that still \
+            message.contains(ENTITY),
+            "case {case:?}: the refusal must name the entity whose composite component still \
              instantiates the type, got {message:?}"
         );
 

@@ -22,7 +22,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{Emulator, Resp};
+use crate::harness::{data_writer_functions, Emulator, Resp};
 
 /// The workspace every case below reads and writes.
 const WORKSPACE: &str = "pathrule";
@@ -58,6 +58,11 @@ fn property_definitions() -> Value {
     })
 }
 
+/// The one path of [`ADDRESSED`] whose component instantiates NO component type,
+/// so it declares no write connector and the time-series data plane sets no
+/// value of its properties.
+const PATH_WITHOUT_A_COMPONENT_TYPE: &str = "Plain";
+
 /// The workspace, the component-type chain and the one entity every case reads.
 async fn seed(emulator: &Emulator) {
     let created = emulator.create_workspace(WORKSPACE).await;
@@ -67,12 +72,19 @@ async fn seed(emulator: &Emulator) {
     );
 
     let component_types: Vec<(&str, Value)> = vec![
-        (LEAF, json!({"propertyDefinitions": property_definitions()})),
+        (
+            LEAF,
+            json!({
+                "propertyDefinitions": property_definitions(),
+                "functions": data_writer_functions(),
+            }),
+        ),
         (
             MID,
             json!({
                 "propertyDefinitions": property_definitions(),
                 "compositeComponentTypes": {"deeper": {"componentTypeId": LEAF}},
+                "functions": data_writer_functions(),
             }),
         ),
         (
@@ -80,6 +92,9 @@ async fn seed(emulator: &Emulator) {
             json!({
                 "propertyDefinitions": property_definitions(),
                 "compositeComponentTypes": {"inner": {"componentTypeId": MID}},
+                // The write connector a value is set THROUGH, declared by every
+                // component type of the chain.
+                "functions": data_writer_functions(),
             }),
         ),
     ];
@@ -320,7 +335,9 @@ async fn one_path_names_one_component_in_every_property_reader() {
 
 /// RULE (the write side of the same resolution): a time-series write through a
 /// `componentPath` lands on the component that path names, so reading the same
-/// path back answers that write and no other path's.
+/// path back answers that write and no other path's. A path whose component
+/// instantiates no component type declares no write connector, so it accepts no
+/// write at all.
 #[tokio::test]
 async fn a_write_through_a_path_lands_on_the_component_the_path_names() {
     let emulator = Emulator::new();
@@ -330,6 +347,7 @@ async fn a_write_through_a_path_lands_on_the_component_the_path_names() {
     // component it was written to.
     let written: Vec<(&Addressed, f64)> = ADDRESSED
         .iter()
+        .filter(|addressed| addressed.path != PATH_WITHOUT_A_COMPONENT_TYPE)
         .enumerate()
         .map(|(index, addressed)| (addressed, 10.0 + index as f64))
         .collect();
@@ -360,6 +378,28 @@ async fn a_write_through_a_path_lands_on_the_component_the_path_names() {
             addressed.case
         );
     }
+
+    // The component instantiating no component type: nothing declares a write
+    // connector for it, so the whole request is refused.
+    let refused = emulator
+        .batch_put_property_values(
+            WORKSPACE,
+            json!([{
+                "entityPropertyReference": {
+                    "entityId": ENTITY,
+                    "componentPath": PATH_WITHOUT_A_COMPONENT_TYPE,
+                    "propertyName": READING,
+                },
+                "propertyValues": [{"time": T0, "value": {"doubleValue": 99.0}}],
+            }]),
+        )
+        .await;
+    assert_eq!(
+        (refused.status, refused.error_type.as_deref()),
+        (400, Some("ValidationException")),
+        "case {PATH_WITHOUT_A_COMPONENT_TYPE:?}: a component with no component type declares no \
+         write connector, so the write must be refused, got {refused:?}"
+    );
 
     for (addressed, value) in &written {
         let history = emulator
@@ -396,10 +436,11 @@ async fn a_write_through_a_path_lands_on_the_component_the_path_names() {
 }
 
 /// RULE (the boundary): a `componentPath` the entity holds no component at
-/// addresses nothing, so every reader refuses it — the three request-shaped
-/// operations as a 404 `ResourceNotFoundException`, `BatchPutPropertyValues` as
-/// that same code on the failed entry, which is where it reports a reference it
-/// cannot resolve.
+/// addresses nothing, so every reader refuses it — `ListComponents` and
+/// `ListProperties` as a 404 `ResourceNotFoundException`, while the property data
+/// plane (`GetPropertyValue`, `GetPropertyValueHistory` and
+/// `BatchPutPropertyValues`) reads it as the bad REFERENCE it is and refuses the
+/// whole call with a 400 `ValidationException`.
 #[tokio::test]
 async fn a_path_that_names_no_component_is_refused_by_every_reader() {
     let emulator = Emulator::new();
@@ -428,8 +469,8 @@ async fn a_path_that_names_no_component_is_refused_by_every_reader() {
             .await;
         assert_eq!(
             (read.status, read.error_type.as_deref()),
-            (404, Some("ResourceNotFoundException")),
-            "case {case:?} ({path:?}): expected 404 ResourceNotFoundException from \
+            (400, Some("ValidationException")),
+            "case {case:?} ({path:?}): expected 400 ValidationException from \
              GetPropertyValue, got {read:?}"
         );
 
@@ -445,8 +486,8 @@ async fn a_path_that_names_no_component_is_refused_by_every_reader() {
             .await;
         assert_eq!(
             (history.status, history.error_type.as_deref()),
-            (404, Some("ResourceNotFoundException")),
-            "case {case:?} ({path:?}): expected 404 ResourceNotFoundException from \
+            (400, Some("ValidationException")),
+            "case {case:?} ({path:?}): expected 400 ValidationException from \
              GetPropertyValueHistory, got {history:?}"
         );
 
@@ -464,28 +505,9 @@ async fn a_path_that_names_no_component_is_refused_by_every_reader() {
             )
             .await;
         assert_eq!(
-            put.status, 200,
-            "case {case:?} ({path:?}): an entry is refused in errorEntries, not by status: got \
-             {put:?}"
-        );
-        let codes: Vec<String> = put
-            .member("errorEntries")
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .flat_map(|entry| entry["errors"].as_array().cloned().unwrap_or_default())
-            .map(|error| {
-                error["errorCode"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(
-            codes,
-            vec!["ResourceNotFoundException".to_string()],
-            "case {case:?} ({path:?}): expected one ResourceNotFoundException entry error from \
+            (put.status, put.error_type.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case:?} ({path:?}): expected 400 ValidationException from \
              BatchPutPropertyValues, got {put:?}"
         );
     }

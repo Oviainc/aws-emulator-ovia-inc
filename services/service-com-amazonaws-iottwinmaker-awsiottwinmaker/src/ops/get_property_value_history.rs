@@ -14,8 +14,10 @@
 //! TIME SERIES property ([`crate::state::property_is_time_series`]): the history
 //! of a property that is not one is nothing this operation reads, so such a
 //! request is a `ValidationException` rather than an empty answer. An unknown
-//! workspace, entity, component or component type is a
-//! `ResourceNotFoundException`.
+//! workspace, entity or component type is a `ResourceNotFoundException`; a
+//! component an EXISTING entity does not have is a bad reference rather than a
+//! missing resource, so it is the modelled `ValidationException`
+//! ([`crate::state::component_not_found_message`]).
 //!
 //! The window is `startTime`/`endTime` — the ISO 8601 members — or the
 //! deprecated `startDateTime`/`endDateTime` they replaced, and both of its
@@ -681,10 +683,10 @@ fn scope<'a>(
             (Some(component_path), _) => at_path(entity, component_path)
                 .map(|component| vec![component])
                 .ok_or_else(|| {
-                    not_found(format!(
-                        "entity {entity_id} of workspace {} has no component at componentPath \
-                         {component_path}",
-                        input.workspace_id
+                    invalid(crate::state::component_not_found_message(
+                        &input.workspace_id,
+                        entity_id,
+                        component_path,
                     ))
                 }),
             (None, Some(component_name)) => entity
@@ -692,9 +694,10 @@ fn scope<'a>(
                 .get(component_name)
                 .map(|component| vec![scoped(&entity.entity_id, component)])
                 .ok_or_else(|| {
-                    not_found(format!(
-                        "entity {entity_id} of workspace {} has no component {component_name}",
-                        input.workspace_id
+                    invalid(crate::state::component_not_found_message(
+                        &input.workspace_id,
+                        entity_id,
+                        component_name,
                     ))
                 }),
             // A property belongs to a component, so an entity alone does not

@@ -815,6 +815,26 @@ pub(crate) fn workspace_arn(workspace_id: &str) -> String {
     format!("arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}")
 }
 
+/// The `functions` map a component type declares its WRITE CONNECTOR in — the
+/// `dataWriter` entry `BatchPutPropertyValues` sets a property's values through,
+/// so a component type a suite writes values to has to declare it.
+///
+/// The name comes from the service's own catalogue of data-connector functions
+/// rather than being spelled here, and the connector is a Lambda one, which is
+/// the form the `DataConnector` shape documents for a caller's own connector
+/// (`smithy_query(query="shape",shape="DataConnector")`).
+pub(crate) fn data_writer_functions() -> Value {
+    let writer = service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::DATA_WRITER_FUNCTION;
+    json!({
+        writer: {
+            "scope": "ENTITY",
+            "implementedBy": {
+                "lambda": {"arn": format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:writer")},
+            },
+        },
+    })
+}
+
 pub(crate) fn entity_arn(workspace_id: &str, entity_id: &str) -> String {
     format!("arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}/entity/{entity_id}")
 }

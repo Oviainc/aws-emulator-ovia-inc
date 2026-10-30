@@ -24,7 +24,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{Emulator, Resp};
+use crate::harness::{data_writer_functions, Emulator, Resp};
 
 /// The workspace every case below reads from.
 const WORKSPACE: &str = "historytoken";
@@ -57,12 +57,16 @@ async fn seed(emulator: &Emulator) {
         .create_component_type(
             WORKSPACE,
             SENSOR,
-            json!({"propertyDefinitions": {
-                "Temp": {"dataType": {"type": "DOUBLE"}, "isTimeSeries": true},
-                // A second time series property, so a filter can name another
-                // property of the same scope.
-                "Count": {"dataType": {"type": "INTEGER"}, "isTimeSeries": true},
-            }}),
+            json!({
+                "propertyDefinitions": {
+                    "Temp": {"dataType": {"type": "DOUBLE"}, "isTimeSeries": true},
+                    // A second time series property, so a filter can name another
+                    // property of the same scope.
+                    "Count": {"dataType": {"type": "INTEGER"}, "isTimeSeries": true},
+                },
+                // The write connector the seeded values are set THROUGH.
+                "functions": data_writer_functions(),
+            }),
         )
         .await;
     assert_eq!(

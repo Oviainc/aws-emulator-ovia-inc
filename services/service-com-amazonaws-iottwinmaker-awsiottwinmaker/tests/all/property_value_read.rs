@@ -664,10 +664,12 @@ struct Refusal {
     error: &'static str,
 }
 
-/// RULE: a request that names something the store does not hold is a 404
-/// `ResourceNotFoundException`; one whose members cannot address a property, or
-/// carry a condition this service does not recognise, is a 400
-/// `ValidationException`. Neither is a 501, and neither reports an empty value.
+/// RULE: a request that names a workspace, an entity, a component type or a
+/// property group the store does not hold is a 404 `ResourceNotFoundException`;
+/// one whose members cannot address a property — a component an existing entity
+/// does not have among them — or carry a condition this service does not
+/// recognise, is a 400 `ValidationException`. Neither is a 501, and neither
+/// reports an empty value.
 #[tokio::test]
 async fn a_request_that_addresses_nothing_is_refused() {
     let emulator = Emulator::new();
@@ -704,8 +706,8 @@ async fn a_request_that_addresses_nothing_is_refused() {
                 "componentName": "NoSuchComponent",
                 "selectedProperties": ["Tag"],
             }),
-            status: 404,
-            error: "ResourceNotFoundException",
+            status: 400,
+            error: "ValidationException",
         },
         Refusal {
             what: "a componentPath that addresses no composite component",
@@ -715,8 +717,8 @@ async fn a_request_that_addresses_nothing_is_refused() {
                 "componentPath": "Spec/missing",
                 "selectedProperties": ["Tag"],
             }),
-            status: 404,
-            error: "ResourceNotFoundException",
+            status: 400,
+            error: "ValidationException",
         },
         Refusal {
             what: "an unknown component type",

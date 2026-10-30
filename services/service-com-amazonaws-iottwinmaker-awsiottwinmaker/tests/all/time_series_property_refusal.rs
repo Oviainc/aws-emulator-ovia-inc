@@ -8,9 +8,7 @@
 //! property (`isTimeSeries`) is refused as a `ValidationException`, and the
 //! refusal names THAT property in one construction — "<propertyName> is not
 //! marked as a time-series property." — whichever of the two data-plane
-//! operations was asked (`GetPropertyValueHistory` carries it as the
-//! exception's `message`, `BatchPutPropertyValues` as the failed entry's
-//! `errorMessage`), however the property's component was addressed, and
+//! operations was asked, however the property's component was addressed, and
 //! whatever else that property's definition declares. A property the same
 //! component type DOES mark is served, so the refusal is about the mark and not
 //! about the component.
@@ -29,7 +27,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::harness::{Emulator, Resp};
+use crate::harness::{data_writer_functions, Emulator, Resp};
 
 /// The workspace every case below reads and writes.
 const WORKSPACE: &str = "seriesmarks";
@@ -114,15 +112,6 @@ fn properties() -> Vec<Property> {
 /// names.
 const NOT_A_TIME_SERIES: &str = " is not marked as a time-series property.";
 
-/// The greatest number of characters `BatchPutPropertyError$errorMessage`
-/// admits (`@length(1..256)`, from
-/// `smithy_query(query="shape",shape="BatchPutPropertyError")`), which is
-/// narrower than the `propertyName` the construction names: a reason past it is
-/// reported cut to it, so a row whose property name is long enough is asserted
-/// by its reason rather than by the whole text. `tests/all/error_message_bounds.rs`
-/// is the suite about that bound.
-const ENTRY_ERROR_MESSAGE_MAX: usize = 256;
-
 /// The message a refusal for `property_name` has to carry, written out here
 /// rather than read from the service so the expectation is independent of the
 /// construction under test.
@@ -154,7 +143,13 @@ async fn seed(emulator: &Emulator, properties: &[Property]) {
     let component_types: Vec<(&str, Value)> = vec![
         (
             GAUGE,
-            json!({"propertyDefinitions": Value::Object(definitions)}),
+            json!({
+                "propertyDefinitions": Value::Object(definitions),
+                // The write connector a value is set THROUGH: declared so the
+                // refusals below are about the time-series MARK and not about a
+                // component type that could accept no write at all.
+                "functions": data_writer_functions(),
+            }),
         ),
         (
             ASSEMBLY,
@@ -267,9 +262,10 @@ async fn a_history_read_names_the_property_that_is_not_marked_as_a_time_series()
     }
 }
 
-/// RULE: `BatchPutPropertyValues` reports the same construction for the same
-/// property, as the failed entry's `errorMessage` beside the
-/// `ValidationException` code — one entry per refused write, however the
+/// RULE: `BatchPutPropertyValues` refuses the same property in the same
+/// construction — as the `ValidationException` the operation models, the whole
+/// request at the HTTP level, since a reference that resolves to no writable
+/// property is not something it degrades to a partial result — however the
 /// component was addressed.
 #[tokio::test]
 async fn a_batch_write_names_the_property_that_is_not_marked_as_a_time_series() {
@@ -303,46 +299,17 @@ async fn a_batch_write_names_the_property_that_is_not_marked_as_a_time_series() 
                 .batch_put_property_values(WORKSPACE, json!([entry]))
                 .await;
             assert_eq!(
-                written.status, 200,
-                "case {case:?}: an entry is refused in errorEntries, not by status: got {written:?}"
+                (written.status, written.error_type.as_deref()),
+                (400, Some("ValidationException")),
+                "case {case:?}: expected 400 ValidationException, got {written:?}"
             );
-            let errors: Vec<Value> = written
-                .member("errorEntries")
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .flat_map(|entry| entry["errors"].as_array().cloned().unwrap_or_default())
-                .collect();
+            let reported = message(&written);
             assert_eq!(
-                errors.len(),
-                1,
-                "case {case:?}: expected one reported error, got {written:?}"
+                reported,
+                expected_message(&property.name),
+                "case {case:?}: expected the message {:?}, got {reported:?}",
+                expected_message(&property.name)
             );
-            assert_eq!(
-                errors[0]["errorCode"].as_str().unwrap_or_default(),
-                "ValidationException",
-                "case {case:?}: expected the ValidationException code, got {written:?}"
-            );
-            let expected = expected_message(&property.name);
-            let reported = errors[0]["errorMessage"].as_str().unwrap_or_default();
-            if expected.chars().count() <= ENTRY_ERROR_MESSAGE_MAX {
-                assert_eq!(
-                    reported, expected,
-                    "case {case:?}: expected the construction {expected:?}, got {written:?}"
-                );
-            } else {
-                assert_eq!(
-                    reported.chars().count(),
-                    ENTRY_ERROR_MESSAGE_MAX,
-                    "case {case:?}: expected a construction too long for the member to be \
-                     reported at its bound, got {written:?}"
-                );
-                assert!(
-                    reported.ends_with(NOT_A_TIME_SERIES),
-                    "case {case:?}: expected the reason to survive the bound, got {reported:?}"
-                );
-            }
         }
     }
 }

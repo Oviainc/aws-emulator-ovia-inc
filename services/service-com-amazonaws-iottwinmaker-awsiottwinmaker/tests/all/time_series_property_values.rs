@@ -5,9 +5,10 @@
 //!
 //! RULE under test: `BatchPutPropertyValues` stores each entry's values in the
 //! series of the TIME SERIES property its `entityPropertyReference` resolves
-//! to, under the instant each value is written for, and applies the entries it
-//! can serve while reporting the ones it cannot in `errorEntries` — one error
-//! per failed entry, carrying that entry. `GetPropertyValueHistory` reads those
+//! to, under the instant each value is written for; a reference it cannot
+//! resolve refuses the whole call, while an entry whose VALUES it cannot record
+//! comes back in `errorEntries` — one error per failed entry, carrying that
+//! entry — beside the entries it applied. `GetPropertyValueHistory` reads those
 //! values back: the ones its window (both bounds inclusive) and its
 //! `propertyFilters` select, in the direction `orderByTime` names, a
 //! `maxResults` page at a time, resampled when `interpolation` asks for it. A
@@ -25,7 +26,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::Emulator;
+use crate::harness::{data_writer_functions, Emulator};
 
 /// The workspace every case below reads and writes.
 const WORKSPACE: &str = "timeseries";
@@ -75,6 +76,9 @@ async fn seed(emulator: &Emulator) {
                     "Label": {"dataType": {"type": "STRING"}},
                     "Tag": {"dataType": {"type": "STRING"}, "isExternalId": true},
                 },
+                // The write connector a value is set THROUGH: without it no
+                // write to this component type's properties is accepted.
+                "functions": data_writer_functions(),
             }),
         ),
         (
@@ -297,18 +301,17 @@ struct BatchCase {
     expected_code: Option<&'static str>,
 }
 
-/// RULE: every entry is judged on its own, so a batch mixing entries the
-/// service can serve with entries it cannot stores the servable ones and
-/// reports the rest in `errorEntries` — a reference naming an entity or a
-/// component the workspace does not hold as a `ResourceNotFoundException`, and
-/// an entry the service cannot be asked to serve at all as a
-/// `ValidationException`.
+/// RULE: once an entry's reference has resolved, what is wrong with that entry's
+/// VALUES is that entry's own failure — so a batch mixing entries whose values
+/// this service can record with entries whose values it cannot stores the former
+/// and reports the latter in `errorEntries`, one `ValidationException` per failed
+/// entry, carrying the entry.
 #[tokio::test]
 async fn a_batch_applies_the_servable_entries_and_reports_the_rest() {
     let emulator = Emulator::new();
     seed(&emulator).await;
 
-    let cases: [BatchCase; 9] = [
+    let cases: [BatchCase; 6] = [
         BatchCase {
             case: "a servable write to a top-level component",
             entry: || sensor_entry("Temp", json!([{"time": T0, "value": {"doubleValue": 1.5}}])),
@@ -329,44 +332,6 @@ async fn a_batch_applies_the_servable_entries_and_reports_the_rest() {
             expected_code: None,
         },
         BatchCase {
-            case: "a reference to an entity the workspace does not hold",
-            entry: || {
-                json!({
-                    "entityPropertyReference": {
-                        "entityId": "ghost-9",
-                        "componentName": "Sensor",
-                        "propertyName": "Temp",
-                    },
-                    "propertyValues": [{"time": T0, "value": {"doubleValue": 3.5}}],
-                })
-            },
-            expected_code: Some("ResourceNotFoundException"),
-        },
-        BatchCase {
-            case: "a reference to a component the entity does not have",
-            entry: || {
-                json!({
-                    "entityPropertyReference": {
-                        "entityId": "unit-1",
-                        "componentName": "Absent",
-                        "propertyName": "Temp",
-                    },
-                    "propertyValues": [{"time": T0, "value": {"doubleValue": 4.5}}],
-                })
-            },
-            expected_code: Some("ResourceNotFoundException"),
-        },
-        BatchCase {
-            case: "a reference to a property the component does not have",
-            entry: || sensor_entry("Nowhere", json!([{"time": T0, "value": {"doubleValue": 5.5}}])),
-            expected_code: Some("ValidationException"),
-        },
-        BatchCase {
-            case: "a reference to a property that is not a time series property",
-            entry: || sensor_entry("Label", json!([{"time": T0, "value": {"stringValue": "tag"}}])),
-            expected_code: Some("ValidationException"),
-        },
-        BatchCase {
             case: "a value of another data type than the property's",
             entry: || sensor_entry("Count", json!([{"time": T0, "value": {"stringValue": "seven"}}])),
             expected_code: Some("ValidationException"),
@@ -383,6 +348,19 @@ async fn a_batch_applies_the_servable_entries_and_reports_the_rest() {
                     "Status",
                     json!([{"time": "not-a-timestamp-at-all", "value": {"stringValue": "x"}}]),
                 )
+            },
+            expected_code: Some("ValidationException"),
+        },
+        BatchCase {
+            case: "an entry carrying no propertyValues member at all",
+            entry: || {
+                json!({
+                    "entityPropertyReference": {
+                        "entityId": "unit-1",
+                        "componentName": "Sensor",
+                        "propertyName": "Online",
+                    },
+                })
             },
             expected_code: Some("ValidationException"),
         },
@@ -458,7 +436,7 @@ async fn a_batch_applies_the_servable_entries_and_reports_the_rest() {
         "the servable composite write is readable back, got {composite:?}"
     );
     // ...and the unservable ones stored nothing.
-    for property in ["Count", "Ticks", "Status"] {
+    for property in ["Count", "Ticks", "Status", "Online"] {
         let read = sensor_history(&emulator, property, json!({})).await;
         assert_eq!(
             reported(&read),
@@ -923,8 +901,8 @@ async fn a_history_read_refuses_what_it_cannot_serve() {
                     "selectedProperties": ["Temp"],
                 })
             },
-            status: 404,
-            error: "ResourceNotFoundException",
+            status: 400,
+            error: "ValidationException",
         },
         Refusal {
             case: "a componentPath no component of the entity sits at",
@@ -936,8 +914,8 @@ async fn a_history_read_refuses_what_it_cannot_serve() {
                     "selectedProperties": ["Temp"],
                 })
             },
-            status: 404,
-            error: "ResourceNotFoundException",
+            status: 400,
+            error: "ValidationException",
         },
         Refusal {
             case: "a workspace the store does not hold",
@@ -1052,7 +1030,8 @@ async fn a_history_read_refuses_what_it_cannot_serve() {
 
 /// RULE: a reference carrying no `entityId` names the component by the EXTERNAL
 /// ID one of its properties is, so the write lands on the component carrying
-/// that id — and on nothing at all when no component carries it.
+/// that id — and an id no component of the workspace carries resolves to no
+/// component at all, which refuses the whole request.
 #[tokio::test]
 async fn an_external_id_reference_addresses_the_component_carrying_it() {
     let emulator = Emulator::new();
@@ -1069,31 +1048,14 @@ async fn an_external_id_reference_addresses_the_component_carrying_it() {
                     },
                     "propertyValues": [{"time": T0, "value": {"doubleValue": 12.0}}],
                 },
-                {
-                    "entityPropertyReference": {
-                        "externalIdProperty": {"Tag": "carried-by-nobody"},
-                        "propertyName": "Temp",
-                    },
-                    "propertyValues": [{"time": T1, "value": {"doubleValue": 13.0}}],
-                },
             ]),
         )
         .await;
     assert_eq!(written.status, 200, "an external-id write: got {written:?}");
-
-    let codes: Vec<String> = written
-        .member("errorEntries")
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .flat_map(|entry| entry["errors"].as_array().cloned().unwrap_or_default())
-        .map(|error| error["errorCode"].as_str().unwrap_or_default().to_string())
-        .collect();
     assert_eq!(
-        codes,
-        vec!["ResourceNotFoundException".to_string()],
-        "only the id nothing carries earns an error, got {written:?}"
+        written.member("errorEntries"),
+        &json!([]),
+        "the carried id earns no error, got {written:?}"
     );
 
     let read = sensor_history(&emulator, "Temp", json!({})).await;
@@ -1101,6 +1063,35 @@ async fn an_external_id_reference_addresses_the_component_carrying_it() {
         reported(&read),
         vec![(T0.to_string(), json!({"doubleValue": 12.0}))],
         "the external-id write lands on the component carrying the id, got {read:?}"
+    );
+
+    // An id nothing carries is an unresolvable reference, so the request is
+    // refused as a whole and the entry beside it stores nothing either.
+    let refused = emulator
+        .batch_put_property_values(
+            WORKSPACE,
+            json!([
+                {
+                    "entityPropertyReference": {
+                        "externalIdProperty": {"Tag": "carried-by-nobody"},
+                        "propertyName": "Temp",
+                    },
+                    "propertyValues": [{"time": T1, "value": {"doubleValue": 13.0}}],
+                },
+                sensor_entry("Temp", json!([{"time": T2, "value": {"doubleValue": 14.0}}])),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        (refused.status, refused.error_type.as_deref()),
+        (404, Some("ResourceNotFoundException")),
+        "an id nothing carries: expected 404 ResourceNotFoundException, got {refused:?}"
+    );
+    let unchanged = sensor_history(&emulator, "Temp", json!({})).await;
+    assert_eq!(
+        reported(&unchanged),
+        vec![(T0.to_string(), json!({"doubleValue": 12.0}))],
+        "a refused request stores nothing, got {unchanged:?}"
     );
 }
 

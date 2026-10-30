@@ -15,10 +15,14 @@
 //! with a reserved one is not stored either.
 //!
 //! An ARN that names no stored resource is refused with `ResourceNotFoundException`
-//! (HTTP 404); a call that would leave the resource carrying more than
-//! [`crate::state::MAX_TAGS_PER_RESOURCE`] tags with the `TooManyTagsException`
-//! (HTTP 400) this operation models for exactly that failure — decided BEFORE
-//! anything is stored, so a refused call changes nothing.
+//! (HTTP 404). A call that would leave the resource carrying more than
+//! [`crate::state::MAX_TAGS_PER_RESOURCE`] tags breaches the service's
+//! "Tags per resource" QUOTA and is refused with `ServiceQuotaExceededException`
+//! (HTTP 402) carrying an empty message — decided BEFORE anything is stored, so a
+//! refused call changes nothing. That is the only tag-count failure THIS handler
+//! decides: a request naming more tags than the `TagMap` shape itself admits
+//! breaches a modelled `@length` bound, which the centralized request walk
+//! refuses before `handle` is reached.
 //!
 //! ## Shape of an operation
 //!
@@ -95,15 +99,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iottwinmaker-awsiottwin
 // shape (HTTP 400, declared by every create of it) and a request naming a tag key in
 // the reserved namespace is a bad request rather than a tag-count one, so the refusal
 // it earns has to be sayable here.
+// `ServiceQuotaExceededException` is widened in for the same reason once more: the
+// service models the shape (HTTP 402, declared by `UpdateComponentType`) and a call
+// past the per-resource tag QUOTA is a quota breach rather than a breach of the
+// per-call bound `TooManyTagsException` is for, so that refusal has to be sayable here
+// too.
 #[smithy_macros::operation_error(
     "com.amazonaws.iottwinmaker#TagResource",
-    extra_errors = ["InternalServerException", "ValidationException"]
+    extra_errors = ["InternalServerException", "ServiceQuotaExceededException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     TooManyTagsException(TooManyTagsException),
     ValidationException(ValidationException),
 }
@@ -205,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Only a key the resource does not already carry grows its tag set, so
-        // rewriting the value of a key it has can never exceed the cap however
+        // rewriting the value of a key it has can never exceed the quota however
         // many of them the request names.
         let added = input
             .tags
@@ -213,14 +223,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|key| !tags.contains_key(key.as_str()))
             .count();
         let resulting = tags.len() + added;
-        // Exceeding the per-resource tag maximum is the failure this operation
-        // models an error FOR, so that modelled error is the refusal: a client
-        // handling the operation's declared error set is told the tag limit was
-        // reached rather than handed a code the operation never declares.
-        if let Some(message) = crate::state::too_many_tags_violation(resulting) {
-            return Err(TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
-                message: Some(message),
-            })
+        // Past the per-resource tag quota the refusal is the QUOTA one: the
+        // request is inside the per-call bound, so telling the caller to shrink
+        // it would not help — what it has to do is untag the resource or stop
+        // tagging it. The quota breach names no value of the request, so the
+        // message is empty.
+        if crate::state::tags_per_resource_quota_exceeded(resulting) {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(String::new()),
+                },
+            )
             .into());
         }
 

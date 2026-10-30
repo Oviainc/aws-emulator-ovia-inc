@@ -2,25 +2,36 @@
 
 //! @op BatchPutPropertyValues
 //! WRITES values into the time series of the properties the request's entries
-//! name: "sets values for multiple time series properties". Each entry is
-//! served on its own — the entries this service can serve are stored and the
-//! ones it cannot come back in `errorEntries`, one `BatchPutPropertyError` per
-//! failed entry carrying the entry itself, so a batch mixing servable entries
-//! with unservable ones is PARTIALLY applied rather than refused whole. The
-//! whole request is refused only for what is wrong with the request rather than
-//! with an entry: an unknown workspace is the `ResourceNotFoundException` the
+//! name: "sets values for multiple time series properties". The whole request is
+//! refused for an unknown workspace with the `ResourceNotFoundException` the
 //! operation models.
 //!
-//! An entry is servable when its `entityPropertyReference` resolves to a
-//! component of an entity of the workspace — by `entityId` with `componentName`
-//! or `componentPath`, or by the `externalIdProperty` that names the component
-//! by its external id — and the property it names is a TIME SERIES property
-//! ([`crate::state::property_is_time_series`]) every one of the entry's values
-//! carries an instant and a value of the declared `dataType` for. A reference
-//! naming an entity or a component the workspace does not hold earns a
-//! `ResourceNotFoundException` entry error; a property that is not a time
-//! series property, a value of another data type and a value with no instant
-//! earn a `ValidationException` entry error.
+//! Every entry's `entityPropertyReference` is RESOLVED before anything is
+//! written, in two passes over the whole batch — what the references NAME first,
+//! then whether what they resolved to is writable — and a reference this service
+//! cannot write through refuses the WHOLE request rather than coming back as a
+//! per-entry result: an `entityId` the workspace does not hold is the modelled
+//! `ResourceNotFoundException` (HTTP 404), while a reference that resolves to no
+//! writable property is the modelled `ValidationException` (HTTP 400) — a
+//! component the entity does not have
+//! ([`crate::state::component_not_found_message`]), a property the component does
+//! not have, a property whose component type declares no WRITE CONNECTOR
+//! ([`crate::state::component_type_has_data_writer`]: the values of a component
+//! type's properties are set through that connector, so a type declaring none has
+//! no way to accept a write), or a property that is not a TIME SERIES property
+//! ([`crate::state::property_is_time_series`]). Nothing of such a request is
+//! applied.
+//!
+//! A reference names its component by `entityId` with `componentName` or
+//! `componentPath`, or by the `externalIdProperty` that names the component by
+//! its external id.
+//!
+//! `errorEntries` carries what goes wrong with ONE entry's VALUES once its
+//! reference has resolved — a value of another data type than the property's, a
+//! value carrying no instant, an instant that is no ISO 8601 DateTime, an entry
+//! carrying no values at all — so a batch mixing such an entry with servable ones
+//! is PARTIALLY applied, one `BatchPutPropertyError` per failed entry carrying
+//! the entry itself.
 //!
 //! A value is stored under the instant it was written FOR — `time`, else the
 //! deprecated `timestamp` — so the series is in time order however it was
@@ -192,10 +203,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the entries arrive in cannot decide which of them are servable. The
         // whole batch is at most `Entries`' modelled ten entries of at most ten
         // values each.
+        //
+        // A reference this service cannot write through refuses the WHOLE
+        // request — the modelled 404 for an entity the workspace does not hold,
+        // the modelled 400 for a reference that resolves to no writable
+        // property — so a caller is never told its values were accepted when
+        // none of them could be.
+        //
+        // In TWO passes over the whole batch, outside in: what the reference
+        // NAMES is resolved for every entry first, and only then is what it
+        // resolved to judged writable — so a batch carrying both an unresolvable
+        // reference and a resolvable one addressing an unwritable property is
+        // refused for the reference, whichever order the entries arrive in.
+        let mut resolved = Vec::with_capacity(input.entries.len());
+        for entry in &input.entries {
+            resolved.push(resolve_reference(workspace, &input.workspace_id, entry)?);
+        }
+        for resolved in &resolved {
+            writable(workspace, &input.workspace_id, resolved)?;
+        }
+
+        // What is wrong with one entry's VALUES, on the other hand, is that
+        // entry's own failure: the entries whose values this service can record
+        // are applied and the rest come back in `errorEntries`.
         let mut plans = Vec::new();
         let mut error_entries = Vec::new();
-        for entry in &input.entries {
-            match plan_entry(workspace, &input.workspace_id, entry) {
+        for (entry, resolved) in input.entries.iter().zip(resolved) {
+            match plan_values(resolved, entry) {
                 Ok(plan) => plans.push(plan),
                 Err(error) => error_entries.push(BatchPutPropertyErrorEntry {
                     errors: vec![BatchPutPropertyError {
@@ -232,21 +266,28 @@ fn not_found(message: String) -> BatchPutPropertyValuesError {
     .into()
 }
 
-/// The `errorCode` an entry error carries when the entry itself is not one this
-/// service can be asked to serve: the property is not a time series property,
-/// a value carries no instant, or a value is of another data type than the
-/// property's.
-///
-/// `errorCode` is modelled as a plain string, so the two codes below are not
-/// read off the model: they are the names of the two failures the operation
-/// models at the REQUEST level (`ValidationException`, HTTP 400, and
-/// `ResourceNotFoundException`, HTTP 404), reported per entry because one entry
-/// failing leaves the others servable.
-const ERROR_CODE_VALIDATION: &str = "ValidationException";
+/// Answer that the request cannot be served as it stands: the modelled
+/// `ValidationException` this operation declares for a bad request.
+fn invalid(message: String) -> BatchPutPropertyValuesError {
+    BatchPutPropertyValuesErrorModeled::ValidationException(ValidationException {
+        message: Some(crate::state::clamped_message(
+            message,
+            crate::state::ERROR_MESSAGE_MAX_CHARS,
+        )),
+    })
+    .into()
+}
 
-/// See [`ERROR_CODE_VALIDATION`]. Carried by an entry whose reference names an
-/// entity or a component the workspace does not hold.
-const ERROR_CODE_NOT_FOUND: &str = "ResourceNotFoundException";
+/// The `errorCode` an entry error carries when ONE entry's values are not ones
+/// this service can record: a value of another data type than the property's, a
+/// value carrying no instant, an instant that is no ISO 8601 DateTime, an entry
+/// carrying no values at all.
+///
+/// `errorCode` is modelled as a plain string, so this is not read off the model:
+/// it is the name of the failure the operation models at the REQUEST level for a
+/// request it cannot serve (`ValidationException`, HTTP 400), reported per entry
+/// because one entry's values being unrecordable leaves the others servable.
+const ERROR_CODE_VALIDATION: &str = "ValidationException";
 
 /// The greatest number of characters `BatchPutPropertyError$errorMessage`
 /// admits: `@length(1..256)`, from
@@ -257,25 +298,17 @@ const ERROR_CODE_NOT_FOUND: &str = "ResourceNotFoundException";
 /// built, rather than reported past the bound of the member it travels on.
 const ENTRY_ERROR_MESSAGE_MAX_CHARS: usize = 256;
 
-/// Why ONE entry cannot be served: the `errorCode` and `errorMessage` its
-/// reported error carries.
+/// Why ONE entry's values cannot be recorded: the `errorCode` and `errorMessage`
+/// its reported error carries.
 struct EntryError {
     code: &'static str,
     message: String,
 }
 
-/// An entry this service cannot be asked to serve.
+/// An entry whose values this service cannot record.
 fn invalid_entry(message: String) -> EntryError {
     EntryError {
         code: ERROR_CODE_VALIDATION,
-        message: crate::state::clamped_message(message, ENTRY_ERROR_MESSAGE_MAX_CHARS),
-    }
-}
-
-/// An entry whose reference names something the workspace does not hold.
-fn absent_entry(message: String) -> EntryError {
-    EntryError {
-        code: ERROR_CODE_NOT_FOUND,
         message: crate::state::clamped_message(message, ENTRY_ERROR_MESSAGE_MAX_CHARS),
     }
 }
@@ -303,15 +336,34 @@ struct Addressed<'a> {
     properties: &'a ::std::collections::BTreeMap<String, crate::state::PropertyRecord>,
 }
 
-/// Judge one entry against the workspace and say what it writes.
+/// One entry's reference, RESOLVED against the workspace: the keys the write
+/// lands under and the definition that gives the property its meaning. Owned, so
+/// the batch is resolved against the workspace before any of it is applied to
+/// it.
+struct Resolved {
+    entity_id: String,
+    component_name: String,
+    composite_path: Option<String>,
+    /// The component type the addressed component instantiates, `None` for a
+    /// component that instantiates none.
+    component_type_id: Option<String>,
+    property_name: String,
+    /// The definition the property's values are judged against, absent for a
+    /// property the component carries without one declaring it.
+    definition: Option<crate::ops::types::PropertyDefinitionRequest>,
+}
+
+/// Resolve what one entry's reference NAMES against the workspace, or refuse the
+/// whole request: the entity, the component on it and the property of that
+/// component.
 ///
-/// Nothing here mutates: an entry is servable or it is not, and the whole batch
-/// is judged before any of it is applied.
-fn plan_entry(
+/// Nothing here mutates: the reference resolves or the request is refused, and
+/// the whole batch is resolved before any of it is applied.
+fn resolve_reference(
     workspace: &crate::state::Workspace,
     workspace_id: &str,
     entry: &PropertyValueEntry,
-) -> Result<Plan, EntryError> {
+) -> Result<Resolved, BatchPutPropertyValuesError> {
     let reference = &entry.entity_property_reference;
     let property_name = reference.property_name.as_str();
     let addressed = address(workspace, workspace_id, reference)?;
@@ -319,24 +371,81 @@ fn plan_entry(
     // The definition that gives the property its meaning: the component's own,
     // else the one it inherits from the component type it instantiates. A
     // property neither declares nor carries anything is none of the
-    // component's, and a property whose definition is not `isTimeSeries` is
-    // not one this data plane sets values for.
+    // component's.
     let definition = workspace.effective_property_definition(
         addressed.component_type_id,
         addressed.properties,
         property_name,
     );
     if definition.is_none() && !addressed.properties.contains_key(property_name) {
-        return Err(invalid_entry(format!(
-            "Property {property_name} is not a property of component {} of entity {}.",
+        return Err(invalid(format!(
+            "Property {property_name} is not a property of component {} of Entity {} in \
+             workspace {workspace_id}.",
             addressed.component_name, addressed.entity_id
         )));
     }
-    if !crate::state::property_is_time_series(definition.as_ref()) {
-        return Err(invalid_entry(
-            crate::state::property_not_time_series_message(property_name),
-        ));
+
+    Ok(Resolved {
+        entity_id: addressed.entity_id,
+        component_name: addressed.component_name,
+        composite_path: addressed.composite_path,
+        component_type_id: addressed.component_type_id.map(str::to_string),
+        property_name: property_name.to_string(),
+        definition,
+    })
+}
+
+/// Judge the property one entry resolved to WRITABLE, or refuse the whole
+/// request.
+///
+/// Both halves answer the same question — is there anything here a value can be
+/// written to? — so both are refused at the REQUEST level, where the write
+/// connector's absence is established to be refused: a reference that resolves
+/// to a property this data plane sets no value of is as unwritable as one whose
+/// component type has no writer, and the alternative would leave one reference
+/// class answered 200 with a partial result and the other 400. The connector is
+/// tested FIRST because a component type with no writer accepts no write at all,
+/// whatever its property declares — which is the order a type declaring neither
+/// a writer nor the time-series mark is refused in.
+fn writable(
+    workspace: &crate::state::Workspace,
+    workspace_id: &str,
+    resolved: &Resolved,
+) -> Result<(), BatchPutPropertyValuesError> {
+    // The values of a component type's properties are SET THROUGH its write
+    // connector, so a component whose type declares none — its own or an
+    // inherited one — has no way to accept a write at all, whatever the
+    // property it names is declared as.
+    if !crate::state::component_type_has_data_writer(workspace, resolved.component_type_id.as_deref())
+    {
+        return Err(invalid(crate::state::missing_data_writer_message(
+            workspace_id,
+            &resolved.entity_id,
+            &resolved.component_name,
+            &resolved.property_name,
+        )));
     }
+    // A property whose definition is not `isTimeSeries` is not one this data
+    // plane sets values for.
+    if !crate::state::property_is_time_series(resolved.definition.as_ref()) {
+        return Err(invalid(crate::state::property_not_time_series_message(
+            &resolved.property_name,
+        )));
+    }
+    Ok(())
+}
+
+/// The values one resolved entry records, or why they are not values this
+/// service can record.
+fn plan_values(resolved: Resolved, entry: &PropertyValueEntry) -> Result<Plan, EntryError> {
+    let Resolved {
+        entity_id,
+        component_name,
+        composite_path,
+        component_type_id: _,
+        property_name,
+        definition,
+    } = resolved;
 
     let requested = entry.property_values.as_deref().unwrap_or_default();
     if requested.is_empty() {
@@ -346,19 +455,21 @@ fn plan_entry(
     }
     let mut values = Vec::with_capacity(requested.len());
     for value in requested {
-        if let Some(violation) =
-            crate::state::data_value_type_violation(property_name, definition.as_ref(), &value.value)
-        {
+        if let Some(violation) = crate::state::data_value_type_violation(
+            &property_name,
+            definition.as_ref(),
+            &value.value,
+        ) {
             return Err(invalid_entry(violation));
         }
-        values.push(instant_and_value(property_name, value)?);
+        values.push(instant_and_value(&property_name, value)?);
     }
 
     Ok(Plan {
-        entity_id: addressed.entity_id,
-        component_name: addressed.component_name,
-        composite_path: addressed.composite_path,
-        property_name: property_name.to_string(),
+        entity_id,
+        component_name,
+        composite_path,
+        property_name,
         values,
     })
 }
@@ -426,10 +537,10 @@ fn address<'a>(
     workspace: &'a crate::state::Workspace,
     workspace_id: &str,
     reference: &EntityPropertyReference,
-) -> Result<Addressed<'a>, EntryError> {
+) -> Result<Addressed<'a>, BatchPutPropertyValuesError> {
     if let Some(entity_id) = reference.entity_id.as_deref() {
         let Some(entity) = workspace.entities.get(entity_id) else {
-            return Err(absent_entry(crate::state::entity_not_found_message(
+            return Err(not_found(crate::state::entity_not_found_message(
                 workspace_id,
                 entity_id,
             )));
@@ -439,9 +550,10 @@ fn address<'a>(
             reference.component_name.as_deref(),
         ) {
             (Some(component_path), _) => at_path(entity, component_path).ok_or_else(|| {
-                absent_entry(format!(
-                    "Entity {entity_id} in workspace {workspace_id} has no component at \
-                     componentPath {component_path}."
+                invalid(crate::state::component_not_found_message(
+                    workspace_id,
+                    entity_id,
+                    component_path,
                 ))
             }),
             (None, Some(component_name)) => entity
@@ -449,14 +561,15 @@ fn address<'a>(
                 .get(component_name)
                 .map(|component| of_component(entity, component))
                 .ok_or_else(|| {
-                    absent_entry(format!(
-                        "Component {component_name} of entity {entity_id} in workspace \
-                         {workspace_id} not found."
+                    invalid(crate::state::component_not_found_message(
+                        workspace_id,
+                        entity_id,
+                        component_name,
                     ))
                 }),
             // A property belongs to a component, so an entity alone addresses
             // none of them.
-            (None, None) => Err(invalid_entry(format!(
+            (None, None) => Err(invalid(format!(
                 "The reference to entity {entity_id} names neither componentName nor \
                  componentPath, so it addresses no component."
             ))),
@@ -468,7 +581,7 @@ fn address<'a>(
         .as_ref()
         .filter(|external_ids| !external_ids.is_empty())
         .ok_or_else(|| {
-            invalid_entry(
+            invalid(
                 "The reference names neither entityId nor externalIdProperty, so it addresses \
                  no property."
                     .to_string(),
@@ -477,11 +590,11 @@ fn address<'a>(
     let mut matched = by_external_id(workspace, external_ids);
     match matched.len() {
         1 => Ok(matched.remove(0)),
-        0 => Err(absent_entry(format!(
+        0 => Err(not_found(format!(
             "No component in workspace {workspace_id} carries the external id the reference \
              names."
         ))),
-        _ => Err(invalid_entry(format!(
+        _ => Err(invalid(format!(
             "The external id the reference names is carried by more than one component of \
              workspace {workspace_id}, so it addresses no one component."
         ))),
