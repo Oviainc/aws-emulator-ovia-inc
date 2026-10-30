@@ -417,6 +417,16 @@ pub const RSLVR_CODE_QUERY_LOG_CONFIG_NOT_FOUND: &str = "RSLVR-01601";
 /// operations. See [`association_priority_in_use`].
 pub const RSLVR_CODE_ASSOCIATION_PRIORITY_IN_USE: &str = "RSLVR-02303";
 
+/// The Route 53 Resolver service error code reported when a DNS Firewall rule
+/// is asked for a `Priority` another rule of the same rule group already holds.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ASSOCIATION_PRIORITY_IN_USE`] —
+/// the status and the exception shape name do not say which fault occurred, and
+/// the model states no message text — and it is the code of the rule's own
+/// priority clash, which is a different fault from an association's. See
+/// [`firewall_rule_priority_in_use`].
+pub const RSLVR_CODE_RULE_PRIORITY_IN_USE: &str = "RSLVR-02203";
+
 /// The Route 53 Resolver service error code reported when a change to, or a
 /// removal of, a DNS Firewall rule-group association is refused because the
 /// association carries mutation protection.
@@ -2050,6 +2060,32 @@ pub fn association_priority_in_use(
                  \"{holding_firewall_rule_group_association_id}\" . \
                  Try again with another priority number"
             ),
+        )),
+    }
+}
+
+/// The `ValidationException` a firewall-rule create is refused with when the
+/// `Priority` it asks for is one another rule of the same rule group already
+/// holds.
+///
+/// `CreateFirewallRule$Priority`'s doc states the rule: "You must specify a
+/// unique priority for each rule in a rule group." The priority is unique over
+/// the whole GROUP and over nothing narrower — no other member of the rule (the
+/// query type it evaluates, its action, its match source) scopes that
+/// uniqueness — so the refusal states the fault with the service's code for it
+/// ([`RSLVR_CODE_RULE_PRIORITY_IN_USE`]), names the rule group the clash is in,
+/// and asks for another number.
+pub fn firewall_rule_priority_in_use(firewall_rule_group_id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(rslvr_message_sentences(
+            RSLVR_CODE_RULE_PRIORITY_IN_USE,
+            &[
+                &format!(
+                    "The DNS Firewall rule group already has a rule associated with the same \
+                     priority: \"{firewall_rule_group_id}\""
+                ),
+                "Provide another priority",
+            ],
         )),
     }
 }
@@ -5255,18 +5291,18 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             return Ok(record.to_rule(now));
         }
 
-        // "You must specify a unique priority for each rule in a rule group."
+        // "You must specify a unique priority for each rule in a rule group":
+        // the priority is unique over the GROUP, so a rule already holding it
+        // clashes whatever else that rule states — its `Qtype`, its `Action`,
+        // its match source scope nothing.
         if group
             .rules
             .iter()
             .any(|record| record.rule.priority == Some(request.priority))
         {
-            return Err(FirewallRuleCreateRefusal::Validation(ValidationException {
-                message: Some(format!(
-                    "Priority {} is already in use by another rule in rule group {}",
-                    request.priority, request.firewall_rule_group_id
-                )),
-            }));
+            return Err(FirewallRuleCreateRefusal::Validation(
+                firewall_rule_priority_in_use(request.firewall_rule_group_id),
+            ));
         }
 
         // The group's rules are bounded: a create past the bound is refused and

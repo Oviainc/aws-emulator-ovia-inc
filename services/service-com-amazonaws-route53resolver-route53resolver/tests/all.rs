@@ -43,6 +43,8 @@ mod firewall_rule_group_policies;
 mod firewall_rule_group_policy_refusal_message;
 #[path = "all/firewall_rule_groups.rs"]
 mod firewall_rule_groups;
+#[path = "all/firewall_rule_priority_uniqueness.rs"]
+mod firewall_rule_priority_uniqueness;
 #[path = "all/firewall_rules_and_associations.rs"]
 mod firewall_rules_and_associations;
 #[path = "all/harness.rs"]
