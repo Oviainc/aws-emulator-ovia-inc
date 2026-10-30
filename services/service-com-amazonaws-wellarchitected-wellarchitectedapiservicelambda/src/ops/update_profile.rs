@@ -160,8 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the request answers, normalized and refused by the rules both operations
         // that record a profile's answers share
         // (`crate::state::recorded_profile_questions`): one entry per `QuestionId`, each
-        // carrying the choices selected for it as a set. Judged before the store is
-        // touched, so a request that cannot be recorded revises nothing.
+        // naming a question the published profile template asks and carrying choices that
+        // question offers, as a set. Judged before the store is touched, so a request that
+        // cannot be recorded revises nothing.
         let answered = match input.profile_questions.as_deref() {
             Some(updates) => crate::state::recorded_profile_questions(updates)
                 .map_err(UpdateProfileErrorModeled::ValidationException)?,
@@ -178,29 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Each entry is "an update to a profile question" (`ProfileQuestionUpdate`), so it
         // replaces the answer recorded for the QUESTION it names — the selected choices
         // are the set in force for that question — and a question the request does not
-        // name keeps the answer the profile already records.
+        // name keeps the answer the profile already records. The published template is
+        // what bounds the map: every key is a question it asks.
         let mut questions = profile.questions.clone();
         questions.extend(answered);
-
-        // The question count one profile records is bounded by this emulator's own ceiling
-        // ([`crate::state::MAX_QUESTIONS_PER_PROFILE`]), which is what keeps a STORED
-        // profile's question map bounded by something other than the request body size.
-        // This operation models no quota error, so a revision that would carry the profile
-        // past the ceiling is answered with the modelled `ConflictException` — "The
-        // resource has already been processed, was deleted, or is too large" — rather than
-        // telling the caller the model refused a list the model allows.
-        if questions.len() > crate::state::MAX_QUESTIONS_PER_PROFILE {
-            return Err(UpdateProfileErrorModeled::ConflictException(crate::state::conflict(
-                crate::state::PROFILE_RESOURCE_TYPE,
-                input.profile_arn.clone(),
-                &format!(
-                    "Profile with ARN {} cannot record more than {} questions.",
-                    input.profile_arn,
-                    crate::state::MAX_QUESTIONS_PER_PROFILE
-                ),
-            ))
-            .into());
-        }
 
         // Every writable member is optional, so one the request leaves out asks for no
         // change to it and the stored value stands.

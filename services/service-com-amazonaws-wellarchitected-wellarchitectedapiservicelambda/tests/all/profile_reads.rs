@@ -5,7 +5,7 @@
 //! optional `ProfileVersion` bound to the query string;
 //! `smithy_query(query="operation", operation="GetProfile")`).
 //!
-//! The round trip of ONE created profile, its refused creates and its quota live in
+//! The round trip of ONE created profile and its refused creates live in
 //! `super::profile_lifecycle`. What this suite adds are the rules that only show up with
 //! SEVERAL profiles in one store, each over a table of rows rather than one request:
 //!
@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 use super::profile_lifecycle::{
     absent_profile_arn, created, expected_questions, member, minimal_profile, profile_of,
 };
-use super::workload_harness::Client;
+use super::workload_harness::{template_choice, template_question, Client};
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
@@ -90,7 +90,10 @@ fn rows() -> Vec<(&'static str, Value)> {
             "one-question-one-choice",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_cost"] },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 0)],
+                    },
                 ]
             }),
         ),
@@ -99,11 +102,14 @@ fn rows() -> Vec<(&'static str, Value)> {
             json!({
                 "ProfileQuestions": [
                     {
-                        "QuestionId": "priority",
-                        "SelectedChoiceIds": ["priority_rel", "priority_cost"],
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 1), template_choice(0, 0)],
                     },
-                    { "QuestionId": "workload-type", "SelectedChoiceIds": ["type_batch"] },
-                    { "QuestionId": "business-objective", "SelectedChoiceIds": [] },
+                    {
+                        "QuestionId": template_question(3),
+                        "SelectedChoiceIds": [template_choice(3, 3)],
+                    },
+                    { "QuestionId": template_question(1), "SelectedChoiceIds": [] },
                 ]
             }),
         ),
@@ -111,8 +117,8 @@ fn rows() -> Vec<(&'static str, Value)> {
             "a-choice-named-twice",
             json!({
                 "ProfileQuestions": [{
-                    "QuestionId": "priority",
-                    "SelectedChoiceIds": ["priority_perf", "priority_perf"],
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [template_choice(0, 4), template_choice(0, 4)],
                 }]
             }),
         ),
@@ -129,12 +135,12 @@ fn rows() -> Vec<(&'static str, Value)> {
             json!({ "ProfileName": "n".repeat(100), "ProfileDescription": "d".repeat(100) }),
         ),
         (
-            "questions-at-the-quota",
+            "every-published-question-answered",
             json!({
-                "ProfileQuestions": (0..state::MAX_QUESTIONS_PER_PROFILE)
+                "ProfileQuestions": (0..state::PROFILE_TEMPLATE_QUESTIONS.len())
                     .map(|index| json!({
-                        "QuestionId": format!("question-{index:03}"),
-                        "SelectedChoiceIds": [format!("choice-{index:03}")],
+                        "QuestionId": template_question(index),
+                        "SelectedChoiceIds": [template_choice(index, 0)],
                     }))
                     .collect::<Vec<Value>>()
             }),

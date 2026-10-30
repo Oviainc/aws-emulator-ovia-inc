@@ -34,7 +34,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use super::workload_harness::{created_profile, member, minimal_profile, Answer, Client};
+use super::workload_harness::{
+    created_profile, member, minimal_profile, template_choice, template_question, Answer, Client,
+};
 
 /// Every member `ProfileSummary` declares, from
 /// `smithy_query(query="shape", shape="ProfileSummary")`. A summary carries these and
@@ -150,10 +152,13 @@ async fn every_stored_profile_is_reported_as_its_modelled_summary() {
         (
             "two-questions",
             json!({ "ProfileQuestions": [
-                { "QuestionId": "priority", "SelectedChoiceIds": ["priority_cost"] },
                 {
-                    "QuestionId": "business-outcome",
-                    "SelectedChoiceIds": ["outcome_cost", "outcome_speed"],
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [template_choice(0, 0)],
+                },
+                {
+                    "QuestionId": template_question(4),
+                    "SelectedChoiceIds": [template_choice(4, 0), template_choice(4, 2)],
                 },
             ] }),
         ),

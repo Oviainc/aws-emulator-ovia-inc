@@ -43,7 +43,7 @@ use serde_json::{json, Value};
 use super::profile_lifecycle::{absent_profile_arn, created};
 use super::workload_harness::{
     age_workload, assert_not_found, created_id, created_profile, minimal_create, profiles_of,
-    updated_at_of, Answer, Client,
+    template_choice, template_question, updated_at_of, Answer, Client,
 };
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
@@ -105,7 +105,7 @@ fn cases() -> Vec<Case> {
             name: "one-question-one-choice",
             profile_name: "single-question-profile".to_string(),
             profile_description: "answers one question".to_string(),
-            questions: vec![("priority", vec!["priority_security"])],
+            questions: vec![(template_question(0), vec![template_choice(0, 2)])],
             tags: vec![("owner", "platform")],
         },
         Case {
@@ -113,9 +113,12 @@ fn cases() -> Vec<Case> {
             profile_name: "many-question-profile".to_string(),
             profile_description: "answers three questions".to_string(),
             questions: vec![
-                ("workload_type", vec!["workload_type_analytics", "zz-other"]),
-                ("budget", vec![]),
-                ("priority", vec!["priority_cost"]),
+                (
+                    template_question(3),
+                    vec![template_choice(3, 0), template_choice(3, 1)],
+                ),
+                (template_question(4), vec![]),
+                (template_question(0), vec![template_choice(0, 0)]),
             ],
             tags: vec![("owner", "platform"), ("tier", "gold")],
         },
@@ -123,7 +126,7 @@ fn cases() -> Vec<Case> {
             name: "name-and-description-at-the-upper-length-bound",
             profile_name: "n".repeat(100),
             profile_description: "d".repeat(100),
-            questions: vec![("budget", vec!["budget_under_100k"])],
+            questions: vec![(template_question(1), vec![template_choice(1, 0)])],
             tags: vec![("only", "")],
         },
     ]

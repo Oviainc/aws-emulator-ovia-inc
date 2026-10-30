@@ -4915,19 +4915,6 @@ pub fn next_profile_version(current: &str) -> String {
 /// realistic client workflow, so a caller never meets it by accident.
 pub const MAX_PROFILES: usize = 1_000;
 
-/// The most profile questions one profile records here.
-///
-/// In the real service the questions come from the ONE profile template the service
-/// publishes (`GetProfileTemplate`), so their number is fixed by that template rather
-/// than by the request. A request here may answer a question
-/// [`PROFILE_TEMPLATE_QUESTIONS`] does not publish — nothing refuses one, and such an
-/// answer is recorded with no published text to report
-/// ([`ProfileRecord::profile_questions`]) — so this is the ceiling that keeps a stored
-/// profile's question map bounded, answered with the modelled
-/// `ServiceQuotaExceededException` for the reason [`MAX_PROFILES`] gives. It sits well
-/// above the number of questions the template asks.
-pub const MAX_QUESTIONS_PER_PROFILE: usize = 100;
-
 /// The modelled input member a profile-question finding names
 /// (`CreateProfileInput$ProfileQuestions` / `UpdateProfileInput$ProfileQuestions`).
 pub const PROFILE_QUESTIONS_MEMBER: &str = "ProfileQuestions";
@@ -4945,11 +4932,23 @@ pub const PROFILE_QUESTIONS_MEMBER: &str = "ProfileQuestions";
 /// choices" — so a choice is either selected or not and naming one twice in one update
 /// selects it once.
 ///
+/// Both identifiers an update carries come from the ONE profile template this service
+/// publishes ([`PROFILE_TEMPLATE_QUESTIONS`], which `GetProfileTemplate` serves and which
+/// is the only place a client discovers either), so each is RESOLVED against it: a
+/// `QuestionId` naming a question the template does not ask answers no question of this
+/// service, and a `SelectedChoiceIds` entry naming no choice of the question it answers
+/// selects nothing of that question. Either is refused rather than stored — the rule every
+/// other identifier taken from a published catalog follows here
+/// ([`undefined_choice_refusal`], [`undefined_pillar_refusal`]) — so a stored profile's
+/// answers and the question text reported beside them
+/// ([`ProfileRecord::profile_questions`]) cannot disagree.
+///
 /// Shared by the two operations that record a profile's answers from this member
 /// (`CreateProfile` and `UpdateProfile`), so neither can normalise or refuse one
 /// differently; the refusal is worded the way the framework's own constraint walk words a
 /// member failure ([`member_constraint_exception`]), so a handler-enforced rule reads like
-/// a modelled one.
+/// a modelled one. The offending choice ids are sorted and deduplicated, so a refusal does
+/// not depend on the order the request listed them in.
 pub fn recorded_profile_questions(
     updates: &[crate::ops::types::ProfileQuestionUpdate],
 ) -> Result<BTreeMap<String, BTreeSet<String>>, crate::ops::types::ValidationException> {
@@ -4970,15 +4969,33 @@ pub fn recorded_profile_questions(
                 ),
             ));
         }
-        questions.insert(
-            question_id.to_string(),
-            update
-                .selected_choice_ids
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-        );
+        let published = profile_template_question(question_id).ok_or_else(|| {
+            member_constraint_exception(
+                PROFILE_QUESTIONS_MEMBER,
+                &format!(
+                    "every question must be a question the profile template asks, which \
+                     {question_id} is not"
+                ),
+            )
+        })?;
+        let selected = update.selected_choice_ids.clone().unwrap_or_default();
+        let mut undefined: Vec<&str> = selected
+            .iter()
+            .map(String::as_str)
+            .filter(|choice_id| !published.offers_choice(choice_id))
+            .collect();
+        if !undefined.is_empty() {
+            undefined.sort_unstable();
+            undefined.dedup();
+            return Err(member_constraint_exception(
+                PROFILE_QUESTIONS_MEMBER,
+                &format!(
+                    "every choice must be a choice of question {question_id}, which {} is not",
+                    undefined.join(", ")
+                ),
+            ));
+        }
+        questions.insert(question_id.to_string(), selected.into_iter().collect());
     }
     Ok(questions)
 }
@@ -5108,8 +5125,10 @@ impl ProfileRecord {
     /// shape="ProfileTemplateQuestion")`), so they are read off this emulator's published
     /// template ([`profile_template_question`]) rather than restated here: what the
     /// profile itself records is the question it answers and the choices selected for it.
-    /// A question the template does not publish has no published text, so for it those
-    /// members are reported ABSENT rather than invented.
+    /// Every question a profile records is one that template asks — both writers resolve
+    /// the identifier against it ([`recorded_profile_questions`]) — so the published row is
+    /// there to read; the members stay optional because the modelled shape declares them
+    /// so, and nothing is invented for a row that is not there.
     pub fn profile_questions(&self) -> Vec<ProfileQuestion> {
         self.questions
             .iter()

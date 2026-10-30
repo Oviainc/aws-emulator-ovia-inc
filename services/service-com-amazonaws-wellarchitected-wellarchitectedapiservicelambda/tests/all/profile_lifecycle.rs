@@ -16,15 +16,14 @@
 //!    parameters returns the original profile, the same token with different parameters
 //!    is a `409 ConflictException`, and a fresh token creates a second profile — even
 //!    under a name an existing profile already carries, which no published rule meters.
-//! 4. A `ProfileQuestions` entry a profile cannot record — one naming no question, or two
-//!    naming the same question — is a `400 ValidationException` naming the member, and
-//!    nothing is stored.
+//! 4. A `ProfileQuestions` entry a profile cannot record — one naming no question, two
+//!    naming the same question, one naming a question the published profile template does
+//!    not ask, or one selecting a choice that question does not offer — is a
+//!    `400 ValidationException` naming the member, and nothing is stored.
 //! 5. A `ProfileArn` and a `ProfileVersion` are RESOLVED against the store: an ARN naming
 //!    no stored profile, or a version the stored profile is not at, is a
 //!    `404 ResourceNotFoundException` carrying the identifier as sent and the missing
 //!    resource's type.
-//! 6. The question count one profile records is bounded by this emulator's own quota,
-//!    answered with the modelled `402 ServiceQuotaExceededException`.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do
@@ -34,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
-use super::workload_harness::{Answer, Client};
+use super::workload_harness::{template_choice, template_question, Answer, Client};
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
@@ -46,9 +45,9 @@ const MAX_QUESTION_ID: usize = 128;
 const MAX_CHOICE_ID: usize = 64;
 
 /// The members of `Profile$ProfileQuestions` that describe the QUESTION rather than the
-/// answer. The service reads them off the profile template it publishes; this emulator
-/// carries none (`GetProfileTemplate` is a stub with its own issue), so a stored
-/// profile's questions report none of them rather than an invented catalog.
+/// answer. The service reads them off the profile template it publishes, and every
+/// question a profile records is one that template asks, so a stored profile reports all
+/// five beside the selection it holds.
 const QUESTION_DESCRIPTION_MEMBERS: [&str; 5] = [
     "QuestionTitle",
     "QuestionDescription",
@@ -58,14 +57,15 @@ const QUESTION_DESCRIPTION_MEMBERS: [&str; 5] = [
 ];
 
 /// A minimal valid `CreateProfile` request; a caller overrides the members its case
-/// varies.
+/// varies. The question it answers and the choice it selects are read off the table the
+/// profile template publishes, which is what a profile may record.
 pub(crate) fn minimal_profile(name: &str, token: &str) -> Value {
     json!({
         "ProfileName": name,
         "ProfileDescription": "a profile under test",
         "ProfileQuestions": [{
-            "QuestionId": "priority",
-            "SelectedChoiceIds": ["priority_cost"],
+            "QuestionId": template_question(0),
+            "SelectedChoiceIds": [template_choice(0, 0)],
         }],
         "ClientRequestToken": token,
     })
@@ -127,8 +127,9 @@ pub(crate) fn created(answer: &Answer, case: &str) -> (String, String) {
 }
 
 /// The `ProfileQuestions` a request's updates must be recorded as: one entry per
-/// `QuestionId` in question-id order, each carrying the choices selected for it as a set.
-/// Computed here from the request, independently of the code under test.
+/// `QuestionId` in question-id order, each carrying the choices selected for it as a set
+/// beside the text the published profile template gives that question. Computed here from
+/// the request and the published table, independently of the code under test.
 pub(crate) fn expected_questions(updates: &Value) -> Value {
     let mut recorded: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for update in updates.as_array().cloned().unwrap_or_default() {
@@ -155,14 +156,35 @@ pub(crate) fn expected_questions(updates: &Value) -> Value {
     Value::Array(
         recorded
             .into_iter()
-            .map(|(question_id, choices)| {
-                json!({
-                    "QuestionId": question_id,
-                    "SelectedChoiceIds": choices.into_iter().collect::<Vec<String>>(),
-                })
-            })
+            .map(|(question_id, choices)| reported_question(&question_id, choices))
             .collect(),
     )
+}
+
+/// One `ProfileQuestion` a read must report: the question answered, the choices selected
+/// for it as a set, and the text the published profile template gives that question — its
+/// title, description, choice catalog and selection bounds, read off
+/// `state::PROFILE_TEMPLATE_QUESTIONS` rather than off the response under test.
+pub(crate) fn reported_question(question_id: &str, selected: BTreeSet<String>) -> Value {
+    let published = state::profile_template_question(question_id)
+        .expect("a stored profile answers only questions the published template asks");
+    json!({
+        "QuestionId": question_id,
+        "SelectedChoiceIds": selected.into_iter().collect::<Vec<String>>(),
+        "QuestionTitle": published.title,
+        "QuestionDescription": published.description,
+        "QuestionChoices": published
+            .choices
+            .iter()
+            .map(|choice| json!({
+                "ChoiceId": choice.choice_id,
+                "ChoiceTitle": choice.title,
+                "ChoiceDescription": choice.description,
+            }))
+            .collect::<Vec<Value>>(),
+        "MinSelectedChoices": published.min_selected_choices,
+        "MaxSelectedChoices": published.max_selected_choices,
+    })
 }
 
 /// Rules 1 and 2. The rows differ along what the request carries — how many questions it
@@ -177,20 +199,25 @@ async fn a_created_profile_round_trips_through_get() {
         ("no-questions-answered", json!({ "ProfileQuestions": [] })),
         (
             "question-without-a-selection",
-            json!({ "ProfileQuestions": [{ "QuestionId": "priority" }] }),
+            json!({ "ProfileQuestions": [{ "QuestionId": template_question(0) }] }),
         ),
         (
             "question-with-an-empty-selection",
             json!({
-                "ProfileQuestions": [{ "QuestionId": "priority", "SelectedChoiceIds": [] }]
+                "ProfileQuestions": [{
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [],
+                }]
             }),
         ),
         (
             "several-choices-selected",
             json!({
                 "ProfileQuestions": [{
-                    "QuestionId": "priority",
-                    "SelectedChoiceIds": ["priority_cost", "priority_perf", "priority_rel"],
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [
+                        template_choice(0, 0), template_choice(0, 4), template_choice(0, 1),
+                    ],
                 }]
             }),
         ),
@@ -201,9 +228,15 @@ async fn a_created_profile_round_trips_through_get() {
             "questions-out-of-order",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "workload-type", "SelectedChoiceIds": ["type_batch"] },
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_cost"] },
-                    { "QuestionId": "business-objective", "SelectedChoiceIds": [] },
+                    {
+                        "QuestionId": template_question(3),
+                        "SelectedChoiceIds": [template_choice(3, 3)],
+                    },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 0)],
+                    },
+                    { "QuestionId": template_question(1), "SelectedChoiceIds": [] },
                 ]
             }),
         ),
@@ -211,9 +244,10 @@ async fn a_created_profile_round_trips_through_get() {
             "choices-out-of-order-and-repeated",
             json!({
                 "ProfileQuestions": [{
-                    "QuestionId": "priority",
+                    "QuestionId": template_question(0),
                     "SelectedChoiceIds": [
-                        "priority_rel", "priority_cost", "priority_rel", "priority_cost"
+                        template_choice(0, 1), template_choice(0, 0),
+                        template_choice(0, 1), template_choice(0, 0),
                     ],
                 }]
             }),
@@ -232,24 +266,15 @@ async fn a_created_profile_round_trips_through_get() {
             "name-and-description-at-the-maximum-length",
             json!({ "ProfileName": "n".repeat(100), "ProfileDescription": "d".repeat(100) }),
         ),
+        // Every question the template asks, answered at once: the published table is what
+        // bounds a stored profile's question map, so this is the largest one there is.
         (
-            "question-and-choice-ids-at-the-maximum-length",
+            "every-published-question-answered",
             json!({
-                "ProfileQuestions": [{
-                    "QuestionId": "q".repeat(MAX_QUESTION_ID),
-                    "SelectedChoiceIds": ["c".repeat(MAX_CHOICE_ID)],
-                }]
-            }),
-        ),
-        // The question quota is a published bound of this emulator's own: a profile
-        // answering exactly as many questions as it meters is accepted.
-        (
-            "questions-at-the-quota",
-            json!({
-                "ProfileQuestions": (0..state::MAX_QUESTIONS_PER_PROFILE)
+                "ProfileQuestions": (0..state::PROFILE_TEMPLATE_QUESTIONS.len())
                     .map(|index| json!({
-                        "QuestionId": format!("question-{index:03}"),
-                        "SelectedChoiceIds": [format!("choice-{index:03}")],
+                        "QuestionId": template_question(index),
+                        "SelectedChoiceIds": [template_choice(index, 0)],
                     }))
                     .collect::<Vec<Value>>()
             }),
@@ -309,10 +334,9 @@ async fn a_created_profile_round_trips_through_get() {
             .unwrap_or_default()
         {
             for name in QUESTION_DESCRIPTION_MEMBERS {
-                assert_eq!(
-                    question.get(name),
-                    None,
-                    "case {case:?}: no profile template is carried, so {name} must be absent, got {question:?}"
+                assert!(
+                    question.get(name).is_some(),
+                    "case {case:?}: every recorded question is one the template asks, so {name} must be reported, got {question:?}"
                 );
             }
         }
@@ -372,8 +396,14 @@ async fn the_client_request_token_decides_what_a_retry_means() {
             "questions-reordered",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "workload-type", "SelectedChoiceIds": ["type_batch"] },
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_cost"] },
+                    {
+                        "QuestionId": template_question(3),
+                        "SelectedChoiceIds": [template_choice(3, 3)],
+                    },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 0)],
+                    },
                 ]
             }),
             true,
@@ -382,10 +412,13 @@ async fn the_client_request_token_decides_what_a_retry_means() {
             "choice-repeated",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_cost"] },
                     {
-                        "QuestionId": "workload-type",
-                        "SelectedChoiceIds": ["type_batch", "type_batch"],
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 0)],
+                    },
+                    {
+                        "QuestionId": template_question(3),
+                        "SelectedChoiceIds": [template_choice(3, 3), template_choice(3, 3)],
                     },
                 ]
             }),
@@ -400,8 +433,14 @@ async fn the_client_request_token_decides_what_a_retry_means() {
             "different-selection",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_perf"] },
-                    { "QuestionId": "workload-type", "SelectedChoiceIds": ["type_batch"] },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 4)],
+                    },
+                    {
+                        "QuestionId": template_question(3),
+                        "SelectedChoiceIds": [template_choice(3, 3)],
+                    },
                 ]
             }),
             false,
@@ -418,8 +457,14 @@ async fn the_client_request_token_decides_what_a_retry_means() {
         let token = format!("tok-{case}");
         let mut first = minimal_profile("retried-profile", &token);
         first["ProfileQuestions"] = json!([
-            { "QuestionId": "priority", "SelectedChoiceIds": ["priority_cost"] },
-            { "QuestionId": "workload-type", "SelectedChoiceIds": ["type_batch"] },
+            {
+                "QuestionId": template_question(0),
+                "SelectedChoiceIds": [template_choice(0, 0)],
+            },
+            {
+                "QuestionId": template_question(3),
+                "SelectedChoiceIds": [template_choice(3, 3)],
+            },
         ]);
         first["Tags"] = json!({ "Env": "test" });
 
@@ -476,7 +521,9 @@ async fn the_client_request_token_decides_what_a_retry_means() {
 }
 
 /// Rule 4. The rows differ along WHICH `ProfileQuestions` entry cannot be recorded, and
-/// whether the model or the handler refuses it.
+/// whether the model or the handler refuses it. The identifiers a request supplies come
+/// from the published profile template, so one naming a question it does not ask, or a
+/// choice the named question does not offer, is a row here too.
 #[tokio::test]
 async fn a_question_update_a_profile_cannot_record_is_refused() {
     // (case, the ProfileQuestions the request carries, whether the handler names the
@@ -484,30 +531,83 @@ async fn a_question_update_a_profile_cannot_record_is_refused() {
     let cases: Vec<(&str, Value, bool)> = vec![
         (
             "update-without-a-question",
-            json!([{ "SelectedChoiceIds": ["priority_cost"] }]),
+            json!([{ "SelectedChoiceIds": [template_choice(0, 0)] }]),
             true,
         ),
         (
             "one-update-without-a-question-among-several",
             json!([
-                { "QuestionId": "priority", "SelectedChoiceIds": ["priority_cost"] },
-                { "SelectedChoiceIds": ["type_batch"] },
+                {
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [template_choice(0, 0)],
+                },
+                { "SelectedChoiceIds": [template_choice(3, 3)] },
             ]),
             true,
         ),
         (
             "the-same-question-twice",
             json!([
-                { "QuestionId": "priority", "SelectedChoiceIds": ["priority_cost"] },
-                { "QuestionId": "priority", "SelectedChoiceIds": ["priority_perf"] },
+                {
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [template_choice(0, 0)],
+                },
+                {
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [template_choice(0, 4)],
+                },
             ]),
+            true,
+        ),
+        // A `QuestionId` the published template does not ask, and a `ChoiceId` the question
+        // it does ask does not offer: both are resolved against that catalog.
+        (
+            "a-question-the-template-does-not-ask",
+            json!([{
+                "QuestionId": "not-a-template-question",
+                "SelectedChoiceIds": [template_choice(0, 0)],
+            }]),
+            true,
+        ),
+        (
+            "a-published-question-id-with-a-suffix",
+            json!([{ "QuestionId": format!("{}-2", template_question(0)) }]),
+            true,
+        ),
+        (
+            "a-question-id-at-the-maximum-length-the-template-does-not-ask",
+            json!([{ "QuestionId": "q".repeat(MAX_QUESTION_ID) }]),
+            true,
+        ),
+        (
+            "a-choice-the-question-does-not-offer",
+            json!([{
+                "QuestionId": template_question(0),
+                "SelectedChoiceIds": ["not-a-choice"],
+            }]),
+            true,
+        ),
+        (
+            "a-choice-of-another-published-question",
+            json!([{
+                "QuestionId": template_question(0),
+                "SelectedChoiceIds": [template_choice(0, 0), template_choice(1, 0)],
+            }]),
+            true,
+        ),
+        (
+            "a-choice-id-at-the-maximum-length-the-question-does-not-offer",
+            json!([{
+                "QuestionId": template_question(0),
+                "SelectedChoiceIds": ["c".repeat(MAX_CHOICE_ID)],
+            }]),
             true,
         ),
         // `QuestionId` is @length(1, 128) and `ChoiceId` @length(1, 64): a value one past
         // either published bound is refused by the boundary walk, before the handler.
         (
             "empty-question-id",
-            json!([{ "QuestionId": "", "SelectedChoiceIds": ["priority_cost"] }]),
+            json!([{ "QuestionId": "", "SelectedChoiceIds": [template_choice(0, 0)] }]),
             false,
         ),
         (
@@ -518,7 +618,7 @@ async fn a_question_update_a_profile_cannot_record_is_refused() {
         (
             "choice-id-past-the-maximum-length",
             json!([{
-                "QuestionId": "priority",
+                "QuestionId": template_question(0),
                 "SelectedChoiceIds": ["c".repeat(MAX_CHOICE_ID + 1)],
             }]),
             false,
@@ -621,46 +721,4 @@ async fn a_profile_arn_and_version_are_resolved_against_the_store() {
             "case {absent_version:?}: the 404 must name the missing resource's type, got {answer:?}"
         );
     }
-}
-
-/// Rule 6: one question past this emulator's published ceiling is refused with the
-/// modelled quota error, and nothing is stored. The accepted boundary — exactly as many
-/// questions as the quota meters — is a row of
-/// [`a_created_profile_round_trips_through_get`].
-#[tokio::test]
-async fn more_questions_than_the_quota_meters_is_a_quota_failure() {
-    let client = Client::new();
-    let mut request = minimal_profile("over-quota-profile", "tok-over-quota");
-    request["ProfileQuestions"] = json!((0..=state::MAX_QUESTIONS_PER_PROFILE)
-        .map(|index| json!({
-            "QuestionId": format!("question-{index:03}"),
-            "SelectedChoiceIds": [format!("choice-{index:03}")],
-        }))
-        .collect::<Vec<Value>>());
-
-    let answer = client.create_profile(request).await;
-    let case = state::MAX_QUESTIONS_PER_PROFILE + 1;
-    assert_eq!(
-        (answer.status, answer.error_code.as_str()),
-        (402, "ServiceQuotaExceededException"),
-        "case {case:?} questions: expected the modelled quota failure, got {answer:?}"
-    );
-    assert_eq!(
-        member(&answer, "ResourceType"),
-        "PROFILE",
-        "case {case:?} questions: the quota failure must name the metered resource, got {answer:?}"
-    );
-    assert_eq!(
-        member(&answer, "ServiceCode"),
-        "wellarchitected",
-        "case {case:?} questions: the quota failure must name this service, got {answer:?}"
-    );
-    assert!(
-        !member(&answer, "QuotaCode").is_empty(),
-        "case {case:?} questions: QuotaCode is @required, got {answer:?}"
-    );
-    assert!(
-        client.store().lock().profiles.is_empty(),
-        "case {case:?} questions: a refused create must store nothing"
-    );
 }

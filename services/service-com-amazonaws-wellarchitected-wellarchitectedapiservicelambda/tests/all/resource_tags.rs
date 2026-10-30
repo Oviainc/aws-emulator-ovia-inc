@@ -38,7 +38,8 @@ use serde_json::{json, Value};
 use super::agent_goals::create_profile as create_agent_profile;
 use super::custom_lens_import::{import, lens_document};
 use super::workload_harness::{
-    encode_path_segment, minimal_create, minimal_template, Answer, Client,
+    encode_path_segment, minimal_create, minimal_template, template_choice, template_question,
+    Answer, Client,
 };
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
@@ -249,8 +250,8 @@ pub(crate) async fn create_tagged(
                 "ProfileName": format!("profile-{slug}"),
                 "ProfileDescription": "a profile under test",
                 "ProfileQuestions": [{
-                    "QuestionId": "priority",
-                    "SelectedChoiceIds": ["priority_cost"],
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [template_choice(0, 0)],
                 }],
                 "ClientRequestToken": format!("tok-pr-{slug}"),
             });

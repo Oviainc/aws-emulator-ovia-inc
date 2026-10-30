@@ -21,11 +21,11 @@
 //!    `UpgradeProfileVersion` re-pins it at the version the profile is now at.
 //! 4. A REQUEST THE PROFILE CANNOT RECORD REVISES NOTHING. An ARN naming no stored profile
 //!    is a `404 ResourceNotFoundException`; a `ProfileQuestions` entry no profile can
-//!    record — one naming no question, or two naming the same question — is a
-//!    `400 ValidationException` naming the member; a value outside a published bound is
-//!    refused by the boundary walk; and a revision that would carry the profile past the
-//!    question ceiling this emulator meters is a `409 ConflictException` naming the
-//!    profile. In every case the stored profile is byte-identical afterwards.
+//!    record — one naming no question, two naming the same question, one naming a question
+//!    the published profile template does not ask, or one selecting a choice that question
+//!    does not offer — is a `400 ValidationException` naming the member; and a value
+//!    outside a published bound is refused by the boundary walk. In every case the stored
+//!    profile is byte-identical afterwards.
 //!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do in
@@ -38,10 +38,11 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::profile_lifecycle::{
-    absent_profile_arn, created, member, minimal_profile, profile_of,
+    absent_profile_arn, created, minimal_profile, profile_of, reported_question,
 };
 use super::workload_harness::{
-    age_profile, assert_not_found, created_id, minimal_create, Client,
+    age_profile, assert_not_found, created_id, minimal_create, template_choice,
+    template_question, Client,
 };
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
@@ -70,11 +71,12 @@ const AGE: Duration = Duration::from_secs(3600);
 type Questions = BTreeMap<String, BTreeSet<String>>;
 
 /// The answers every profile in this suite starts from, so a revision has answers to
-/// replace and answers to leave alone.
+/// replace and answers to leave alone. Both questions are ones the published profile
+/// template asks, and each selection is a choice that question offers.
 fn starting_questions() -> Questions {
     [
-        ("priority", vec!["priority_cost"]),
-        ("workload-type", vec!["type_batch"]),
+        (template_question(0), vec![template_choice(0, 0)]),
+        (template_question(3), vec![template_choice(3, 3)]),
     ]
     .into_iter()
     .map(|(question_id, choices)| {
@@ -86,8 +88,7 @@ fn starting_questions() -> Questions {
     .collect()
 }
 
-/// A question map as the wire carries it: the `ProfileQuestionUpdates` a request sends, and
-/// the `Profile$ProfileQuestions` a read reports, which carry the same two members.
+/// A question map as the wire carries it: the `ProfileQuestionUpdates` a request sends.
 fn questions_json(questions: &Questions) -> Value {
     Value::Array(
         questions
@@ -98,6 +99,17 @@ fn questions_json(questions: &Questions) -> Value {
                     "SelectedChoiceIds": choices.iter().cloned().collect::<Vec<String>>(),
                 })
             })
+            .collect(),
+    )
+}
+
+/// A question map as a READ reports it (`Profile$ProfileQuestions`): the selection stored
+/// for each question, beside the text the published template gives that question.
+fn reported_questions(questions: &Questions) -> Value {
+    Value::Array(
+        questions
+            .iter()
+            .map(|(question_id, choices)| reported_question(question_id, choices.clone()))
             .collect(),
     )
 }
@@ -187,8 +199,14 @@ async fn a_revision_writes_what_it_names_and_leaves_the_rest() {
             "the-answers-already-stored",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "workload-type", "SelectedChoiceIds": ["type_batch"] },
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_cost"] },
+                    {
+                        "QuestionId": template_question(3),
+                        "SelectedChoiceIds": [template_choice(3, 3)],
+                    },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 0)],
+                    },
                 ]
             }),
         ),
@@ -201,23 +219,34 @@ async fn a_revision_writes_what_it_names_and_leaves_the_rest() {
             "one-answer-replaced",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_perf"] },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 4)],
+                    },
                 ]
             }),
         ),
         (
             "an-answer-cleared",
-            json!({ "ProfileQuestions": [{ "QuestionId": "priority", "SelectedChoiceIds": [] }] }),
+            json!({
+                "ProfileQuestions": [{
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [],
+                }]
+            }),
         ),
         (
             "an-answer-without-a-selection",
-            json!({ "ProfileQuestions": [{ "QuestionId": "priority" }] }),
+            json!({ "ProfileQuestions": [{ "QuestionId": template_question(0) }] }),
         ),
         (
             "a-question-not-yet-answered",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "business-objective", "SelectedChoiceIds": ["objective_growth"] },
+                    {
+                        "QuestionId": template_question(1),
+                        "SelectedChoiceIds": [template_choice(1, 3)],
+                    },
                 ]
             }),
         ),
@@ -225,11 +254,14 @@ async fn a_revision_writes_what_it_names_and_leaves_the_rest() {
             "several-questions-at-once",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "workload-type", "SelectedChoiceIds": ["type_stream"] },
-                    { "QuestionId": "business-objective", "SelectedChoiceIds": [] },
                     {
-                        "QuestionId": "priority",
-                        "SelectedChoiceIds": ["priority_rel", "priority_cost"],
+                        "QuestionId": template_question(3),
+                        "SelectedChoiceIds": [template_choice(3, 0)],
+                    },
+                    { "QuestionId": template_question(1), "SelectedChoiceIds": [] },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 1), template_choice(0, 0)],
                     },
                 ]
             }),
@@ -238,9 +270,10 @@ async fn a_revision_writes_what_it_names_and_leaves_the_rest() {
             "choices-out-of-order-and-repeated",
             json!({
                 "ProfileQuestions": [{
-                    "QuestionId": "priority",
+                    "QuestionId": template_question(0),
                     "SelectedChoiceIds": [
-                        "priority_rel", "priority_cost", "priority_rel", "priority_cost",
+                        template_choice(0, 1), template_choice(0, 0),
+                        template_choice(0, 1), template_choice(0, 0),
                     ],
                 }]
             }),
@@ -250,7 +283,10 @@ async fn a_revision_writes_what_it_names_and_leaves_the_rest() {
             json!({
                 "ProfileDescription": "a profile revised in both members",
                 "ProfileQuestions": [
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_sec"] },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 2)],
+                    },
                 ]
             }),
         ),
@@ -263,13 +299,17 @@ async fn a_revision_writes_what_it_names_and_leaves_the_rest() {
             "description-at-the-maximum-length",
             json!({ "ProfileDescription": "d".repeat(MAX_DESCRIPTION) }),
         ),
+        // Every question the published template asks, answered at once: the table it
+        // publishes is what bounds a stored profile's question map.
         (
-            "question-and-choice-ids-at-the-maximum-length",
+            "every-published-question-answered",
             json!({
-                "ProfileQuestions": [{
-                    "QuestionId": "q".repeat(MAX_QUESTION_ID),
-                    "SelectedChoiceIds": ["c".repeat(MAX_CHOICE_ID)],
-                }]
+                "ProfileQuestions": (0..state::PROFILE_TEMPLATE_QUESTIONS.len())
+                    .map(|index| json!({
+                        "QuestionId": template_question(index),
+                        "SelectedChoiceIds": [template_choice(index, 1)],
+                    }))
+                    .collect::<Vec<Value>>()
             }),
         ),
     ];
@@ -321,7 +361,7 @@ async fn a_revision_writes_what_it_names_and_leaves_the_rest() {
             Some(expected_description.as_str()),
             "case {case:?}: expected ProfileDescription {expected_description:?}, got {revised:?}"
         );
-        let expected_reported = questions_json(&expected_questions);
+        let expected_reported = reported_questions(&expected_questions);
         assert_eq!(
             revised.get("ProfileQuestions"),
             Some(&expected_reported),
@@ -377,7 +417,12 @@ async fn successive_revisions_advance_the_count_and_accumulate() {
     let revisions: Vec<(&str, Value)> = vec![
         (
             "first",
-            json!({ "ProfileQuestions": [{ "QuestionId": "priority", "SelectedChoiceIds": ["priority_perf"] }] }),
+            json!({
+                "ProfileQuestions": [{
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [template_choice(0, 4)],
+                }]
+            }),
         ),
         (
             "second",
@@ -389,7 +434,10 @@ async fn successive_revisions_advance_the_count_and_accumulate() {
             "fourth",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "business-objective", "SelectedChoiceIds": ["objective_cost"] },
+                    {
+                        "QuestionId": template_question(1),
+                        "SelectedChoiceIds": [template_choice(1, 0)],
+                    },
                 ]
             }),
         ),
@@ -397,7 +445,10 @@ async fn successive_revisions_advance_the_count_and_accumulate() {
             "fifth",
             json!({
                 "ProfileDescription": "revised a last time",
-                "ProfileQuestions": [{ "QuestionId": "workload-type", "SelectedChoiceIds": [] }],
+                "ProfileQuestions": [{
+                    "QuestionId": template_question(3),
+                    "SelectedChoiceIds": [],
+                }],
             }),
         ),
     ];
@@ -435,7 +486,7 @@ async fn successive_revisions_advance_the_count_and_accumulate() {
             Some(count.to_string().as_str()),
             "case {case:?}: expected the count to stand at {count}, got {revised:?}"
         );
-        let expected_reported = questions_json(&questions);
+        let expected_reported = reported_questions(&questions);
         assert_eq!(
             revised.get("ProfileQuestions"),
             Some(&expected_reported),
@@ -481,7 +532,12 @@ async fn a_revision_moves_the_version_a_read_and_an_upgrade_resolve_at() {
     let answer = client
         .update_profile(
             &arn,
-            json!({ "ProfileQuestions": [{ "QuestionId": "priority", "SelectedChoiceIds": ["priority_ops"] }] }),
+            json!({
+                "ProfileQuestions": [{
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [template_choice(0, 3)],
+                }]
+            }),
         )
         .await;
     assert_eq!(
@@ -551,8 +607,9 @@ async fn a_revision_moves_the_version_a_read_and_an_upgrade_resolve_at() {
 
 /// Rule 4. The rows differ along WHAT the request cannot record and along which layer
 /// refuses it — the boundary's constraint walk for a value outside a published bound, the
-/// handler for an entry no profile can record — and every row asserts the stored profile is
-/// untouched afterwards.
+/// handler for an entry no profile can record, including an identifier the published
+/// profile template does not name — and every row asserts the stored profile is untouched
+/// afterwards.
 #[tokio::test]
 async fn a_revision_a_profile_cannot_record_writes_nothing() {
     // (case, the request body, the expected status and wire error code, whether the
@@ -560,7 +617,7 @@ async fn a_revision_a_profile_cannot_record_writes_nothing() {
     let cases: Vec<(&str, Value, u16, &str, bool)> = vec![
         (
             "an-update-without-a-question",
-            json!({ "ProfileQuestions": [{ "SelectedChoiceIds": ["priority_cost"] }] }),
+            json!({ "ProfileQuestions": [{ "SelectedChoiceIds": [template_choice(0, 0)] }] }),
             400,
             "ValidationException",
             true,
@@ -569,8 +626,11 @@ async fn a_revision_a_profile_cannot_record_writes_nothing() {
             "one-update-without-a-question-among-several",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_perf"] },
-                    { "SelectedChoiceIds": ["type_batch"] },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 4)],
+                    },
+                    { "SelectedChoiceIds": [template_choice(3, 3)] },
                 ]
             }),
             400,
@@ -581,9 +641,72 @@ async fn a_revision_a_profile_cannot_record_writes_nothing() {
             "the-same-question-twice",
             json!({
                 "ProfileQuestions": [
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_cost"] },
-                    { "QuestionId": "priority", "SelectedChoiceIds": ["priority_perf"] },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 0)],
+                    },
+                    {
+                        "QuestionId": template_question(0),
+                        "SelectedChoiceIds": [template_choice(0, 4)],
+                    },
                 ]
+            }),
+            400,
+            "ValidationException",
+            true,
+        ),
+        // An identifier the published template does not name: a question it does not ask,
+        // and a choice the named question does not offer.
+        (
+            "a-question-the-template-does-not-ask",
+            json!({
+                "ProfileQuestions": [{
+                    "QuestionId": "not-a-template-question",
+                    "SelectedChoiceIds": [template_choice(0, 0)],
+                }]
+            }),
+            400,
+            "ValidationException",
+            true,
+        ),
+        (
+            "a-question-id-at-the-maximum-length-the-template-does-not-ask",
+            json!({ "ProfileQuestions": [{ "QuestionId": "q".repeat(MAX_QUESTION_ID) }] }),
+            400,
+            "ValidationException",
+            true,
+        ),
+        (
+            "a-choice-the-question-does-not-offer",
+            json!({
+                "ProfileQuestions": [{
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": ["not-a-choice"],
+                }]
+            }),
+            400,
+            "ValidationException",
+            true,
+        ),
+        (
+            "a-choice-of-another-published-question",
+            json!({
+                "ProfileQuestions": [{
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [template_choice(1, 0)],
+                }]
+            }),
+            400,
+            "ValidationException",
+            true,
+        ),
+        (
+            "a-choice-id-at-the-maximum-length-the-question-does-not-offer",
+            json!({
+                "ProfileQuestions": [{
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": ["c".repeat(MAX_CHOICE_ID)],
+                }]
             }),
             400,
             "ValidationException",
@@ -615,7 +738,7 @@ async fn a_revision_a_profile_cannot_record_writes_nothing() {
             "choice-id-past-the-maximum-length",
             json!({
                 "ProfileQuestions": [{
-                    "QuestionId": "priority",
+                    "QuestionId": template_question(0),
                     "SelectedChoiceIds": ["c".repeat(MAX_CHOICE_ID + 1)],
                 }]
             }),
@@ -688,80 +811,83 @@ async fn a_revision_of_a_profile_that_is_not_stored_is_not_found() {
     );
 }
 
-/// Rule 4, at the question ceiling this emulator meters: a revision that re-answers a
-/// question the profile already holds is accepted at the ceiling, and one that would add a
-/// question past it is refused with the modelled `ConflictException` naming the profile.
+/// Rule 4, at the bound the published template sets: a profile answers each question that
+/// template asks at most once, so a profile answering all of them is as large as a
+/// question map gets, re-answering one of them records no new question, and an entry
+/// naming a question the template does not ask is refused and writes nothing.
 #[tokio::test]
-async fn a_revision_past_the_question_ceiling_is_a_conflict() {
+async fn the_published_template_bounds_a_profiles_question_map() {
     let client = Client::new();
-    // Exactly as many questions as the quota meters — the accepted boundary of
-    // `CreateProfile`, pinned by `super::profile_lifecycle`.
-    let start: Questions = (0..state::MAX_QUESTIONS_PER_PROFILE)
+    let published = state::PROFILE_TEMPLATE_QUESTIONS.len();
+    // Every question the published template asks, answered with a choice it offers.
+    let start: Questions = (0..published)
         .map(|index| {
             (
-                format!("question-{index:03}"),
-                [format!("choice-{index:03}")].into_iter().collect(),
+                template_question(index).to_string(),
+                [template_choice(index, 0).to_string()].into_iter().collect(),
             )
         })
         .collect();
-    let (arn, version) = stored_profile(&client, "ceiling-profile", &start).await;
+    let (arn, version) = stored_profile(&client, "bounded-profile", &start).await;
+    assert_eq!(
+        start.len(),
+        published,
+        "case {published:?} questions: the published table must ask each question once, got {start:?}"
+    );
 
-    // At the ceiling, re-answering a question the profile already holds records no new
-    // question, so it is a revision like any other.
+    // Re-answering a question the profile already holds records no new question, so the
+    // map stays at the published size.
     let accepted = client
         .update_profile(
             &arn,
             json!({
-                "ProfileQuestions": [
-                    { "QuestionId": "question-000", "SelectedChoiceIds": ["choice-999"] },
-                ]
+                "ProfileQuestions": [{
+                    "QuestionId": template_question(0),
+                    "SelectedChoiceIds": [template_choice(0, 1)],
+                }]
             }),
         )
         .await;
     assert_eq!(
         accepted.status, 200,
-        "case {:?} questions: a revision that adds no question must be served at the ceiling, got {accepted:?}",
-        state::MAX_QUESTIONS_PER_PROFILE
+        "case {published:?} questions: a revision that adds no question must be served, got {accepted:?}"
     );
-    let at_ceiling = profile_of(&accepted);
-    let revised_version = next_version(&version, "ceiling");
+    let at_bound = profile_of(&accepted);
+    let revised_version = next_version(&version, "bounded");
     assert_eq!(
-        at_ceiling.get("ProfileVersion").and_then(Value::as_str),
+        at_bound.get("ProfileVersion").and_then(Value::as_str),
         Some(revised_version.as_str()),
-        "case {:?} questions: expected ProfileVersion {revised_version:?}, got {accepted:?}",
-        state::MAX_QUESTIONS_PER_PROFILE
+        "case {published:?} questions: expected ProfileVersion {revised_version:?}, got {accepted:?}"
+    );
+    assert_eq!(
+        at_bound
+            .get("ProfileQuestions")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(published),
+        "case {published:?} questions: the map must stay at the published size, got {at_bound:?}"
     );
 
-    // One question past it: the profile would be too large to record, so nothing is.
+    // A question the template does not ask cannot be added to it.
     let refused = client
         .update_profile(
             &arn,
             json!({
-                "ProfileQuestions": [
-                    { "QuestionId": "one-question-too-many", "SelectedChoiceIds": ["choice-000"] },
-                ]
+                "ProfileQuestions": [{
+                    "QuestionId": "one-question-the-template-never-asks",
+                    "SelectedChoiceIds": [template_choice(0, 0)],
+                }]
             }),
         )
         .await;
-    let case = state::MAX_QUESTIONS_PER_PROFILE + 1;
     assert_eq!(
         (refused.status, refused.error_code.as_str()),
-        (409, "ConflictException"),
-        "case {case:?} questions: expected a 409 ConflictException, got {refused:?}"
+        (400, "ValidationException"),
+        "case {published:?} questions: a question the template does not ask must be refused, got {refused:?}"
     );
     assert_eq!(
-        member(&refused, "ResourceId"),
-        arn,
-        "case {case:?} questions: the conflict must name the profile, got {refused:?}"
-    );
-    assert_eq!(
-        member(&refused, "ResourceType"),
-        "PROFILE",
-        "case {case:?} questions: the conflict must name the resource type, got {refused:?}"
-    );
-    assert_eq!(
-        read_profile(&client, &arn, "ceiling").await,
-        at_ceiling,
-        "case {case:?} questions: a refused revision must leave the stored profile as it was"
+        read_profile(&client, &arn, "bounded").await,
+        at_bound,
+        "case {published:?} questions: a refused revision must leave the stored profile as it was"
     );
 }

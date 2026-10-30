@@ -167,35 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The profile questions" (`CreateProfileInput$ProfileQuestions`) are answers to
         // questions, so each one is recorded UNDER the question it answers: the request's
-        // list becomes the map the profile holds, keyed by `QuestionId`. The normalization,
-        // and the modelled `ValidationException` for an entry no profile can record, live
-        // in `crate::state` (`recorded_profile_questions`), shared with `UpdateProfile`,
-        // which records a profile's answers from the very same member.
+        // list becomes the map the profile holds, keyed by `QuestionId`. Both identifiers
+        // an entry carries are resolved against the ONE profile template this service
+        // publishes, which is where a client discovers them, so a question it does not ask
+        // and a choice it does not offer are refused rather than stored. The
+        // normalization, that resolution and the modelled `ValidationException` for an
+        // entry no profile can record live in `crate::state`
+        // (`recorded_profile_questions`), shared with `UpdateProfile`, which records a
+        // profile's answers from the very same member. The published template is also what
+        // bounds a stored profile's question map: each entry answers a question it asks,
+        // at most once.
         let questions = crate::state::recorded_profile_questions(&input.profile_questions)
             .map_err(CreateProfileErrorModeled::ValidationException)?;
-
-        // How many questions one profile records is a QUOTA this emulator sets, not a
-        // modelled constraint: `ProfileQuestionUpdates` publishes no `@length`, so the
-        // boundary validator does not bound the list. It is answered with the modelled
-        // `ServiceQuotaExceededException` — "The user has reached their resource quota" —
-        // rather than a `ValidationException`, so a caller is not told the model refused a
-        // list the model allows, and it is what keeps a STORED profile's question map
-        // bounded by something other than the request body size.
-        if questions.len() > crate::state::MAX_QUESTIONS_PER_PROFILE {
-            return Err(CreateProfileErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "The quota of {} questions per profile has been reached",
-                        crate::state::MAX_QUESTIONS_PER_PROFILE
-                    ),
-                    resource_id: None,
-                    resource_type: Some(crate::state::PROFILE_RESOURCE_TYPE.to_string()),
-                    quota_code: "QuestionsPerProfile".to_string(),
-                    service_code: crate::state::ARN_NAMESPACE.to_string(),
-                },
-            )
-            .into());
-        }
 
         let tags: std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();

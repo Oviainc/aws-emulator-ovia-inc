@@ -877,16 +877,38 @@ pub(crate) fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
 /// `ProfileQuestions` and `ClientRequestToken` are all `@required`
 /// (`smithy_query(query="operation", operation="CreateProfile")`). The one profile request
 /// builder this crate's suites share.
+///
+/// The answer names a question the published profile template asks and a choice that
+/// question offers, which is what a profile may record: both ids are read off
+/// `state::PROFILE_TEMPLATE_QUESTIONS`, the table `GetProfileTemplate` serves, so this
+/// request stays valid however that table is revised.
 pub(crate) fn minimal_profile(name: &str) -> Value {
     json!({
         "ProfileName": name,
         "ProfileDescription": "a profile under test",
         "ProfileQuestions": [{
-            "QuestionId": "priority",
-            "SelectedChoiceIds": ["priority_cost"],
+            "QuestionId": template_question(0),
+            "SelectedChoiceIds": [template_choice(0, 0)],
         }],
         "ClientRequestToken": format!("tok-{name}"),
     })
+}
+
+/// The `QuestionId` of the question at `index` in the table the profile template publishes
+/// (`state::PROFILE_TEMPLATE_QUESTIONS`, served by `GetProfileTemplate` — the only place a
+/// client discovers one). The index wraps, so a fixture asking for "a fourth question"
+/// gets a published one however many the template asks.
+pub(crate) fn template_question(index: usize) -> &'static str {
+    let published = state::PROFILE_TEMPLATE_QUESTIONS;
+    published[index % published.len()].question_id
+}
+
+/// The `ChoiceId` of the choice at `choice` among those the question
+/// [`template_question`] names at `index` offers. Both indices wrap, for the same reason.
+pub(crate) fn template_choice(index: usize, choice: usize) -> &'static str {
+    let published = state::PROFILE_TEMPLATE_QUESTIONS;
+    let question = &published[index % published.len()];
+    question.choices[choice % question.choices.len()].choice_id
 }
 
 /// A profile minted over HTTP: its `ProfileArn` and the `ProfileVersion` the service put

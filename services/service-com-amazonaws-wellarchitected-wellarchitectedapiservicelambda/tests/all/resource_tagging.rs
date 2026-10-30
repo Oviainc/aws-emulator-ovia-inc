@@ -43,7 +43,10 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use super::workload_harness::{created_id, encode_path_segment, minimal_create, Answer, Client};
+use super::workload_harness::{
+    created_id, encode_path_segment, minimal_create, template_choice, template_question, Answer,
+    Client,
+};
 
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
@@ -222,8 +225,8 @@ async fn resource_arn(client: &Client, kind: Kind, label: &str) -> String {
                         "ProfileName": label,
                         "ProfileDescription": "a profile under test",
                         "ProfileQuestions": [{
-                            "QuestionId": "priority",
-                            "SelectedChoiceIds": ["priority_cost"],
+                            "QuestionId": template_question(0),
+                            "SelectedChoiceIds": [template_choice(0, 0)],
                         }],
                         "ClientRequestToken": format!("{label}-create"),
                     })),
