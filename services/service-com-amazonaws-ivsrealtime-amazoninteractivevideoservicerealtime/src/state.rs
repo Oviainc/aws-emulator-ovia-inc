@@ -606,6 +606,37 @@ pub const PUBLISHING_INGEST_CONFIGURATION_STATE: &str = "ACTIVE";
 /// stage's session.
 pub const NO_ASSOCIATED_STAGE_ARN: &str = "";
 
+// ---------------------------------------------------------------------------
+// The members this service MATERIALISES when the creating request leaves them out
+//
+// Two optional members of a created resource are reported by the recorded responses as
+// the empty string rather than left out: an encoder configuration's `name` and an ingest
+// configuration's `userId`. Each targets a string whose `@length` admits the empty value
+// (`EncoderConfigurationName` is `@length(0..128)`, `UserId` is `@length(0..128)` —
+// `smithy_query(query="shape",shape="EncoderConfigurationName,UserId")`), so the empty
+// string is a value the member can hold rather than a stand-in for absence.
+//
+// So each is materialised ONCE, by the operation that creates the resource, and stored on
+// the record as a `String`. That is what makes every projection of that resource — the
+// create response, the single-resource read, the update response and a listing's summary —
+// report the member: none of them decides whether to carry it, because the record holds a
+// value. It is the same reading [`NO_ACTIVE_SESSION_ID`] and [`NO_ASSOCIATED_STAGE_ARN`]
+// already apply to the two members whose documentation states the empty default outright.
+// ---------------------------------------------------------------------------
+
+/// `name` of an encoder configuration whose creating request named none.
+///
+/// `EncoderConfiguration$name` is "optional name to identify the resource", and a
+/// configuration created without one reports the member as empty rather than omitting it.
+pub const UNNAMED_RESOURCE_NAME: &str = "";
+
+/// `userId` of an ingest configuration whose creating request supplied none.
+///
+/// `IngestConfiguration$userId` is the "customer-assigned name to help identify the
+/// participant using the IngestConfiguration", and a configuration created without one
+/// reports the member as empty rather than omitting it.
+pub const UNNAMED_PARTICIPANT_USER_ID: &str = "";
+
 /// Credentials an ingest configuration carries BESIDE its own `streamKey` when
 /// `redundantIngest` is enabled.
 ///
@@ -1163,7 +1194,10 @@ pub struct IngestConfigurationRecord {
     pub stage_arn: String,
     /// The participant this configuration's publisher appears as in the stage.
     pub participant_id: String,
-    pub user_id: Option<String>,
+    /// The user id the creating request gave, or [`UNNAMED_PARTICIPANT_USER_ID`] when it
+    /// gave none: materialised at creation, so it is a value this record HOLDS rather
+    /// than one each projection decides, and every projection reports it.
+    pub user_id: String,
     pub redundant_ingest: bool,
     /// The backup credentials redundant ingest takes, minted at creation beside the
     /// primary one. Empty unless [`Self::redundant_ingest`] is set; see
@@ -1193,7 +1227,10 @@ impl IngestConfigurationRecord {
             stage_arn: self.stage_arn.clone(),
             participant_id: self.participant_id.clone(),
             state: self.state(store),
-            user_id: self.user_id.clone(),
+            // Always reported, the empty string included: the user id is materialised on
+            // the record ([`Self::user_id`]), so a caller cannot read "no user id" as
+            // "the member is not served".
+            user_id: Some(self.user_id.clone()),
             redundant_ingest: self.redundant_ingest,
             // "present only when `redundantIngest` is set to `true`", as the member's
             // own doc states it: see [`REDUNDANT_INGEST_CREDENTIALS`].
@@ -1234,7 +1271,9 @@ impl IngestConfigurationRecord {
             stage_arn: self.stage_arn.clone(),
             participant_id: self.participant_id.clone(),
             state: self.state(store),
-            user_id: self.user_id.clone(),
+            // The same member of the same record [`Self::to_ingest_configuration`]
+            // reports, so a summary and a read answer alike.
+            user_id: Some(self.user_id.clone()),
             redundant_ingest: self.redundant_ingest,
         }
     }
@@ -1305,7 +1344,10 @@ impl IngestConfigurationRecord {
 pub struct EncoderConfigurationRecord {
     /// The encoder-configuration ARN, and the single key every lookup and delete uses.
     pub arn: String,
-    pub name: Option<String>,
+    /// The name the creating request gave, or [`UNNAMED_RESOURCE_NAME`] when it gave
+    /// none: materialised at creation, so it is a value this record HOLDS rather than one
+    /// each projection decides, and every projection reports it.
+    pub name: String,
     /// The transcoding settings. Not optional: every encoder configuration has them,
     /// with the modelled defaults where the creating request supplied none
     /// ([`effective_video`]).
@@ -1321,7 +1363,10 @@ impl EncoderConfigurationRecord {
     pub fn to_encoder_configuration(&self) -> EncoderConfiguration {
         EncoderConfiguration {
             arn: self.arn.clone(),
-            name: self.name.clone(),
+            // Always reported, the empty string included: the name is materialised on the
+            // record ([`Self::name`]), so a caller reading it back finds a value wherever
+            // the configuration has one.
+            name: Some(self.name.clone()),
             video: Some(self.video.clone()),
             // Always reported, empty map included: `tags` is how a caller reads the tags
             // back, exactly as on a stage.
@@ -1339,7 +1384,9 @@ impl EncoderConfigurationRecord {
     pub fn to_summary(&self) -> EncoderConfigurationSummary {
         EncoderConfigurationSummary {
             arn: self.arn.clone(),
-            name: self.name.clone(),
+            // The same member of the same record [`Self::to_encoder_configuration`]
+            // reports, so a summary and a read answer alike.
+            name: Some(self.name.clone()),
             tags: Some(self.tags.clone()),
         }
     }
@@ -4078,39 +4125,156 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     }
 }
 
-// `CreateIngestConfigurationResponse$accessControlAllowOrigin` and its three siblings are
-// deliberately left UNSET, and no value for them appears below: which web origin may read
-// an answer off this listener is the emulator operator's decision, not this service's, and
-// the framework that owns the listener is what answers it (it reflects an origin the
-// operator allowed and grants no origin otherwise). A service that asserted an origin of
-// its own would hand that grant to every caller of this emulator with nothing to turn it
-// off. The model's `@cors` trait names no origin either
-// (`smithy_query(query="service_info")` reports the trait carrying
-// `additionalAllowedHeaders` and `additionalExposedHeaders` only), so there is no modelled
-// origin to report. The six headers below are restrictions rather than grants, and are
-// this service's to state.
+// The seven CORS and security response headers this model binds as output members are a
+// property of the ENDPOINT, not of the resource any one response reports, and AWS answers
+// every call of this service with the same fixed value for each. They are stated once
+// below, from the recorded responses of the operations whose output shapes bind them, so
+// one answer of this service cannot publish a different policy from another.
+//
+// Two of the seven are BROWSER-FACING in a way the rest are not — the cross-origin read
+// grant, and the content policy that travels with it — so those two are not this
+// service's to assert by default: see [`BrowserPolicy`].
 
-/// Response headers a browser client may read off an answer of this endpoint.
+/// Which web origin may read an answer of this endpoint, and what such an answer may load.
 ///
-/// The model's `@cors` trait lists them as `additionalExposedHeaders`
-/// (`smithy_query(query="service_info")`): `x-amzn-errortype`, `x-amzn-requestid`,
-/// `x-amzn-errormessage`, `x-amzn-trace-id`, `x-amz-apigw-id` and `date` — the trait's own
-/// list, with the one name it repeats stated once. The first three are the three
-/// `crate::service` writes on a failure, so what this header publishes is exactly what the
-/// responses carry.
-pub const ACCESS_CONTROL_EXPOSE_HEADERS: &str = "x-amzn-errortype, x-amzn-requestid, \
-     x-amzn-errormessage, x-amzn-trace-id, x-amz-apigw-id, date";
+/// `CreateIngestConfigurationResponse$accessControlAllowOrigin` and `$contentSecurityPolicy`
+/// bind `@httpHeader("Access-Control-Allow-Origin")` and
+/// `@httpHeader("Content-Security-Policy")`
+/// (`smithy_query(query="shape",shape="CreateIngestConfigurationResponse")`), and the
+/// recorded AWS responses carry the any-origin grant together with a same-origin content
+/// policy. Those two are the pair that decides what a web page served by SOMEONE ELSE'S
+/// origin may do with an answer of this emulator, and this emulator is reached by whoever
+/// can reach its listener — nothing about a request identifies its caller. So the recorded
+/// grant is NOT the default here: by default this service asserts no origin at all, which
+/// leaves the answer unreadable to a cross-origin page, and the content policy allows no
+/// source of any kind, which is right for a JSON answer no browser renders.
+///
+/// An operator who is emulating a browser client, and therefore needs the answers readable
+/// cross-origin the way AWS's are, selects the recorded pair with [`BROWSER_POLICY_VAR`];
+/// selecting it logs a warning naming what it opens. Every other header below is the
+/// recorded value unconditionally: none of them grants anything to any origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserPolicy {
+    /// The origin this endpoint grants a read to, or `None` to grant none — in which case
+    /// the modelled member is left absent and no such header is written.
+    pub allow_origin: Option<&'static str>,
+    /// What an answer of this endpoint may load.
+    pub content_security_policy: &'static str,
+}
 
-/// How long an answer of this endpoint may be reused: not at all.
+impl BrowserPolicy {
+    /// The default: no cross-origin read granted, and an answer that may load nothing.
+    #[must_use]
+    pub const fn confined() -> Self {
+        Self {
+            allow_origin: None,
+            content_security_policy: CONFINED_CONTENT_SECURITY_POLICY,
+        }
+    }
+
+    /// The pair the recorded AWS responses carry: the any-origin read grant, and a
+    /// same-origin content policy whose subresource references are upgraded to HTTPS
+    /// before they are fetched.
+    #[must_use]
+    pub const fn recorded() -> Self {
+        Self {
+            allow_origin: Some(RECORDED_ACCESS_CONTROL_ALLOW_ORIGIN),
+            content_security_policy: RECORDED_CONTENT_SECURITY_POLICY,
+        }
+    }
+}
+
+/// The variable an operator selects the recorded browser-facing pair with.
+///
+/// Read ONCE per process ([`browser_policy`]). Absent — the default — is
+/// [`BrowserPolicy::confined`].
+pub const BROWSER_POLICY_VAR: &str = "EMULATOR_IVSREALTIME_RECORDED_BROWSER_POLICY";
+
+/// The settings of [`BROWSER_POLICY_VAR`] that select [`BrowserPolicy::recorded`], compared
+/// case-insensitively after trimming. Anything else — including an unset variable and an
+/// empty one — keeps the confined default, so the widening happens only where it was asked
+/// for in as many words.
+pub const BROWSER_POLICY_ENABLED_SETTINGS: [&str; 3] = ["1", "true", "yes"];
+
+/// The policy `setting` selects: [`BrowserPolicy::recorded`] only for a setting
+/// [`BROWSER_POLICY_ENABLED_SETTINGS`] names, [`BrowserPolicy::confined`] for every other
+/// setting and for no setting at all.
+#[must_use]
+pub fn browser_policy_from_setting(setting: Option<&str>) -> BrowserPolicy {
+    let selected = setting.is_some_and(|value| {
+        let value = value.trim();
+        BROWSER_POLICY_ENABLED_SETTINGS
+            .iter()
+            .any(|enabled| value.eq_ignore_ascii_case(enabled))
+    });
+    if selected {
+        BrowserPolicy::recorded()
+    } else {
+        BrowserPolicy::confined()
+    }
+}
+
+/// The policy this process answers with, from [`BROWSER_POLICY_VAR`].
+///
+/// Read once, so every answer of one run publishes the same policy, and the warning the
+/// widening owes is logged once rather than per response.
+pub fn browser_policy() -> BrowserPolicy {
+    static POLICY: LazyLock<BrowserPolicy> = LazyLock::new(|| {
+        let policy = browser_policy_from_setting(std::env::var(BROWSER_POLICY_VAR).ok().as_deref());
+        if policy.allow_origin.is_some() {
+            tracing::warn!(
+                setting = BROWSER_POLICY_VAR,
+                "ivs-realtime answers are now readable by ANY web origin: a page served by \
+                 any site the developer's browser visits can read this emulator's responses, \
+                 including the ingest keys an ingest configuration reports. Unset the \
+                 variable to grant no origin."
+            );
+        }
+        policy
+    });
+
+    *POLICY
+}
+
+/// Response headers a browser client may read off an answer of this endpoint, where a
+/// cross-origin read is granted at all.
+///
+/// The service's own fixed list, as the recorded responses state it: every header its
+/// answers carry — the two CORS headers, the five caching and security policies, the two
+/// content headers, and the six the model's `@cors` trait also names in
+/// `additionalExposedHeaders` (`smithy_query(query="service_info")`: `x-amzn-errortype`,
+/// `x-amzn-requestid`, `x-amzn-errormessage`, `x-amzn-trace-id`, `x-amz-apigw-id` and
+/// `date`). Stated in the order and spelling the recorded responses use, since the value a
+/// client reads is the header's text. It names which headers are readable once a grant
+/// exists and grants nothing itself, so it is the recorded value whatever
+/// [`browser_policy`] answers.
+pub const ACCESS_CONTROL_EXPOSE_HEADERS: &str = "Access-Control-Allow-Origin,\
+     Access-Control-Expose-Headers,Cache-Control,Content-Length,Content-Security-Policy,\
+     Content-Type,date,Strict-Transport-Security,x-amz-apigw-id,x-amzn-errormessage,\
+     x-amzn-errortype,x-amzn-requestid,x-amzn-trace-id,X-Content-Type-Options,\
+     X-Frame-Options";
+
+/// How long an answer of this endpoint may be reused: not at all, by either directive the
+/// recorded responses state — no store of it, and no cached copy served without
+/// revalidation.
 ///
 /// Every operation of this service reports state a later call can change — a stage's
 /// `activeSessionId`, an ingest configuration's `state` — so no answer is a representation
 /// a client or a proxy may serve again.
-pub const CACHE_CONTROL: &str = "no-store";
+pub const CACHE_CONTROL: &str = "no-store, no-cache";
 
-/// What an answer of this endpoint may load: nothing. The answer is a JSON document, never
-/// one a browser renders, so no source of any kind is allowed.
-pub const CONTENT_SECURITY_POLICY: &str = "default-src 'none'";
+/// The cross-origin read grant the recorded responses carry; served only where
+/// [`BrowserPolicy::recorded`] is selected.
+pub const RECORDED_ACCESS_CONTROL_ALLOW_ORIGIN: &str = "*";
+
+/// What an answer may load under [`BrowserPolicy::recorded`]: the policy the recorded
+/// responses state — same-origin sources only, and any subresource reference upgraded to
+/// HTTPS before it is fetched.
+pub const RECORDED_CONTENT_SECURITY_POLICY: &str = "default-src 'self'; upgrade-insecure-requests;";
+
+/// What an answer may load under [`BrowserPolicy::confined`]: nothing. The answer is a JSON
+/// document, never one a browser renders, so no source of any kind is allowed.
+pub const CONFINED_CONTENT_SECURITY_POLICY: &str = "default-src 'none'";
 
 /// How long a client holds this endpoint to TLS, stated as the header's `max-age` in
 /// seconds and applied to its subdomains too. The span is this emulator's own choice; what
@@ -4126,8 +4290,9 @@ pub const X_CONTENT_TYPE_OPTIONS: &str = "nosniff";
 /// `DENY` and `SAMEORIGIN`, and an API answer belongs in no frame at all.
 pub const X_FRAME_OPTIONS: &str = "DENY";
 
-/// The six headers above, each paired with the name the model's `@httpHeader` trait gives
-/// it.
+/// The headers above, each paired with the name the model's `@httpHeader` trait gives it:
+/// the five every answer carries, plus the cross-origin grant where [`browser_policy`]
+/// selects one.
 ///
 /// A SUCCESS does not go through this table: there they are modelled output members
 /// ([`ResponseHeaderPolicy`]), so the protocol serializer writes each under the name its
@@ -4136,17 +4301,28 @@ pub const X_FRAME_OPTIONS: &str = "DENY";
 /// `crate::scaffolded::STATED_ERROR_SCHEMA` describes rather than the modelled error
 /// shape, though the same members are on each of those shapes too — so `crate::service`
 /// writes them onto the response itself, at the one place every response passes through.
-pub const RESPONSE_HEADER_POLICY: [(&str, &str); 6] = [
-    (
-        "Access-Control-Expose-Headers",
-        ACCESS_CONTROL_EXPOSE_HEADERS,
-    ),
-    ("Cache-Control", CACHE_CONTROL),
-    ("Content-Security-Policy", CONTENT_SECURITY_POLICY),
-    ("Strict-Transport-Security", STRICT_TRANSPORT_SECURITY),
-    ("X-Content-Type-Options", X_CONTENT_TYPE_OPTIONS),
-    ("X-Frame-Options", X_FRAME_OPTIONS),
-];
+/// The set is the SAME one a success carries, so the policy a client reads off this
+/// endpoint does not depend on whether the call succeeded.
+#[must_use]
+pub fn response_header_policy() -> Vec<(&'static str, &'static str)> {
+    let browser = browser_policy();
+    let mut policy = Vec::with_capacity(7);
+    if let Some(origin) = browser.allow_origin {
+        policy.push(("Access-Control-Allow-Origin", origin));
+    }
+    policy.extend([
+        (
+            "Access-Control-Expose-Headers",
+            ACCESS_CONTROL_EXPOSE_HEADERS,
+        ),
+        ("Cache-Control", CACHE_CONTROL),
+        ("Content-Security-Policy", browser.content_security_policy),
+        ("Strict-Transport-Security", STRICT_TRANSPORT_SECURITY),
+        ("X-Content-Type-Options", X_CONTENT_TYPE_OPTIONS),
+        ("X-Frame-Options", X_FRAME_OPTIONS),
+    ]);
+    policy
+}
 
 /// An output shape of this service that binds the CORS and security response headers.
 ///
@@ -4157,10 +4333,10 @@ pub const RESPONSE_HEADER_POLICY: [(&str, &str); 6] = [
 /// values are a property of the ENDPOINT rather than of the resource any one of them
 /// reports, so they are filled in here, in one place, instead of in each handler.
 pub trait ResponseHeaderPolicy {
-    /// This output with each restriction member the shape binds carrying the endpoint's
-    /// value for it, so the protocol serializer writes all six on the response. The
-    /// cross-origin grant member is left absent; see the note above
-    /// [`ACCESS_CONTROL_EXPOSE_HEADERS`].
+    /// This output with each member the shape binds carrying the endpoint's value for it,
+    /// so the protocol serializer writes them on the response. The cross-origin grant is
+    /// the one member that may be left absent — [`browser_policy`] decides, and an absent
+    /// member writes no header, which grants no origin.
     #[must_use]
     fn with_response_header_policy(self) -> Self;
 }
@@ -4171,10 +4347,14 @@ macro_rules! impl_response_header_policy {
     ($($output:ty),+ $(,)?) => {
         $(impl ResponseHeaderPolicy for $output {
             fn with_response_header_policy(mut self) -> Self {
+                let browser = browser_policy();
+                self.access_control_allow_origin =
+                    browser.allow_origin.map(::std::string::ToString::to_string);
                 self.access_control_expose_headers =
                     Some(ACCESS_CONTROL_EXPOSE_HEADERS.to_string());
                 self.cache_control = Some(CACHE_CONTROL.to_string());
-                self.content_security_policy = Some(CONTENT_SECURITY_POLICY.to_string());
+                self.content_security_policy =
+                    Some(browser.content_security_policy.to_string());
                 self.strict_transport_security = Some(STRICT_TRANSPORT_SECURITY.to_string());
                 self.x_content_type_options = Some(X_CONTENT_TYPE_OPTIONS.to_string());
                 self.x_frame_options = Some(X_FRAME_OPTIONS.to_string());
@@ -4186,7 +4366,7 @@ macro_rules! impl_response_header_policy {
 
 // The still-scaffolded operation of the four is implemented here as well: the policy is
 // the shape's, not the handler's, so implementing that operation is a call to this trait
-// rather than six more assignments.
+// rather than seven more assignments.
 impl_response_header_policy!(
     CreateIngestConfigurationOutput,
     StartParticipantReplicationOutput,
@@ -4540,7 +4720,11 @@ pub fn stage_participant(
             // An ingest configuration is a publisher's credential: it carries the ingest
             // key a broadcast is published with, so its participant publishes.
             publishes: true,
-            user_id: configuration.user_id.clone(),
+            // The user id this credential was created WITH, or none when it was created
+            // without one: the configuration materialises that member as the empty string
+            // for its own projections ([`UNNAMED_PARTICIPANT_USER_ID`]), and a participant
+            // carries a user id only where one was really named.
+            user_id: (!configuration.user_id.is_empty()).then(|| configuration.user_id.clone()),
             attributes: configuration.attributes.clone(),
         })
 }

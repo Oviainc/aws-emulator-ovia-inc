@@ -21,6 +21,11 @@
 #[macro_use]
 pub mod date_time_wire;
 
+// The output-side rendering of a `float` member, because the vendored JSON writer
+// renders one from a widened double. Hand-added, not generated; see the module's own
+// note.
+pub mod float_wire;
+
 pub mod create_encoder_configuration_types;
 pub mod create_ingest_configuration_types;
 pub mod create_participant_token_types;
@@ -62,6 +67,8 @@ pub mod untag_resource_types;
 pub mod update_ingest_configuration_types;
 pub mod update_stage_types;
 
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use float_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_encoder_configuration_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

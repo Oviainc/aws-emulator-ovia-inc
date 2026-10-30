@@ -321,7 +321,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // another stage by `UpdateIngestConfiguration`.
             stage_arn,
             participant_id: primary.participant_id,
-            user_id: input.user_id,
+            // The user id the request gave, or the empty string it left out
+            // (`crate::state::UNNAMED_PARTICIPANT_USER_ID`): the member is materialised
+            // once, here, so every projection of this configuration reports it.
+            user_id: input
+                .user_id
+                .unwrap_or_else(|| crate::state::UNNAMED_PARTICIPANT_USER_ID.to_string()),
             redundant_ingest: input.redundant_ingest,
             redundant_ingest_credentials,
             attributes,

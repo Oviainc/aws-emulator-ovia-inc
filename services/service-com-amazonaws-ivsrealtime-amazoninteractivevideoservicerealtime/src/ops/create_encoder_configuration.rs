@@ -142,7 +142,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for CreateEncoderConfiguration<Eng>
 {
     type Input = CreateEncoderConfigurationInput;
-    type Output = CreateEncoderConfigurationOutput;
+    // The modelled output, served through the wrapper that renders its `video.framerate`
+    // from the binary32 value the configuration holds (`super::types::float_wire`): the
+    // decimal the request configured is the decimal the response reports.
+    type Output = ReportedFloats<CreateEncoderConfigurationOutput>;
     type Error = CreateEncoderConfigurationError;
 
     const NAME: &'static str = "CreateEncoderConfiguration";
@@ -240,7 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = crate::state::EncoderConfigurationRecord {
             arn: arn.clone(),
-            name: input.name,
+            // The name the request gave, or the empty string it left out
+            // (`crate::state::UNNAMED_RESOURCE_NAME`): the member is materialised once,
+            // here, so every projection of this configuration reports it.
+            name: input
+                .name
+                .unwrap_or_else(|| crate::state::UNNAMED_RESOURCE_NAME.to_string()),
             video,
             tags,
             sequence,
@@ -249,9 +257,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let encoder_configuration = record.to_encoder_configuration();
         store.encoder_configurations.insert(arn, record);
 
-        Ok(CreateEncoderConfigurationOutput {
+        Ok(ReportedFloats(CreateEncoderConfigurationOutput {
             encoder_configuration: Some(encoder_configuration),
-        })
+        }))
     }
 }
 

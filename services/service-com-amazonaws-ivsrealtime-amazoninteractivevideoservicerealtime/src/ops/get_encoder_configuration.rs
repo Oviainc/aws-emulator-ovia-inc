@@ -130,7 +130,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetEncoderConfiguration<Eng>
 {
     type Input = GetEncoderConfigurationInput;
-    type Output = GetEncoderConfigurationOutput;
+    // The modelled output, served through the wrapper that renders its `video.framerate`
+    // from the binary32 value the configuration holds (`super::types::float_wire`), so a
+    // read reports the decimal the create reported.
+    type Output = ReportedFloats<GetEncoderConfigurationOutput>;
     type Error = GetEncoderConfigurationError;
 
     const NAME: &'static str = "GetEncoderConfiguration";
@@ -163,8 +166,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.arn,
                 )
             })?;
-        Ok(GetEncoderConfigurationOutput {
+        Ok(ReportedFloats(GetEncoderConfigurationOutput {
             encoder_configuration: Some(record.to_encoder_configuration()),
-        })
+        }))
     }
 }

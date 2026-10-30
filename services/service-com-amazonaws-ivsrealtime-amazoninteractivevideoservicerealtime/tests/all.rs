@@ -59,6 +59,8 @@ mod encoder_configuration_in_use;
 mod encoder_configurations;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
+#[path = "all/float_members_wire_form.rs"]
+mod float_members_wire_form;
 #[path = "all/foreign_page_token_wording.rs"]
 mod foreign_page_token_wording;
 #[path = "all/get_composition.rs"]
@@ -83,6 +85,8 @@ mod list_ingest_configurations;
 mod list_participant_replicas_paging;
 #[path = "all/list_participant_replicas_token_publisher_scope.rs"]
 mod list_participant_replicas_token_publisher_scope;
+#[path = "all/materialised_member_defaults.rs"]
+mod materialised_member_defaults;
 #[path = "all/minted_identities.rs"]
 mod minted_identities;
 #[path = "all/page_token_filter_scope.rs"]

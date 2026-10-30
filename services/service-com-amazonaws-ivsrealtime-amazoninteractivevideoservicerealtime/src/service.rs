@@ -61,9 +61,11 @@
 //! (`crate::state::ResponseHeaderPolicy`) and the protocol serializer writes them from the
 //! model's own `@httpHeader` traits; a failure is rendered as the one-member body
 //! `crate::scaffolded` describes, whose members the serializer never sees, so the headers
-//! are written onto the refusal here instead. The cross-origin GRANT is not among them: no
-//! response of this service names an allowed origin, which is the listener's own policy to
-//! decide.
+//! are written onto the refusal here instead. The set is the same one a success carries, so
+//! the policy a client reads off this endpoint does not depend on the outcome of the call —
+//! including the cross-origin read grant, which this service asserts on NO response unless
+//! the operator selected the recorded browser-facing policy
+//! (`crate::state::BrowserPolicy`).
 //!
 //! # How this service words a refusal
 //!
@@ -333,9 +335,8 @@ fn with_response_envelope(mut resp: RtResponse) -> RtResponse {
         // found present here; a FAILURE renders the one-member body `crate::scaffolded`
         // describes rather than the modelled error shape, so its members never reach the
         // serializer and the headers are written onto the response here, by the same
-        // `crate::state` policy the outputs report. The cross-origin grant is in neither
-        // place: see the note beside that policy.
-        for (name, value) in crate::state::RESPONSE_HEADER_POLICY {
+        // `crate::state` policy the outputs report.
+        for (name, value) in crate::state::response_header_policy() {
             if resp.headers().get(name).is_none() {
                 let _ = resp.headers_mut().try_insert(name, value);
             }
