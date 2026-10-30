@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelInstanceRefresh
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelInstanceRefresh`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelInstanceRefresh::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the instance refresh a group has in progress: the refresh is reported
+//! `Cancelling` and the clock brings it to `Cancelled`, and the answer carries the id
+//! of the refresh the cancellation acted on. A cancellation starts no further
+//! replacement and rolls none back, so the progress the refresh had already made
+//! stands; a group with no refresh in progress has nothing to cancel.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelInstanceRefresh` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelInstanceRefreshErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelInstanceRefresh"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CancelInstanceRefreshErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name;
+        // "When cancelling an instance refresh, this indicates whether to wait for
+        // in-flight launches and terminations to complete. The default is true"
+        // (smithy_query(query="doc",shape="CancelInstanceRefreshType",
+        // member="WaitForTransitioningInstances")).
+        let wait_for_transitioning_instances =
+            input.wait_for_transitioning_instances.unwrap_or(true);
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        if !state.groups.contains_key(&name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message(&name),
+            ));
+        }
+
+        // "If an instance refresh or rollback is not in progress, an
+        // ActiveInstanceRefreshNotFound error occurs"
+        // (smithy_query(query="operation",operation="CancelInstanceRefresh")).
+        let Some(instance_refresh_id) =
+            state.cancel_instance_refresh(&name, wait_for_transitioning_instances, now)
+        else {
+            return Err(
+                CancelInstanceRefreshErrorModeled::ActiveInstanceRefreshNotFoundFault(
+                    ActiveInstanceRefreshNotFoundFault {
+                        message: Some(no_active_refresh_message(&name)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        crate::state::audit(
+            ctx.parts(),
+            "CancelInstanceRefresh",
+            &name,
+            "instance refresh cancelled",
+        );
+        Ok(CancelInstanceRefreshOutput {
+            instance_refresh_id: Some(instance_refresh_id),
+        })
     }
+}
+
+/// The sentence Amazon EC2 Auto Scaling refuses a cancellation of a group with no
+/// instance refresh in progress with: the error class names the group that was asked
+/// for, which is the request's own.
+fn no_active_refresh_message(group_name: &str) -> String {
+    format!("No active Instance Refresh found for Auto Scaling group {group_name}")
 }

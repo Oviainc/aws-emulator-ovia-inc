@@ -22,7 +22,9 @@
 //!   cooldown to elapse before it is applied (`HonorCooldown`);
 //! * a running instance refresh replaces one instance of its group per
 //!   [`INSTANCE_REFRESH_REPLACEMENT`] and succeeds once it has replaced them all
-//!   ([`StoredInstanceRefresh`]).
+//!   ([`StoredInstanceRefresh`]);
+//! * a refresh a caller cancelled is reported `Cancelling` and becomes `Cancelled`
+//!   ([`INSTANCE_REFRESH_CANCELLATION`]).
 //!
 //! # The instances a group holds
 //!
@@ -110,6 +112,14 @@ pub const HEALTH_STATUS_HEALTHY: &str = "Healthy";
 /// reads it straight after starting it still see it running.
 pub const INSTANCE_REFRESH_REPLACEMENT: Duration = LIFECYCLE_TRANSITION;
 
+/// How long the cancellation of an instance refresh takes to come due.
+///
+/// A cancelled refresh is reported `Cancelling` before it is reported `Cancelled`, so
+/// a caller that reads it straight after cancelling it still sees the transient
+/// status. The span is this service's own transient span ([`LIFECYCLE_TRANSITION`]):
+/// chosen, not documented, and never slept for.
+pub const INSTANCE_REFRESH_CANCELLATION: Duration = LIFECYCLE_TRANSITION;
+
 // The `InstanceRefreshStatus` values this slice moves an instance refresh through,
 // spelled exactly as the model's `com.amazonaws.autoscaling#InstanceRefreshStatus`
 // enum does (smithy_query(query="shape",shape="InstanceRefreshStatus")).
@@ -121,6 +131,10 @@ pub const REFRESH_IN_PROGRESS: &str = "InProgress";
 pub const REFRESH_SUCCESSFUL: &str = "Successful";
 /// A refresh that could not finish.
 pub const REFRESH_FAILED: &str = "Failed";
+/// A refresh whose cancellation has been asked for and has not completed.
+pub const REFRESH_CANCELLING: &str = "Cancelling";
+/// A refresh whose cancellation has completed.
+pub const REFRESH_CANCELLED: &str = "Cancelled";
 
 /// `Strategy` when a `StartInstanceRefresh` request omits it.
 ///
@@ -392,9 +406,16 @@ pub struct StoredInstanceRefresh {
 }
 
 impl StoredInstanceRefresh {
-    /// Whether this refresh is still running, which is what makes it the group's
-    /// ACTIVE refresh: a group may have only one at a time.
+    /// Whether this refresh has not reached a terminal status, which is what makes it
+    /// the group's ACTIVE refresh: a group may have only one at a time, and one whose
+    /// cancellation has not completed still holds its group.
     pub fn is_active(&self) -> bool {
+        self.is_in_progress() || self.status == REFRESH_CANCELLING
+    }
+
+    /// Whether this refresh is IN PROGRESS: the statuses that mean it is still
+    /// replacing instances, which is what a cancellation acts on.
+    pub fn is_in_progress(&self) -> bool {
         self.status == REFRESH_PENDING || self.status == REFRESH_IN_PROGRESS
     }
 }
@@ -473,6 +494,47 @@ impl AutoScalingState {
         self.instance_refreshes
             .iter()
             .find(|refresh| refresh.auto_scaling_group_name == group_name && refresh.is_active())
+    }
+
+    /// Cancel the group's in-progress instance refresh at `now`, answering the id of
+    /// the refresh the cancellation acted on, or `None` when the group has none in
+    /// progress.
+    ///
+    /// A cancellation starts no further replacement and rolls none back, so the
+    /// progress the refresh had already made stands: it moves to `Cancelling` and the
+    /// clock brings it to `Cancelled` ([`INSTANCE_REFRESH_CANCELLATION`]). With
+    /// `wait_for_transitioning_instances`, that is owed only once the group's in-flight
+    /// launches and terminations have themselves settled; without it, the cancellation
+    /// does not wait for them.
+    pub fn cancel_instance_refresh(
+        &mut self,
+        group_name: &str,
+        wait_for_transitioning_instances: bool,
+        now: SystemTime,
+    ) -> Option<String> {
+        // The in-flight launches and terminations of the group: the instances whose
+        // transient lifecycle state has not come due yet.
+        let in_flight_settled = if wait_for_transitioning_instances {
+            self.groups
+                .get(group_name)
+                .into_iter()
+                .flat_map(|group| group.instances.iter())
+                .filter_map(|instance| instance.transition_due)
+                .chain([now])
+                .max()
+                .unwrap_or(now)
+        } else {
+            now
+        };
+        let refresh = self
+            .instance_refreshes
+            .iter_mut()
+            .find(|refresh| {
+                refresh.auto_scaling_group_name == group_name && refresh.is_in_progress()
+            })?;
+        refresh.status = REFRESH_CANCELLING.to_string();
+        refresh.next_step_due = Some(in_flight_settled + INSTANCE_REFRESH_CANCELLATION);
+        Some(refresh.instance_refresh_id.clone())
     }
 
     /// Append a scaling activity that finishes at `completes_at`.
@@ -916,8 +978,9 @@ impl AutoScalingState {
         }
     }
 
-    /// Retire the one step the refresh at `index` owes at `due`: replace its next
-    /// instance, or — with none left to replace — finish it.
+    /// Retire the one step the refresh at `index` owes at `due`: complete its
+    /// cancellation, replace its next instance, or — with none left to replace —
+    /// finish it.
     fn advance_one_instance_refresh<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
@@ -931,6 +994,20 @@ impl AutoScalingState {
         let instance_refresh_id = refresh.instance_refresh_id.clone();
         let desired_configuration = refresh.desired_configuration.clone();
         let next_instance_id = refresh.pending_instance_ids.first().cloned();
+        let cancelling = refresh.status == REFRESH_CANCELLING;
+
+        // A cancellation replaces nothing further and rolls nothing back, so the only
+        // step a refresh being cancelled owes is the end of that cancellation — which
+        // leaves the progress its replacements made, and the instances it never got to,
+        // exactly as they stood.
+        if cancelling {
+            if let Some(refresh) = self.instance_refreshes.get_mut(index) {
+                refresh.status = REFRESH_CANCELLED.to_string();
+                refresh.end_time = Some(due);
+                refresh.next_step_due = None;
+            }
+            return;
+        }
 
         // A refresh whose group is gone has no instances left to replace and cannot
         // finish: the group it was started for no longer exists.
