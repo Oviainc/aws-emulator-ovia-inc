@@ -1311,19 +1311,52 @@ pub fn requested_evaluation_type(
     }
 }
 
+/// The member path a refusal about the period-based SLI config names, spelled the way the
+/// boundary validator spells a member path for this service ([`START_TIME_MEMBER_PATH`]):
+/// lower camel case, as the refusal of a modelled constraint on a member of the same
+/// operation spells it.
+const SLI_CONFIG_MEMBER_PATH: &str = "sliConfig";
+
+/// [`SLI_CONFIG_MEMBER_PATH`], for the member that carries the request-based config.
+const REQUEST_BASED_SLI_CONFIG_MEMBER_PATH: &str = "requestBasedSliConfig";
+
+/// The member an SLI config of `evaluation_kind` travels in: the two kinds and the two
+/// members are one correspondence — [`requested_evaluation_type`] reads the kind off exactly
+/// this member — so a refusal about a kind names the member a request of that kind carried.
+fn sli_config_member_path(evaluation_kind: &str) -> &'static str {
+    if evaluation_kind == EVALUATION_TYPE_REQUEST_BASED {
+        REQUEST_BASED_SLI_CONFIG_MEMBER_PATH
+    } else {
+        SLI_CONFIG_MEMBER_PATH
+    }
+}
+
 /// The refusal for a request that names BOTH mutually exclusive SLI configs, or `None`
 /// when it names at most one.
 ///
 /// Documented on both members — "You can't specify both RequestBasedSliConfig and SliConfig
 /// in the same operation" — and inexpressible in the model, so the boundary validator admits
 /// the pair and every operation that accepts it refuses here, through one wording.
+///
+/// Worded through the service's one constraint-violation builder ([`constraint_clause`],
+/// under [`validation_envelope`]), like every other constraint this crate enforces in a
+/// handler: the clause names the member the request must DROP and the sibling whose presence
+/// forbids it, so the member at fault reaches a client exactly as it does from a modelled
+/// constraint refused at the boundary. The pair is symmetric, and the member named is the one
+/// the input shapes declare SECOND (`smithy_query(query="operation",
+/// operation="CreateServiceLevelObjective")`: `SliConfig`, then `RequestBasedSliConfig`) —
+/// the same tie-break the inverted-window refusal makes by naming the member that CLOSES a
+/// pair ([`status_event_window`]).
 pub fn exclusive_sli_configs_refusal(
     sli_config: Option<&ServiceLevelIndicatorConfig>,
     request_based_sli_config: Option<&RequestBasedServiceLevelIndicatorConfig>,
-) -> Option<&'static str> {
-    (sli_config.is_some() && request_based_sli_config.is_some()).then_some(
-        "You can't specify both RequestBasedSliConfig and SliConfig in the same operation.",
-    )
+) -> Option<String> {
+    (sli_config.is_some() && request_based_sli_config.is_some()).then(|| {
+        validation_envelope(&[constraint_clause(
+            REQUEST_BASED_SLI_CONFIG_MEMBER_PATH,
+            &format!("Member must be null when {SLI_CONFIG_MEMBER_PATH} is provided"),
+        )])
+    })
 }
 
 /// The refusal for a request that must DEFINE an SLO's indicator and names neither config,
@@ -1335,13 +1368,27 @@ pub fn exclusive_sli_configs_refusal(
 /// a request-based SLO", a classification [`requested_evaluation_type`] can only read off
 /// one of the two configs. So a definition that names neither describes no indicator, no
 /// evaluation kind and no metric source, and is refused instead of stored.
+///
+/// Worded through the same builder as the exclusion above, in the form a conditionally
+/// required member is stated in ([`paired_member_refusal`]): the clause names the member the
+/// request must ADD and the condition that requires it — the absence of the sibling that
+/// would have defined the indicator instead — so the requirement the clause states is
+/// satisfied by either member while the client is still told a member it can fix.
 pub fn absent_sli_config_refusal(
     sli_config: Option<&ServiceLevelIndicatorConfig>,
     request_based_sli_config: Option<&RequestBasedServiceLevelIndicatorConfig>,
-) -> Option<&'static str> {
+) -> Option<String> {
     requested_evaluation_type(sli_config, request_based_sli_config)
         .is_none()
-        .then_some("You must specify either SliConfig or RequestBasedSliConfig.")
+        .then(|| {
+            validation_envelope(&[constraint_clause(
+                SLI_CONFIG_MEMBER_PATH,
+                &format!(
+                    "Member must not be null when {REQUEST_BASED_SLI_CONFIG_MEMBER_PATH} is \
+                     not provided"
+                ),
+            )])
+        })
 }
 
 /// The `EvaluationType` a STORED SLO is of, or `None` when the record carries no indicator
@@ -1361,6 +1408,35 @@ pub fn stored_evaluation_type(slo: &ServiceLevelObjective) -> Option<&'static st
         _ if slo.request_based_sli.is_some() => Some(EVALUATION_TYPE_REQUEST_BASED),
         _ => None,
     }
+}
+
+/// The refusal a request that would change a STORED SLO's evaluation kind earns, or `None`
+/// when the two kinds agree, when the request names no config, or when the record carries no
+/// kind for a config to disagree with.
+///
+/// An SLO's evaluation kind is settled when it is created:
+/// `UpdateServiceLevelObjective`'s doc states "You cannot change from a period-based SLO to a
+/// request-based SLO, or change from a request-based SLO to a period-based SLO", so a config
+/// of the other kind than the record's own is refused rather than written. A DIFFERENT rule
+/// from [`exclusive_sli_configs_refusal`]: that one is about one request naming two configs,
+/// this one about a request whose single config does not belong to the stored resource's kind.
+///
+/// Worded through the service's one constraint-violation builder, like every other constraint
+/// this crate enforces in a handler: the clause names the member the request must drop — the
+/// config member the REQUESTED kind travels in ([`sli_config_member_path`]), which is the one
+/// the request actually sent — and states the stored kind that admits no such member, the way
+/// a member inadmissible for the value of a sibling is stated ([`requested_expiry`]).
+pub fn evaluation_kind_change_refusal(
+    stored_kind: Option<&str>,
+    requested_kind: Option<&str>,
+) -> Option<String> {
+    let (stored, requested) = (stored_kind?, requested_kind?);
+    (stored != requested).then(|| {
+        validation_envelope(&[constraint_clause(
+            sli_config_member_path(requested),
+            &format!("Member must be null for a {stored} service level objective"),
+        )])
+    })
 }
 
 /// The `MetricSourceType` an SLI describes.

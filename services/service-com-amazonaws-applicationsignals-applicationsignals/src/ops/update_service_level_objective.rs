@@ -216,16 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.sli_config.as_ref(),
             input.request_based_sli_config.as_ref(),
         );
-        let stored_kind = crate::state::stored_evaluation_type(slo);
-        let switches_kind = matches!(
-            (stored_kind, requested_kind),
-            (Some(stored), Some(requested)) if stored != requested
-        );
-        if switches_kind {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "You cannot change from a period-based SLO to a request-based SLO, or change \
-                 from a request-based SLO to a period-based SLO.",
-            ));
+        if let Some(message) = crate::state::evaluation_kind_change_refusal(
+            crate::state::stored_evaluation_type(slo),
+            requested_kind,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
         if let Some(description) = input.description.as_ref() {

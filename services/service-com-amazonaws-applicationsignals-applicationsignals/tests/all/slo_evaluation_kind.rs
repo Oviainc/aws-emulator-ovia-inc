@@ -18,7 +18,10 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::slo_lifecycle::{call, create, router, sli_config};
 
 /// A request-based SLI config on an Application Signals service entity.
-fn request_based_sli_config(service_name: &str) -> Value {
+///
+/// `pub(crate)` so the sibling suite that asserts how the SLO writers WORD a refusal drives
+/// the same configs rather than re-deriving them.
+pub(crate) fn request_based_sli_config(service_name: &str) -> Value {
     json!({
         "RequestBasedSliMetricConfig": {
             "KeyAttributes": { "Type": "Service", "Name": service_name, "Environment": "prod" },
@@ -29,7 +32,7 @@ fn request_based_sli_config(service_name: &str) -> Value {
 
 /// A request-based SLI config that spells its own CloudWatch metric-math queries rather than
 /// naming an Application Signals entity: a different FORM of the same kind of config.
-fn request_based_sli_config_with_queries() -> Value {
+pub(crate) fn request_based_sli_config_with_queries() -> Value {
     json!({
         "RequestBasedSliMetricConfig": {
             "TotalRequestCountMetric": [{
@@ -55,7 +58,7 @@ fn request_based_sli_config_with_queries() -> Value {
 }
 
 /// A period-based SLI config that spells its own metric queries instead of naming an entity.
-fn sli_config_with_queries() -> Value {
+pub(crate) fn sli_config_with_queries() -> Value {
     json!({
         "SliMetricConfig": {
             "MetricDataQueries": [{

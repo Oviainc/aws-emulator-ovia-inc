@@ -225,7 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request-based SLO", and the only source of `EvaluationType` and
         // `MetricSourceType`. The model can express neither half of that rule, so the
         // boundary validator admits both shapes and each is refused here, BEFORE any state
-        // is read or written: a refused create stores nothing.
+        // is read or written: a refused create stores nothing. Both refusals are worded
+        // through the service's one constraint-violation builder, like the tag maximum
+        // below, so a client reads the member it must fix whichever rule fired.
         if let Some(message) = crate::state::exclusive_sli_configs_refusal(
             input.sli_config.as_ref(),
             input.request_based_sli_config.as_ref(),
