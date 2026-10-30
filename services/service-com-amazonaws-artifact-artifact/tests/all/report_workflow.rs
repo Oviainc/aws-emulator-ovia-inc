@@ -383,17 +383,14 @@ async fn every_listed_report_is_fetchable_by_id_and_by_version() {
             "case {case:?}: the metadata read reports the upload's status message, got {:?}",
             detail
         );
-        assert_eq!(
-            detail["termArn"].as_str(),
-            Some(
-                format!(
-                    "arn:aws:artifact:{REGION}::term/term-{}-v{}",
-                    expected.id.trim_start_matches("report-"),
-                    expected.versions.iter().copied().next_back().unwrap_or(1)
-                )
-                .as_str()
-            ),
-            "case {case:?}: expected a service-owned term ARN, got {:?}",
+        // `termArn` identifies the TERM resource governing this report — one term for every
+        // version of it — so it is service-owned (the signed region, an empty account id)
+        // and names a term resource. That it does not vary with the version, and tracks the
+        // term DOCUMENT, is pinned over the whole catalog in `report_term_identity.rs`.
+        let term_arn = detail["termArn"].as_str().unwrap_or_default().to_string();
+        assert!(
+            term_arn.starts_with(&format!("arn:aws:artifact:{REGION}::term/term-")),
+            "case {case:?}: expected a service-owned term ARN naming a term resource, got {:?}",
             detail
         );
         assert!(
@@ -428,6 +425,15 @@ async fn every_listed_report_is_fetchable_by_id_and_by_version() {
                 answer.body["reportDetails"]["version"].as_i64(),
                 Some(*version),
                 "case {case:?} v{version}: expected that version back, got {:?}",
+                answer.body
+            );
+            // The term is the report's, not the version's, so every version names the one
+            // term resource the latest version named.
+            assert_eq!(
+                answer.body["reportDetails"]["termArn"].as_str(),
+                Some(term_arn.as_str()),
+                "case {case:?} v{version}: expected the report's one term ARN {term_arn:?}, \
+                 got {:?}",
                 answer.body
             );
         }

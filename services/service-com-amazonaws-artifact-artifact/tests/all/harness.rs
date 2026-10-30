@@ -25,6 +25,11 @@ use serde_json::Value;
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// The endpoint host every request of this harness is addressed to — and therefore the
+/// host an announced document URL names, since a document URL names the endpoint the
+/// caller reached the emulator on.
+pub const ENDPOINT: &str = "artifact.eu-west-1.amazonaws.com";
+
 /// A SigV4 credential scope naming this service. It is what routes a request to the
 /// artifact service, and its region is what a report ARN is built for.
 pub const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
@@ -284,7 +289,7 @@ pub async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: By
     let request = ::http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", "artifact.eu-west-1.amazonaws.com")
+        .header("host", ENDPOINT)
         .header("content-type", "application/json")
         .header("authorization", SIGNED_FOR_EU_WEST_1)
         .body(body)
@@ -310,7 +315,7 @@ pub async fn get_signed(router: &MultiServiceRouter, uri: &str, authorization: &
     let request = ::http::Request::builder()
         .method("GET")
         .uri(uri)
-        .header("host", "artifact.eu-west-1.amazonaws.com")
+        .header("host", ENDPOINT)
         .header("authorization", authorization)
         .body(Bytes::new())
         .expect("the test request is well formed");
@@ -349,4 +354,55 @@ pub async fn get_term_for_report(router: &MultiServiceRouter, query: &str) -> An
 
 pub async fn get_report(router: &MultiServiceRouter, query: &str) -> Answer {
     get(router, &format!("/v1/report/get{query}")).await
+}
+
+/// What following an announced document URL served: the status, the content type and the
+/// raw bytes — a document is not JSON, so it is kept as bytes rather than parsed.
+pub struct Served {
+    pub status: u16,
+    pub content_type: String,
+    pub bytes: Bytes,
+}
+
+/// Follow a `documentPresignedUrl` the service announced, exactly as a client does:
+/// addressed to the endpoint that URL names ([`ENDPOINT`]) and with NO credential of any
+/// kind, since the URL carries the token that authorises the fetch.
+///
+/// Asserts the announcement is absolute and names this service's own endpoint, so the URL a
+/// suite follows is the one a client could follow; `case` names the row that announced it.
+pub async fn follow_announced_url(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+) -> Served {
+    let rest = url
+        .strip_prefix("https://")
+        .unwrap_or_else(|| panic!("case {case}: an announced URL is absolute, got {url:?}"));
+    let (host, path_and_query) = rest
+        .split_once('/')
+        .unwrap_or_else(|| panic!("case {case}: an announced URL carries a path, got {url:?}"));
+    assert_eq!(
+        host, ENDPOINT,
+        "case {case}: an announced URL must name the endpoint the caller reached, got {url:?}"
+    );
+
+    let request = ::http::Request::builder()
+        .method("GET")
+        .uri(format!("/{path_and_query}"))
+        .header("host", ENDPOINT)
+        .body(Bytes::new())
+        .expect("the test request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    Served {
+        status,
+        content_type,
+        bytes: response.into_body(),
+    }
 }

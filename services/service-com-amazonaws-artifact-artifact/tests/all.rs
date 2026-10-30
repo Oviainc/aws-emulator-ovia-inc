@@ -71,6 +71,8 @@ mod report_projection;
 mod report_published_description;
 #[path = "all/report_target_resolution_rule.rs"]
 mod report_target_resolution_rule;
+#[path = "all/report_term_identity.rs"]
+mod report_term_identity;
 #[path = "all/report_workflow.rs"]
 mod report_workflow;
 #[path = "all/reserved_tag_keys.rs"]

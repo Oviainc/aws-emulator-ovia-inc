@@ -633,7 +633,10 @@ impl Report {
             category: Some(self.category.clone()),
             company_name: Some(self.company_name.clone()),
             product_name: Some(self.product_name.clone()),
-            term_arn: Some(term_arn(region, &self.id, version.version)),
+            // The term is the REPORT's, one for every version of it, so the ARN that
+            // identifies it is read off that one stored document and never off the version
+            // this projection was asked for.
+            term_arn: Some(term_arn(region, &self.term)),
             version: Some(version.version),
             acceptance_type: Some(self.acceptance_type.clone()),
             sequence_number: Some(version.sequence_number),
@@ -1939,11 +1942,37 @@ pub fn report_arn(region: &str, report_id: &str, version: i64) -> String {
     format!("arn:aws:artifact:{region}::report/{report_id}:{version}")
 }
 
-/// The ARN of the term resource attached to one version of a report, in the same
-/// service-owned form as [`report_arn`] (`arn:aws:artifact:<region>::term/<termId>`).
-pub fn term_arn(region: &str, report_id: &str, version: i64) -> String {
-    let suffix = report_id.strip_prefix("report-").unwrap_or(report_id);
-    format!("arn:aws:artifact:{region}::term/term-{suffix}-v{version}")
+/// The ARN of a TERM resource, in the same service-owned form as [`report_arn`]
+/// (`arn:aws:artifact:<region>::term/<termId>`).
+///
+/// `ReportDetail$termArn` is "Unique resource ARN for term resource": an IDENTIFIER of the
+/// term, so it is a function of the term alone. A term in this service IS its document
+/// ([`Document::digest`] is that document's identity), and that is the identity a download
+/// grant covers ([`ComAmazonawsArtifactArtifactState::grant_covers`]): one term document is
+/// one term resource — under every version of every report it governs — and two different
+/// term texts are two term resources, whatever file names they are published under. So this
+/// ARN never carries the report version a projection was read through: a report holds one
+/// term ([`Report::term`]) for all of its versions, and naming one term per version would
+/// tell a client to accept as many terms as the report has versions while a single
+/// acceptance authorises every one of them.
+pub fn term_arn(region: &str, term: &Document) -> String {
+    format!("arn:aws:artifact:{region}::term/{}", term_id(term))
+}
+
+/// How many hex digits of a term document's digest the term's resource id carries — enough
+/// for the id to have the 16-character shape this service's other resource ids have
+/// (`ReportId` is `^report-[a-zA-Z0-9]{16}$`).
+const TERM_ID_DIGITS: usize = 16;
+
+/// The resource id of the term `term` is: `term-` followed by [`TERM_ID_DIGITS`] of the
+/// document's own identity digest.
+///
+/// Derived from the document's CONTENT, so the id is stable across reads, equal for the
+/// same term text and different for different term text — which is what makes
+/// [`term_arn`] identify the term rather than locate it.
+fn term_id(term: &Document) -> String {
+    let digits = term.digest.get(..TERM_ID_DIGITS).unwrap_or(&term.digest);
+    format!("term-{digits}")
 }
 
 /// The ARN of a customer-agreement resource.
