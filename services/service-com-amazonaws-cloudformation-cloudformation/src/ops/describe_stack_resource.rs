@@ -191,12 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The name or the unique stack ID that's associated with the stack": a running
         // stack by either, a deleted one by its id only, and in either form only in the
         // Region the request was signed for. A name that resolves to nothing is a
-        // `ValidationError`, as it is on every other read of a stack.
+        // `ValidationError`, as it is on every other read of a stack — worded with this
+        // operation's own template for that class, which quotes the name the request sent.
         let region = crate::state::request_region(ctx.parts());
         let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
-                &input.stack_name,
-            ))
+            crate::scaffolded::Scaffolded::validation_error(
+                crate::state::quoted_stack_does_not_exist(&input.stack_name),
+            )
         })?;
 
         // "Returns a description of the specified resource in the specified stack": one

@@ -195,15 +195,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Rolls back the specified stack to the last known stable state from
             // CREATE_FAILED or UPDATE_FAILED stack statuses": a stack in any other status has
             // no failed operation of that kind to clear up, so it is refused and left exactly
-            // where it is.
+            // where it is. The refusal is a FIXED sentence stating the statuses the call can
+            // be made from: the stack's id and the status it is in are this run's own state,
+            // so neither is interpolated into it.
             if previous.pending.is_some()
                 || !crate::state::status_takes_a_rollback(&previous.status)
             {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::stack_cannot_be_rolled_back(
-                        &previous.stack_id,
-                        &previous.status,
-                    ),
+                    crate::state::stack_cannot_be_rolled_back(),
                 ));
             }
             // "A unique identifier for this RollbackStack request": a token an operation on

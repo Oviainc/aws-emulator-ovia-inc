@@ -813,7 +813,7 @@ async fn a_signal_to_a_stack_that_does_not_resolve_is_refused() {
         );
         assert_eq!(
             xml_text(&refused, "Message").unwrap_or_default(),
-            format!("Stack with id {name} does not exist"),
+            format!("Stack {name} does not exist"),
             "case {case:?}: expected the refusal to name the stack, got {refused}"
         );
     }

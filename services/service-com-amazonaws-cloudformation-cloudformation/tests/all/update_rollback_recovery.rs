@@ -37,7 +37,9 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions::{
     DEFAULT_TIMEOUT, MAX_TIMEOUT,
 };
-use service_com_amazonaws_cloudformation_cloudformation::state::{resource_status, status};
+use service_com_amazonaws_cloudformation_cloudformation::state::{
+    resource_status, status, CANNOT_CONTINUE_UPDATE_ROLLBACK,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
@@ -288,9 +290,9 @@ async fn continuing_a_rollback_is_refused_unless_the_rollback_failed() {
             "case {case:?}: expected the call to be refused with 400, got {http_status} {body}"
         );
         assert!(
-            body.contains("can not be continued"),
-            "case {case:?}: expected the refusal to say the stack cannot be continued, got \
-             {body}"
+            body.contains(CANNOT_CONTINUE_UPDATE_ROLLBACK),
+            "case {case:?}: expected the refusal to be \
+             {CANNOT_CONTINUE_UPDATE_ROLLBACK:?}, got {body}"
         );
         wait_for_the_transition().await;
     }

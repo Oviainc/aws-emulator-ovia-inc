@@ -226,13 +226,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "A stack goes into the UPDATE_ROLLBACK_FAILED state when CloudFormation can't
             // roll back all changes after a failed stack update": that is the one state a
             // rollback can be continued from, so a stack in any other one is refused and
-            // left exactly where it is.
+            // left exactly where it is. The refusal is a FIXED sentence about the call: the
+            // stack's id and the status it is in are this run's own state, so neither is
+            // interpolated into it.
             if previous.status != status::UPDATE_ROLLBACK_FAILED {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::stack_cannot_be_continued(
-                        &previous.stack_id,
-                        &previous.status,
-                    ),
+                    crate::state::CANNOT_CONTINUE_UPDATE_ROLLBACK,
                 ));
             }
             // "A client request token already exists": the token identifies ONE request, so

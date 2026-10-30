@@ -608,11 +608,13 @@ async fn a_change_set_the_request_cannot_resolve_is_refused() {
         ),
         ("the name alone", "addressed-set", None, 400, "ValidationError"),
         (
+            // The stack is resolved BEFORE the change set, so this is a refusal about the
+            // stack rather than the change-set-not-found of a lookup that had no stack.
             "the name with a stack that does not exist",
             "addressed-set",
             Some("addressed-other"),
-            404,
-            "ChangeSetNotFound",
+            400,
+            "ValidationError",
         ),
         (
             "a name the stack carries no change set under",

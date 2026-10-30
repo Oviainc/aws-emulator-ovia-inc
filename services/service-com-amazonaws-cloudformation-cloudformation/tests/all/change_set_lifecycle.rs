@@ -817,11 +817,13 @@ async fn a_change_set_is_addressable_by_its_arn_alone() {
         ("the name with its stack", "by-arn-set", Some("by-arn"), 200, ""),
         ("the name alone", "by-arn-set", None, 400, "ValidationError"),
         (
+            // The stack is resolved BEFORE the change set, so a stack this Region holds none
+            // of is refused about the stack rather than about the change set.
             "the name with the wrong stack",
             "by-arn-set",
             Some("by-arn-other"),
-            404,
-            "ChangeSetNotFound",
+            400,
+            "ValidationError",
         ),
         (
             "a name no change set carries",
@@ -1125,10 +1127,17 @@ async fn a_change_set_is_deleted_by_request_by_execution_and_with_its_stack() {
     let (code, body) = call(&router, "DeleteStack", &[member("StackName", "siblings")]).await;
     assert_eq!(code, 200, "the stack is deleted, got {code} {body}");
     settle_the_store(&router, &engine).await;
+    // The stack is resolved BEFORE the change set, so a read addressing one of its change
+    // sets by name is now refused about the STACK rather than about the change set.
     let (code, body) = describe_change_set(&router, "first-set", Some("siblings")).await;
     assert_eq!(
-        code, 404,
-        "case \"deleting a stack\": its change sets go with it, got {code} {body}"
+        code, 400,
+        "case \"deleting a stack\": the stack it addressed is gone, got {code} {body}"
+    );
+    assert_eq!(
+        xml_text(&body, "Message").as_deref(),
+        Some("Stack [siblings] does not exist"),
+        "case \"deleting a stack\": expected the refusal to name the stack, got {body}"
     );
     assert!(
         store(&engine).lock().change_sets.is_empty(),

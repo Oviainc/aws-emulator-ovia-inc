@@ -181,6 +181,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.stack_name.as_deref(),
             )
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+            // The change set is addressed WITHIN the stack named beside it, so that stack is
+            // resolved first: a request naming one this Region holds none of is refused about
+            // the STACK — in this operation's own wording for that class, the one its stack
+            // read below answers — rather than answered the change-set-not-found of a lookup
+            // that never had a stack to look inside.
+            if let Some(absent) = store.unresolved_stack(&region, input.stack_name.as_deref()) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_does_not_exist(absent),
+                ));
+            }
             let change_set = store
                 .resolve_change_set(&region, change_set_name, input.stack_name.as_deref())
                 .ok_or_else(|| {

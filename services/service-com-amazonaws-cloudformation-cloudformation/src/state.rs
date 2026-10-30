@@ -5330,6 +5330,27 @@ impl ComAmazonawsCloudformationCloudformationState {
             .map(|i| &mut self.stacks[i])
     }
 
+    /// `Some(name_or_id)` when a request named a stack this Region holds none for, and
+    /// `None` when it resolves or when the request named no stack at all.
+    ///
+    /// What an operation that addresses a NESTED record — a change set, which is addressed
+    /// "by its name plus the stack it belongs to" — checks BEFORE it looks that record up:
+    /// the outer resource is resolved first, so a request naming a stack that is not
+    /// addressable is refused about the STACK rather than about the record the nested lookup
+    /// could not reach inside it. A client can then tell a bad stack name (fix the name)
+    /// from a record that is really missing (create it), and the two refusals keep their own
+    /// status codes.
+    ///
+    /// The refusal itself is worded by the OPERATION ([`stack_does_not_exist`] and the forms
+    /// beside it), so this answers WHICH name did not resolve rather than a message.
+    pub fn unresolved_stack<'a>(
+        &self,
+        region: &str,
+        name_or_id: Option<&'a str>,
+    ) -> Option<&'a str> {
+        name_or_id.filter(|name_or_id| self.resolve(region, name_or_id).is_none())
+    }
+
     /// The live stacks of one Region, in creation order: what `DescribeStacks` reports when
     /// no `StackName` is given ("Deleted stacks don't show up in DescribeStacks if the
     /// deletion has been completed successfully"), and the set a stack NAME has to be
@@ -6123,8 +6144,8 @@ pub fn status_takes_an_update(status: &str) -> bool {
     )
 }
 
-/// Whether a stack whose last operation left it in `status` can be ROLLED BACK on request,
-/// or whether the call is the refusal [`stack_cannot_be_rolled_back`] words.
+/// The statuses a stack can be ROLLED BACK from on request, in the order `RollbackStack`'s
+/// own refusal states them ([`stack_cannot_be_rolled_back`]).
 ///
 /// `RollbackStack` "rolls back the specified stack to the last known stable state from
 /// CREATE_FAILED or UPDATE_FAILED stack statuses": those are the two statuses of an
@@ -6133,15 +6154,29 @@ pub fn status_takes_an_update(status: &str) -> bool {
 /// up. Every other status is a stack with nothing of that kind outstanding — one already
 /// stable, one whose own rollback or deletion another operation resolves, or one with an
 /// operation still in flight.
+///
+/// ONE list, so the gate and the sentence that states it cannot drift apart.
+pub const ROLLBACK_STATUSES: [&str; 2] = [status::UPDATE_FAILED, status::CREATE_FAILED];
+
+/// Whether a stack whose last operation left it in `status` can be ROLLED BACK on request,
+/// or whether the call is the refusal [`stack_cannot_be_rolled_back`] words — the statuses
+/// [`ROLLBACK_STATUSES`] names.
 pub fn status_takes_a_rollback(status: &str) -> bool {
-    matches!(status, status::CREATE_FAILED | status::UPDATE_FAILED)
+    ROLLBACK_STATUSES.contains(&status)
 }
 
 /// The message CloudFormation answers when `RollbackStack` names a stack whose current
-/// status is not one a rollback can be started from — the same form
-/// [`stack_cannot_be_updated`] words the analogous refusal in.
-pub fn stack_cannot_be_rolled_back(stack_id: &str, status: &str) -> String {
-    format!("Stack:{stack_id} is in {status} state and can not be rolled back.")
+/// status is not one a rollback can be started from.
+///
+/// Entirely FIXED text: the sentence states which statuses the call CAN be made from
+/// ([`ROLLBACK_STATUSES`]) and carries no part of the stack it was made against — neither
+/// its id nor the status it is really in, both of which are this run's own state and are
+/// what `DescribeStacks` reports.
+pub fn stack_cannot_be_rolled_back() -> String {
+    format!(
+        "RollbackStack can only be called on any of the [{}] statuses.",
+        ROLLBACK_STATUSES.join(", ")
+    )
 }
 
 /// The message CloudFormation answers when `ContinueUpdateRollback` names a stack whose
@@ -6149,11 +6184,10 @@ pub fn stack_cannot_be_rolled_back(stack_id: &str, status: &str) -> String {
 ///
 /// "A stack goes into the UPDATE_ROLLBACK_FAILED state when CloudFormation can't roll back
 /// all changes after a failed stack update": that is the one state the rollback can be
-/// continued from, and the refusal names the stack and the state it really is in — the same
-/// form [`stack_cannot_be_updated`] words the analogous refusal in.
-pub fn stack_cannot_be_continued(stack_id: &str, status: &str) -> String {
-    format!("Stack:{stack_id} is in {status} state and can not be continued.")
-}
+/// continued from. Entirely fixed text, as [`stack_cannot_be_rolled_back`] is: it names the
+/// internal operation the call would resume and nothing of the stack it was made against.
+pub const CANNOT_CONTINUE_UPDATE_ROLLBACK: &str =
+    "RollbackUpdatedStack cannot be called from current stack status";
 
 /// `Err(message)` for a request that names a change set by NAME without the stack it
 /// belongs to.
@@ -6230,25 +6264,56 @@ pub fn resource_failure_summary<'a>(
 
 /// The message CloudFormation answers when a request READS a stack that is not addressable:
 /// no live stack has that name and no stack has that id.
+///
+/// ## One refusal per operation, not one sentence per service
+///
+/// CloudFormation does not word "that stack is not there" once. Each operation answers its
+/// OWN fixed template for the class, and the only variable part of any of them is the
+/// `StackName` the request named, spelled as the request spelled it — so these forms are
+/// kept apart here, one function per template, and an operation is moved between them only
+/// on evidence of what it really answers. The forms this service has evidence for:
+///
+/// * `Stack with id <name> does not exist` — this function, the one most reads answer
+///   (`DescribeStacks`, `DescribeStackEvents`, `DescribeStackResources`,
+///   `DescribeStackResourceDrifts`, `ListStackResources`, `ListChangeSets`, `GetTemplate`,
+///   `GetTemplateSummary`, `GetStackPolicy`, `DescribeEvents`, `CreateChangeSet`,
+///   `CreateGeneratedTemplate`, `ContinueUpdateRollback`, `DetectStackResourceDrift`).
+/// * `Stack [<name>] does not exist` — [`changed_stack_does_not_exist`].
+/// * `Stack '<name>' does not exist` — [`quoted_stack_does_not_exist`].
+/// * `Stack <name> does not exist` — [`bare_stack_does_not_exist`].
+/// * `Stack: <name> does not exist` — [`labelled_stack_does_not_exist`].
 pub fn stack_does_not_exist(name_or_id: &str) -> String {
     format!("Stack with id {name_or_id} does not exist")
 }
 
-/// The message CloudFormation answers when a request that would CHANGE a stack names one
-/// that is not addressable — a stack that was deleted, or never created.
+/// The message CloudFormation answers for a stack that is not addressable with the named
+/// stack in SQUARE BRACKETS, which is this family's template for `UpdateStack`,
+/// `UpdateTerminationProtection`, `RollbackStack`, `DetectStackDrift` and the operations
+/// that address a change set within its stack (`DescribeChangeSet`,
+/// `DescribeChangeSetHooks`, `ExecuteChangeSet`) — see [`stack_does_not_exist`] for the
+/// family, of which this is one template among several.
 ///
-/// A stack operation words this refusal differently from a read ([`stack_does_not_exist`]):
-/// the stack the request named appears in SQUARE BRACKETS, and that name is the message's
-/// only variable part. Worded once, so the operations that ASK A STACK TO CHANGE cannot
-/// drift apart about it.
-///
-/// Which operations those are is decided per operation rather than by the kind of call:
-/// `UpdateStack`, `UpdateTerminationProtection` and `RollbackStack` word it this way, while
-/// every read — and `SignalResource`, whose own refusal is the read wording — keeps
-/// [`stack_does_not_exist`]. An operation this emulator has no evidence for keeps the
-/// wording it has rather than being moved on a guess.
+/// The bracketed name is the message's only variable part.
 pub fn changed_stack_does_not_exist(name_or_id: &str) -> String {
     format!("Stack [{name_or_id}] does not exist")
+}
+
+/// The same refusal with the named stack in SINGLE QUOTES, which is this family's template
+/// for `DescribeStackResource` ([`stack_does_not_exist`] documents the family).
+pub fn quoted_stack_does_not_exist(name_or_id: &str) -> String {
+    format!("Stack '{name_or_id}' does not exist")
+}
+
+/// The same refusal with the named stack BARE — no quoting, no bracketing — which is this
+/// family's template for `SignalResource` ([`stack_does_not_exist`] documents the family).
+pub fn bare_stack_does_not_exist(name_or_id: &str) -> String {
+    format!("Stack {name_or_id} does not exist")
+}
+
+/// The same refusal with the named stack after a COLON, which is this family's template for
+/// `SetStackPolicy` ([`stack_does_not_exist`] documents the family).
+pub fn labelled_stack_does_not_exist(name_or_id: &str) -> String {
+    format!("Stack: {name_or_id} does not exist")
 }
 
 /// The message answered when a stack IS addressable but carries no template: a stack a
@@ -6375,8 +6440,24 @@ pub fn export_in_use_delete_canceled_reason(
 /// has not deployed: the stack is addressable, so what does not exist is the resource
 /// under that logical id in that stack. Built from what the request named, the way
 /// [`stack_does_not_exist`] is.
+///
+/// The template of the reads that report one resource of a stack (`DescribeStackResource`);
+/// a DRIFT check of one resource words the same class its own way
+/// ([`resource_does_not_exist_in_stack`]), the way the stack-not-found templates differ per
+/// operation.
 pub fn resource_does_not_exist(logical_resource_id: &str, stack_name: &str) -> String {
     format!("Resource {logical_resource_id} does not exist for stack {stack_name}")
+}
+
+/// The message `DetectStackResourceDrift` answers when the stack it resolved has not
+/// deployed the `LogicalResourceId` the request named.
+///
+/// The fixed text is "does not exist in stack" and the two variable parts are the logical id
+/// the request named and the stack's own ID — the stack as the SERVICE addresses it (its
+/// ARN), not as the request spelled it, which is what a drift record itself reports a stack
+/// by (`StackResourceDrift$StackId`).
+pub fn resource_does_not_exist_in_stack(logical_resource_id: &str, stack_id: &str) -> String {
+    format!("Resource {logical_resource_id} does not exist in stack {stack_id}")
 }
 
 /// The message answered when a request asks for the drift of a resource whose TYPE drift
@@ -6407,10 +6488,14 @@ pub fn extension_does_not_exist(identifier: &str) -> String {
 /// The message answered when a request names a `StackDriftDetectionId` this account has
 /// not run a drift detection under — an id nothing issued, or one whose result this store
 /// no longer retains ("the number of drift results CloudFormation retains for any given
-/// stack, and for how long, may vary"). Built from what the request named, the way
-/// [`stack_does_not_exist`] is.
+/// stack, and for how long, may vary").
+///
+/// What the request did not resolve is the RESULT of a drift detection, which is what
+/// `DescribeStackDriftDetectionStatus` reads, and the detection id the request named is the
+/// message's only variable part — bracketed, as the stack-not-found template of the
+/// operations that bracket theirs is ([`changed_stack_does_not_exist`]).
 pub fn drift_detection_does_not_exist(detection_id: &str) -> String {
-    format!("Drift detection with id {detection_id} does not exist")
+    format!("Stack drift detection result [{detection_id}] does not exist")
 }
 
 /// The `HookResultNotFoundException` message CloudFormation answers when a request names a

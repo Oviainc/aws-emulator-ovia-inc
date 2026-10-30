@@ -231,6 +231,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // exported output values in force in the Region this request is signed for.
             let exports = store.exported_values(&request_region);
 
+            // A change set named beside a stack is addressed WITHIN that stack, so the stack
+            // is resolved first: a request naming one this Region holds none of is refused
+            // about the STACK rather than answered the change-set-not-found of a lookup that
+            // never had a stack to look inside — the same order `DescribeChangeSet` resolves
+            // in.
+            if let Some(absent) =
+                store.unresolved_stack(&request_region, input.stack_name.as_deref())
+            {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::changed_stack_does_not_exist(absent),
+                ));
+            }
+
             let change_set = store
                 .resolve_change_set(
                     &request_region,
@@ -309,6 +322,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The stack the change set belongs to. An operation already in flight on it is
             // exactly the case `InvalidChangeSetStatusException` documents ("the stack
             // status might be UPDATE_IN_PROGRESS").
+            //
+            // This resolution is of the stack id the RESOLVED change set carries, not of
+            // what the request named — a store this change set outlived its stack in — so it
+            // keeps the read wording rather than the bracketed one the pre-check above
+            // answers for a `StackName` the request named and this Region holds no stack for.
             let Some(stack) = store.resolve_mut(&request_region, &stack_id) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
                     crate::state::stack_does_not_exist(&stack_id),

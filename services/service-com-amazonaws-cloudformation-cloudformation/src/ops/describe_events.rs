@@ -313,18 +313,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // changes for.
         let change_set = match input.change_set_name.as_deref() {
             None => None,
-            Some(change_set_name) => Some(
-                store
-                    .resolve_change_set(&region, change_set_name, input.stack_name.as_deref())
-                    .map(|change_set| {
-                        (change_set.change_set_id.clone(), change_set.stack_id.clone())
-                    })
-                    .ok_or_else(|| {
-                        crate::scaffolded::Scaffolded::validation_error(
-                            crate::state::change_set_does_not_exist(change_set_name),
+            Some(change_set_name) => {
+                // The change set is addressed WITHIN the stack named beside it, so that
+                // stack is resolved first: a request naming one this Region holds none of is
+                // refused about the STACK — in this operation's own wording for that class,
+                // the one its stack read below answers — rather than answered the
+                // change-set-not-found of a lookup that never had a stack to look inside.
+                if let Some(absent) =
+                    store.unresolved_stack(&region, input.stack_name.as_deref())
+                {
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(absent),
+                    ));
+                }
+                Some(
+                    store
+                        .resolve_change_set(
+                            &region,
+                            change_set_name,
+                            input.stack_name.as_deref(),
                         )
-                    })?,
-            ),
+                        .map(|change_set| {
+                            (change_set.change_set_id.clone(), change_set.stack_id.clone())
+                        })
+                        .ok_or_else(|| {
+                            crate::scaffolded::Scaffolded::validation_error(
+                                crate::state::change_set_does_not_exist(change_set_name),
+                            )
+                        })?,
+                )
+            }
         };
 
         // WHOSE log is read: the stack the request named, the stack the named change set

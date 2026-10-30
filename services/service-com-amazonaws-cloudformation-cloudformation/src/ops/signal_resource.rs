@@ -184,13 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.settle(now);
             // "The stack name or unique stack ID that includes the resource that you want
             // to signal": a signal to a stack that is not there is refused, which is the
-            // ONE thing this operation refuses.
+            // ONE thing this operation refuses — worded with this operation's own template
+            // for that class, which names the stack bare.
             let stack = store
                 .resolve_mut(&region, &input.stack_name)
                 .filter(|stack| stack.is_live())
                 .ok_or_else(|| {
                     crate::scaffolded::Scaffolded::validation_error(
-                        crate::state::stack_does_not_exist(&input.stack_name),
+                        crate::state::bare_stack_does_not_exist(&input.stack_name),
                     )
                 })?;
 

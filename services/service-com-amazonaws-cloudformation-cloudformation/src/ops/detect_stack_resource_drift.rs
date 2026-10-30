@@ -174,23 +174,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // under. A logical id the stack has not deployed names no resource, so the
             // request is refused rather than answered with a record about nothing — the same
             // refusal every other read of one resource of a stack answers for it.
+            // The refusal names the stack by its own ID rather than as the request spelled
+            // it, which is how a drift record addresses the stack it belongs to.
+            let stack_id = stack.stack_id.clone();
             let deployed = stack
                 .resources
                 .iter()
                 .find(|deployed| deployed.resource.logical_id == input.logical_resource_id)
                 .ok_or_else(|| {
                     crate::scaffolded::Scaffolded::validation_error(
-                        crate::state::resource_does_not_exist(
+                        crate::state::resource_does_not_exist_in_stack(
                             &input.logical_resource_id,
-                            &input.stack_name,
+                            &stack_id,
                         ),
                     )
                 })?;
-            (
-                stack.stack_id.clone(),
-                stack.region.clone(),
-                deployed.resource.clone(),
-            )
+            (stack_id, stack.region.clone(), deployed.resource.clone())
         };
 
         // The comparison itself: one read from the service that owns the resource, in the
@@ -229,15 +228,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.stack_name,
             ))
         })?;
+        let reported_stack_id = stack.stack_id.clone();
         let deployed = stack
             .resources
             .iter()
             .find(|deployed| deployed.resource.logical_id == input.logical_resource_id)
             .ok_or_else(|| {
                 crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::resource_does_not_exist(
+                    crate::state::resource_does_not_exist_in_stack(
                         &input.logical_resource_id,
-                        &input.stack_name,
+                        &reported_stack_id,
                     ),
                 )
             })?;

@@ -174,9 +174,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.settle(now);
 
             let region = crate::state::request_region(ctx.parts());
+            // A stack that is not addressable is refused with this operation's own template
+            // for that class, which brackets the name the request sent.
             let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
                 crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::stack_does_not_exist(&input.stack_name),
+                    crate::state::changed_stack_does_not_exist(&input.stack_name),
                 )
             })?;
             let stack_id = stack.stack_id.clone();

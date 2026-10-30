@@ -299,6 +299,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock had already made due, which was owed whether or not anyone called.
         store.settle(::std::time::SystemTime::now());
 
+        // A change set named beside a stack is addressed WITHIN that stack, so the stack is
+        // resolved first: a request naming one this Region holds none of is refused about
+        // the STACK rather than answered the change-set-not-found of a lookup that never had
+        // a stack to look inside — the same order `DescribeChangeSetHooks` resolves in.
+        if let Some(absent) = store.unresolved_stack(&region, input.stack_name.as_deref()) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::changed_stack_does_not_exist(absent),
+            ));
+        }
+
         let change_set = store
             .resolve_change_set(&region, &input.change_set_name, input.stack_name.as_deref())
             .ok_or_else(|| {

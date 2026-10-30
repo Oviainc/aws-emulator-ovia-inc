@@ -231,6 +231,8 @@ mod stack_outputs;
 mod stack_parameter_driven_updates;
 #[path = "all/stack_policy_enforcement.rs"]
 mod stack_policy_enforcement;
+#[path = "all/stack_refusal_wording.rs"]
+mod stack_refusal_wording;
 #[path = "all/stack_reported_members.rs"]
 mod stack_reported_members;
 #[path = "all/stack_resource_detail.rs"]

@@ -865,15 +865,25 @@ async fn only_a_stack_whose_last_operation_failed_takes_a_rollback() {
         let message = xml_text(&body, "Message").unwrap_or_default();
         match row.status {
             Some(expected) => {
-                let (_, described) = describe_stack(&router, row.stack).await;
-                let stack_id = xml_text(&described, "StackId").unwrap_or_default();
                 assert_eq!(
                     message,
-                    stack_cannot_be_rolled_back(&stack_id, expected),
-                    "case {:?}: expected the refusal to name the stack and the status it is \
-                     in, got {message:?}",
+                    stack_cannot_be_rolled_back(),
+                    "case {:?}: expected the refusal to state the statuses a rollback can be \
+                     called from, got {message:?}",
                     row.case
                 );
+                // The stack's own id and the status it is in are this run's state, and the
+                // fixed sentence carries neither.
+                let (_, described) = describe_stack(&router, row.stack).await;
+                let stack_id = xml_text(&described, "StackId").unwrap_or_default();
+                for leaked in [stack_id.as_str(), expected] {
+                    assert!(
+                        !message.contains(leaked),
+                        "case {:?}: expected the refusal to carry no per-run value, got \
+                         {leaked:?} in {message:?}",
+                        row.case
+                    );
+                }
                 // The stack is left exactly where it was.
                 let reported = status_of(&router, row.stack).await;
                 assert_eq!(

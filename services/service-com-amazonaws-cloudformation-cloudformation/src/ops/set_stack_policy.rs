@@ -190,13 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A stack policy governs updates to a LIVE stack, so — as for `GetStackPolicy` — a
         // stack id that resolves a completed deletion names nothing a policy can be set
-        // on.
+        // on. The refusal carries this operation's own template for that class, which names
+        // the stack after a colon.
         let stack = store
             .resolve_mut(&region, &input.stack_name)
             .filter(|stack| stack.is_live())
             .ok_or_else(|| {
                 crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::stack_does_not_exist(&input.stack_name),
+                    crate::state::labelled_stack_does_not_exist(&input.stack_name),
                 )
             })?;
         // "Sets a stack policy for a specified stack": the policy set last is the one in
