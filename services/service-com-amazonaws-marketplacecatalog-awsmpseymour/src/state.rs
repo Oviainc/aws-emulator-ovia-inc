@@ -752,10 +752,17 @@ pub struct ChangeRecord {
     pub change_name: Option<String>,
     pub entity_tags: Vec<Tag>,
     /// The entity this change acts on: the id `Entity$Identifier` resolved to,
-    /// or the id minted for the entity the change creates. Absent for a change
-    /// of a `VALIDATE` change set that names no existing entity, since a
-    /// validation never creates one.
-    pub entity_id: Option<String>,
+    /// or the id reserved for the entity the change creates.
+    ///
+    /// Resolved from the REQUEST alone, so a change resolves to an entity
+    /// whatever `Intent` the change set carries: what the intent decides is
+    /// whether the entities are WRITTEN when the run ends, not which entity
+    /// each change is judged against.
+    pub entity_id: String,
+    /// Whether this change creates the entity [`Self::entity_id`] names — it
+    /// named no existing one — which is the change a `VALIDATE` change set
+    /// judges but never applies.
+    pub creates: bool,
     /// `ChangeSummary$ErrorDetailList`: what applying this change found wrong
     /// with it. Empty until the change set's changes are applied, and empty
     /// afterwards for a change that was applicable.
@@ -850,10 +857,17 @@ impl ChangeSetRecord {
     /// The entities this change set acts on, in submission order and without
     /// repeats — `ChangeSetSummaryListItem$EntityIdList`.
     pub fn entity_ids(&self) -> Vec<String> {
+        let validating = self.intent == INTENT_VALIDATE;
         let mut ids: Vec<String> = Vec::with_capacity(self.changes.len());
-        for id in self.changes.iter().filter_map(|c| c.entity_id.as_ref()) {
-            if !ids.iter().any(|seen| seen == id) {
-                ids.push(id.clone());
+        for change in &self.changes {
+            // A validation applies nothing, so the entities it is a part of are
+            // the ones its changes NAMED: the id a creating change resolved to
+            // is reserved for judging the request, and no entity carries it.
+            if validating && change.creates {
+                continue;
+            }
+            if !ids.iter().any(|seen| seen == &change.entity_id) {
+                ids.push(change.entity_id.clone());
             }
         }
         ids
@@ -871,7 +885,7 @@ impl ChangeSetRecord {
             // `EntityIdList` is documented "a maximum of 20 entities. It must
             // contain at least one entity", so a change set holding no entity
             // id — a `VALIDATE` change set whose changes all create, since a
-            // validation reserves nothing — reports NO member rather than an
+            // validation applies nothing — reports NO member rather than an
             // empty list that bound excludes. The same decision `Tags` takes
             // for its own `@length(min: 1 …)` list.
             entity_id_list: {
@@ -1603,7 +1617,7 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
                     && record
                         .changes
                         .iter()
-                        .any(|change| change.entity_id.as_deref() == Some(entity_id))
+                        .any(|change| change.entity_id == entity_id)
             })
             .map(|record| record.id.as_str())
     }
@@ -1794,9 +1808,10 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
         for (index, change) in record.changes.iter().enumerate() {
             let details = change.details_value();
             verdict.change_errors[index] = details_defects(details.as_ref());
-            let Some(entity_id) = change.entity_id.as_deref() else {
-                continue;
-            };
+            // Every change resolved to an entity, whatever the intent, so every
+            // change is judged against what that entity would then hold: a
+            // validation reaches the verdict applying the same request reaches.
+            let entity_id = change.entity_id.as_str();
             let merged = entity_details.entry(entity_id.to_string()).or_insert_with(|| {
                 self.entities
                     .get(entity_id)
@@ -1872,9 +1887,7 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
         let change_set_id = record.id.clone();
         let stamp = iso8601(at);
         for change in changes {
-            let Some(entity_id) = change.entity_id.clone() else {
-                continue;
-            };
+            let entity_id = change.entity_id.clone();
             let mut details = change.details_value();
             // `Change$Entity$Type` is a REFERENCE to an entity type, optionally
             // at a schema version (`DataProduct@1.0`); the entity itself is of
@@ -2615,9 +2628,7 @@ fn contradicting_details(changes: &[ChangeRecord]) -> Option<String> {
     };
     let mut claimed: HashMap<(String, &str), Value> = HashMap::new();
     for change in changes {
-        let Some(entity_id) = change.entity_id.clone() else {
-            continue;
-        };
+        let entity_id = change.entity_id.clone();
         let Some(Value::Object(members)) = change.details_value() else {
             continue;
         };

@@ -427,12 +427,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut changes: Vec<crate::state::ChangeRecord> =
             Vec::with_capacity(input.change_set.len());
-        // The entity each change resolved to, by index, filled as the changes
-        // are read: a change that names another change acts on the SAME entity,
-        // so resolving one of them resolves both, whichever is read first — and
-        // the entity a change creates is reserved ONCE however many changes
-        // name it.
-        let mut resolved: Vec<Option<Option<String>>> = vec![None; input.change_set.len()];
+        // The entity each change resolved to and whether that change creates
+        // it, by index, filled as the changes are read: a change that names
+        // another change acts on the SAME entity, so resolving one of them
+        // resolves both, whichever is read first — and the entity a change
+        // creates is reserved ONCE however many changes name it.
+        let mut resolved: Vec<Option<(String, bool)>> = vec![None; input.change_set.len()];
         // The (entity, change type) pairs the changes have taken once the
         // entity each one acts on is known, which is what the uniqueness rule
         // above cannot see on a change set whose changes name each other.
@@ -557,9 +557,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             // A change naming an entity acts on that entity; a change naming
             // none creates one, and the id it will carry is reserved now so
-            // `EntityIdList` can report it while the change set runs. A
-            // `VALIDATE` change set never creates an entity, so it reserves
-            // nothing.
+            // `EntityIdList` can report it while the change set runs. Which
+            // entity a change acts on follows from the REQUEST, so it is
+            // resolved under either `Intent`: the intent decides whether the
+            // run WRITES those entities, not what the change set is judged to
+            // be — a validation has to reach the verdict applying the same
+            // request reaches.
             //
             // A change that names another change acts on that change's entity,
             // so the change it resolves THROUGH is the one its chain of
@@ -582,7 +585,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            let entity_id = match resolved[target].clone() {
+            let (entity_id, creates) = match resolved[target].clone() {
                 Some(held) => held,
                 None => {
                     let held = match target_change.entity.identifier.as_deref() {
@@ -634,35 +637,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 )
                                 .into());
                             }
-                            Some(entity.id.clone())
+                            (entity.id.clone(), false)
                         }
-                        None if intent == crate::state::INTENT_APPLY => {
-                            Some(store.mint_entity_id())
-                        }
-                        None => None,
+                        None => (store.mint_entity_id(), true),
                     };
                     resolved[target] = Some(held.clone());
                     held
                 }
             };
 
-            if let Some(entity_id) = entity_id.as_deref() {
-                // "Within a single ChangeSet, you can't start the same change
-                // type against the same entity multiple times" — judged here on
-                // the entity the changes RESOLVED to as well as above on the one
-                // each named, because two changes reach one entity whenever one
-                // of them names the other or the entity it creates.
-                if !claimed_entities.insert((entity_id.to_string(), change.change_type.clone())) {
-                    return Err(StartChangeSetErrorModeled::ValidationException(
-                        crate::state::duplicate_change_pair(&change.change_type, entity_id),
-                    )
-                    .into());
-                }
-                // The lock is judged where the entity is resolved, above: an id
-                // this call MINTED is held by nothing (`mint_entity_id` skips
-                // every id a running change set reserved), and an id a change
-                // NAMED was refused there if a change set in flight holds it.
+            // "Within a single ChangeSet, you can't start the same change type
+            // against the same entity multiple times" — judged here on the
+            // entity the changes RESOLVED to as well as above on the one each
+            // named, because two changes reach one entity whenever one of them
+            // names the other or the entity it creates.
+            if !claimed_entities.insert((entity_id.clone(), change.change_type.clone())) {
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::duplicate_change_pair(&change.change_type, &entity_id),
+                )
+                .into());
             }
+            // The lock is judged where the entity is resolved, above: an id
+            // this call MINTED is held by nothing (`mint_entity_id` skips
+            // every id a running change set reserved), and an id a change
+            // NAMED was refused there if a change set in flight holds it.
 
             changes.push(crate::state::ChangeRecord {
                 change_type: change.change_type.clone(),
@@ -676,6 +674,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // pairs describe rather than the list as written.
                 entity_tags: crate::state::tag_set(change.entity_tags.clone().unwrap_or_default()),
                 entity_id,
+                creates,
                 // What applying the change finds wrong with it, which nothing
                 // has looked for yet: the change set has not run.
                 errors: Vec::new(),

@@ -71,3 +71,5 @@ mod sort_order_direction;
 mod state_roundtrip;
 #[path = "all/tag_set_uniqueness.rs"]
 mod tag_set_uniqueness;
+#[path = "all/validate_intent_verdict.rs"]
+mod validate_intent_verdict;
