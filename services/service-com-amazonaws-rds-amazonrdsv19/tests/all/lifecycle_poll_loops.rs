@@ -564,7 +564,9 @@ async fn a_polling_client_provisions_and_tears_down_a_limitless_shard_group() {
         );
         assert_eq!(
             optional_text(&shard_group, "MaxACU"),
-            Some(row.max_acu.to_string()),
+            Some(service_common::query_decimal_floats::decimal_double_text(
+                row.max_acu
+            )),
             "case {case:?}: the settled shard group must report its maximum capacity, got \
              {:?}",
             optional_text(&shard_group, "MaxACU")

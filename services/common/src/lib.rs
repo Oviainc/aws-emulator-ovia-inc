@@ -297,6 +297,9 @@ pub mod management_events;
 /// template request with, and the mapping skeleton the other does.
 pub mod model_mapping_template;
 pub mod network;
+/// A floating-point member of a response rendered the way AWS renders one — with a
+/// fractional part — which the framework's XML writer drops for a whole value.
+pub mod query_decimal_floats;
 pub mod query_error_envelope;
 /// An `@httpQuery`-bound timestamp read in the `epoch-seconds` form the model declares (or
 /// documents), which the generated schema drops and the framework therefore refuses.

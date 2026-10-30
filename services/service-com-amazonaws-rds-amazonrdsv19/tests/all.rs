@@ -145,3 +145,5 @@ mod sibling_control_plane_clusters;
 mod state_roundtrip;
 #[path = "all/valid_db_instance_modifications.rs"]
 mod valid_db_instance_modifications;
+#[path = "all/wire_decimal_doubles.rs"]
+mod wire_decimal_doubles;

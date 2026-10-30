@@ -295,6 +295,35 @@ impl<S: AuditedService> AuditedTable<S> {
         self
     }
 
+    /// Serve `operation` audited, as a call of `kind`, with the audited operation itself
+    /// served behind ONE more wrapper — `wrap` is handed it, together with the envelope
+    /// its pre-dispatch failures render in, and hands back what the table serves.
+    ///
+    /// The audited call stays INSIDE, which is the point of this variant over
+    /// [`serve`](Self::serve) wrapped from the outside: a record reports the operation's
+    /// OWN input and output, so a wrapper that changes how a response is rendered on the
+    /// wire cannot change the document a lookup reports.
+    pub fn serve_behind<O, W>(
+        &mut self,
+        operation: O,
+        kind: CallKind,
+        wrap: impl FnOnce(AuditedOperation<O, S>, PreDispatchProtocol<'static>) -> W,
+    ) -> &mut Self
+    where
+        O: Operation + ErasedOperation,
+        W: ErasedOperation + 'static,
+    {
+        let audited = AuditedOperation {
+            operation,
+            service: Arc::clone(&self.service),
+            kind,
+            pre_dispatch: self.pre_dispatch,
+        };
+        self.table
+            .add_operation(O::NAME, Box::new(wrap(audited, self.pre_dispatch)));
+        self
+    }
+
     /// Serve `operation` audited as a REPORTING call ([`CallKind::Reporting`]).
     pub fn reports<O: Operation + ErasedOperation>(&mut self, operation: O) -> &mut Self {
         self.serve(operation, CallKind::Reporting)

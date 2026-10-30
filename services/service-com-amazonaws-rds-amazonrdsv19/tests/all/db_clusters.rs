@@ -118,8 +118,9 @@ const CLUSTER_CASES: &[ClusterCase] = &[
             ("MasterUsername", "appsyncadmin"),
             ("StorageEncrypted", "true"),
             ("MinCapacity", "0.5"),
-            // The double the request carried as `2.0`, as the wire renders it.
-            ("MaxCapacity", "2"),
+            // A double carries a fractional part on the wire, so the `2.0` the request
+            // named is reported as `2.0` rather than as `2`.
+            ("MaxCapacity", "2.0"),
             // The documented defaults of the members this row leaves out.
             ("DeletionProtection", "false"),
             ("CopyTagsToSnapshot", "false"),

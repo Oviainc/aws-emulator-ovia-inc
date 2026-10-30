@@ -29,6 +29,9 @@ tracing = { workspace = true }
 # `audited_operation` / `management_events`: the shared operation wrapper that records each
 # call this front door serves in the account's management-event log, and the log itself —
 # the one store CloudTrail's `LookupEvents` reads (`src/service/management_events.rs`).
+# `query_decimal_floats`: the wrapper that renders a floating-point member of a response as
+# the decimal AWS renders one as, which every operation of this front door is served behind
+# (`src/service/management_events.rs`).
 service-common = { path = "../common" }
 # `state::new_request_id`'s digest: a maintained hash, so the per-response request id in
 # an awsQuery `<ErrorResponse>` envelope is shaped by library code rather than by hand.

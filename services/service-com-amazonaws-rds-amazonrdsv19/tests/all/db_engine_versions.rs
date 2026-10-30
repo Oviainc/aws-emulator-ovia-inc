@@ -1015,7 +1015,7 @@ async fn the_envelope_reports_the_published_per_engine_and_per_version_reference
     //   Aurora Serverless v2 pause/resume ("if the minimum capacity is 0 ACUs, the engine
     //   version … supports the automatic pause/resume feature") and half an ACU for one
     //   that does not; `MaxCapacity` is one of the two the member documents ("might be
-    //   `256` or `128`").
+    //   `256` or `128`"). Both are doubles, so each is reported as a decimal.
     //
     // (case, engine, engine version, exportable log types, feature names, Serverless v2
     // limits as reported on the wire)
@@ -1062,7 +1062,7 @@ async fn the_envelope_reports_the_published_per_engine_and_per_version_reference
             "16.6",
             AURORA_POSTGRESQL_LOGS,
             AURORA_POSTGRESQL_FEATURES,
-            Some(("0", "256")),
+            Some(("0.0", "256.0")),
         ),
         (
             "Aurora PostgreSQL 13",
@@ -1070,7 +1070,7 @@ async fn the_envelope_reports_the_published_per_engine_and_per_version_reference
             "13.15",
             AURORA_POSTGRESQL_LOGS,
             AURORA_POSTGRESQL_FEATURES,
-            Some(("0", "256")),
+            Some(("0.0", "256.0")),
         ),
         // Aurora PostgreSQL 11 ran before Aurora Serverless v2 existed.
         (
@@ -1089,7 +1089,7 @@ async fn the_envelope_reports_the_published_per_engine_and_per_version_reference
             "8.0.mysql_aurora.3.05.2",
             MYSQL_LOGS,
             AURORA_MYSQL_FEATURES,
-            Some(("0.5", "128")),
+            Some(("0.5", "128.0")),
         ),
         (
             "Aurora MySQL at the raised maximum",
@@ -1097,7 +1097,7 @@ async fn the_envelope_reports_the_published_per_engine_and_per_version_reference
             "8.0.mysql_aurora.3.07.1",
             MYSQL_LOGS,
             AURORA_MYSQL_FEATURES,
-            Some(("0.5", "256")),
+            Some(("0.5", "256.0")),
         ),
         (
             "Aurora MySQL with pause/resume",
@@ -1105,7 +1105,7 @@ async fn the_envelope_reports_the_published_per_engine_and_per_version_reference
             "8.0.mysql_aurora.3.08.0",
             MYSQL_LOGS,
             AURORA_MYSQL_FEATURES,
-            Some(("0", "256")),
+            Some(("0.0", "256.0")),
         ),
         // Aurora MySQL 2 is a cluster engine without Serverless v2.
         (
@@ -1410,9 +1410,10 @@ async fn a_capability_is_the_versions_own_and_not_its_engines() {
                 );
                 let reported_max = text(limits, "MaxCapacity");
                 assert!(
-                    matches!(reported_max.as_str(), "256" | "128"),
+                    matches!(reported_max.as_str(), "256.0" | "128.0"),
                     "case {case:?}: the Serverless v2 maximum is one of the two published \
-                     capacities, got {reported_max:?} in {}",
+                     capacities, as the decimal a double is on the wire, got \
+                     {reported_max:?} in {}",
                     version.scalars
                 );
             }
