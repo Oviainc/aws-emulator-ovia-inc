@@ -110,6 +110,20 @@ pub const MAX_ENTITIES_PER_REQUEST: usize = 100;
 /// per-kind rule.
 pub const MAX_ENTITIES_PER_BATCH: usize = 200;
 
+/// How many entities a token-based BATCH authorization call's `entities` may
+/// carry, from `BatchIsAuthorizedWithToken`'s own model documentation: "The
+/// entities of a BatchIsAuthorizedWithToken API request can contain up to 100
+/// resources and up to 99 user groups."
+///
+/// Only the FIRST of those two figures bounds the member, because only resources
+/// (and the action entities named beside them) may travel in it: the same
+/// documentation forbids the member any entity of a type the call's identity
+/// source generates — a user or one of its groups — and
+/// [`check_token_request_entities`] refuses one. The up-to-99 user groups of that
+/// sentence are therefore the ones the call builds out of the token's own claims
+/// and adds to the slice itself, not entities a caller may send.
+pub const MAX_ENTITIES_PER_TOKEN_BATCH: usize = 100;
+
 /// How many bytes of Cedar text one policy may carry. The published Verified
 /// Permissions quota for the size of a policy is 10,000 bytes; the model puts no
 /// upper `@length` on `PolicyStatement`, so the boundary validator cannot refuse

@@ -23,13 +23,13 @@ use crate::harness::{self, error_code, fault_message};
 const PASSWORD: &str = "Passw0rd!2024";
 
 /// The entity type the identity sources in this suite generate principals as.
-const PRINCIPAL_TYPE: &str = "App::User";
+pub(crate) const PRINCIPAL_TYPE: &str = "App::User";
 
 /// The entity type they map user-pool groups to.
-const GROUP_TYPE: &str = "App::UserGroup";
+pub(crate) const GROUP_TYPE: &str = "App::UserGroup";
 
 /// The group a permit policy in this suite is written over.
-const PERMITTED_GROUP: &str = "admins";
+pub(crate) const PERMITTED_GROUP: &str = "admins";
 
 /// The refusal a presented token whose audience the identity source accepts none of is
 /// answered with: ONE fixed sentence with no variable part, so a client can tell an
@@ -90,7 +90,7 @@ fn with_forged_claims(token: &str, claims: &Value) -> String {
 }
 
 /// `token` with one byte of its signature changed, inside the base64url alphabet.
-fn with_tampered_signature(token: &str) -> String {
+pub(crate) fn with_tampered_signature(token: &str) -> String {
     let (header, payload, signature) = segments(token);
     let mut characters: Vec<char> = signature.chars().collect();
     let last = characters.len() - 1;
@@ -101,24 +101,24 @@ fn with_tampered_signature(token: &str) -> String {
 
 /// A user signed in to a user pool: the pool, the app client and the identity the tokens
 /// name, plus the tokens themselves.
-struct SignedIn {
-    user_pool_id: String,
-    client_id: String,
-    sub: String,
-    access_token: String,
-    id_token: String,
+pub(crate) struct SignedIn {
+    pub(crate) user_pool_id: String,
+    pub(crate) client_id: String,
+    pub(crate) sub: String,
+    pub(crate) access_token: String,
+    pub(crate) id_token: String,
 }
 
 impl SignedIn {
     /// The principal entity id Verified Permissions generates for this identity:
     /// `<user pool id>|<sub>`.
-    fn entity_id(&self) -> String {
+    pub(crate) fn entity_id(&self) -> String {
         format!("{}|{}", self.user_pool_id, self.sub)
     }
 }
 
 /// Create an app client of `pool` that admin password sign-in is enabled for.
-async fn app_client(router: &MultiServiceRouter, pool: &str, name: &str) -> String {
+pub(crate) async fn app_client(router: &MultiServiceRouter, pool: &str, name: &str) -> String {
     harness::cognito(
         router,
         "CreateUserPoolClient",
@@ -136,7 +136,7 @@ async fn app_client(router: &MultiServiceRouter, pool: &str, name: &str) -> Stri
 
 /// Create `username` in `pool` with `attributes`, put it in `groups`, and sign it in
 /// through `client`.
-async fn sign_in(
+pub(crate) async fn sign_in(
     router: &MultiServiceRouter,
     pool: &str,
     client: &str,
@@ -226,7 +226,7 @@ async fn reauthenticate(
 
 /// Create an identity source for `pool` in `store`, accepting `client_ids` and mapping
 /// groups to `group_entity_type` when one is given, and return its `identitySourceId`.
-async fn identity_source(
+pub(crate) async fn identity_source(
     router: &MultiServiceRouter,
     store: &str,
     pool: &str,
@@ -258,7 +258,7 @@ async fn identity_source(
 /// The issuer a user pool's tokens claim, in the form the model documents for
 /// `CognitoUserPoolConfigurationDetail$issuer`:
 /// `https://cognito-idp.<region>.amazonaws.com/<user pool id>`.
-fn pool_issuer(pool: &str) -> String {
+pub(crate) fn pool_issuer(pool: &str) -> String {
     format!(
         "https://cognito-idp.{}.amazonaws.com/{pool}",
         harness::SIGNING_REGION
@@ -267,12 +267,12 @@ fn pool_issuer(pool: &str) -> String {
 
 /// The refusal a token-based authorization call answers when the policy store it addressed
 /// has no identity source for the issuer the token claims.
-fn no_identity_source_message(issuer: &str, store: &str) -> String {
+pub(crate) fn no_identity_source_message(issuer: &str, store: &str) -> String {
     format!("Identity Source does not exist for issuer {issuer} in policy store {store}")
 }
 
 /// Store a static policy and return its `policyId`.
-async fn policy(router: &MultiServiceRouter, store: &str, statement: String) -> String {
+pub(crate) async fn policy(router: &MultiServiceRouter, store: &str, statement: String) -> String {
     harness::ok(
         router,
         "CreatePolicy",
@@ -289,7 +289,7 @@ async fn policy(router: &MultiServiceRouter, store: &str, statement: String) -> 
 
 /// The `permit` policy this suite writes over a group: the group's members may read
 /// [`DOCUMENT`].
-fn group_permit(group_type: &str, pool: &str) -> String {
+pub(crate) fn group_permit(group_type: &str, pool: &str) -> String {
     format!(
         "permit(principal in {group_type}::\"{pool}|{PERMITTED_GROUP}\", \
          action == App::Action::\"read\", resource == App::Doc::\"{DOCUMENT}\");"
@@ -297,7 +297,7 @@ fn group_permit(group_type: &str, pool: &str) -> String {
 }
 
 /// The resource every request in this suite asks about.
-const DOCUMENT: &str = "doc-1";
+pub(crate) const DOCUMENT: &str = "doc-1";
 
 /// One `IsAuthorizedWithToken` request against `store`, carrying whatever token members
 /// `tokens` names.

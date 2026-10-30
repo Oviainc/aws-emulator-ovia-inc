@@ -17,6 +17,8 @@ mod alias_name_prefix;
 mod batch_get_policy;
 #[path = "all/batch_is_authorized.rs"]
 mod batch_is_authorized;
+#[path = "all/batch_is_authorized_with_token.rs"]
+mod batch_is_authorized_with_token;
 #[path = "all/date_time_wire_format.rs"]
 mod date_time_wire_format;
 #[path = "all/delete_policy_idempotency.rs"]
