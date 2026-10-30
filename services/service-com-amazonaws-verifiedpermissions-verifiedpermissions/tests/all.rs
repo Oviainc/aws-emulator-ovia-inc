@@ -71,6 +71,8 @@ mod policy_store_id_only_references;
 mod policy_store_record_stamp;
 #[path = "all/policy_store_settings.rs"]
 mod policy_store_settings;
+#[path = "all/policy_template_name_assignment.rs"]
+mod policy_template_name_assignment;
 #[path = "all/policy_templates.rs"]
 mod policy_templates;
 #[path = "all/policy_update.rs"]
