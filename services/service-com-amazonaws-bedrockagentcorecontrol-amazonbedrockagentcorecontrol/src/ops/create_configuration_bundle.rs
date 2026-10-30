@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationBundle
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfigurationBundle`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfigurationBundle::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a configuration bundle and PERSISTS it in [`crate::state`]: the name it
+//! is addressed by in this account, the tags it carries, and the INITIAL version
+//! holding the components, description and KMS key the caller supplied, on the
+//! branch the request named (or `mainline`). Every later read of the bundle or
+//! of that version comes from that record.
+//!
+//! Only the ids, the ARN and the create instant are reported here — they are the
+//! members `CreateConfigurationBundleResponse` declares — so what the bundle
+//! holds is read back through `GetConfigurationBundle`.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +186,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfigurationBundle` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationBundleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfigurationBundle"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConfigurationBundleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the configuration bundle store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // bundle that token first produced, rather than minting a second one:
+        // "If this token matches a previous request, the service ignores the
+        // request, but doesn't return an error."
+        if let Some(bundle_id) =
+            store.replayed_configuration_bundle_result(Self::NAME, input.client_token.as_deref())
+        {
+            if let Some(record) = store.configuration_bundles.get(&bundle_id) {
+                if let Some(first) = record.initial_version() {
+                    return Ok(CreateConfigurationBundleOutput {
+                        bundle_arn: record.bundle_arn.clone(),
+                        bundle_id: record.bundle_id.clone(),
+                        version_id: first.version_id.clone(),
+                        created_at: crate::state::timestamp(record.created_at),
+                    });
+                }
+            }
+        }
+
+        // "Names must be unique within your account", so a repeated name is a
+        // conflict, not a second bundle that later reads cannot tell apart.
+        if let Some(existing) = store.configuration_bundle_names.get(&input.bundle_name) {
+            return Err(CreateConfigurationBundleErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "a configuration bundle named {} already exists (bundleId {existing})",
+                        input.bundle_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if store.configuration_bundles.len() >= crate::state::MAX_CONFIGURATION_BUNDLES {
+            return Err(
+                CreateConfigurationBundleErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} configuration bundles",
+                            crate::state::MAX_CONFIGURATION_BUNDLES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let bundle_id = store.mint_configuration_bundle_id(&input.bundle_name, now);
+        let version_id = store.mint_configuration_bundle_version_id(&input.bundle_name, now);
+        let version = crate::state::ConfigurationBundleVersionRecord {
+            version_id: version_id.clone(),
+            components: input.components.into_iter().collect(),
+            description: input.description,
+            kms_key_arn: input.kms_key_arn,
+            // The version a create mints is the bundle's first commit, so
+            // nothing precedes it.
+            parent_version_ids: Vec::new(),
+            branch_name: input
+                .branch_name
+                .unwrap_or_else(|| crate::state::DEFAULT_BRANCH_NAME.to_string()),
+            created_by: input.created_by,
+            commit_message: input.commit_message,
+            created_at: now,
+        };
+        let mut record = crate::state::ConfigurationBundleRecord::new(
+            bundle_id.clone(),
+            crate::state::configuration_bundle_arn(&region, &bundle_id),
+            input.bundle_name,
+            crate::state::sorted_map(input.tags),
+            now,
+        );
+        // The bundle's version history is bounded, so the one place a commit is
+        // appended is the one place the ceiling is checked. A bundle this call
+        // just built holds no version yet, so the initial commit always fits;
+        // the quota answer is the same one a later commit of a full history
+        // gets.
+        if !record.commit(version) {
+            return Err(
+                CreateConfigurationBundleErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "configuration bundle {} already holds the maximum of {} versions",
+                            record.bundle_id,
+                            crate::state::MAX_VERSIONS_PER_CONFIGURATION_BUNDLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let output = CreateConfigurationBundleOutput {
+            bundle_arn: record.bundle_arn.clone(),
+            bundle_id: bundle_id.clone(),
+            version_id,
+            created_at: crate::state::timestamp(record.created_at),
+        };
+
+        store
+            .configuration_bundle_names
+            .insert(record.bundle_name.clone(), bundle_id.clone());
+        store.remember_configuration_bundle_client_token(
+            Self::NAME,
+            input.client_token,
+            &bundle_id,
+        );
+        store.configuration_bundles.insert(bundle_id, record);
+
+        Ok(output)
     }
 }

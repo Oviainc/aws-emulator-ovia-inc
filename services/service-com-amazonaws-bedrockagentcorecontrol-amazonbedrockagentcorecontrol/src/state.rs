@@ -23,7 +23,12 @@
 //!   `GetRegistry` and any later registry read answer from one store;
 //! * the token vault ([`TokenVaults`]): the KMS configuration each vault of the
 //!   account is encrypted under, so `SetTokenVaultCMK` and `GetTokenVault`
-//!   answer from one store.
+//!   answer from one store;
+//! * the configuration bundle (`/configuration-bundles/`): one
+//!   [`ConfigurationBundleRecord`] per `bundleId`, holding every version ever
+//!   committed to it ([`ConfigurationBundleVersionRecord`]), so a create and
+//!   every later read of the bundle or of one of its versions answer from one
+//!   store.
 //!
 //! Helpers the handlers share (the region a request was signed for, the
 //! canonical ARNs, id minting, the clock-owed status transition, the response
@@ -38,11 +43,12 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AgentRuntime, AgentRuntimeArtifact, AgentRuntimeVersionSummary, ApprovalConfiguration,
     AuthorizerConfiguration,
-    CapacityProviderConfiguration, CertificateConfiguration, Code, CreateGatewayOutput,
+    CapacityProviderConfiguration, CertificateConfiguration, Code, ComponentConfiguration,
+    CreateGatewayOutput,
     CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
     FilesystemConfiguration, GatewayInterceptorConfiguration, GatewayPolicyEngineConfiguration,
     GatewayProtocolConfiguration, GatewaySummary, GetGatewayOutput, GetGatewayTargetOutput,
-    GetRegistryOutput,
+    GetConfigurationBundleOutput, GetRegistryOutput,
     Harness, HarnessAgentCoreRuntimeEnvironment, HarnessAgentCoreRuntimeEnvironmentRequest,
     HarnessEnvironmentArtifact, HarnessEnvironmentProvider, HarnessEnvironmentProviderRequest,
     HarnessHook, HarnessMemoryConfiguration, HarnessModelConfiguration, HarnessSkill,
@@ -54,7 +60,7 @@ use crate::ops::types::{
     ResourceNotFoundException,
     RuntimeMetadataConfiguration, S3Location, StreamDeliveryResources, TargetConfiguration,
     TargetSummary,
-    ToolDefinition, ToolSchema,
+    ToolDefinition, ToolSchema, VersionCreatedBySource, VersionLineageMetadata,
     CreateWorkloadIdentityOutput, GetWorkloadIdentityOutput, UpdateWorkloadIdentityOutput,
     UpdateGatewayOutput, ValidationException, ValidationExceptionField, WafConfiguration,
     WorkloadIdentityDetails, WorkloadIdentityType,
@@ -1429,6 +1435,198 @@ impl RegistryRecord {
     }
 }
 
+/// The resource noun [`resource_not_found`] names for a configuration bundle.
+pub const RESOURCE_CONFIGURATION_BUNDLE: &str = "configuration bundle";
+
+/// The resource noun for ONE version of a configuration bundle — a bundle that
+/// holds no version on the branch a read names is not a missing bundle.
+pub const RESOURCE_CONFIGURATION_BUNDLE_VERSION: &str = "configuration bundle version";
+
+/// The resource type a `ConfigurationBundleArn` carries
+/// (`…:configuration-bundle/{bundleId}`).
+const ARN_TYPE_CONFIGURATION_BUNDLE: &str = "configuration-bundle";
+
+/// The branch a configuration bundle version belongs to when the request names
+/// none: "Defaults to mainline if not specified"
+/// (`smithy_query(query="doc",shape="CreateConfigurationBundleRequest",member="branchName")`),
+/// and "If not specified, returns the latest version on the mainline branch" for
+/// a read.
+pub const DEFAULT_BRANCH_NAME: &str = "mainline";
+
+/// How many configuration bundles this emulator will hold.
+///
+/// `CreateConfigurationBundle` models `ServiceQuotaExceededException` (HTTP 402)
+/// for exceeding the real service's quota; this number is not a fidelity claim
+/// about that quota but the emulator's own ceiling, set generously so no
+/// realistic workflow meets it, so a caller looping on create cannot grow this
+/// process's memory without bound.
+pub const MAX_CONFIGURATION_BUNDLES: usize = 1_000;
+
+/// How many versions ONE configuration bundle holds. Each commit stores the
+/// components, description and commit message the caller supplied, so the
+/// version history is caller-driven growth and is bounded for the same reason
+/// [`MAX_CONFIGURATION_BUNDLES`] is: not a fidelity claim about the real
+/// service's quota, but the emulator's own ceiling, set generously so no
+/// realistic workflow meets it.
+pub const MAX_VERSIONS_PER_CONFIGURATION_BUNDLE: usize = 1_000;
+
+/// One version (commit) of a configuration bundle: the component
+/// configurations, the description and the encryption key this version holds,
+/// and the lineage it was committed with.
+///
+/// A bundle's content is versioned, so the description, the components and the
+/// KMS key live here rather than on the bundle: a read of one version reports
+/// exactly what was committed in it.
+#[derive(Debug, Clone)]
+pub struct ConfigurationBundleVersionRecord {
+    pub version_id: String,
+    /// The components the commit carries, as the ordered map the store keeps so
+    /// a read-back is deterministic.
+    pub components: BTreeMap<String, ComponentConfiguration>,
+    pub description: Option<String>,
+    pub kms_key_arn: Option<String>,
+    /// The versions this one was committed on top of: empty for the version a
+    /// create mints, which has nothing before it ("Regular commits have 0-1
+    /// parents. Merge commits have 2 parents").
+    pub parent_version_ids: Vec<String>,
+    /// The EFFECTIVE branch: the caller's, or [`DEFAULT_BRANCH_NAME`].
+    pub branch_name: String,
+    pub created_by: Option<VersionCreatedBySource>,
+    pub commit_message: Option<String>,
+    pub created_at: SystemTime,
+}
+
+impl ConfigurationBundleVersionRecord {
+    /// The lineage this version was committed with, as every read of a version
+    /// reports it.
+    pub fn lineage_metadata(&self) -> VersionLineageMetadata {
+        VersionLineageMetadata {
+            parent_version_ids: Some(self.parent_version_ids.clone()),
+            branch_name: Some(self.branch_name.clone()),
+            created_by: self.created_by.clone(),
+            commit_message: self.commit_message.clone(),
+        }
+    }
+
+    /// The components this version holds, as the wire map.
+    pub fn component_map(&self) -> std::collections::HashMap<String, ComponentConfiguration> {
+        self.components
+            .iter()
+            .map(|(identifier, configuration)| (identifier.clone(), configuration.clone()))
+            .collect()
+    }
+}
+
+/// One configuration bundle: the resource `CreateConfigurationBundle` minted and
+/// every version ever committed to it, so a create, a read of the latest version
+/// on a branch and a read of one historical version all answer from one record.
+#[derive(Debug, Clone)]
+pub struct ConfigurationBundleRecord {
+    pub bundle_id: String,
+    pub bundle_arn: String,
+    /// The name the bundle is addressed by in this account, which an update can
+    /// change — so it lives on the bundle rather than on a version.
+    pub bundle_name: String,
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    /// When the bundle last gained a version.
+    pub updated_at: SystemTime,
+    /// Every version, in the order they were committed, so "the latest version"
+    /// is the last entry rather than whatever a version id happens to sort as.
+    /// Grown only through [`ConfigurationBundleRecord::commit`], which caps it
+    /// at [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`].
+    versions: Vec<ConfigurationBundleVersionRecord>,
+}
+
+impl ConfigurationBundleRecord {
+    /// A bundle with no commit yet: what a create builds before committing the
+    /// initial version through [`Self::commit`].
+    pub fn new(
+        bundle_id: String,
+        bundle_arn: String,
+        bundle_name: String,
+        tags: BTreeMap<String, String>,
+        at: SystemTime,
+    ) -> Self {
+        Self {
+            bundle_id,
+            bundle_arn,
+            bundle_name,
+            tags,
+            created_at: at,
+            updated_at: at,
+            versions: Vec::new(),
+        }
+    }
+
+    /// Append `version` as this bundle's next commit and date the bundle at it,
+    /// or answer `false` when the bundle already holds
+    /// [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`] versions — whereupon the caller
+    /// answers the operation's modelled quota error rather than growing this
+    /// process's memory. The ceiling lives here, at the ONE place a version is
+    /// appended (`versions` is private for exactly that reason), so no commit
+    /// path can skip it.
+    #[must_use]
+    pub fn commit(&mut self, version: ConfigurationBundleVersionRecord) -> bool {
+        if self.versions.len() >= MAX_VERSIONS_PER_CONFIGURATION_BUNDLE {
+            return false;
+        }
+        self.updated_at = version.created_at;
+        self.versions.push(version);
+        true
+    }
+
+    /// Every version of this bundle, in the order they were committed.
+    pub fn versions(&self) -> &[ConfigurationBundleVersionRecord] {
+        &self.versions
+    }
+
+    /// The version the create minted, which is the first commit of the bundle.
+    pub fn initial_version(&self) -> Option<&ConfigurationBundleVersionRecord> {
+        self.versions.first()
+    }
+
+    /// The version a `versionId` names, or `None` when this bundle holds no such
+    /// version.
+    pub fn version(&self, version_id: &str) -> Option<&ConfigurationBundleVersionRecord> {
+        self.versions
+            .iter()
+            .find(|version| version.version_id == version_id)
+    }
+
+    /// The latest version committed on `branch_name` — the caller's branch, or
+    /// [`DEFAULT_BRANCH_NAME`] when the request names none.
+    pub fn latest_on_branch(
+        &self,
+        branch_name: Option<&str>,
+    ) -> Option<&ConfigurationBundleVersionRecord> {
+        let branch = branch_name.unwrap_or(DEFAULT_BRANCH_NAME);
+        self.versions
+            .iter()
+            .rev()
+            .find(|version| version.branch_name == branch)
+    }
+
+    /// What a read of one version of this bundle reports.
+    pub fn get_output(
+        &self,
+        version: &ConfigurationBundleVersionRecord,
+    ) -> GetConfigurationBundleOutput {
+        GetConfigurationBundleOutput {
+            bundle_arn: self.bundle_arn.clone(),
+            bundle_id: self.bundle_id.clone(),
+            bundle_name: self.bundle_name.clone(),
+            description: version.description.clone(),
+            version_id: version.version_id.clone(),
+            components: version.component_map(),
+            lineage_metadata: Some(version.lineage_metadata()),
+            created_at: timestamp(self.created_at),
+            updated_at: timestamp(self.updated_at),
+            kms_key_arn: version.kms_key_arn.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol. A handler reaches it through [`service_state`].
 ///
 /// Every map here is caller-driven growth, so every one is bounded:
@@ -1439,7 +1637,10 @@ impl RegistryRecord {
 /// the memories (and with them their 1:1 name index),
 /// [`MAX_STRATEGIES_PER_MEMORY`] the strategies one memory holds,
 /// [`MAX_HARNESSES`] the harnesses (and with them their 1:1 name index),
-/// [`MAX_REGISTRIES`] the registries (and with them their 1:1 name index) and
+/// [`MAX_REGISTRIES`] the registries (and with them their 1:1 name index),
+/// [`MAX_CONFIGURATION_BUNDLES`] the configuration bundles (and with them their
+/// 1:1 name index), [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`] the versions one
+/// bundle accumulates and
 /// [`MAX_WORKLOAD_IDENTITIES`] the workload identities, and the
 /// idempotency records are capped at [`MAX_REMEMBERED_CLIENT_TOKENS`] with
 /// oldest-first eviction plus removal when the resource they name is deleted.
@@ -1541,6 +1742,24 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::registry_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     registry_idempotency_order: VecDeque<String>,
+    /// Every configuration bundle, keyed by `bundleId` — the identifier every
+    /// configuration-bundle route addresses it by. The key order is the
+    /// deterministic list order a bundle listing pages over.
+    pub configuration_bundles: BTreeMap<String, ConfigurationBundleRecord>,
+    /// `bundleName` -> `bundleId`, so a duplicate name at create time is a
+    /// `ConflictException` ("Names must be unique within your account"). One
+    /// entry per stored bundle.
+    pub configuration_bundle_names: BTreeMap<String, String>,
+    /// `<operation>/<clientToken>` -> the configuration bundle that token first
+    /// produced, so a replayed `CreateConfigurationBundle` answers with its
+    /// first result instead of minting a second bundle. Separate from the maps
+    /// above because the record is validated against a different store; the key
+    /// carries the operation for the same reason as there.
+    configuration_bundle_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::configuration_bundle_idempotency`] in the order they
+    /// were first recorded, so the oldest record is the one evicted at the
+    /// ceiling.
+    configuration_bundle_idempotency_order: VecDeque<String>,
     /// The account's token vaults, keyed by `tokenVaultId`. Bounded by its own
     /// type: no operation of this service creates a vault, so the map holds the
     /// one default vault [`TokenVaults`] seeds and never grows.
@@ -1992,6 +2211,71 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
             registry_id.to_string(),
         );
     }
+
+    /// Mint a `bundleId` for `bundle_name` that no stored bundle holds:
+    /// `bundle_name` + `-` + 10 alphanumerics, per `ConfigurationBundleId`'s
+    /// pattern `^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`.
+    pub fn mint_configuration_bundle_id(&mut self, bundle_name: &str, at: SystemTime) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = format!("{bundle_name}-{}", suffix_for(bundle_name, self.mint_counter, at));
+            if !self.configuration_bundles.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint a `versionId` for a commit of `bundle_name`: the UUID form
+    /// `ConfigurationBundleVersion` takes
+    /// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`).
+    ///
+    /// The counter is bumped first, so two commits of one bundle in the same
+    /// instant are digested from different inputs and cannot share an id.
+    pub fn mint_configuration_bundle_version_id(
+        &mut self,
+        bundle_name: &str,
+        at: SystemTime,
+    ) -> String {
+        self.mint_counter = self.mint_counter.wrapping_add(1);
+        uuid_shaped(bundle_name, self.mint_counter, at)
+    }
+
+    /// The configuration bundle a previous request to `operation` carrying this
+    /// `clientToken` produced, if the record is still held and the bundle still
+    /// exists.
+    pub fn replayed_configuration_bundle_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<String> {
+        let bundle_id = self
+            .configuration_bundle_idempotency
+            .get(&token_key(operation, client_token?))?;
+        self.configuration_bundles
+            .contains_key(bundle_id)
+            .then(|| bundle_id.clone())
+    }
+
+    /// Record what a `clientToken` produced for `operation`, evicting the oldest
+    /// record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held. An evicted token is
+    /// indistinguishable from one whose idempotency window has passed: the next
+    /// request carrying it is served as a fresh one.
+    pub fn remember_configuration_bundle_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        bundle_id: &str,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        remember_token(
+            &mut self.configuration_bundle_idempotency,
+            &mut self.configuration_bundle_idempotency_order,
+            token_key(operation, &token),
+            bundle_id.to_string(),
+        );
+    }
 }
 
 /// One idempotency key: the operation the token was presented to, then the
@@ -2059,6 +2343,42 @@ fn suffix_of_length(name: &str, counter: u64, at: SystemTime, len: usize) -> Str
         .take(len)
         .map(|byte| char::from(ALPHABET[usize::from(*byte) % ALPHABET.len()]))
         .collect()
+}
+
+/// A UUID-shaped identifier for an id whose pattern is the hyphenated UUID form
+/// rather than this service's `name-suffix` ids.
+///
+/// The 128 bits come from the same derivation [`suffix_of_length`] uses — a
+/// SHA-256 (`sha2`) over the name, the mint counter and the instant, hex-encoded
+/// (`hex`) — with the version nibble and the variant bits RFC 4122 §4.4 fixes
+/// set, so the value is a well-formed version-4 UUID in lower case. It names a
+/// resource version; a credential would come from `ctx.credential_store()`,
+/// never here.
+fn uuid_shaped(name: &str, counter: u64, at: SystemTime) -> String {
+    use sha2::{Digest, Sha256};
+
+    let nanos = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update(counter.to_be_bytes());
+    hasher.update(nanos.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let rendered = ::hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &rendered[..8],
+        &rendered[8..12],
+        &rendered[12..16],
+        &rendered[16..20],
+        &rendered[20..]
+    )
 }
 
 /// Encode the store key a page ended on as the opaque `nextToken` every
@@ -2193,6 +2513,16 @@ pub fn registry_arn(region: &str, registry_id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{RESOURCE_REGISTRY}/{registry_id}"),
+    )
+}
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:configuration-bundle/{bundleId}`
+/// — `ConfigurationBundleArn`'s pattern.
+pub fn configuration_bundle_arn(region: &str, bundle_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{ARN_TYPE_CONFIGURATION_BUNDLE}/{bundle_id}"),
     )
 }
 
