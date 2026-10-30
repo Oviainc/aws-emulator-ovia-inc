@@ -48,12 +48,12 @@ use crate::site_and_outpost_lifecycle::{refusal, segment, text, Outposts, Refusa
 
 /// The route `StartConnection` is bound to, from
 /// `smithy_query(query="operation",operation="StartConnection")`.
-const START_ROUTE: &str = "/connections";
+pub(crate) const START_ROUTE: &str = "/connections";
 
 /// The route `GetConnection` is bound to, for one `ConnectionId`:
 /// `GET /connections/{ConnectionId}`. The label is percent-encoded, because the
 /// modelled `ConnectionId` alphabet carries `+`, `/` and `=`.
-fn route(connection_id: &str) -> String {
+pub(crate) fn route(connection_id: &str) -> String {
     format!("{START_ROUTE}/{}", segment(connection_id))
 }
 
@@ -75,7 +75,7 @@ const MAX_CONNECTION_ID_LENGTH: usize = 1024;
 /// A `WireGuardPublicKey` whose 43 key characters are `filler`, repeated: the
 /// modelled form and nothing else fixed, so a row can vary which characters of the
 /// alphabet a client key carries.
-fn client_key(filler: &str) -> String {
+pub(crate) fn client_key(filler: &str) -> String {
     let body: String = filler.chars().cycle().take(43).collect();
     format!("{body}=")
 }
@@ -156,7 +156,7 @@ const ABSENT_ASSET_ID: &str = "asset_nothing_holds";
 /// and `ClientPublicKey` always, the dongle serial and the device index only where
 /// the row names them — the model marks `NetworkInterfaceDeviceIndex` `@required`,
 /// so a row that omits it is a row about a refusal.
-fn start_request(
+pub(crate) fn start_request(
     asset_id: &str,
     client_public_key: &str,
     device_serial_number: Option<&str>,
@@ -213,7 +213,11 @@ async fn outpost_holding(outposts: &Outposts, name: &str, asset_id: &str) -> Str
 /// because the hardware a connection installs is the Outpost SERVER itself; which
 /// kinds of unit `StartConnection` accepts is [`crate::outpost_server_asset_kind`]'s
 /// own rule.
-async fn outpost_holding_all(outposts: &Outposts, name: &str, asset_ids: &[&str]) -> String {
+pub(crate) async fn outpost_holding_all(
+    outposts: &Outposts,
+    name: &str,
+    asset_ids: &[&str],
+) -> String {
     let (outpost_id, _) = outposts.site_and_outpost(name).await;
     let hardware: Vec<_> = asset_ids
         .iter()

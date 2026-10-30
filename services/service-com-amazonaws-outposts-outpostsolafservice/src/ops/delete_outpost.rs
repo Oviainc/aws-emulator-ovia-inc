@@ -2,8 +2,9 @@
 
 //! @op DeleteOutpost
 //! IMPLEMENTED: removes the stored Outpost the `OutpostId` names, and with it the
-//! capacity tasks that exist only as tasks of that Outpost, so every later call
-//! observes it gone. An Outpost with work still outstanding on it -> the modelled
+//! records that exist only as part of that Outpost — the capacity tasks of it and
+//! the installation connections started for its assets — so every later call
+//! observes it and them gone. An Outpost with work still outstanding on it -> the modelled
 //! `ConflictException` (409) naming the resource the conflict is about, with
 //! nothing removed. Absent id -> `NotFoundException` (404).
 //!
@@ -206,15 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // The removal takes with it every record this store keeps that exists only
+        // as part of the Outpost — its capacity tasks, and the installation
+        // connections started for the assets the Outpost held — so nothing of a
+        // vanished Outpost is left to be read or to occupy a slot of its own store
+        // ([`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::remove_outpost`]).
         store.remove_outpost(&region, &outpost_id);
-        // A capacity task exists only as a task OF an Outpost, so the Outpost going
-        // away takes its tasks with it: nothing can name them any more (every
-        // capacity-task route resolves the Outpost first), and leaving the records
-        // behind would let a later Outpost's calls trip over them. Every task left
-        // here is finished work — an unfinished one is the conflict above.
-        store
-            .capacity_tasks
-            .retain(|_, task| task.outpost_id != outpost_id);
 
         Ok(DeleteOutpostOutput {})
     }

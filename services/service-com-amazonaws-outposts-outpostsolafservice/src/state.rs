@@ -3149,6 +3149,10 @@ pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
     /// Every persisted Outpost-server installation connection, keyed by the
     /// `ConnectionId` `StartConnection` minted for it. Resolved through
     /// [`Self::connection`]; see [`Self::sites`].
+    ///
+    /// A connection installs ONE hardware asset of ONE Outpost, so every stored
+    /// connection names hardware the store still holds: the Outpost going away takes
+    /// the connections started for its assets with it ([`Self::remove_outpost`]).
     pub connections: BTreeMap<String, ConnectionRecord>,
     /// This store's own tunnel-server public key, or `None` until the first
     /// connection mints it. See [`Self::server_public_key`].
@@ -3230,10 +3234,44 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         in_region_mut(&mut self.outposts, region, outpost_id)
     }
 
-    /// Remove the Outpost `outpost_id` names in `region`. See [`Self::remove_site`].
+    /// Remove the Outpost `outpost_id` names in `region`, and with it every record
+    /// this store keeps that exists only as part of that Outpost. See
+    /// [`Self::remove_site`].
+    ///
+    /// A record whose whole subject is the Outpost or something inside it has no
+    /// existence once the Outpost is gone, so it goes with the Outpost rather than
+    /// being left where nothing can reach it: nothing can name it any more, a read of
+    /// it would answer for an Outpost the store does not hold, and the slot it holds
+    /// in its own map would never come back to the store's ceiling
+    /// ([`MAX_RESOURCES`]). This store keeps two such records outside
+    /// [`OutpostRecord`] itself:
+    ///
+    /// * [`Self::capacity_tasks`] — a capacity task is a task OF an Outpost
+    ///   ([`CapacityTaskRecord::outpost_id`]), and every capacity-task route resolves
+    ///   that Outpost first. Every task left here is finished work: an unfinished one
+    ///   is the conflict a delete refuses on ([`Self::unfinished_work_on_outpost`]).
+    /// * [`Self::connections`] — a connection is the installation tunnel for ONE
+    ///   hardware asset ([`ConnectionRecord::asset_id`]), and an asset belongs to
+    ///   exactly one Outpost ([`OutpostRecord::assets`]), so a connection started for
+    ///   an asset of this Outpost installs hardware that is going away with it.
+    ///
+    /// Each is matched the way the operations that read it resolve it: a task by the
+    /// Outpost it names, and a connection by the asset it installs within the region
+    /// that Outpost's inventory belongs to (see [`RegionalRecord`]).
     pub fn remove_outpost(&mut self, region: &str, outpost_id: &str) -> Option<OutpostRecord> {
         in_region(&self.outposts, region, outpost_id)?;
-        self.outposts.remove(outpost_id)
+        let removed = self.outposts.remove(outpost_id)?;
+        self.capacity_tasks
+            .retain(|_, task| task.outpost_id != outpost_id);
+        let installed: BTreeSet<&str> = removed
+            .assets
+            .iter()
+            .filter_map(|asset| asset.asset_id.as_deref())
+            .collect();
+        self.connections.retain(|_, connection| {
+            connection.region != region || !installed.contains(connection.asset_id.as_str())
+        });
+        Some(removed)
     }
 
     /// Every Outpost of `region`, in the store's creation order — what
@@ -4687,6 +4725,10 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
     ///   connectivity configuration, its renewal pricing, its installed assets and
     ///   the instances recorded as running on it. None has an identity outside the
     ///   Outpost, so removing the Outpost leaves nothing of them behind to dangle.
+    /// * an installation connection started for one of those assets, which is a
+    ///   tunnel to hardware of this Outpost rather than work the service owes on it,
+    ///   and which the removal takes with the asset it installs
+    ///   ([`Self::remove_outpost`]).
     ///
     /// ONE piece of work, since the modelled `ConflictException` names one
     /// resource: an Outpost that holds both a running task and an outstanding order

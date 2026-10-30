@@ -81,6 +81,8 @@ mod orderable_instance_types;
 mod outpost_assets;
 #[path = "all/outpost_decommission.rs"]
 mod outpost_decommission;
+#[path = "all/outpost_deletion_cascade.rs"]
+mod outpost_deletion_cascade;
 #[path = "all/outpost_hardware_installation.rs"]
 mod outpost_hardware_installation;
 #[path = "all/outpost_hardware_type_change.rs"]
