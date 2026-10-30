@@ -330,20 +330,20 @@ async fn the_default_read_is_scoped_to_the_current_billing_period() {
         DefaultReadRow {
             case: "an association that ended before the current period",
             associated: Some(json!({
-                "InclusiveStartBillingPeriod": period(-3),
+                "InclusiveStartBillingPeriod": period(-1),
                 "ExclusiveEndBillingPeriod": period(0),
             })),
             by_default: None,
-            inside: (period(-2), Some(Some(period(0)))),
+            inside: (period(-1), Some(Some(period(0)))),
         },
         DefaultReadRow {
-            case: "an association wholly in past periods",
+            case: "an association wholly in past periods, spelled without a leading zero",
             associated: Some(json!({
-                "InclusiveStartBillingPeriod": period(-6),
-                "ExclusiveEndBillingPeriod": period(-3),
+                "InclusiveStartBillingPeriod": one_digit_month(&period(-1)),
+                "ExclusiveEndBillingPeriod": one_digit_month(&period(0)),
             })),
             by_default: None,
-            inside: (period(-5), Some(Some(period(-3)))),
+            inside: (period(-1), Some(Some(one_digit_month(&period(0))))),
         },
         DefaultReadRow {
             case: "an association that only starts in a later period",
@@ -482,8 +482,9 @@ struct ProbeRow {
     billing_period: String,
     /// Is the association made with NO range in effect in that period?
     open: bool,
-    /// Is the association the call bounded to `[period(-4), period(-1))` in effect in
-    /// it?
+    /// Is the association the call bounded to `[period(-1), period(0))` — the previous
+    /// billing period, the earliest one an association may be put in effect in — in
+    /// effect in it?
     backdated: bool,
 }
 
@@ -509,30 +510,24 @@ async fn a_period_before_the_association_does_not_report_it() {
         },
         ProbeRow {
             case: "the period before the backdated range starts",
-            billing_period: period(-5),
+            billing_period: period(-2),
             open: false,
             backdated: false,
         },
         ProbeRow {
             case: "the backdated range's inclusive start",
-            billing_period: period(-4),
-            open: false,
-            backdated: true,
-        },
-        ProbeRow {
-            case: "the period before the backdated range's exclusive end",
-            billing_period: period(-2),
-            open: false,
-            backdated: true,
-        },
-        ProbeRow {
-            case: "the backdated range's exclusive end",
             billing_period: period(-1),
             open: false,
-            backdated: false,
+            backdated: true,
         },
         ProbeRow {
-            case: "the current period",
+            case: "the backdated range's inclusive start, one-digit month",
+            billing_period: one_digit_month(&period(-1)),
+            open: false,
+            backdated: true,
+        },
+        ProbeRow {
+            case: "the current period, which is the backdated range's exclusive end",
             billing_period: period(0),
             open: true,
             backdated: false,
@@ -571,8 +566,8 @@ async fn a_period_before_the_association_does_not_report_it() {
             &target,
             &backdated,
             Some(json!({
-                "InclusiveStartBillingPeriod": period(-4),
-                "ExclusiveEndBillingPeriod": period(-1),
+                "InclusiveStartBillingPeriod": period(-1),
+                "ExclusiveEndBillingPeriod": period(0),
             })),
         )
         .await;

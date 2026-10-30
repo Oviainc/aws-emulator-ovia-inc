@@ -666,17 +666,19 @@ async fn a_request_level_fault_is_the_calls_own_modelled_error() {
     );
 
     // A range that does cover a period is accepted, and so is one with no end at all.
+    // Their starts are billing periods whose bill is not closed — the previous period is
+    // the earliest one a write may name.
     for (case, range) in [
         (
             "a one-period range",
             json!({
-                "InclusiveStartBillingPeriod": "2026-3",
-                "ExclusiveEndBillingPeriod": "2026-4",
+                "InclusiveStartBillingPeriod": period(0),
+                "ExclusiveEndBillingPeriod": period(1),
             }),
         ),
         (
-            "an open range",
-            json!({ "InclusiveStartBillingPeriod": "2026-3" }),
+            "an open range from the previous billing period",
+            json!({ "InclusiveStartBillingPeriod": period(-1) }),
         ),
     ] {
         let (status, body) = emulator

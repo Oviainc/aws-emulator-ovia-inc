@@ -26,7 +26,11 @@
 //! covering no period at all is dropped. A request that names NO range ends the
 //! association at the billing period the call is made in — it is disassociated from
 //! that period on, while the earlier periods it was in effect in are closed bills a
-//! read scoped to one of them still reports it for. A request that would leave one
+//! read scoped to one of them still reports it for. A range whose
+//! `InclusiveStartBillingPeriod` names a period whose bill is already closed — one
+//! before the previous billing period — is refused for the whole call, because the
+//! periods this write rewrites have to be periods no bill has been issued for. A request
+//! that would leave one
 //! association in effect over more separate stretches of billing periods than the store
 //! holds for one fails THAT resource with the modelled `SERVICE_LIMIT_EXCEEDED` reason
 //! and writes nothing for it.
@@ -291,6 +295,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(range) => {
                 if let Err((reason, field, message)) =
                     crate::state::check_billing_period_range_is_ordered(range)
+                {
+                    return Err(validation(reason, field, message));
+                }
+                // A disassociation REWRITES the billing periods the range names: the
+                // resource stops being reported for each of them and the charge a
+                // percentage item contributes to it is recomputed without the resource.
+                // A period whose bill is already closed is not one such a write may
+                // name, so a range starting there is refused and the stored
+                // associations are left exactly as they were — the same refusal the
+                // other operations taking this shape answer a start they may not act in
+                // with. How far FORWARD the range reaches is the request's to choose:
+                // the periods from the previous one on have no issued bill.
+                if let Err((reason, field, message)) =
+                    crate::state::check_billing_period_range_starts_in_an_open_bill(range)
                 {
                     return Err(validation(reason, field, message));
                 }

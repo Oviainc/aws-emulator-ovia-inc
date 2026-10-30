@@ -211,16 +211,17 @@ async fn a_re_association_puts_the_billing_periods_it_names_in_effect() {
                 "InclusiveStartBillingPeriod": period(0),
                 "ExclusiveEndBillingPeriod": period(1),
             })),
+            // The previous billing period is the earliest one a re-association may put
+            // back in effect: its bill is the oldest that is not closed.
             re_associated: Some(json!({
-                "InclusiveStartBillingPeriod": period(-2),
-                "ExclusiveEndBillingPeriod": period(-1),
+                "InclusiveStartBillingPeriod": period(-1),
+                "ExclusiveEndBillingPeriod": period(0),
             })),
             // A range sharing no period with what is left is a stretch of its own, and
             // it restores only the periods it names.
             probes: &[
-                (-3, None),
-                (-2, Some(Some(-1))),
-                (-1, None),
+                (-2, None),
+                (-1, Some(Some(0))),
                 (0, None),
                 (1, Some(None)),
             ],
@@ -368,10 +369,12 @@ async fn a_re_association_past_the_bound_on_separate_ranges_is_refused() {
         "case the first association: expected HTTP 200, got {status} with {body}"
     );
 
-    // Every other month from the one after the current period is disassociated, so each
-    // call punches a hole strictly inside a stretch the association already has and
-    // splits it in two: after `MAX_RANGES - 1` holes the association is in effect over
-    // exactly `MAX_RANGES` separate stretches.
+    // Every fourth month from the one after the current period begins a THREE-period
+    // hole, so each call punches a hole strictly inside a stretch the association
+    // already has and splits it in two: after `MAX_RANGES - 1` holes the association is
+    // in effect over exactly `MAX_RANGES` separate stretches. The holes are wider than
+    // one period so that a range can sit strictly inside one, touching neither of the
+    // stretches around it.
     for hole in 0..MAX_RANGES - 1 {
         let offset = i64::try_from(hole).expect("a stretch index fits in i64");
         disassociate(
@@ -380,8 +383,8 @@ async fn a_re_association_past_the_bound_on_separate_ranges_is_refused() {
             &target,
             &resource,
             Some(json!({
-                "InclusiveStartBillingPeriod": period(1 + offset * 2),
-                "ExclusiveEndBillingPeriod": period(2 + offset * 2),
+                "InclusiveStartBillingPeriod": period(1 + offset * 4),
+                "ExclusiveEndBillingPeriod": period(4 + offset * 4),
             })),
         )
         .await;
@@ -395,8 +398,8 @@ async fn a_re_association_past_the_bound_on_separate_ranges_is_refused() {
             &target,
             std::slice::from_ref(&resource),
             Some(json!({
-                "InclusiveStartBillingPeriod": period(-4),
-                "ExclusiveEndBillingPeriod": period(-3),
+                "InclusiveStartBillingPeriod": period(2),
+                "ExclusiveEndBillingPeriod": period(3),
             })),
         )
         .await;
@@ -414,7 +417,7 @@ async fn a_re_association_past_the_bound_on_separate_ranges_is_refused() {
         reported(&body, "SuccessfullyAssociatedResources").is_empty(),
         "case {case:?}: expected no resource reported associated, got {body}"
     );
-    let refused = ends_in_period(&emulator, case, &target, &resource, &period(-4)).await;
+    let refused = ends_in_period(&emulator, case, &target, &resource, &period(2)).await;
     assert!(
         refused.is_empty(),
         "case {case:?}: expected the refused call to write nothing, got {refused:?}"
@@ -429,7 +432,7 @@ async fn a_re_association_past_the_bound_on_separate_ranges_is_refused() {
             std::slice::from_ref(&resource),
             Some(json!({
                 "InclusiveStartBillingPeriod": period(1),
-                "ExclusiveEndBillingPeriod": period(2),
+                "ExclusiveEndBillingPeriod": period(4),
             })),
         )
         .await;
@@ -445,7 +448,7 @@ async fn a_re_association_past_the_bound_on_separate_ranges_is_refused() {
     let filled = ends_in_period(&emulator, case, &target, &resource, &period(1)).await;
     assert_eq!(
         filled,
-        vec![Some(period(3))],
+        vec![Some(period(5))],
         "case {case:?}: expected the filled hole to be in effect, ending where the next hole \
          begins, got {filled:?}"
     );

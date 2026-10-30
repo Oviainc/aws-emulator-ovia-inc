@@ -15,7 +15,10 @@
 //! An association is in effect over the BILLING PERIODS of the ranges the calls that
 //! associated the resource named, so a call puts the periods its `BillingPeriodRange`
 //! names in effect whether or not the item already holds the resource — the resource is
-//! held by ONE record either way. The operation is `@idempotent` on that union:
+//! held by ONE record either way. A range whose `InclusiveStartBillingPeriod` names a
+//! period whose bill is already closed — one before the previous billing period — is
+//! refused for the whole call, because a closed bill never acquires a resource that was
+//! not in it. The operation is `@idempotent` on that union:
 //! re-associating over periods already in effect changes nothing, so a retry (or a
 //! repeat inside one request) cannot double-count `AssociationSize`.
 //!
@@ -258,6 +261,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(range) = &input.billing_period_range {
             if let Err((reason, field, message)) =
                 crate::state::check_billing_period_range_is_ordered(range)
+            {
+                return Err(validation(reason, field, message));
+            }
+            // An association WRITES the billing periods the range names: in each of them
+            // the resource is reported for the item and enters the charge a percentage
+            // item contributes to that period. A period whose bill is already closed is
+            // not one such a write may name — a closed bill never acquires a resource
+            // that was not in it — so a range starting there is refused and no
+            // association is written, the same refusal the other operations taking this
+            // shape answer a start they may not act in with. How far FORWARD the range
+            // reaches is the request's to choose: the periods from the previous one on
+            // have no issued bill.
+            if let Err((reason, field, message)) =
+                crate::state::check_billing_period_range_starts_in_an_open_bill(range)
             {
                 return Err(validation(reason, field, message));
             }

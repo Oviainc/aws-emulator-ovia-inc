@@ -27,6 +27,8 @@ mod associate_pricing_rules;
 mod auto_associate_billing_group_cap;
 #[path = "all/batch_disassociate_resources_from_custom_line_item.rs"]
 mod batch_disassociate_resources_from_custom_line_item;
+#[path = "all/batch_resource_association_closed_billing_period.rs"]
+mod batch_resource_association_closed_billing_period;
 #[path = "all/billing_family_membership.rs"]
 mod billing_family_membership;
 #[path = "all/billing_group_account_grouping_validation.rs"]
