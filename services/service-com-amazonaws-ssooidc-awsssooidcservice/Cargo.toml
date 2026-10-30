@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The IAM Identity Center instances of this account, whose access portal is what a
+# device authorization's `startUrl` has to name: the instances are IAM Identity
+# Center's own records, so this service resolves the portal against them rather
+# than keeping a second copy of them.
+service-com-amazonaws-ssoadmin-swbexternalservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

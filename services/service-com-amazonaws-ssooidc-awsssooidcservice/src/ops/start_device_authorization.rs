@@ -180,9 +180,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // `startUrl` is the portal the user is sent to, so it must be a URI the
-        // user agent can actually open.
-        if !st::is_absolute_uri(&input.start_url) {
+        let now = SystemTime::now();
+        let region = st::request_region(ctx.parts());
+
+        // `startUrl` is "The URL for the Amazon Web Services access portal": the
+        // page the user is sent to in order to approve this device. A portal
+        // exists only for an IAM Identity Center instance of the account, so a
+        // URL that names no instance's portal — whatever its form — names
+        // nothing this authorization could ever be approved at. It is settled
+        // FIRST, before any credential is read and before anything is minted or
+        // stored.
+        //
+        // Resolving the portal settles the account's IAM Identity Center
+        // enablement, as every call that resolves an instance does, so a request
+        // refused here has still found the account its one ambient instance —
+        // the enablement is the account's, not this request's, and the refusal
+        // adds nothing of its own to any store.
+        let names_portal = st::names_account_access_portal(
+            &*self.engine,
+            &input.start_url,
+            &region,
+            now,
+        )
+        .ok_or_else(|| {
+            // The instances could not be reached at all: a fault of this service,
+            // answered as one rather than as a refusal of the request.
+            modeled(StartDeviceAuthorizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("server_error".to_string()),
+                    error_description: Some(st::DESCRIPTION_SERVER_ERROR.to_string()),
+                },
+            ))
+        })?;
+        if !names_portal {
             return Err(modeled(
                 StartDeviceAuthorizationErrorModeled::InvalidRequestException(
                     InvalidRequestException {
@@ -194,8 +224,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let now = SystemTime::now();
-        let region = st::request_region(ctx.parts());
         let mut store = state.lock();
         // Reclaim the authorizations that can no longer be exchanged. The store's
         // capacity is checked further down, just before the record is inserted:

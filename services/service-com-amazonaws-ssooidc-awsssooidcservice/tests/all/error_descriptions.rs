@@ -28,7 +28,7 @@ use ssooidc::state::{
 };
 use service_com_amazonaws_ssooidc_awsssooidcservice as ssooidc;
 
-use crate::device_authorization_flow::{assert_failure, text, Emulator, REGION, START_URL};
+use crate::device_authorization_flow::{assert_failure, start_url, text, Emulator, REGION};
 
 /// The route `RegisterClient` is bound to.
 const REGISTER_PATH: &str = "/client/register";
@@ -504,7 +504,7 @@ async fn every_refusal_answers_the_fixed_description_of_its_class() {
             json!({
                 "clientId": "client-id-that-was-never-registered",
                 "clientSecret": "client-secret-that-was-never-issued",
-                "startUrl": START_URL,
+                "startUrl": start_url(),
             }),
             401,
             "InvalidClientException",
@@ -539,7 +539,7 @@ async fn an_invalid_client_refusal_names_the_member_of_the_pair_at_fault() {
         .start_device_authorization(&json!({
             "clientId": first_id,
             "clientSecret": first_secret,
-            "startUrl": START_URL,
+            "startUrl": start_url(),
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
@@ -554,7 +554,7 @@ async fn an_invalid_client_refusal_names_the_member_of_the_pair_at_fault() {
         })
     };
     let start = |client_id: &str, secret: &str| {
-        json!({"clientId": client_id, "clientSecret": secret, "startUrl": START_URL})
+        json!({"clientId": client_id, "clientSecret": secret, "startUrl": start_url()})
     };
 
     let rows = vec![

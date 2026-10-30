@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_ssoadmin_swbexternalservice as identity_center;
 use service_com_amazonaws_ssooidc_awsssooidcservice as ssooidc;
 use ssooidc::state::{
     ACCESS_TOKEN_EXPIRES_IN, APPROVAL_DELAY, CLIENT_SECRET_LIFETIME, DEVICE_CODE_EXPIRES_IN,
@@ -22,8 +23,13 @@ use ssooidc::state::{
 
 /// The region most cases sign for; the region table below varies it.
 pub(crate) const REGION: &str = "us-west-2";
-/// The portal a device flow starts from.
-pub(crate) const START_URL: &str = "https://my-sso-portal.awsapps.com/start";
+/// The portal a device flow starts from: the access portal of the account's IAM
+/// Identity Center instance, which is the only portal a device authorization can
+/// be approved at. Derived from the instance's identity store, never written out
+/// as a URL literal.
+pub(crate) fn start_url() -> String {
+    ssooidc::state::access_portal_url(identity_center::state::SEED_IDENTITY_STORE_ID)
+}
 /// Long enough for the approval the clock owes a pending authorization to come due.
 pub(crate) const PAST_APPROVAL: Duration = APPROVAL_DELAY.saturating_add(Duration::from_millis(250));
 
@@ -45,6 +51,19 @@ impl Emulator {
 
     /// POST `path` in `region` and return the status and the parsed JSON body.
     pub(crate) async fn post(&self, path: &str, region: &str, body: &Value) -> (u16, Value) {
+        let (status, _error_type, body) = self.post_with_error_type(path, region, body).await;
+        (status, body)
+    }
+
+    /// POST `path` in `region` and return the status, the `x-amzn-errortype` header the
+    /// restJson1 error shape is named by, and the parsed JSON body — for a case that
+    /// asserts the whole error response and not only its body.
+    pub(crate) async fn post_with_error_type(
+        &self,
+        path: &str,
+        region: &str,
+        body: &Value,
+    ) -> (u16, Option<String>, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=EMULATORAKTEST/20260101/{region}/sso-oauth/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=0123456789abcdef"
@@ -56,7 +75,7 @@ impl Emulator {
             .header("authorization", authorization)
             .body(bytes::Bytes::from(body.to_string()))
             .expect("the request builds");
-        self.send(request).await
+        self.dispatch(request).await
     }
 
     /// Dispatch `request` through the router and return the status and the parsed JSON
@@ -67,9 +86,24 @@ impl Emulator {
     /// addressed to a host that names no service — through exactly the path every case
     /// here uses.
     pub(crate) async fn send(&self, request: http::Request<bytes::Bytes>) -> (u16, Value) {
+        let (status, _error_type, body) = self.dispatch(request).await;
+        (status, body)
+    }
+
+    /// Dispatch `request` and report the status, the `x-amzn-errortype` header and the
+    /// parsed JSON body.
+    async fn dispatch(
+        &self,
+        request: http::Request<bytes::Bytes>,
+    ) -> (u16, Option<String>, Value) {
         let path = request.uri().path().to_string();
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let body = if response.body().is_empty() {
             Value::Null
         } else {
@@ -80,11 +114,27 @@ impl Emulator {
                 )
             })
         };
-        (status, body)
+        (status, error_type, body)
     }
 
-    async fn register_client(&self, body: &Value) -> (u16, Value) {
+    pub(crate) async fn register_client(&self, body: &Value) -> (u16, Value) {
         self.post("/client/register", REGION, body).await
+    }
+
+    /// The access portal of the account's IAM Identity Center instance, read off the
+    /// instance records IAM Identity Center holds in this same engine — the one portal a
+    /// device authorization of this account can be approved at.
+    pub(crate) fn account_portal_url(&self) -> String {
+        let identity_center = identity_center::state::service_state(&*self.engine)
+            .expect("the IAM Identity Center state is reachable");
+        let mut identity_center = identity_center.lock();
+        identity_center.on_request(REGION, SystemTime::now());
+        let instance = identity_center
+            .instances
+            .values()
+            .next()
+            .expect("the account holds an IAM Identity Center instance");
+        ssooidc::state::access_portal_url(&instance.identity_store_id)
     }
 
     pub(crate) async fn start_device_authorization(&self, body: &Value) -> (u16, Value) {
@@ -158,7 +208,7 @@ pub(crate) async fn device_flow_token(
         .start_device_authorization(&json!({
             "clientId": client_id,
             "clientSecret": client_secret,
-            "startUrl": START_URL,
+            "startUrl": start_url(),
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
@@ -294,21 +344,32 @@ async fn register_client_mints_a_distinct_persisted_pair_for_every_registration(
             "case {case:?}: expected the secret to expire {lifetime} seconds after it was issued, got {expires_at} - {issued_at}"
         );
 
-        // The endpoints are computed: from the client's own issuer when it named
-        // one, else from this service's endpoint in the request's region.
-        let base = body["issuerUrl"].as_str().map_or_else(
-            || format!("https://oidc.{REGION}.amazonaws.com"),
-            |issuer| issuer.trim_end_matches('/').to_string(),
-        );
+        // The authorization-code endpoints are reported only for a registration
+        // that declared that grant, and are then computed: from the client's own
+        // issuer when it named one, else from this service's endpoint in the
+        // request's region.
+        let declares_authorization_code = body["grantTypes"]
+            .as_array()
+            .is_some_and(|grants| grants.iter().any(|g| g == GRANT_TYPE_AUTHORIZATION_CODE));
+        let expected_endpoints = declares_authorization_code.then(|| {
+            let base = body["issuerUrl"].as_str().map_or_else(
+                || format!("https://oidc.{REGION}.amazonaws.com"),
+                |issuer| issuer.trim_end_matches('/').to_string(),
+            );
+            (format!("{base}/authorize"), format!("{base}/token"))
+        });
         assert_eq!(
-            text(&response, "tokenEndpoint"),
-            format!("{base}/token"),
-            "case {case:?}: tokenEndpoint was not computed from {base}: {response}"
-        );
-        assert_eq!(
-            text(&response, "authorizationEndpoint"),
-            format!("{base}/authorize"),
-            "case {case:?}: authorizationEndpoint was not computed from {base}: {response}"
+            (
+                response["authorizationEndpoint"].as_str(),
+                response["tokenEndpoint"].as_str()
+            ),
+            expected_endpoints
+                .as_ref()
+                .map_or((None, None), |(authorize, token)| (
+                    Some(authorize.as_str()),
+                    Some(token.as_str())
+                )),
+            "case {case:?}: expected the endpoints {expected_endpoints:?}, got {response}"
         );
 
         // The pair is accepted...
@@ -316,7 +377,7 @@ async fn register_client_mints_a_distinct_persisted_pair_for_every_registration(
             .start_device_authorization(&json!({
                 "clientId": client_id,
                 "clientSecret": client_secret,
-                "startUrl": START_URL,
+                "startUrl": start_url(),
             }))
             .await;
         assert_eq!(
@@ -329,7 +390,7 @@ async fn register_client_mints_a_distinct_persisted_pair_for_every_registration(
             .start_device_authorization(&json!({
                 "clientId": client_id,
                 "clientSecret": format!("{client_secret}-tampered"),
-                "startUrl": START_URL,
+                "startUrl": start_url(),
             }))
             .await;
         assert_failure(
@@ -344,7 +405,7 @@ async fn register_client_mints_a_distinct_persisted_pair_for_every_registration(
             .start_device_authorization(&json!({
                 "clientId": "never-registered-client",
                 "clientSecret": client_secret,
-                "startUrl": START_URL,
+                "startUrl": start_url(),
             }))
             .await;
         assert_failure(
@@ -499,7 +560,7 @@ async fn register_client_records_the_metadata_it_is_handed() {
             .start_device_authorization(&json!({
                 "clientId": client_id,
                 "clientSecret": client_secret,
-                "startUrl": START_URL,
+                "startUrl": start_url(),
             }))
             .await;
         assert_eq!(
@@ -530,7 +591,7 @@ async fn start_device_authorization_computes_the_codes_from_the_region_and_persi
                 &json!({
                     "clientId": client_id,
                     "clientSecret": client_secret,
-                    "startUrl": START_URL,
+                    "startUrl": start_url(),
                 }),
             )
             .await;
@@ -592,7 +653,7 @@ async fn start_device_authorization_computes_the_codes_from_the_region_and_persi
             .unwrap_or_else(|| panic!("case {region:?}: the deviceCode was not persisted"));
         assert_eq!(
             (stored.client_id.as_str(), stored.start_url.as_str()),
-            (client_id.as_str(), START_URL),
+            (client_id.as_str(), start_url().as_str()),
             "case {region:?}: the stored record is bound to the wrong client: {stored:?}"
         );
         assert_eq!(
@@ -634,7 +695,7 @@ async fn the_device_flow_runs_end_to_end_from_persisted_state() {
         .start_device_authorization(&json!({
             "clientId": client_id,
             "clientSecret": client_secret,
-            "startUrl": START_URL,
+            "startUrl": start_url(),
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
@@ -938,7 +999,7 @@ async fn create_token_answers_each_grant_from_the_state_it_resolves() {
         .start_device_authorization(&json!({
             "clientId": scoped_id,
             "clientSecret": scoped_secret,
-            "startUrl": START_URL,
+            "startUrl": start_url(),
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
@@ -994,7 +1055,7 @@ async fn a_device_authorization_past_its_lifetime_is_an_expired_token() {
             .start_device_authorization(&json!({
                 "clientId": client_id,
                 "clientSecret": client_secret,
-                "startUrl": START_URL,
+                "startUrl": start_url(),
             }))
             .await;
         assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
@@ -1063,7 +1124,7 @@ async fn a_registrations_grant_types_decide_only_whether_a_refresh_token_is_mint
             .start_device_authorization(&json!({
                 "clientId": client_id,
                 "clientSecret": client_secret,
-                "startUrl": START_URL,
+                "startUrl": start_url(),
             }))
             .await;
         assert_eq!(
@@ -1127,7 +1188,7 @@ async fn spent_records_are_reclaimed_rather_than_held_for_ever() {
         .start_device_authorization(&json!({
             "clientId": client_id,
             "clientSecret": client_secret,
-            "startUrl": START_URL,
+            "startUrl": start_url(),
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
@@ -1152,7 +1213,7 @@ async fn spent_records_are_reclaimed_rather_than_held_for_ever() {
         .start_device_authorization(&json!({
             "clientId": client_id,
             "clientSecret": client_secret,
-            "startUrl": START_URL,
+            "startUrl": start_url(),
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {second}");
@@ -1296,7 +1357,7 @@ async fn a_refresh_cannot_widen_the_scope_it_was_granted() {
         .start_device_authorization(&json!({
             "clientId": client_id,
             "clientSecret": client_secret,
-            "startUrl": START_URL,
+            "startUrl": start_url(),
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");

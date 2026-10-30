@@ -21,7 +21,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_ssooidc_awsssooidcservice as ssooidc;
 use ssooidc::state::GRANT_TYPE_DEVICE_CODE;
 
-use crate::device_authorization_flow::{error_shape, text, Emulator, START_URL};
+use crate::device_authorization_flow::{error_shape, start_url, text, Emulator};
 
 /// The router's own refusal when NO registered service claims a request: no service was
 /// named and no modelled route attributed it either.
@@ -195,7 +195,7 @@ async fn an_unsigned_request_routes_by_the_modelled_route_it_addresses() {
                 &json!({
                     "clientId": client_id,
                     "clientSecret": client_secret,
-                    "startUrl": START_URL,
+                    "startUrl": start_url(),
                 }),
             ))
             .await;
@@ -452,7 +452,7 @@ async fn authentication_decides_the_signature_and_the_claim_decides_the_service(
             &json!({
                 "clientId": client_id,
                 "clientSecret": client_secret,
-                "startUrl": START_URL,
+                "startUrl": start_url(),
             }),
         ),
     )

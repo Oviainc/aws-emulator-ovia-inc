@@ -21,7 +21,7 @@ use ssooidc::state::{
 use service_com_amazonaws_ssooidc_awsssooidcservice as ssooidc;
 
 use crate::device_authorization_flow::{
-    assert_failure, device_flow_token, seconds, text, Emulator, REGION,
+    assert_failure, device_flow_token, seconds, start_url, text, Emulator, REGION,
 };
 
 /// The route `CreateTokenWithIAM` is bound to: the `/token` path of `CreateToken` with
@@ -635,7 +635,7 @@ async fn a_token_issued_in_another_region_is_refused_with_that_regions_endpoint(
         .start_device_authorization(&json!({
             "clientId": client_id,
             "clientSecret": client_secret,
-            "startUrl": "https://my-sso-portal.awsapps.com/start",
+            "startUrl": start_url(),
         }))
         .await;
     assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");

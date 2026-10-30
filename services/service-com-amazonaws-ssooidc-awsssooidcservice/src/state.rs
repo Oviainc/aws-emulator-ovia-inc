@@ -15,6 +15,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// IAM Identity Center's own control plane, which holds the account's instances:
+/// the access portal a device authorization's `startUrl` names belongs to one of
+/// them.
+use service_com_amazonaws_ssoadmin_swbexternalservice as identity_center;
+
 /// The only `clientType` the service accepts: "The service supports only public
 /// as a client type. Anything other than public will be rejected by the
 /// service." (`RegisterClientRequest$clientType` documentation).
@@ -823,13 +828,84 @@ pub fn mint_user_code() -> String {
     format!("{head}-{tail}")
 }
 
-/// Whether `value` is an absolute URI: the `URI` shapes this service takes
-/// (`startUrl`, `issuerUrl`, a redirect URI) address a remote endpoint, so each
-/// needs a scheme and an authority.
-pub fn is_absolute_uri(value: &str) -> bool {
-    value
-        .parse::<http::Uri>()
-        .is_ok_and(|uri| uri.scheme().is_some() && uri.authority().is_some())
+/// The DNS suffix every Amazon Web Services access portal is served under. A
+/// portal is `https://<subdomain>.awsapps.com/start`, where the subdomain is
+/// the IAM Identity Center instance's identity store id ("Using the Amazon Web
+/// Services access portal", the guide
+/// `StartDeviceAuthorizationRequest$startUrl` points at).
+pub const ACCESS_PORTAL_HOST_SUFFIX: &str = ".awsapps.com";
+
+/// The path an access portal is served at under its own host; the portal's own
+/// page may address a path or a fragment below it.
+pub const ACCESS_PORTAL_PATH: &str = "/start";
+
+/// The access portal of the IAM Identity Center instance whose identity store is
+/// `identity_store_id`.
+pub fn access_portal_url(identity_store_id: &str) -> String {
+    format!("https://{identity_store_id}{ACCESS_PORTAL_HOST_SUFFIX}{ACCESS_PORTAL_PATH}")
+}
+
+/// The portal subdomain `value` addresses, when `value` is the URL of an Amazon
+/// Web Services access portal at all: `https`, ONE subdomain label under
+/// [`ACCESS_PORTAL_HOST_SUFFIX`], and [`ACCESS_PORTAL_PATH`] or a path below it.
+pub fn access_portal_subdomain(value: &str) -> Option<String> {
+    // A portal URL is copied out of the console with the portal page's own
+    // fragment (`/start/#/`), which is not part of a request target and so not
+    // part of the URI a client parses.
+    let addressed = value.split('#').next().unwrap_or(value);
+    let uri = addressed.parse::<http::Uri>().ok()?;
+    if uri.scheme_str() != Some("https") {
+        return None;
+    }
+    let subdomain = uri
+        .host()?
+        .to_ascii_lowercase()
+        .strip_suffix(ACCESS_PORTAL_HOST_SUFFIX)?
+        .to_string();
+    if subdomain.is_empty() || subdomain.contains('.') {
+        return None;
+    }
+    let path = uri.path();
+    let addresses_portal = path == ACCESS_PORTAL_PATH
+        || path
+            .strip_prefix(ACCESS_PORTAL_PATH)
+            .is_some_and(|below| below.starts_with('/'));
+    addresses_portal.then_some(subdomain)
+}
+
+/// Whether `start_url` names the access portal of an IAM Identity Center
+/// instance this account holds, or `None` when IAM Identity Center's instances
+/// are not reachable at all — which is a fault of this service and not of the
+/// request, so the caller answers its modelled server error for it rather than
+/// refusing the `startUrl`.
+///
+/// `startUrl` is "The URL for the Amazon Web Services access portal": the page
+/// the user approves the device at. A portal exists only for an IAM Identity
+/// Center instance, and the instances of the account are IAM Identity Center's
+/// own records — so they are read where they live rather than copied here, and a
+/// URL that addresses no portal of them names nothing a device authorization
+/// could ever be approved at.
+pub fn names_account_access_portal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    start_url: &str,
+    region: &str,
+    now: SystemTime,
+) -> Option<bool> {
+    let identity_center = identity_center::state::service_state(engine)?;
+    let Some(subdomain) = access_portal_subdomain(start_url) else {
+        return Some(false);
+    };
+    let mut identity_center = identity_center.lock();
+    // The account's IAM Identity Center enablement is decided by the first
+    // request that needs an instance — this request needs one — and the same
+    // call applies every transition the clock already owes those instances.
+    identity_center.on_request(region, now);
+    Some(
+        identity_center
+            .instances
+            .values()
+            .any(|instance| instance.identity_store_id.eq_ignore_ascii_case(&subdomain)),
+    )
 }
 
 /// The device-verification page IAM Identity Center sends a device-flow client

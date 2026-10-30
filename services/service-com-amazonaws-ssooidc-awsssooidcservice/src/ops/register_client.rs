@@ -261,21 +261,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_secret_expires_at,
         };
 
-        // The endpoints the registration is told to use: the client's own issuer
-        // when it named one, else this service's endpoint in the request's region.
-        let base = client
-            .issuer_url
-            .clone()
-            .unwrap_or_else(|| st::oidc_endpoint(&st::request_region(ctx.parts())));
-        let base = base.trim_end_matches('/').to_string();
+        // `authorizationEndpoint` is "an endpoint that the client can use to
+        // request authorization" and `tokenEndpoint` one it can "use to create
+        // tokens": both are OPTIONAL members of the response, and the pair is
+        // only ever something a registration can act on when that registration
+        // declared the authorization-code grant — the one flow that sends a user
+        // agent to an authorization endpoint and then redeems the code it
+        // redirects back. A registration that declared no such grant (a bare
+        // device-code registration, or one that named no `grantTypes` at all) is
+        // answered with both members ABSENT rather than with URLs it has no flow
+        // for. When they are reported, they are computed from the registration's
+        // own issuer when it named one, else from this service's endpoint in the
+        // region the request is addressed to.
+        let serves_authorization_code = client
+            .grant_types
+            .iter()
+            .any(|grant| grant == st::GRANT_TYPE_AUTHORIZATION_CODE);
+        let authorization_base = serves_authorization_code.then(|| {
+            let base = client
+                .issuer_url
+                .clone()
+                .unwrap_or_else(|| st::oidc_endpoint(&st::request_region(ctx.parts())));
+            base.trim_end_matches('/').to_string()
+        });
 
         let output = RegisterClientOutput {
             client_id: Some(client.client_id.clone()),
             client_secret: Some(client.client_secret.clone()),
             client_id_issued_at,
             client_secret_expires_at,
-            authorization_endpoint: Some(format!("{base}/authorize")),
-            token_endpoint: Some(format!("{base}/token")),
+            authorization_endpoint: authorization_base
+                .as_deref()
+                .map(|base| format!("{base}/authorize")),
+            token_endpoint: authorization_base
+                .as_deref()
+                .map(|base| format!("{base}/token")),
         };
 
         let mut store = state.lock();

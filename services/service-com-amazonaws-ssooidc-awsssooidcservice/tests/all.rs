@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/anonymous_routing.rs"]
 mod anonymous_routing;
+#[path = "all/aws_response_contract.rs"]
+mod aws_response_contract;
 #[path = "all/create_token_with_iam.rs"]
 mod create_token_with_iam;
 #[path = "all/device_authorization_flow.rs"]
