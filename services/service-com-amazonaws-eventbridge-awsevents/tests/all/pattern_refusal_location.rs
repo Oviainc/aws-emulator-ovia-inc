@@ -12,6 +12,10 @@
 //!   pattern exactly as submitted>"; line: <n>, column: <c>]` — every part of it
 //!   derived from the request, the position being the one just past the text the
 //!   validator had to read to find the fault;
+//! * text that is not JSON at all is refused with the PARSE's own diagnostic: the
+//!   character it stopped on and what was expected there, the whole word it does
+//!   not recognise, or what was left unclosed when the text ran out — at the
+//!   position the parse reports, whose column counts bytes;
 //! * the same pattern answers the same message whichever operation was handed it,
 //!   because one validator reads them all (`TestEventPattern`, `PutRule`,
 //!   `CreateArchive`, `UpdateArchive`);
@@ -331,6 +335,59 @@ fn location_rows() -> Vec<Row> {
             reason: r#""source" must be an object or an array"#,
             read: "{\"source\": \"",
         },
+        // Text that is not JSON at all is refused by the JSON READER, which
+        // states the character it stopped on and what it was expecting there.
+        Row {
+            case: "a word where a member name was due",
+            pattern: "{ bad json",
+            reason: "Unexpected character ('b' (code 98)): was expecting double-quote to start \
+                     field name",
+            read: "{ ",
+        },
+        Row {
+            case: "a member name with no colon after it",
+            pattern: r#"{"source" ["com.demo.orders"]}"#,
+            reason: "Unexpected character ('[' (code 91)): was expecting a colon to separate \
+                     field name and value",
+            read: r#"{"source" "#,
+        },
+        Row {
+            case: "two members with no comma between them",
+            pattern: r#"{"source": ["a"] "detail-type": ["b"]}"#,
+            reason: "Unexpected character ('\"' (code 34)): was expecting comma to separate \
+                     Object entries",
+            read: r#"{"source": ["a"] "#,
+        },
+        Row {
+            case: "two list elements with no comma between them",
+            pattern: r#"{"source": ["a" "b"]}"#,
+            reason: "Unexpected character ('\"' (code 34)): was expecting comma to separate \
+                     Array entries",
+            read: r#"{"source": ["a" "#,
+        },
+        Row {
+            case: "a member with no value at all",
+            pattern: r#"{"source": }"#,
+            reason: "Unexpected character ('}' (code 125)): was expecting a valid value (JSON \
+                     String, Number, Array, Object or token 'null', 'true' or 'false')",
+            read: r#"{"source": "#,
+        },
+        Row {
+            // A word where a value belongs is named WHOLE, so the position is
+            // the one the word STARTS at.
+            case: "a token the language does not define, inside a term list",
+            pattern: r#"{"source": [nul]}"#,
+            reason: "Unrecognized token 'nul': was expecting (JSON String, Number, Array, Object \
+                     or token 'null', 'true' or 'false')",
+            read: r#"{"source": ["#,
+        },
+        Row {
+            case: "a pattern that is one bare word",
+            pattern: "not json",
+            reason: "Unrecognized token 'not': was expecting (JSON String, Number, Array, Object \
+                     or token 'null', 'true' or 'false')",
+            read: "",
+        },
     ]
 }
 
@@ -374,6 +431,119 @@ async fn a_refused_pattern_states_the_reason_and_where_in_the_pattern_it_stopped
             error_message(&body)
         );
     }
+}
+
+/// A pattern whose text ENDS before the JSON it begins is complete names what
+/// the parse was still reading when it ran out of text: the collection or string
+/// whose close marker never came.
+///
+/// The rows span the class: an object left open, the list inside it left open,
+/// and a string — a value's and a member name's — left unterminated.
+#[tokio::test]
+async fn a_pattern_that_ends_mid_json_names_what_was_left_unclosed() {
+    let router = emulator();
+    let event = envelope(json!({ "k": "ok" }));
+    // (case, the pattern, the reason the refusal states)
+    let rows: [(&str, &str, &str); 4] = [
+        (
+            "an object left open",
+            r#"{"source": ["a"]"#,
+            "Unexpected end-of-input: expected close marker for Object",
+        ),
+        (
+            "the list inside it left open",
+            r#"{"source": ["a""#,
+            "Unexpected end-of-input: expected close marker for Array",
+        ),
+        (
+            "a value string left unterminated",
+            r#"{"source": ["a"#,
+            "Unexpected end-of-input: expected close marker for String",
+        ),
+        (
+            "a member name left unterminated",
+            r#"{"sou"#,
+            "Unexpected end-of-input: expected close marker for String",
+        ),
+    ];
+
+    for (case, pattern, reason) in rows {
+        let (status, body) = events(
+            &router,
+            "TestEventPattern",
+            &json!({ "EventPattern": pattern, "Event": event }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidEventPatternException",
+            "case {case:?}: expected InvalidEventPatternException, got {body}"
+        );
+        // The parse ran out of text, so the position it reports is the end of
+        // the pattern it was given, counted in bytes like every column it
+        // reports.
+        let expected = format!(
+            "Event pattern is not valid. Reason: {reason}\n at [Source: (String)\"{pattern}\"; \
+             line: 1, column: {}]",
+            pattern.len()
+        );
+        assert_eq!(
+            error_message(&body),
+            expected,
+            "case {case:?}: expected the refusal to state {expected:?}, got {:?}",
+            error_message(&body)
+        );
+    }
+}
+
+/// The position an UNREADABLE pattern reports is the parse's own, and a parser
+/// counts a column in BYTES, so a multi-byte character before the fault counts
+/// as the bytes it occupies rather than as one character.
+#[tokio::test]
+async fn an_unreadable_pattern_reports_the_position_the_parse_stopped_at() {
+    let router = emulator();
+    let event = envelope(json!({ "k": "ok" }));
+    // A member name with no colon after it, with a multi-byte character in the
+    // text the parse read to get there.
+    let pattern = "{\"d\u{e9}tail\": {\"k\" [\"ok\"]}}";
+    let read = "{\"d\u{e9}tail\": {\"k\" ";
+    assert!(
+        pattern.starts_with(read),
+        "the prefix {read:?} must be a prefix of {pattern:?}"
+    );
+    let expected = format!(
+        "Event pattern is not valid. Reason: Unexpected character ('[' (code 91)): was expecting \
+         a colon to separate field name and value\n at [Source: (String)\"{pattern}\"; line: 1, \
+         column: {}]",
+        read.len() + 1
+    );
+    assert!(
+        read.len() > read.chars().count(),
+        "the row only states the byte convention if the prefix is multi-byte, got {read:?}"
+    );
+
+    let (status, body) = events(
+        &router,
+        "TestEventPattern",
+        &json!({ "EventPattern": pattern, "Event": event }),
+    )
+    .await;
+    assert_eq!(status, 400, "expected HTTP 400, got {status} {body}");
+    assert_eq!(
+        error_code(&body),
+        "InvalidEventPatternException",
+        "expected InvalidEventPatternException, got {body}"
+    );
+    assert_eq!(
+        error_message(&body),
+        expected,
+        "expected the refusal to state {expected:?}, got {:?}",
+        error_message(&body)
+    );
 }
 
 /// A `cidr` operand is read by the ADDRESS parser rather than by the pattern

@@ -15,11 +15,12 @@
 //! `InvalidEventPatternException`, validated through the SAME interpreter
 //! `PutRule` and `TestEventPattern` use.
 //!
-//! A created archive is answered in `CREATING` and reaches
-//! [`crate::state::ARCHIVE_STATE_ENABLED`]
-//! [`crate::state::ARCHIVE_TRANSITION`] later, which is what "incoming events
-//! might not immediately start being sent to the archive" means: a caller acting
-//! straight after the call still observes the transient state.
+//! A created archive is answered in
+//! [`crate::state::ARCHIVE_STATE_ENABLED`]: the create provisions it, so the
+//! state the call answers is the settled one `DescribeArchive` and
+//! `ListArchives` go on reporting, and it captures what its bus routes from that
+//! instant on. "Incoming events might not immediately start being sent to the
+//! archive" is about how soon ingestion catches up, not a state a reader sees.
 //!
 //! The archive is served by a MANAGED rule on its source bus
 //! ([`crate::state::archive_rule`]), whose `EventPattern` mirrors the archive's,

@@ -285,8 +285,8 @@ async fn given_scenario(emulator: &Emulator, label: &str) -> Scenario {
         "case {label}: CreateArchive answered {status} {body}"
     );
     let archive_arn = member(label, &body, "ArchiveArn");
-    // An archive captures nothing until it has reached `ENABLED`.
-    ::tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
+    // The archive is capturing from the create on; the read confirms the state
+    // the create answered.
     let (status, body) = events(
         emulator,
         "DescribeArchive",

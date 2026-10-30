@@ -1358,31 +1358,16 @@ pub fn reported_http_parameters(parameters: &ConnectionHttpParameters) -> Connec
     }
 }
 
-/// The `ArchiveState` an archive is created in: "CREATING".
-pub const ARCHIVE_STATE_CREATING: &str = "CREATING";
-
-/// The `ArchiveState` an archive that is capturing events is in.
+/// The settled `ArchiveState` of an archive that is capturing events.
+///
+/// An archive is provisioned by the call that writes it: `CreateArchive` and
+/// `UpdateArchive` both answer the archive in this state, and every reader
+/// (`DescribeArchive`, `ListArchives`) reports the state stored for the archive,
+/// so a client polling for a terminal `ArchiveState` is already done when the
+/// write returns. "Incoming events might not immediately start being sent to the
+/// archive" (`CreateArchive`) is about ingestion latency, not about a transient
+/// state a reader observes.
 pub const ARCHIVE_STATE_ENABLED: &str = "ENABLED";
-
-/// The `ArchiveState` an archive an `UpdateArchive` has just changed is in.
-///
-/// The update is applied to the archive and then takes effect on its ingestion,
-/// the way a create does ("allow a short period of time for changes to take
-/// effect", `CreateArchive`), so the call answers this non-terminal state and the
-/// archive reaches [`ARCHIVE_STATE_ENABLED`] again [`ARCHIVE_TRANSITION`] later
-/// ([`ComAmazonawsEventbridgeAwseventsState::settle_archives`]).
-pub const ARCHIVE_STATE_UPDATING: &str = "UPDATING";
-
-/// How long after `CreateArchive` the archive's `ENABLED` state becomes due.
-///
-/// "When you create an archive, incoming events might not immediately start
-/// being sent to the archive. Allow a short period of time for changes to take
-/// effect" (`CreateArchive`), so an archive answered in `CREATING` reaches
-/// `ENABLED` a moment later rather than instantly. AWS publishes no duration for
-/// it; this is the emulator's own span, chosen inside the 250–750 ms window the
-/// project fixes for a clock-owed transition, and it is stored as a DUE INSTANT
-/// rather than waited for.
-pub const ARCHIVE_TRANSITION: Duration = Duration::from_millis(400);
 
 /// Largest number of archives this store holds.
 ///
@@ -1446,9 +1431,6 @@ pub struct ArchiveRecord {
     pub state: String,
     pub state_reason: Option<String>,
     pub created: SystemTime,
-    /// When the clock owes this archive its `ENABLED` state, or `None` once it
-    /// has settled.
-    pub enabled_due: Option<SystemTime>,
     /// What the archive captured, oldest first. A ring bounded by
     /// [`MAX_ARCHIVED_EVENTS`] and [`MAX_ARCHIVED_BYTES`] — see
     /// [`Self::capture`], the one place it grows.
@@ -1459,11 +1441,11 @@ pub struct ArchiveRecord {
 }
 
 impl ArchiveRecord {
-    /// A newly created archive on `event_bus_name`: in [`ARCHIVE_STATE_CREATING`]
-    /// and capturing nothing yet, with its [`ARCHIVE_STATE_ENABLED`] state due
-    /// [`ARCHIVE_TRANSITION`] later. The optional members the request carried
-    /// (`Description`, `EventPattern`, `RetentionDays`, `KmsKeyIdentifier`) are
-    /// written onto the record by its creator.
+    /// A newly created archive on `event_bus_name`: settled in
+    /// [`ARCHIVE_STATE_ENABLED`] and capturing from this instant on, holding
+    /// nothing yet. The optional members the request carried (`Description`,
+    /// `EventPattern`, `RetentionDays`, `KmsKeyIdentifier`) are written onto the
+    /// record by its creator.
     pub fn new(
         name: &str,
         arn: String,
@@ -1480,10 +1462,9 @@ impl ArchiveRecord {
             event_pattern: None,
             retention_days: None,
             kms_key_identifier: None,
-            state: ARCHIVE_STATE_CREATING.to_string(),
+            state: ARCHIVE_STATE_ENABLED.to_string(),
             state_reason: None,
             created,
-            enabled_due: Some(created + ARCHIVE_TRANSITION),
             events: VecDeque::new(),
             captured_bytes: 0,
         }
@@ -1491,17 +1472,13 @@ impl ArchiveRecord {
 
     /// Whether this archive captures published events at all.
     ///
-    /// An archive that has not reached `ENABLED` yet captures nothing, which is
-    /// what "incoming events might not immediately start being sent to the
-    /// archive" (`CreateArchive`) means. An `UpdateArchive` does not interrupt
-    /// that: it changes WHAT the archive keeps
-    /// ([`ARCHIVE_STATE_UPDATING`]) rather than stopping it keeping anything, so
-    /// an archive mid-update captures by the pattern the update wrote.
+    /// Only an archive in [`ARCHIVE_STATE_ENABLED`] keeps what its bus routes; a
+    /// `DISABLED` or failed archive keeps nothing. An `UpdateArchive` does not
+    /// interrupt capture: it changes WHAT the archive keeps rather than stopping
+    /// it keeping anything, so an archive captures by the pattern the update
+    /// wrote from the instant that update returns.
     pub fn captures_events(&self) -> bool {
-        matches!(
-            self.state.as_str(),
-            ARCHIVE_STATE_ENABLED | ARCHIVE_STATE_UPDATING
-        )
+        self.state == ARCHIVE_STATE_ENABLED
     }
 
     /// Append one captured event, evicting the oldest first so the archive never
@@ -2859,26 +2836,15 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// Materialise every archive change the clock has ALREADY made due at `now`,
     /// and answer how many archives one was applied to.
     ///
-    /// Two changes are owed by the clock alone: the transition into
-    /// [`ARCHIVE_STATE_ENABLED`] that a create ([`ARCHIVE_STATE_CREATING`]) or an
-    /// update ([`ARCHIVE_STATE_UPDATING`]) left due [`ARCHIVE_TRANSITION`] later,
-    /// and the expiry of a captured event past the archive's `RetentionDays`
-    /// ([`ArchiveRecord::expire_captured`]). Both were owed at the same instant
-    /// even if nobody had called, which is why a reporting operation may finish
-    /// them.
+    /// One change is owed by the clock alone: the expiry of a captured event past
+    /// the archive's `RetentionDays` ([`ArchiveRecord::expire_captured`]). It was
+    /// owed at the same instant even if nobody had called, which is why a
+    /// reporting operation may finish it. An archive's `ArchiveState` is NOT
+    /// clock-owed: a write settles it ([`ARCHIVE_STATE_ENABLED`]).
     pub fn settle_archives(&mut self, now: SystemTime) -> usize {
         let mut settled = 0usize;
         for archive in self.archives.values_mut() {
-            let mut changed = false;
-            if archive.enabled_due.is_some_and(|due| due <= now) {
-                // The state moves to the instant the transition fell DUE, not to
-                // the instant it was noticed, so two reads agree.
-                archive.enabled_due = None;
-                archive.state = ARCHIVE_STATE_ENABLED.to_string();
-                changed = true;
-            }
-            changed |= archive.expire_captured(now) > 0;
-            settled += usize::from(changed);
+            settled += usize::from(archive.expire_captured(now) > 0);
         }
         settled
     }
@@ -5503,15 +5469,8 @@ pub mod event_pattern {
     /// The parse itself, reporting the reason the refusal states and where in
     /// the submitted text the reader stood when it stopped.
     fn parse_reason(pattern: &str, validator: Validator) -> Result<Map<String, Value>, Refusal> {
-        let value: Value = ::serde_json::from_str(pattern).map_err(|error| Refusal {
-            reason: format!("Event pattern is not valid JSON: {error}"),
-            // The only position known about text that does not parse is the one
-            // the JSON reader itself stopped at.
-            spot: Some(Spot::Position {
-                line: error.line(),
-                column: error.column(),
-            }),
-        })?;
+        let value: Value =
+            ::serde_json::from_str(pattern).map_err(|error| unreadable_json(pattern, &error))?;
         let Value::Object(map) = value else {
             return Err(At::root().refuse(Read::Opening, FILTER_NOT_AN_OBJECT));
         };
@@ -5523,6 +5482,47 @@ pub mod event_pattern {
         }
         validate_object(&map, &At::root(), 1, validator)?;
         Ok(map)
+    }
+
+    /// The refusal of text that is not JSON at all: WHERE the parse that ran
+    /// stopped, and what it was expecting there.
+    ///
+    /// EventBridge refuses a pattern it cannot read with its JSON parser's own
+    /// diagnostic rather than with a restatement of the member's type, and the
+    /// two readings that diagnostic is built from — the unquoted word a parse
+    /// stopped on where a value belongs, and the character or end-of-input it
+    /// stopped on otherwise, with what was expected there — are the tree's
+    /// shared ones ([`::service_common::json_parse_fault`]), taken from the parse
+    /// that actually ran, so this service and every other one handed the same
+    /// text cannot disagree about where it went wrong. A fault class worded
+    /// wrongly or missing is corrected THERE, for every service that quotes it.
+    ///
+    /// What is this service's own is the framing: the opening
+    /// ([`INVALID_PATTERN`]) and the location clause [`Refusal::message`] builds,
+    /// which echoes the pattern as submitted (`(String)"<pattern>"`) rather than
+    /// redacting it, because that is what this service answers.
+    fn unreadable_json(pattern: &str, error: &::serde_json::Error) -> Refusal {
+        use ::service_common::json_parse_fault as fault;
+
+        // A word where a value belongs is named WHOLE, at the position it
+        // STARTS; every other fault names the character, or the end of the
+        // input, the parse stopped on, and the position is the parse's own.
+        match fault::unrecognized_token(pattern, error) {
+            Some((word, line, column)) => Refusal {
+                reason: format!(
+                    "Unrecognized token '{word}': was expecting ({})",
+                    fault::VALUE_CLASSES
+                ),
+                spot: Some(Spot::Position { line, column }),
+            },
+            None => Refusal {
+                reason: fault::unexpected_input(pattern, error),
+                spot: Some(Spot::Position {
+                    line: error.line(),
+                    column: error.column(),
+                }),
+            },
+        }
     }
 
     /// A pattern the language does not admit: the reason, and where in the

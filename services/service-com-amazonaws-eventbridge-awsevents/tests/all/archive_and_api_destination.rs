@@ -12,10 +12,10 @@
 //! * a created archive is a PERSISTED resource bound to ONE event bus: it
 //!   answers an ARN of the modelled `ArchiveArn` form (`…:archive/<name>`) and
 //!   reads back under its name with every member it was created with;
-//! * an archive AWS answers in a non-terminal state reaches its next one on its
-//!   own, a moment later rather than instantly ("incoming events might not
-//!   immediately start being sent to the archive"): `CREATING` -> `ENABLED`, and
-//!   a caller reading straight after the create still observes `CREATING`;
+//! * an archive is provisioned by the call that writes it: `CreateArchive`
+//!   answers it in the settled `ENABLED` state and a read taken straight after
+//!   the create reports that same state, so there is no transient state to poll
+//!   out of;
 //! * an `ENABLED` archive captures exactly the events of ITS bus that its own
 //!   `EventPattern` matches, and "if you do not specify a pattern to filter
 //!   events sent to the archive, all events are sent to the archive" — so
@@ -183,10 +183,10 @@ struct ArchiveCase {
 }
 
 /// A created archive carries an ARN of the modelled form, reads back under its
-/// name with every member it was created with, and settles into `ENABLED` on its
-/// own.
+/// name with every member it was created with, and is `ENABLED` from the create
+/// on.
 #[tokio::test]
-async fn a_created_archive_is_read_back_and_settles_into_enabled() {
+async fn a_created_archive_is_read_back_and_is_enabled_from_the_create_on() {
     let cases = [
         ArchiveCase {
             case: "the default bus, no filter and no options",
@@ -236,31 +236,17 @@ async fn a_created_archive_is_read_back_and_settles_into_enabled() {
         );
         assert_eq!(
             created["State"],
-            json!(state::ARCHIVE_STATE_CREATING),
+            json!(state::ARCHIVE_STATE_ENABLED),
             "case {case:?}: a created archive is answered in {}, got {created}",
-            state::ARCHIVE_STATE_CREATING
+            state::ARCHIVE_STATE_ENABLED
         );
         assert!(
             created["CreationTime"].as_f64().is_some(),
             "case {case:?}: expected a CreationTime on the create, got {created}"
         );
 
-        // The transient state is OBSERVABLE: a caller reading straight after the
-        // create still sees it.
-        let (status, transient) =
-            events(&router, "DescribeArchive", &json!({ "ArchiveName": name })).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: DescribeArchive answered {status} {transient}"
-        );
-        assert_eq!(
-            transient["State"],
-            json!(state::ARCHIVE_STATE_CREATING),
-            "case {case:?}: a read taken at once still reports {}, got {transient}",
-            state::ARCHIVE_STATE_CREATING
-        );
-
-        tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
+        // The settled state is what a read taken STRAIGHT after the create
+        // reports: there is no transient state to poll out of.
         let (status, settled) =
             events(&router, "DescribeArchive", &json!({ "ArchiveName": name })).await;
         assert_eq!(
@@ -270,7 +256,7 @@ async fn a_created_archive_is_read_back_and_settles_into_enabled() {
         assert_eq!(
             settled["State"],
             json!(state::ARCHIVE_STATE_ENABLED),
-            "case {case:?}: the clock owes the archive {}, got {settled}",
+            "case {case:?}: a read taken at once reports {}, got {settled}",
             state::ARCHIVE_STATE_ENABLED
         );
         assert_eq!(
@@ -358,27 +344,29 @@ async fn an_enabled_archive_captures_only_what_its_pattern_matches_on_its_own_bu
         assert_eq!(status, 200, "CreateArchive {name} answered {status} {body}");
     }
 
-    // An archive that has not reached `ENABLED` captures nothing: "incoming
-    // events might not immediately start being sent to the archive".
-    publish(&router, "while still creating", archived, "com.demo.orders").await;
-    for (name, _, _) in given {
+    // An archive is `ENABLED` from the create on, so an event published straight
+    // after it is captured.
+    publish(&router, "straight after the create", archived, "com.demo.orders").await;
+    // (the archive, how many of that first event it holds)
+    let immediate: [(&str, i64); 3] = [("everything", 1), ("orders-only", 1), ("other-bus", 0)];
+    for (name, count) in immediate {
         let (status, body) = events(&router, "DescribeArchive", &json!({ "ArchiveName": name })).await;
         assert_eq!(status, 200, "DescribeArchive {name} answered {status} {body}");
         assert_eq!(
             body["EventCount"],
-            json!(0),
-            "case {name:?}: an archive still creating captures nothing, got {body}"
+            json!(count),
+            "case {name:?}: expected {count} captured events straight after the create, \
+             got {body}"
         );
     }
 
-    tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
     publish(&router, "orders", archived, "com.demo.orders").await;
     publish(&router, "another order", archived, "com.demo.orders").await;
     publish(&router, "shipments", archived, "com.demo.shipments").await;
     publish(&router, "on the other bus", ignored, "com.demo.orders").await;
 
     // (the archive, how many events it holds)
-    let expected: [(&str, i64); 3] = [("everything", 3), ("orders-only", 2), ("other-bus", 1)];
+    let expected: [(&str, i64); 3] = [("everything", 4), ("orders-only", 3), ("other-bus", 1)];
     for (name, count) in expected {
         let (status, body) =
             events(&router, "DescribeArchive", &json!({ "ArchiveName": name })).await;

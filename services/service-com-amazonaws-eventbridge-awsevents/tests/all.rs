@@ -21,6 +21,8 @@ mod archive_and_api_destination;
 mod archive_registry;
 #[path = "all/archive_replay.rs"]
 mod archive_replay;
+#[path = "all/archive_state_is_settled.rs"]
+mod archive_state_is_settled;
 #[path = "all/bus_forward_authorization.rs"]
 mod bus_forward_authorization;
 #[path = "all/connection_authorization.rs"]

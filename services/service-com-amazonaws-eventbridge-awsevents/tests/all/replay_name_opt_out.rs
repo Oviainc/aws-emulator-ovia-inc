@@ -27,7 +27,6 @@
 //! falls relative to each event's own time, and which rules the filters name.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state;
@@ -263,8 +262,6 @@ async fn a_rule_requiring_no_replay_name_receives_the_live_event_but_not_the_rep
     .await;
     assert_eq!(status, 200, "CreateArchive answered {status} {body}");
     let archive_arn = member("archive", &body, "ArchiveArn");
-    // An archive captures nothing until it has reached `ENABLED`.
-    ::tokio::time::sleep(state::ARCHIVE_TRANSITION + Duration::from_millis(250)).await;
 
     // One batch, three event times: one well before the window and two inside
     // it. The anchor is shared with the window below, so a bound falls exactly

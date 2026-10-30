@@ -17,8 +17,8 @@
 //! * `UpdateArchive` REPLACES each member the request carries and leaves every
 //!   member it does not name as it was; the new `EventPattern` is what the
 //!   archive ingests by from then on and is mirrored into the managed rule that
-//!   serves the archive on its source bus, and the archive is answered in a
-//!   non-terminal `UPDATING` state that reaches `ENABLED` on its own;
+//!   serves the archive on its source bus, and the archive is answered in the
+//!   settled `ENABLED` state every later reader reports;
 //! * `DeleteArchive` removes the archive and the managed rule that fed it, frees
 //!   the name for a new archive, leaves every other archive alone, and refuses a
 //!   name this account holds no archive for;
@@ -235,25 +235,21 @@ async fn list_archives_reports_the_stored_archives_and_one_filter_narrows_them()
     let _ = given_archive(&router, "ord-beta", &alpha, &json!({ "RetentionDays": 7 })).await;
     let _ = given_archive(&router, "inv-gamma", &beta, &json!({})).await;
 
-    // An archive is answered in `CREATING`, so the `State` filter discriminates on
-    // the state the archive is in at the instant of the read: this listing happens
-    // before the clock has made `ENABLED` due.
-    let (status, creating) = events(
-        &router,
-        "ListArchives",
-        &json!({ "State": state::ARCHIVE_STATE_CREATING }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "the CREATING listing answered {status} {creating}"
-    );
-    assert!(
-        !archive_names(&creating).is_empty(),
-        "an archive is CREATING before the transition falls due, got {creating}"
-    );
-
-    tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
+    // An archive is `ENABLED` from the create on, so the `State` filter
+    // discriminates on the state the archive is in at the instant of the read and
+    // the non-terminal members of `ArchiveState`
+    // (`smithy_query(query="shape", shape="ArchiveState")`) select nothing.
+    for transient in ["CREATING", "UPDATING"] {
+        let (status, body) = events(&router, "ListArchives", &json!({ "State": transient })).await;
+        assert_eq!(
+            status, 200,
+            "case {transient:?}: ListArchives answered {status} {body}"
+        );
+        assert!(
+            archive_names(&body).is_empty(),
+            "case {transient:?}: no archive is left in a transient state, got {body}"
+        );
+    }
 
     // (case, the request, the names it has to report in order)
     let rows: [(&str, Value, Vec<&str>); 7] = [
@@ -496,7 +492,6 @@ async fn update_archive_replaces_only_the_members_it_carries() {
             }),
         )
         .await;
-        tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
         let before = describe_archive(&router, case, "updated-archive").await;
 
         let mut request = json!({ "ArchiveName": "updated-archive" });
@@ -515,22 +510,21 @@ async fn update_archive_replaces_only_the_members_it_carries() {
         );
         assert_eq!(
             answered["State"],
-            json!(state::ARCHIVE_STATE_UPDATING),
+            json!(state::ARCHIVE_STATE_ENABLED),
             "case {case:?}: an updated archive is {}, got {answered}",
-            state::ARCHIVE_STATE_UPDATING
+            state::ARCHIVE_STATE_ENABLED
         );
         assert_eq!(
             answered["CreationTime"], before["CreationTime"],
             "case {case:?}: the archive was not created again, got {answered}"
         );
 
-        // It reaches `ENABLED` again on its own.
-        tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
+        // The read agrees with what the update answered.
         let after = describe_archive(&router, case, "updated-archive").await;
         assert_eq!(
             after["State"],
             json!(state::ARCHIVE_STATE_ENABLED),
-            "case {case:?}: the archive settles back into {}, got {after}",
+            "case {case:?}: the archive stays {}, got {after}",
             state::ARCHIVE_STATE_ENABLED
         );
         for member in [
@@ -597,7 +591,6 @@ async fn the_updated_pattern_governs_what_is_archived_afterwards() {
         &json!({ "EventPattern": json!({ "source": ["com.demo.orders"] }).to_string() }),
     )
     .await;
-    tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
 
     publish(&router, "before the update", "ingest-bus", "com.demo.orders").await;
     assert_eq!(
@@ -616,7 +609,6 @@ async fn the_updated_pattern_governs_what_is_archived_afterwards() {
     )
     .await;
     assert_eq!(status, 200, "UpdateArchive answered {status} {body}");
-    tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
 
     // (case, the source published, how many events the archive holds afterwards)
     let rows: [(&str, &str, i64); 4] = [
@@ -719,7 +711,6 @@ async fn delete_archive_removes_the_archive_and_the_rule_that_fed_it() {
         let _ = given_archive(&router, deleted, &bus, &extra).await;
         // A second archive on the same bus, which the delete has to leave alone.
         let _ = given_archive(&router, "bystander-archive", &bus, &json!({})).await;
-        tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
 
         let (status, body) = events(&router, "DeleteArchive", &json!({ "ArchiveName": deleted })).await;
         assert_eq!(
@@ -797,7 +788,6 @@ async fn delete_archive_is_not_blocked_by_a_replay_and_frees_its_bus() {
     let router = emulator();
     let bus = given_bus(&router, "replayed-bus").await;
     let archive = given_archive(&router, "replayed-archive", &bus, &json!({})).await;
-    tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
     publish(&router, "the archived event", "replayed-bus", "com.demo.orders").await;
 
     let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()).secs();
@@ -871,7 +861,6 @@ async fn start_replay_refuses_leaving_the_event_bus_the_events_were_archived_fro
     let source = given_bus(&router, "source-bus").await;
     let other = given_bus(&router, "other-bus").await;
     let archive = given_archive(&router, "crossing-archive", &source, &json!({})).await;
-    tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
 
     // A rule on the OTHER bus, so a filter has a real rule of the wrong bus to name.
     let (status, body) = events(

@@ -293,8 +293,6 @@ async fn filter_arns_confine_a_replay_to_the_rules_they_name() {
     .await;
     assert_eq!(status, 200, "CreateArchive answered {status} {body}");
     let archive_arn = member("archive", &body, "ArchiveArn");
-    // An archive captures nothing until it has reached `ENABLED`.
-    ::tokio::time::sleep(state::ARCHIVE_TRANSITION + Duration::from_millis(250)).await;
 
     // The one event every replay below re-publishes, timed an hour ago so the
     // window selects it by its OWN time.

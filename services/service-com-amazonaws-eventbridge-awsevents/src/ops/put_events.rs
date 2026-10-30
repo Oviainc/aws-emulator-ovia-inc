@@ -256,9 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::collections::BTreeMap::new();
         {
             let mut store = state.lock();
-            // An archive whose clock has already made its `ENABLED` state due is
-            // settled first, so one that became due before this request captures
-            // this request's events.
+            // What the clock already owed every archive is settled first, so an
+            // event this request captures is not kept by an archive whose
+            // retention no longer covers it.
             store.settle_archives(now);
             for slot in &mut screened {
                 let Screened::Accepted(accepted) = slot else {

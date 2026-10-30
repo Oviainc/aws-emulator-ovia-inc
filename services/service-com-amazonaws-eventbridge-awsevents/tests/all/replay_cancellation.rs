@@ -155,8 +155,6 @@ async fn given_archive(emulator: &Emulator, label: &str) -> (String, String, Str
         .as_str()
         .unwrap_or_else(|| panic!("case {label}: no ArchiveArn in {body}"))
         .to_string();
-    // The archive captures events only once the clock has made it `ENABLED`.
-    tokio::time::sleep(past_the_transition(state::ARCHIVE_TRANSITION)).await;
 
     let (status, body) = call(
         emulator,
