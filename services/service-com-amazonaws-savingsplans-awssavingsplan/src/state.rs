@@ -728,6 +728,20 @@ pub fn resource_not_found_message(resource_arn: &str) -> String {
     format!("Resource with resourceArn: {resource_arn} doesn't exist")
 }
 
+/// How this service states that the Savings Plan an operation was pointed at
+/// does not exist.
+///
+/// AWS builds this message FROM THE REQUEST, naming the `savingsPlanId` the
+/// caller sent — `SavingsPlan can't be found. Savings Plan Id: <id>.`, the id
+/// taken verbatim and closed with a period — so the template is part of the
+/// contract and lives in ONE place, shared by every operation that is pointed
+/// at a plan by its `savingsPlanId`; each handler only wraps the message in its
+/// own `ResourceNotFoundException` variant. Nothing about the id's spelling
+/// changes the sentence: not being in the store is what makes the answer a 404.
+pub fn savings_plan_not_found_message(savings_plan_id: &str) -> String {
+    format!("SavingsPlan can't be found. Savings Plan Id: {savings_plan_id}.")
+}
+
 // ---------------------------------------------------------------------------
 // The offering catalog
 // ---------------------------------------------------------------------------

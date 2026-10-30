@@ -180,10 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // plan cannot stay mutably borrowed across it.
         let plan = store.plan(&input.savings_plan_id).ok_or_else(|| {
             ReturnSavingsPlanErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "no Savings Plan with id '{}'",
-                    input.savings_plan_id
-                ),
+                message: crate::state::savings_plan_not_found_message(&input.savings_plan_id),
             })
         })?;
         let plan_state = plan.state.clone();

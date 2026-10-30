@@ -187,7 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let plan = store.plan(&input.savings_plan_id).ok_or_else(|| {
                 DescribeSavingsPlanRatesErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("no Savings Plan with id '{}'", input.savings_plan_id),
+                        message: crate::state::savings_plan_not_found_message(
+                            &input.savings_plan_id,
+                        ),
                     },
                 )
             })?;
