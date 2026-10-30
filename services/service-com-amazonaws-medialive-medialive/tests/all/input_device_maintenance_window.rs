@@ -518,6 +518,23 @@ async fn a_devices_attachment_is_derived_from_the_inputs_that_name_it() {
                 "case {case:?}: DeleteInput({input_id}): expected 200, got {status}: {deleted}"
             );
         }
+        // An input in the transient `DELETING` step the delete opens is still a
+        // resource the account holds, so it is still one of the inputs attached
+        // to the device; the attachment ends when the clock has settled the
+        // input into its terminal `DELETED` state.
+        let deleting = device(&router, &case, id).await;
+        assert_eq!(
+            deleting["medialiveInputArns"], attached["medialiveInputArns"],
+            "case {case:?}: expected an input still DELETING to stay attached, got {:?}",
+            deleting["medialiveInputArns"]
+        );
+        assert_eq!(
+            deleting["outputType"], attached["outputType"],
+            "case {case:?}: expected the output type to hold while an input is still DELETING, got {:?}",
+            deleting["outputType"]
+        );
+
+        wait_for_the_clock();
         let detached = device(&router, &case, id).await;
         assert_eq!(
             detached["outputType"],

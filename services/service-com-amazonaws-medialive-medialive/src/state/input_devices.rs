@@ -1280,12 +1280,16 @@ impl ComAmazonawsMedialiveMedialiveState {
     ///
     /// Derived from the input store on every read, so it tracks every later
     /// create, update and delete rather than being recorded when the device was
-    /// claimed. An input whose delete has been accepted is no longer attached,
-    /// the same reading of a current reference the rest of this state applies.
+    /// claimed. An input that has reached its TERMINAL `DELETED` state is
+    /// attached no longer, which is the one cut point every derived "currently
+    /// using" list of this store applies
+    /// ([`ComAmazonawsMedialiveMedialiveState::inputs_using_security_group`]):
+    /// an input in the transient `DELETING` step the clock still owes is a
+    /// resource the account holds, so the device goes on reporting it.
     fn inputs_using_input_device(&self, id: &str) -> Vec<String> {
         self.inputs
             .values()
-            .filter(|input| !input.is_delete_accepted())
+            .filter(|input| !input.is_deleted())
             .filter(|input| {
                 input
                     .input_devices

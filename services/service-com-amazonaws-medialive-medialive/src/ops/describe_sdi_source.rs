@@ -144,8 +144,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
         // Reporting only: the description is read out of the store, and an id no
-        // stored source carries is the operation's own modelled 404.
-        let state = state.lock();
+        // stored source carries is the operation's own modelled 404. `settle`
+        // materialises the transitions the clock had already made due — the
+        // deletions that decide which inputs are still using this source —
+        // which were owed whether or not this describe ran.
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
         let sdi_source = state
             .sdi_source_description(&input.sdi_source_id)
             .ok_or_else(|| {

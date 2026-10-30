@@ -162,6 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
         let mut state = state.lock();
+        // `settle` first, for the same reason every other operation runs it: the
+        // transitions the clock had already made due were owed whether or not
+        // this update ran, and the `Inputs` this response reports is derived
+        // from them.
+        state.settle(::std::time::SystemTime::now());
         // One lookup, two refusals told apart by what it finds: a source that was
         // deleted is reported as already deleted, naming the id the request asked
         // for, while an id no source ever had is simply not found. Both are

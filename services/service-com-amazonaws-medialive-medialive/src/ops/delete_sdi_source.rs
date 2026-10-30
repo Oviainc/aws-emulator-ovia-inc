@@ -160,6 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine, ctx.parts()).ok_or_else(unavailable)?;
 
         let mut state = state.lock();
+        // `settle` first, for the same reason every other operation runs it: the
+        // transitions the clock had already made due — the input deletions that
+        // decide whether this source is still attached to anything — were owed
+        // whether or not this delete ran.
+        state.settle(::std::time::SystemTime::now());
         if !state.sdi_sources.contains_key(&input.sdi_source_id) {
             return Err(DeleteSdiSourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::not_found_message(

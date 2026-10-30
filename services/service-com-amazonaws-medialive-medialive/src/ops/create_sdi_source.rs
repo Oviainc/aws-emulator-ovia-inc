@@ -176,6 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
 
         let mut state = state.lock();
+        // `settle` first, for the same reason every other operation runs it: the
+        // transitions the clock had already made due were owed whether or not
+        // this create ran, and the `Inputs` this response reports is derived
+        // from them.
+        state.settle(::std::time::SystemTime::now());
 
         // A retried create (same `@idempotencyToken` `RequestId`) must return the
         // SdiSource the first one created, not a second source.

@@ -153,7 +153,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let state = state.lock();
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises the transitions the clock had
+        // already made due — the deletions that decide which inputs are still
+        // using each source — which were owed whether or not this listing ran.
+        state.settle(::std::time::SystemTime::now());
         let state = &*state;
 
         // `NextToken` is the id the next page starts at, and ids sort in mint

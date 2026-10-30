@@ -77,7 +77,11 @@
 //! enum models is
 //! what the clock owes between the call and that terminal state, and a resource in
 //! `DELETED` is no longer *currently using* anything, so it leaves the derived
-//! `Inputs`, `Channels`, `AttachedChannels` and `AssociatedClusterIds` lists.
+//! `Inputs`, `Channels`, `AttachedChannels`, `MedialiveInputArns` and
+//! `AssociatedClusterIds` lists. That terminal state is the ONE cut point every
+//! one of those lists applies: a resource the delete has only been ACCEPTED for
+//! is still a resource this account holds, so it goes on being reported as a
+//! current user until the clock settles it.
 //!
 //! A kept record is READABLE, not writable: once a delete has been accepted for
 //! an id, that id names no resource a caller may still change. Every MUTATION
@@ -2730,11 +2734,14 @@ impl ComAmazonawsMedialiveMedialiveState {
     pub fn inputs_using_security_group(&self, group_id: &str) -> Vec<String> {
         self.inputs
             .values()
-            // An input whose deletion has been accepted is on its way out of the
-            // account and no longer "currently using" anything — the same
-            // reading of "currently using" that `inputs_using_sdi_source`
-            // applies to the source side.
-            .filter(|input| !input.is_delete_accepted())
+            // The SAME cut point the channel side applies, which is the one this
+            // module documents for every derived "currently using" list: an
+            // input stops using the group once it has reached its TERMINAL
+            // `DELETED` state. One still in the transient `DELETING` step the
+            // clock owes is a resource the account holds, so it goes on being a
+            // current user of the group — exactly as a `DELETING` channel does
+            // in [`Self::channels_using_security_group`] above.
+            .filter(|input| !input.is_deleted())
             .filter(|input| {
                 input
                     .security_groups
@@ -2856,9 +2863,13 @@ impl ComAmazonawsMedialiveMedialiveState {
         }
         self.inputs
             .values()
-            // An input whose deletion has been accepted has stopped using the
-            // source, exactly as a deleted source has nothing using it.
-            .filter(|input| !input.is_delete_accepted())
+            // The one cut point every derived "currently using" list of this
+            // store applies ([`Self::inputs_using_security_group`]): an input
+            // stops using the source when it reaches its TERMINAL `DELETED`
+            // state, not when its delete is merely accepted, so one still in the
+            // transient `DELETING` step is reported here just as a `DELETING`
+            // channel is by [`Self::channels_attaching`].
+            .filter(|input| !input.is_deleted())
             .filter(|input| input.sdi_sources.iter().any(|source| source == id))
             .map(|input| input.id.clone())
             .collect()
@@ -5792,8 +5803,10 @@ impl InputRecord {
 
     /// Whether a delete has been accepted for this input, in either half of the
     /// deletion lifecycle — so a repeated `DeleteInput` is idempotent rather
-    /// than restarting the clock, and an input on its way out is no longer a
-    /// current user of the resources it referenced
+    /// than restarting the clock, and the id names no input a caller may still
+    /// CHANGE ([`ComAmazonawsMedialiveMedialiveState::live_input`]). NOT what
+    /// decides whether this input still USES the resources it references: that
+    /// is cut at the terminal `DELETED` state alone
     /// ([`ComAmazonawsMedialiveMedialiveState::inputs_using_security_group`]).
     pub fn is_delete_accepted(&self) -> bool {
         self.is_deleting() || self.is_deleted()

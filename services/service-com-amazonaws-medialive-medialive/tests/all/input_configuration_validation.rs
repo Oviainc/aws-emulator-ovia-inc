@@ -19,6 +19,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::channel_lifecycle::wait_for_the_clock;
 use crate::support::{claimed_device, input_security_group, sdi_source};
 use crate::wire::{call, error_code, error_message, medialive};
 
@@ -378,6 +379,11 @@ async fn a_deleted_resource_is_not_one_an_input_may_name() {
             status, 200,
             "case {case:?}: expected the input's delete to be accepted, got {status}: {deleting}"
         );
+        // An input in the transient `DELETING` step is still a resource this
+        // account holds, so it is still using what it names: the resource it
+        // held is free to be deleted once the clock has settled that input into
+        // its terminal state.
+        wait_for_the_clock();
         let (status, deleted) = call(&router, "DELETE", &format!("{collection}/{id}"), None).await;
         assert_eq!(
             status, 200,

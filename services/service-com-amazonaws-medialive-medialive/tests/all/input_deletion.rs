@@ -352,10 +352,10 @@ async fn deleting_an_unknown_input_is_not_found() {
 /// Rule: the resources an input references report what is CURRENTLY using them
 /// (`InputSecurityGroup$Inputs` is "The list of inputs currently using this
 /// Input Security Group"; `SdiSource$Inputs` is "The list of inputs that are
-/// currently using this SDI source"), so an input whose deletion has been
-/// accepted — in the transient `DELETING` state as much as in the terminal
-/// `DELETED` one — is no longer one of their users, and a resource left with
-/// none goes back to `IDLE`.
+/// currently using this SDI source"), so an input stops being one of their
+/// users when it reaches its TERMINAL `DELETED` state — not while it is still
+/// in the transient `DELETING` step the clock owes — and a resource left with
+/// no user at all goes back to `IDLE`.
 ///
 /// The rows span the two resource kinds an input references by id, because the
 /// rule is about deletion ending a reference, not about either one of them, and
@@ -446,9 +446,9 @@ async fn a_deleted_input_stops_using_the_resources_it_referenced() {
     let (status, deleted) = delete_input(&router, &input_id).await;
     assert_eq!(status, 200, "DeleteInput: got {status}: {deleted}");
 
-    // The reference ends when the DELETE is ACCEPTED, not when the clock settles
-    // it: while the input is still in the transient `DELETING` state it is
-    // already no longer "currently using" either resource.
+    // The reference ends when the deletion comes DUE, not when the delete is
+    // accepted: while the input is still in the transient `DELETING` step the
+    // account holds it, so it goes on being a current user of both resources.
     assert_eq!(
         state_of(&router, "referencing input", &input_id).await,
         "DELETING",
@@ -460,14 +460,14 @@ async fn a_deleted_input_stops_using_the_resources_it_referenced() {
         let body = member.map_or_else(|| read.clone(), |name| read[name].clone());
         assert_eq!(
             body["state"],
-            json!("IDLE"),
-            "case {case:?}: expected IDLE as soon as the delete was accepted, got {:?}",
+            json!("IN_USE"),
+            "case {case:?}: expected IN_USE while the input is only DELETING, got {:?}",
             body["state"]
         );
         assert_eq!(
             body["inputs"],
-            json!([]),
-            "case {case:?}: expected an input being deleted to stop being a current user, got {:?}",
+            json!([input_id.clone()]),
+            "case {case:?}: expected an input still DELETING to stay a current user, got {:?}",
             body["inputs"]
         );
     }

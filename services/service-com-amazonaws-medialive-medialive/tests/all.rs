@@ -128,6 +128,9 @@ mod cluster_network_resolution;
 #[path = "all/cluster_update.rs"]
 mod cluster_update;
 
+#[path = "all/current_user_cut_point.rs"]
+mod current_user_cut_point;
+
 #[path = "all/deleted_resource_mutation.rs"]
 mod deleted_resource_mutation;
 
