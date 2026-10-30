@@ -1245,8 +1245,11 @@ pub struct ComAmazonawsNetworkmonitorNetworkmonitorState {
     ///
     /// The ONLY record of which token minted which resource: a monitor and a
     /// probe keep no token of their own, so there is nothing for this map to
-    /// disagree with once a record is forgotten (TTL, ceiling, or the delete of
-    /// the monitor it named).
+    /// disagree with once a record is forgotten (TTL, ceiling, or the resource
+    /// it named being gone). Because it is the only record, a record that still
+    /// replays is never written over by a later create reusing the same token
+    /// ([`Self::record_client_token`]): a token identifies the create that used
+    /// it FIRST, for as long as that create's resource is stored.
     client_tokens: BTreeMap<(String, String), ClientTokenRecord>,
     /// Monotonic counter behind [`Self::next_probe_id`]; never reused within a
     /// run.
@@ -1354,10 +1357,56 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
         self.monitor(region, monitor_name)?.probes.get(probe_id)
     }
 
-    /// Record what a `clientToken` sent to `region` replays.
+    /// Whether a record still replays a STORED resource: `region` holds the
+    /// monitor it names, and — for a record made by a probe create — that
+    /// monitor still holds the probe it names.
+    ///
+    /// A record that replays nothing decides no retry
+    /// ([`Self::monitor_minted_by_token`], [`Self::probe_minted_by_token`] both
+    /// require the resource to be stored), so it is spent and may be written
+    /// over.
+    fn record_replays_a_resource(&self, region: &str, record: &ClientTokenRecord) -> bool {
+        let Some(monitor) = self.monitor(region, &record.monitor_name) else {
+            return false;
+        };
+        match record.probe_id.as_deref() {
+            Some(probe_id) => monitor.probes.contains_key(probe_id),
+            None => true,
+        }
+    }
+
+    /// Record what a `clientToken` sent to `region` replays — the resource of
+    /// the create that used the token FIRST.
+    ///
+    /// A token whose record still replays a stored resource KEEPS that record: a
+    /// later create carrying the same token is a different request, not the
+    /// retry of the one that recorded it, and since this map is the only record
+    /// of which token minted which resource, rewriting it would leave the first
+    /// resource with no idempotency at all — a retry of that first create would
+    /// then be judged as a fresh request and conflict, or mint a duplicate. So a
+    /// record is replaced only once it replays nothing
+    /// ([`Self::record_replays_a_resource`]), and is otherwise forgotten only by
+    /// [`CLIENT_TOKEN_TTL`], the [`MAX_CLIENT_TOKENS`] ceiling, or the delete of
+    /// the monitor it named ([`Self::forget_client_tokens_of_monitor`]).
+    ///
+    /// So a token already spoken for buys the LATER create no idempotency of its
+    /// own: that create is answered from its own request, and every repeat of it
+    /// is judged on its own too — the same answer a request carrying no token
+    /// gets (a stored monitor name conflicts, a probe create mints another
+    /// probe). A token is unique per request by contract, and the model declares
+    /// no mismatch error for one that is not, so a second request reusing a
+    /// token is served rather than refused; what it cannot do is take over the
+    /// record that identifies the first.
     pub fn record_client_token(&mut self, region: &str, token: String, record: ClientTokenRecord) {
-        self.client_tokens
-            .insert((region.to_string(), token), record);
+        let key = (region.to_string(), token);
+        let replaying = self
+            .client_tokens
+            .get(&key)
+            .is_some_and(|existing| self.record_replays_a_resource(region, existing));
+        if replaying {
+            return;
+        }
+        self.client_tokens.insert(key, record);
     }
 
     /// Forget every `clientToken` of `region` that named this monitor: once the

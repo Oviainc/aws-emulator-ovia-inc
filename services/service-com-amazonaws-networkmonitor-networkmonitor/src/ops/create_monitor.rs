@@ -390,6 +390,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with probes is owed its activation. The same rule every later call
         // applies, read off the probes the record holds.
         monitor.follow_probe_states(now);
+        // What this token replays, for as long as the monitor it minted is
+        // stored: the record belongs to the create that used the token FIRST, so
+        // a token already replaying another resource keeps its own record
+        // ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::record_client_token`])
+        // and that resource keeps its idempotency.
         if let Some(token) = input.client_token {
             store.record_client_token(
                 &region,

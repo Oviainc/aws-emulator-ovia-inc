@@ -25,14 +25,18 @@ use super::resource_tags::delete_monitor;
 
 /// A `CreateMonitor` body carrying a token and an explicit `aggregationPeriod`,
 /// so a replayed answer is distinguishable from a fresh create's.
-fn monitor_body(name: &str, token: &str, aggregation_period: i64) -> String {
+///
+/// `pub(crate)` so the suite that covers which create a token's record belongs
+/// to (`client_token_record_is_the_first_creates`) drives the same bodies.
+pub(crate) fn monitor_body(name: &str, token: &str, aggregation_period: i64) -> String {
     format!(
         r#"{{"monitorName":"{name}","clientToken":"{token}","aggregationPeriod":{aggregation_period}}}"#
     )
 }
 
-/// A `CreateProbe` body carrying a token.
-fn probe_body(token: &str, destination: &str) -> String {
+/// A `CreateProbe` body carrying a token. `pub(crate)` for the same reason as
+/// [`monitor_body`].
+pub(crate) fn probe_body(token: &str, destination: &str) -> String {
     format!(
         r#"{{"clientToken":"{token}","probe":{}}}"#,
         probe_json(destination, "ICMP", r#","packetSize":56"#)

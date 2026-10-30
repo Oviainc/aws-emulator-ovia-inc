@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/authored_refusal_messages.rs"]
 mod authored_refusal_messages;
+#[path = "all/client_token_record_is_the_first_creates.rs"]
+mod client_token_record_is_the_first_creates;
 #[path = "all/client_token_replay.rs"]
 mod client_token_replay;
 #[path = "all/delete_probe_and_monitor_state.rs"]
