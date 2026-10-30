@@ -8,6 +8,11 @@
 //! projection the call that MADE the association answered with — so an associate's
 //! answer and this listing cannot disagree about what the domain has.
 //!
+//! A report over that set, so an empty set is an empty page: a domain holding no
+//! package and a name this account holds no domain under both answer 200 with an empty
+//! `DomainPackageDetailsList`, leaving the refusal of such a name to the calls that
+//! CHANGE a domain's associations.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -83,7 +88,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{domain_not_found, invalid_next_token, max_results_out_of_range};
+use crate::state::{invalid_next_token, max_results_out_of_range};
 
 /// The largest page this operation answers with: `MaxResults` is `@range(max: 100)`,
 /// so 100 results is the most any request can ask for. Held as the modelled member's
@@ -195,21 +200,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain.settle_package_associations(now);
         }
 
-        // The set belongs to the domain, so a name the store holds no domain for has no
-        // set to report: the modelled missing-resource refusal rather than an empty
-        // page.
-        let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
-            ListPackagesForDomainErrorModeled::ResourceNotFoundException(domain_not_found(
-                &input.domain_name,
-            ))
-        })?;
-
+        // This report answers over the SET of links a domain holds, and an empty set is
+        // an empty page however it came to be empty: a domain holding no package, and a
+        // name this account holds no domain under, both report nothing linked. Refusing
+        // such a name belongs to the calls that CHANGE a domain's associations, which
+        // cannot be served without the domain; a listing can, so a caller walking a set
+        // of names is told each name's links rather than stopped at the first name that
+        // is gone. The name's own shape is still a requirement, enforced by
+        // `DomainName`'s modelled length and pattern before this handler runs.
+        //
         // Order-stable, because the domain's set is keyed by the package's id: the same
         // request reports the same order twice, which is what lets a token name a place
         // in the set. Bounded by the store itself — a domain holds at most one
         // association per package of the account.
-        let associations: Vec<&crate::state::PackageAssociation> =
-            domain.package_associations.values().collect();
+        let associations: Vec<&crate::state::PackageAssociation> = store
+            .domains
+            .get(&input.domain_name)
+            .map(|domain| domain.package_associations.values().collect())
+            .unwrap_or_default();
 
         // A token names the package the next page starts at, so paging resumes from a
         // place in the set rather than from an offset an associate or a dissociate

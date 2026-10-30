@@ -119,6 +119,8 @@ mod package_dependency_lifecycle;
 mod package_dissociation;
 #[path = "all/package_dissociation_batches.rs"]
 mod package_dissociation_batches;
+#[path = "all/package_listing_for_missing_domain.rs"]
+mod package_listing_for_missing_domain;
 #[path = "all/package_listing_page_bounds.rs"]
 mod package_listing_page_bounds;
 #[path = "all/package_registry.rs"]

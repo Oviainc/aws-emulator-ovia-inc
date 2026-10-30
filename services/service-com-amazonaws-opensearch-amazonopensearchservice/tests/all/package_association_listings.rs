@@ -22,8 +22,10 @@
 //!   created, and the request links nothing: the package it named still has no domain;
 //! * a batch that names one package twice is refused as a whole and links nothing,
 //!   while the same package named once is served and reports exactly one association;
-//! * a listing of a resource that does not exist is the missing-resource refusal, and
-//!   one of a resource that exists with nothing linked is the empty set;
+//! * a listing of a domain's packages is a report over that domain's set, so a name
+//!   nothing created and a domain that exists with nothing linked both report the
+//!   empty set, while the sibling listing of ONE package's domains refuses an id
+//!   nothing minted as the bad input value it is;
 //! * paging walks the whole set exactly once, with every page but the last as large as
 //!   the request asked for.
 
@@ -436,21 +438,21 @@ async fn a_batch_that_names_one_package_twice_is_refused_as_a_whole() {
 }
 
 #[tokio::test]
-async fn a_listing_of_something_that_does_not_exist_is_refused_and_an_empty_set_is_reported() {
+async fn a_listing_of_a_domain_nothing_created_is_the_empty_set_and_a_bad_package_id_is_refused() {
     let emulator = Emulator::new();
     let ids = available_packages(&emulator).await;
 
-    // A domain the store holds no domain for has no set to report, whatever the name's
-    // shape; same for a package id nothing minted.
+    // A name the store holds no domain under holds no link either, whatever the name's
+    // shape: the listing reports that empty set rather than refusing the name.
     for name in ["abc", "no-such-domain-7", "a23456789012345678901234567"] {
-        let answer = list_for_domain(&emulator, name, None, None).await;
+        let reported = listed(
+            &list_for_domain(&emulator, name, None, None).await,
+            &format!("ListPackagesForDomain({name:?})"),
+        );
         assert_eq!(
-            (answer.status, error_code(&answer).as_str()),
-            (409, "ResourceNotFoundException"),
-            "case ListPackagesForDomain({name:?}): expected the modelled missing-resource \
-             refusal, got {} with {:?}",
-            answer.status,
-            answer.body
+            reported,
+            Vec::<Value>::new(),
+            "case ListPackagesForDomain({name:?}): expected the empty set, got {reported:?}"
         );
     }
     let answer = list_for_package(&emulator, UNKNOWN_PACKAGE_ID, None, None).await;

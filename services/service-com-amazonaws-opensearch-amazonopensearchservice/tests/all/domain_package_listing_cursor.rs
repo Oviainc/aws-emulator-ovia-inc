@@ -251,15 +251,14 @@ async fn paging_a_domains_packages_changes_nothing_a_later_caller_sees() {
         }
     }
 
-    // And a listing of a domain nothing created, which has no set to report at all.
-    let refused = list_for_domain(&emulator, "no-such-domain-4", "").await;
-    assert_eq!(
-        (refused.status, error_code(&refused).as_str()),
-        (409, "ResourceNotFoundException"),
-        "case ListPackagesForDomain(a domain nothing created): expected the modelled \
-         missing-resource refusal, got {} with {:?}",
-        refused.status,
-        refused.body
+    // And a listing of a domain nothing created, whose set of links is empty: a report
+    // over an empty set is an empty page, not a refusal.
+    let answer = list_for_domain(&emulator, "no-such-domain-4", "").await;
+    let reported = details(&answer, "ListPackagesForDomain(a domain nothing created)");
+    assert!(
+        reported.is_empty(),
+        "case ListPackagesForDomain(a domain nothing created): expected the empty set, got \
+         {reported:?}"
     );
 
     for page_size in [0_i32, 1, 2, 4, PUBLISHED_MAX_RESULTS] {

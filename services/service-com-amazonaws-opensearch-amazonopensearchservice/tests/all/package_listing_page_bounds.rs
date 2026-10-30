@@ -52,7 +52,9 @@ const DOMAINS: [&str; 5] = [
 ];
 
 /// `AssociatePackage`: `POST /2021-01-01/packages/associate/{PackageID}/{DomainName}`.
-async fn associate_one(emulator: &Emulator, domain: &str, package_id: &str) -> Answer {
+/// `pub(crate)` so a sibling suite drives the single-package associate through this one
+/// request helper rather than growing a second copy of it.
+pub(crate) async fn associate_one(emulator: &Emulator, domain: &str, package_id: &str) -> Answer {
     emulator
         .call(
             "POST",
