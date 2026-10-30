@@ -17,15 +17,22 @@
 //!   is, so a resource that does not exist is never reported as over its tag limit.
 //! * An ARN outside the caller's own account earns `AccessDeniedException` (403),
 //!   decided before the resource is resolved — see [`crate::state::authorize_resource_arn`].
-//! * A request that would leave the resource holding more than
-//!   [`crate::state::MAX_TAGS_PER_RESOURCE`] tags earns the modelled
-//!   `TooManyTagsException` (400) and writes NOTHING, so a refused call leaves the
-//!   stored tags exactly as they were.
 //! * `Tags` naming a key in the namespace AWS reserves for its own tags
 //!   ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) earns the modelled
 //!   `ValidationException` (400) and writes nothing: such a key is AWS's, not the
 //!   caller's, so no path that writes tags — this one, `CreateApprovalTeam` or
 //!   `CreateIdentitySource` — writes one.
+//! * A request that would leave the resource holding more than
+//!   [`crate::state::MAX_TAGS_PER_RESOURCE`] tags earns the modelled
+//!   `TooManyTagsException` (400) and writes NOTHING, so a refused call leaves the
+//!   stored tags exactly as they were.
+//!
+//! Those last two rules are decided in the ONE order
+//! [`crate::state::tag_write_breach`] fixes for every path that writes tags: the
+//! reserved namespace, a property of the request's own keys, before the ceiling, a
+//! property of the tag set the resource would be left holding. So a `Tags` map breaking
+//! both is refused for the namespace here exactly as it is on either create path, and
+//! never for one rule on one path and the other rule on the next.
 //!
 //! ## Shape of an operation
 //!
@@ -201,33 +208,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A tag key in the namespace reserved for Amazon Web Services belongs to AWS,
-        // not to the caller, so this call cannot create or replace one: the request is
-        // refused with the modelled `ValidationException` (400) and writes nothing. The
-        // resource's existence is still decided first, so a resource that does not exist
-        // is never reported as naming a reserved key.
-        if crate::state::names_reserved_tag_key(input.tags.keys().map(String::as_str)) {
-            return Err(
-                TagResourceErrorModeled::ValidationException(crate::state::reserved_tag_key())
-                    .into(),
-            );
-        }
-
-        // Whether the merged set fits is decided before anything is written, so a
-        // refused call leaves the resource's tags exactly as they were. A key the
-        // resource already carries is an update, not an addition, so it does not count
-        // against the limit twice.
+        // The two rules every path that writes tags holds a request to are decided in ONE
+        // order, by the one gate in `crate::state`: a key in the namespace reserved for
+        // Amazon Web Services first, because it is a property of the request's own keys,
+        // and the per-resource ceiling second, because it is a property of the tag set the
+        // resource would be left holding. So a map that breaks both is refused the same way
+        // here as on either create path. Both are decided before anything is written, so a
+        // refused call leaves the resource's tags exactly as they were, and the resource's
+        // existence is decided ahead of both — a resource that does not exist is never
+        // reported as naming a reserved key or as over its tag limit. A key the resource
+        // already carries is an update, not an addition, so it does not count against the
+        // ceiling twice.
         let merged = crate::state::merged_tag_count(tags, input.tags.keys().map(String::as_str));
-        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
-                message: format!(
-                    "The request would leave {merged} tags on the resource, more than the \
-                     maximum of {} tags allowed per resource. Remove some tags, and try again.",
-                    crate::state::MAX_TAGS_PER_RESOURCE
-                ),
-                resource_name: Some(input.resource_arn.clone()),
-            })
-            .into());
+        match crate::state::tag_write_breach(input.tags.keys().map(String::as_str), merged) {
+            None => {}
+            Some(crate::state::TagWriteBreach::ReservedKey) => {
+                return Err(TagResourceErrorModeled::ValidationException(
+                    crate::state::reserved_tag_key(),
+                )
+                .into());
+            }
+            // Unlike a create, this operation declares the `TooManyTagsException` (400) the
+            // model gives exactly this condition, so the ceiling is reported with it,
+            // naming the resource the request addressed.
+            Some(crate::state::TagWriteBreach::PastResourceCeiling(merged)) => {
+                return Err(TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
+                    message: format!(
+                        "The request would leave {merged} tags on the resource, more than the \
+                         maximum of {} tags allowed per resource. Remove some tags, and try \
+                         again.",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                    resource_name: Some(input.resource_arn.clone()),
+                })
+                .into());
+            }
         }
 
         for (key, value) in &input.tags {

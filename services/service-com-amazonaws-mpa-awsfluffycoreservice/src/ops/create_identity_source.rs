@@ -36,7 +36,12 @@
 //! `Tags` naming a key in the namespace AWS reserves for its own tags
 //! ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) earns `ValidationException` (400), the
 //! same rule `create_approval_team.rs` and `tag_resource.rs` hold: such a key is AWS's,
-//! not the caller's, so no path that writes tags writes one.
+//! not the caller's, so no path that writes tags writes one. `Tags` naming more than
+//! [`crate::state::MAX_TAGS_PER_RESOURCE`] tags earns the same `ValidationException`
+//! (400) — the per-resource ceiling `TagResource` reports with `TooManyTagsException`,
+//! which this operation does not declare — and is decided AFTER the namespace, the one
+//! order [`crate::state::tag_write_breach`] fixes for every path that writes tags
+//! ([`crate::state::create_tags_refusal`] is this path's door to it).
 //!
 //! `IdentitySourceParameters.IamIdentityCenter.Region` names the Region the IAM Identity
 //! Center instance is located in, and the member is a plain string the constraint
@@ -300,27 +305,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // One resource carries at most `MAX_TAGS_PER_RESOURCE` tags, the ceiling
-        // `TagResource` reports with `TooManyTagsException`. Create is the other path that
-        // writes tags, so it holds the same ceiling and no resource is stored already past
-        // it; `CreateIdentitySource` does not declare `TooManyTagsException`, so the
-        // request is refused with the `ValidationException` (400) it does declare. The
-        // rule itself lives once, beside the other tag rules in `crate::state`.
-        if let Some(refusal) = crate::state::tags_past_resource_ceiling(input.tags.as_ref()) {
+        // The two rules every path that writes tags holds a request to are decided in ONE
+        // order, by the one gate in `crate::state`: a key in the namespace reserved for
+        // Amazon Web Services first, because it is a property of the request's own keys,
+        // and the per-resource ceiling `TagResource` reports with `TooManyTagsException`
+        // second, because it is a property of the tag set the resource would be left
+        // holding. So a map that breaks both is refused the same way here as on
+        // `CreateApprovalTeam` and `TagResource`. `CreateIdentitySource` declares neither
+        // `TooManyTagsException` nor a second validation error, so either breach is the
+        // `ValidationException` (400) it does declare, raised before any identity source is
+        // stored.
+        if let Some(refusal) = crate::state::create_tags_refusal(input.tags.as_ref()) {
             return Err(CreateIdentitySourceErrorModeled::ValidationException(refusal).into());
-        }
-
-        // A tag key in the namespace reserved for Amazon Web Services belongs to AWS,
-        // not to the caller, so no path that writes tags may write one: create is one of
-        // those paths, and refuses such a request with the `ValidationException` (400) it
-        // declares before any identity source is stored.
-        if let Some(tags) = input.tags.as_ref() {
-            if crate::state::names_reserved_tag_key(tags.keys().map(String::as_str)) {
-                return Err(CreateIdentitySourceErrorModeled::ValidationException(
-                    crate::state::reserved_tag_key(),
-                )
-                .into());
-            }
         }
 
         // The identity source is a regional resource of the caller's account, so its ARN

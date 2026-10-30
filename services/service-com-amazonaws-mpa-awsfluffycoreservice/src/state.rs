@@ -197,7 +197,9 @@
 //!   a member the model gives no ARN `@pattern` and by `crate::service`'s refusal seam
 //!   ([`is_malformed_arn_violation`]) for the members it does.
 //! * [`reserved_tag_key`] — the one message every path that WRITES tags refuses a key in
-//!   the [`RESERVED_TAG_KEY_PREFIX`] namespace with ([`names_reserved_tag_key`]).
+//!   the [`RESERVED_TAG_KEY_PREFIX`] namespace with ([`names_reserved_tag_key`]), raised
+//!   through the one ordered tag-write gate [`tag_write_breach`] below, which is also
+//!   what decides which of the two tag rules a request breaking both is refused for.
 //! * [`foreign_next_token`] / [`FOREIGN_NEXT_TOKEN_MESSAGE`] — the one message every
 //!   paginated listing refuses a `NextToken` it did not issue with.
 //! * [`unattachable_policy`] / [`policy_version_not_attachable`] — the two messages the
@@ -830,29 +832,88 @@ pub fn reserved_tag_key() -> ValidationException {
     }
 }
 
-/// The refusal a create request whose `Tags` carries more than [`MAX_TAGS_PER_RESOURCE`]
-/// tags earns, or `None` when the request stays within the ceiling.
+/// Which of the two rules a path that WRITES tags holds a request to the request breaks.
+///
+/// Every writing path raises its own modelled error for each of them — a create has only
+/// `ValidationException` to answer with, while `TagResource` declares the
+/// `TooManyTagsException` the model gives the ceiling condition — so the breach is reported
+/// as a VALUE here and worded by the path that raised it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagWriteBreach {
+    /// `Tags` names a key in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves, refused
+    /// with [`reserved_tag_key`].
+    ReservedKey,
+    /// The resource would be left holding this many tags, more than
+    /// [`MAX_TAGS_PER_RESOURCE`].
+    PastResourceCeiling(usize),
+}
+
+/// The breach a tag write earns, or `None` when the request breaks neither rule.
+///
+/// The ONE place the two tag rules are decided, and therefore the one place their ORDER
+/// is stated: a request is held to the constraints on its own INPUT before the resource
+/// it names is held to a limit on the state that input would leave behind. The reserved
+/// namespace is a property of the keys the request carries, and `Tags` carries no modelled
+/// length constraint at all, so the ceiling is the per-resource LIMIT
+/// `TooManyTagsException` is declared for ("the request exceeds the maximum number of tags
+/// allowed for this resource") rather than a constraint on the map. So the namespace is
+/// decided FIRST and the ceiling second, and a map that breaks both earns the namespace
+/// refusal on every path that writes tags instead of one refusal per path.
+///
+/// `resulting_tag_count` is how many tags the resource would hold once the request was
+/// written: the request's own `Tags` on a create, which writes a resource that does not
+/// exist yet, and [`merged_tag_count`] on a path that merges into tags a resource already
+/// carries.
+#[must_use]
+pub fn tag_write_breach<'a, I>(keys: I, resulting_tag_count: usize) -> Option<TagWriteBreach>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    if names_reserved_tag_key(keys) {
+        return Some(TagWriteBreach::ReservedKey);
+    }
+    (resulting_tag_count > MAX_TAGS_PER_RESOURCE)
+        .then_some(TagWriteBreach::PastResourceCeiling(resulting_tag_count))
+}
+
+/// The refusal a CREATE request's `Tags` earns, or `None` when it breaks neither tag rule.
 ///
 /// Create is the path that writes a resource's tags before the resource exists, so the
-/// count it holds against the ceiling is the request's own `Tags` — and because the
-/// refusal is decided before anything is stored, no resource is ever stored already past
-/// it. A create does not declare the `TooManyTagsException` `TagResource` reports the same
-/// ceiling with, so the refusal is the `ValidationException` (400) a create does declare,
-/// which each create lifts into its own error type.
+/// count it holds against the ceiling is the request's own `Tags` — and because either
+/// refusal is decided before anything is stored, no resource is ever stored past the
+/// ceiling or already carrying a key a caller may not write. A create declares neither the
+/// `TooManyTagsException` `TagResource` reports the ceiling with nor a second validation
+/// error, so both breaches are the `ValidationException` (400) a create does declare,
+/// which each create lifts into its own error type — decided in the order
+/// [`tag_write_breach`] fixes for every writing path.
+#[must_use]
+pub fn create_tags_refusal(
+    tags: Option<&::std::collections::HashMap<String, String>>,
+) -> Option<ValidationException> {
+    let keys = tags
+        .into_iter()
+        .flat_map(|tags| tags.keys().map(String::as_str));
+    match tag_write_breach(keys, tags.map_or(0, ::std::collections::HashMap::len))? {
+        TagWriteBreach::ReservedKey => Some(reserved_tag_key()),
+        TagWriteBreach::PastResourceCeiling(tag_count) => {
+            Some(tags_past_resource_ceiling(tag_count))
+        }
+    }
+}
+
+/// The refusal a create request whose `Tags` would leave the resource holding `tag_count`
+/// tags, more than [`MAX_TAGS_PER_RESOURCE`], earns.
 ///
 /// The message names the member, how many tags the request carried and the ceiling, and no
 /// value the request carried: a `TagKey` and a `TagValue` are `@sensitive`.
 #[must_use]
-pub fn tags_past_resource_ceiling(
-    tags: Option<&::std::collections::HashMap<String, String>>,
-) -> Option<ValidationException> {
-    let tag_count = tags.map_or(0, ::std::collections::HashMap::len);
-    (tag_count > MAX_TAGS_PER_RESOURCE).then(|| ValidationException {
+pub fn tags_past_resource_ceiling(tag_count: usize) -> ValidationException {
+    ValidationException {
         message: format!(
             "Tags names {tag_count} tags, more than the maximum of \
              {MAX_TAGS_PER_RESOURCE} tags allowed per resource."
         ),
-    })
+    }
 }
 
 /// The refusal a `Policies` reference that names no policy version this service holds

@@ -97,5 +97,7 @@ mod session_filter_value_bound;
 mod session_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_write_rule_order.rs"]
+mod tag_write_rule_order;
 #[path = "all/write_path_input_validation.rs"]
 mod write_path_input_validation;
