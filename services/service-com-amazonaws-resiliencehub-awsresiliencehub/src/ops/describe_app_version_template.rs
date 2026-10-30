@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAppVersionTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAppVersionTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAppVersionTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a pure read of ONE app version's contents from
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::app_versions`],
+//! rendered as the `appTemplateBody` JSON string — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +166,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAppVersionTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAppVersionTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAppVersionTemplate"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        let store = state.lock();
+
+        // A template is the template OF one app version of one application, so each
+        // link of that path has to resolve before anything is rendered.
+        if !store.apps.contains_key(&input.app_arn) {
+            return Err(app_not_found(&input.app_arn));
+        }
+        if !store.app_version_exists(&input.app_arn, &input.app_version) {
+            return Err(app_version_not_found(&input.app_arn, &input.app_version));
+        }
+
+        // A version that exists while holding nothing — a draft nobody has written
+        // to — has an empty template rather than no template.
+        let contents = store
+            .app_version(&input.app_arn, &input.app_version)
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(DescribeAppVersionTemplateOutput {
+            app_template_body: app_template_body(&input.app_version, &contents),
+            app_arn: input.app_arn,
+            app_version: input.app_version,
+        })
     }
+}
+
+/// What ONE app version holds, as the `appTemplateBody` JSON string.
+///
+/// The members and their nesting are the structure the model documents for
+/// `appTemplateBody` (`smithy_query query="doc"
+/// shape="DescribeAppVersionTemplateResponse" member="appTemplateBody"`):
+/// `resources` (each with its `logicalResourceId`, `type`, `name` and
+/// `additionalInfo`), `appComponents` (each with its `name`, `type`,
+/// `resourceNames` and `additionalInfo`) and `version`, documented there as the
+/// Resilience Hub application version — so the label this template was read at.
+///
+/// Rendered from the stored version, so the body a reader gets back is what the
+/// last write to that version persisted: a published version's body cannot change,
+/// because the version it is rendered from is a frozen copy.
+///
+/// `excludedResources` is not rendered: it reports the resources EXCLUDED from the
+/// application, and the stored versions hold none — nothing in this service marks a
+/// resource excluded (`UpdateAppVersionResource$excluded`, the member that would, is
+/// still a stub), so there is nothing to report under it.
+///
+/// The rendered body is bounded by what one version can hold —
+/// [`crate::state::MAX_RESOURCES_PER_APP_VERSION`] resources and
+/// [`crate::state::MAX_APP_COMPONENTS_PER_APP_VERSION`] components — so no request
+/// renders a body this emulator did not already have the state for.
+fn app_template_body(app_version: &str, contents: &crate::state::AppVersionContents) -> String {
+    // "Don't add the resources that you want to exclude" (the member's own
+    // documentation), so an excluded resource is no part of the template's
+    // `resources`.
+    let included: Vec<&PhysicalResource> = contents
+        .resources
+        .values()
+        .filter(|resource| resource.excluded != Some(true))
+        .collect();
+
+    let resources: Vec<::serde_json::Value> = included
+        .iter()
+        .map(|resource| {
+            let mut rendered = ::serde_json::Map::new();
+            rendered.insert(
+                "logicalResourceId".to_string(),
+                logical_resource_id(&resource.logical_resource_id),
+            );
+            rendered.insert("type".to_string(), ::serde_json::json!(resource.resource_type));
+            if let Some(name) = resource.resource_name.as_deref() {
+                rendered.insert("name".to_string(), ::serde_json::json!(name));
+            }
+            if let Some(info) = additional_info(resource.additional_info.as_ref()) {
+                rendered.insert("additionalInfo".to_string(), info);
+            }
+            ::serde_json::Value::Object(rendered)
+        })
+        .collect();
+
+    let app_components: Vec<::serde_json::Value> = contents
+        .app_components
+        .values()
+        .map(|component| {
+            let mut rendered = ::serde_json::Map::new();
+            rendered.insert("name".to_string(), ::serde_json::json!(component.name));
+            rendered.insert("type".to_string(), ::serde_json::json!(component.r#type));
+            rendered.insert(
+                "resourceNames".to_string(),
+                ::serde_json::json!(assigned_resource_names(component, &included)),
+            );
+            if let Some(info) = additional_info(component.additional_info.as_ref()) {
+                rendered.insert("additionalInfo".to_string(), info);
+            }
+            ::serde_json::Value::Object(rendered)
+        })
+        .collect();
+
+    ::serde_json::json!({
+        "resources": resources,
+        "appComponents": app_components,
+        "version": app_version,
+    })
+    .to_string()
+}
+
+/// One resource's `logicalResourceId`, carrying the members the stored
+/// `LogicalResourceId` names: the required `identifier`, plus whichever source the
+/// resource belongs to — a CloudFormation stack, a resource group, a Terraform state
+/// file or an EKS cluster namespace — when it belongs to one.
+fn logical_resource_id(logical: &LogicalResourceId) -> ::serde_json::Value {
+    let mut rendered = ::serde_json::Map::new();
+    rendered.insert("identifier".to_string(), ::serde_json::json!(logical.identifier));
+    for (member, value) in [
+        ("logicalStackName", logical.logical_stack_name.as_deref()),
+        ("resourceGroupName", logical.resource_group_name.as_deref()),
+        ("terraformSourceName", logical.terraform_source_name.as_deref()),
+        ("eksSourceName", logical.eks_source_name.as_deref()),
+    ] {
+        if let Some(value) = value {
+            rendered.insert(member.to_string(), ::serde_json::json!(value));
+        }
+    }
+    ::serde_json::Value::Object(rendered)
+}
+
+/// The names of the INCLUDED resources assigned to `component` — the member's own
+/// reading of `resourceNames`. A resource carries the components it was created
+/// with, so the assignment is read from the resource side; a resource that was
+/// created without a `resourceName` has no name to report here.
+fn assigned_resource_names(component: &AppComponent, included: &[&PhysicalResource]) -> Vec<String> {
+    included
+        .iter()
+        .filter(|resource| {
+            resource
+                .app_components
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|assigned| {
+                    assigned.name == component.name
+                        || (assigned.id.is_some() && assigned.id == component.id)
+                })
+        })
+        .filter_map(|resource| resource.resource_name.clone())
+        .collect()
+}
+
+/// An `additionalInfo` map as the template carries it, when anything is stored
+/// under it: the modelled `AdditionalInfoMap` is a map of name to value list, so it
+/// renders as an object of arrays. In the map's own key order, so two reads of one
+/// version render byte-identical bodies.
+fn additional_info(
+    info: Option<&::std::collections::HashMap<String, Vec<String>>>,
+) -> Option<::serde_json::Value> {
+    let info = info.filter(|info| !info.is_empty())?;
+    let ordered: ::std::collections::BTreeMap<&String, &Vec<String>> = info.iter().collect();
+    Some(::serde_json::json!(ordered))
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> DescribeAppVersionTemplateError {
+    DescribeAppVersionTemplateErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted.
+fn app_not_found(app_arn: &str) -> DescribeAppVersionTemplateError {
+    DescribeAppVersionTemplateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("application {app_arn} does not exist")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// A 404 for an `appVersion` the application does not have.
+fn app_version_not_found(app_arn: &str, app_version: &str) -> DescribeAppVersionTemplateError {
+    DescribeAppVersionTemplateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("application {app_arn} has no version {app_version}")),
+        resource_id: Some(app_version.to_string()),
+        resource_type: Some("AppVersion".to_string()),
+    })
+    .into()
 }

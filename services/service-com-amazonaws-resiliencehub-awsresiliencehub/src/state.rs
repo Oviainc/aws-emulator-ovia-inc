@@ -11,9 +11,22 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// The `appVersion` of an application's DRAFT version — the one version every
 /// application has, and the only one the `CreateAppVersion*` / `UpdateAppVersion*`
-/// operations write to (`PublishAppVersion` is what mints a numbered, frozen
-/// version from it).
+/// operations write to (`PublishAppVersion` is what freezes a snapshot of it as
+/// the current release).
 pub const DRAFT_APP_VERSION: &str = "draft";
+
+/// The `appVersion` that addresses an application's CURRENT RELEASE — the newest
+/// snapshot `PublishAppVersion` froze from the draft.
+///
+/// A FIXED alias, not a number: the version LABEL and the publish sequence number
+/// are distinct values in the model (`PublishAppVersion` answers both `appVersion`,
+/// an `EntityVersion`, and `identifier`, a `LongOptional`), and this alias is the
+/// `appVersion` every reader of a published version — `DescribeAppVersionTemplate`,
+/// `ListAppVersionResources`, `DescribeAppVersionResource`,
+/// `ResolveAppVersionResources` — addresses the current release by. A re-publish
+/// replaces what it resolves to; see
+/// [`ComAmazonawsResiliencehubAwsresiliencehubState::publish_app_version`].
+pub const RELEASE_APP_VERSION: &str = "release";
 
 /// The most applications this emulator stores.
 ///
@@ -368,19 +381,50 @@ impl ComAmazonawsResiliencehubAwsresiliencehubState {
         highest.saturating_add(1)
     }
 
-    /// Store `contents` as version `app_version` of `app_arn`. The caller has
-    /// already established that `app_arn` names a stored application and that
-    /// `app_version` is not in use.
-    pub fn insert_app_version(
+    /// Store `contents` as the new CURRENT RELEASE of `app_arn`, answering the
+    /// `appVersion` it is addressed by — [`RELEASE_APP_VERSION`].
+    ///
+    /// The snapshot the alias resolved to until now keeps its contents under its
+    /// OWN publish sequence number, so a superseded release stays readable by the
+    /// number it was minted with while the alias always names the newest one.
+    /// `contents.identifier` is that number for the snapshot being stored.
+    ///
+    /// What moves with the superseded snapshot is everything recorded ABOUT that
+    /// version: its contents and the resolutions recorded against it, so a
+    /// resolution of the release a client resolved before re-publishing stays with
+    /// the snapshot it resolved and the new release starts with none of its own.
+    ///
+    /// The caller has already established that `app_arn` names a stored
+    /// application.
+    pub fn publish_app_version(
         &mut self,
         app_arn: &str,
-        app_version: &str,
         contents: AppVersionContents,
-    ) {
-        self.app_versions
-            .entry(app_arn.to_string())
-            .or_default()
-            .insert(app_version.to_string(), contents);
+    ) -> &'static str {
+        let versions = self.app_versions.entry(app_arn.to_string()).or_default();
+
+        // The key the snapshot being superseded keeps, read BEFORE it is taken out,
+        // so nothing is ever removed without somewhere to put it. Only a published
+        // snapshot is stored under the alias and every one of those carries the
+        // sequence number it was minted with, so the key is always there.
+        let superseded_key = versions
+            .get(RELEASE_APP_VERSION)
+            .and_then(|superseded| superseded.identifier)
+            .map(|identifier| identifier.to_string());
+        if let Some(key) = superseded_key {
+            if let Some(superseded) = versions.remove(RELEASE_APP_VERSION) {
+                versions.insert(key.clone(), superseded);
+            }
+            if let Some(resolutions) = self.resolutions.get_mut(app_arn) {
+                if let Some(recorded) = resolutions.remove(RELEASE_APP_VERSION) {
+                    resolutions.insert(key, recorded);
+                }
+            }
+        }
+
+        let versions = self.app_versions.entry(app_arn.to_string()).or_default();
+        versions.insert(RELEASE_APP_VERSION.to_string(), contents);
+        RELEASE_APP_VERSION
     }
 
     /// Forget every app version of `app_arn`, so deleting an application releases

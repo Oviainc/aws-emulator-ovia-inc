@@ -19,6 +19,8 @@ mod app_version_app_components;
 mod app_version_resource_resolution;
 #[path = "all/app_version_resources.rs"]
 mod app_version_resources;
+#[path = "all/app_version_template.rs"]
+mod app_version_template;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
 #[path = "all/list_app_versions.rs"]

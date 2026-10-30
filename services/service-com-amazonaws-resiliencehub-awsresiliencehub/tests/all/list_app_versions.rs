@@ -8,9 +8,10 @@
 //! The rule under test: `ListAppVersions` reports every app version the addressed
 //! application holds — its DRAFT version, which exists from the moment the
 //! application is created and carries the application's own `creationTime`, and
-//! every version `PublishAppVersion` froze from it, each with the publish sequence
-//! number as both its `appVersion` and its `identifier` and the `versionName` the
-//! publish named — oldest first, narrowed to the `startTime`/`endTime` bounds on a
+//! every version `PublishAppVersion` froze from it, the newest under the release
+//! alias and every superseded one under its own publish sequence number, each with
+//! that number as its `identifier` and the `versionName` the publish named —
+//! oldest first, narrowed to the `startTime`/`endTime` bounds on a
 //! version's creation time, in pages of at most `maxResults` that a `nextToken`
 //! resumes exactly where the previous page stopped; an `appArn` naming no stored
 //! application is the modelled 404.
@@ -19,7 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_resiliencehub_awsresiliencehub::state::DRAFT_APP_VERSION;
+use service_com_amazonaws_resiliencehub_awsresiliencehub::state::{
+    DRAFT_APP_VERSION, RELEASE_APP_VERSION,
+};
 use service_com_amazonaws_resiliencehub_awsresiliencehub::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -247,8 +250,9 @@ fn publish_table() -> Vec<Publish> {
 }
 
 /// A freshly created application already has exactly one version — the draft — and
-/// each publish adds exactly one more, reported with its sequence number, its
-/// `identifier` and its `versionName`.
+/// each publish adds exactly one more: the newest under the release alias, the one
+/// it supersedes under its own sequence number, each with its `identifier` and its
+/// `versionName`.
 #[tokio::test]
 async fn lists_the_draft_and_then_every_published_version() {
     let router = emulator();
@@ -284,23 +288,26 @@ async fn lists_the_draft_and_then_every_published_version() {
         let minted = publish(&router, &app_arn, row.version_name.as_deref()).await;
         let sequence = index as i64 + 1;
         assert_eq!(
-            minted,
-            sequence.to_string(),
-            "case {case:?}: expected publish number {sequence}, got {minted:?}"
+            minted, RELEASE_APP_VERSION,
+            "case {case:?}: publish number {sequence} is addressed by the release \
+             alias, got {minted:?}"
         );
         expected_names.push(row.version_name.clone());
 
         let listed = list_versions(&router, &app_arn, &json!({})).await;
         let page = summaries(&listed, case);
 
-        // The draft, then every version published so far, in publish order.
+        // The draft, then every superseded version in publish order, then the
+        // current release — the newest publish, which the alias names.
         let mut expected_order = vec![DRAFT_APP_VERSION.to_string()];
-        expected_order.extend((1..=sequence).map(|number| number.to_string()));
+        expected_order.extend((1..sequence).map(|number| number.to_string()));
+        expected_order.push(RELEASE_APP_VERSION.to_string());
         assert_eq!(
             version_order(&page),
             expected_order,
-            "case {case:?}: expected the draft then versions 1..{sequence} in that \
-             order, got {page:?}"
+            "case {case:?}: expected the draft, then versions 1..{} by number, then \
+             the release alias, got {page:?}",
+            sequence - 1
         );
 
         // The draft is still the application's own creation time, untouched by
@@ -588,8 +595,16 @@ async fn lists_only_the_addressed_application_and_refuses_an_unknown_one() {
     publish(&router, &second, Some("only-one")).await;
 
     for (case, app_arn, expected) in [
-        ("the application with three publishes", &first, vec!["1", "2", "3"]),
-        ("the application with one publish", &second, vec!["1"]),
+        (
+            "the application with three publishes",
+            &first,
+            vec!["1", "2", RELEASE_APP_VERSION],
+        ),
+        (
+            "the application with one publish",
+            &second,
+            vec![RELEASE_APP_VERSION],
+        ),
     ] {
         let listed = list_versions(&router, app_arn, &json!({})).await;
         let got = version_order(&summaries(&listed, case));

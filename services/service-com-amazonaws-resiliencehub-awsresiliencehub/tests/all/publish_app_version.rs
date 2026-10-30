@@ -6,18 +6,21 @@
 //! restJson1 request — and asserts the response BODY, not just the status.
 //!
 //! The rule under test: `PublishAppVersion` freezes a COPY of the addressed
-//! application's DRAFT version under that application's next publish sequence
-//! number, reporting that number both as the `appVersion` a later read addresses it
-//! by and as the `identifier` long, echoing the `versionName` the request named;
-//! the draft stays as it was, so a later write to it cannot change what was
-//! published; and a draft holding nothing to publish is refused with the modelled
-//! 409 `ConflictException` while an application that does not exist is refused with
-//! the modelled 404.
+//! application's DRAFT version as that application's CURRENT RELEASE, reporting the
+//! fixed release alias as the `appVersion` a later read addresses it by and the
+//! publish sequence number — separately — as the `identifier` long, echoing the
+//! `versionName` the request named; the snapshot a publish supersedes stays readable
+//! under its own sequence number; the draft stays as it was, so a later write to it
+//! cannot change what was published; and a draft holding nothing to publish is
+//! refused with the modelled 409 `ConflictException` while an application that does
+//! not exist is refused with the modelled 404.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_resiliencehub_awsresiliencehub::state::DRAFT_APP_VERSION;
+use service_com_amazonaws_resiliencehub_awsresiliencehub::state::{
+    DRAFT_APP_VERSION, RELEASE_APP_VERSION,
+};
 use service_com_amazonaws_resiliencehub_awsresiliencehub::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -213,16 +216,19 @@ fn publish_table() -> Vec<Publish> {
     ]
 }
 
-/// The whole table against one application: each publish mints the next sequence
-/// number, reports it as both `appVersion` and `identifier`, echoes the
-/// `versionName`, and freezes exactly the components the draft held at that point.
+/// The whole table against one application: each publish reports the release alias
+/// as its `appVersion` and the next sequence number as its `identifier`, echoes the
+/// `versionName`, and freezes exactly the components the draft held at that point —
+/// the newest snapshot addressed by the alias, every superseded one by its own
+/// number.
 #[tokio::test]
-async fn each_publish_freezes_the_draft_under_the_next_version_number() {
+async fn each_publish_freezes_the_draft_as_the_current_release() {
     let router = emulator();
     let app_arn = create_an_app(&router, "publish-sequence").await;
 
-    // What the draft held at each published version, in publish order.
-    let mut frozen: Vec<(String, Vec<&'static str>)> = Vec::new();
+    // What the draft held at each published version, in publish order, with the
+    // sequence number that publish was minted with.
+    let mut frozen: Vec<(i64, Vec<&'static str>)> = Vec::new();
     let mut draft_components: Vec<&'static str> = Vec::new();
 
     for (index, row) in publish_table().into_iter().enumerate() {
@@ -242,7 +248,7 @@ async fn each_publish_freezes_the_draft_under_the_next_version_number() {
         let expected_identifier = index as i64 + 1;
         let mut expected = json!({
             "appArn": app_arn,
-            "appVersion": expected_identifier.to_string(),
+            "appVersion": RELEASE_APP_VERSION,
             "identifier": expected_identifier,
         });
         if let Some(version_name) = row.version_name.as_deref() {
@@ -250,14 +256,12 @@ async fn each_publish_freezes_the_draft_under_the_next_version_number() {
         }
         assert_eq!(
             published, expected,
-            "case {case:?}: publish number {expected_identifier} must report that \
-             sequence number and echo its versionName, got {published:?}"
+            "case {case:?}: publish number {expected_identifier} must report the \
+             release alias with that sequence number and echo its versionName, got \
+             {published:?}"
         );
 
-        frozen.push((
-            expected_identifier.to_string(),
-            draft_components.clone(),
-        ));
+        frozen.push((expected_identifier, draft_components.clone()));
 
         // The draft is untouched by publishing: everything added to it so far is
         // still readable there.
@@ -271,34 +275,44 @@ async fn each_publish_freezes_the_draft_under_the_next_version_number() {
     }
 
     // Every published version is frozen: it holds exactly what the draft held when
-    // it was published — nothing added later, and nothing dropped.
+    // it was published — nothing added later, and nothing dropped. The newest is
+    // addressed by the alias, each superseded one by its own sequence number.
+    let newest = frozen.len() as i64;
     let every_component: Vec<&'static str> = frozen
         .last()
         .map(|(_, components)| components.clone())
         .unwrap_or_default();
-    for (app_version, components) in &frozen {
+    for (identifier, components) in &frozen {
+        let app_version = if *identifier == newest {
+            RELEASE_APP_VERSION.to_string()
+        } else {
+            identifier.to_string()
+        };
         for id in &every_component {
             let case = format!("version {app_version} holds {id:?}");
             let expected = Some(components.contains(id));
             assert_eq!(
-                version_holds_component(&router, &app_arn, app_version, id).await,
+                version_holds_component(&router, &app_arn, &app_version, id).await,
                 expected,
                 "case {case:?}: expected {expected:?}"
             );
         }
     }
 
-    // A version number past the last publish was never minted.
-    let next = (frozen.len() + 1).to_string();
-    assert_eq!(
-        version_holds_component(&router, &app_arn, &next, "compute-tier").await,
-        None,
-        "case {next:?}: no version beyond the last publish may exist"
-    );
+    // The newest snapshot's own number addresses nothing: while it is the current
+    // release, the alias is what names it. Nor does a number past the last publish.
+    for app_version in [newest.to_string(), (newest + 1).to_string()] {
+        assert_eq!(
+            version_holds_component(&router, &app_arn, &app_version, "compute-tier").await,
+            None,
+            "case {app_version:?}: only a SUPERSEDED snapshot is addressed by its number"
+        );
+    }
 }
 
 /// Sequence numbers are per application: two applications publish their own 1, 2,
-/// … independently of each other.
+/// … independently of each other, and each addresses its own current release by the
+/// same alias.
 #[tokio::test]
 async fn publish_sequence_numbers_are_per_application() {
     let router = emulator();
@@ -324,17 +338,35 @@ async fn publish_sequence_numbers_are_per_application() {
         );
         assert_eq!(
             published["appVersion"],
-            json!(expected.to_string()),
-            "case {case:?}: appVersion must be the identifier as a string, got {published:?}"
+            json!(RELEASE_APP_VERSION),
+            "case {case:?}: appVersion must be the release alias, got {published:?}"
         );
     }
 
-    // Each application's versions hold only its own component.
-    for (case, app_arn, own, other) in [
-        ("first app's versions", &first, "first-tier", "second-tier"),
-        ("second app's versions", &second, "second-tier", "first-tier"),
+    // Each application's versions hold only its own component: the first published
+    // three times (1, 2 superseded, 3 the release), the second twice (1 superseded,
+    // 2 the release).
+    for (case, app_arn, own, other, superseded) in [
+        (
+            "first app's versions",
+            &first,
+            "first-tier",
+            "second-tier",
+            &["1", "2"][..],
+        ),
+        (
+            "second app's versions",
+            &second,
+            "second-tier",
+            "first-tier",
+            &["1"][..],
+        ),
     ] {
-        for app_version in ["1", "2"] {
+        for app_version in superseded
+            .iter()
+            .copied()
+            .chain(std::iter::once(RELEASE_APP_VERSION))
+        {
             assert_eq!(
                 version_holds_component(&router, app_arn, app_version, own).await,
                 Some(true),
@@ -402,9 +434,13 @@ async fn publishing_an_empty_draft_is_refused_with_a_conflict() {
         let published = post(&router, "/publish-app-version", &request).await;
         let published = published.ok(case).clone();
         assert_eq!(
-            published["appVersion"],
-            json!("1"),
-            "case {case:?}: the first publish of this application is version 1, got {published:?}"
+            (
+                published["appVersion"].clone(),
+                published["identifier"].clone()
+            ),
+            (json!(RELEASE_APP_VERSION), json!(1)),
+            "case {case:?}: the first publish of this application is the release \
+             alias with sequence number 1, got {published:?}"
         );
     }
 }

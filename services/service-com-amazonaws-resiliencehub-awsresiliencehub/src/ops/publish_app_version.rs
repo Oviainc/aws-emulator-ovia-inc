@@ -3,9 +3,10 @@
 //! @op PublishAppVersion
 //!
 //! Publishes a new, frozen version of an application from its DRAFT version: the
-//! draft's contents are copied under the next publish sequence number of that
-//! application, the draft itself stays editable, and a draft holding nothing to
-//! publish is refused with the modelled `ConflictException`.
+//! draft's contents are copied under the application's current-release alias — with
+//! the publish sequence number reported separately and keeping the snapshot it
+//! supersedes readable — the draft itself stays editable, and a draft holding
+//! nothing to publish is refused with the modelled `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -198,12 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(too_many_published_versions(&input.app_arn));
         }
 
-        // The published version's id IS its publish sequence number, so the two
-        // members the model has for it — the `appVersion` string a later
-        // `Describe*`/`List*` addresses it by and the `identifier` long — can never
-        // disagree about which version this is.
+        // The two output members for the published snapshot are DIFFERENT values:
+        // `identifier` is the publish sequence number this snapshot was minted
+        // with, while `appVersion` is the label a later read addresses it by — and
+        // the newest published snapshot is always labelled by the release alias, so
+        // a client reads its current release without knowing how many times it has
+        // published.
         let identifier = store.next_published_app_version(&input.app_arn);
-        let app_version = identifier.to_string();
 
         // A frozen COPY of the draft: the draft stays as it is, editable, so a later
         // change to it cannot alter what was published.
@@ -214,11 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             identifier: Some(identifier),
             creation_time: Some(crate::state::now()),
         };
-        store.insert_app_version(&input.app_arn, &app_version, published);
+        // Storing under the alias is what moves it: the snapshot it supersedes
+        // stays readable under its own sequence number.
+        let app_version = store.publish_app_version(&input.app_arn, published);
 
         Ok(PublishAppVersionOutput {
             app_arn: input.app_arn,
-            app_version: Some(app_version),
+            app_version: Some(app_version.to_string()),
             identifier: Some(identifier),
             version_name: input.version_name,
         })
