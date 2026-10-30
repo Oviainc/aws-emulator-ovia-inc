@@ -194,7 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
-        crate::state::validate_budget(&input.new_budget).map_err(|message| {
+        // The instant of this write: the defaults the service supplies are computed from
+        // it, so the rules below judge the budget this call will actually leave stored.
+        let now = ::std::time::SystemTime::now();
+
+        crate::state::validate_budget(&input.new_budget, now).map_err(|message| {
             UpdateBudgetErrorModeled::InvalidParameterException(InvalidParameterException {
                 message: Some(message),
             })
@@ -204,7 +208,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.account_id.clone(),
             input.new_budget.budget_name.clone(),
         );
-        let now = ::std::time::SystemTime::now();
         // The alerts this write leaves owed, decided under the store's lock and published
         // once it is released, so no delivery is made while the store is held.
         let alerts = {

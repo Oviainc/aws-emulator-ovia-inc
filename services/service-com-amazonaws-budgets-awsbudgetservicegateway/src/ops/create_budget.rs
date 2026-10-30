@@ -204,11 +204,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(message));
         }
 
+        // The instant of this write: the defaults the service supplies are computed from
+        // it, so the rules below judge the budget this call will actually leave stored.
+        let now = ::std::time::SystemTime::now();
+
         // The rules the model documents but no constraint trait can express; every
         // modelled constraint (the 12-digit AccountId, the BudgetName pattern above,
         // the TimeUnit/BudgetType enums, the list bounds) is refused as a validation
         // failure rather than reaching here.
-        crate::state::validate_budget(&input.budget).map_err(|message| {
+        crate::state::validate_budget(&input.budget, now).map_err(|message| {
             CreateBudgetErrorModeled::InvalidParameterException(InvalidParameterException {
                 message: Some(message),
             })
@@ -294,7 +298,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let key = (input.account_id.clone(), input.budget.budget_name.clone());
-        let now = ::std::time::SystemTime::now();
         // Every write this call makes is made under the store's lock, and the lock is
         // released at the end of this block: the alerts it leaves owed are published
         // afterwards, so no delivery is made while the store is held.

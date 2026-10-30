@@ -775,6 +775,29 @@ fn is_period_start(time_unit: &str, secs: i64) -> bool {
     default_time_period_start(time_unit, at).secs() == secs
 }
 
+/// The `TimePeriod` a write of `budget` at `at` LEAVES on it: each bound the request
+/// carried, and the documented default for each it did not — "If you create your budget
+/// and don't specify a start date, Amazon Web Services defaults to the start of your
+/// chosen time period ... If you didn't specify an end date, Amazon Web Services set your
+/// end date to `06/15/87 00:00 UTC`" (`Budget$TimePeriod`, via
+/// [`default_time_period_start`] / [`default_time_period_end`]).
+///
+/// The one answer to "what period will this budget cover?", so the write path that stores
+/// it ([`stamp_service_owned`]) and the rules that judge it ([`validate_time_period`])
+/// cannot come to disagree: a cross-member rule over the period is checked against the
+/// period that will be STORED, not only against the bounds the request spelled out.
+pub(crate) fn stamped_time_period(budget: &Budget, at: SystemTime) -> TimePeriod {
+    let carried = budget.time_period.as_ref();
+    TimePeriod {
+        start: carried
+            .and_then(|period| period.start)
+            .or_else(|| Some(default_time_period_start(&budget.time_unit, at))),
+        end: carried
+            .and_then(|period| period.end)
+            .or_else(|| Some(default_time_period_end())),
+    }
+}
+
 /// Stamp the members of `budget` the SERVICE owns, on the `CreateBudget` /
 /// `UpdateBudget` write path, so that every later read reports what was stored rather
 /// than recomputing it:
@@ -782,7 +805,7 @@ fn is_period_start(time_unit: &str, secs: i64) -> bool {
 /// * `LastUpdatedTime` — "the last time that you updated this budget", so a value the
 ///   caller sent is replaced by the time of this write.
 /// * `TimePeriod` — a budget always covers a period; an absent `Start` or `End` takes
-///   its documented default (see [`default_time_period_start`] / [`default_time_period_end`]).
+///   its documented default (see [`stamped_time_period`]).
 /// * `CostTypes` — the unset members of a `COST` budget's cost types take their
 ///   documented defaults, and a budget whose type has no cost types at all is stored
 ///   with none whatever the request carried (see [`settle_cost_types`]).
@@ -801,14 +824,7 @@ pub fn stamp_service_owned(budget: &mut Budget, at: SystemTime, previous: Option
     drop_service_derived(budget);
     apply_percentage_limit_default(budget);
 
-    let default_start = default_time_period_start(&budget.time_unit, at);
-    let period = budget.time_period.get_or_insert_with(TimePeriod::default);
-    if period.start.is_none() {
-        period.start = Some(default_start);
-    }
-    if period.end.is_none() {
-        period.end = Some(default_time_period_end());
-    }
+    budget.time_period = Some(stamped_time_period(budget, at));
 
     settle_cost_types(budget);
 
@@ -1907,9 +1923,11 @@ pub fn budget_name_violation(member_path: &[&str], name: &str) -> Option<String>
 /// * "only one set of filter and metric selections can be present in the syntax at
 ///   one time. Either `FilterExpression` and `Metrics` or `CostFilters` and
 ///   `CostTypes`, not both or a different combination." (`CreateBudget`)
-/// * "The start date must come before the end date." (`Budget$TimePeriod`)
-/// * "The end date must come before `06/15/87 00:00 UTC`." (`Budget$TimePeriod`) —
-///   [`validate_time_period_end`]
+/// * "The start date must come before the end date." (`Budget$TimePeriod`) and "The end
+///   date must come before `06/15/87 00:00 UTC`." (same member) — both judged over the
+///   period the write LEAVES stored ([`stamped_time_period`]), so a bound the SERVICE
+///   supplies is held to the same rule as one the caller spelled out
+///   ([`validate_time_period`])
 /// * "`BudgetLimit` is required for cost or usage budgets." (`Budget$BudgetLimit`) —
 ///   [`validate_budget_limit_present`]
 /// * "RI and Savings Plans utilization or coverage budgets default to `100`. This is the
@@ -1927,11 +1945,13 @@ pub fn budget_name_violation(member_path: &[&str], name: &str) -> Option<String>
 /// `Metrics`) carries no entry, so it names no limit and no filter syntax and is judged
 /// the same way as a member that was not sent at all ([`selection`]).
 ///
-/// Every rule holds for the whole `Budget` shape, so both write paths
+/// Every rule holds for the whole `Budget` shape AS IT WILL BE STORED, so both write paths
 /// (`CreateBudget$Budget` and `UpdateBudget$NewBudget`) run all of them before anything
 /// is stored: an update that would leave a budget in a shape a create could not have
-/// produced is refused, and the stored budget is left as it was.
-pub fn validate_budget(budget: &Budget) -> Result<(), String> {
+/// produced is refused, and the stored budget is left as it was. `at` is the instant of
+/// that write — the one the service's own defaults are computed from — so a rule over a
+/// member the service supplies judges the value the write will actually leave behind.
+pub fn validate_budget(budget: &Budget, at: SystemTime) -> Result<(), String> {
     if budget.budget_limit.is_some() && selects(&budget.planned_budget_limits) {
         return Err(
             "Unable to create/update budget: BudgetLimit can't be used with \
@@ -1948,16 +1968,7 @@ pub fn validate_budget(budget: &Budget) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if budget
-        .time_period
-        .as_ref()
-        .is_some_and(|period| !time_period_ordered(period))
-    {
-        return Err(
-            "Unable to create/update budget: TimePeriod Start must come before End.".to_string(),
-        );
-    }
-    validate_time_period_end(budget)?;
+    validate_time_period(&stamped_time_period(budget, at))?;
     validate_budget_limit_present(budget)?;
     validate_percentage_limit_amount(budget)?;
     validate_planned_budget_limits(budget)?;
@@ -2183,12 +2194,23 @@ pub const EVENT_TYPE_SYSTEM: &str = "SYSTEM";
 /// most recent history.
 pub const MAX_ACTION_HISTORY_RECORDS: usize = 1_000;
 
-/// "The end date must come before `06/15/87 00:00 UTC`" (`Budget$TimePeriod`), which is
-/// also the end date a budget written without one is given
-/// ([`default_time_period_end`]) — so that instant itself is accepted and anything after
-/// it is not.
-fn validate_time_period_end(budget: &Budget) -> Result<(), String> {
-    let Some(end) = budget.time_period.as_ref().and_then(|period| period.end.as_ref()) else {
+/// The two rules a budget's `TimePeriod` carries, over the period a write LEAVES on the
+/// budget ([`stamped_time_period`]) rather than over the bounds a request spelled out:
+///
+/// * "The start date must come before the end date" ([`time_period_ordered`]), so the
+///   period a write stores is never the inverted one the model says cannot exist —
+///   whichever of its two bounds the service itself supplied;
+/// * "The end date must come before `06/15/87 00:00 UTC`" (`Budget$TimePeriod`), which is
+///   also the end date a budget written without one is given
+///   ([`default_time_period_end`]) — so that instant itself is accepted and anything after
+///   it is not.
+fn validate_time_period(period: &TimePeriod) -> Result<(), String> {
+    if !time_period_ordered(period) {
+        return Err(
+            "Unable to create/update budget: TimePeriod Start must come before End.".to_string(),
+        );
+    }
+    let Some(end) = period.end.as_ref() else {
         return Ok(());
     };
     let last = default_time_period_end();

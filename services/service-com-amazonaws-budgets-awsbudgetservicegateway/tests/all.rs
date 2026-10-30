@@ -59,6 +59,8 @@ mod budget_performance_history;
 mod budget_read_projection;
 #[path = "all/budget_rule_conjunction.rs"]
 mod budget_rule_conjunction;
+#[path = "all/budget_stored_period_ordering.rs"]
+mod budget_stored_period_ordering;
 #[path = "all/budget_validation_rules.rs"]
 mod budget_validation_rules;
 #[path = "all/calculated_spend.rs"]
