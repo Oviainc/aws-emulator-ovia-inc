@@ -218,7 +218,10 @@ impl Case {
 
 /// `CreateConnectPeer` on the Connect attachment `attachment`, answering the minted id.
 /// `index` offsets the addresses so two peers of one attachment differ.
-async fn create_connect_peer(emulator: &Emulator, attachment: &str, index: usize) -> String {
+///
+/// `pub(crate)` because `tests/all/disassociate_link_tie_scope.rs` needs a peer of its own
+/// global network's core network, so both suites mint one through this helper.
+pub(crate) async fn create_connect_peer(emulator: &Emulator, attachment: &str, index: usize) -> String {
     let (status, created) = emulator
         .post(
             "/connect-peers",

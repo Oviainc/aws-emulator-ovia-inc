@@ -111,6 +111,8 @@ mod device_lifecycle;
 mod direct_connect_gateway_attachment_lifecycle;
 #[path = "all/disassociate_connect_peer.rs"]
 mod disassociate_connect_peer;
+#[path = "all/disassociate_link_tie_scope.rs"]
+mod disassociate_link_tie_scope;
 #[path = "all/edge_location_in_force.rs"]
 mod edge_location_in_force;
 #[path = "all/empty_optional_reference.rs"]

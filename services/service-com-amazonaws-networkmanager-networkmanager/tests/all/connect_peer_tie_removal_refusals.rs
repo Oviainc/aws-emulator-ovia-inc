@@ -56,7 +56,10 @@ const REGISTRATION_BLOCKED: &str = "Transit Gateway Registration cannot be delet
 /// another's ("connect peer association" of "transit gateway connect peer association"), so
 /// only the exact wording can show that the refusal named the kind that blocks and not the
 /// other one.
-fn assert_dependency_refusal(case: &str, status: u16, body: &Value, message: &str) {
+///
+/// `pub(crate)` because `tests/all/disassociate_link_tie_scope.rs` holds the same refusal
+/// to the same envelope, so both suites assert it through one helper.
+pub(crate) fn assert_dependency_refusal(case: &str, status: u16, body: &Value, message: &str) {
     assert_eq!(
         status, 400,
         "case {case:?}: a dependency refusal is HTTP 400, got {status} with {body}"
