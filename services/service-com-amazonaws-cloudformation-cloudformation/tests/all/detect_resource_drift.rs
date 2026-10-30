@@ -16,12 +16,18 @@
 //! no stack, and a `LogicalResourceId` the stack has not deployed, are refused with HTTP 400
 //! `ValidationError`.
 //!
+//! A resource whose TYPE drift detection is not supported for is refused the same way:
+//! "resources that don't currently support drift detection can't be checked", and the one
+//! status that would report such a non-check in a `StackResourceDrift` is the one the model
+//! records CloudFormation "does not currently return", so there is no record to answer with.
+//!
 //! The rows span the class the rule generalises over rather than one recorded case: a
 //! resource nothing touched, one whose nested declared document was changed outside the
-//! stack, one whose scalar property was, one deleted outside the stack and one of a type
-//! nothing here provisions a configuration for; one resource in the stack and several, with
-//! the check aimed at one of them; and two owning services (Amazon S3 and Amazon SNS), so
-//! the difference paths asserted are ones each of those services really reports.
+//! stack, one whose scalar property was, and one deleted outside the stack; one resource in
+//! the stack and several, with the check aimed at one of them; and two owning services
+//! (Amazon S3 and Amazon SNS), so the difference paths asserted are ones each of those
+//! services really reports. The refusal rows span the types nothing here reports a
+//! configuration for, over two namespaces.
 //!
 //! Everything goes through the one router `stack_lifecycle.rs` builds, over each service's
 //! own wire — awsQuery for CloudFormation and Amazon SNS, REST for Amazon S3.
@@ -191,31 +197,6 @@ fn detect_cases() -> Vec<DetectCase> {
             actual_properties: None,
             differences: vec![],
             reported_afterwards: true,
-            untouched: vec![],
-        },
-        DetectCase {
-            case: "a resource of a type nothing here reports a configuration for",
-            stack: "detect-one-unsupported",
-            template: concat!(
-                "Resources:\n",
-                "  Signal:\n",
-                "    Type: AWS::Logs::LogGroup\n",
-                "    Properties:\n",
-                "      LogGroupName: detect-one-unsupported-signal\n",
-            )
-            .to_string(),
-            tamper: Tamper::Nothing,
-            detect: "Signal",
-            resource_type: "AWS::Logs::LogGroup",
-            // "Any resources that do not currently support drift detection have a status of
-            // NOT_CHECKED": nothing was read, so neither configuration is reported.
-            status: resource_drift_status::NOT_CHECKED,
-            expected_properties: None,
-            actual_properties: None,
-            differences: vec![],
-            // "Resources that don't currently support drift detection aren't checked, and so
-            // not included."
-            reported_afterwards: false,
             untouched: vec![],
         },
         DetectCase {
@@ -598,6 +579,84 @@ fn assert_refused(case: &str, status: u16, body: &str, names: &[&str]) {
             "case {case:?}: expected the refusal to name {named:?}, got {message:?}"
         );
     }
+}
+
+/// A resource whose TYPE drift detection is not supported for cannot be checked at all, so
+/// the request for its drift is REFUSED — naming the type — and records nothing: the one
+/// status that would report such a non-check in a `StackResourceDrift` is the one the model
+/// records CloudFormation "does not currently return".
+///
+/// The rows are the types nothing here reports a configuration for, over two namespaces.
+#[tokio::test]
+async fn a_check_of_a_type_drift_detection_is_not_supported_for_is_refused() {
+    let router = router();
+    let stack = "detect-one-unsupported";
+    deploy(
+        &router,
+        stack,
+        concat!(
+            "Resources:\n",
+            "  Signal:\n",
+            "    Type: AWS::Logs::LogGroup\n",
+            "    Properties:\n",
+            "      LogGroupName: detect-one-unsupported-signal\n",
+            "  Escalation:\n",
+            "    Type: AWS::Bedrock::KnowledgeBase\n",
+            "    Properties:\n",
+            "      Name: detect-one-unsupported-kb\n",
+            "      RoleArn: arn:aws:iam::000000000000:role/detect-one-unsupported\n",
+        ),
+    )
+    .await;
+
+    for (case, logical_id, resource_type) in [
+        (
+            "a log group, which no owning service here reports",
+            "Signal",
+            "AWS::Logs::LogGroup",
+        ),
+        (
+            "a knowledge base, which nothing here provisions",
+            "Escalation",
+            "AWS::Bedrock::KnowledgeBase",
+        ),
+    ] {
+        let (status, body) = detect_resource_drift(&router, stack, logical_id).await;
+        assert_refused(case, status, &body, &[resource_type]);
+        // CloudFormation's own sentence for it, with the resource's TYPE as its one
+        // variable part.
+        let message = xml_text(&body, "Message").unwrap_or_default();
+        let expected = format!("Drift detection is not supported for ResourceType {resource_type}");
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the refusal {expected:?}, got {message:?}"
+        );
+
+        // The refused request checked nothing, so the resource is still unchecked and
+        // carries no check instant.
+        let (status, detail) = describe_stack_resource(&router, stack, logical_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeStackResource answered {status} with {detail}"
+        );
+        let got = xml_text(&detail, "StackResourceDriftStatus");
+        assert_eq!(
+            got.as_deref(),
+            Some(resource_drift_status::NOT_CHECKED),
+            "case {case:?}: expected the resource to be left unchecked, got {got:?}"
+        );
+        assert!(
+            xml_text(&detail, "LastCheckTimestamp").is_none(),
+            "case {case:?}: expected no check instant, got {detail}"
+        );
+    }
+
+    // …and the stack reports no checked resource at all.
+    let reported = reported_drifts(&router, stack).await;
+    assert!(
+        reported.is_empty(),
+        "case \"after the refusals\": expected no drift records, got {reported:?}"
+    );
 }
 
 /// A request that names no resource of a stack of this Region is refused, and records

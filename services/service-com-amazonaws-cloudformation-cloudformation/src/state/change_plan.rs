@@ -36,11 +36,20 @@
 //!   `ReplaceAnd…` form of its `UpdateReplacePolicy`.
 //!
 //! Which property change recreates a resource is published per property in the resource
-//! and property types reference; what this module reads from it is the rule that holds for
-//! EVERY type: a resource's physical name is fixed when it is created, so the property a
-//! resource takes its name from (see [`template::name_property`]) is documented "Update
-//! requires: Replacement", and so is each of the type's other create-only properties
-//! ([`template::replacement_properties`]) — every other property change is `Never`.
+//! and property types reference, and the three answers it publishes are the three values
+//! `RequiresRecreation` takes:
+//!
+//! * `Always` — the resource cannot take a new value for the property at all: its physical
+//!   name, for a type its owning service identifies BY that name
+//!   ([`template::replacing_properties`]), and each of the type's other create-only
+//!   properties ([`template::replacement_properties`]).
+//! * `Conditionally` — "a change to this property causes the resource to be recreated…
+//!   [t]o determine the conditions for a `Conditionally` recreation, see the update
+//!   behavior for that property": the property carries values of BOTH kinds, so whether
+//!   the change recreates the resource depends on which of them the two revisions state
+//!   differently ([`template::conditionally_replacing_properties`]).
+//! * `Never` — every other property, including the name of a resource whose owning service
+//!   RENAMES it in place.
 //!
 //! Nothing here is computed on a read: `CreateChangeSet` calls [`computed_changes`] once
 //! and stores what it answered.
@@ -64,6 +73,10 @@ pub mod replacement {
 pub mod requires_recreation {
     pub const NEVER: &str = "Never";
     pub const ALWAYS: &str = "Always";
+    /// "To determine the conditions for a `Conditionally` recreation, see the update
+    /// behavior for that property": the change recreates the resource only under the
+    /// conditions that property's own update behaviour states.
+    pub const CONDITIONALLY: &str = "Conditionally";
 }
 
 /// `EvaluationType` values (the model's `EvaluationType` enum).
@@ -504,12 +517,8 @@ fn propagate_recreations(
         propagated.push(StoredChangeDetail {
             attribute: PROPERTIES_ATTRIBUTE.to_string(),
             name: Some(property.to_string()),
-            requires_recreation: if replacing.iter().any(|name| name == property) {
-                requires_recreation::ALWAYS
-            } else {
-                requires_recreation::NEVER
-            }
-            .to_string(),
+            requires_recreation: recreation_of(&resource.resource_type, &replacing, property)
+                .to_string(),
             // The value this property will carry is the recreated resource's, which the
             // plan already decided: determined, and determined to change, which is what
             // `Static` reports.
@@ -519,6 +528,28 @@ fn propagate_recreations(
         });
     }
     details.extend(propagated);
+}
+
+/// The `RequiresRecreation` of a change to one property of a declaration of
+/// `resource_type`, given the properties of that declaration a change recreates the
+/// resource over (`recreating`, from [`template::replacing_properties`]).
+///
+/// `Always` for a property the resource cannot take a new value for at all, `Conditionally`
+/// for one that carries such a value AMONG values it can take anew — "a change to this
+/// property causes the resource to be recreated… [t]o determine the conditions for a
+/// `Conditionally` recreation, see the update behavior for that property" — and `Never` for
+/// every other property.
+///
+/// The one classification both passes below report, so a property is classified the same
+/// way whether the template states its change outright or the plan implies it.
+fn recreation_of(resource_type: &str, recreating: &[String], property: &str) -> &'static str {
+    if recreating.iter().any(|name| name == property) {
+        return requires_recreation::ALWAYS;
+    }
+    if template::conditionally_replacing_properties(resource_type).contains(&property) {
+        return requires_recreation::CONDITIONALLY;
+    }
+    requires_recreation::NEVER
 }
 
 /// The order a resource's details are reported in: by the attribute they target, in the
@@ -659,20 +690,19 @@ fn property_details(
         } else {
             evaluation::STATIC
         };
-        let recreates = recreating.iter().any(|name| name == property);
+        let recreates = recreation_of(&submitted.resource_type, &recreating, property);
         let target = |evaluation: &str, source: &str, causing_entity: Option<String>| {
             StoredChangeDetail {
                 attribute: PROPERTIES_ATTRIBUTE.to_string(),
                 name: Some(property.to_string()),
-                requires_recreation: if recreates {
-                    // The property the resource takes its physical NAME from: a name is
-                    // fixed when the resource is created, which is why every name
-                    // property's "Update requires" is `Replacement`.
-                    requires_recreation::ALWAYS
-                } else {
-                    requires_recreation::NEVER
-                }
-                .to_string(),
+                // What a change to this property does to the resource: the property the
+                // resource takes its physical NAME from, for a type whose owning service
+                // cannot rename it, is `Always` — a name is fixed when the resource is
+                // created, which is why every such name property's "Update requires" is
+                // `Replacement` — and so is each of the type's other create-only
+                // properties, while a property that carries a create-only value among
+                // updatable ones is `Conditionally` ([`recreation_of`]).
+                requires_recreation: recreates.to_string(),
                 evaluation: evaluation.to_string(),
                 change_source: source.to_string(),
                 causing_entity,
@@ -764,8 +794,10 @@ fn property_names(properties: &Value) -> Vec<&str> {
 }
 
 /// `ResourceChange$Replacement` read off a `Modify`'s details, as the model documents it:
-/// `Always` + `Static` is `True`, `Always` + `Dynamic` is `Conditional`, and with several
-/// details "the `Replacement` value depends on the change with the most impact".
+/// `Always` + `Static` is `True`, `Always` + `Dynamic` is `Conditional`, a `Conditionally`
+/// recreation is `Conditional` whatever its evaluation, and with several details "the
+/// `Replacement` value depends on the change with the most impact. A `RequiresRecreation`
+/// value of `Always` has the most impact, followed by `Conditional`, and then `Never`".
 fn replacement_of(details: &[StoredChangeDetail]) -> &'static str {
     let mut answer = replacement::FALSE;
     for detail in details {
@@ -777,6 +809,7 @@ fn replacement_of(details: &[StoredChangeDetail]) -> &'static str {
             (requires_recreation::ALWAYS, _) => replacement::CONDITIONAL,
             // `Conditionally`: recreation depends on the value, which is the same impact a
             // recreation this emulator cannot evaluate has.
+            (requires_recreation::CONDITIONALLY, _) => replacement::CONDITIONAL,
             (requires_recreation::NEVER, _) => replacement::FALSE,
             _ => replacement::CONDITIONAL,
         };

@@ -2262,7 +2262,8 @@ pub fn name_property(resource_type: &str, properties: &Value) -> Option<String> 
 /// The properties of this type a resource cannot take a NEW VALUE for while it goes on
 /// existing — the ones the resource and property types reference publishes with "Update
 /// requires: `Replacement`" — BESIDE the name, which is in that position for every type
-/// ([`name_property`]) and is read from the declaration rather than catalogued.
+/// whose owning service cannot rename the resource ([`name_is_create_only`]) and is read
+/// from the declaration rather than catalogued.
 ///
 /// A resource is created with such a property and nothing changes it afterwards: an IAM
 /// access key belongs to the user `CreateAccessKey` minted it for and carries the `Serial`
@@ -2280,15 +2281,60 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
     }
 }
 
+/// The properties of this type that carry a value the resource cannot take anew AMONG
+/// values it CAN: a change to such a property recreates the resource only when it is the
+/// create-only value inside it that the two revisions state differently, which is the
+/// `Conditionally` of `ResourceTargetDefinition$RequiresRecreation` ("to determine the
+/// conditions for a `Conditionally` recreation, see the update behavior for that
+/// property").
+///
+/// An Amazon Bedrock knowledge base is the case: `UpdateKnowledgeBase` takes a knowledge
+/// base's whole `knowledgeBaseConfiguration` by id, so most of what that property states IS
+/// updatable, while the embedding model inside it is not — the knowledge base's vectors were
+/// produced by that model, so a knowledge base reading another one is a new knowledge base.
+/// A change to the property is therefore reported as a recreation whose condition is which
+/// value inside it changed, which is what the recorded preview of such a change answers
+/// (`Replacement` `Conditional` rather than `True`).
+///
+/// A type with no entry has no such property: each of its properties is either create-only
+/// ([`replacement_properties`]) or updatable.
+pub fn conditionally_replacing_properties(resource_type: &str) -> &'static [&'static str] {
+    match resource_type {
+        BEDROCK_KNOWLEDGE_BASE => &["KnowledgeBaseConfiguration"],
+        _ => &[],
+    }
+}
+
+/// Whether a resource of this type cannot take a new physical NAME while it goes on
+/// existing, so that the property it takes its name from ([`name_property`]) is one of its
+/// create-only ones.
+///
+/// It is for a resource its owning service identifies BY that name: there is no call that
+/// renames it, so a declaration stating another name asks for a different resource. A
+/// service that identifies the resource by an identifier IT minted renames it in place
+/// instead, and the service's own model is where that shows — Amazon Bedrock Agent's
+/// `UpdateKnowledgeBase` takes a `knowledgeBaseId` together with a new required `name`, as
+/// `UpdateAgent` takes an `agentId` and an `agentName`, `UpdateAgentAlias` an
+/// `agentAliasId` and an `agentAliasName`, and `UpdateDataSource` a data source's id and a
+/// new `name`. Renaming such a resource is a modification of it, not a recreation.
+fn name_is_create_only(resource_type: &str) -> bool {
+    !matches!(
+        resource_type,
+        BEDROCK_KNOWLEDGE_BASE | BEDROCK_AGENT | BEDROCK_AGENT_ALIAS | BEDROCK_DATA_SOURCE
+    )
+}
+
 /// Every property of one declaration whose change RECREATES the resource: the name it takes
-/// its identity from, and the type's other replacement properties
-/// ([`replacement_properties`]).
+/// its identity from, where the type's own name is create-only ([`name_is_create_only`]),
+/// and the type's other replacement properties ([`replacement_properties`]).
 ///
 /// The one reading of "Update requires: `Replacement`" a change set's `RequiresRecreation`
 /// details and a deployment's own replacement decision share, so a preview cannot say a
 /// change recreates a resource that the deployment then updates in place.
 pub fn replacing_properties(resource_type: &str, properties: &Value) -> Vec<String> {
-    name_property(resource_type, properties)
+    name_is_create_only(resource_type)
+        .then(|| name_property(resource_type, properties))
+        .flatten()
         .into_iter()
         .chain(
             replacement_properties(resource_type)
@@ -4549,6 +4595,19 @@ pub const FIREHOSE_DELIVERY_STREAM: &str = "AWS::KinesisFirehose::DeliveryStream
 /// under, so a GENERATED one is held to that service's own rules for it ([`naming_rules`])
 /// and the identity is not service-assigned.
 pub const KINESIS_STREAM: &str = "AWS::Kinesis::Stream";
+
+/// The `AWS::<cloudFormationName>::<Resource>` types of the Amazon Bedrock resources an
+/// agent estate declares. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`Bedrock`).
+///
+/// Each one's owning API — Amazon Bedrock Agent's build-time service — identifies the
+/// resource by a ten-character identifier IT mints (`CreateKnowledgeBase` answers a
+/// `knowledgeBaseId`, `CreateAgent` an `agentId`) and takes a new name on the matching
+/// update, which is why [`name_is_create_only`] names these types.
+pub const BEDROCK_KNOWLEDGE_BASE: &str = "AWS::Bedrock::KnowledgeBase";
+pub const BEDROCK_AGENT: &str = "AWS::Bedrock::Agent";
+pub const BEDROCK_AGENT_ALIAS: &str = "AWS::Bedrock::AgentAlias";
+pub const BEDROCK_DATA_SOURCE: &str = "AWS::Bedrock::DataSource";
 
 /// The `AWS::<cloudFormationName>::<Resource>` types of the two OpenSearch Serverless
 /// resources a stack creates. The middle segment is that service's own

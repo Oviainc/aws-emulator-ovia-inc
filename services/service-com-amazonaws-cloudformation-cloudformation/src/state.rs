@@ -6263,6 +6263,15 @@ pub fn resource_does_not_exist(logical_resource_id: &str, stack_name: &str) -> S
     format!("Resource {logical_resource_id} does not exist for stack {stack_name}")
 }
 
+/// The message answered when a request asks for the drift of a resource whose TYPE drift
+/// detection is not supported for: "resources that don't currently support drift detection
+/// can't be checked", so there is no comparison to answer with and the request is refused.
+/// CloudFormation's own sentence for it, naming the `ResourceType` the named resource
+/// carries.
+pub fn drift_detection_unsupported(resource_type: &str) -> String {
+    format!("Drift detection is not supported for ResourceType {resource_type}")
+}
+
 /// The message answered when a request names an extension the registry of this account and
 /// Region does not hold — an unknown name or ARN, a name registered under another kind or
 /// in another Region, a publisher that published no such extension, or a version the

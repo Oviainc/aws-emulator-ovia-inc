@@ -8,7 +8,10 @@
 //! found is recorded on the resource, so `DescribeStackResourceDrifts` and the resource
 //! reads report it afterwards, and answered directly as this operation's
 //! `StackResourceDrift`. A `StackName` that resolves to no stack of the Region, and a
-//! `LogicalResourceId` the stack has not deployed, are refused with `ValidationError`.
+//! `LogicalResourceId` the stack has not deployed, are refused with `ValidationError` — as
+//! is a resource whose TYPE drift detection is not supported for, which cannot be checked
+//! at all ("resources that don't currently support drift detection can't be checked"), so
+//! there is no comparison to answer with.
 //!
 //! ## Shape of an operation
 //!
@@ -195,6 +198,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let detected =
             crate::state::drift::detect(ctx, &stack_region, ::std::slice::from_ref(&resource))
                 .await;
+
+        // "Resources that don't currently support drift detection can't be checked": for
+        // such a resource no comparison was carried out, and the one status that would say
+        // so in a `StackResourceDrift` is the one the model records CloudFormation "does not
+        // currently return" — so the request for it is REFUSED rather than answered with a
+        // record about a check nothing ran, and nothing is recorded on the resource either.
+        if detected
+            .results
+            .iter()
+            .any(|result| result.status == crate::state::resource_drift_status::NOT_CHECKED)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::drift_detection_unsupported(&resource.resource_type),
+            ));
+        }
 
         let mut store = state.lock();
         // What the check FOUND goes onto the resource it was carried out over, so every

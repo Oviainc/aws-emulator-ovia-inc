@@ -32,6 +32,10 @@
 //! * `IN_SYNC` — the resource is there and no declared property it reports differs.
 //! * `NOT_CHECKED` — nothing was asked of any service for it (declared-only resource, a
 //!   type with no provisioner, or an owning service whose read is still a scaffold stub).
+//!   It is the outcome of a check that never happened, so it is never REPORTED in a
+//!   `StackResourceDrift` ("CloudFormation does not currently return this value"): a
+//!   whole-stack detection holds no record for such a resource, and a request for that ONE
+//!   resource's drift is refused instead (`crate::ops::detect_stack_resource_drift`).
 //! * `UNKNOWN` — the read was refused for another reason, so the check could not run; the
 //!   detection as a whole is then `DETECTION_FAILED`, with that refusal as its reason.
 //!
