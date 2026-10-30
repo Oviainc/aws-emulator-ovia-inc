@@ -236,10 +236,8 @@ impl Seed {
                 total_files_failed: counts[2],
                 total_resources_generated: counts[3],
             }),
-            // Seeded rather than started, so no `ClientToken` named this job
-            // and no request fingerprinted to it.
+            // Seeded rather than started, so no `ClientToken` named this job.
             client_token: None,
-            request_fingerprint: String::new(),
         }
     }
 

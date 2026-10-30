@@ -235,7 +235,6 @@ impl Listing {
                             message: None,
                             progress_report: None,
                             client_token: None,
-                            request_fingerprint: String::new(),
                         },
                     );
                 }

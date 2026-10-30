@@ -772,10 +772,8 @@ async fn reading_a_version_a_profile_does_not_have_is_not_found() {
 }
 
 /// The idempotency table: the rule must hold whatever the request carries, so the
-/// rows differ along the number of mapping entries (the content map arrives as an
-/// unordered map, so a multi-entry row is the one that catches an
-/// iteration-order-dependent fingerprint), along the tags (another unordered map)
-/// and along which optional members are present.
+/// rows differ along the number of mapping entries, along the tags and along which
+/// optional members are present.
 fn idempotency_cases() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -831,9 +829,9 @@ fn idempotency_cases() -> Vec<(&'static str, Value)> {
 /// [`idempotency_cases`], which only exists once the test has created it.
 const CLONE_ORIGIN_PLACEHOLDER: &str = "<origin>";
 
-/// `ClientToken` is this operation's `@idempotencyToken`: the same token with the
-/// same request answers with the profile the first call minted and mints no
-/// second one; the same token with a different request is refused.
+/// `ClientToken` is this operation's `@idempotencyToken`: a call carrying a token
+/// the service has already seen is ignored and answered with the profile the first
+/// call minted, mints no second profile and returns no error.
 #[tokio::test]
 async fn client_token_makes_the_create_idempotent() {
     let healthlake = Profiles::new();
@@ -889,19 +887,20 @@ async fn client_token_makes_the_create_idempotent() {
             "case {case:?}: a create without a token mints its own profile"
         );
 
-        // The same token with a DIFFERENT request is a different request.
+        // The same token with a DIFFERENT request is IGNORED, not refused:
+        // `CreateDataTransformationProfileRequest$ClientToken` documents that
+        // "the service ignores the request but does not return an error".
         let mut altered = request.clone();
         altered["ProfileName"] = json!(format!(
             "{}-renamed",
             altered["ProfileName"].as_str().unwrap_or_default()
         ));
-        let (status, code) = healthlake
-            .refused(case, "CreateDataTransformationProfile", &altered)
+        let ignored = healthlake
+            .ok(case, "CreateDataTransformationProfile", &altered)
             .await;
         assert_eq!(
-            (status, code.as_str()),
-            (400, "ValidationException"),
-            "case {case:?}: one token cannot stand for two different requests"
+            ignored, first,
+            "case {case:?}: a call under a token already seen answers what the first call answered"
         );
 
         // The profile the token minted is still readable, and is the one the

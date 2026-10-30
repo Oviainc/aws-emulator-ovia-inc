@@ -20,9 +20,9 @@
 //! 4. a `ProfileId` no profile record holds is `ResourceNotFoundException` in
 //!    this service's fixed not-found sentence, and a refused start mints
 //!    nothing;
-//! 5. one `ClientToken` starts one job: a repeat of the same request answers
-//!    out of the job it started — whatever status that job has reached by then
-//!    — and the same token with a different request is refused.
+//! 5. one `ClientToken` starts one job: a call carrying a token already seen
+//!    is IGNORED and answered out of the job that token started — whatever
+//!    status that job has reached by then, and whatever else the request says.
 //!
 //! Every call goes through [`MultiServiceRouter::dispatch`](smithy_server_runtime::MultiServiceRouter)
 //! by way of the harness in `fhir_datastore_lifecycle`, so routing,
@@ -537,9 +537,11 @@ async fn one_client_token_starts_one_data_transformation_job() {
         "one ClientToken must start exactly one job"
     );
 
-    // The same token with a DIFFERENT request is a different request, and is
-    // refused rather than answered with the earlier job. The rows differ along
-    // which member differs.
+    // A token already seen makes the service ignore the call it carries and
+    // return no error, as `StartDataTransformationJobRequest$ClientToken`
+    // documents, so each row below is answered with the job the token started
+    // and starts nothing. The rows differ along which member differs from the
+    // request that minted it.
     let (other_profile, _name) = profile(&service, "other").await;
     for (case, member, value) in [
         ("a different JobName", "JobName", json!("nightly")),
@@ -581,19 +583,32 @@ async fn one_client_token_starts_one_data_transformation_job() {
             .call("StartDataTransformationJob", &different)
             .await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: a reused ClientToken must be refused, got {status}: {payload}"
+            status, 200,
+            "case {case:?}: a call under a token already seen must not be refused, got {status}: {payload}"
         );
         assert_eq!(
-            error_code(&payload),
-            "ValidationException",
-            "case {case:?}: a reused ClientToken must answer ValidationException, got {payload}"
+            payload["JobId"],
+            json!(job_id),
+            "case {case:?}: the call must be answered with the job the token started, got {payload}"
+        );
+        // What the ignored call carried reached no record: the job still
+        // reports the members the first request named.
+        let described = describe(&service, &job_id).await;
+        assert_eq!(
+            described.get("JobName").and_then(Value::as_str),
+            Some("hourly"),
+            "case {case:?}: an ignored call must change nothing on the job, got {described}"
+        );
+        assert_eq!(
+            described["ProfileId"],
+            json!(profile_id),
+            "case {case:?}: an ignored call must change nothing on the job, got {described}"
         );
     }
     assert_eq!(
         held_jobs(&service),
         1,
-        "every refusal above must have started no further job"
+        "every ignored call above must have started no further job"
     );
 
     // A DIFFERENT token starts a second job of the same request.

@@ -275,7 +275,6 @@ fn seed(service: &HealthLake, datastore_id: &str, rows: &[Row]) -> (Instant, Sys
                         message: None,
                         progress_report: None,
                         client_token: None,
-                        request_fingerprint: String::new(),
                     },
                 );
             }

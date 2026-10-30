@@ -75,6 +75,8 @@ mod resource_tagging;
 mod resource_untagging;
 #[path = "all/restore_fhir_datastore.rs"]
 mod restore_fhir_datastore;
+#[path = "all/seen_client_token_is_ignored.rs"]
+mod seen_client_token_is_ignored;
 #[path = "all/source_format_enum_refusal.rs"]
 mod source_format_enum_refusal;
 #[path = "all/start_data_transformation_job.rs"]

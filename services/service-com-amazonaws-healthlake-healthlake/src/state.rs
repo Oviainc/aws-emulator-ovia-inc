@@ -1364,11 +1364,6 @@ pub struct TransformationJob {
     /// token resolves to the one job it started. `None` on a record that was
     /// not started through the API.
     pub client_token: Option<String>,
-    /// A fingerprint of the request that started this job, so
-    /// [`ComAmazonawsHealthlakeHealthlakeState::transformation_job_for_client_token`]
-    /// can tell a repeat of the SAME request from a token reused with a
-    /// different one.
-    pub request_fingerprint: String,
 }
 
 impl TransformationJob {
@@ -1449,15 +1444,17 @@ pub struct ClientTokenRecord {
 }
 
 /// What one `CreateDataTransformationProfile` `ClientToken` recorded: the
-/// profile it minted and a fingerprint of the request that minted it.
+/// profile it minted.
 ///
 /// Kept apart from [`ClientTokenRecord`] because the two operations mint
 /// different resources: one caller's token for a data store must never resolve
-/// to a profile, or the other way round.
+/// to a profile, or the other way round. It holds no request fingerprint: the
+/// model documents that operation's token as making the service IGNORE a
+/// repeat, so what the repeat asked for is never compared with what the first
+/// call asked for.
 #[derive(Debug, Clone)]
 pub struct ProfileClientTokenRecord {
     pub profile_id: String,
-    pub fingerprint: String,
 }
 
 /// One version of a data transformation profile: its content, why it changed,
@@ -2272,15 +2269,9 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         )
     }
 
-    /// Record `token` as having minted `profile_id` from a request with
-    /// `fingerprint`, evicting the oldest token first if that would push the map
-    /// past [`MAX_PROFILE_CLIENT_TOKENS`].
-    pub fn record_profile_client_token(
-        &mut self,
-        token: String,
-        profile_id: &str,
-        fingerprint: String,
-    ) {
+    /// Record `token` as having minted `profile_id`, evicting the oldest token
+    /// first if that would push the map past [`MAX_PROFILE_CLIENT_TOKENS`].
+    pub fn record_profile_client_token(&mut self, token: String, profile_id: &str) {
         while self.profile_client_tokens.len() >= MAX_PROFILE_CLIENT_TOKENS {
             match self.profile_client_token_order.pop_front() {
                 Some(oldest) => {
@@ -2301,7 +2292,6 @@ impl ComAmazonawsHealthlakeHealthlakeState {
                 token.clone(),
                 ProfileClientTokenRecord {
                     profile_id: profile_id.to_string(),
-                    fingerprint,
                 },
             )
             .is_none()

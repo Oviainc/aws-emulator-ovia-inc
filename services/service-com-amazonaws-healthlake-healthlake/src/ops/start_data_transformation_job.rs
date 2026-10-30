@@ -21,10 +21,11 @@
 //! `ClientToken` is this operation's required idempotency token — "a unique,
 //! case-sensitive identifier to ensure that the operation completes no more
 //! than one time. If this token matches a previous request, the service ignores
-//! the request but does not return an error" — so a repeat of the SAME call is
-//! answered out of the job that token started instead of starting a second one,
-//! and a token reused with a DIFFERENT request is refused, exactly as the other
-//! operations in this crate that honour a token do.
+//! the request but does not return an error" — so a call carrying a token this
+//! service has already seen IGNORES what that call asked for: it starts no
+//! second job, changes nothing on the job the token started, and answers out of
+//! that job's stored record, whatever the rest of the request says and whether
+//! or not it repeats the first one. Nothing about the repeat is refused.
 //!
 //! RUNNING THE TRANSFORMATION means reading the source files from the input
 //! Amazon S3 location and writing the converted output to the destination
@@ -204,26 +205,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let fingerprint = request_fingerprint(&input);
         let mut store = state.lock();
         // The job records must have caught up with the clock before any of them
         // is read: an earlier job whose transition is already due would
         // otherwise be answered under the status it has left.
         store.settle_transformation_jobs();
 
-        // A repeat of the SAME call under a token already seen is answered out
-        // of the job that token started, so one token starts one job. A token
-        // reused with a DIFFERENT request is a different request, and is
-        // refused rather than answered with the earlier job — the
-        // `ValidationException` this operation models, a bad request, nothing
-        // here being a resource-state conflict.
+        // A call under a token already seen is IGNORED and answered out of the
+        // job that token started — see the module docs — so one token starts
+        // one job however the rest of the request is spelled, and nothing the
+        // repeat carries is looked at or validated past the boundary.
         if let Some(started) = store.transformation_job_for_client_token(&input.client_token) {
-            if started.request_fingerprint != fingerprint {
-                return Err(validation(
-                    "ClientToken was already used for a different \
-                     StartDataTransformationJob request",
-                ));
-            }
             // Answered out of the STORED record, so a repeat cannot report a
             // status the job has already left.
             return Ok(StartDataTransformationJobOutput {
@@ -299,7 +291,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             message: None,
             progress_report: None,
             client_token: Some(input.client_token),
-            request_fingerprint: fingerprint,
         };
 
         let output = StartDataTransformationJobOutput {
@@ -309,15 +300,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.transformation_jobs.insert(id, job);
         Ok(output)
     }
-}
-
-/// This operation's 400 refusal, as the modelled `ValidationException` it
-/// declares.
-fn validation(message: impl Into<String>) -> StartDataTransformationJobError {
-    StartDataTransformationJobErrorModeled::ValidationException(ValidationException {
-        message: Some(message.into()),
-    })
-    .into()
 }
 
 /// This operation's 404, worded without quoting the requested identifier — the
@@ -337,31 +319,3 @@ fn internal_server(message: &str) -> StartDataTransformationJobError {
     .into()
 }
 
-/// A fingerprint of everything this request asks for, so one `ClientToken`
-/// resolves to the job it started only for a repeat of the SAME request.
-///
-/// Built from the members that define the job — never from the token itself —
-/// with presence of the optional members rendered explicitly. The
-/// length-prefixed folding itself lives in
-/// [`crate::state::request_fingerprint`], shared with the other operations here
-/// that honour an idempotency token.
-fn request_fingerprint(input: &StartDataTransformationJobInput) -> String {
-    crate::state::request_fingerprint([
-        input.profile_id.clone(),
-        input.data_access_role_arn.clone(),
-        crate::state::optional_field("JobName", input.job_name.as_deref()),
-        // Neither data configuration carries a map, so each one's derived
-        // `Debug` has a canonical form for a given value, which is all a
-        // fingerprint needs.
-        format!("{:?}", input.input_data_config),
-        format!("{:?}", input.output_data_config),
-        crate::state::optional_field(
-            "DriftDetectionEnabled",
-            input
-                .drift_detection_enabled
-                .map(|enabled| enabled.to_string())
-                .as_deref(),
-        ),
-        format!("ProvenanceEnabled={}", input.provenance_enabled),
-    ])
-}

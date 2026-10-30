@@ -17,6 +17,13 @@
 //! the model documents for it is enforced. Nothing is invented and nothing is
 //! persisted for them.
 //!
+//! `ClientToken` is this operation's `@idempotencyToken`, and the model documents
+//! what a token the service has already seen does: "If this token matches a
+//! previous request, the service ignores the request but does not return an
+//! error". A call carrying one therefore mints nothing, changes nothing on the
+//! profile that token minted, and answers what the create that minted it
+//! answered — whatever the rest of the request says.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -220,32 +227,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        let fingerprint = request_fingerprint(&region, &input);
         let mut store = state.lock();
 
-        // `ClientToken` is this operation's `@idempotencyToken`: a repeat of the SAME
-        // call carrying a token already seen resolves to the profile that token
-        // minted instead of minting a second one, and answers what that create
-        // answered. A token reused with a DIFFERENT request is a different request,
-        // and is refused rather than answered with the earlier profile.
-        //
-        // The refusal is this operation's `ValidationException`, not the
-        // `ConflictException` it also models: the model documents that one as "The
-        // data store is in a transition state and the user requested action cannot be
-        // performed", a RESOURCE-state conflict, while a token carried on two
-        // different requests is a bad request and nothing here is in transition.
+        // `ClientToken` is this operation's `@idempotencyToken`, and the model
+        // documents what a token already seen does: "the service ignores the
+        // request but does not return an error". So a call carrying one mints
+        // no second profile, changes nothing on the profile that token minted,
+        // and answers what the create that minted it answered — whatever the
+        // rest of the request says and whether or not it repeats the first one.
         if let Some(recorded) = input
             .client_token
             .as_deref()
             .and_then(|token| store.profile_client_tokens.get(token))
             .cloned()
         {
-            if recorded.fingerprint != fingerprint {
-                return Err(validation(
-                    "ClientToken was already used for a different \
-                     CreateDataTransformationProfile request",
-                ));
-            }
             if let Some(existing) = store.profiles.get(&recorded.profile_id) {
                 return Ok(CreateDataTransformationProfileOutput {
                     profile_id: existing.id.clone(),
@@ -326,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         store.profiles.insert(id.clone(), profile);
         if let Some(token) = input.client_token {
-            store.record_profile_client_token(token, &id, fingerprint);
+            store.record_profile_client_token(token, &id);
         }
         Ok(output)
     }
@@ -453,63 +448,3 @@ fn internal_server(message: &str) -> CreateDataTransformationProfileError {
     .into()
 }
 
-/// A fingerprint of everything this request asks for, so one `ClientToken`
-/// resolves to its profile only for a repeat of the SAME request.
-///
-/// Built from the members that define the profile — never from the token itself —
-/// with the region included because it is what the minted ARN is built from. Every
-/// field is rendered in a CANONICAL form: the modelled maps (`Tags`, and the raw
-/// profile content) deserialize into a `HashMap`, whose iteration order differs per
-/// instance, so they are ordered by key before they are folded in. Folding itself
-/// is [`crate::state::request_fingerprint`], shared with the other creates that
-/// honour an idempotency token.
-fn request_fingerprint(region: &str, input: &CreateDataTransformationProfileInput) -> String {
-    let mut fields = vec![
-        region.to_string(),
-        input.profile_name.clone(),
-        crate::state::optional_field("ProfileDescription", input.profile_description.as_deref()),
-        crate::state::optional_field("KmsKeyId", input.kms_key_id.as_deref()),
-        input.source_format.clone(),
-    ];
-    let tags: ::std::collections::BTreeMap<&String, &String> =
-        input.tags.iter().flatten().collect();
-    fields.push(format!("Tags={}", tags.len()));
-    for (key, value) in tags {
-        fields.push(key.clone());
-        fields.push(value.clone());
-    }
-    fields.extend(source_fields(&input.source));
-    crate::state::request_fingerprint(fields)
-}
-
-/// The request's `Source` as canonical fingerprint fields: which variant it is,
-/// then that variant's own members, with the content map ordered by key.
-fn source_fields(source: &CreateDataTransformationProfileSource) -> Vec<String> {
-    match source {
-        CreateDataTransformationProfileSource::ProfileMapping(source) => {
-            let content: ::std::collections::BTreeMap<&String, &String> =
-                source.profile_mapping.iter().collect();
-            let mut fields = vec![
-                "Source=ProfileMapping".to_string(),
-                format!("ProfileMapping={}", content.len()),
-            ];
-            for (path, entry) in content {
-                fields.push(path.clone());
-                fields.push(entry.clone());
-            }
-            fields
-        }
-        CreateDataTransformationProfileSource::ExistingVersionedProfileId(source) => vec![
-            "Source=ExistingVersionedProfileId".to_string(),
-            source.profile_id.clone(),
-            source.version.to_string(),
-        ],
-        CreateDataTransformationProfileSource::StarterProfile(source) => vec![
-            "Source=StarterProfile".to_string(),
-            source.starter_profile_name.clone(),
-        ],
-        CreateDataTransformationProfileSource::SampleData(source) => {
-            vec!["Source=SampleData".to_string(), source.s3_uri.clone()]
-        }
-    }
-}

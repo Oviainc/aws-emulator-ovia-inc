@@ -175,10 +175,8 @@ impl Seed {
             provenance_enabled: None,
             message: None,
             progress_report: None,
-            // Seeded rather than started, so no `ClientToken` named this job
-            // and no request fingerprinted to it.
+            // Seeded rather than started, so no `ClientToken` named this job.
             client_token: None,
-            request_fingerprint: String::new(),
         }
     }
 }

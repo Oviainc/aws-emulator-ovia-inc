@@ -8,8 +8,8 @@
 //! create carrying such a token is a FRESH request (neither replayed with the gone
 //! record nor refused as a reuse), and the token's slot in the bounded token store
 //! is given back. While the profile is still held the token keeps its full
-//! idempotency force: the same request replays it and a different request carrying
-//! it is refused.
+//! idempotency force: a create carrying it is ignored and answered with the
+//! profile it minted, whether or not that create repeats the original request.
 //!
 //! The rows differ along what the rule generalises over: the source format, how many
 //! mapping entries and optional members the minting request carried, the token's own
@@ -152,18 +152,18 @@ async fn mint_and_check_live_token(
         "case {case:?}: while the profile is held, the token replays what the first \
          call answered"
     );
-    // ...and the same token on a DIFFERENT request is refused, because the profile
-    // that token minted is still there to disagree with.
+    // ...and the same token on a DIFFERENT request is ignored and answered with
+    // the profile that token minted, as the modelled `ClientToken` documents
+    // ("the service ignores the request but does not return an error").
     let mut altered = request.clone();
     altered["ProfileName"] = json!(format!("{profile_name}-renamed"));
-    let (status, code, payload) = healthlake
-        .refused_body(case, "CreateDataTransformationProfile", &altered)
+    let ignored = healthlake
+        .ok(case, "CreateDataTransformationProfile", &altered)
         .await;
     assert_eq!(
-        (status, code.as_str()),
-        (400, "ValidationException"),
-        "case {case:?}: while the profile is held, one token cannot stand for two \
-         different requests, got {payload}"
+        ignored, first,
+        "case {case:?}: while the profile is held, a create under its token answers \
+         what the first call answered"
     );
 
     profile_id
