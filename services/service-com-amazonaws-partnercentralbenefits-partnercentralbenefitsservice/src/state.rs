@@ -3112,6 +3112,59 @@ pub fn reserved_tag_key_requirement() -> String {
     format!("Member must not use the reserved tag key prefix: {RESERVED_TAG_KEY_PREFIX}")
 }
 
+/// The member of a supplied `Tag` that carries the tag key, as the wire spells it
+/// (`Tag$Key`, `smithy_query(query="shape",shape="Tag")`).
+pub const TAG_KEY_MEMBER: &str = "Key";
+
+/// Where in a request's input member the tag keys sit — which is what decides the POSITION
+/// a refusal of one is reported at.
+///
+/// The two forms the model gives a caller for supplying tag keys: a list whose ELEMENTS are
+/// the keys (`UntagResourceInput$tagKeys`, a `TagKeyList` of `TagKey`) and a list of `Tag`
+/// STRUCTURES, each carrying the key in its own member (`TagResourceInput$tags` and
+/// `CreateBenefitApplicationInput$Tags`, both `Tags` lists of `Tag`); see
+/// `smithy_query(query="shape",shape="TagKeyList,Tag")`.
+#[derive(Debug, Clone, Copy)]
+pub enum SuppliedTagKeys<'a> {
+    /// The keys are the collection's own elements.
+    Keys(&'a [String]),
+    /// Each key is the [`TAG_KEY_MEMBER`] of one structure element of the collection.
+    Tags(&'a [Tag]),
+}
+
+impl SuppliedTagKeys<'_> {
+    /// The member path and the requirement a refusal states for the first reserved key
+    /// among these, or `None` when every key is the caller's own.
+    ///
+    /// Both are decided by the POSITION the offending key sits at, stated the way the
+    /// centralized walk states a violation there (see
+    /// [`crate::service::constraint_clause`]): a key that IS an element of the collection
+    /// collapses onto the collection member and carries the element's requirement set
+    /// ([`crate::service::element_requirement`]), while a key held by a member INSIDE a
+    /// structure element keeps that member's own full path
+    /// ([`element_member_path`]) and states its requirement flat.
+    fn reserved(&self, member: &str) -> Option<(String, String)> {
+        let requirement = reserved_tag_key_requirement();
+        match self {
+            Self::Keys(keys) => keys.iter().any(|key| is_reserved_tag_key(key)).then(|| {
+                (
+                    member.to_string(),
+                    crate::service::element_requirement(&requirement),
+                )
+            }),
+            Self::Tags(tags) => tags
+                .iter()
+                .position(|tag| is_reserved_tag_key(&tag.key))
+                .map(|index| {
+                    (
+                        element_member_path(member, index, TAG_KEY_MEMBER),
+                        requirement,
+                    )
+                }),
+        }
+    }
+}
+
 /// The refusal a request supplying a reserved tag key is answered with, or `None` when
 /// every key it carries is the caller's own.
 ///
@@ -3120,22 +3173,25 @@ pub fn reserved_tag_key_requirement() -> String {
 /// the member the caller must fix. The exception is built by the one construction every
 /// member refusal of this crate goes through ([`member_validation_exception`], which
 /// renders the message with [`crate::service::member_clause`] and
-/// [`crate::service::validation_envelope`]) and echoes NOTHING of the rejected value; the
-/// element path collapses onto the collection member, the way the walk reports a violation
-/// on a collection's element.
+/// [`crate::service::validation_envelope`]) and echoes NOTHING of the rejected value.
+///
+/// WHERE inside that member the key sat is what the refusal reports, and it reports it the
+/// way the centralized walk reports a violation at the same position — see
+/// [`SuppliedTagKeys::reserved`] — so one input member is described one way whether the
+/// walk refused it on a modelled constraint or this rule refused it on the namespace.
+/// Several reserved keys in one member are the one refusal the first of them states, as
+/// [`unconstrained_members_refusal`] reports the first element it refuses.
 ///
 /// A caller gets this answer whether the keys would be created, overwritten or removed:
 /// one rule, applied wherever a request carries tag keys.
-pub fn reserved_tag_key_refusal<'a>(
+pub fn reserved_tag_key_refusal(
     member: &str,
-    keys: impl IntoIterator<Item = &'a str>,
+    supplied: SuppliedTagKeys<'_>,
 ) -> Option<crate::ops::types::ValidationException> {
-    if !keys.into_iter().any(is_reserved_tag_key) {
-        return None;
-    }
+    let (path, requirement) = supplied.reserved(member)?;
     Some(member_validation_exception(
-        member,
-        &reserved_tag_key_requirement(),
+        &path,
+        &requirement,
         VALIDATION_REASON_FIELD,
     ))
 }

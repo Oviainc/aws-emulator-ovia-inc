@@ -75,6 +75,8 @@ mod persisted_string_bounds;
 mod recall_benefit_application;
 #[path = "all/refusal_member_path.rs"]
 mod refusal_member_path;
+#[path = "all/reserved_tag_key_refusal_form.rs"]
+mod reserved_tag_key_refusal_form;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]

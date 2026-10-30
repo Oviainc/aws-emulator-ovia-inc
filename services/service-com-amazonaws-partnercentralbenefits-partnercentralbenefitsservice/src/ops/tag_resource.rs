@@ -17,7 +17,10 @@
 //! A key in the AWS-reserved `aws:` namespace is not the caller's to write: a request
 //! carrying one is refused with the modelled `ValidationException` (HTTP 400) and nothing
 //! is stored — see [`crate::state::reserved_tag_key_refusal`], which `UntagResource` and
-//! `CreateBenefitApplication` apply to their own tag-key members too.
+//! `CreateBenefitApplication` apply to their own tag-key members too. The key sits in the
+//! `Key` member of one element of `tags`, so the refusal names that member's own full path
+//! (`tags.<position>.member.key`), which is the path the centralized walk reports for a
+//! violation there.
 //!
 //! A `resourceArn` that names no resource this service holds is refused with the modelled
 //! `ResourceNotFoundException` (HTTP 404). Its message is the service's catalog-lookup
@@ -201,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // can enforce; see [`crate::state::reserved_tag_key_refusal`].
         if let Some(refusal) = crate::state::reserved_tag_key_refusal(
             "tags",
-            input.tags.iter().map(|tag| tag.key.as_str()),
+            crate::state::SuppliedTagKeys::Tags(&input.tags),
         ) {
             return Err(TagResourceErrorModeled::ValidationException(refusal).into());
         }

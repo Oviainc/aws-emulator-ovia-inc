@@ -33,7 +33,9 @@
 //! The create's own `Tags` are caller-supplied tag keys, so they go through the same
 //! reserved-namespace rule the tagging operations apply: a key in the AWS-reserved `aws:`
 //! namespace is refused with the modelled `ValidationException` (HTTP 400) and no
-//! application is created — see [`crate::state::reserved_tag_key_refusal`].
+//! application is created — see [`crate::state::reserved_tag_key_refusal`]. `Tags` is a
+//! list of structures, as `TagResource$tags` is, so the refusal names the full path of the
+//! key member inside the element it sat in.
 //!
 //! How many tags the create may supply is the per-resource tag cap
 //! ([`crate::state::MAX_TAGS_PER_RESOURCE`]) that `TagResource` refuses a merge past: the
@@ -268,11 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused and no application is created.
         if let Some(refusal) = crate::state::reserved_tag_key_refusal(
             "Tags",
-            input
-                .tags
-                .iter()
-                .flatten()
-                .map(|tag| tag.key.as_str()),
+            crate::state::SuppliedTagKeys::Tags(input.tags.as_deref().unwrap_or_default()),
         ) {
             return Err(
                 CreateBenefitApplicationErrorModeled::ValidationException(refusal).into(),

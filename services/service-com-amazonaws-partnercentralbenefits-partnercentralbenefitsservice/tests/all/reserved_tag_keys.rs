@@ -26,6 +26,13 @@
 //! (`aws` with no colon, `awsome`, `aws.`, another service's namespace). Each row is
 //! driven through all three operations, and the `aws:createdBy` key the issue reported is
 //! one row among them.
+//!
+//! WHERE the refused key sat is what each refusal reports: a key that is an ELEMENT of the
+//! member (`tagKeys`) collapses onto that member with the element's requirement nested,
+//! and a key held by the `Key` member of a structure element (`tags` / `Tags`) keeps that
+//! member's own full path. The form itself is the subject of the sibling suite
+//! `tests/all/reserved_tag_key_refusal_form.rs`, which pins it against the centralized
+//! walk's own refusal at the same position.
 
 use std::collections::BTreeMap;
 
@@ -156,20 +163,64 @@ fn seeded_map() -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Require that `operation` refuses `body` as a reserved-key violation of the member named
-/// by `member`: HTTP 400, the modelled `ValidationException`, and a message that names the
+/// The path a refusal states for the tag key held by the element at 1-based `position` of a
+/// list-of-STRUCTURES member: the member in lowerCamel, the element's position and the
+/// collection step, then the key member in lowerCamel. That is the path the centralized
+/// walk reports for a violation on a member inside a structure element — pinned on a
+/// modelled constraint of this very member in `tests/all/validation_exception_message.rs`.
+pub(crate) fn tag_key_path(member: &str, position: usize) -> String {
+    format!("{member}.{position}.member.key")
+}
+
+/// A requirement as it reads for a refused ELEMENT of a collection: the element's
+/// requirement set, bracketed — the constraint it failed, then the requirement that the
+/// element be present at all (no list of this model is `@sparse`).
+pub(crate) fn element_requirement(requirement: &str) -> String {
+    format!("Member must satisfy constraint: [{requirement}, Member must not be null]")
+}
+
+/// The path and the requirement a reserved key supplied as the `Key` of the tag at 1-based
+/// `position` of the list-of-structures member `member` is refused with.
+pub(crate) fn tag_refusal(member: &str, position: usize) -> (String, String) {
+    (
+        tag_key_path(member, position),
+        reserved_tag_key_requirement(),
+    )
+}
+
+/// The path and the requirement a reserved key supplied as an ELEMENT of the key-list
+/// member `member` is refused with: the member itself, with the requirement nested.
+pub(crate) fn key_refusal(member: &str) -> (String, String) {
+    (
+        member.to_string(),
+        element_requirement(&reserved_tag_key_requirement()),
+    )
+}
+
+/// The 1-based position of the first reserved key in `tags`, which is the element a refusal
+/// of that list reports.
+fn first_reserved(tags: &[(&str, &str)]) -> usize {
+    tags.iter()
+        .position(|(key, _)| is_reserved_tag_key(key))
+        .map(|index| index + 1)
+        .unwrap_or_else(|| panic!("the row must carry a reserved key, got {tags:?}"))
+}
+
+/// Require that `operation` refuses `body` as a reserved-key violation reported at
+/// `expected`: HTTP 400, the modelled `ValidationException`, and a message that names the
 /// member path the caller must fix and the requirement it failed.
 ///
-/// `member` is the path the refusal states — the input member in lowerCamel, the spelling
-/// the centralized walk reports for it — whatever case the wire member is spelled in
-/// (`Tags` on the create, `tags`/`tagKeys` on the tagging operations).
+/// `expected` is the `(path, requirement)` pair the refusal must state — [`tag_refusal`]
+/// for a key inside a `Tag` structure, [`key_refusal`] for a key that is an element of the
+/// member itself.
 async fn assert_reserved_refusal(
     harness: &Harness,
     case: &str,
     operation: &str,
-    member: &str,
+    expected: &(String, String),
     body: &Value,
 ) {
+    let (member, requirement) = (expected.0.as_str(), expected.1.as_str());
     let (status, out) = harness.call(operation, body).await;
     assert_eq!(
         status, 400,
@@ -186,7 +237,7 @@ async fn assert_reserved_refusal(
     });
     assert_eq!(
         message,
-        one(&clause(member, &reserved_tag_key_requirement())),
+        one(&clause(member, requirement)),
         "case {case:?}: expected the refusal to name {member:?} and the reserved prefix, \
          got {message:?}"
     );
@@ -248,7 +299,14 @@ async fn tag_resource_refuses_a_reserved_key_and_serves_every_other() {
                 "tags": tag_payload(&[(row.key.as_str(), "mine")]),
             });
             if row.reserved {
-                assert_reserved_refusal(&harness, &case, "TagResource", "tags", &body).await;
+                assert_reserved_refusal(
+                    &harness,
+                    &case,
+                    "TagResource",
+                    &tag_refusal("tags", 1),
+                    &body,
+                )
+                .await;
             } else {
                 ok(&harness, &case, "TagResource", &body).await;
                 expected.insert(row.key.clone(), "mine".to_string());
@@ -295,7 +353,7 @@ async fn one_reserved_key_refuses_the_whole_tagging_call() {
             &harness,
             case,
             "TagResource",
-            "tags",
+            &tag_refusal("tags", first_reserved(&tags)),
             &json!({ "resourceArn": arn, "tags": tag_payload(&tags) }),
         )
         .await;
@@ -324,7 +382,7 @@ async fn a_reserved_key_is_refused_before_the_resource_lookup() {
         &harness,
         "TagResource on an ARN that names no resource",
         "TagResource",
-        "tags",
+        &tag_refusal("tags", 1),
         &json!({
             "resourceArn": missing,
             "tags": tag_payload(&[("aws:createdBy", "mine")]),
@@ -335,7 +393,7 @@ async fn a_reserved_key_is_refused_before_the_resource_lookup() {
         &harness,
         "UntagResource on an ARN that names no resource",
         "UntagResource",
-        "tagKeys",
+        &key_refusal("tagKeys"),
         &json!({ "resourceArn": missing, "tagKeys": ["aws:createdBy"] }),
     )
     .await;
@@ -373,7 +431,14 @@ async fn untag_resource_refuses_a_reserved_key_and_serves_every_other() {
         // nothing is removed, an admissible one is removed and the seeded keys stay.
         let body = json!({ "resourceArn": arn, "tagKeys": [row.key.clone()] });
         if row.reserved {
-            assert_reserved_refusal(&harness, &case, "UntagResource", "tagKeys", &body).await;
+            assert_reserved_refusal(
+                &harness,
+                &case,
+                "UntagResource",
+                &key_refusal("tagKeys"),
+                &body,
+            )
+            .await;
         } else {
             ok(&harness, &case, "UntagResource", &body).await;
         }
@@ -411,7 +476,7 @@ async fn one_reserved_key_refuses_the_whole_removal() {
             &harness,
             case,
             "UntagResource",
-            "tagKeys",
+            &key_refusal("tagKeys"),
             &json!({ "resourceArn": arn, "tagKeys": tag_keys }),
         )
         .await;
@@ -450,8 +515,14 @@ async fn create_refuses_a_reserved_key_and_mints_nothing() {
         });
 
         if row.reserved {
-            assert_reserved_refusal(&harness, &case, "CreateBenefitApplication", "tags", &body)
-                .await;
+            assert_reserved_refusal(
+                &harness,
+                &case,
+                "CreateBenefitApplication",
+                &tag_refusal("tags", 1),
+                &body,
+            )
+            .await;
         } else {
             let created = ok(&harness, &case, "CreateBenefitApplication", &body).await;
             let arn = created["Arn"]
@@ -498,7 +569,14 @@ async fn a_refused_create_leaves_its_client_token_unused() {
         "Tags": tag_payload(&[("aws:createdBy", "mine")]),
     });
 
-    assert_reserved_refusal(&harness, "token", "CreateBenefitApplication", "tags", &body).await;
+    assert_reserved_refusal(
+        &harness,
+        "token",
+        "CreateBenefitApplication",
+        &tag_refusal("tags", 1),
+        &body,
+    )
+    .await;
 
     body["Tags"] = tag_payload(&[("createdBy", "mine")]);
     let created = ok(&harness, "token", "CreateBenefitApplication", &body).await;

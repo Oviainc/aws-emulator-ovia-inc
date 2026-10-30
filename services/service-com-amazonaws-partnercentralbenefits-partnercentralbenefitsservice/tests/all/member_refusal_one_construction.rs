@@ -35,6 +35,7 @@ use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
 use crate::disassociate_benefit_application_resource::{
     body as association_body, seed as seed_with_resources,
 };
+use crate::reserved_tag_keys::{element_requirement, tag_key_path};
 use crate::resource_tagging::tag_payload;
 use crate::service_error_rules::{assert_validation_invariants, message_of};
 
@@ -259,7 +260,9 @@ async fn every_member_refusal_is_the_one_construction() {
                 "resourceArn": subject_arn,
                 "tags": tag_payload(&[(RESERVED_KEY, "mine")]),
             }),
-            member: "tags".to_string(),
+            // The key sits in the `Key` member of one element of `tags`, so the refusal
+            // names that member's own full path.
+            member: tag_key_path("tags", 1),
             requirement: reserved_tag_key_requirement(),
             reason: VALIDATION_REASON_FIELD,
         },
@@ -267,8 +270,10 @@ async fn every_member_refusal_is_the_one_construction() {
             case: "a reserved tag key named to UntagResource".to_string(),
             operation: "UntagResource",
             body: json!({ "resourceArn": subject_arn, "tagKeys": [RESERVED_KEY] }),
+            // Here the key IS an element of `tagKeys`, so the path collapses onto the
+            // member and the requirement is the element's requirement set.
             member: "tagKeys".to_string(),
-            requirement: reserved_tag_key_requirement(),
+            requirement: element_requirement(&reserved_tag_key_requirement()),
             reason: VALIDATION_REASON_FIELD,
         },
         Row {

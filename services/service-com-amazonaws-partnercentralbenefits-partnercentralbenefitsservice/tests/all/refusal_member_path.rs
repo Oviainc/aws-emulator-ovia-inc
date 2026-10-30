@@ -10,10 +10,11 @@
 //! The rule under test, stated over the class of refusals it covers:
 //!
 //! **A refusal of an input member names that member by the path the centralized constraint
-//! walk reports for it — the member in lowerCamel — in the clause of the AWS validation
-//! envelope and in `ValidationExceptionField$Name` alike.** So one input member has ONE
-//! path whichever bound it broke: a constraint the model declares, which the centralized
-//! walk enforces, or a rule a handler enforces itself.
+//! walk reports for it — the member in lowerCamel, followed by the steps a handler
+//! addressed below it — in the clause of the AWS validation envelope and in
+//! `ValidationExceptionField$Name` alike.** So one input member has ONE path whichever
+//! bound it broke: a constraint the model declares, which the centralized walk enforces, or
+//! a rule a handler enforces itself.
 //!
 //! Two tables span what the rule generalises over:
 //!
@@ -26,9 +27,10 @@
 //!    clause for that path, and the one-member `FieldList` naming it. The rows cross the
 //!    case the WIRE spells the member in (`NextToken`, `Tags` and
 //!    `BenefitApplicationDetails` in PascalCase; `tags` and `tagKeys` already in
-//!    lowerCamel), the operation deciding the refusal and the kind of rule it enforces (a
+//!    lowerCamel), the operation deciding the refusal, the kind of rule it enforces (a
 //!    cursor this service never issued, the reserved tag namespace, a document guard, a
-//!    benefit the catalog no longer offers).
+//!    benefit the catalog no longer offers) and the shape of the path (the member alone, and
+//!    a member reached below it inside a collection element).
 
 use serde_json::{json, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
@@ -38,6 +40,7 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
 
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
 use crate::member_refusal_one_construction::withdrawn_benefit;
+use crate::reserved_tag_keys::{element_requirement, tag_key_path};
 use crate::resource_tagging::tag_payload;
 use crate::service_error_rules::{assert_validation_invariants, clause, message_of, one};
 
@@ -221,8 +224,9 @@ struct Row {
     operation: &'static str,
     /// The member as the WIRE spells it.
     wire_member: &'static str,
-    /// The path the refusal must state, in the clause and in the `FieldList`.
-    path: &'static str,
+    /// The path the refusal must state, in the clause and in the `FieldList`: the member in
+    /// lowerCamel, plus any steps the handler addressed below it.
+    path: String,
     /// The requirement that member failed, as the refusal must word it.
     requirement: String,
     body: Value,
@@ -269,7 +273,7 @@ async fn an_in_handler_refusal_names_the_walks_path_under_the_envelope() {
             case: format!("{operation}: a cursor it never issued"),
             operation,
             wire_member: "NextToken",
-            path: "nextToken",
+            path: "nextToken".to_string(),
             requirement: format!("Member must be a pagination token issued by {operation}"),
             body: json!({
                 "Catalog": CATALOG,
@@ -281,7 +285,9 @@ async fn an_in_handler_refusal_names_the_walks_path_under_the_envelope() {
         case: "CreateBenefitApplication: a reserved tag key".to_string(),
         operation: "CreateBenefitApplication",
         wire_member: "Tags",
-        path: "tags",
+        // The key sits in the `Key` member of one element of the list, which keeps its own
+        // full path below the member.
+        path: tag_key_path("tags", 1),
         requirement: reserved_requirement.clone(),
         body: json!({
             "Catalog": CATALOG,
@@ -295,7 +301,7 @@ async fn an_in_handler_refusal_names_the_walks_path_under_the_envelope() {
         case: "TagResource: a reserved tag key".to_string(),
         operation: "TagResource",
         wire_member: "tags",
-        path: "tags",
+        path: tag_key_path("tags", 1),
         requirement: reserved_requirement.clone(),
         body: json!({
             "resourceArn": subject_arn,
@@ -306,15 +312,17 @@ async fn an_in_handler_refusal_names_the_walks_path_under_the_envelope() {
         case: "UntagResource: a reserved tag key".to_string(),
         operation: "UntagResource",
         wire_member: "tagKeys",
-        path: "tagKeys",
-        requirement: reserved_requirement,
+        // Here the refused key IS an element of the member, so the path collapses onto the
+        // member and the requirement is the element's requirement set.
+        path: "tagKeys".to_string(),
+        requirement: element_requirement(&reserved_requirement),
         body: json!({ "resourceArn": subject_arn, "tagKeys": [RESERVED_KEY] }),
     });
     rows.push(Row {
         case: "CreateBenefitApplication: a document past the depth bound".to_string(),
         operation: "CreateBenefitApplication",
         wire_member: "BenefitApplicationDetails",
-        path: "benefitApplicationDetails",
+        path: "benefitApplicationDetails".to_string(),
         requirement: format!("Member must nest no deeper than {MAX_DETAILS_DEPTH} levels"),
         body: json!({
             "Catalog": CATALOG,
@@ -328,7 +336,7 @@ async fn an_in_handler_refusal_names_the_walks_path_under_the_envelope() {
         case: format!("CreateBenefitApplication: a {withdrawn_status} benefit"),
         operation: "CreateBenefitApplication",
         wire_member: "BenefitIdentifier",
-        path: "benefitIdentifier",
+        path: "benefitIdentifier".to_string(),
         requirement: format!(
             "Member must name a benefit the catalog offers, which a {withdrawn_status} benefit \
              is not"
@@ -352,13 +360,22 @@ async fn an_in_handler_refusal_names_the_walks_path_under_the_envelope() {
             rows.iter().map(|row| row.wire_member).collect::<Vec<_>>()
         );
     }
+    // And a path that carries steps below the input member, so it cannot shrink to the
+    // top-level members either.
+    assert!(
+        rows.iter().any(|row| row.path.contains('.')),
+        "case \"table\": expected a row whose path carries steps below the member, got {:?}",
+        rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>()
+    );
 
     for row in &rows {
         let case = &row.case;
+        let named_member = row.path.split('.').next().unwrap_or_default();
         assert_eq!(
-            row.path,
+            named_member,
             walk_spelling(row.wire_member),
-            "case {case:?}: the row's own path must be the wire member in lowerCamel, got {:?}",
+            "case {case:?}: the row's own path must open with the wire member in lowerCamel, \
+             got {:?}",
             row.path
         );
         let (status, out) = harness.call(row.operation, &row.body).await;
@@ -377,7 +394,7 @@ async fn an_in_handler_refusal_names_the_walks_path_under_the_envelope() {
         });
         assert_eq!(
             message,
-            one(&clause(row.path, &row.requirement)),
+            one(&clause(&row.path, &row.requirement)),
             "case {case:?}: expected the envelope over the clause for {:?}, got {message:?}",
             row.path
         );

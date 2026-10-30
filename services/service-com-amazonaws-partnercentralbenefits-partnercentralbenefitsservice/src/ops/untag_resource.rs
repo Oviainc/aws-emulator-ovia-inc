@@ -17,7 +17,10 @@
 //! A key in the AWS-reserved `aws:` namespace is not the caller's to remove either: a
 //! request naming one is refused with the modelled `ValidationException` (HTTP 400) and
 //! no tag is removed — see [`crate::state::reserved_tag_key_refusal`], the one rule
-//! `TagResource` and `CreateBenefitApplication` apply to their own tag-key members.
+//! `TagResource` and `CreateBenefitApplication` apply to their own tag-key members. The
+//! key IS an element of `tagKeys` here, so the refusal collapses onto that member and
+//! nests the element's requirement, which is how the centralized walk reports a violation
+//! on an element.
 //!
 //! ## Shape of an operation
 //!
@@ -185,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`crate::state::reserved_tag_key_refusal`].
         if let Some(refusal) = crate::state::reserved_tag_key_refusal(
             "tagKeys",
-            input.tag_keys.iter().map(String::as_str),
+            crate::state::SuppliedTagKeys::Keys(&input.tag_keys),
         ) {
             return Err(UntagResourceErrorModeled::ValidationException(refusal).into());
         }
