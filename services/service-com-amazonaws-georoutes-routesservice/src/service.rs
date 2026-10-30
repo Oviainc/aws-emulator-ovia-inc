@@ -97,16 +97,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) BEFORE any handler
+        // runs. This service words such a refusal the way its handlers do: the
+        // modeled `ValidationException`, and a sentence that names the member at
+        // fault in the model's own spelling and states the rule it broke, quoting
+        // none of the rejected value — never the generic constraint-validator
+        // envelope, which names members by a spelling no caller of this service
+        // ever sees. That wording lives once in `crate::state`, so a rule caught at
+        // the boundary and the same rule caught in a handler read alike.
+        match refusal {
+            Refusal::Invalid(violations) if !violations.is_empty() => Some(Refused {
+                code: "ValidationException".to_string(),
+                message: crate::state::violations_message(violations),
+            }),
+            // An unauthenticated caller is not an input-validation failure, and a
+            // refusal the framework cannot describe structurally keeps its wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

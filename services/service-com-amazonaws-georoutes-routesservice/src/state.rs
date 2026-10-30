@@ -1285,15 +1285,26 @@ pub fn at_least_one_of(members: &[&str]) -> String {
     )
 }
 
+/// Member names as a refusal ENUMERATES them: each quoted, separated by commas —
+/// `'A'`, `'A', 'B'`. Used where the sentence lists a set rather than reading as prose.
+pub fn quoted_list(members: &[&str]) -> String {
+    quoted(members).join(", ")
+}
+
 /// Member names as a refusal lists them: each quoted, separated by commas, with the last
 /// one joined by `and` — `'A'`, `'A' and 'B'`, `'A', 'B' and 'C'`.
 pub fn quoted_members(members: &[&str]) -> String {
-    let quoted: Vec<String> = members.iter().map(|member| format!("'{member}'")).collect();
+    let quoted = quoted(members);
     match quoted.split_last() {
         None => String::new(),
         Some((last, &[])) => last.clone(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+/// Each member single-quoted, the one way a refusal of this service quotes a member name.
+fn quoted(members: &[&str]) -> Vec<String> {
+    members.iter().map(|member| format!("'{member}'")).collect()
 }
 
 /// `'{member}' {rule}` — the shape of a refusal that names the member at fault. The
@@ -1329,23 +1340,189 @@ pub fn check_range(member: &str, bounds: (f64, f64), value: f64) -> Result<(), S
     Err(must_not_be_greater_than(member, bounds.1))
 }
 
+/// A value shorter than the length its member allows. Worded as a LENGTH rather than in
+/// entries, because the same rule applies to a string.
+pub fn must_have_length_at_least(member: &str, minimum: impl std::fmt::Display) -> String {
+    member_rule(member, &format!("must have length at least {minimum}"))
+}
+
+/// A value longer than the length its member allows.
+pub fn must_have_length_at_most(member: &str, maximum: impl std::fmt::Display) -> String {
+    member_rule(member, &format!("must have length at most {maximum}"))
+}
+
+/// A `@required` member the request left out.
+///
+/// Ends in a period, as the sibling Amazon Location service's recorded refusal of an absent
+/// required member does; the bound sentences above carry none, which is how their own
+/// recordings read.
+pub fn must_not_be_null(member: &str) -> String {
+    member_rule(member, "must not be null.")
+}
+
+/// A value that does not satisfy the `@pattern` its member declares, naming the modelled
+/// expression itself so the caller can see what the value had to look like.
+pub fn must_match_regex(member: &str, pattern: &str) -> String {
+    member_rule(member, &format!("must match regex {pattern}"))
+}
+
+/// A value outside the set an enumerated member declares. The accepted set is taken from
+/// the model — the generated value list, or the trait the boundary walk reported — so it
+/// cannot drift from what the member actually admits.
+pub fn must_be_one_of<S: AsRef<str>>(member: &str, accepted: &[S]) -> String {
+    let accepted: Vec<&str> = accepted.iter().map(AsRef::as_ref).collect();
+    member_rule(member, &format!("must be one of: {}", accepted.join(", ")))
+}
+
 /// A collection member against the length it allows, stated by the bound it broke. Worded
 /// as a LENGTH rather than in entries, because the same rule applies to a string.
 pub fn check_length(member: &str, bounds: (usize, usize), length: usize) -> Result<(), String> {
     if length < bounds.0 {
-        return Err(member_rule(
-            member,
-            &format!("must have a length of at least {}", bounds.0),
-        ));
+        return Err(must_have_length_at_least(member, bounds.0));
     }
     if length > bounds.1 {
-        return Err(member_rule(
-            member,
-            &format!("must have a length of at most {}", bounds.1),
-        ));
+        return Err(must_have_length_at_most(member, bounds.1));
     }
     Ok(())
 }
+
+/// The member a path from the framework's constraint walk names, spelled the way the MODEL
+/// spells it — which is how every refusal of this service names a member.
+///
+/// The walk reports a path in lowerCamel with a collection step spelled `<1-based
+/// position>.member` (`maxAlternatives`, `thresholds.time`, `waypoints.2.member.position`),
+/// while this service names the member as the model declares it and locates an element by
+/// its own 0-based subscript (`MaxAlternatives`, `Thresholds.Time`,
+/// `Waypoints[1].Position`) — the spelling its handlers already use in a `fieldList` entry,
+/// so one rule reads alike whether it was caught at the boundary or inside a handler.
+///
+/// Capitalising each segment recovers the model's spelling because every member this
+/// service declares is PascalCase in the model and lowerCamel on the wire, which is the
+/// regular mapping the path builder applies.
+pub fn member_of_path(path: &str) -> String {
+    let mut named: Vec<String> = Vec::new();
+    let mut pending_position: Option<usize> = None;
+    for segment in path.split('.') {
+        // A collection step is the pair `<position>.member`: the position subscripts the
+        // segment before it rather than becoming a segment of its own.
+        if let Ok(position) = segment.parse::<usize>() {
+            pending_position = Some(position);
+            continue;
+        }
+        if segment == "member" {
+            if let (Some(position), Some(last)) = (pending_position.take(), named.last_mut()) {
+                last.push_str(&format!("[{}]", position.saturating_sub(1)));
+            }
+            continue;
+        }
+        pending_position = None;
+        let mut characters = segment.chars();
+        if let Some(first) = characters.next() {
+            named.push(first.to_ascii_uppercase().to_string() + characters.as_str());
+        }
+    }
+    if named.is_empty() {
+        path.to_string()
+    } else {
+        named.join(".")
+    }
+}
+
+/// This service's wording for ONE modelled constraint the framework found violated before
+/// any handler ran: the member it names, and the rule the member's own trait states.
+///
+/// The rejected value is never quoted back: a refusal of this service states the RULE, and
+/// which member broke it, so the sentence is the same for every value that breaks it.
+pub fn violation_message(violation: &::smithy_server_runtime::Violation) -> String {
+    use ::smithy_server_runtime::ViolationKind;
+
+    let member = member_of_path(&violation.path);
+    match &violation.kind {
+        ViolationKind::MissingRequiredMember => must_not_be_null(&member),
+        ViolationKind::MinLength(minimum) => must_have_length_at_least(&member, minimum),
+        ViolationKind::MaxLength(maximum) => must_have_length_at_most(&member, maximum),
+        ViolationKind::MinValue(minimum) => must_not_be_less_than(&member, minimum),
+        ViolationKind::MaxValue(maximum) => must_not_be_greater_than(&member, maximum),
+        ViolationKind::Pattern(pattern) => must_match_regex(&member, pattern),
+        ViolationKind::EnumValue(accepted) => must_be_one_of(&member, accepted),
+        ViolationKind::UniqueItems => member_rule(&member, "must not contain duplicate values"),
+        // `ViolationKind` is `#[non_exhaustive]`: a class this service does not word yet
+        // still names its member rather than falling back to a generic rendering that
+        // spells the member a way no caller of this service ever sees.
+        _ => member_rule(&member, "must satisfy the constraints the model declares"),
+    }
+}
+
+/// This service's wording for every modelled constraint one refused request violated.
+///
+/// Each violation is stated in full and the sentences joined, rather than summarised behind
+/// a count: a request that broke two rules has broken both, and a caller fixing it needs
+/// each member named.
+pub fn violations_message(violations: &[::smithy_server_runtime::Violation]) -> String {
+    violations
+        .iter()
+        .map(violation_message)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Which of a `TravelModeOptions` structure's per-mode option blocks the request set.
+///
+/// One entry per member the operation's own options structure DECLARES, in the model's
+/// order, paired with whether the request set it. Each handler builds this from its own
+/// generated options type, so the set a rule is checked over cannot drift from the model.
+pub type DeclaredTravelModeOptions<'a> = [(&'a str, bool)];
+
+/// The option block of a `TravelModeOptions` structure that BELONGS to `mode`: the block
+/// whose member names that mode. At most one can, since a structure declares each member
+/// once; `None` where the structure declares no block for the selected mode (a matrix is
+/// modelled with no pedestrian options at all).
+pub fn block_of_mode<'a>(mode: &str, declared: &DeclaredTravelModeOptions<'a>) -> Option<&'a str> {
+    declared
+        .iter()
+        .map(|(member, _)| *member)
+        .find(|member| *member == mode)
+}
+
+/// The per-mode option block of a `TravelModeOptions` structure belongs to ONE travel mode:
+/// the member whose name is that mode. A request may therefore set only a block the service
+/// permits for the `TravelMode` it selected, and setting any other is refused — the options
+/// would otherwise be silently dropped and the answer computed for a different vehicle than
+/// the constraints describe.
+///
+/// `permitted` is the set of blocks the operation allows for the selected mode (normally the
+/// block that names it, per [`block_of_mode`]); `declared` carries every block the
+/// operation's options structure declares and whether the request set it. `Err` is the pair
+/// a `ValidationException` is built from: the member path its `fieldList` names, and the
+/// sentence. Which sentence it is depends on whether the mode permits any block at all:
+/// where it does, the refusal states the blocks that may be set; where it permits none,
+/// there is no set to state, so the refusal names the block that must not be set instead.
+pub fn check_travel_mode_options(
+    mode: &str,
+    permitted: &[&str],
+    declared: &DeclaredTravelModeOptions<'_>,
+) -> Result<(), (String, String)> {
+    let Some((offender, _)) = declared
+        .iter()
+        .find(|(member, is_set)| *is_set && !permitted.contains(member))
+    else {
+        return Ok(());
+    };
+    let member = format!("{TRAVEL_MODE_OPTIONS_MEMBER}.{offender}");
+    let message = if permitted.is_empty() {
+        format!("'{member}' must not be set when 'TravelMode' has value {mode}.")
+    } else {
+        format!(
+            "Only the following fields may be set within '{TRAVEL_MODE_OPTIONS_MEMBER}' when \
+             'TravelMode' has value {mode}: {}.",
+            quoted_list(permitted)
+        )
+    };
+    Err((member, message))
+}
+
+/// The member every operation of this service carries its per-mode options under.
+const TRAVEL_MODE_OPTIONS_MEMBER: &str = "TravelModeOptions";
 
 /// The geometry format a request asked for, or the documented default. `Err` names the
 /// member for a value `GeometryFormat` does not declare, read from the generated
@@ -1356,10 +1533,7 @@ pub fn geometry_format(member: &str, requested: Option<&String>) -> Result<Strin
     match requested.map(String::as_str) {
         None => Ok(DEFAULT_GEOMETRY_FORMAT.to_string()),
         Some(format) if accepted.contains(&format) => Ok(format.to_string()),
-        Some(other) => Err(format!(
-            "{member} must be one of {}; got {other}",
-            accepted.join(", ")
-        )),
+        Some(_) => Err(must_be_one_of(member, accepted)),
     }
 }
 

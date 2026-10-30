@@ -188,17 +188,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(value) => TravelMode::from_model_values(value, ROAD_SNAP_TRAVEL_MODE_VALUES).ok_or_else(|| {
                 invalid(
                     "TravelMode",
-                    format!("TravelMode {value} is not a RoadSnapTravelMode"),
+                    state::must_be_one_of("TravelMode", ROAD_SNAP_TRAVEL_MODE_VALUES),
                 )
             })?,
         };
         let geometry_format = state::geometry_format("SnappedGeometryFormat", input.snapped_geometry_format.as_ref())
             .map_err(|message| invalid("SnappedGeometryFormat", message))?;
 
-        // The model's `@default` is 0, which is no radius at all; the documented default
-        // the service applies is 300 metres. The modeled range (`0..10000`) is not
-        // enforced on a defaulted member, so the handler refuses anything outside it
-        // rather than reading it as "unset".
+        // A per-mode option block belongs to the one travel mode its member names, so a
+        // request may set only the block the `TravelMode` it selected names; this
+        // operation's options structure declares a block for one of the four modes its
+        // travel-mode enum admits, and a mode with none permits no block at all.
+        let declared = declared_travel_mode_options(input.travel_mode_options.as_ref());
+        let permitted: Vec<&str> = state::block_of_mode(travel_mode.as_model(), &declared)
+            .into_iter()
+            .collect();
+        state::check_travel_mode_options(travel_mode.as_model(), &permitted, &declared)
+            .map_err(|(member, message)| invalid(&member, message))?;
+
+        // `SnapRadius` narrows the range of the shape it targets: `DistanceMeters` is
+        // `0..4294967295` and the member is `0..10000`, so the boundary validator enforces
+        // the TARGET's wider range and the member's own upper bound is the handler's to
+        // apply. The model's `@default` is 0, which is no radius at all; the documented
+        // default the service applies is 300 metres, so a radius outside the member's range
+        // is refused rather than read as "unset".
         state::check_range(
             "SnapRadius",
             (0.0, state::MAX_SNAP_RADIUS_M as f64),
@@ -359,4 +372,13 @@ fn internal(message: &str) -> SnapToRoadsError {
         message: message.to_string(),
     })
     .into()
+}
+
+/// Every per-mode option block `RoadSnapTravelModeOptions` declares, in the model's order,
+/// paired with whether the request set it — what [`state::check_travel_mode_options`]
+/// holds against the selected `TravelMode`.
+fn declared_travel_mode_options(
+    options: Option<&RoadSnapTravelModeOptions>,
+) -> [(&'static str, bool); 1] {
+    [("Truck", options.is_some_and(|set| set.truck.is_some()))]
 }

@@ -260,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(value) => TravelMode::from_model_values(value, ROUTE_MATRIX_TRAVEL_MODE_VALUES).ok_or_else(|| {
                 invalid(
                     "TravelMode",
-                    format!("TravelMode {value} is not a RouteMatrixTravelMode"),
+                    state::must_be_one_of("TravelMode", ROUTE_MATRIX_TRAVEL_MODE_VALUES),
                 )
             })?,
         };
@@ -270,10 +270,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(value) => RoutingObjective::from_model(value).ok_or_else(|| {
                 invalid(
                     "OptimizeRoutingFor",
-                    format!("OptimizeRoutingFor {value} is not a RoutingObjective"),
+                    state::must_be_one_of("OptimizeRoutingFor", ROUTING_OBJECTIVE_VALUES),
                 )
             })?,
         };
+        // A per-mode option block belongs to the one travel mode its member names, so a
+        // request may set only the block the `TravelMode` it selected names. This
+        // operation's options structure declares no block for every mode its travel-mode
+        // enum admits, so a mode with none permits no block at all.
+        let declared = declared_travel_mode_options(input.travel_mode_options.as_ref());
+        let permitted: Vec<&str> = state::block_of_mode(travel_mode.as_model(), &declared)
+            .into_iter()
+            .collect();
+        state::check_travel_mode_options(travel_mode.as_model(), &permitted, &declared)
+            .map_err(|(member, message)| invalid(&member, message))?;
         if input.depart_now == Some(true) && input.departure_time.is_some() {
             return Err(invalid(
                 "DepartNow",
@@ -393,6 +403,19 @@ fn internal(message: &str) -> CalculateRouteMatrixError {
         message: message.to_string(),
     })
     .into()
+}
+
+/// Every per-mode option block `RouteMatrixTravelModeOptions` declares, in the model's
+/// order, paired with whether the request set it — what
+/// [`state::check_travel_mode_options`] holds against the selected `TravelMode`.
+fn declared_travel_mode_options(
+    options: Option<&RouteMatrixTravelModeOptions>,
+) -> [(&'static str, bool); 3] {
+    [
+        ("Car", options.is_some_and(|set| set.car.is_some())),
+        ("Scooter", options.is_some_and(|set| set.scooter.is_some())),
+        ("Truck", options.is_some_and(|set| set.truck.is_some())),
+    ]
 }
 
 /// Documented upper bound on the radius of a routing boundary circle and on the

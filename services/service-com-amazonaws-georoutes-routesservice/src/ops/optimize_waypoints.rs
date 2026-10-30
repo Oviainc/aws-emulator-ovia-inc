@@ -295,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| {
                     invalid(
                         "TravelMode",
-                        format!("TravelMode {value} is not a WaypointOptimizationTravelMode"),
+                        state::must_be_one_of("TravelMode", WAYPOINT_OPTIMIZATION_TRAVEL_MODE_VALUES),
                     )
                 })?,
         };
@@ -304,10 +304,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(value) => RoutingObjective::from_model(value).ok_or_else(|| {
                 invalid(
                     "OptimizeSequencingFor",
-                    format!("OptimizeSequencingFor {value} is not a WaypointOptimizationSequencingObjective"),
+                    state::must_be_one_of(
+                        "OptimizeSequencingFor",
+                        WAYPOINT_OPTIMIZATION_SEQUENCING_OBJECTIVE_VALUES,
+                    ),
                 )
             })?,
         };
+        // A per-mode option block belongs to the one travel mode its member names, so a
+        // request may set only the block the `TravelMode` it selected names; this
+        // operation's options structure declares a block for two of the four modes its
+        // travel-mode enum admits, and a mode with none permits no block at all.
+        let declared = declared_travel_mode_options(input.travel_mode_options.as_ref());
+        let permitted: Vec<&str> = state::block_of_mode(travel_mode.as_model(), &declared)
+            .into_iter()
+            .collect();
+        state::check_travel_mode_options(travel_mode.as_model(), &permitted, &declared)
+            .map_err(|(member, message)| invalid(&member, message))?;
 
         let departure = match &input.departure_time {
             Some(value) => {
@@ -844,4 +857,19 @@ fn internal(message: &str) -> OptimizeWaypointsError {
         message: message.to_string(),
     })
     .into()
+}
+
+/// Every per-mode option block `WaypointOptimizationTravelModeOptions` declares, in the
+/// model's order, paired with whether the request set it — what
+/// [`state::check_travel_mode_options`] holds against the selected `TravelMode`.
+fn declared_travel_mode_options(
+    options: Option<&WaypointOptimizationTravelModeOptions>,
+) -> [(&'static str, bool); 2] {
+    [
+        (
+            "Pedestrian",
+            options.is_some_and(|set| set.pedestrian.is_some()),
+        ),
+        ("Truck", options.is_some_and(|set| set.truck.is_some())),
+    ]
 }

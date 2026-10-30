@@ -65,7 +65,9 @@
 //! `Metric` and in feet and miles for `Imperial`.
 //!
 //! `Allow`, `Tolls`, `Traffic` and `TravelModeOptions` have nothing to act on: the model
-//! carries no HOV/HOT lane, toll, traffic variation or vehicle restriction.
+//! carries no HOV/HOT lane, toll, traffic variation or vehicle restriction. A
+//! `TravelModeOptions` block is still held to the `TravelMode` it belongs to — the member
+//! names its mode — so a block for another mode is refused rather than dropped.
 //!
 //! ## Places
 //!
@@ -254,6 +256,50 @@ fn internal(message: &str) -> CalculateRoutesError {
         message: message.to_string(),
     })
     .into()
+}
+
+/// The option blocks a route request may set for `mode`.
+///
+/// A block belongs to the mode its member names, so a mode permits the block that names it.
+/// A car also permits the service's electric-vehicle block, which it names `Ev`: the two
+/// are the set this refusal states for `Car`, and `RouteTravelModeOptions` in the model this
+/// crate is generated from carries no member for the second one yet, so nothing reads it —
+/// a refusal must state the set the service permits, not a narrower one.
+fn permitted_travel_mode_options(
+    mode: TravelMode,
+    declared: &state::DeclaredTravelModeOptions<'static>,
+) -> Vec<&'static str> {
+    let mut permitted: Vec<&'static str> =
+        state::block_of_mode(mode.as_model(), declared).into_iter().collect();
+    if matches!(mode, TravelMode::Car) {
+        permitted.push(EV_OPTIONS_BLOCK);
+    }
+    permitted
+}
+
+/// The electric-vehicle option block a car route may set beside its own.
+const EV_OPTIONS_BLOCK: &str = "Ev";
+
+/// Every per-mode option block `RouteTravelModeOptions` declares, in the model's order,
+/// paired with whether the request set it — what
+/// [`state::check_travel_mode_options`] holds against the selected `TravelMode`.
+fn declared_travel_mode_options(
+    options: Option<&RouteTravelModeOptions>,
+) -> [(&'static str, bool); 6] {
+    [
+        ("Car", options.is_some_and(|set| set.car.is_some())),
+        (
+            "Pedestrian",
+            options.is_some_and(|set| set.pedestrian.is_some()),
+        ),
+        ("Scooter", options.is_some_and(|set| set.scooter.is_some())),
+        ("Truck", options.is_some_and(|set| set.truck.is_some())),
+        (
+            "Intermodal",
+            options.is_some_and(|set| set.intermodal.is_some()),
+        ),
+        ("Transit", options.is_some_and(|set| set.transit.is_some())),
+    ]
 }
 
 /// The documented maximum number of waypoints between the origin and the destination
@@ -468,7 +514,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `Default value: Car`.
             None => TravelMode::Car,
             Some(value) => TravelMode::from_model_values(value, ROUTE_TRAVEL_MODE_VALUES)
-                .ok_or_else(|| invalid("TravelMode", format!("TravelMode {value} is not a RouteTravelMode")))?,
+                .ok_or_else(|| invalid("TravelMode", state::must_be_one_of("TravelMode", ROUTE_TRAVEL_MODE_VALUES)))?,
         };
         if matches!(travel_mode, TravelMode::Transit | TravelMode::Intermodal) {
             // No transit network or timetable is held, so there is nothing to compute a
@@ -483,10 +529,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(value) => RoutingObjective::from_model(value).ok_or_else(|| {
                 invalid(
                     "OptimizeRoutingFor",
-                    format!("OptimizeRoutingFor {value} is not a RoutingObjective"),
+                    state::must_be_one_of("OptimizeRoutingFor", ROUTING_OBJECTIVE_VALUES),
                 )
             })?,
         };
+        // A per-mode option block belongs to the one travel mode its member names, so a
+        // request may set only a block this operation permits for the `TravelMode` it
+        // selected. Accepting another mode's block would answer with a route computed for a
+        // different vehicle than the constraints the caller supplied describe.
+        let declared = declared_travel_mode_options(input.travel_mode_options.as_ref());
+        state::check_travel_mode_options(
+            travel_mode.as_model(),
+            &permitted_travel_mode_options(travel_mode, &declared),
+            &declared,
+        )
+        .map_err(|(member, message)| invalid(&member, message))?;
         let geometry_format = state::geometry_format("LegGeometryFormat", input.leg_geometry_format.as_ref())
             .map_err(|message| invalid("LegGeometryFormat", message))?;
 
@@ -530,7 +587,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(value) => StepDetail::from_model(value).ok_or_else(|| {
                 invalid(
                     "TravelStepType",
-                    format!("TravelStepType {value} is not a RouteTravelStepType"),
+                    state::must_be_one_of("TravelStepType", ROUTE_TRAVEL_STEP_TYPE_VALUES),
                 )
             })?,
         };
@@ -539,7 +596,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(value) => Measurement::from_model(value).ok_or_else(|| {
                 invalid(
                     "InstructionsMeasurementSystem",
-                    format!("InstructionsMeasurementSystem {value} is not a MeasurementSystem"),
+                    state::must_be_one_of("InstructionsMeasurementSystem", MEASUREMENT_SYSTEM_VALUES),
                 )
             })?,
         };
