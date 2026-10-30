@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCidrCollection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCidrCollection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCidrCollection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +72,35 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::{
+    resource_location, StoredCidrCollection, FIRST_CIDR_COLLECTION_VERSION, MAX_CIDR_COLLECTIONS,
+};
+
+/// The refusal text this operation answers a `Name` the account already holds
+/// under another caller reference with (`CidrCollectionAlreadyExistsException`,
+/// HTTP 400).
+///
+/// A CONSTANT, and the sentence the model states for this error class: it names
+/// neither the collection nor the reference, because what a caller can act on is
+/// that the name is taken by a collection some other request created — which is
+/// what tells this refusal apart from the RETRY of its own create, served with
+/// the collection that create already made.
+const CIDR_COLLECTION_ALREADY_EXISTS_MESSAGE: &str =
+    "A CIDR collection with this name and a different caller reference already exists in this \
+     account.";
+
+/// The refusal text this operation answers a create past
+/// [`MAX_CIDR_COLLECTIONS`] with (`LimitsExceeded`, HTTP 400).
+///
+/// The sentence the model states for this error class, which is about the
+/// ACCOUNT rather than about the request: a caller cannot make this create
+/// succeed by sending different values, only by releasing a collection the
+/// account holds or by having its limit raised.
+const LIMITS_EXCEEDED_MESSAGE: &str =
+    "This operation can't be completed because the current account has reached the limit on the \
+     resource you are trying to create. To request a higher limit, create a case with the Amazon \
+     Web Services Support Center.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,17 +174,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCidrCollection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCidrCollectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCidrCollection"))
+        // request metadata.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            CreateCidrCollectionErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // `Name` is "a unique identifier for the account that can be used to
+        // reference the collection from other API calls" (its own
+        // documentation), so a name the account already holds is either this
+        // create arriving twice or a second create over a taken name, and
+        // `CallerReference` — the token that "allows requests to be securely
+        // retried so that the intended outcome will only occur once, retries
+        // receive a similar response" — is what separates the two.
+        let held = store.cidr_collection_with_name(&input.name).cloned();
+        if let Some(held) = held {
+            if held.caller_reference != input.caller_reference {
+                return Err(
+                    CreateCidrCollectionErrorModeled::CidrCollectionAlreadyExistsException(
+                        CidrCollectionAlreadyExistsException {
+                            message: Some(CIDR_COLLECTION_ALREADY_EXISTS_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The same request again: the collection it asked for is already
+            // there, so it is reported rather than duplicated — nothing is
+            // created and no version moves.
+            return Ok(CreateCidrCollectionOutput {
+                location: Some(resource_location(
+                    ctx,
+                    &format!("cidrcollection/{}", held.id),
+                )),
+                collection: Some(held.to_cidr_collection()),
+            });
+        }
+
+        // The account's own quota: a caller chooses `Name` freely, so without
+        // this the store would take on a record for every distinct one it sends.
+        if store.cidr_collections.len() >= MAX_CIDR_COLLECTIONS {
+            return Err(
+                CreateCidrCollectionErrorModeled::LimitsExceeded(LimitsExceeded {
+                    message: Some(LIMITS_EXCEEDED_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        let id = store.mint_cidr_collection_id();
+        let collection = StoredCidrCollection {
+            id: id.clone(),
+            name: input.name,
+            caller_reference: input.caller_reference,
+            version: FIRST_CIDR_COLLECTION_VERSION,
+        };
+        // Insert and read back in ONE step: what the caller is told is read out
+        // of the store it was just written to, so a later read of the
+        // collection tells it the same thing.
+        let stored = store
+            .cidr_collections
+            .entry(id.clone())
+            .or_insert(collection)
+            .to_cidr_collection();
+        Ok(CreateCidrCollectionOutput {
+            collection: Some(stored),
+            location: Some(resource_location(ctx, &format!("cidrcollection/{id}"))),
+        })
     }
 }

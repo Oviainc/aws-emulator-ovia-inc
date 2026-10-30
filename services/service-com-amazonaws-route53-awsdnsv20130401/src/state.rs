@@ -4,8 +4,9 @@
 //!
 //! Route 53 is a control plane over the hosted zone and, inside it, the
 //! resource record set, plus the traffic policy a record set can be generated
-//! from, the health check a record set can be routed by, and the reusable
-//! delegation set a zone's name servers can come from. They all live here,
+//! from, the health check a record set can be routed by, the reusable
+//! delegation set a zone's name servers can come from, and the CIDR collection
+//! an IP-based record set routes a client's address through. They all live here,
 //! in ONE store, so every operation reads the records
 //! another operation wrote. The helpers in this module are the
 //! shared vocabulary the handlers in `src/ops/` use for them — DNS name
@@ -46,6 +47,7 @@ pub mod geo_location;
 /// health check carries it.
 pub mod monitored_alarm;
 
+use crate::ops::types::create_cidr_collection_types::CidrCollection;
 use crate::ops::types::create_reusable_delegation_set_types::HostedZoneNotFound;
 use crate::ops::types::delete_vpc_association_authorization_types::VPCAssociationAuthorizationNotFound;
 use crate::ops::types::get_change_types::NoSuchChange;
@@ -322,6 +324,23 @@ pub const MAX_TRAFFIC_POLICIES: usize = 50;
 /// account"), and the model declares `TooManyTrafficPolicyInstances` for the
 /// refusal that enforces it.
 pub const MAX_TRAFFIC_POLICY_INSTANCES: usize = 50;
+
+/// The most CIDR collections the account may hold.
+///
+/// A caller picks a collection's `Name` freely, so without a bound the store
+/// would take on a record for every distinct name a request carries. The number
+/// is this emulator's own — it is generous enough that no faithful workload
+/// reaches it — and `LimitsExceeded`, the error `CreateCidrCollection` models
+/// for an account that "has reached the limit on the resource you are trying to
+/// create", is what a create past it answers.
+pub const MAX_CIDR_COLLECTIONS: usize = 100;
+
+/// The `Version` a freshly created CIDR collection carries.
+///
+/// `CidrCollection$Version`'s own documentation: "A sequential counter that
+/// Route 53 sets to 1 when you create a CIDR collection and increments by 1
+/// each time you update settings for the CIDR collection."
+pub const FIRST_CIDR_COLLECTION_VERSION: i64 = 1;
 
 /// The `AccountLimitType` naming the hosted-zone quota (`AccountLimitType` enum).
 pub const ACCOUNT_LIMIT_MAX_HOSTED_ZONES: &str = "MAX_HOSTED_ZONES_BY_OWNER";
@@ -1629,6 +1648,45 @@ impl StoredTrafficPolicyInstance {
     }
 }
 
+/// A CIDR collection: the named group of CIDR blocks an IP-based record set
+/// routes a client's address through.
+///
+/// The blocks themselves are not here yet — `ChangeCidrCollection`, the one
+/// operation that puts a block in a collection, is still a scaffold — so this
+/// record is the collection's IDENTITY: the id Route 53 minted for it, the name
+/// and caller reference the create carried, and the version counter a later
+/// change moves.
+#[derive(Debug, Clone)]
+pub struct StoredCidrCollection {
+    /// The collection id, which is also this record's key in
+    /// [`ComAmazonawsRoute53Awsdnsv20130401State::cidr_collections`].
+    pub id: String,
+    /// The `Name` the collection was created with, unique across the account's
+    /// collections ([`ComAmazonawsRoute53Awsdnsv20130401State::cidr_collection_with_name`]).
+    pub name: String,
+    /// The `CallerReference` the create carried, which is what tells a RETRY of
+    /// that create apart from a second create over the same name.
+    pub caller_reference: String,
+    /// This collection's version counter, [`FIRST_CIDR_COLLECTION_VERSION`] from
+    /// the create on.
+    pub version: i64,
+}
+
+impl StoredCidrCollection {
+    /// The modelled `CidrCollection` for this record.
+    ///
+    /// The ONE projection every CIDR-collection response is built from, so a
+    /// create and a later read cannot report one collection differently.
+    pub fn to_cidr_collection(&self) -> CidrCollection {
+        CidrCollection {
+            arn: Some(cidr_collection_arn(&self.id)),
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            version: Some(self.version),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-route53-awsdnsv20130401. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsRoute53Awsdnsv20130401State {
@@ -1678,6 +1736,10 @@ pub struct ComAmazonawsRoute53Awsdnsv20130401State {
     /// `CreateReusableDelegationSet` answers `DelegationSetAlreadyCreated`
     /// from.
     pub delegation_set_by_caller_reference: HashMap<String, String>,
+    /// Every CIDR collection of the account's, keyed by its id. A `BTreeMap` so
+    /// a listing pages over a stable total order of collection ids. Bounded by
+    /// [`MAX_CIDR_COLLECTIONS`].
+    pub cidr_collections: BTreeMap<String, StoredCidrCollection>,
     /// The id generator, kept here so ids stay unique across calls.
     ids: IdMinter,
     /// The health-checker CIDR blocks `GetCheckerIpRanges` reports, in the order
@@ -1721,6 +1783,7 @@ impl Default for ComAmazonawsRoute53Awsdnsv20130401State {
             deleted_health_check_references: VecDeque::new(),
             delegation_sets: BTreeMap::new(),
             delegation_set_by_caller_reference: HashMap::new(),
+            cidr_collections: BTreeMap::new(),
             ids: IdMinter::default(),
             checker_ip_ranges: checker_ip_ranges(),
             geo_locations: geo_location::catalog(),
@@ -1776,6 +1839,33 @@ impl ComAmazonawsRoute53Awsdnsv20130401State {
                 return id;
             }
         }
+    }
+
+    /// Mint a CIDR collection id: 8-4-4-4-12 lowercase hex, which is the form
+    /// the model fixes for one (`UUID`, `pattern
+    /// ^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$`). Retried until it is
+    /// unused.
+    pub fn mint_cidr_collection_id(&mut self) -> String {
+        loop {
+            let id = self.ids.mint_uuid();
+            if !self.cidr_collections.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The CIDR collection carrying `name`, if the account holds one.
+    ///
+    /// `CidrCollectionAlreadyExistsException`'s own documentation — "A CIDR
+    /// collection with this name and a different caller reference already
+    /// exists in this account" — makes the NAME the identity a create collides
+    /// on, so the lookup is by name, and it is searched off the store rather
+    /// than tracked beside it: a collection that is deleted frees its name by
+    /// itself.
+    pub fn cidr_collection_with_name(&self, name: &str) -> Option<&StoredCidrCollection> {
+        self.cidr_collections
+            .values()
+            .find(|collection| collection.name == name)
     }
 
     /// Record that the health check holding `caller_reference` was deleted, so
@@ -2903,6 +2993,22 @@ pub fn resource_location(
         .unwrap_or(DEFAULT_ENDPOINT_HOST);
     format!("https://{host}/2013-04-01/{path}")
 }
+
+/// The ARN of the CIDR collection `id`, as `CidrCollection$Arn` reports it.
+///
+/// Route 53 is a global service, so its resource ARNs name no region; the
+/// account is the one every ARN this emulator mints carries
+/// ([`::engine::emulator_arn`]). The resource half is the collection's own
+/// `cidrcollection/<id>`, which is what makes the ARN usable "to reference the
+/// collection in IAM policy or in another Amazon Web Services account"
+/// (`CidrCollection$Arn`).
+pub fn cidr_collection_arn(id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, "", &format!("cidrcollection/{id}"))
+}
+
+/// The service segment of every ARN this service mints, which is this service's
+/// own name in an ARN.
+const ARN_SERVICE: &str = "route53";
 
 /// The modelled `VPCAssociationAuthorizationNotFound` (HTTP 404) for a
 /// `(hosted zone, VPC)` pair the zone's authorization ledger does not hold.
