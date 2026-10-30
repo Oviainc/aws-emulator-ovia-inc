@@ -11,20 +11,28 @@
 //! operation keyed by its lowercased verb (the `ANY` catch-all becomes API Gateway's own
 //! `x-amazon-apigateway-any-method` key, the same key `PutRestApi` IMPORTS it from), each
 //! method response a `responses` entry with the headers its `responseParameters` declare,
-//! the API's name/description/version its `info`, the API's binary media types the
-//! `x-amazon-apigateway-binary-media-types` extension, the gateway responses configured on
-//! the API the `x-amazon-apigateway-gateway-responses` extension, and the api id + region
+//! the content types a method negotiates its `consumes` and `produces` (the content types
+//! its request and response models and its integration's request and response templates
+//! are keyed by), the API's name/description/version its `info`, the API's TLS security
+//! policy the `x-amazon-apigateway-security-policy` extension, the API's binary media
+//! types the `x-amazon-apigateway-binary-media-types` extension, the gateway responses
+//! configured on the API the `x-amazon-apigateway-gateway-responses` extension, and the
+//! api id + region
 //! + stage name the invoke endpoint the dialect renders in its own place (`host`/
-//! `basePath`/`schemes` for 2.0, `servers` for 3.0). The vendor extensions are rendered
-//! only when the request's `parameters` ask for them, as that member documents: the
-//! integration and authorizer extensions for the value that names each, the extensions
-//! describing the API itself — its gateway responses — for the value that asks for API
-//! Gateway's own extension set (`extensions=apigateway`), and the documentation set the
-//! stage SERVES for the value that asks for the documentation extension
-//! (`extensions=documentation`): the `DocumentationVersion` snapshot the stage's
-//! `documentationVersion` pins, rendered under the same
-//! `x-amazon-apigateway-documentation` key `ImportDocumentationParts` reads one back out
-//! of.
+//! `basePath`/`schemes` for 2.0, `servers` for 3.0). The vendor extensions that describe
+//! a CONFIGURATION a caller made — an integration, an authorizer, a customized gateway
+//! response, a documentation snapshot — are rendered only when the request's `parameters`
+//! ask for them, as that member documents: the integration and authorizer extensions for
+//! the value that names each, the extensions describing the API itself — its gateway
+//! responses — for the value that asks for API Gateway's own extension set
+//! (`extensions=apigateway`), and the documentation set the stage SERVES for the value
+//! that asks for the documentation extension (`extensions=documentation`): the
+//! `DocumentationVersion` snapshot the stage's `documentationVersion` pins, rendered under
+//! the same `x-amazon-apigateway-documentation` key `ImportDocumentationParts` reads one
+//! back out of. The two extensions that state what the API IS rather than how it was
+//! configured — its TLS security policy and its binary media types, members every stored
+//! API carries — are written whatever the request asks for, the way the definition's own
+//! `swagger`/`info` are.
 //!
 //! The document is served as the FILE it is: the response reports the attachment's
 //! unspecified byte stream as its `contentType` whichever spelling `accepts` selected, and
@@ -121,7 +129,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::{Map, Value};
 
@@ -238,6 +246,10 @@ const AUTHORIZER_EXTENSION: &str = "x-amazon-apigateway-authorizer";
 /// Reached from the IMPORT side, which reads the same collection back out of the same
 /// key, so the two directions cannot disagree on it.
 use super::put_rest_api::GATEWAY_RESPONSES_EXTENSION;
+
+/// The document key the API's own TLS security policy is exported under — API Gateway's
+/// own OpenAPI extension for the member `RestApi$securityPolicy` reports.
+const SECURITY_POLICY_EXTENSION: &str = "x-amazon-apigateway-security-policy";
 
 /// The document key that says which kind of authorization a security scheme stands for.
 const AUTHTYPE_EXTENSION: &str = "x-amazon-apigateway-authtype";
@@ -461,7 +473,7 @@ impl Serialization {
             Self::Json => ::serde_json::to_string_pretty(document)
                 .map(String::into_bytes)
                 .map_err(|error| format!("the export could not be written as JSON: {error}")),
-            Self::Yaml => yaml_text(document).map(String::into_bytes),
+            Self::Yaml => Ok(yaml_text(document).into_bytes()),
         }
     }
 }
@@ -480,41 +492,178 @@ struct Extensions {
     documentation: bool,
 }
 
-/// The YAML spelling of `document`, emitted by the YAML crate this service already parses
-/// an API definition with rather than by a second hand-written writer.
+/// The YAML spelling of `document`, as the FILE API Gateway serves a YAML export as: a
+/// bare mapping — no document start marker — whose string scalars are all double-quoted
+/// and whose sequences are written at their key's own indentation.
 ///
-/// A mapping keeps the order it was built in (the emitter's hash preserves insertion
-/// order), so the YAML and the JSON spelling of one export carry the same document.
-/// `Err` carries the emitter's refusal, which a document built by this module cannot
-/// provoke (see [`Serialization::render`]).
-fn yaml_text(document: &Value) -> Result<String, String> {
+/// Written here rather than emitted by a YAML crate because an export is a file with a
+/// byte spelling, not just a document: the emitters this tree has open a document with a
+/// start marker and leave a scalar plain wherever a reader would resolve it back
+/// unambiguously, which is a different file for the same export — one that compares and
+/// re-imports differently. Quoting every string instead keeps a scalar the string it is
+/// whatever it spells (a version `2.0`, a status code `200`, a date), which is what the
+/// quoting is FOR.
+///
+/// Total over the documents this module builds — a finite tree of strings, numbers,
+/// booleans, arrays and string-keyed objects — so there is no failure to report. Its
+/// nesting is this module's own, apart from the one caller-supplied subtree a document can
+/// carry (a `DocumentationPart`'s `properties`), whose depth is already bounded where it is
+/// parsed.
+fn yaml_text(document: &Value) -> String {
     let mut rendered = String::new();
-    let mut emitter = ::yaml_rust2::emitter::YamlEmitter::new(&mut rendered);
-    emitter
-        .dump(&yaml_node(document))
-        .map_err(|error| format!("the export could not be written as YAML: {error}"))?;
-    rendered.push('\n');
-    Ok(rendered)
+    match document {
+        Value::Object(entries) if !entries.is_empty() => {
+            for (key, value) in entries {
+                write_yaml_entry(&mut rendered, key, value, 0);
+            }
+        }
+        other => {
+            rendered.push_str(&yaml_inline(other));
+            rendered.push('\n');
+        }
+    }
+    rendered
 }
 
-/// One node of [`yaml_text`]'s document.
-fn yaml_node(value: &Value) -> ::yaml_rust2::yaml::Yaml {
-    use ::yaml_rust2::yaml::Yaml;
-    match value {
-        Value::Null => Yaml::Null,
-        Value::Bool(flag) => Yaml::Boolean(*flag),
-        Value::Number(number) => number
-            .as_i64()
-            .map_or_else(|| Yaml::Real(number.to_string()), Yaml::Integer),
-        Value::String(text) => Yaml::String(text.clone()),
-        Value::Array(items) => Yaml::Array(items.iter().map(yaml_node).collect()),
-        Value::Object(entries) => Yaml::Hash(
-            entries
-                .iter()
-                .map(|(key, value)| (Yaml::String(key.clone()), yaml_node(value)))
-                .collect(),
-        ),
+/// The spaces one level of YAML nesting is indented by.
+const YAML_INDENT: &str = "  ";
+
+/// Indent a line to `depth` levels; see [`YAML_INDENT`].
+fn push_yaml_indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str(YAML_INDENT);
     }
+}
+
+/// One `key: value` of a block mapping, indented to `depth`.
+fn write_yaml_entry(out: &mut String, key: &str, value: &Value, depth: usize) {
+    push_yaml_indent(out, depth);
+    write_yaml_entry_body(out, key, value, depth);
+}
+
+/// One `key: value` whose indentation the caller has already written — a mapping's entry,
+/// or the first entry of a mapping that is an item of a sequence, which follows the `- `
+/// on the same line. `depth` is the key's own level, so its children indent one deeper.
+fn write_yaml_entry_body(out: &mut String, key: &str, value: &Value, depth: usize) {
+    out.push_str(&yaml_key(key));
+    out.push(':');
+    match value {
+        Value::Object(entries) if !entries.is_empty() => {
+            out.push('\n');
+            for (child, node) in entries {
+                write_yaml_entry(out, child, node, depth + 1);
+            }
+        }
+        // A sequence's items sit at their KEY's indentation, which is how API Gateway's
+        // own YAML exports read.
+        Value::Array(items) if !items.is_empty() => {
+            out.push('\n');
+            write_yaml_sequence(out, items, depth);
+        }
+        scalar => {
+            out.push(' ');
+            out.push_str(&yaml_inline(scalar));
+            out.push('\n');
+        }
+    }
+}
+
+/// The items of a block sequence, each at `depth`.
+fn write_yaml_sequence(out: &mut String, items: &[Value], depth: usize) {
+    for item in items {
+        push_yaml_indent(out, depth);
+        out.push_str("- ");
+        match item {
+            // A mapping inside a sequence opens on the `- ` line and continues one level
+            // deeper, the width of the `- ` itself.
+            Value::Object(entries) if !entries.is_empty() => {
+                for (index, (key, value)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        push_yaml_indent(out, depth + 1);
+                    }
+                    write_yaml_entry_body(out, key, value, depth + 1);
+                }
+            }
+            scalar => {
+                out.push_str(&yaml_inline(scalar));
+                out.push('\n');
+            }
+        }
+    }
+}
+
+/// A value that fits on one line: a scalar, or an EMPTY collection.
+///
+/// The last arm is the total case, not a shape of these documents: every member built
+/// above is a scalar, a mapping, or a sequence OF scalars or mappings, so a non-empty
+/// collection sitting directly inside a sequence never reaches here. One that did would be
+/// written in YAML's flow style, which is JSON — still the same document, on one line.
+fn yaml_inline(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => yaml_quoted(text),
+        collection => collection.to_string(),
+    }
+}
+
+/// `text` as a double-quoted YAML scalar. YAML's double-quoted style takes JSON's own
+/// escapes, so the escaping is `serde_json`'s rather than a hand-written table of it.
+fn yaml_quoted(text: &str) -> String {
+    Value::from(text).to_string()
+}
+
+/// A mapping key: written plain, and double-quoted only where plain would not read back as
+/// the string it is — a key that resolves to a number, a boolean or null (a method
+/// response is keyed by its status code), one that opens with a YAML indicator, or one
+/// carrying whitespace a reader would strip.
+fn yaml_key(key: &str) -> String {
+    if is_plain_yaml_key(key) {
+        key.to_string()
+    } else {
+        yaml_quoted(key)
+    }
+}
+
+/// The characters a plain scalar may not OPEN with: YAML's own indicators.
+const YAML_INDICATORS: &[char] = &[
+    '-', '?', ':', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`',
+];
+
+/// Whether `key` can be written plain; see [`yaml_key`].
+///
+/// The rule is deliberately one-sided: a key is plain only where no reader could resolve
+/// it as anything but a string, and quoted wherever that is in doubt. A scalar that
+/// resolves to a number, a boolean, a null, a date or a time opens with a digit, a `.`, a
+/// `+` or one of the indicators above, or spells one of the words below — so a key that
+/// opens with none of those and spells none of them is the string it reads as, whatever
+/// number, date or sexagesimal form a reader also knows.
+fn is_plain_yaml_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.trim() == key
+        && !key.starts_with(YAML_INDICATORS)
+        && !key.starts_with(YAML_SCALAR_OPENERS)
+        && !key.contains(": ")
+        && !key.contains(" #")
+        && !key.ends_with(':')
+        && !key.chars().any(char::is_control)
+        && !resolves_as_non_string(key)
+}
+
+/// The characters a non-string YAML scalar — a number in any base, a date, a time, an
+/// infinity — can OPEN with; see [`is_plain_yaml_key`]. A key opening with one of them is
+/// quoted whether or not it completes such a form.
+const YAML_SCALAR_OPENERS: &[char] =
+    &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '+'];
+
+/// Whether a YAML reader would resolve the plain scalar `text` to a boolean or a null: the
+/// words that are not a string however they are cased.
+fn resolves_as_non_string(text: &str) -> bool {
+    matches!(
+        text.to_ascii_lowercase().as_str(),
+        "null" | "~" | "true" | "false" | "yes" | "no" | "on" | "off"
+    )
 }
 
 /// The extensions `parameters` asks for.
@@ -708,6 +857,17 @@ fn export_document(
             document.insert(DOCUMENTATION_EXTENSION.to_string(), documentation);
         }
     }
+    // The TLS policy of the endpoint this definition is served at: "The Transport Layer
+    // Security (TLS) version + cipher suite for this RestApi" (`RestApi$securityPolicy`).
+    // It describes the API rather than one of its methods, and every stored API carries
+    // one (`crate::state::DEFAULT_SECURITY_POLICY` when the create set none), so the
+    // exported definition states it.
+    if let Some(policy) = &api.security_policy {
+        document.insert(
+            SECURITY_POLICY_EXTENSION.to_string(),
+            Value::from(policy.as_str()),
+        );
+    }
     if !api.binary_media_types.is_empty() {
         document.insert(
             super::put_rest_api::BINARY_MEDIA_TYPES_EXTENSION.to_string(),
@@ -788,6 +948,18 @@ fn operation_object(
     if let Some(name) = &method.operation_name {
         operation.insert("operationId".to_string(), Value::from(name.as_str()));
     }
+    // The content types the method negotiates. 2.0 states them on the operation itself;
+    // 3.0 has no such member — a content type is a key of the Request Body / Response
+    // `content` map there, which is a Media Type Object describing the payload, and this
+    // export carries no payload schemas (see [`responses_object`]).
+    if dialect == Dialect::Swagger {
+        if let Some(consumed) = media_type_list(&request_media_types(method)) {
+            operation.insert("consumes".to_string(), consumed);
+        }
+        if let Some(produced) = media_type_list(&response_media_types(method)) {
+            operation.insert("produces".to_string(), produced);
+        }
+    }
     let parameters = parameter_objects(resource, method, dialect);
     if !parameters.is_empty() {
         operation.insert("parameters".to_string(), Value::Array(parameters));
@@ -806,6 +978,75 @@ fn operation_object(
         }
     }
     Value::Object(operation)
+}
+
+/// The media types a method's REQUEST is defined for: the content types it declares a
+/// request model under (`Method$requestModels`, "keyed by … content type") and the
+/// content types its integration maps a request body from (`Integration$requestTemplates`,
+/// "represented as a key/value map, with a content-type as the key"). Each one is a
+/// content type the method accepts a body in, so each is a content type the definition
+/// says the operation consumes.
+fn request_media_types(method: &MethodEntry) -> Vec<&str> {
+    let mut media_types: BTreeSet<&str> = method
+        .request_models
+        .keys()
+        .map(String::as_str)
+        .collect();
+    if let Some(integration) = &method.integration {
+        media_types.extend(
+            integration
+                .request_templates
+                .iter()
+                .flatten()
+                .map(|(media_type, _)| media_type.as_str()),
+        );
+    }
+    media_types.into_iter().collect()
+}
+
+/// The media types a method's RESPONSES are rendered in: the content types its method
+/// responses declare a model under (`MethodResponse$responseModels`) and the content types
+/// its integration responses map a body into (`IntegrationResponse$responseTemplates`,
+/// "Specifies the templates used to transform the integration response body … with the
+/// content-type as the key"). Each one is a content type the operation can answer in, so
+/// each is a content type the definition says it produces.
+fn response_media_types(method: &MethodEntry) -> Vec<&str> {
+    let mut media_types: BTreeSet<&str> = BTreeSet::new();
+    for response in method.method_responses.values() {
+        media_types.extend(
+            response
+                .response_models
+                .iter()
+                .flatten()
+                .map(|(media_type, _)| media_type.as_str()),
+        );
+    }
+    if let Some(integration) = &method.integration {
+        for (_, response) in integration.integration_responses.iter().flatten() {
+            media_types.extend(
+                response
+                    .response_templates
+                    .iter()
+                    .flatten()
+                    .map(|(media_type, _)| media_type.as_str()),
+            );
+        }
+    }
+    media_types.into_iter().collect()
+}
+
+/// `media_types` as a document member, or `None` when the records name none: a method
+/// that negotiates no content type states nothing, rather than an empty list.
+fn media_type_list(media_types: &[&str]) -> Option<Value> {
+    if media_types.is_empty() {
+        return None;
+    }
+    Some(Value::Array(
+        media_types
+            .iter()
+            .map(|media_type| Value::from(*media_type))
+            .collect(),
+    ))
 }
 
 /// The Parameter Objects of one method: the parameters the resource's path template

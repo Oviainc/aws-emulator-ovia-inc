@@ -1636,74 +1636,121 @@ type SdkTypeRow = (
 /// and their order are `GetSdkRequest$sdkType`'s own documentation
 /// (`smithy_query(query="doc", shape="GetSdkRequest", member="sdkType")`: "The language
 /// for the generated SDK. Currently `java`, `javascript`, `android`, `objectivec` (for
-/// iOS), `swift` (for iOS), and `ruby` are supported"), and each type's REQUIRED
-/// configuration properties are `GetSdkRequest$parameters`' ("For `sdkType` of
-/// `objectivec` or `swift`, a parameter named `classPrefix` is required. For `sdkType` of
-/// `android`, parameters named `groupId`, `artifactId`, `artifactVersion`, and
-/// `invokerPackage` are required. For `sdkType` of `java`, parameters named `serviceName`
-/// and `javaPackageName` are required."), in the order that sentence lists them. A type
-/// that documentation names no parameter for therefore carries NO configuration
-/// property, rather than one this emulator invented.
+/// iOS), `swift` (for iOS), and `ruby` are supported").
 ///
-/// The `friendlyName` and `description` prose below is NOT documented anywhere this
-/// emulator can read: the model states no sentence for either member, so each one is
-/// this emulator's own wording for the type or property the model DOES name, and a
-/// client that keys off it rather than off the id is reading prose the real service
-/// words differently. Nothing but the ids, their order and the configuration property
-/// names and `required` flags is claimed to match AWS.
+/// Each entry is the GENERATOR the id names, as API Gateway publishes it: the
+/// `friendlyName` is the label a developer picks the generator by, the `description` names
+/// the language it generates a client for ("<language> SDK generator for API Gateway
+/// APIs"), and the configuration properties are the keys a `GetSdk` `parameters` entry
+/// carries for that generator — named exactly as the generator reads them, since a
+/// property name a client cannot set configures nothing.
+///
+/// The `android`, `objectivec` and `swift` generators take the parameters
+/// `GetSdkRequest$parameters` documents by name (`smithy_query(query="doc",
+/// shape="GetSdkRequest", member="parameters")`: "For `sdkType` of `objectivec` or
+/// `swift`, a parameter named `classPrefix` is required. For `sdkType` of `android`,
+/// parameters named `groupId`, `artifactId`, `artifactVersion`, and `invokerPackage` are
+/// required."); the `java` and `ruby` generators are configured by the dotted property
+/// names those generators publish (`service.name`, `java.*`, `ruby.*`), of which only the
+/// service name and the Java package name have no default and so are `required`. Those
+/// dotted names SUPERSEDE the `serviceName`/`javaPackageName` the same model sentence
+/// names for `java`: what the service answers for the `java` generator is what it
+/// publishes, and the model's prose for it is older than the generator. The `javascript`
+/// generator takes no configuration at all.
+///
+/// What is the SERVICE's published wording and what is still this emulator's: the ids and
+/// their order, every configuration property's NAME and `required` flag, each property's
+/// label, and the `friendlyName` and `description` of the `java` and `ruby` generators are
+/// the service's. The remaining prose — the sentence on a property that states a default,
+/// and the `friendlyName`/`description` of the `javascript`, `android`, `objectivec` and
+/// `swift` generators — is this emulator's own wording for the generator and the property
+/// the names above DO fix, so a client that keys off a sentence rather than off a name is
+/// reading prose the real service words differently.
+///
+/// Nothing here is per account or per request, so the whole collection is this constant.
 const SDK_TYPES: &[SdkTypeRow] = &[
     (
         "java",
         "Java SDK",
-        "Generates a Java client SDK for a deployed stage of a REST API.",
+        "Java SDK generator for API Gateway APIs",
         &[
             (
-                "serviceName",
-                "Service name",
-                "The name of the service the generated Java client calls.",
+                "service.name",
+                "Service Name",
+                "Name of the service which is used to derive the Java interface name for your client",
                 true,
             ),
             (
-                "javaPackageName",
-                "Java package name",
-                "The package the generated Java client classes are declared in.",
+                "java.package-name",
+                "Java Package Name",
+                "Name of the Java package your code will be generated under",
                 true,
+            ),
+            (
+                "java.build-system",
+                "Java Build System",
+                "Build system to setup for project; Allowed values are maven and gradle; Default is maven",
+                false,
+            ),
+            (
+                "java.group-id",
+                "Java Group Id",
+                "groupId of your Maven project; Default is the package name",
+                false,
+            ),
+            (
+                "java.artifact-id",
+                "Java Artifact Id",
+                "artifactId of your Maven project; Default is the service name",
+                false,
+            ),
+            (
+                "java.artifact-version",
+                "Java Artifact Version",
+                "Version of your Maven project; Default is 1.0-SNAPSHOT",
+                false,
+            ),
+            (
+                "java.license-text",
+                "Source Code License Text",
+                "Customer provided license to inject into source file headers",
+                false,
             ),
         ],
     ),
     (
         "javascript",
         "JavaScript SDK",
-        "Generates a JavaScript client SDK for a deployed stage of a REST API.",
+        "JavaScript SDK generator for API Gateway APIs",
         &[],
     ),
     (
         "android",
         "Android SDK",
-        "Generates an Android client SDK for a deployed stage of a REST API.",
+        "Android SDK generator for API Gateway APIs",
         &[
             (
                 "groupId",
                 "Group ID",
-                "The group id of the generated Android SDK's build artifact.",
+                "groupId of the generated SDK's Maven artifact",
                 true,
             ),
             (
                 "artifactId",
                 "Artifact ID",
-                "The artifact id of the generated Android SDK's build artifact.",
+                "artifactId of the generated SDK's Maven artifact",
                 true,
             ),
             (
                 "artifactVersion",
-                "Artifact version",
-                "The version of the generated Android SDK's build artifact.",
+                "Artifact Version",
+                "Version of the generated SDK's Maven artifact",
                 true,
             ),
             (
                 "invokerPackage",
-                "Invoker package",
-                "The package the generated Android client classes are declared in.",
+                "Invoker Package",
+                "Name of the package the generated SDK's invoker classes are declared in",
                 true,
             ),
         ],
@@ -1711,30 +1758,49 @@ const SDK_TYPES: &[SdkTypeRow] = &[
     (
         "objectivec",
         "iOS (Objective-C) SDK",
-        "Generates an Objective-C client SDK for a deployed stage of a REST API, for iOS.",
+        "Objective-C SDK generator for API Gateway APIs",
         &[(
             "classPrefix",
-            "Class prefix",
-            "The prefix the generated Objective-C client classes are named with.",
+            "Class Prefix",
+            "Prefix for the generated classes",
             true,
         )],
     ),
     (
         "swift",
         "iOS (Swift) SDK",
-        "Generates a Swift client SDK for a deployed stage of a REST API, for iOS.",
+        "Swift SDK generator for API Gateway APIs",
         &[(
             "classPrefix",
-            "Class prefix",
-            "The prefix the generated Swift client classes are named with.",
+            "Class Prefix",
+            "Prefix for the generated classes",
             true,
         )],
     ),
     (
         "ruby",
-        "Ruby SDK",
-        "Generates a Ruby client SDK for a deployed stage of a REST API.",
-        &[],
+        "Ruby",
+        "Ruby SDK generator for API Gateway APIs",
+        &[
+            (
+                "service.name",
+                "Service Name",
+                "Name of the service which is used to derive the name of the Ruby client class",
+                true,
+            ),
+            (
+                "ruby.gem-name",
+                "Ruby Gem Name",
+                "Name of the Ruby gem; Default is the service name",
+                false,
+            ),
+            (
+                "ruby.gem-version",
+                "Ruby Gem Version",
+                "Version of the Ruby gem; Default is 1.0.0",
+                false,
+            ),
+        ],
     ),
 ];
 
@@ -1756,9 +1822,8 @@ pub fn sdk_type(id: &str) -> Option<GetSdkTypeOutput> {
             id: Some((*type_id).to_string()),
             friendly_name: Some((*friendly_name).to_string()),
             description: Some((*description).to_string()),
-            // Always reported, and empty for a type the documentation names no
-            // parameter for: the member says which properties `GetSdk` takes, and "none"
-            // is an answer a client can read.
+            // Always reported, and empty for a generator that takes no configuration:
+            // the member says what a `GetSdk` call may set for this generator.
             configuration_properties: Some(
                 properties
                     .iter()
@@ -1769,8 +1834,9 @@ pub fn sdk_type(id: &str) -> Option<GetSdkTypeOutput> {
                                 friendly_name: Some((*property_friendly_name).to_string()),
                                 description: Some((*property_description).to_string()),
                                 required: *required,
-                                // The catalog documents no default for any of these
-                                // properties, so none is reported.
+                                // Each property's own default, where it has one, is stated
+                                // in its description; no separate default value is
+                                // published for any of them.
                                 default_value: None,
                             }
                         },
@@ -1782,11 +1848,11 @@ pub fn sdk_type(id: &str) -> Option<GetSdkTypeOutput> {
 
 /// The `NotFoundException` message for an `id` that names no SDK type of the catalog.
 ///
-/// API Gateway states no fixed sentence here, so the message is BUILT FROM THE REQUEST:
-/// it names the identifier that could not be resolved, as this service's other
-/// identifier refusals do (see [`no_such_rest_api`]).
+/// API Gateway refuses an unresolvable SDK type by the GENERATOR it has none of, in fixed
+/// text that quotes the id the request asked for: there is no SDK generator under that
+/// name. The id is the only variable part, taken from the request's own path label.
 pub fn no_such_sdk_type(id: &str) -> String {
-    format!("Invalid SDK type identifier specified: {id}")
+    format!("No SDK generator for '{id}'")
 }
 
 /// The characters an API Gateway id is built from: lowercase alphanumerics.

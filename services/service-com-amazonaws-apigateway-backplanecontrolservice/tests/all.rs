@@ -316,3 +316,8 @@ mod usage_plan_api_stage_resolution;
 // control plane's 400 and 404 refusals name, and the sentences it names them in.
 #[path = "all/refusal_sentence_targets.rs"]
 mod refusal_sentence_targets;
+// Appended for the reason the note above gives: what an exported definition says about
+// CONTENT — the media types an operation negotiates, the API's TLS security policy, and
+// the byte spelling of the YAML serialization.
+#[path = "all/stage_export_content_types.rs"]
+mod stage_export_content_types;
