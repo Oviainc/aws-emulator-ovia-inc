@@ -1125,46 +1125,26 @@ async fn deleting_removes_exactly_what_it_names() {
 /// The three `/tags` operations are NOT in the table: they are implemented, over the tag
 /// directory the Amazon Chime family shares, and pinned by `resource_tagging.rs` beside
 /// this suite. Neither is `UpdateAttendeeCapabilities`, which is implemented over the
-/// stored attendee and pinned by `attendee_capabilities.rs`.
+/// stored attendee and pinned by `attendee_capabilities.rs`, nor
+/// `BatchUpdateAttendeeCapabilitiesExcept`, implemented over the same stored attendees and
+/// pinned by `batch_update_attendee_capabilities_except.rs`.
 #[tokio::test]
 async fn the_operations_outside_this_slice_are_still_not_implemented() {
     let emulator = Emulator::new();
     let meeting_id = emulator
         .meeting_id_of_new_meeting(&minimal_meeting("tok-stubs", "us-east-1", "ext-stubs"))
         .await;
-    let attendee_id = emulator
-        .attendee_id_of_new_attendee(&meeting_id, "user-stubs")
-        .await;
-    let capabilities = json!({ "Audio": "Send", "Video": "None", "Content": "None" });
 
-    let cases: Vec<(&str, Reply)> = vec![
-        (
-            "BatchCreateAttendee",
-            emulator
-                .call(
-                    "POST",
-                    &format!("/meetings/{meeting_id}/attendees?operation=batch-create"),
-                    Some(&json!({ "Attendees": [{ "ExternalUserId": "user-batch" }] })),
-                )
-                .await,
-        ),
-        (
-            "BatchUpdateAttendeeCapabilitiesExcept",
-            emulator
-                .call(
-                    "PUT",
-                    &format!(
-                        "/meetings/{meeting_id}/attendees/capabilities\
-                         ?operation=batch-update-except"
-                    ),
-                    Some(&json!({
-                        "ExcludedAttendeeIds": [{ "AttendeeId": attendee_id }],
-                        "Capabilities": capabilities,
-                    })),
-                )
-                .await,
-        ),
-    ];
+    let cases: Vec<(&str, Reply)> = vec![(
+        "BatchCreateAttendee",
+        emulator
+            .call(
+                "POST",
+                &format!("/meetings/{meeting_id}/attendees?operation=batch-create"),
+                Some(&json!({ "Attendees": [{ "ExternalUserId": "user-batch" }] })),
+            )
+            .await,
+    )];
 
     for (case, reply) in cases {
         assert_eq!(

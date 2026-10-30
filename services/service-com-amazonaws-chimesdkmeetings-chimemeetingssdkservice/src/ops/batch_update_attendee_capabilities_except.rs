@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateAttendeeCapabilitiesExcept
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateAttendeeCapabilitiesExcept`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateAttendeeCapabilitiesExcept::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -98,6 +89,8 @@
 //! * `ThrottlingException` (HTTP 429) — The number of customer requests exceeds the request
 //!   rate limit.
 //! * `UnauthorizedException` (HTTP 401) — The user isn't authorized to request a resource.
+
+use std::collections::BTreeSet;
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -201,18 +194,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateAttendeeCapabilitiesExcept` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateAttendeeCapabilitiesExceptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateAttendeeCapabilitiesExcept"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchUpdateAttendeeCapabilitiesExceptErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        // ONE guard spans the whole call: the meeting's features are read, the set is
+        // judged against them and every attendee outside the excluded list is rewritten
+        // without releasing it, so a concurrent reader never observes a batch that was
+        // applied to some of the meeting's attendees and not the rest.
+        let mut store = state.lock();
+
+        // An attendee exists only inside a meeting, so a `MeetingId` that names none is
+        // refused before anything is written.
+        let Some(meeting) = store.meetings.get(&input.meeting_id) else {
+            return Err(
+                BatchUpdateAttendeeCapabilitiesExceptErrorModeled::NotFoundException(
+                    store.meeting_absent(&input.meeting_id),
+                )
+                .into(),
+            );
+        };
+
+        // Which sets are admissible is decided by the STORED meeting's features, never by
+        // this request — the same judgement a single-attendee update makes, so a batch
+        // cannot install a set a one-attendee call would have been refused.
+        if let Some(problem) = crate::state::capability_problem(
+            &input.capabilities,
+            meeting.meeting.meeting_features.as_ref(),
+        ) {
+            return Err(
+                BatchUpdateAttendeeCapabilitiesExceptErrorModeled::BadRequestException(
+                    crate::state::bad_request(problem),
+                )
+                .into(),
+            );
+        }
+
+        // `ExcludedAttendeeIds` selects WHICH attendees of the meeting are left alone; it
+        // names no resource the call reads or writes, so an id in it that belongs to no
+        // attendee of this meeting excludes nothing and refuses nothing.
+        let excluded: BTreeSet<&str> = input
+            .excluded_attendee_ids
+            .iter()
+            .map(|item| item.attendee_id.as_str())
+            .collect();
+
+        let Some(meeting) = store.meetings.get_mut(&input.meeting_id) else {
+            return Err(
+                BatchUpdateAttendeeCapabilitiesExceptErrorModeled::ServiceFailureException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+        for (attendee_id, attendee) in meeting.attendees.iter_mut() {
+            if excluded.contains(attendee_id.as_str()) {
+                continue;
+            }
+            // The whole set in one assignment, exactly as a single-attendee update applies
+            // it: every member the request carried replaces the attendee's set, and none of
+            // the attendee's other members is touched.
+            attendee.capabilities = Some(input.capabilities.clone());
+        }
+
+        // The operation models no output members (`output_shape: Unit`), so a success is
+        // reported by the modelled 200 alone; what it changed is read back through
+        // `GetAttendee`/`ListAttendees`.
+        Ok(BatchUpdateAttendeeCapabilitiesExceptOutput)
     }
 }
