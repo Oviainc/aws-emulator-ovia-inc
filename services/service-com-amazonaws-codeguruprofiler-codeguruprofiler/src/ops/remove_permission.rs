@@ -4,10 +4,10 @@
 //!
 //! Removes the action group's statement from the profiling group's resource-based
 //! policy under optimistic locking on `revisionId`, and answers with the policy as it
-//! then stands and the revision that removal minted — including when the removal took
-//! the LAST statement, where the policy goes on existing holding no statement at all,
-//! which is what `GetPolicy` then reports and what the next `PutPermission` must name
-//! the revision of.
+//! then stands and the revision that removal minted. A policy exists only while it
+//! holds a statement, so a removal that takes the LAST one deletes the policy: the
+//! group is policy-less again, which is what `GetPolicy` then reports and why the next
+//! `PutPermission` on it is a first write, naming no revision.
 //!
 //! ## Shape of an operation
 //!
@@ -189,8 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         match written {
             // Every applied removal reports both members the model marks `@required`:
-            // the document the policy carries now and the revision it carries now —
-            // also when no statement is left, since the policy itself still exists.
+            // the document the removal left and the revision it minted — also when it
+            // took the last statement and so deleted the policy, where the document is
+            // the one with no statement in it.
             crate::state::PolicyWrite::Written {
                 policy,
                 revision_id,
@@ -211,8 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
             // Nothing to remove from: the group resolved but holds no resource-based
-            // policy, which the service states naming the group and the account the
-            // lookup was scoped to.
+            // policy — none was ever created, or the removal of its last statement
+            // deleted it — which the service states naming the group and the account
+            // the lookup was scoped to.
             crate::state::PolicyWrite::NoPolicy => {
                 Err(RemovePermissionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

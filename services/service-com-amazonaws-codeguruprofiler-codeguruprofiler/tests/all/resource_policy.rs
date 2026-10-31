@@ -7,10 +7,11 @@
 //! STORED on the named profiling group — one `Allow` statement per stored action group,
 //! carrying that action group's statement id, that action group's principals, the
 //! actions the action group grants and the group's own stored ARN, beside the stored
-//! revision id — and, when the group resolves but no write has ever created a policy on
-//! it, answers 200 with `policy` and `revisionId` both absent, reserving 404
-//! `ResourceNotFoundException` for a profiling group that does not exist. Being a read,
-//! it leaves what a later caller sees untouched.
+//! revision id — and, when the group resolves but holds no policy (none was ever
+//! created, or the removal of its last statement deleted it), answers 200 with `policy`
+//! and `revisionId` both absent, reserving 404 `ResourceNotFoundException` for a
+//! profiling group that does not exist. Being a read, it leaves what a later caller sees
+//! untouched.
 //!
 //! Rows differ along what the rule generalises over: how many principals a grant names,
 //! what kind of principal ARN they are, how many action groups the policy carries, and
@@ -35,6 +36,7 @@ use service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::{
     action_group_statement_id,
 };
 
+use crate::permission_writes::{put_permission, remove_permission};
 use crate::profiling_group_lifecycle::{Answer, GroupCase, Harness, group_cases};
 
 /// The revision a seeded policy starts at, before the seeding rotates it to the case's
@@ -355,8 +357,8 @@ async fn no_stored_policy_answers_an_empty_200_and_stores_nothing() {
 
     // Rows: every group of the shared table, created and never granted anything (the
     // recorded "absent before any permission" case, across both name-length bounds). A
-    // policy a write created is reported even when it holds no statement, so no row
-    // here carries a policy record at all.
+    // policy exists only while it holds a statement, so no row here carries a policy
+    // record at all.
     let groups = group_cases();
     for (index, case) in groups.iter().enumerate() {
         assert_eq!(
@@ -421,45 +423,79 @@ async fn no_stored_policy_answers_an_empty_200_and_stores_nothing() {
 }
 
 #[tokio::test]
-async fn a_statement_less_policy_is_still_the_group_s_policy() {
+async fn a_statement_less_policy_is_never_what_the_group_stores() {
     let harness = Harness::new();
 
-    // The state a removal of a policy's last statement leaves behind, seeded here: the
-    // policy record exists at a revision and holds no grant. It is still the group's
-    // resource-based policy, so `GetPolicy` reports its document — one with no
-    // statement in it — and its revision.
-    let case = group_cases().swap_remove(0);
-    assert_eq!(
-        harness.create(&case, "tok-statement-less").await.status,
-        201,
-        "case {case:?}: the group must be created first"
-    );
-    attach_policy(&harness, &case.name, &[], PLACEHOLDER_REVISION);
-
-    for label in ["first read", "second read"] {
-        let answer = get_policy(&harness, &case.name).await;
+    // The state a removal of a policy's last statement leaves behind, driven over HTTP:
+    // a policy exists only while it holds a statement, so the removal deletes it and the
+    // group is policy-less again. The claim is checked against the raw stored field as
+    // well as through the reader, so it does not lean on the reader alone.
+    let account = ::engine::EMULATOR_ACCOUNT_ID;
+    let granted = vec![format!("arn:aws:iam::{account}:role/ProfilerAgent")];
+    for (index, case) in group_cases().into_iter().enumerate() {
+        let name = case.name.clone();
+        let name = name.as_str();
         assert_eq!(
-            answer.status,
+            harness.create(&case, &format!("tok-no-empty-{index}")).await.status,
+            201,
+            "case {case:?}: the group must be created first"
+        );
+        let written =
+            put_permission(&harness, name, ACTION_GROUP_AGENT_PERMISSIONS, &granted, None).await;
+        assert_eq!(
+            written.status,
             200,
-            "case {case:?} ({label}): expected 200, got {} {}",
-            answer.status,
-            String::from_utf8_lossy(&answer.body)
+            "case {case:?}: the grant must be applied, got {} {}",
+            written.status,
+            String::from_utf8_lossy(&written.body)
         );
+        let revision = written
+            .json()
+            .get("revisionId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: no revisionId in the grant's answer"))
+            .to_string();
+        assert!(
+            holds_a_policy_record(&harness, name),
+            "case {case:?}: the grant must store a policy"
+        );
+
+        let removed =
+            remove_permission(&harness, name, ACTION_GROUP_AGENT_PERMISSIONS, &revision).await;
         assert_eq!(
-            answer.json(),
-            serde_json::json!({
-                "policy": format!("{{\n  \"Version\" : \"{POLICY_VERSION}\",\n  \"Statement\" : [ ]\n}}"),
-                "revisionId": PLACEHOLDER_REVISION,
-            }),
-            "case {case:?} ({label}): a statement-less policy must be reported with no \
-             statement in it, got {}",
-            String::from_utf8_lossy(&answer.body)
+            removed.status,
+            200,
+            "case {case:?}: the removal must be applied, got {} {}",
+            removed.status,
+            String::from_utf8_lossy(&removed.body)
         );
+        assert!(
+            !holds_a_policy_record(&harness, name),
+            "case {case:?}: the removal took the last statement, so no policy record may \
+             remain stored"
+        );
+        assert!(
+            !has_stored_policy(&harness, name),
+            "case {case:?}: no policy may be readable once the last statement is removed"
+        );
+        for label in ["first read", "second read"] {
+            let answer = get_policy(&harness, name).await;
+            assert_eq!(
+                answer.status,
+                200,
+                "case {case:?} ({label}): expected 200, got {} {}",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            assert_eq!(
+                answer.json(),
+                serde_json::json!({}),
+                "case {case:?} ({label}): a group whose policy was deleted must carry \
+                 neither policy nor revisionId, got {}",
+                String::from_utf8_lossy(&answer.body)
+            );
+        }
     }
-    assert!(
-        has_stored_policy(&harness, &case.name),
-        "case {case:?}: the seeded statement-less policy must survive the reads"
-    );
 }
 
 #[tokio::test]

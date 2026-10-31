@@ -156,9 +156,10 @@ async fn both_policy_writes_answer_from_the_shared_action_group_rule() {
     create_group(&harness, GROUP).await;
 
     // The ACCEPT side of the shared path, driven through BOTH operations that take an
-    // `actionGroup`: every grantable group is written, read back and removed again. The
-    // revision each write must name is the one the previous applied write reported,
-    // since a policy exists from its first write on.
+    // `actionGroup`: every grantable group is written, read back and removed again. Each
+    // write names the revision the stored policy carries, which is none at the start of
+    // every row — the previous row's removal took its policy's last statement and so
+    // deleted the policy.
     let mut current: Option<String> = None;
     for action_group in state::grantable_action_groups() {
         let granted = principals(action_group);
@@ -214,25 +215,23 @@ async fn both_policy_writes_answer_from_the_shared_action_group_rule() {
             removed.status,
             String::from_utf8_lossy(&removed.body)
         );
-        // The statement is gone, and the policy that is left is reported by both the
-        // removal and the read: same document, same revision.
+        // The statement is gone; it was the policy's only one, so the policy went with
+        // it and the group is policy-less again — which is what the reader reports, and
+        // why the next grantable action group is written as a FIRST write.
         let after = get_policy(&harness, GROUP).await;
         assert_eq!(
-            string_member(&after, "policy"),
-            string_member(&removed, "policy"),
-            "case {action_group:?}: GetPolicy must report the document the removal left"
-        );
-        assert_eq!(
-            string_member(&after, "revisionId"),
-            string_member(&removed, "revisionId"),
-            "case {action_group:?}: GetPolicy must report the revision the removal minted"
+            after.json(),
+            serde_json::json!({}),
+            "case {action_group:?}: the removal took the policy's last statement, so \
+             GetPolicy must report neither policy nor revisionId, got {}",
+            String::from_utf8_lossy(&after.body)
         );
         assert!(
-            !string_member(&after, "policy").contains(sid.as_str()),
+            !string_member(&removed, "policy").contains(sid.as_str()),
             "case {action_group:?}: the removed action group must hold no statement, got {}",
-            string_member(&after, "policy")
+            string_member(&removed, "policy")
         );
-        current = Some(string_member(&removed, "revisionId"));
+        current = None;
     }
 
     // Whatever the accept side left stored, no refusal below may change it.

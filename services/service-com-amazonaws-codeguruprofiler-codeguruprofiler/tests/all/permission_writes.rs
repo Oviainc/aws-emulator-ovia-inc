@@ -10,10 +10,10 @@
 //! fresh `revisionId`; a write is applied only when it names the revision the stored
 //! policy currently carries (and, for the first write, names none); `GetPolicy` reports
 //! that stored document and revision unchanged; and `RemovePermission` drops the
-//! statement and reports the policy as it then stands with the revision it then carries,
-//! including when it took the last statement — the policy goes on existing, holding no
-//! statement, which is what `GetPolicy` then reports and what the next write must name
-//! the revision of.
+//! statement and reports the policy as it then stands with the revision it then carries.
+//! A policy exists only while it holds a statement, so a removal that took the LAST one
+//! deletes it: `GetPolicy` then reports neither member and the next grant is a first
+//! write again, naming no revision.
 //!
 //! The harness and the group table are the ones [`crate::profiling_group_lifecycle`]
 //! already builds, so the group variation (compute platform, orchestration flag, tag
@@ -602,12 +602,13 @@ async fn remove_permission_drops_the_statement_and_reports_the_policy_it_leaves_
             );
         }
 
-        // The policy the removal left behind is the group's policy now: the store holds
-        // it at the revision the removal reported, and `GetPolicy` reports both.
+        // The policy the removal emptied is GONE: the group stores none, and `GetPolicy`
+        // reports neither member.
         assert_eq!(
             harness.stored_policy_revision(group),
-            Some(removal_revision.clone()),
-            "case {case:?}: the group must carry the revision the removal minted, got {:?}",
+            None,
+            "case {case:?}: the removal took the last statement, so the group must store \
+             no policy, got {:?}",
             harness.stored_policy_revision(group)
         );
         let read = get_policy(&harness, group).await;
@@ -620,45 +621,34 @@ async fn remove_permission_drops_the_statement_and_reports_the_policy_it_leaves_
         );
         assert_eq!(
             read.json(),
-            removed.json(),
-            "case {case:?}: GetPolicy must report the policy and revision the removal \
-             left, got {}",
+            serde_json::json!({}),
+            "case {case:?}: a group whose policy was deleted must report neither policy \
+             nor revisionId, got {}",
             String::from_utf8_lossy(&read.body)
         );
 
-        // There is no statement left for the action group, so a second removal naming
-        // the CURRENT revision has nothing to remove — while one naming a revision the
-        // policy has moved past is a conflict, as on any other policy.
-        let again = remove_permission(&harness, group, ACTION_GROUP, &removal_revision).await;
-        assert_eq!(
-            again.status,
-            404,
-            "case {case:?}: removing a statement the policy does not hold must answer \
-             404, got {} {}",
-            again.status,
-            String::from_utf8_lossy(&again.body)
-        );
-        let moved_past = remove_permission(&harness, group, ACTION_GROUP, &revision).await;
-        assert_eq!(
-            moved_past.status,
-            409,
-            "case {case:?}: a superseded revision must conflict, got {} {}",
-            moved_past.status,
-            String::from_utf8_lossy(&moved_past.body)
-        );
+        // There is no policy, so neither the revision the removal minted nor the one it
+        // consumed names one: both removals are refused the same way.
+        for sent in [&removal_revision, &revision] {
+            let again = remove_permission(&harness, group, ACTION_GROUP, sent).await;
+            assert_eq!(
+                again.status,
+                404,
+                "case {case:?}: a removal at {sent} must find no policy, got {} {}",
+                again.status,
+                String::from_utf8_lossy(&again.body)
+            );
+            assert_eq!(
+                again.error_code(),
+                "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException, got {}",
+                String::from_utf8_lossy(&again.body)
+            );
+        }
 
-        // The policy exists, so the next write must name the revision the removal
-        // handed back — and that revision is live: the write naming it is applied.
-        let unversioned = put_permission(&harness, group, ACTION_GROUP, &case.second, None).await;
-        assert_eq!(
-            unversioned.status,
-            409,
-            "case {case:?}: a write against an existing policy must name its revision, \
-             got {} {}",
-            unversioned.status,
-            String::from_utf8_lossy(&unversioned.body)
-        );
-        let regranted = put_permission(
+        // The group has no policy, so the next grant is a FIRST write: it names no
+        // revision, and one that names the consumed revision is refused.
+        let stale_grant = put_permission(
             &harness,
             group,
             ACTION_GROUP,
@@ -667,10 +657,18 @@ async fn remove_permission_drops_the_statement_and_reports_the_policy_it_leaves_
         )
         .await;
         assert_eq!(
+            stale_grant.status,
+            409,
+            "case {case:?}: naming a revision when no policy exists must conflict, got {} {}",
+            stale_grant.status,
+            String::from_utf8_lossy(&stale_grant.body)
+        );
+        let regranted = put_permission(&harness, group, ACTION_GROUP, &case.second, None).await;
+        assert_eq!(
             regranted.status,
             200,
-            "case {case:?}: the revision the removal reported must be the one the next \
-             write names, got {} {}",
+            "case {case:?}: a group with no policy must take a write that names no \
+             revision, got {} {}",
             regranted.status,
             String::from_utf8_lossy(&regranted.body)
         );

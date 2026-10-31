@@ -543,9 +543,9 @@ async fn an_applied_policy_write_mints_one_revision_and_a_refused_one_mints_none
          {after_second:?} from {after_first:?}"
     );
 
-    // Removing the policy's LAST statement is an applied write like any other: the
-    // policy it leaves behind holds no statement but still exists, so exactly one
-    // revision is minted and that revision is the one the group now carries.
+    // Removing the policy's LAST statement is an applied write like any other: exactly
+    // one revision is minted and reported, even though the policy that revision belongs
+    // to is deleted by the same removal — so the group stores none afterwards.
     let removed = remove_permission(&harness, group, ACTION_GROUP, &second_revision).await;
     assert_eq!(
         removed.status,
@@ -569,9 +569,9 @@ async fn an_applied_policy_write_mints_one_revision_and_a_refused_one_mints_none
     );
     assert_eq!(
         harness.stored_policy_revision(group),
-        Some(removal_revision.clone()),
-        "case emptying removal: the group must carry the revision the removal minted, got \
-         {:?}",
+        None,
+        "case emptying removal: the removal took the last statement, so the group must \
+         store no policy, got {:?}",
         harness.stored_policy_revision(group)
     );
 }

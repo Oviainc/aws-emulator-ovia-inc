@@ -49,6 +49,8 @@ mod instant_comparison_resolution;
 mod interval_resolution;
 #[path = "all/interval_validation.rs"]
 mod interval_validation;
+#[path = "all/last_statement_removal_deletes_the_policy.rs"]
+mod last_statement_removal_deletes_the_policy;
 #[path = "all/latest_aggregated_profile.rs"]
 mod latest_aggregated_profile;
 #[path = "all/list_pagination.rs"]

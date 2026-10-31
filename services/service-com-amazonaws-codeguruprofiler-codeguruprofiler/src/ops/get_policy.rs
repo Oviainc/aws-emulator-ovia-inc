@@ -5,11 +5,10 @@
 //!
 //! `GetPolicy` is `@readonly`: it renders the document from the grants stored on the
 //! group and never attaches, rotates or clears anything. A profiling group that EXISTS
-//! but has no resource-based policy — the state it is created in, before any
-//! `PutPermission` — is answered 200 with `policy` and `revisionId` both ABSENT, i.e.
-//! an empty body, because there is no policy to report and no revision to report; a
-//! group whose policy a `RemovePermission` emptied still HAS that policy, at the
-//! revision the removal minted, so it is reported like any other. The operation's 404
+//! but has no resource-based policy — the state it is created in before any
+//! `PutPermission`, and the state a `RemovePermission` of its last statement returns it
+//! to — is answered 200 with `policy` and `revisionId` both ABSENT, i.e. an empty body,
+//! because there is no policy to report and no revision to report. The operation's 404
 //! `ResourceNotFoundException` — "The
 //! resource specified in the request does not exist" — is reserved for a request naming
 //! a profiling group that does not exist, and states the lookup that found nothing.

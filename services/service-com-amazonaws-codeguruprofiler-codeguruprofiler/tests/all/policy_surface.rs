@@ -8,12 +8,13 @@
 //! generalises over. None of the rows is the one the issue recorded: the group names,
 //! the principal ARNs and the revisions here are this suite's own.
 //!
-//! 1. ABSENCE. `policy` and `revisionId` are reported wherever a policy exists: an
-//!    operation on a profiling group that RESOLVES but on which no write has ever
-//!    created a policy answers 200 with both members absent (an empty body), while a
-//!    policy whose last statement was removed still exists and is still reported — and
-//!    404 `ResourceNotFoundException` is reserved for a profiling group that does not
-//!    exist, or for a statement the existing policy does not hold.
+//! 1. ABSENCE. `policy` and `revisionId` are reported exactly while a policy exists: an
+//!    operation on a profiling group that RESOLVES but holds no policy — because none
+//!    was ever written, or because the removal of its last statement deleted it —
+//!    answers 200 with both members absent (an empty body), while a policy that still
+//!    holds a statement is reported with both; and 404 `ResourceNotFoundException` is
+//!    reserved for a profiling group that does not exist, for a policy the group does
+//!    not have, or for a statement the existing policy does not hold.
 //!    Rows: a group that was never granted, a group whose last statement was just
 //!    removed, the same group granted and emptied again, and a name no group has.
 //!
@@ -204,7 +205,7 @@ fn assert_empty_policy_answer(case: &str, answer: &Answer) {
 }
 
 #[tokio::test]
-async fn a_group_with_no_policy_answers_an_empty_200_while_an_emptied_policy_is_still_reported() {
+async fn a_group_with_no_policy_answers_an_empty_200_whether_none_was_written_or_it_was_emptied() {
     let harness = Harness::new();
 
     for group in created_groups(&harness, "absence").await {
@@ -244,15 +245,12 @@ async fn a_group_with_no_policy_answers_an_empty_200_while_an_emptied_policy_is_
             );
         }
 
-        // Rows: granted and emptied, twice over — the second cycle starts from an
-        // emptied policy rather than from no policy, and must behave the same way: the
-        // write names the revision the store holds, and the removal reports the
-        // statement-less policy it leaves behind.
-        let mut current: Option<String> = None;
+        // Rows: granted and emptied, twice over — the removal that takes the last
+        // statement deletes the policy, so the second cycle starts from exactly the
+        // state the first did: no policy, so the grant names no revision.
         for round in 0..2 {
             let created =
-                put_permission(&harness, name, ACTION_GROUP, &principals(2), current.as_deref())
-                    .await;
+                put_permission(&harness, name, ACTION_GROUP, &principals(2), None).await;
             assert_eq!(
                 created.status,
                 200,
@@ -274,33 +272,29 @@ async fn a_group_with_no_policy_answers_an_empty_200_while_an_emptied_policy_is_
             assert_eq!(
                 string_member(&removed, "policy"),
                 empty_document(),
-                "case {name}: round {round}: the policy left behind must hold no statement"
+                "case {name}: round {round}: the document the removal reports must hold \
+                 no statement"
             );
-            assert_eq!(
-                get_policy(&harness, name).await.json(),
-                removed.json(),
-                "case {name}: round {round}: GetPolicy must report the policy the removal \
-                 left"
+            assert_empty_policy_answer(
+                &format!("{name}: round {round}: emptied"),
+                &get_policy(&harness, name).await,
             );
 
-            // The revision the policy used to carry is one it has moved past, so a
-            // write naming it is a conflict; the one the removal reported is current.
-            let stale = put_permission(
-                &harness,
-                name,
-                ACTION_GROUP,
-                &principals(1),
-                Some(&revision),
-            )
-            .await;
-            assert_eq!(
-                stale.status,
-                409,
-                "case {name}: round {round}: a superseded revision must conflict, got {} {}",
-                stale.status,
-                String::from_utf8_lossy(&stale.body)
-            );
-            current = Some(emptied);
+            // Neither the revision the policy used to carry nor the one the removal
+            // minted names a policy any more, there being none: a write naming either is
+            // refused.
+            for sent in [&revision, &emptied] {
+                let stale =
+                    put_permission(&harness, name, ACTION_GROUP, &principals(1), Some(sent)).await;
+                assert_eq!(
+                    stale.status,
+                    409,
+                    "case {name}: round {round}: a revision naming no stored policy must \
+                     conflict, got {} {}",
+                    stale.status,
+                    String::from_utf8_lossy(&stale.body)
+                );
+            }
         }
     }
 

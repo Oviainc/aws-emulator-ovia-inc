@@ -529,9 +529,11 @@ pub struct ResourcePolicy {
 
 impl ResourcePolicy {
     /// A statement-less policy at `revision_id` — the state a policy is built up from
-    /// by the first write, and the state a removal that took its last statement leaves
-    /// it in: the policy itself goes on existing at the revision that removal minted
-    /// ([`ProfilingGroup::resource_policy`] reports it), holding no grants.
+    /// by the first write, which then grants it at least one statement. A STORED policy
+    /// always holds at least one statement: a removal that takes the last one deletes
+    /// the policy rather than storing it empty
+    /// ([`ComAmazonawsCodeguruprofilerCodeguruprofilerState::remove_permission`]), so
+    /// this is a transient value on the way to a grant, never a stored state.
     ///
     /// This constructor and the two writers below are what the permission handlers'
     /// store writers —
@@ -566,6 +568,12 @@ impl ResourcePolicy {
     /// [`ResourcePolicy::grant`]: the writer rotates it once for the change.
     pub fn revoke(&mut self, action_group: &str) -> bool {
         self.statements.remove(action_group).is_some()
+    }
+
+    /// Whether the policy holds no statement at all — what the writer that revoked the
+    /// last one asks before deciding whether there is still a policy to store.
+    pub fn is_empty(&self) -> bool {
+        self.statements.is_empty()
     }
 
     /// The JSON-formatted resource-based policy document, as every operation that
@@ -1013,9 +1021,11 @@ pub struct ProfilingGroup {
     /// created without one, and the permission writers
     /// ([`ComAmazonawsCodeguruprofilerCodeguruprofilerState::put_permission`] and
     /// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::remove_permission`], which
-    /// are what enforce the revision check) attach and clear it. It lives ON the group
-    /// so deleting the group takes its policy with it and a re-created group starts
-    /// with none. Read it through [`ProfilingGroup::resource_policy`].
+    /// are what enforce the revision check) attach and clear it. It is `Some` exactly
+    /// while the policy holds at least one statement, since the removal of the last
+    /// one deletes the policy. It lives ON the group so deleting the group takes its
+    /// policy with it and a re-created group starts with none. Read it through
+    /// [`ProfilingGroup::resource_policy`].
     pub policy: Option<ResourcePolicy>,
     /// The recommendation reports recorded against this group, oldest recorded FIRST.
     /// Bounded at [`MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP`] by
@@ -1378,13 +1388,14 @@ impl ProfilingGroup {
             .collect()
     }
 
-    /// This group's resource-based policy, or `None` when no write has created one.
+    /// This group's resource-based policy, or `None` when it has none.
     ///
-    /// A policy exists from the write that created it until the group is deleted,
-    /// whatever it then holds: `RemovePermission` reports "the revision of the
-    /// resource-based policy after the specified permissions were removed", so the
-    /// policy a removal emptied is still the group's policy — at the revision that
-    /// removal minted, holding no statements.
+    /// A policy exists exactly while it holds at least one statement: it comes into
+    /// being with the write that grants the first one, and the removal that takes the
+    /// last one takes the policy with it
+    /// ([`ComAmazonawsCodeguruprofilerCodeguruprofilerState::remove_permission`]), so
+    /// the group is policy-less again — the same state it was created in. Deleting the
+    /// group also takes whatever policy it held.
     pub fn resource_policy(&self) -> Option<&ResourcePolicy> {
         self.policy.as_ref()
     }
@@ -1633,15 +1644,18 @@ pub enum PolicyLimit {
 /// or [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::remove_permission`]) did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyWrite {
-    /// Applied: the policy document as it now stands, and the revision it now carries.
-    /// EVERY applied write reports both, including a removal that left the policy
-    /// holding no statement at all — the policy still exists, so it still has a
-    /// document (one with no statement in it) and a revision.
+    /// Applied: the policy document the write produced, and the revision it minted.
+    /// EVERY applied write reports both, including a removal that took the policy's
+    /// last statement: that removal DELETED the policy, and what it reports is the
+    /// document the removal left (one with no statement in it) at the revision it
+    /// minted — a revision no later write can name, there being no policy to name it
+    /// of.
     Written { policy: String, revision_id: String },
     /// There is no such profiling group.
     UnknownGroup,
     /// The group has no resource-based policy at all, so there is nothing to remove
-    /// from.
+    /// from — whether none was ever created, or the removal of its last statement
+    /// deleted it.
     NoPolicy,
     /// The group HAS a resource-based policy, but it holds no statement for the named
     /// action group — a different state from [`PolicyWrite::NoPolicy`], and a different
@@ -1704,9 +1718,10 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
         // The `revisionId` rule of this surface, from the member's own doc: "Do not
         // specify this when you add permissions to a profiling group for the first
         // time. If a policy already exists on the profiling group, you must specify the
-        // revisionId." A policy exists from its first write on
-        // (`ProfilingGroup::resource_policy`), so only a write against a group that has
-        // none is a FIRST write.
+        // revisionId." A group holds a policy exactly while that policy holds a
+        // statement (`ProfilingGroup::resource_policy`), so a write against a group that
+        // has none is a FIRST write — including the first grant after a removal took the
+        // previous policy's last statement.
         match (group.resource_policy(), revision_id) {
             (None, Some(named)) => {
                 return PolicyWrite::RevisionMismatch(RevisionMismatch::Unexpected {
@@ -1780,11 +1795,14 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
     /// so a stale revision is answered as a conflict whatever else the request names.
     ///
     /// An applied removal is [`PolicyWrite::Written`] whatever it leaves behind: the
-    /// policy as it then stands and the revision the change minted. That holds for the
-    /// removal of the LAST statement too — the operation reports "the revision of the
-    /// resource-based policy after the specified permissions were removed", so the
-    /// policy goes on existing, statement-less, at the revision minted here, and that
-    /// revision is the one the next write to it must name.
+    /// policy as it then stands and the revision the change minted.
+    ///
+    /// A resource-based policy exists only while it holds at least one statement, so a
+    /// removal that takes the LAST statement DELETES the policy: the group is
+    /// policy-less again, exactly as it was before the first grant. The removal still
+    /// reports the document it left (one with no statement in it) and the revision it
+    /// minted, but nothing stores that revision — the next grant on the group is a
+    /// FIRST write again, and every other policy-scoped call finds no policy.
     pub fn remove_permission(
         &mut self,
         group_name: &str,
@@ -1816,7 +1834,7 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
             // Unreachable: the group was resolved above, under the same `&mut self`.
             return PolicyWrite::UnknownGroup;
         };
-        let Some(policy) = group.policy.as_mut() else {
+        let Some(mut policy) = group.policy.take() else {
             // Unreachable for the same reason: the policy was read above.
             return PolicyWrite::NoPolicy;
         };
@@ -1825,6 +1843,13 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
         // The policy as it stands after the removal — the statements it still holds,
         // which is none once the removal took the last of them.
         let document = policy.document(&group.arn);
+        // A statement-less policy is no policy: the removal that took the last
+        // statement is what deletes the group's policy, so the group goes back to the
+        // policy-less state it was created in. Only a policy that still holds a
+        // statement is stored again.
+        if !policy.is_empty() {
+            group.policy = Some(policy);
+        }
         PolicyWrite::Written {
             policy: document,
             revision_id,
