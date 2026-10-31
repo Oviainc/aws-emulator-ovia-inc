@@ -692,8 +692,10 @@ pub fn statistic_for_forecast_type(forecast_type: &str) -> String {
     }
 }
 
-/// Length of the documented date layout through the MINUTES — `yyyy-MM-dd`, the date/time
-/// separator, `HH:mm`.
+/// Length of the FIXED part of the documented date layout — `yyyy-MM-dd`, the date/time
+/// separator, `HH:mm`. Everything an ISO 8601 date and time of day may carry after it (the
+/// seconds field, fractional seconds, a zone designator or offset) is optional, so this is
+/// the part every spelling of a date carries.
 const LAYOUT_THROUGH_MINUTES: usize = 16;
 
 /// Length of the documented date layout through the SECONDS — [`LAYOUT_THROUGH_MINUTES`]
@@ -785,7 +787,6 @@ pub fn parse_date_time(value: &str) -> Option<i128> {
     if !walks_date_time_layout(bytes, LAYOUT_THROUGH_MINUTES) {
         return None;
     }
-
     // The walk has read ASCII bytes up to its length, so each index below is a character
     // boundary. Where the seconds field is written, the time of day ends after it; where it
     // is not, it is implied — and what follows the minutes is then the zone.

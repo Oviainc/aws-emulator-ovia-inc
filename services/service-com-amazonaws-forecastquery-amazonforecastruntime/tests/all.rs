@@ -15,6 +15,8 @@
 mod arn_resource_kinds;
 #[path = "all/date_layout_walk.rs"]
 mod date_layout_walk;
+#[path = "all/date_time_spellings.rs"]
+mod date_time_spellings;
 #[path = "all/forecast_not_active.rs"]
 mod forecast_not_active;
 #[path = "all/forecastquery.rs"]
@@ -35,5 +37,7 @@ mod shape_validation;
 mod shared_query_decision;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stored_point_timestamps.rs"]
+mod stored_point_timestamps;
 #[path = "all/unknown_filter_key_message.rs"]
 mod unknown_filter_key_message;
