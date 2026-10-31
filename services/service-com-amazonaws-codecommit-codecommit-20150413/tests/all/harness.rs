@@ -9,10 +9,13 @@
 //! lives here is what more than one repository suite needs: the `GetRepository`
 //! metadata projection a stored repository is read back through, the timestamp reader
 //! its date members are compared with, the reader that answers a failed call's
-//! error code AND the message text that came with it, and the wording CodeCommit
+//! error code AND the message text that came with it, the key a repository with no
+//! key of its own is encrypted under together with the ARN form a key id is
+//! reported in, and the wording CodeCommit
 //! refuses a `pullRequestId` or a `revisionId` naming nothing with. One definition
 //! each, so two suites cannot disagree about what "the stored repository", "that
-//! instant", "that error's message" or "that refusal's words" means.
+//! instant", "that error's message", "that repository's key" or "that refusal's
+//! words" means.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -26,6 +29,27 @@ pub(crate) async fn metadata_of(router: &MultiServiceRouter, name: &str) -> Valu
     got.get("repositoryMetadata")
         .unwrap_or_else(|| panic!("no repositoryMetadata for {name:?} in {got}"))
         .clone()
+}
+
+/// The Amazon Web Services managed key a repository created without a `kmsKeyId`
+/// of its own is encrypted under: `CreateRepository`'s `kmsKeyId` documents that
+/// "If no key is specified, the default aws/codecommit Amazon Web Services managed
+/// key is used"
+/// (`smithy_query(query="doc",shape="CreateRepositoryInput",member="kmsKeyId")`),
+/// and the service names that key by its alias.
+pub(crate) const DEFAULT_ENCRYPTION_KEY_ALIAS: &str = "alias/aws/codecommit";
+
+/// The ARN of a KMS key id: `arn:<partition>:kms:<region>:<account>:key/<key id>`
+/// — the identifier KMS reports a key by, and the form a repository's key is
+/// reported in once a bare key id has been resolved to it. Built for the Region
+/// every suite signs for ([`crate::repository_lifecycle::REGION`]) and the account
+/// every ARN this emulator mints is scoped to.
+pub(crate) fn kms_key_arn_of(key_id: &str) -> String {
+    format!(
+        "arn:aws:kms:{}:{}:key/{key_id}",
+        crate::repository_lifecycle::REGION,
+        engine::emulator_account_id()
+    )
 }
 
 /// A modelled timestamp member as epoch seconds. awsJson1_1 renders a timestamp as

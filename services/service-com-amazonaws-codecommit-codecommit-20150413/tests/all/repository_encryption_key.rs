@@ -6,7 +6,9 @@
 //! The rule under test: a rotation writes the requested key onto the STORED
 //! repository, so every later read of its metadata reports that key and the call
 //! answers with the repository's id, the key now in effect and the key it left
-//! behind (absent when the repository held none); nothing else about the
+//! behind (always present — every repository is encrypted); each of the two is
+//! reported in the one canonical form of the selector it was set from, a bare
+//! key id as that key's ARN; nothing else about the
 //! repository — its id, name, description, default branch, ARN, clone URLs,
 //! creation date or content — moves with it, the last-modified instant records
 //! the change, and a `kmsKeyId` that selects no KMS key, or a repository the
@@ -24,6 +26,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::{kms_key_arn_of, DEFAULT_ENCRYPTION_KEY_ALIAS};
 use crate::repository_lifecycle::{emulator, error, is_uuid, ok, string_at, REGION};
 
 /// The account every ARN this emulator mints is scoped to.
@@ -49,8 +52,11 @@ fn multi_region_key_id() -> String {
     format!("mrk-{}", "a1b2c3d4".repeat(4))
 }
 
+/// The ARN of a KMS key id comes from the shared harness
+/// ([`crate::harness::kms_key_arn_of`]), so this suite and its sibling cannot
+/// disagree about the form a key id is reported in.
 fn key_arn() -> String {
-    format!("arn:aws:kms:{REGION}:{}:key/{}", account(), key_id())
+    kms_key_arn_of(&key_id())
 }
 
 fn alias_name() -> String {
@@ -110,42 +116,49 @@ async fn put_file(router: &MultiServiceRouter, repository: &str, branch: &str, p
 }
 
 /// One row of the rotation table: the repository, the key it was created with (or
-/// none at all), the keys it is rotated through in order, and whether it carries
-/// a file.
+/// none at all), the key its metadata must report once created, the rotations it
+/// is walked through in order — each the selector requested paired with the key
+/// the service must report for it — and whether it carries a file.
 #[derive(Debug, Clone)]
 struct Case {
     name: String,
     created_with: Option<String>,
-    rotations: Vec<String>,
+    reported_after_create: String,
+    rotations: Vec<(String, String)>,
     content: Option<(&'static str, &'static str)>,
 }
 
 /// The table: rows differ along what the rule generalises over — the form of the
 /// key (every form KMS documents for `KeyId`, plus the multi-region key id), the
 /// repository's starting state (created with a key, created with none), the number
-/// of rotations (one, chained, and one repeating the key already in effect), and
-/// whether the repository holds history.
+/// of rotations (one, chained, one repeating the key already in effect and one
+/// naming the key in effect through a DIFFERENT selector for it), and whether the
+/// repository holds history.
 fn rotation_cases() -> Vec<Case> {
     vec![
         Case {
-            // Created with a key ARN, then walked through every other form.
+            // Created with a key ARN, then walked through every other form. The
+            // first rotation names the key already in effect by its bare id, so
+            // it resolves to the same ARN and changes nothing.
             name: "rotate-every-form".to_string(),
             created_with: Some(key_arn()),
+            reported_after_create: key_arn(),
             rotations: vec![
-                key_id(),
-                alias_name(),
-                alias_arn(),
-                multi_region_key_id(),
-                second_key_id(),
+                (key_id(), key_arn()),
+                (alias_name(), alias_name()),
+                (alias_arn(), alias_arn()),
+                (multi_region_key_id(), kms_key_arn_of(&multi_region_key_id())),
+                (second_key_id(), kms_key_arn_of(&second_key_id())),
             ],
             content: Some(("main", "README.md")),
         },
         Case {
-            // Created with no key of its own: the first rotation leaves none
-            // behind, so `originalKmsKeyId` is absent for it.
+            // Created with no key of its own: it is encrypted under the service's
+            // managed key, which is what the first rotation leaves behind.
             name: "rotate.from_none-1".to_string(),
             created_with: None,
-            rotations: vec![key_id(), key_arn()],
+            reported_after_create: DEFAULT_ENCRYPTION_KEY_ALIAS.to_string(),
+            rotations: vec![(key_id(), key_arn()), (alias_name(), alias_name())],
             content: None,
         },
         Case {
@@ -153,14 +166,21 @@ fn rotation_cases() -> Vec<Case> {
             // nothing — not even the last-modified instant.
             name: "r".to_string(),
             created_with: Some(alias_name()),
-            rotations: vec![alias_name(), alias_name(), key_arn()],
+            reported_after_create: alias_name(),
+            rotations: vec![
+                (alias_name(), alias_name()),
+                (alias_name(), alias_name()),
+                (key_arn(), key_arn()),
+            ],
             content: Some(("release-1.0", "/src/main/app.sh")),
         },
         Case {
-            // The modelled maximum `RepositoryName` length (100), rotated once.
+            // The modelled maximum `RepositoryName` length (100), created with a
+            // multi-region key id — reported as that key's ARN — and rotated once.
             name: "x".repeat(100),
             created_with: Some(multi_region_key_id()),
-            rotations: vec![alias_arn()],
+            reported_after_create: kms_key_arn_of(&multi_region_key_id()),
+            rotations: vec![(alias_arn(), alias_arn())],
             content: None,
         },
     ]
@@ -192,13 +212,13 @@ async fn a_rotation_moves_the_stored_repositorys_key_and_reports_the_one_it_left
             None => None,
         };
 
-        let mut in_effect = case.created_with.clone();
-        for requested in &case.rotations {
+        let mut in_effect = case.reported_after_create.clone();
+        for (requested, expected) in &case.rotations {
             let label = format!("{} -> {requested}", case.name);
             let before = metadata_of(&router, &case.name).await;
             assert_eq!(
                 before.get("kmsKeyId").and_then(Value::as_str),
-                in_effect.as_deref(),
+                Some(in_effect.as_str()),
                 "case {label:?}: the key in effect before the rotation, got {before}"
             );
 
@@ -226,12 +246,12 @@ async fn a_rotation_moves_the_stored_repositorys_key_and_reports_the_one_it_left
             );
             assert_eq!(
                 rotated.get("kmsKeyId").and_then(Value::as_str),
-                Some(requested.as_str()),
-                "case {label:?}: kmsKeyId must be the requested key, got {rotated}"
+                Some(expected.as_str()),
+                "case {label:?}: kmsKeyId must be the requested key in its canonical form, got {rotated}"
             );
             assert_eq!(
                 rotated.get("originalKmsKeyId").and_then(Value::as_str),
-                in_effect.as_deref(),
+                Some(in_effect.as_str()),
                 "case {label:?}: originalKmsKeyId must be the key formerly in effect, got {rotated}"
             );
 
@@ -240,7 +260,7 @@ async fn a_rotation_moves_the_stored_repositorys_key_and_reports_the_one_it_left
             let after = metadata_of(&router, &case.name).await;
             assert_eq!(
                 after.get("kmsKeyId").and_then(Value::as_str),
-                Some(requested.as_str()),
+                Some(expected.as_str()),
                 "case {label:?}: GetRepository must report the rotated key, got {after}"
             );
 
@@ -269,7 +289,7 @@ async fn a_rotation_moves_the_stored_repositorys_key_and_reports_the_one_it_left
             // and a rotation to the key already in effect changes nothing.
             let modified = as_f64(&after, "lastModifiedDate");
             let was_modified = as_f64(&before, "lastModifiedDate");
-            if in_effect.as_deref() == Some(requested.as_str()) {
+            if in_effect == *expected {
                 assert_eq!(
                     modified, was_modified,
                     "case {label:?}: rotating to the key already in effect must change nothing"
@@ -285,7 +305,7 @@ async fn a_rotation_moves_the_stored_repositorys_key_and_reports_the_one_it_left
                 "case {label:?}: lastModifiedDate must not precede creationDate, got {after}"
             );
 
-            in_effect = Some(requested.clone());
+            in_effect = expected.clone();
         }
     }
 }
@@ -510,7 +530,7 @@ async fn a_rotation_moves_only_the_repository_it_names() {
     let untouched = metadata_of(&router, "shared-b").await;
     assert_eq!(
         rotated_metadata.get("kmsKeyId").and_then(Value::as_str),
-        Some(second_key_id().as_str()),
+        Some(kms_key_arn_of(&second_key_id()).as_str()),
         "case {:?}: the rotated repository holds the new key, got {rotated_metadata}",
         "shared-a"
     );

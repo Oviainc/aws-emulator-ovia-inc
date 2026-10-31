@@ -183,8 +183,10 @@ struct Row {
     declared_name: Option<&'static str>,
     /// The `repositoryDescription` `GetRepository` must report, if the row declares one.
     expected_description: Option<&'static str>,
-    /// The `kmsKeyId` it must report, if the row declares one.
-    expected_kms_key_id: Option<&'static str>,
+    /// The `kmsKeyId` `GetRepository` must report: the key the row's template
+    /// declares, or [`DEFAULT_KEY_ALIAS`] where it declares none — every CodeCommit
+    /// repository is encrypted, so one is always reported.
+    expected_kms_key_id: &'static str,
     /// The triggers `GetRepositoryTriggers` must report, built from what the row declares.
     expected_triggers: fn(&str) -> Value,
     /// The tags the repository's own declaration asks for.
@@ -193,6 +195,12 @@ struct Row {
     /// intrinsic over the resource — "Ref returns the repository name".
     name_outputs: &'static [&'static str],
 }
+
+/// The Amazon Web Services managed key a repository created without a key of its
+/// own is encrypted under: `CreateRepository`'s `kmsKeyId` documents that "If no key
+/// is specified, the default aws/codecommit Amazon Web Services managed key is used",
+/// and CodeCommit names that key by its alias.
+const DEFAULT_KEY_ALIAS: &str = "alias/aws/codecommit";
 
 const ROWS: &[Row] = &[
     Row {
@@ -233,7 +241,7 @@ const ROWS: &[Row] = &[
         },
         declared_name: Some("orders-service"),
         expected_description: Some("the orders service's sources"),
-        expected_kms_key_id: None,
+        expected_kms_key_id: DEFAULT_KEY_ALIAS,
         expected_triggers: |region| {
             json!([{
                 "name": "notify-releases",
@@ -281,7 +289,7 @@ const ROWS: &[Row] = &[
         },
         declared_name: Some("billing-service"),
         expected_description: None,
-        expected_kms_key_id: None,
+        expected_kms_key_id: DEFAULT_KEY_ALIAS,
         expected_triggers: |region| {
             json!([
                 {
@@ -323,9 +331,8 @@ const ROWS: &[Row] = &[
         },
         declared_name: None,
         expected_description: None,
-        expected_kms_key_id: Some(
+        expected_kms_key_id:
             "arn:aws:kms:eu-west-1:000000000000:key/12345678-1234-1234-1234-123456789012",
-        ),
         expected_triggers: |_| json!([]),
         expected_tags: &[("Owner", "platform")],
         name_outputs: &["RepoRef"],
@@ -466,8 +473,9 @@ async fn a_stack_provisions_the_codecommit_repository_its_template_declares() {
         );
         assert_eq!(
             metadata.get("kmsKeyId").and_then(Value::as_str),
-            row.expected_kms_key_id,
-            "case {case:?}: expected the declared encryption key, got {metadata}"
+            Some(row.expected_kms_key_id),
+            "case {case:?}: expected the declared encryption key, or the managed key where \
+             the template declared none, got {metadata}"
         );
 
         // The trigger configuration the template's `Triggers` declared, read through the

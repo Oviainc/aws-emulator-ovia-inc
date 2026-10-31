@@ -4,7 +4,11 @@
 //! Rotates the KMS encryption key a repository already in the store is encrypted
 //! under: the STORED repository takes the requested key, so every later read of
 //! its metadata reports that key, and the call answers with the repository's id,
-//! the key now in effect and the key formerly in effect. Nothing else about the
+//! the key now in effect and the key formerly in effect. Both keys are reported
+//! in the one form a repository's key is held in
+//! (`crate::state::canonical_encryption_key`): a bare key id resolves to that
+//! key's ARN, and every other selector KMS documents is kept as it was set.
+//! Nothing else about the
 //! repository moves — its id, name, description, tags and whole history carry
 //! over — and a key selector that names no KMS key is refused, leaving the
 //! repository exactly as it was.
@@ -209,9 +213,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateRepositoryEncryptionKeyErrorModeled::EncryptionKeyInvalidIdException(
                     EncryptionKeyInvalidIdException {
-                        message: Some(format!(
-                            "the encryption key id {} is not valid: it names neither a key id, a key ARN, an alias nor an alias ARN",
-                            input.kms_key_id
+                        message: Some(crate::state::invalid_encryption_key_id_message(
+                            &input.kms_key_id,
                         )),
                     },
                 )
@@ -242,15 +245,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The write: the stored repository now depends on the requested key, which
         // is what every later read of its metadata reports. The key it leaves
-        // behind is the `originalKmsKeyId` this call answers with — absent for a
-        // repository that was holding no key of its own.
+        // behind is the `originalKmsKeyId` this call answers with — every
+        // repository is encrypted, so there is always one to report. Both are the
+        // canonical form of their selector (`crate::state::canonical_encryption_key`),
+        // which is the form this repository's metadata reports the key in.
         let original_kms_key_id =
             repository.rotate_encryption_key(&input.kms_key_id, std::time::SystemTime::now());
 
         Ok(UpdateRepositoryEncryptionKeyOutput {
             repository_id: Some(repository.repository_id.clone()),
-            kms_key_id: repository.kms_key_id.clone(),
-            original_kms_key_id,
+            kms_key_id: Some(repository.kms_key_id.clone()),
+            original_kms_key_id: Some(original_kms_key_id),
         })
     }
 }

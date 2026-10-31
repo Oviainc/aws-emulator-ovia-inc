@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
+//! Implemented: answers with the tags stored on the repository the `resourceArn`
+//! names, paged by this service's one pagination rule, plus the `tagrisId` of
+//! the tagging record they were read from. This is a read: nothing in the store
+//! changes.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +79,53 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::aws_smithy_schema::serde::SerializableStruct;
+
+/// The schema of the `tagrisId` member this operation answers with.
+///
+/// `ListTagsForResourceOutput` models `tags` and `nextToken` only, while the
+/// service's response carries a third, top-level member: the id of the tagging
+/// record the tags were read from. A member outside the shape is written the way
+/// the protocol itself writes one (the `__type` discriminator an awsJson error
+/// carries): a member schema of its own, plus a [`SerializableStruct`] that
+/// delegates every modelled member to the modelled output. The wire name is the
+/// member name, which is what the awsJson codec writes.
+static TAGRIS_ID_MEMBER_SCHEMA: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.codecommit#ListTagsForResourceOutput$tagrisId",
+            "com.amazonaws.codecommit#ListTagsForResourceOutput",
+            "tagrisId",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "tagrisId",
+        // After the two members the shape itself declares.
+        2,
+    )
+    .with_json_name("tagrisId");
+
+/// What this operation answers with: the modelled output, plus the `tagrisId`
+/// of the tagging record the tags came from.
+#[derive(Debug, Clone)]
+pub struct ListTagsForResourceResponse {
+    /// The members `ListTagsForResourceOutput` declares, serialized by the
+    /// generated impl for that shape.
+    modeled: ListTagsForResourceOutput,
+    /// The id of the resource's tagging record, read from the store with the
+    /// tags themselves.
+    tagris_id: String,
+}
+
+impl SerializableStruct for ListTagsForResourceResponse {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.modeled.serialize_members(serializer)?;
+        serializer.write_string(&TAGRIS_ID_MEMBER_SCHEMA, &self.tagris_id)
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -133,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for ListTagsForResource<Eng>
 {
     type Input = ListTagsForResourceInput;
-    type Output = ListTagsForResourceOutput;
+    type Output = ListTagsForResourceResponse;
     type Error = ListTagsForResourceError;
 
     const NAME: &'static str = "ListTagsForResource";
@@ -201,9 +252,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        Ok(ListTagsForResourceOutput {
-            tags: Some(tags),
-            next_token,
+        Ok(ListTagsForResourceResponse {
+            modeled: ListTagsForResourceOutput {
+                tags: Some(tags),
+                next_token,
+            },
+            // The id of the tagging record these tags were read from: the
+            // resource's own, minted with it and stable for its life, so two
+            // reads of one resource report the same id.
+            tagris_id: repository.tagging_id.clone(),
         })
     }
 }

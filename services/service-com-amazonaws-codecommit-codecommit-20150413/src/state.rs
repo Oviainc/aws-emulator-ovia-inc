@@ -1382,7 +1382,19 @@ pub struct Repository {
     pub description: Option<String>,
     pub default_branch: Option<String>,
     pub arn: String,
-    pub kms_key_id: Option<String>,
+    /// The KMS key this repository is encrypted under, in the single form
+    /// [`canonical_encryption_key`] holds every selector in. Never absent: a
+    /// repository created without a key of its own carries
+    /// [`DEFAULT_ENCRYPTION_KEY_ALIAS`], the managed key `kmsKeyId`'s own
+    /// documentation names — "If no key is specified, the default
+    /// aws/codecommit Amazon Web Services managed key is used"
+    /// (`smithy_query(query="doc",shape="CreateRepositoryInput",member="kmsKeyId")`).
+    pub kms_key_id: String,
+    /// The id of this repository's tagging record, reported beside the tags
+    /// themselves. Minted with the repository and stable for its life, so two
+    /// reads of one repository's tags report the same id and no two
+    /// repositories share one.
+    pub tagging_id: String,
     pub creation_date: SystemTime,
     pub last_modified_date: SystemTime,
     pub tags: BTreeMap<String, String>,
@@ -2024,7 +2036,13 @@ impl Repository {
             description,
             default_branch: None,
             arn: ::engine::emulator_arn("codecommit", region, name),
-            kms_key_id,
+            // Every repository is encrypted, so a request that names no key of
+            // its own takes the service's managed key rather than none.
+            kms_key_id: canonical_encryption_key(
+                kms_key_id.as_deref().unwrap_or(DEFAULT_ENCRYPTION_KEY_ALIAS),
+                region,
+            ),
+            tagging_id: tagging_id(name, created),
             creation_date: created,
             last_modified_date: created,
             tags,
@@ -2219,7 +2237,7 @@ impl Repository {
             clone_url_http: Some(endpoint.clone_url_http(&self.name)),
             clone_url_ssh: Some(endpoint.clone_url_ssh(&self.name)),
             arn: Some(self.arn.clone()),
-            kms_key_id: self.kms_key_id.clone(),
+            kms_key_id: Some(self.kms_key_id.clone()),
         }
     }
 
@@ -2241,20 +2259,21 @@ impl Repository {
     }
 
     /// Point this repository at another KMS encryption key, answering the key it
-    /// was encrypted under before — the `originalKmsKeyId` a rotation reports,
-    /// absent for a repository that carried no key of its own.
+    /// was encrypted under before — the `originalKmsKeyId` a rotation reports.
+    /// A repository always carries a key, so there is always one to report.
+    ///
+    /// Both keys are the [`canonical_encryption_key`] form of their selector, so
+    /// a rotation reports the same key the metadata of this repository reports
+    /// before and after it.
     ///
     /// Only which key the repository DEPENDS on changes: its identity, its
     /// metadata and its whole history carry over, and the last-modified instant
     /// records the change. A request naming the key already in effect changes
     /// nothing at all, so it leaves that instant where it is too.
-    pub fn rotate_encryption_key(
-        &mut self,
-        kms_key_id: &str,
-        rotated: SystemTime,
-    ) -> Option<String> {
-        let original = self.kms_key_id.replace(kms_key_id.to_string());
-        if original.as_deref() != Some(kms_key_id) {
+    pub fn rotate_encryption_key(&mut self, kms_key_id: &str, rotated: SystemTime) -> String {
+        let canonical = canonical_encryption_key(kms_key_id, &self.region);
+        let original = ::std::mem::replace(&mut self.kms_key_id, canonical);
+        if original != self.kms_key_id {
             self.last_modified_date = rotated;
         }
         original
@@ -4107,6 +4126,19 @@ fn repository_id(name: &str, created: SystemTime) -> String {
     ))
 }
 
+/// The id of a repository's tagging record — the id reported beside the tags
+/// themselves: the same kind of version-8 UUID as every other opaque id this
+/// service mints, over the account, the repository name and the instant the
+/// repository was created, so it is stable for the life of the repository and
+/// distinct for a repository of the same name created later.
+fn tagging_id(name: &str, created: SystemTime) -> String {
+    let nanos = nanos_since_epoch(created);
+    uuid_v8(&format!(
+        "codecommit/{}/{name}/{nanos}/tags",
+        ::engine::emulator_account_id()
+    ))
+}
+
 /// An approval rule template's opaque `approvalRuleTemplateId`: the same kind of
 /// version-8 UUID, over the account, the template name and the instant it was
 /// created. It is therefore stable for the life of the template and distinct for a
@@ -4367,6 +4399,38 @@ fn is_kms_arn(candidate: &str) -> bool {
 /// `EncryptionKeyInvalidIdException`.
 pub fn is_kms_key_selector(key_id: &str) -> bool {
     is_kms_alias(key_id) || is_kms_key_id(key_id) || is_kms_arn(key_id)
+}
+
+/// The message `EncryptionKeyInvalidIdException` carries: one code, one
+/// sentence, worded in a single place so the two operations that take a
+/// `kmsKeyId` cannot word the same refusal differently. The only variable part
+/// is the selector the request named.
+pub fn invalid_encryption_key_id_message(key_id: &str) -> String {
+    format!(
+        "the encryption key id {key_id} is not valid: it names neither a key id, a key ARN, an alias nor an alias ARN"
+    )
+}
+
+/// The Amazon Web Services managed key a repository is encrypted under when the
+/// request names no key of its own, in the alias form KMS names that key by:
+/// `kmsKeyId`'s own documentation states "If no key is specified, the default
+/// aws/codecommit Amazon Web Services managed key is used"
+/// (`smithy_query(query="doc",shape="CreateRepositoryInput",member="kmsKeyId")`).
+pub const DEFAULT_ENCRYPTION_KEY_ALIAS: &str = "alias/aws/codecommit";
+
+/// The ONE form a repository's encryption key is held and reported in, for every
+/// selector that names a key ([`is_kms_key_selector`]).
+///
+/// KMS's `KeyId` admits four selectors for the same key, and of them only the
+/// bare key id leaves the key's account and region unsaid; a key id therefore
+/// resolves to the ARN of that key in the repository's own account and region,
+/// the identifier KMS reports a key by, while a selector that already names a
+/// key or an alias in full is kept as the caller set it.
+pub fn canonical_encryption_key(selector: &str, region: &str) -> String {
+    if is_kms_key_id(selector) {
+        return ::engine::emulator_arn("kms", region, &format!("key/{selector}"));
+    }
+    selector.to_string()
 }
 
 /// The region this request is addressed to: the SigV4 credential scope's region,

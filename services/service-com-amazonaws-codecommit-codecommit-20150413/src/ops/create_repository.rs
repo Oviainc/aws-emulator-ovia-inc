@@ -2,7 +2,10 @@
 
 //! @op CreateRepository
 //! Implemented: persists a new repository in `crate::state` and answers with the
-//! stored repository's metadata.
+//! stored repository's metadata. Every repository is encrypted, so a request
+//! naming no `kmsKeyId` takes the service's managed key
+//! (`crate::state::DEFAULT_ENCRYPTION_KEY_ALIAS`) and the stored key is reported
+//! in the one canonical form (`crate::state::canonical_encryption_key`).
 //!
 //! ## Shape of an operation
 //!
@@ -208,6 +211,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A `kmsKeyId` the caller DID name has to select a key: of the values the
+        // modelled pattern admits, only the four forms KMS documents for `KeyId`
+        // do (`crate::state::is_kms_key_selector`), and the modelled
+        // `EncryptionKeyInvalidIdException` is what the service answers for the
+        // rest — the same rule, and the same wording,
+        // `UpdateRepositoryEncryptionKey` applies to the key it is handed. A
+        // request naming no key at all is not this refusal: it takes the
+        // service's managed key (`crate::state::DEFAULT_ENCRYPTION_KEY_ALIAS`).
+        if let Some(key_id) = input
+            .kms_key_id
+            .as_deref()
+            .filter(|key_id| !crate::state::is_kms_key_selector(key_id))
+        {
+            return Err(
+                CreateRepositoryErrorModeled::EncryptionKeyInvalidIdException(
+                    EncryptionKeyInvalidIdException {
+                        message: Some(crate::state::invalid_encryption_key_id_message(key_id)),
+                    },
+                )
+                .into(),
+            );
         }
 
         // A key AWS reserves to itself is a well-formed key the CALLER may not
