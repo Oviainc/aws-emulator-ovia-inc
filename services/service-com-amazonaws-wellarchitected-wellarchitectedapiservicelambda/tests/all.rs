@@ -493,3 +493,8 @@ mod workload_pillar_identity;
 // position for an agent suite is the one gap of this list every new agent suite lands in.
 #[path = "all/agent_no_op_updates.rs"]
 mod agent_no_op_updates;
+
+// Appended at the end of this list for the same reason as the declarations above: modules
+// are appended here so a new suite does not collide with another insertion.
+#[path = "all/defaulted_member_token_identity.rs"]
+mod defaulted_member_token_identity;

@@ -177,13 +177,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // "Set to true if this new major lens version" (`IsMajorVersion` doc): the member
+        // is a plain optional boolean with no modelled default, so a request that omits it
+        // publishes a version that is not a major one — the very version a request spelling
+        // the member `false` publishes. Resolved HERE, ahead of the fingerprint, so the
+        // fingerprint covers the value this publish would RECORD rather than the spelling
+        // it was asked by.
+        let is_major_version = input.is_major_version.unwrap_or(false);
+
         // The parameters an `@idempotencyToken` retry is compared on, as this operation
         // RESOLVES them: the lens counts as the lens its `LensAlias` names rather than as
         // the spelling it was named by (`crate::state::lens_alias`, the identity
         // `lens_by_alias_mut` resolves the lens through below), so a retry that spells the
-        // same lens the other way is the SAME request and replays.
+        // same lens the other way is the SAME request and replays. `IsMajorVersion` is
+        // taken the same way, as the value the publish would record rather than as the
+        // spelling it was named by, so a retry that spells the default explicitly is the
+        // SAME request too — the convention the sibling creates hold their defaulted
+        // members to.
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
-            "IsMajorVersion": &input.is_major_version,
+            "IsMajorVersion": is_major_version,
             "LensAlias": crate::state::lens_alias(&input.lens_alias),
             "LensVersion": &input.lens_version,
         }));
@@ -274,9 +286,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.lens_version.clone(),
             crate::state::PublishedLensVersion {
                 content,
-                // "Set to true if this new major lens version": a request that omits the
-                // member is not publishing a major version.
-                is_major_version: input.is_major_version.unwrap_or(false),
+                // Resolved above, where the fingerprint reads it too.
+                is_major_version,
                 published_at: now,
             },
         );
