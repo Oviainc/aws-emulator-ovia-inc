@@ -3,6 +3,10 @@
 //! @op PutSubscriptionFilter
 //! Implemented: creates or updates the subscription filter `filterName` names on the
 //! log group in the shared store, so `DescribeSubscriptionFilters` reports it back.
+//! A put against a logical destination this account holds is first AUTHORIZED against
+//! that destination's access policy — the only thing that authorizes one
+//! ([`crate::state::subscription_destination_refusal`]) — and refused with
+//! `AccessDeniedException` when it grants this caller nothing.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -292,6 +296,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect::<Vec<_>>()
                     .join(", ")
             )));
+        }
+
+        // A logical destination is authorized by the ACCESS POLICY attached to it and by
+        // nothing else: "Through an access policy, a destination controls what is written to
+        // it. By default, PutDestination does not set any access policy with the
+        // destination, which means a cross-account user cannot call PutSubscriptionFilter
+        // against this destination" (`PutDestination`). So a put against a destination this
+        // account holds that carries no policy — or whose policy leaves this caller
+        // ungranted — is refused as unauthorized, before the filter is created, and nothing
+        // of it is stored ([`crate::state::subscription_destination_refusal`]).
+        if let Some(message) =
+            crate::state::subscription_destination_refusal(&store, &input.destination_arn)
+        {
+            return Err(PutSubscriptionFilterError::access_denied(message));
         }
 
         // The filter pattern is parsed at configuration time, so a pattern that opens a

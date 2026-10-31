@@ -59,6 +59,8 @@ mod delivery_source_log_types;
 mod delivery_source_region_support;
 #[path = "all/delivery_sources.rs"]
 mod delivery_sources;
+#[path = "all/destination_access_authorization.rs"]
+mod destination_access_authorization;
 #[path = "all/destination_policies.rs"]
 mod destination_policies;
 #[path = "all/destination_removal.rs"]

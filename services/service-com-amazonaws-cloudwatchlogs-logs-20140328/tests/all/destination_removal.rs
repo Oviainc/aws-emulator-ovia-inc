@@ -532,7 +532,16 @@ async fn a_put_after_a_delete_creates_a_fresh_destination() {
 async fn deleting_a_destination_leaves_the_subscription_filters_that_publish_to_it() {
     let logs = Logs::new();
 
-    let case = Case::of("the destination a filter publishes to", "kinesis-dest", KINESIS_ARN, ROLE_ARN);
+    // The destination carries an access policy, because a filter can only be registered
+    // against a destination whose access policy authorizes the registration: "the
+    // destination owner must call PutDestinationPolicy after PutDestination".
+    let case = Case::of(
+        "the destination a filter publishes to",
+        "kinesis-dest",
+        KINESIS_ARN,
+        ROLE_ARN,
+    )
+    .with_access_policy();
     create(&logs, &case).await;
     let arn = destination_arn(REGION, &case.name);
 

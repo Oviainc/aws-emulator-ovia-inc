@@ -251,8 +251,9 @@ fn physical_destination(
 ) -> Option<String> {
     let parsed = ::service_common::arn::parse(destination_arn)?;
     if parsed.vendor == LOGS_DESTINATION.0 {
-        let name = ::service_common::arn::resource_id_of_type(destination_arn, LOGS_DESTINATION.1)?;
-        let target = store.destinations.get(name)?.target_arn.clone();
+        // Resolved through the store's own lookup, so the destination a delivery follows is
+        // the one `PutSubscriptionFilter` authorized the filter against.
+        let target = store.destination_by_arn(destination_arn)?.target_arn.clone();
         // A logical destination's target is a physical resource of one of the streaming
         // vendors, so it is not followed further: a destination naming another destination
         // addresses nothing.

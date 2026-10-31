@@ -206,6 +206,57 @@ impl Emulator {
         )
         .await;
     }
+
+    /// A logical destination over the Kinesis stream `stream`, USABLE: `PutDestination`
+    /// creates it and `PutDestinationPolicy` attaches the access policy that authorizes a
+    /// subscription filter against it, because the two calls are one flow — "By default,
+    /// PutDestination does not set any access policy with the destination [...] To enable
+    /// this, the destination owner must call PutDestinationPolicy after PutDestination"
+    /// (`PutDestination`). Answers the destination's own ARN, which is what a filter names.
+    pub(crate) async fn logical_destination(
+        &self,
+        case: &str,
+        name: &str,
+        stream: &str,
+    ) -> String {
+        let created = self
+            .logs(
+                case,
+                "PutDestination",
+                &json!({
+                    "destinationName": name,
+                    "targetArn": stream_arn(stream),
+                    "roleArn": role_arn(),
+                }),
+            )
+            .await;
+        let arn = created["destination"]["arn"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {case}: PutDestination reports the destination's arn, got {created}")
+            })
+            .to_string();
+        let access_policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "AllowThisAccountToSubscribe",
+                "Effect": "Allow",
+                "Principal": {
+                    "AWS": format!("arn:aws:iam::{}:root", engine::emulator_account_id()),
+                },
+                "Action": "logs:PutSubscriptionFilter",
+                "Resource": arn,
+            }],
+        })
+        .to_string();
+        self.logs(
+            case,
+            "PutDestinationPolicy",
+            &json!({"destinationName": name, "accessPolicy": access_policy}),
+        )
+        .await;
+        arn
+    }
 }
 
 /// The JSON a delivered record's gzip frame carries. A frame that is not gzip, or does not
@@ -575,21 +626,9 @@ async fn a_logical_destination_delivers_to_the_physical_target_it_names() {
     emulator.create_stream(case, stream).await;
     tokio::time::sleep(past_activation()).await;
 
-    let destination = emulator
-        .logs(
-            case,
-            "PutDestination",
-            &json!({
-                "destinationName": "to-the-stream",
-                "targetArn": stream_arn(stream),
-                "roleArn": role_arn(),
-            }),
-        )
+    let destination_arn = emulator
+        .logical_destination(case, "to-the-stream", stream)
         .await;
-    let destination_arn = destination["destination"]["arn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case}: PutDestination reports the destination's arn"))
-        .to_string();
 
     let group = "logical-group";
     let log_stream = "logical-log-stream";

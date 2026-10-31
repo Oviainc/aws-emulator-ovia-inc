@@ -1408,6 +1408,19 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
             .find(|destination| destination.arn == arn)
     }
 
+    /// The logical destination this account holds under the ARN `destination_arn`, if any.
+    ///
+    /// A destination is keyed by its `destinationName`, which is the only thing
+    /// `PutDestinationPolicy` and `DeleteDestination` identify one by, while a subscription
+    /// filter names its destination by ARN (`PutSubscriptionFilter$destinationArn`) — so the
+    /// name is read off the ARN's `destination` resource segment
+    /// ([`destination_name_from_arn`]) and the store is asked for it. `None` for an ARN that
+    /// names no `destination` resource at all, and for one naming a destination this account
+    /// does not hold — another account's destination, which this store knows nothing about.
+    pub fn destination_by_arn(&self, destination_arn: &str) -> Option<&DestinationRecord> {
+        self.destinations.get(destination_name_from_arn(destination_arn)?)
+    }
+
     /// The scheduled query this account holds under `identifier`, if any.
     ///
     /// A scheduled query is keyed by its name, but every reader identifies one by "The ARN or
@@ -3092,6 +3105,82 @@ fn names_wildcard_principal(principal: Option<&serde_json::Value>) -> bool {
         Some(value) => is_wildcard(value),
         None => false,
     }
+}
+
+/// The IAM action registering a subscription filter is authorized as: this service's action
+/// namespace (`logs`, its `arnNamespace`) and the operation's own name. It is the action a
+/// destination's access policy has to authorize, since one "is used to authorize claims to
+/// register a subscription filter against a given destination" (`PutDestinationPolicy`).
+pub const PUT_SUBSCRIPTION_FILTER_ACTION: &str = "logs:PutSubscriptionFilter";
+
+/// AWS's refusal for a call nothing authorizes: the account the request was signed for, the
+/// action it asked for and the resource it asked for. Every variable part comes from the
+/// request and from this store — the caller's account id, the fully qualified action and the
+/// resource's own ARN — so the sentence states the rule rather than one call's values.
+pub fn not_authorized_message(account_id: &str, action: &str, resource_arn: &str) -> String {
+    format!(
+        "User with accountId: {account_id} is not authorized to perform: {action} on \
+         resource: {resource_arn}"
+    )
+}
+
+/// Whether the calling principal may take `action` on the logical destination `destination`.
+///
+/// The destination's ACCESS POLICY is the only thing that authorizes one: "Through an access
+/// policy, a destination controls what is written to it. By default, PutDestination does not
+/// set any access policy with the destination, which means a cross-account user cannot call
+/// PutSubscriptionFilter against this destination. To enable this, the destination owner must
+/// call PutDestinationPolicy after PutDestination" (`PutDestination`). So a destination
+/// carrying NO policy authorizes nobody — not even the account that owns it, which is what
+/// AWS answers such a call with — and a destination carrying one is decided by the tree's
+/// single evaluation of IAM documents ([`service_common::iam_authorization`]).
+///
+/// The destination's OWN account also reaches it through its identity-based policies, which
+/// is why an attached policy naming only another account does not revoke the owner; an
+/// explicit `Deny` about this request still refuses it, as IAM evaluates one.
+pub fn destination_authorizes(destination: &DestinationRecord, action: &str) -> bool {
+    let Some(document) = destination.access_policy.as_deref() else {
+        return false;
+    };
+    // Every spelling an access policy can name the caller by: the principal this emulator's
+    // credential speaks for, and the account that principal belongs to, which IAM lets a
+    // resource policy name in place of the principal itself.
+    let caller = ::service_common::caller_principal::ambient_user_arn();
+    let mut principals = vec![caller.clone()];
+    principals.extend(::service_common::iam_authorization::account_principals(
+        &caller,
+    ));
+    let stated = ::service_common::iam_authorization::resource_decision(
+        document,
+        &::service_common::iam_authorization::Request::new(action, &destination.arn, &principals),
+    );
+    let by_identity = if arn_account_id(&destination.arn) == arn_account_id(&caller) {
+        ::service_common::iam_authorization::Decision::Allowed
+    } else {
+        ::service_common::iam_authorization::Decision::NotStated
+    };
+    ::service_common::iam_authorization::is_allowed(by_identity, stated)
+}
+
+/// The refusal a request that would register a subscription filter against the destination
+/// `destination_arn` names is answered with, or `None` when the destination authorizes it.
+///
+/// `None` as well for an ARN that names no logical destination THIS account holds: a
+/// physical destination (a stream, a delivery stream, a function) carries no access policy,
+/// and a destination of another account is a resource whose policy this store does not hold
+/// — a refusal has to be grounded in a policy that was read, so neither is refused here.
+pub fn subscription_destination_refusal(
+    store: &ComAmazonawsCloudwatchlogsLogs20140328State,
+    destination_arn: &str,
+) -> Option<String> {
+    let destination = store.destination_by_arn(destination_arn)?;
+    (!destination_authorizes(destination, PUT_SUBSCRIPTION_FILTER_ACTION)).then(|| {
+        not_authorized_message(
+            ::engine::emulator_account_id(),
+            PUT_SUBSCRIPTION_FILTER_ACTION,
+            destination_arn,
+        )
+    })
 }
 
 /// The refusal CloudWatch Logs answers a `PutDestinationPolicy` that would replace a
@@ -6438,6 +6527,24 @@ impl TaggedResource {
 /// `TagResource$resourceArn` documents for one.
 const DESTINATION_ARN_PREFIX: &str = "destination:";
 
+/// The `Destination$destinationName` an ARN names — the name the store keys a logical
+/// destination by — or `None` for an ARN that names no `destination` resource of this
+/// service.
+///
+/// The ARN format is the one `TagResource$resourceArn` documents
+/// (`arn:aws:logs:Region:account-id:destination:destination-name`), and the name is
+/// whatever follows that resource prefix, separators included: `DestinationName` is
+/// `^[^:*]*$`, so a name can carry slashes and dots.
+pub fn destination_name_from_arn(arn: &str) -> Option<&str> {
+    let (service, resource) = arn_service_and_resource(arn)?;
+    if service != "logs" {
+        return None;
+    }
+    resource
+        .strip_prefix(DESTINATION_ARN_PREFIX)
+        .filter(|name| !name.is_empty())
+}
+
 /// The ARN resource-segment prefix of a delivery, as [`delivery_arn`] builds one.
 const DELIVERY_ARN_PREFIX: &str = "delivery:";
 
@@ -6466,8 +6573,8 @@ pub fn tagged_resource(arn: &str) -> Option<TaggedResource> {
             log_group_name_from_identifier(arn).to_string(),
         ));
     }
-    if let Some(name) = resource.strip_prefix(DESTINATION_ARN_PREFIX) {
-        return (!name.is_empty()).then(|| TaggedResource::Destination(name.to_string()));
+    if let Some(name) = destination_name_from_arn(arn) {
+        return Some(TaggedResource::Destination(name.to_string()));
     }
     if let Some(name) = resource.strip_prefix(DELIVERY_SOURCE_ARN_PREFIX) {
         return (!name.is_empty()).then(|| TaggedResource::DeliverySource(name.to_string()));

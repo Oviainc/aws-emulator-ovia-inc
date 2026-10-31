@@ -278,24 +278,9 @@ async fn a_groups_kms_key_changes_nothing_about_what_its_filter_delivers() {
 
         // The filter addresses the stream directly, or a logical destination that names it.
         let destination_arn = if row.through_logical_destination {
-            let destination = emulator
-                .logs(
-                    case,
-                    "PutDestination",
-                    &json!({
-                        "destinationName": format!("cmk-destination-{index}"),
-                        "targetArn": stream_arn(&stream),
-                        "roleArn": role_arn(),
-                    }),
-                )
-                .await;
-            destination["destination"]["arn"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!("case {case}: PutDestination reports the destination's arn, got \
-                            {destination}")
-                })
-                .to_string()
+            emulator
+                .logical_destination(case, &format!("cmk-destination-{index}"), &stream)
+                .await
         } else {
             stream_arn(&stream)
         };
