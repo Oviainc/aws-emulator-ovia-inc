@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchContent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchContent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchContent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: REPORTS a page of the contents of one knowledge base that satisfy every
+//! filter of the search expression, in `contentId` order, out of the records
+//! `CreateContent` persisted. The operation is `@readonly`, so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchContent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchContentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchContent"))
+        // `knowledgeBaseId`'s `UuidOrArn` pattern, `maxResults`' `range 1..100`,
+        // `nextToken`'s `len 1..2048` and each filter member's own constraints — including
+        // `field`'s and `operator`'s value sets — are refused before this handler runs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: there is nothing to report, and
+            // this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("SearchContent"));
+        };
+        let now = ::std::time::SystemTime::now();
+        let state = state.lock();
+
+        // The knowledge base the route names is resolved first: a label this account
+        // holds none under is the modelled not-found, not an empty page of matches.
+        let Some(knowledge_base_id) = state.resolve_knowledge_base_id(&input.knowledge_base_id)
+        else {
+            return Err(SearchContentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::MESSAGE_KNOWLEDGE_BASE_NOT_FOUND.to_string()),
+                    resource_name: Some(input.knowledge_base_id.clone()),
+                },
+            )
+            .into());
+        };
+
+        // `maxResults` is modelled `range 1..100`, which the boundary validator has
+        // already enforced; a call that names none gets the modelled maximum.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE as usize)
+            .clamp(1, crate::state::MAX_PAGE_SIZE as usize);
+
+        // The matches are ordered by `contentId`, and `nextToken` names the first content
+        // of the NEXT page, exactly as the plain listing of the same collection orders and
+        // continues: a content deleted between two pages therefore cannot invalidate a
+        // token already handed out, because the continuation resumes at the first
+        // surviving id at or after it.
+        let contents = state.contents_of(&knowledge_base_id);
+        let mut remaining = contents
+            .iter()
+            .filter(|content| satisfies_search_expression(content, &input.search_expression))
+            .filter(|content| {
+                input
+                    .next_token
+                    .as_deref()
+                    .is_none_or(|from| content.content_id.as_str() >= from)
+            });
+        let content_summaries: Vec<ContentSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|content| content.to_summary(now))
+            .collect();
+        let next_token = remaining.next().map(|content| content.content_id.clone());
+
+        Ok(SearchContentOutput {
+            content_summaries,
+            next_token,
+        })
+    }
+}
+
+/// The field a filter selects on: the one value the model's own `FilterField` catalog
+/// carries, taken from that catalog rather than restating its literal, so this handler
+/// stays in step with the model (`smithy_query(query="shape",shape="FilterField")`).
+const FILTER_FIELD_NAME: &str = FILTER_FIELD_VALUES[0];
+
+/// The operator the comparison is made under: the one value the model's own
+/// `FilterOperator` catalog carries, equality
+/// (`smithy_query(query="shape",shape="FilterOperator")`).
+const FILTER_OPERATOR_EQUALS: &str = FILTER_OPERATOR_VALUES[0];
+
+/// Whether `content` satisfies EVERY filter of `expression`.
+///
+/// A search expression is a conjunction of its filters, so an expression carrying no
+/// filter selects the whole collection and one carrying two filters selects only what
+/// both accept.
+fn satisfies_search_expression(
+    content: &crate::state::Content,
+    expression: &SearchExpression,
+) -> bool {
+    expression
+        .filters
+        .iter()
+        .all(|filter| satisfies_filter(content, filter))
+}
+
+/// Whether `content` satisfies one filter: the selected field's value compared with the
+/// filter's value under the filter's operator.
+fn satisfies_filter(content: &crate::state::Content, filter: &Filter) -> bool {
+    match (filter.field.as_str(), filter.operator.as_str()) {
+        // A content's name is unique within its knowledge base, which is what lets this
+        // operation retrieve one content by name.
+        (FILTER_FIELD_NAME, FILTER_OPERATOR_EQUALS) => content.name == filter.value,
+        // The model declares no other field and no other operator, and a value outside an
+        // enumeration's value set is refused where the request is read, so no other pair
+        // reaches here; one that somehow did would select nothing rather than silently
+        // select everything.
+        _ => false,
     }
 }
