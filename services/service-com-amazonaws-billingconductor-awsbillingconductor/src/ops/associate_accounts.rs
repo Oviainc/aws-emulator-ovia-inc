@@ -164,6 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The consolidated billing family's roster, which AWS Organizations owns: read
+        // from that store BEFORE this service's guard is taken — one lock at a time, in
+        // one direction.
+        let organization = crate::state::organization_linked_accounts(&*self.engine);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AssociateAccountsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -207,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal is the reason the model enumerates for an account list this service
         // may not take.
         for account_id in &input.account_ids {
-            if state.is_outside_billing_family(account_id) {
+            if state.is_outside_billing_family(account_id, organization.as_ref()) {
                 return Err(AssociateAccountsErrorModeled::ValidationException(
                     crate::state::account_not_in_billing_family("AccountIds", account_id),
                 )

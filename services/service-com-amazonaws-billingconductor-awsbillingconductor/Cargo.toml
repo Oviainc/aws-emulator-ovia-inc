@@ -25,6 +25,10 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # SHA-256, for the integrity tag those tokens carry.
 sha2 = { workspace = true }
+# Which accounts a consolidated billing family holds, and the name and email each one
+# carries, is state the Organizations control plane owns: the account listing reads that
+# store through the one shared engine instead of reporting what this service was told.
+service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -2595,11 +2595,13 @@ const TRANSFER_DIRECTIONS: &[&str] = &["inbound", "outbound"];
 ///   roster, which NO request writes (an account joins a family in AWS Organizations,
 ///   not here), so it is bounded by whatever recorded it rather than by a cap of this
 ///   store, and no caller can grow it.
-/// * `unassociated_accounts` keeps the released accounts a later
-///   `ListAccountAssociations` has to report as `UNMONITORED`. Nothing deletes a
-///   linked account, so this one is capped at [`MAX_UNASSOCIATED_ACCOUNTS`] and
-///   evicts oldest-first, forgetting the evicted account's billing group
-///   memberships with it; one account keeps at most
+/// * `unassociated_accounts` keeps the released accounts this service has SEEN, beside
+///   the family's own roster, so a later `ListAccountAssociations` reports one as
+///   `UNMONITORED` even where no roster is known. The family's accounts are reported
+///   from the roster itself ([`organization_linked_accounts`]), which no cap of this
+///   store evicts; nothing deletes a linked account, so this memory is capped at
+///   [`MAX_UNASSOCIATED_ACCOUNTS`] and evicts oldest-first, forgetting the evicted
+///   account's billing group memberships with it; one account keeps at most
 ///   [`MAX_ACCOUNT_ASSOCIATIONS_PER_ACCOUNT`] of them, oldest ENDED membership
 ///   dropped first.
 /// * the idempotency index is capped at [`MAX_IDEMPOTENCY_TOKENS`], evicts
@@ -2717,21 +2719,24 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// Organizations surface) designates a payer account by setting it, which is the
     /// only way the control plane becomes reachable.
     pub payer_account_id: Option<String>,
-    /// The linked accounts of the consolidated billing family this store records:
-    /// `Some` once the family's roster is known, `None` while it is not.
+    /// The ids of the consolidated billing family's linked accounts as THIS store
+    /// records them, beside the roster the organization itself records
+    /// ([`organization_linked_accounts`]): `Some` once they are recorded, `None` while
+    /// they are not.
     ///
     /// Which accounts a consolidated billing family holds is an AWS Organizations
     /// fact — an account joins a family THERE, and this API never adds one — so no
-    /// request writes this field and nothing a caller does grows it. It holds `None`
-    /// by default, for the reason [`Self::payer_account_id`] holds no account: this
-    /// emulator presents one account ([`caller_account_id`]) and emulates no
-    /// Organizations control plane, so there is no family whose roster could be
-    /// recorded, and non-membership is not decidable — the accounts this service has
-    /// seen stay the linked accounts it reports ([`Self::linked_accounts`]). A test
-    /// (or a future Organizations surface) records the family by setting it, and from
-    /// then on membership IS decidable: an account the roster does not hold is outside
-    /// the family ([`Self::is_outside_billing_family`]), so an operation that would
-    /// take it into a billing group's membership refuses the request
+    /// request writes this field and nothing a caller does grows it. The family is
+    /// normally read from the Organizations store ([`Self::billing_family`]), and this
+    /// field is the seam for an engine that mounts no Organizations surface: it carries
+    /// ids alone, so an account known only from here is reported with no
+    /// `AccountName`/`AccountEmail` beside its id. It holds `None` by default, for the
+    /// reason [`Self::payer_account_id`] holds no account, and while NO roster is known
+    /// non-membership is not decidable — the accounts this service has seen stay the
+    /// linked accounts it reports ([`Self::linked_accounts`]). Once a roster is known
+    /// membership IS decidable: an account no roster holds is outside the family
+    /// ([`Self::is_outside_billing_family`]), so an operation that would take it into a
+    /// billing group's membership refuses the request
     /// ([`account_not_in_billing_family`]), while every account of the roster is a
     /// linked account this service reports whether or not a billing group holds it.
     pub billing_family_account_ids: Option<BTreeSet<String>>,
@@ -2942,14 +2947,16 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         true
     }
 
-    /// Record a linked account that belongs to no billing group, so a later
-    /// `ListAccountAssociations` reports it as `UNMONITORED`. Capped at
-    /// [`MAX_UNASSOCIATED_ACCOUNTS`], oldest evicted first.
+    /// Record a linked account this service has SEEN belong to no billing group, so a
+    /// later `ListAccountAssociations` reports it as `UNMONITORED` even where no family
+    /// roster is known. Capped at [`MAX_UNASSOCIATED_ACCOUNTS`], oldest evicted first.
     ///
     /// An evicted account is forgotten whole: the memberships it once had go with it,
     /// unless it is in a billing group NOW, in which case the membership that stands
-    /// is what keeps it reportable. So the membership history is bounded by the same
-    /// cap as the roster it belongs to.
+    /// is what keeps it reportable. So this memory of past writes is bounded, and it is
+    /// only a memory: the family's accounts are reported from the family's own roster
+    /// ([`Self::billing_family`]), which no cap of this store evicts, so an account of
+    /// the family stays `UNMONITORED` in the listing however many releases followed it.
     pub fn note_unassociated_account(&mut self, account_id: &str) {
         if self
             .unassociated_accounts
@@ -3033,19 +3040,31 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// the billing group it was associated with IN `billing_period` (`None` when it
     /// was in none then).
     ///
-    /// The roster is the consolidated billing family's own roster where the store
-    /// records one ([`Self::billing_family_account_ids`]), together with every account
-    /// this service has seen, whatever period is asked about: a linked account stays in
-    /// the consolidated billing family whether or not it was in a billing group then,
-    /// so one that joined a group later is reported for an earlier period with no group
-    /// at all, and a family account no group has ever held is reported with none too.
-    pub fn linked_accounts(&self, billing_period: &str) -> BTreeMap<String, Option<String>> {
+    /// The roster is the consolidated billing family's own roster ([`Self::billing_family`]),
+    /// together with every account this service has seen, whatever period is asked about: a
+    /// linked account stays in the consolidated billing family whether or not it was in a
+    /// billing group then, so one that joined a group later is reported for an earlier
+    /// period with no group at all, and a family account no group has ever held is reported
+    /// with none too.
+    ///
+    /// `organization` is the family as the organization itself records it, read from the
+    /// Organizations store before this store's guard was taken
+    /// ([`organization_linked_accounts`]).
+    pub fn linked_accounts(
+        &self,
+        billing_period: &str,
+        organization: Option<&BTreeMap<String, LinkedAccountIdentity>>,
+    ) -> BTreeMap<String, Option<String>> {
         let mut accounts: BTreeMap<String, Option<String>> = self
-            .billing_family_account_ids
-            .iter()
+            .billing_family(organization)
+            .into_iter()
             .flatten()
-            .chain(self.unassociated_accounts.iter())
-            .map(|account_id| (account_id.clone(), None))
+            .map(|(account_id, _)| (account_id, None))
+            .chain(
+                self.unassociated_accounts
+                    .iter()
+                    .map(|account_id| (account_id.clone(), None)),
+            )
             .collect();
         for (account_id, memberships) in &self.account_associations {
             let group_arn = membership_in(memberships, billing_period).map(str::to_string);
@@ -3602,19 +3621,55 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .collect()
     }
 
+    /// The consolidated billing family this store answers for: every linked account of
+    /// the payer account, keyed by account id and carrying the identity the account's own
+    /// record holds — or `None` when no roster is known at all, so membership of the
+    /// family is not decidable.
+    ///
+    /// Which accounts a family holds, and what each one is called, is an AWS Organizations
+    /// fact that no request of this API writes, so the roster the organization itself
+    /// records ([`organization_linked_accounts`], passed in as `organization` because it
+    /// is read from that store before this one's guard is taken) is the roster this service
+    /// reports. Beside it, a store may record the family's ids on its own
+    /// ([`Self::billing_family_account_ids`]) — the seam for an engine that mounts no
+    /// Organizations surface, which carries ids alone and so no identity beside them.
+    /// Either source alone makes the family known; an account held by neither is outside
+    /// it.
+    pub fn billing_family(
+        &self,
+        organization: Option<&BTreeMap<String, LinkedAccountIdentity>>,
+    ) -> Option<BTreeMap<String, LinkedAccountIdentity>> {
+        if organization.is_none() && self.billing_family_account_ids.is_none() {
+            return None;
+        }
+        let mut roster: BTreeMap<String, LinkedAccountIdentity> = self
+            .billing_family_account_ids
+            .iter()
+            .flatten()
+            .map(|account_id| (account_id.clone(), LinkedAccountIdentity::default()))
+            .collect();
+        for (account_id, identity) in organization.into_iter().flatten() {
+            roster.insert(account_id.clone(), identity.clone());
+        }
+        Some(roster)
+    }
+
     /// Whether `account_id` is known NOT to be a linked account of the consolidated
-    /// billing family this store records — the decision behind "the account IDs must
+    /// billing family this store answers for — the decision behind "the account IDs must
     /// be a part of the consolidated billing family".
     ///
     /// Refusing an account needs EVIDENCE that it is outside the family, so the answer
-    /// comes from the recorded roster alone ([`Self::billing_family_account_ids`]): a
-    /// store that records no roster knows of no account that it is outside the family,
-    /// while a store whose roster IS recorded answers for every account id, since the
-    /// roster is the family and an id it does not hold is not in it.
-    pub fn is_outside_billing_family(&self, account_id: &str) -> bool {
-        self.billing_family_account_ids
-            .as_ref()
-            .is_some_and(|roster| !roster.contains(account_id))
+    /// comes from the roster alone ([`Self::billing_family`]): a store no roster is known
+    /// for knows of no account that it is outside the family, while one whose roster IS
+    /// known answers for every account id, since the roster is the family and an id it
+    /// does not hold is not in it.
+    pub fn is_outside_billing_family(
+        &self,
+        account_id: &str,
+        organization: Option<&BTreeMap<String, LinkedAccountIdentity>>,
+    ) -> bool {
+        self.billing_family(organization)
+            .is_some_and(|roster| !roster.contains_key(account_id))
     }
 
     /// The group an account is already associated with, when it is not `group_arn`.
@@ -4976,6 +5031,61 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsBillingconductorAwsbillingconductorState>)
+}
+
+/// What a linked account of the consolidated billing family is called, beside its id:
+/// the `AccountName` and `AccountEmail` a listing of the family reports for it.
+///
+/// Both are `Option`, and both absent is the identity of an account no roster carries one
+/// for: a name or an email is reported where the account's own record holds it and left
+/// absent otherwise, never invented.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkedAccountIdentity {
+    /// "The Amazon Web Services account name" (`AccountAssociationsListElement.AccountName`).
+    pub account_name: Option<String>,
+    /// "The Amazon Web Services account email" (`AccountAssociationsListElement.AccountEmail`).
+    pub account_email: Option<String>,
+}
+
+/// The linked accounts of the consolidated billing family this engine's organization has,
+/// each with the identity the organization records for it — or `None` when Organizations
+/// records no organization at all, in which case the family is not known from there.
+///
+/// An account joins a consolidated billing family in AWS Organizations and no Billing
+/// Conductor request puts one there, so the family's roster, and every account's name and
+/// email, is state the Organizations control plane owns: it is READ from that store
+/// through the one shared engine rather than derived from what this service happens to
+/// have been told. The organization's management account is one of its accounts, so it is
+/// in the roster too.
+///
+/// A one-directional, guard-free read of another service's store: it takes that store's
+/// lock, holds no other while it does and hands back owned values, so it is called with NO
+/// guard of this service's own store held. Nothing is written — membership of an
+/// organization is not something the clock makes due.
+pub fn organization_linked_accounts<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<BTreeMap<String, LinkedAccountIdentity>> {
+    let organizations =
+        ::service_com_amazonaws_organizations_awsorganizationsv20161128::state::service_state(
+            engine,
+        )?;
+    let organizations = organizations.lock();
+    organizations.organization.as_ref()?;
+    Some(
+        organizations
+            .accounts
+            .iter()
+            .map(|(account_id, account)| {
+                (
+                    account_id.clone(),
+                    LinkedAccountIdentity {
+                        account_name: Some(account.name.clone()),
+                        account_email: Some(account.email.clone()),
+                    },
+                )
+            })
+            .collect(),
+    )
 }
 
 /// The authorization decision for one call of this service's payer-gated surface: whether

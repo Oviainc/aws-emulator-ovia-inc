@@ -4,6 +4,11 @@
 //! Reads the linked accounts and the billing group each one is associated with out
 //! of state. A pure read: it writes nothing.
 //!
+//! The roster is the consolidated billing family's: the linked accounts of the payer
+//! account, with the `AccountName` and `AccountEmail` the organization records for each
+//! (`crate::state::organization_linked_accounts`), since an account joins a family in AWS
+//! Organizations and no request of this API puts one there.
+//!
 //! `BillingPeriod` selects the month to report for: each account is answered with the
 //! billing group its membership was in force for in that month
 //! (`crate::state::linked_accounts`), and an absent `BillingPeriod` means
@@ -174,6 +179,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // "list linked accounts that are linked to the payer account": the roster is the
+        // consolidated billing family's own, which AWS Organizations owns, so it is read
+        // from that store BEFORE this service's guard is taken — one lock at a time, in
+        // one direction.
+        let organization = crate::state::organization_linked_accounts(&*self.engine);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListAccountAssociationsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -215,7 +225,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(crate::state::normalize_billing_group_arn);
 
         let mut selected: Vec<(String, AccountAssociationsListElement)> = Vec::new();
-        for (account_id, group_arn) in state.linked_accounts(&billing_period) {
+        for (account_id, group_arn) in state.linked_accounts(&billing_period, organization.as_ref())
+        {
             let association_matches = match filters.association.as_deref() {
                 None => true,
                 Some(MONITORED) => group_arn.is_some(),
@@ -239,15 +250,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 continue;
             }
+            // "The Amazon Web Services account name" / "account email" — the identity the
+            // account's own record in the organization carries, reported for every element
+            // the roster holds one for and left absent (never invented) for an account no
+            // roster records one for.
+            let identity = organization
+                .as_ref()
+                .and_then(|roster| roster.get(&account_id))
+                .cloned()
+                .unwrap_or_default();
             selected.push((
                 account_id.clone(),
                 AccountAssociationsListElement {
                     account_id: Some(account_id),
                     billing_group_arn: group_arn,
-                    // The account's name and email live in Organizations, which this
-                    // emulator has not been told; absent rather than invented.
-                    account_name: None,
-                    account_email: None,
+                    account_name: identity.account_name,
+                    account_email: identity.account_email,
                 },
             ));
         }

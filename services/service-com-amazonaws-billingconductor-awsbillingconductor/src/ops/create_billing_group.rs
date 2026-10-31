@@ -210,6 +210,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateBillingGroupErrorModeled::ValidationException(refusal).into());
         }
 
+        // The consolidated billing family's roster, which AWS Organizations owns: read
+        // from that store BEFORE this service's guard is taken — one lock at a time, in
+        // one direction.
+        let organization = crate::state::organization_linked_accounts(&*self.engine);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateBillingGroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -295,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same state predicate: a group cannot be created over an account an
         // association could not add to it either.
         for account_id in &linked_account_ids {
-            if state.is_outside_billing_family(account_id) {
+            if state.is_outside_billing_family(account_id, organization.as_ref()) {
                 return Err(CreateBillingGroupErrorModeled::ValidationException(
                     crate::state::account_not_in_billing_family(
                         "AccountGrouping.LinkedAccountIds",
