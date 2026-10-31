@@ -4112,7 +4112,8 @@ pub enum TokenScope {
 /// The ONE place every list operation of this service cuts a page out of its listing, so a
 /// page boundary cannot drift between them. The rule: an absent or empty token starts at
 /// the beginning, any other token is the index of the first entry the previous page did
-/// not return and resumes there — and is refused when it is not an index into this
+/// not return and resumes there — in the one spelling a page hands an index out in
+/// ([`index_token`]) — and is refused when it is not an index into this
 /// listing; `maxResults` is how many entries the page holds, every remaining entry when
 /// the caller sent none; and the response carries a token exactly while entries remain
 /// after the page. `operation` and `scope` are what the refusal names (see [`TokenScope`]).
@@ -4130,14 +4131,29 @@ pub fn page<'entries, Entry>(
     let len = listing.len();
     let start = match next_token {
         None | Some("") => 0usize,
-        Some(token) => match token.parse::<usize>() {
-            Ok(index) if index <= len => index,
+        Some(token) => match index_token(token) {
+            Some(index) if index <= len => index,
             _ => return Err(unhandled_next_token_message(operation, scope, token)),
         },
     };
     let limit = max_results.map_or(len, |max| max.max(1) as usize);
     let end = start.saturating_add(limit).min(len);
     Ok((&listing[start..end], (end < len).then(|| end.to_string())))
+}
+
+/// The index `token` names, and `None` when it is not a spelling a page of this service
+/// ever handed out.
+///
+/// A token resumes a listing only AS THE STRING a previous page returned, and the one place
+/// a token is minted writes an index's canonical decimal (`end.to_string()`: no sign, no
+/// leading zeros). `usize::from_str` by itself admits more than that — a leading `+` and any
+/// number of leading zeros — so the parse is confirmed by rendering the index back and
+/// requiring the token to be exactly what the minting site would have written. Anything
+/// else is a token no call of this service issued, which is what its refusal says, so it is
+/// refused rather than silently read as a position (which would skip the records before it).
+fn index_token(token: &str) -> Option<usize> {
+    let index: usize = token.parse().ok()?;
+    (token == index.to_string()).then_some(index)
 }
 
 /// Why `token` resumes no page of `operation`'s listing.

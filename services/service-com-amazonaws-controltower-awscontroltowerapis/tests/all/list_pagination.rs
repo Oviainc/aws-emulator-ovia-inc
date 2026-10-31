@@ -46,21 +46,21 @@ use crate::landing_zone_lifecycle::{
 /// `@http` trait binds it to, the output member carrying its records, and the record member
 /// that identifies one record across pages.
 #[derive(Clone, Copy)]
-struct Listing {
-    operation: &'static str,
-    path: &'static str,
-    records: &'static str,
-    identity: &'static str,
+pub(crate) struct Listing {
+    pub(crate) operation: &'static str,
+    pub(crate) path: &'static str,
+    pub(crate) records: &'static str,
+    pub(crate) identity: &'static str,
     /// The published bounds of this operation's `maxResults`, which the page sizes a case
     /// drives it with are built from.
-    max_results_range: (i64, i64),
+    pub(crate) max_results_range: (i64, i64),
     /// Whether this listing is narrowed from the request, so its token only resumes for a
     /// call that repeats those members — which is what its refusal says.
-    token_scoped_to_parameters: bool,
+    pub(crate) token_scoped_to_parameters: bool,
     /// Whether an empty `nextToken` reaches the handler at all: `true` where the member is
     /// a plain `String`, `false` where its modelled pattern admits no empty value, so the
     /// front door refuses one.
-    empty_token_reaches_the_handler: bool,
+    pub(crate) empty_token_reaches_the_handler: bool,
 }
 
 /// `ListLandingZones`, whose handler held one copy of the rule.
@@ -132,7 +132,7 @@ const BASELINES: Listing = Listing {
 };
 
 /// Every listing that reaches the shared rule.
-fn listings() -> Vec<Listing> {
+pub(crate) fn listings() -> Vec<Listing> {
     vec![
         LANDING_ZONES,
         LANDING_ZONE_OPERATIONS,
@@ -144,7 +144,11 @@ fn listings() -> Vec<Listing> {
 }
 
 /// POST one listing's path with `body`, asserting the call succeeded.
-async fn list(router: &MultiServiceRouter, listing: Listing, body: serde_json::Value) -> Answer {
+pub(crate) async fn list(
+    router: &MultiServiceRouter,
+    listing: Listing,
+    body: serde_json::Value,
+) -> Answer {
     let answer = call(router, listing.path, body.clone()).await;
     assert_eq!(
         answer.status, 200,
@@ -156,7 +160,7 @@ async fn list(router: &MultiServiceRouter, listing: Listing, body: serde_json::V
 
 /// The identity of every record an answer reports, in the order reported — a page is
 /// compared as a SEQUENCE, because a token resumes an order rather than a set.
-fn identities(listing: Listing, answer: &Answer) -> Vec<String> {
+pub(crate) fn identities(listing: Listing, answer: &Answer) -> Vec<String> {
     entries(answer.get(listing.records))
         .iter()
         .map(|record| {
@@ -170,7 +174,7 @@ fn identities(listing: Listing, answer: &Answer) -> Vec<String> {
 }
 
 /// The `nextToken` an answer carries, or `None` when it reported the end of the listing.
-fn reported_token(answer: &Answer) -> Option<String> {
+pub(crate) fn reported_token(answer: &Answer) -> Option<String> {
     answer
         .body
         .get("nextToken")
@@ -180,7 +184,7 @@ fn reported_token(answer: &Answer) -> Option<String> {
 
 /// The request body a page asks for: `maxResults` and `nextToken` only where the case
 /// sends them.
-fn page_body(max_results: Option<i64>, next_token: Option<&str>) -> serde_json::Value {
+pub(crate) fn page_body(max_results: Option<i64>, next_token: Option<&str>) -> serde_json::Value {
     let mut body = serde_json::json!({});
     if let Some(max) = max_results {
         body["maxResults"] = serde_json::json!(max);
@@ -347,6 +351,21 @@ async fn the_rule_holds_over(router: &MultiServiceRouter, listing: Listing) {
     an_unhandled_token_is_refused(router, listing, population.len()).await;
 }
 
+/// The one wording every listing refuses a token no page of it handed out with — the
+/// message `state::unhandled_next_token_message` builds, read off the listing's own scope,
+/// written here once so no suite asserting this rule can drift from another.
+pub(crate) fn unhandled_token_refusal(listing: Listing, token: &str) -> String {
+    format!(
+        "nextToken {token} was not returned by a previous {} call{}",
+        listing.operation,
+        if listing.token_scoped_to_parameters {
+            " with these parameters"
+        } else {
+            ""
+        }
+    )
+}
+
 /// Assert the refusal side of the rule over one listing: a token that is not an index into
 /// a listing of `total` records is the operation's own `ValidationException`, worded the one
 /// way every listing words it.
@@ -379,15 +398,7 @@ async fn an_unhandled_token_is_refused(router: &MultiServiceRouter, listing: Lis
             (refused.status, refused.error_code.as_deref()),
             refused.body
         );
-        let expected = format!(
-            "nextToken {token} was not returned by a previous {} call{}",
-            listing.operation,
-            if listing.token_scoped_to_parameters {
-                " with these parameters"
-            } else {
-                ""
-            }
-        );
+        let expected = unhandled_token_refusal(listing, &token);
         assert_eq!(
             refused.string("message"),
             expected,
@@ -407,7 +418,7 @@ async fn an_unhandled_token_is_refused(router: &MultiServiceRouter, listing: Lis
 /// Seed every store the listings page over: the account's landing zone and the calls that
 /// append to its operation log, the control enablements and their operation log, and the
 /// baseline enablements.
-async fn seed(router: &MultiServiceRouter) {
+pub(crate) async fn seed(router: &MultiServiceRouter) {
     let created = call(
         router,
         "/create-landingzone",

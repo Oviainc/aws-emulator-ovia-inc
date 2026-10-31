@@ -113,6 +113,8 @@ mod mandatory_control_is_the_services;
 mod manifest_region_names;
 #[path = "all/minted_arn_region_segment.rs"]
 mod minted_arn_region_segment;
+#[path = "all/non_canonical_page_token_spellings.rs"]
+mod non_canonical_page_token_spellings;
 #[path = "all/one_enabled_control_per_target.rs"]
 mod one_enabled_control_per_target;
 #[path = "all/reserved_tag_keys.rs"]
