@@ -699,6 +699,13 @@ mod ipam_prefix_list_resolvers;
 mod ipam_prefix_list_resolver_targets;
 #[path = "all/ipam_routing_policy_registrations.rs"]
 mod ipam_routing_policy_registrations;
+// What `ModifyHosts` applies to the Dedicated Hosts it names, what it leaves as it was, which
+// hosts it reports unsuccessful, and what the request itself is refused for. Declared here
+// rather than in sorted position for the reason the header gives: the `modify_*` neighbourhood
+// and the tail of this file are where other suites insert their lines, and this declaration
+// lost several serialized squash merges to exactly that.
+#[path = "all/modify_hosts.rs"]
+mod modify_hosts;
 #[path = "all/launch_templates.rs"]
 mod launch_templates;
 #[path = "all/local_gateway_route_table_virtual_interface_group_associations.rs"]

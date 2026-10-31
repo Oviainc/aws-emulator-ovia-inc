@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyHosts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyHosts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyHosts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the settings the request names to the Dedicated Hosts it names — auto-placement,
+//! host recovery, host maintenance and which instance types the host supports — reporting
+//! each host it changed in `Successful` and each one it could not change in `Unsuccessful`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,299 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyHosts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyHostsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF, ALLOWS_MULTIPLE_INSTANCE_TYPES_ON,
+            INVALID_HOST_ID_MALFORMED, INVALID_PARAMETER_VALUE, MAX_RESOURCE_IDS,
+            host_instance_family, host_is_released, instance_family_is_modelled,
+            instance_type_is_modelled, invalid_request, missing_parameter, require_service_state,
+            unresolvable_host_ids_message,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — the host
+        // store is per account, not per Region, exactly as `DescribeHosts` and
+        // `ReleaseHosts` read it. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The IDs of the Dedicated Hosts to modify" (`ModifyHostsRequest$HostIds`) is a
+        // REQUIRED member, so a request naming no host has already been refused before this
+        // handler runs: what reaches here names at least one host.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyHosts"))
+        // The same ceiling the rest of this crate puts on a caller-chosen id list, charged
+        // before any per-id work is done.
+        if input.host_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "HostIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.host_ids.len()
+            )));
+        }
+
+        // "You cannot specify InstanceType and InstanceFamily in the same request"
+        // (`ModifyHostsRequest$InstanceType`): one asks for a host that supports a single
+        // instance type, the other for one that supports a whole family, so the REQUEST is
+        // what is invalid — the same refusal, with the same sentence, `AllocateHosts`
+        // answers the pair with. Either value has to name hardware EC2 offers, checked
+        // against the modelled `InstanceType` catalog, so a misspelling is refused instead
+        // of being stored as a host nothing can launch on.
+        let supported = match (
+            input.instance_type.as_deref(),
+            input.instance_family.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(invalid_request(
+                    "You cannot set both 'InstanceType' and 'InstanceFamily'.",
+                ));
+            }
+            (Some(instance_type), None) => {
+                if !instance_type_is_modelled(instance_type) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{instance_type}' for instanceType. \
+                         EC2 offers no such instance type"
+                    )));
+                }
+                Some(SupportedInstances::OneType(instance_type))
+            }
+            (None, Some(instance_family)) => {
+                if !instance_family_is_modelled(instance_family) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{instance_family}' for instanceFamily. \
+                         EC2 offers no instance type in such a family"
+                    )));
+                }
+                Some(SupportedInstances::WholeFamily(instance_family))
+            }
+            (None, None) => None,
+        };
+
+        // This operation modifies "the auto-placement setting of a Dedicated Host" and the
+        // instance types it supports (`ModifyHosts`), and those settings are these five
+        // members: a request naming none of them asks for no change at all, so there is
+        // nothing to apply.
+        if input.auto_placement.is_none()
+            && input.host_recovery.is_none()
+            && input.host_maintenance.is_none()
+            && supported.is_none()
+        {
+            return Err(missing_parameter(
+                "The request must contain the parameter autoPlacement, hostRecovery, \
+                 hostMaintenance, instanceType or instanceFamily",
+            ));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Each host is judged on its own and reported in `Unsuccessful` when the setting
+        // cannot be applied to it — "the IDs of the Dedicated Hosts that could not be
+        // modified[;] check whether the setting you requested can be used"
+        // (`ModifyHostsResult$Unsuccessful`) — so one host that cannot take the setting does
+        // not refuse the hosts beside it. The code carried is the one this service answers
+        // that same cause with elsewhere, so a client reads one code per cause whether it
+        // arrives as an error or as an unsuccessful item.
+        let mut successful: Vec<String> = Vec::new();
+        let mut unsuccessful: Vec<UnsuccessfulItem> = Vec::new();
+        let mut named: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for host_id in &input.host_ids {
+            // One id names ONE host, so an id the list repeats names that host once: the
+            // repeat is neither modified twice nor reported as a failure of its own.
+            if !named.insert(host_id.as_str()) {
+                continue;
+            }
+            let refusal = match store.dedicated_hosts.get(host_id) {
+                // An id this account holds no host for is reported as the id it is: to EC2 a
+                // host id it never issued is NOT VALID rather than merely absent, whatever
+                // its shape, so a misspelling and an id of another account read the same
+                // here as they do out of this service's other host operations — the one
+                // wording lives in `crate::state`.
+                //
+                // A released host is as unmodifiable as one that never existed: "the host ID
+                // of Dedicated Hosts that have been released can no longer be specified in
+                // another request" (`ReleaseHosts`), even though a describe still reports it.
+                None => Some((
+                    INVALID_HOST_ID_MALFORMED,
+                    unresolvable_host_ids_message([host_id.as_str()]),
+                )),
+                Some(host) if host_is_released(host) => Some((
+                    INVALID_HOST_ID_MALFORMED,
+                    unresolvable_host_ids_message([host_id.as_str()]),
+                )),
+                // "Specify this parameter to modify a Dedicated Host to support multiple
+                // instance types within its CURRENT INSTANCE FAMILY"
+                // (`ModifyHostsRequest$InstanceFamily`), and `$InstanceType` is the same
+                // modification narrowed to one type of that family — so what this operation
+                // changes is which instance types of the host's own family it supports, and a
+                // value naming another family asks for hardware this host is not. That is a
+                // fact of the host, so it is reported per host rather than refusing the
+                // whole request.
+                Some(host) => match (supported, host_instance_family(host)) {
+                    (Some(supported), Some(current)) if supported.instance_family() != current => {
+                        Some((
+                            INVALID_PARAMETER_VALUE,
+                            format!(
+                                "Invalid value '{value}' for {member}. The Dedicated Host \
+                                 '{host_id}' is configured for the instance family \
+                                 '{current}', and the instance types it supports can only be \
+                                 changed within that family",
+                                value = supported.value(),
+                                member = supported.member(),
+                            ),
+                        ))
+                    }
+                    (Some(_), None) => {
+                        return Err(Scaffolded::internal_error(format!(
+                            "the Dedicated Host '{host_id}' is stored with no instance family"
+                        )));
+                    }
+                    _ => None,
+                },
+            };
+            match refusal {
+                Some((code, message)) => unsuccessful.push(UnsuccessfulItem {
+                    resource_id: Some(host_id.clone()),
+                    error: Some(UnsuccessfulItemError {
+                        code: Some(code.to_string()),
+                        message: Some(message),
+                    }),
+                }),
+                None => successful.push(host_id.clone()),
+            }
+        }
+
+        // The settings are written to the stored host, so a later describe of it reports
+        // what this call asked for. A member the request did not carry asks for no change,
+        // so the stored value stands.
+        for host_id in &successful {
+            let Some(host) = store.dedicated_hosts.get_mut(host_id) else {
+                return Err(Scaffolded::internal_error(format!(
+                    "the Dedicated Host '{host_id}' this call judged modifiable is no longer \
+                     stored"
+                )));
+            };
+            if let Some(auto_placement) = input.auto_placement.clone() {
+                host.auto_placement = Some(auto_placement);
+            }
+            if let Some(host_recovery) = input.host_recovery.clone() {
+                host.host_recovery = Some(host_recovery);
+            }
+            if let Some(host_maintenance) = input.host_maintenance.clone() {
+                host.host_maintenance = Some(host_maintenance);
+            }
+            if let Some(supported) = supported {
+                let properties = host.host_properties.get_or_insert_with(HostProperties::default);
+                // "If the host supports multiple instance types, no instanceType is
+                // returned" (`HostProperties$InstanceType`), and the family is the member
+                // every host carries — so a host modified to a whole family reports the
+                // family alone, and one modified to a single type reports both.
+                properties.instance_type = match supported {
+                    SupportedInstances::OneType(instance_type) => Some(instance_type.to_string()),
+                    SupportedInstances::WholeFamily(_) => None,
+                };
+                properties.instance_family = Some(supported.instance_family().to_string());
+                // "If the value is on, the Dedicated Host supports multiple instance types
+                // in the instance family […] if off, the Dedicated Host supports a single
+                // instance type only" (`Host$AllowsMultipleInstanceTypes`): exactly the
+                // difference between the two modifications.
+                host.allows_multiple_instance_types = Some(
+                    match supported {
+                        SupportedInstances::OneType(_) => ALLOWS_MULTIPLE_INSTANCE_TYPES_OFF,
+                        SupportedInstances::WholeFamily(_) => ALLOWS_MULTIPLE_INSTANCE_TYPES_ON,
+                    }
+                    .to_string(),
+                );
+            }
+        }
+
+        // Read the modified hosts back OUT of the store, so the caller is told about hosts a
+        // later describe will report with the requested settings rather than about ids this
+        // handler merely listed.
+        if let Some(unapplied) = successful.iter().find(|host_id| {
+            store
+                .dedicated_hosts
+                .get(*host_id)
+                .is_none_or(|host| !carries_requested_settings(host, &input, supported))
+        }) {
+            return Err(Scaffolded::internal_error(format!(
+                "the modified Dedicated Host '{unapplied}' could not be read back with the \
+                 requested settings"
+            )));
+        }
+
+        Ok(ModifyHostsOutput {
+            successful: Some(successful),
+            unsuccessful: Some(unsuccessful),
+        })
     }
+}
+
+/// Which instance types one request asks a Dedicated Host to support: a single instance type
+/// (`ModifyHostsRequest$InstanceType`) or every type of one instance family
+/// (`$InstanceFamily`). The two members cannot be given together, so one request asks for at
+/// most one of these.
+#[derive(Debug, Clone, Copy)]
+enum SupportedInstances<'a> {
+    /// "Specify this parameter to modify a Dedicated Host to support only a specific
+    /// instance type" (`ModifyHostsRequest$InstanceType`).
+    OneType(&'a str),
+    /// "Specify this parameter to modify a Dedicated Host to support multiple instance types
+    /// within its current instance family" (`ModifyHostsRequest$InstanceFamily`).
+    WholeFamily(&'a str),
+}
+
+impl<'a> SupportedInstances<'a> {
+    /// The instance family this modification is about: the family named outright, or the
+    /// family of the one instance type named ([`crate::state::instance_family_of`]).
+    fn instance_family(self) -> &'a str {
+        match self {
+            Self::OneType(instance_type) => crate::state::instance_family_of(instance_type),
+            Self::WholeFamily(instance_family) => instance_family,
+        }
+    }
+
+    /// The value the request carried, for the message that reports it back.
+    fn value(self) -> &'a str {
+        match self {
+            Self::OneType(instance_type) => instance_type,
+            Self::WholeFamily(instance_family) => instance_family,
+        }
+    }
+
+    /// The member the value arrived in, in its wire spelling, for the same message.
+    fn member(self) -> &'static str {
+        match self {
+            Self::OneType(_) => "instanceType",
+            Self::WholeFamily(_) => "instanceFamily",
+        }
+    }
+}
+
+/// Whether `host` as it is now stored carries every setting `input` asked for.
+///
+/// The read-back check of this operation: a member the request did not carry is not compared,
+/// because it asked for no change.
+fn carries_requested_settings(
+    host: &Host,
+    input: &ModifyHostsInput,
+    supported: Option<SupportedInstances<'_>>,
+) -> bool {
+    let matches = |stored: Option<&str>, requested: Option<&str>| {
+        requested.is_none_or(|requested| stored == Some(requested))
+    };
+    let properties = host.host_properties.as_ref();
+    matches(
+        host.auto_placement.as_deref(),
+        input.auto_placement.as_deref(),
+    ) && matches(host.host_recovery.as_deref(), input.host_recovery.as_deref())
+        && matches(
+            host.host_maintenance.as_deref(),
+            input.host_maintenance.as_deref(),
+        )
+        && supported.is_none_or(|supported| {
+            properties.and_then(|properties| properties.instance_family.as_deref())
+                == Some(supported.instance_family())
+                && properties.and_then(|properties| properties.instance_type.as_deref())
+                    == match supported {
+                        SupportedInstances::OneType(instance_type) => Some(instance_type),
+                        SupportedInstances::WholeFamily(_) => None,
+                    }
+        })
 }
