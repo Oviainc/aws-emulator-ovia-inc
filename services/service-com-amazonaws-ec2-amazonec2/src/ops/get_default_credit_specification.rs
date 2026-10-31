@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDefaultCreditSpecification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDefaultCreditSpecification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDefaultCreditSpecification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's default credit option for CPU usage of ONE burstable performance
+//! instance family in the Region the request was signed for, out of this service's state
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::default_credit_specification`]), where
+//! `ModifyDefaultCreditSpecification` sets it.
+//!
+//! A family the account has never modified in that Region is reported at AWS's own default
+//! for it ([`crate::state::default_cpu_credits`]) — `standard` for T2 and `unlimited` for
+//! the later unlimited-supported families — so this is a pure REPORT: it writes nothing and
+//! cannot change what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -69,6 +70,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -137,18 +139,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDefaultCreditSpecification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDefaultCreditSpecificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDefaultCreditSpecification"))
+        // "The default credit option is set at the account level per Amazon Web Services
+        // Region" (`ModifyDefaultCreditSpecification`): the Region is the one the request
+        // was signed for, read off its SigV4 credential scope, so a caller asking in a
+        // Region the account never modified the family in is told AWS's own default for it.
+        let region = state::request_region(ctx.parts());
+
+        // The family resolved against the model's own `UnlimitedSupportedInstanceFamily`
+        // catalog, so the store is read with a modelled member rather than the request's
+        // text. That modelled enum constraint already refuses a word outside the catalog
+        // before this handler runs — with the same code and sentence, through this service's
+        // refusal override — so the refusal here is reached only if that boundary ever stops
+        // covering the member; it is EC2's `InvalidInstanceFamily`, never a 501.
+        let family = state::unlimited_supported_instance_family(&input.instance_family)
+            .ok_or_else(|| state::invalid_instance_family(&input.instance_family))?;
+
+        // A `DryRun` request that would have succeeded stops HERE, before the store is even
+        // reached, so a dry run reports nothing: "If you have the required permissions, the
+        // error response is DryRunOperation" (`DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+
+        // A REPORTING operation: the default is read out of the store and nothing is written
+        // back. The projection into the modelled shape lives on the store, so this reports
+        // exactly what the last `ModifyDefaultCreditSpecification` left — or, where there
+        // was none, AWS's own default for the family.
+        let reported = store.lock().default_credit_specification(&region, family);
+
+        Ok(GetDefaultCreditSpecificationOutput {
+            instance_family_credit_specification: Some(reported),
+        })
     }
 }

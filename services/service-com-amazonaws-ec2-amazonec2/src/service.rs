@@ -610,6 +610,11 @@ impl ErasedOperation for FinishedEnvelope {
 /// shape. A type whose EC2 wording this service has not recorded answers `None` and keeps
 /// the framework's own clause.
 ///
+/// A value outside the burstable `UnlimitedSupportedInstanceFamily` catalog is the second
+/// catalog this service has EC2's wording for: EC2 answers its own `InvalidInstanceFamily`
+/// with the sentence it words for that parameter type
+/// ([`crate::state::instance_family_refusal_message`]), keyed on that catalog the same way.
+///
 /// A `MaxResults` below the smallest page the operation publishes is the other refusal this
 /// service states: EC2 answers its own code and sentence for it, naming the value and the
 /// bound ([`crate::state::max_results_refusal`]). It is keyed on the member the constraint
@@ -628,6 +633,22 @@ fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<
             Some(Refused {
                 code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
                 message: crate::state::caller_role_refusal_message(
+                    violation.value.as_deref().unwrap_or_default(),
+                ),
+            })
+        }
+        ViolationKind::EnumValue(allowed)
+            if crate::state::is_unlimited_supported_instance_family_catalog(allowed) =>
+        {
+            // A family outside the burstable catalog is EC2's own `InvalidInstanceFamily`
+            // rather than a validation clause, in the sentence EC2 words for that parameter
+            // type ([`crate::state::instance_family_refusal_message`], which the handlers
+            // that resolve a family answer with too). The value it names is already elided
+            // to the framework's `MAX_ECHOED_VALUE`, so echoing it cannot amplify a request
+            // into an arbitrarily long response.
+            Some(Refused {
+                code: crate::state::INVALID_INSTANCE_FAMILY.to_string(),
+                message: crate::state::instance_family_refusal_message(
                     violation.value.as_deref().unwrap_or_default(),
                 ),
             })

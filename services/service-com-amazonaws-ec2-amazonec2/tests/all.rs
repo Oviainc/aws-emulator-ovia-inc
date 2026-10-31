@@ -493,6 +493,11 @@ mod create_security_group;
 mod dedicated_hosts;
 #[path = "all/default_network.rs"]
 mod default_network;
+// The account's default credit option for CPU usage of a burstable instance family, per
+// Region and per family: `ModifyDefaultCreditSpecification` and
+// `GetDefaultCreditSpecification`.
+#[path = "all/default_credit_specification.rs"]
+mod default_credit_specification;
 #[path = "all/default_network_per_region.rs"]
 mod default_network_per_region;
 // What `DeleteCarrierGateway` removes from the carrier gateway store, what it reports back,

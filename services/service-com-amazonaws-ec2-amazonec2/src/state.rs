@@ -931,6 +931,18 @@
 //! modelled `InstanceMetadataDefaultsResponse`, so `ModifyInstanceMetadataDefaults` and
 //! `GetInstanceMetadataDefaults` cannot disagree about what the account's defaults are.
 //!
+//! The DEFAULT CREDIT SPECIFICATION of a burstable instance family is a setting of a Region
+//! like the two above, with one difference: it is held per instance family rather than once
+//! — "The default credit option is set at the account level per Amazon Web Services Region,
+//! and is specified per instance family" (`ModifyDefaultCreditSpecification`). So
+//! [`ComAmazonawsEc2Amazonec2State::default_credit_specifications`] is keyed by Region and
+//! then by family, and a family with no entry is one the account has never modified there,
+//! which is reported at AWS's own default for that family ([`default_cpu_credits`]) rather
+//! than stored. [`ComAmazonawsEc2Amazonec2State::default_credit_specification`] is the one
+//! projection into the modelled `InstanceFamilyCreditSpecification` both operations answer
+//! with, so `ModifyDefaultCreditSpecification` and `GetDefaultCreditSpecification` cannot
+//! report one family's default two ways.
+//!
 //! The MANAGED RESOURCE VISIBILITY default is a single-word setting of the same kind as the
 //! snapshot one, and account-wide for the same reason this store is: "visibility settings
 //! are account-wide and affect all IAM principals uniformly"
@@ -4330,6 +4342,29 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// disagree about one Region. PRIVATE, like the single-word setting above, so those
     /// accessors are the only way in.
     ebs_encryption_by_default_regions: BTreeSet<String>,
+    /// The default credit option this account has SET for each burstable instance family,
+    /// by Region and then by instance family.
+    ///
+    /// "The default credit option is set at the account level per Amazon Web Services
+    /// Region, and is specified per instance family"
+    /// (`ModifyDefaultCreditSpecification`) — so the outer key is the Region of the request
+    /// that set it ([`request_region`]), the way the EBS encryption-by-default set above is,
+    /// and the inner key is the family. A family with no entry is one the account has never
+    /// modified there, which is reported at AWS's own default for that family
+    /// ([`default_cpu_credits`]) without storing anything; the outer map is bounded by
+    /// [`MAX_DEFAULT_CREDIT_SPECIFICATION_REGIONS`].
+    ///
+    /// Both the family and the credit option are `&'static str` so only members of the
+    /// modelled `UnlimitedSupportedInstanceFamily` catalog and of the documented
+    /// [`CPU_CREDITS_VALUES`] pair can be stored here
+    /// ([`unlimited_supported_instance_family`] and [`cpu_credits_value`] are what turn a
+    /// request's words into them), never the request's own text. Reached through
+    /// [`ComAmazonawsEc2Amazonec2State::default_credit_specification`] and
+    /// [`ComAmazonawsEc2Amazonec2State::set_default_credit_specification`], so
+    /// `ModifyDefaultCreditSpecification` and `GetDefaultCreditSpecification` cannot
+    /// disagree about one family's default. PRIVATE, like the account-level settings above,
+    /// so those accessors are the only way in.
+    default_credit_specifications: BTreeMap<String, BTreeMap<&'static str, &'static str>>,
     /// The account's EC2 Capacity Manager settings — see the module docs.
     ///
     /// ONE value rather than a map because the setting is an account-level singleton with
@@ -4660,6 +4695,10 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // No Region has EBS encryption by default turned on until something enables
             // it there, so a fresh account holds the empty set.
             ebs_encryption_by_default_regions: BTreeSet::new(),
+            // An account that has never called `ModifyDefaultCreditSpecification` has set
+            // no family's default anywhere, so every family is reported at AWS's own
+            // default for it and the map starts empty.
+            default_credit_specifications: BTreeMap::new(),
             // An account that has never called `EnableCapacityManager` has Capacity
             // Manager `disabled`, no Organizations access and no ingestion at all, which
             // is what `CapacityManagerSettings::default()` is.
@@ -36505,6 +36544,197 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn would_exceed_encryption_by_default_regions(&self, region: &str) -> bool {
         !self.ebs_encryption_by_default_regions.contains(region)
             && self.ebs_encryption_by_default_regions.len() >= MAX_ENCRYPTION_BY_DEFAULT_REGIONS
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The default credit specification of a burstable instance family
+// ---------------------------------------------------------------------------
+
+/// The credit option under which a burstable instance spends only the CPU credits it has
+/// earned: `standard` — one of the two values "Valid values are `standard` and `unlimited`"
+/// (`InstanceFamilyCreditSpecification$CpuCredits`) documents.
+pub const CPU_CREDITS_STANDARD: &str = "standard";
+
+/// The other credit option: `unlimited`, under which a burstable instance may sustain high
+/// CPU beyond the credits it has earned, from the same documented pair.
+pub const CPU_CREDITS_UNLIMITED: &str = "unlimited";
+
+/// The credit options a default credit specification can hold: "Valid values are
+/// `standard` and `unlimited`" (`InstanceFamilyCreditSpecification$CpuCredits`, and
+/// `ModifyDefaultCreditSpecificationRequest$CpuCredits` in the same words).
+///
+/// The member is a plain `String` in the model with no enum behind it, so nothing refuses a
+/// word outside this pair before a handler runs and this list is the only place the
+/// documented pair lives.
+pub const CPU_CREDITS_VALUES: [&str; 2] = [CPU_CREDITS_STANDARD, CPU_CREDITS_UNLIMITED];
+
+/// The [`CPU_CREDITS_VALUES`] member `requested` names, or `None` when it names none.
+///
+/// Answering a `&'static str` out of this module's own constants is what keeps request text
+/// out of the store, the way [`image_block_public_access_mode`] does for its catalog.
+pub fn cpu_credits_value(requested: &str) -> Option<&'static str> {
+    catalog_member(&CPU_CREDITS_VALUES, requested)
+}
+
+/// The modelled `UnlimitedSupportedInstanceFamily` member `requested` names, or `None` when
+/// it names none.
+///
+/// The catalog is the model's own generated member list, so a family the model gains is
+/// accepted without touching this module, and the stored family is always one of its
+/// members rather than the request's text. Shared because both operations that report a
+/// family's default credit option resolve the family exactly this way.
+pub fn unlimited_supported_instance_family(requested: &str) -> Option<&'static str> {
+    catalog_member(
+        crate::ops::types::UNLIMITED_SUPPORTED_INSTANCE_FAMILY_VALUES,
+        requested,
+    )
+}
+
+/// The code EC2 answers for an instance family the action does not serve:
+/// `InvalidInstanceFamily`. EC2 declares no error SHAPES at all, so every documented code
+/// is carried by the error channel ([`crate::scaffolded`]) rather than by a modelled error.
+pub const INVALID_INSTANCE_FAMILY: &str = "InvalidInstanceFamily";
+
+/// Is `allowed` the `UnlimitedSupportedInstanceFamily` catalog — the value set the model
+/// declares for the `InstanceFamily` member that names a burstable performance family?
+///
+/// The boundary's constraint walk reports a refused enum value as the value set it failed
+/// rather than as the shape that declared it, so the catalog IS how that type is recognised,
+/// exactly as [`is_caller_role_catalog`] recognises its own. EC2 words a refused value per
+/// PARAMETER TYPE, which is why the wording is keyed to the type's catalog rather than to
+/// the operation that happened to carry it.
+pub fn is_unlimited_supported_instance_family_catalog(allowed: &[String]) -> bool {
+    let catalog = crate::ops::types::UNLIMITED_SUPPORTED_INSTANCE_FAMILY_VALUES;
+    allowed.len() == catalog.len()
+        && allowed
+            .iter()
+            .zip(catalog)
+            .all(|(held, member)| held == member)
+}
+
+/// How EC2 states an instance family the burstable catalog does not hold: the family at
+/// fault, that the credit option the request is about is for burstable performance families
+/// only, and what to do about it.
+///
+/// A fixed sentence as EC2 words this refusal, with ONE variable part — the family the
+/// request named, echoed back. On the boundary's refusal path that value arrives already
+/// elided to the framework's own `MAX_ECHOED_VALUE`, so echoing it cannot amplify a request
+/// into an arbitrarily long response.
+pub fn instance_family_refusal_message(value: &str) -> String {
+    format!(
+        "The {value} instance family does not support Unlimited. Only burstable performance \
+         instance families support Unlimited. Change the instance family and try again."
+    )
+}
+
+/// Refuse an instance family outside that catalog the way EC2 does: HTTP 400
+/// [`INVALID_INSTANCE_FAMILY`] with [`instance_family_refusal_message`].
+///
+/// The modelled enum constraint already refuses such a word before a handler runs — and the
+/// service's own refusal override answers this same code and sentence for it
+/// (`crate::service`) — so a handler reaches this only if that boundary ever stops covering
+/// the member. Shared, so the two operations that resolve a family and the boundary cannot
+/// word one refusal three ways.
+pub fn invalid_instance_family<E>(value: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_INSTANCE_FAMILY,
+        400,
+        instance_family_refusal_message(value),
+    )
+}
+
+/// The one burstable family whose instances launch `standard` unless the account says
+/// otherwise: T2 — "T2 instances launch as `standard` by default", while "T3, T3a and T4g
+/// instances launch as `unlimited` by default" (Amazon EC2 User Guide, "Burstable
+/// performance instances"). Later unlimited-supported families follow T3 rather than T2,
+/// which is what [`default_cpu_credits`] answers for them.
+pub const STANDARD_BY_DEFAULT_INSTANCE_FAMILY: &str = "t2";
+
+/// How many Regions this emulator holds default credit specifications for.
+///
+/// CHOSEN, like [`MAX_ENCRYPTION_BY_DEFAULT_REGIONS`] and for the same reason: the Region
+/// comes from the caller's SigV4 credential scope, so without a ceiling a caller could set
+/// a default in unboundedly many Region names and nothing would ever reclaim the entries.
+/// An emulator storage bound, not an AWS-modelled refusal —
+/// `ModifyDefaultCreditSpecification` models no error at all.
+pub const MAX_DEFAULT_CREDIT_SPECIFICATION_REGIONS: usize = MAX_ENCRYPTION_BY_DEFAULT_REGIONS;
+
+/// AWS's own default credit option for `family`: where a family sits in an account that has
+/// never modified it — [`CPU_CREDITS_STANDARD`] for
+/// [`STANDARD_BY_DEFAULT_INSTANCE_FAMILY`] and [`CPU_CREDITS_UNLIMITED`] for every other
+/// unlimited-supported family.
+pub fn default_cpu_credits(family: &str) -> &'static str {
+    if family == STANDARD_BY_DEFAULT_INSTANCE_FAMILY {
+        CPU_CREDITS_STANDARD
+    } else {
+        CPU_CREDITS_UNLIMITED
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// The account's default credit option for `family` in `region`.
+    ///
+    /// A pure READ: a family the account has never modified there answers
+    /// [`default_cpu_credits`] without storing anything, and the setting has no clock-owed
+    /// move — the option a modify asks for is the option the next read reports — so nothing
+    /// about it changes with time and `GetDefaultCreditSpecification` cannot change what a
+    /// later caller sees.
+    pub fn default_cpu_credits_for(&self, region: &str, family: &str) -> &'static str {
+        self.default_credit_specifications
+            .get(region)
+            .and_then(|families| families.get(family).copied())
+            .unwrap_or_else(|| default_cpu_credits(family))
+    }
+
+    /// That default as the modelled `InstanceFamilyCreditSpecification` both operations
+    /// report it in.
+    ///
+    /// The ONE projection, so a modify answers exactly what a later get does. The shape is
+    /// named by its full path rather than imported at the top of this module, the way the
+    /// IMDS defaults' projection names its own.
+    pub fn default_credit_specification(
+        &self,
+        region: &str,
+        family: &'static str,
+    ) -> crate::ops::types::InstanceFamilyCreditSpecification {
+        crate::ops::types::InstanceFamilyCreditSpecification {
+            instance_family: Some(family.to_string()),
+            cpu_credits: Some(self.default_cpu_credits_for(region, family).to_string()),
+        }
+    }
+
+    /// Put the account's default credit option for `family` in `region` at `cpu_credits`,
+    /// and answer the specification as it now stands.
+    ///
+    /// `family` and `cpu_credits` are `&'static str` so only a modelled catalog member and a
+    /// documented credit option can be stored ([`unlimited_supported_instance_family`] and
+    /// [`cpu_credits_value`] are what turn a request's words into them), and the answer is
+    /// read back OUT of the store rather than echoed, so a writer reports exactly what a
+    /// later read will. Idempotent: setting a family to the option it already holds changes
+    /// nothing and answers the same specification.
+    pub fn set_default_credit_specification(
+        &mut self,
+        region: &str,
+        family: &'static str,
+        cpu_credits: &'static str,
+    ) -> crate::ops::types::InstanceFamilyCreditSpecification {
+        self.default_credit_specifications
+            .entry(region.to_string())
+            .or_default()
+            .insert(family, cpu_credits);
+        self.default_credit_specification(region, family)
+    }
+
+    /// Would setting a family's default in `region` take the store past
+    /// [`MAX_DEFAULT_CREDIT_SPECIFICATION_REGIONS`]?
+    ///
+    /// A Region the store already holds a default for costs nothing, so modifying another
+    /// family there is never refused.
+    pub fn would_exceed_default_credit_specification_regions(&self, region: &str) -> bool {
+        !self.default_credit_specifications.contains_key(region)
+            && self.default_credit_specifications.len()
+                >= MAX_DEFAULT_CREDIT_SPECIFICATION_REGIONS
     }
 }
 

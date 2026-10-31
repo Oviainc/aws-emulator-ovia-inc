@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDefaultCreditSpecification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDefaultCreditSpecification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDefaultCreditSpecification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the account's default credit option for CPU usage of ONE burstable performance
+//! instance family in the Region the request was signed for, in this service's state
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::set_default_credit_specification`]),
+//! where `GetDefaultCreditSpecification` reads it back.
+//!
+//! `CpuCredits` is a plain `String` in the model, so nothing refuses a word outside the
+//! documented pair before this handler runs: a value that is neither `standard` nor
+//! `unlimited` ([`crate::state::CPU_CREDITS_VALUES`]) is refused here with EC2's
+//! `InvalidParameterValue`, and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +80,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -130,6 +132,26 @@ impl<Eng> ModifyDefaultCreditSpecification<Eng> {
     }
 }
 
+/// The sentence EC2 answers a `CpuCredits` outside the documented pair with: it names the
+/// parameter, the two values it requires and what to do about it, and quotes no value at
+/// fault — which is why [`invalid_cpu_credits`] takes no argument.
+///
+/// A fixed sentence, as EC2 words this refusal; the pair it names is
+/// [`state::CPU_CREDITS_VALUES`], which carries the documentation citation for it.
+const INVALID_CPU_CREDITS_MESSAGE: &str = "The CpuCredits parameter requires a value of \
+                                           either Standard or Unlimited. Change the value \
+                                           and try again.";
+
+/// Refuse a `CpuCredits` outside the documented pair the way EC2 does: HTTP 400
+/// `InvalidParameterValue` with [`INVALID_CPU_CREDITS_MESSAGE`].
+///
+/// It lives here rather than in [`crate::state`] because this is the only operation that
+/// sets a family's default credit option: "each operation's own validation and orchestration
+/// stays in its `src/ops/<operation>.rs` file" (`crate::state`'s module docs).
+fn invalid_cpu_credits<E>() -> crate::scaffolded::Scaffolded<E> {
+    state::invalid_parameter_value(INVALID_CPU_CREDITS_MESSAGE)
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ModifyDefaultCreditSpecification<Eng>
 {
@@ -147,18 +169,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDefaultCreditSpecification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDefaultCreditSpecificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDefaultCreditSpecification"))
+        // "The default credit option is set at the account level per Amazon Web Services
+        // Region, and is specified per instance family": the Region is the one the request
+        // was signed for, read off its SigV4 credential scope, so setting a family's default
+        // in one Region leaves every other Region's default where it was.
+        let region = state::request_region(ctx.parts());
+
+        // The family resolved against the model's own `UnlimitedSupportedInstanceFamily`
+        // catalog, so what reaches the store is a modelled member rather than the request's
+        // text. The modelled enum constraint already refuses a word outside the catalog
+        // before this handler runs — with the same code and sentence, through this service's
+        // refusal override — so this refusal is reached only if that boundary ever stops
+        // covering the member; it is EC2's `InvalidInstanceFamily`, never a 501.
+        let family = state::unlimited_supported_instance_family(&input.instance_family)
+            .ok_or_else(|| state::invalid_instance_family(&input.instance_family))?;
+
+        // "The credit option for CPU usage of the instance family. Valid Values: standard |
+        // unlimited" (`CpuCredits`). The member is a plain `String` with no enum behind it,
+        // so this is the only place that pair can be enforced — and what is stored is the
+        // catalog's own word, never the request's text.
+        let cpu_credits = state::cpu_credits_value(&input.cpu_credits)
+            .ok_or_else(invalid_cpu_credits)?;
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // The store holds these defaults for a bounded number of Regions, and the Region
+        // comes from the caller, so a request that would push it past that ceiling is
+        // refused rather than stored. A Region the store already holds a default for costs
+        // nothing. This sits BEFORE the DryRun check, the way the other store ceilings in
+        // this crate do: DryRun asks whether the request WOULD have worked, so a request
+        // this emulator could not have carried out is answered with that reason instead.
+        if store.would_exceed_default_credit_specification_regions(&region) {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "This emulator holds default credit specifications for {} Regions, which \
+                     is as many as it stores",
+                    state::MAX_DEFAULT_CREDIT_SPECIFICATION_REGIONS
+                ),
+            ));
+        }
+
+        // DryRun sits AFTER every refusal above and BEFORE the write: the flag asks whether
+        // the request WOULD have succeeded, so one that would have been refused is refused
+        // with that reason instead, and one that would have succeeded leaves the family's
+        // default exactly where it was.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // One write, after every refusal, and the answer is read back OUT of the store
+        // rather than echoed, so the caller sees what a later `GetDefaultCreditSpecification`
+        // will see. The reported shape carries no status member — there is no state for a
+        // pending update to be reported in — so the option this call sets is the option the
+        // next read reports, which is what "you can call GetDefaultCreditSpecification and
+        // check DefaultCreditSpecification for updates" asks of the pair.
+        let specification = store.set_default_credit_specification(&region, family, cpu_credits);
+
+        Ok(ModifyDefaultCreditSpecificationOutput {
+            instance_family_credit_specification: Some(specification),
+        })
     }
 }
