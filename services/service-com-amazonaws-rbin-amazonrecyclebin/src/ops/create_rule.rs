@@ -209,17 +209,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A tag key in the namespace AWS reserves for its own tags is one the caller may
-        // not create, so a create naming one is a parameter fault answered before
-        // anything is minted. The rule's resource SELECTION (`ResourceTags`,
-        // `ExcludeResourceTags`) is not held to it: those members name tags the retained
-        // resources already carry.
-        let reserved_tag_key = crate::state::names_reserved_tag_key(
-            input.tags.iter().flatten().map(|tag| tag.key.as_str()),
-        );
-        if reserved_tag_key {
+        // A tag key or tag value in the namespace AWS reserves for its own tags is one
+        // the caller may not create, so a create naming one on either half of a tag is a
+        // parameter fault answered before anything is minted. The rule's resource
+        // SELECTION (`ResourceTags`, `ExcludeResourceTags`) is not held to it: those
+        // members name tags the retained resources already carry.
+        if let Some(half) = crate::state::reserved_tag_half(input.tags.iter().flatten()) {
             return Err(CreateRuleErrorModeled::ValidationException(
-                crate::state::reserved_tag_key_not_allowed(crate::state::TAGS_MEMBER),
+                crate::state::reserved_tag_not_allowed(crate::state::TAGS_MEMBER, half),
             )
             .into());
         }

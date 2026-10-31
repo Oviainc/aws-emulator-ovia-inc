@@ -140,9 +140,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// the rule would carry AFTERWARDS, which is why replacing the value of a key the
     /// rule already holds can never exceed it.
     ///
-    /// A key in the namespace AWS reserves for its own tags is refused outright: a caller
-    /// may not create one, so the request is a parameter fault and nothing it carried is
-    /// assigned — not even a well-formed key that travelled beside the reserved one.
+    /// A key or a value in the namespace AWS reserves for its own tags is refused
+    /// outright: a caller may not create one on either half of a tag, so the request is a
+    /// parameter fault and nothing it carried is assigned — not even a well-formed tag
+    /// that travelled beside the reserved one.
     async fn handle(
         &self,
         input: Self::Input,
@@ -150,9 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A fault in the request itself, so it is answered before the addressed rule is
         // resolved and before anything is written.
-        if crate::state::names_reserved_tag_key(input.tags.iter().map(|tag| tag.key.as_str())) {
+        if let Some(half) = crate::state::reserved_tag_half(input.tags.iter()) {
             return Err(TagResourceErrorModeled::ValidationException(
-                crate::state::reserved_tag_key_not_allowed(crate::state::TAGS_MEMBER),
+                crate::state::reserved_tag_not_allowed(crate::state::TAGS_MEMBER, half),
             )
             .into());
         }

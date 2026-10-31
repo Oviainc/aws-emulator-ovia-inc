@@ -144,10 +144,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A fault in the request itself, so it is answered before the addressed rule is
-        // resolved and before anything is removed.
-        if crate::state::names_reserved_tag_key(input.tag_keys.iter().map(String::as_str)) {
+        // resolved and before anything is removed. This door carries tag KEYS alone, so
+        // the key is the only half of a tag it can claim the reserved namespace on.
+        if crate::state::names_reserved_tag_namespace(input.tag_keys.iter().map(String::as_str)) {
             return Err(UntagResourceErrorModeled::ValidationException(
-                crate::state::reserved_tag_key_not_allowed(crate::state::TAG_KEYS_MEMBER),
+                crate::state::reserved_tag_not_allowed(
+                    crate::state::TAG_KEYS_MEMBER,
+                    crate::state::TagHalf::Key,
+                ),
             )
             .into());
         }

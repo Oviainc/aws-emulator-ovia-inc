@@ -8,6 +8,10 @@
 //! `aws:` namespace; a key that merely RESEMBLES it is the caller's own and round-trips
 //! like any other. The namespace is reserved however it is cased.
 //!
+//! The namespace covers the VALUE half of a tag as well; `tests/all/reserved_tag_values.rs`
+//! is the same rule read off that half, and shares this suite's fixtures and refusal
+//! assertion.
+//!
 //! The doors are `CreateRule$Tags`, `TagResource$Tags` and `UntagResource$TagKeys` — the
 //! three members through which a caller names a key of its own. A rule's resource
 //! SELECTION (`ResourceTags`, `ExcludeResourceTags`) is not covered: those members name
@@ -31,7 +35,7 @@ use crate::retention_rule_lifecycle::{create_rule, list_rules, retention, router
 /// The reserved prefix, and the member paths a refusal names, read off the handler-side
 /// constants so the suite cannot drift from what the service enforces.
 use service_com_amazonaws_rbin_amazonrecyclebin::state::{
-    is_reserved_tag_key, RESERVED_TAG_KEY_PREFIX, TAGS_MEMBER, TAG_KEYS_MEMBER,
+    claims_reserved_tag_namespace, RESERVED_TAG_PREFIX, TAGS_MEMBER, TAG_KEYS_MEMBER,
 };
 
 /// `TagKey` is `@length(min: 1, max: 128)`.
@@ -70,8 +74,8 @@ fn reserved_keys() -> Vec<(&'static str, String)> {
     // The prefix plus a tail that brings the key to exactly `MAX_TAG_KEY_LEN`, the
     // longest key the model admits.
     let longest = format!(
-        "{RESERVED_TAG_KEY_PREFIX}{}",
-        "k".repeat(MAX_TAG_KEY_LEN - RESERVED_TAG_KEY_PREFIX.len())
+        "{RESERVED_TAG_PREFIX}{}",
+        "k".repeat(MAX_TAG_KEY_LEN - RESERVED_TAG_PREFIX.len())
     );
     vec![
         (
@@ -114,8 +118,9 @@ fn ordinary_keys() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// A rule carrying `tags`, as `(Identifier, RuleArn)`.
-async fn rule_with_tags(
+/// A rule carrying `tags`, as `(Identifier, RuleArn)`. `pub(crate)` so the sibling suite
+/// over the other half of a tag starts from the same fixture.
+pub(crate) async fn rule_with_tags(
     router: &MultiServiceRouter,
     case: &str,
     tags: &[(String, String)],
@@ -151,7 +156,7 @@ async fn rule_with_tags(
 
 /// The tags `ListTagsForResource` reports for one rule, as `(Key, Value)` pairs sorted so
 /// the comparison does not depend on an order the service does not document.
-async fn stored_tags(router: &MultiServiceRouter, case: &str, rule_arn: &str) -> Vec<(String, String)> {
+pub(crate) async fn stored_tags(router: &MultiServiceRouter, case: &str, rule_arn: &str) -> Vec<(String, String)> {
     let (status, listed) = list_tags(router, rule_arn).await;
     assert_eq!(
         status, 200,
@@ -173,7 +178,7 @@ async fn stored_tags(router: &MultiServiceRouter, case: &str, rule_arn: &str) ->
 }
 
 /// How many retention rules this Region holds.
-async fn rule_count(router: &MultiServiceRouter, case: &str) -> usize {
+pub(crate) async fn rule_count(router: &MultiServiceRouter, case: &str) -> usize {
     let (status, listed) = list_rules(router, json!({ "ResourceType": RESOURCE_TYPE })).await;
     assert_eq!(
         status, 200,
@@ -186,10 +191,17 @@ async fn rule_count(router: &MultiServiceRouter, case: &str) -> usize {
 }
 
 /// Every refusal of this class: HTTP 400, the modelled `ValidationException`, the
-/// parameter-value fault class, and a message naming the member that carried the key and
-/// the prefix that key may not claim. Returns the message, so a caller can assert that
-/// every row of a table was refused with the SAME sentence.
-fn assert_reserved_key_refusal(case: &str, member: &str, status: u16, body: &Value) -> String {
+/// parameter-value fault class, and a message naming the member that carried the tag, the
+/// HALF of the tag that claimed the namespace (`key` or `value`) and the prefix that half
+/// may not claim. Returns the message, so a caller can assert that every row of a table
+/// was refused with the SAME sentence.
+pub(crate) fn assert_reserved_refusal(
+    case: &str,
+    member: &str,
+    half: &str,
+    status: u16,
+    body: &Value,
+) -> String {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} / {body:?}"
@@ -211,9 +223,13 @@ fn assert_reserved_key_refusal(case: &str, member: &str, status: u16, body: &Val
         "case {case:?}: expected the message to name the {member:?} member, got {stated:?}"
     );
     assert!(
-        stated.contains(RESERVED_TAG_KEY_PREFIX),
+        stated.contains(&format!("tag {half}")),
+        "case {case:?}: expected the message to name the tag {half}, got {stated:?}"
+    );
+    assert!(
+        stated.contains(RESERVED_TAG_PREFIX),
         "case {case:?}: expected the message to state the reserved prefix \
-         {RESERVED_TAG_KEY_PREFIX:?}, got {stated:?}"
+         {RESERVED_TAG_PREFIX:?}, got {stated:?}"
     );
     stated
 }
@@ -224,13 +240,13 @@ fn assert_reserved_key_refusal(case: &str, member: &str, status: u16, body: &Val
 fn the_reserved_namespace_is_claimed_by_the_prefix_in_any_casing_alone() {
     for (case, key) in reserved_keys() {
         assert!(
-            is_reserved_tag_key(&key),
+            claims_reserved_tag_namespace(&key),
             "case {case:?}: expected {key:?} to claim the reserved namespace"
         );
     }
     for (case, key) in ordinary_keys() {
         assert!(
-            !is_reserved_tag_key(&key),
+            !claims_reserved_tag_namespace(&key),
             "case {case:?}: expected {key:?} to be the caller's own key"
         );
     }
@@ -253,7 +269,7 @@ async fn tag_resource_refuses_a_reserved_tag_key_and_assigns_nothing() {
         let (status, body) = tag_resource(&router, &rule_arn, &assigned).await;
         refusals.push((
             case,
-            assert_reserved_key_refusal(case, TAGS_MEMBER, status, &body),
+            assert_reserved_refusal(case, TAGS_MEMBER, "key", status, &body),
         ));
         // Nothing of the refused call is stored: neither the reserved key nor the
         // acceptable one beside it.
@@ -280,7 +296,7 @@ async fn untag_resource_refuses_a_reserved_tag_key_and_removes_nothing() {
         let (status, body) = untag_resource(&router, &rule_arn, &named).await;
         refusals.push((
             case,
-            assert_reserved_key_refusal(case, TAG_KEYS_MEMBER, status, &body),
+            assert_reserved_refusal(case, TAG_KEYS_MEMBER, "key", status, &body),
         ));
         assert_eq!(
             stored_tags(&router, case, &rule_arn).await,
@@ -314,7 +330,7 @@ async fn create_rule_refuses_a_reserved_tag_key_and_mints_nothing() {
         .await;
         refusals.push((
             case,
-            assert_reserved_key_refusal(case, TAGS_MEMBER, status, &body),
+            assert_reserved_refusal(case, TAGS_MEMBER, "key", status, &body),
         ));
         assert_eq!(
             rule_count(&router, case).await,
@@ -368,7 +384,7 @@ async fn a_key_that_only_resembles_the_reserved_prefix_round_trips() {
 
 /// Every row of a refusal table was answered with the same sentence: the clause states
 /// the member and the reserved prefix, and echoes nothing of the key the request sent.
-fn assert_same_sentence(refusals: &[(&str, String)]) {
+pub(crate) fn assert_same_sentence(refusals: &[(&str, String)]) {
     let Some((first_case, first)) = refusals.first() else {
         panic!("a refusal table must have at least one row");
     };

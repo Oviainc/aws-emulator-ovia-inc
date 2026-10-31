@@ -170,41 +170,83 @@ pub fn upsert_tags(held: &mut Vec<Tag>, tags: Vec<Tag>) {
     }
 }
 
-/// The tag-key prefix AWS reserves for its own tags: a caller may not create, change or
-/// remove a tag whose key claims it, and a tagging API refuses such a request with its
-/// parameter-fault error.
+/// The tag prefix AWS reserves for its own tags: a caller may not create, change or
+/// remove a tag whose KEY or whose VALUE claims it, and a tagging API refuses such a
+/// request with its parameter-fault error.
 ///
 /// Source: AWS General Reference, "Tag naming limits and requirements" — the `aws:`
 /// prefix is reserved for AWS use, and tag keys and values carrying it can be neither
 /// created nor edited nor deleted through a tagging API.
 ///
-/// The model cannot express the rule — `TagKey`'s pattern admits a colon anywhere — so
-/// the boundary validator passes such a key through and every door a caller names a tag
-/// key of its OWN through is held to it here: `CreateRule$Tags`, `TagResource$Tags` and
-/// `UntagResource$TagKeys`. A rule's resource selection (`ResourceTags`,
-/// `ExcludeResourceTags`) is NOT held to it: those members select the resources a rule
-/// retains by tags those resources already carry, which creates, changes and deletes
-/// nothing.
-pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+/// The model cannot express the rule — `TagKey`'s and `TagValue`'s patterns both admit a
+/// colon anywhere — so the boundary validator passes such a key or value through and
+/// every door a caller names a tag of its OWN through is held to it here:
+/// `CreateRule$Tags` and `TagResource$Tags`, which carry both halves of a tag, and
+/// `UntagResource$TagKeys`, which carries keys alone. A rule's resource selection
+/// (`ResourceTags`, `ExcludeResourceTags`) is NOT held to it: those members select the
+/// resources a rule retains by tags those resources already carry, which creates, changes
+/// and deletes nothing.
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
 
-/// Whether `key` claims the reserved namespace.
+/// Whether `text` — one half of a tag, its key or its value — claims the reserved
+/// namespace.
 ///
 /// Compared case-INSENSITIVELY: what AWS reserves is the namespace, not one spelling of
-/// it, so a key may not claim it in any casing. The comparison is over BYTES, so a key
-/// whose leading characters are multi-byte answers `false` rather than slicing a string
-/// inside a character — correct, since a key whose leading bytes are not the prefix does
-/// not claim the namespace.
-pub fn is_reserved_tag_key(key: &str) -> bool {
-    key.as_bytes()
-        .get(..RESERVED_TAG_KEY_PREFIX.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX.as_bytes()))
+/// it, so neither half may claim it in any casing. The comparison is over BYTES, so a
+/// half whose leading characters are multi-byte answers `false` rather than slicing a
+/// string inside a character — correct, since a half whose leading bytes are not the
+/// prefix does not claim the namespace.
+pub fn claims_reserved_tag_namespace(text: &str) -> bool {
+    text.as_bytes()
+        .get(..RESERVED_TAG_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_PREFIX.as_bytes()))
 }
 
-/// Whether any of `keys` claims the reserved namespace — what the tag-writing operations
-/// check before they write anything, so a refused call leaves the rule's tags untouched
-/// however many well-formed keys travelled beside the reserved one.
-pub fn names_reserved_tag_key<'a>(keys: impl IntoIterator<Item = &'a str>) -> bool {
-    keys.into_iter().any(is_reserved_tag_key)
+/// Whether any of `halves` claims the reserved namespace — what a door carrying tag
+/// KEYS alone (`UntagResource$TagKeys`) checks before it writes anything, so a refused
+/// call leaves the rule's tags untouched however many well-formed keys travelled beside
+/// the reserved one.
+pub fn names_reserved_tag_namespace<'a>(halves: impl IntoIterator<Item = &'a str>) -> bool {
+    halves.into_iter().any(claims_reserved_tag_namespace)
+}
+
+/// The half of a tag a refusal names: the reserved namespace covers both, and a caller
+/// acts on which one of them its request claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagHalf {
+    Key,
+    Value,
+}
+
+impl TagHalf {
+    /// The word a validation clause names this half by — the modelled member names of
+    /// `Tag` are `Key` and `Value` (smithy_query(query="shape", shape="Tag")), which a
+    /// clause states in prose as "tag key" and "tag value".
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Value => "value",
+        }
+    }
+}
+
+/// The half of the first tag of `tags` that claims the reserved namespace, or `None` when
+/// no tag in the list claims it on either side.
+///
+/// A tag is checked key first, then value, so a tag claiming the namespace on both halves
+/// is reported by its key — the half a caller names a tag by. Checked over the WHOLE list
+/// before anything is written, so a refused call leaves the rule's tags untouched however
+/// many well-formed tags travelled beside the reserved one.
+pub fn reserved_tag_half<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Option<TagHalf> {
+    tags.into_iter().find_map(|tag| {
+        if claims_reserved_tag_namespace(&tag.key) {
+            Some(TagHalf::Key)
+        } else if claims_reserved_tag_namespace(&tag.value) {
+            Some(TagHalf::Value)
+        } else {
+            None
+        }
+    })
 }
 
 /// The member path a refused `Tags` is named by.
@@ -213,19 +255,22 @@ pub const TAGS_MEMBER: &str = "tags";
 /// The member path a refused `TagKeys` is named by.
 pub const TAG_KEYS_MEMBER: &str = "tagKeys";
 
-/// The modelled 400 for a request naming a tag key in the reserved namespace, in the
-/// envelope every member-level refusal of this service takes.
+/// The modelled 400 for a request naming a tag key or a tag value in the reserved
+/// namespace, in the envelope every member-level refusal of this service takes.
 ///
-/// `member` is the member that carried the key — the tag list a write assigns, or the key
-/// list a removal names. The offending key is NOT echoed back, as no other validation
-/// clause of this service echoes the value it refused; the clause states the prefix a tag
-/// key may not claim, which is the fact the caller can act on.
-pub fn reserved_tag_key_not_allowed(member: &str) -> ValidationException {
+/// `member` is the member that carried it — the tag list a write assigns, or the key list
+/// a removal names — and `half` is the half of the tag that claimed the namespace, so the
+/// clause states which side of the tag the caller must change. The offending key or value
+/// is NOT echoed back, as no other validation clause of this service echoes the value it
+/// refused; the clause states the prefix a tag may not claim, which is the fact the
+/// caller can act on.
+pub fn reserved_tag_not_allowed(member: &str, half: TagHalf) -> ValidationException {
     member_validation_failed(
         member,
         &format!(
-            "Member must not contain a tag key beginning with {RESERVED_TAG_KEY_PREFIX}, \
-             which is reserved for AWS use"
+            "Member must not contain a tag {} beginning with {RESERVED_TAG_PREFIX}, \
+             which is reserved for AWS use",
+            half.noun()
         ),
     )
 }
