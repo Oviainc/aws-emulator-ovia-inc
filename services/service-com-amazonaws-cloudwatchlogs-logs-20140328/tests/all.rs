@@ -77,6 +77,8 @@ mod event_ingestion_time_independence;
 mod event_window_selection;
 #[path = "all/export_task_account_slot.rs"]
 mod export_task_account_slot;
+#[path = "all/export_task_active_window.rs"]
+mod export_task_active_window;
 #[path = "all/export_task_cancellation.rs"]
 mod export_task_cancellation;
 #[path = "all/export_task_status_messages.rs"]

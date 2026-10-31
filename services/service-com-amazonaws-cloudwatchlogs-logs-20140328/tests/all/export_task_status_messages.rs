@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::harness::{now_ms, Logs};
+use crate::harness::{mid_export, now_ms, past_completion, Logs};
 
 /// The operations under test.
 const CANCEL: &str = "CancelExportTask";
@@ -44,18 +44,6 @@ const COMPLETED_SUCCESSFULLY: &str = "Completed successfully";
 /// The bucket every case exports to, and the log group every case exports from.
 const BUCKET: &str = "export-bucket";
 const GROUP: &str = "/export/status-messages";
-
-/// How long a case waits before treating a started task as finished: past both spans the
-/// create armed, with room for the test's own scheduling.
-fn past_completion() -> Duration {
-    Duration::from_millis(900)
-}
-
-/// How long a case waits to catch a started task mid-export: past the instant it begins
-/// moving data and well before the instant it completes.
-fn mid_export() -> Duration {
-    Duration::from_millis(375)
-}
 
 /// How a case settles the task it created.
 #[derive(Debug, Clone, Copy)]

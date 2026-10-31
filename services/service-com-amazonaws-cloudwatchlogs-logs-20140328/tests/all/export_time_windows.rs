@@ -24,8 +24,6 @@
 //! window is inverted (one millisecond, a minute, an hour). The request an issue happens to
 //! quote is one row.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use crate::harness::{base_ms, batch, group_with_stream, now_ms, Logs};
@@ -33,6 +31,10 @@ use crate::harness::{base_ms, batch, group_with_stream, now_ms, Logs};
 /// The operations under test.
 const CREATE: &str = "CreateExportTask";
 const DESCRIBE: &str = "DescribeExportTasks";
+
+/// The operation a row settles its own task with, so the next row's create is not refused the
+/// account's one active slot.
+const CANCEL: &str = "CancelExportTask";
 
 /// The modelled code a window that is no range is refused under.
 const INVALID_PARAMETER: &str = "InvalidParameterException";
@@ -42,14 +44,6 @@ const DESTINATION: &str = "export-window-bucket";
 
 /// One hour in the milliseconds `CreateExportTask$from` / `$to` carry.
 const HOUR_MS: i64 = 60 * 60 * 1_000;
-
-/// How long a case waits before treating a started task as finished: past both spans the
-/// create armed, with room for the test's own scheduling. "Each account can only have one
-/// active (RUNNING or PENDING) export task at a time", so an accepted row waits this out
-/// before the next one runs.
-fn past_completion() -> Duration {
-    Duration::from_millis(900)
-}
 
 /// The whole message CloudWatch Logs refuses a window that is not a time range with: fixed
 /// text, with the request's own `from` and `to` in its two quoted slots.
@@ -163,7 +157,9 @@ async fn a_window_that_is_a_range_is_accepted_wherever_it_sits() {
             Some(GROUP),
             "case {case:?}: the task exports from the log group the request named, got {reported}"
         );
-        tokio::time::sleep(past_completion()).await;
+        // "Each account can only have one active (RUNNING or PENDING) export task at a time",
+        // so an accepted row settles its own task before the next one runs.
+        logs.ok(CANCEL, &json!({"taskId": id})).await;
     }
 }
 

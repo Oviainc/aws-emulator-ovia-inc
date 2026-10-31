@@ -33,7 +33,7 @@ use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     ComAmazonawsCloudwatchlogsLogs20140328State, ExportTaskRecord, EXPORT_TASK_STATUS_FAILED,
 };
 
-use crate::harness::{now_ms, Logs};
+use crate::harness::{mid_export, now_ms, past_completion, Logs};
 
 /// The operations under test.
 const CANCEL: &str = "CancelExportTask";
@@ -80,18 +80,6 @@ const TASK_NOT_FOUND: &str = "The specified export task does not exist.";
 /// row of unknown ids walks and then steps past.
 const TASK_ID_MIN_LEN: usize = 1;
 const TASK_ID_MAX_LEN: usize = 512;
-
-/// How long a case waits before treating a started task as finished: past both spans the
-/// create armed, with room for the test's own scheduling.
-fn past_completion() -> Duration {
-    Duration::from_millis(900)
-}
-
-/// How long a case waits to catch a started task mid-export: past the instant it begins
-/// moving data and well before the instant it completes.
-fn mid_export() -> Duration {
-    Duration::from_millis(375)
-}
 
 /// The tasks `DescribeExportTasks` reports for `body`.
 async fn described(logs: &Logs, body: &Value) -> Vec<Value> {

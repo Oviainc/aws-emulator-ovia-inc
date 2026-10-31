@@ -23,15 +23,14 @@
 //! — including a window wholly in the past of the log group — the rows live in
 //! [`crate::export_time_windows`].
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
-use crate::harness::{now_ms, Logs};
+use crate::harness::{now_ms, past_completion, Logs};
 
 /// The operations under test.
 const CREATE: &str = "CreateExportTask";
 const DESCRIBE: &str = "DescribeExportTasks";
+const CANCEL: &str = "CancelExportTask";
 
 /// The modelled error codes the rule names.
 const NOT_FOUND: &str = "ResourceNotFoundException";
@@ -46,12 +45,6 @@ const COMPLETED: &str = "COMPLETED";
 /// The prefix a task gets when the request names none: "If you don't specify a value, the
 /// default is exportedlogs" (`CreateExportTask$destinationPrefix`).
 const DEFAULT_PREFIX: &str = "exportedlogs";
-
-/// How long a case waits before treating a started task as finished: past both spans the
-/// create armed, with room for the test's own scheduling.
-fn past_completion() -> Duration {
-    Duration::from_millis(900)
-}
 
 /// The tasks `DescribeExportTasks` reports for `body`.
 async fn described(logs: &Logs, body: &Value) -> Vec<Value> {
@@ -153,8 +146,10 @@ async fn a_created_export_task_is_reported_with_what_the_request_named() {
                 .is_some_and(|created| created >= now),
             "case {case}: the task reports when it was created, got {reported}"
         );
-        // One active task at a time, so this one is waited out before the next row runs.
-        tokio::time::sleep(past_completion()).await;
+        // One active task at a time, so this row settles its own task — the export is still
+        // under way, which is what the account's slot being held means — before the next row
+        // creates one.
+        logs.ok(CANCEL, &json!({"taskId": id})).await;
     }
 
     assert_eq!(

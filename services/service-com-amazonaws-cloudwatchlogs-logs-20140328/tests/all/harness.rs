@@ -15,6 +15,7 @@ use serde_json::Value;
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::ops::types::{Anomaly, LogEvent};
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     ComAmazonawsCloudwatchlogsLogs20140328State, ANOMALY_STATE_ACTIVE,
+    EXPORT_TASK_COMPLETION_DELAY_MS, EXPORT_TASK_RUNNING_DELAY_MS,
 };
 
 /// The region the tests' SigV4 credential scope names, so an ARN built from the request
@@ -208,6 +209,34 @@ pub fn now_ms() -> i64 {
             .as_millis(),
     )
     .expect("the epoch milliseconds fit in an i64")
+}
+
+/// Room for a test's own scheduling on top of a span the export-task clock owes, so a sleep
+/// that has to land past one of those instants does even on a loaded host.
+const EXPORT_SCHEDULING_SLACK_MS: i64 = 1_000;
+
+/// A span of the clock as a [`std::time::Duration`].
+fn span(millis: i64) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        u64::try_from(millis).expect("a span of the clock is not negative"),
+    )
+}
+
+/// How long to wait to catch a started export task mid-export: past the instant it begins
+/// moving data and well before the instant it completes.
+///
+/// Every export suite waits on the same two spans the create arms, so both waits are derived
+/// from those constants here rather than restated — or, worse, hardcoded — once per suite.
+pub fn mid_export() -> std::time::Duration {
+    span(EXPORT_TASK_RUNNING_DELAY_MS + EXPORT_SCHEDULING_SLACK_MS)
+}
+
+/// How long to wait before treating a started export task as finished: past both the spans the
+/// create armed. See [`mid_export`].
+pub fn past_completion() -> std::time::Duration {
+    span(
+        EXPORT_TASK_RUNNING_DELAY_MS + EXPORT_TASK_COMPLETION_DELAY_MS + EXPORT_SCHEDULING_SLACK_MS,
+    )
 }
 
 /// An in-window base timestamp: one hour before the ingestion clock. `PutLogEvents`

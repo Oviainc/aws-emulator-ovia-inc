@@ -23,8 +23,6 @@
 //! prefix or task name, which of the two under-way statuses the holding task is in when the
 //! second create arrives, and how that task later settles.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
@@ -32,7 +30,7 @@ use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     EXPORT_TASK_RUNNING_DELAY_MS,
 };
 
-use crate::harness::{now_ms, Logs};
+use crate::harness::{now_ms, past_completion, Logs};
 
 /// The operations under test.
 const CREATE: &str = "CreateExportTask";
@@ -58,15 +56,6 @@ const OTHER_GROUP: &str = "/export/slot-other";
 
 /// One hour, in the milliseconds `CreateExportTask$from` / `$to` carry.
 const HOUR_MS: i64 = 60 * 60 * 1_000;
-
-/// How long a case waits before treating a started task as finished: past both spans the
-/// create armed, with room for the test's own scheduling.
-fn past_completion() -> Duration {
-    Duration::from_millis(
-        u64::try_from(2 * (EXPORT_TASK_RUNNING_DELAY_MS + EXPORT_TASK_COMPLETION_DELAY_MS))
-            .expect("a span of the clock is not negative"),
-    )
-}
 
 /// A margin well beyond the spans an export is under way for, so a transition pinned this far
 /// out cannot fall due while a case makes the handful of calls it has left.

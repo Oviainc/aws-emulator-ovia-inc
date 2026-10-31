@@ -719,15 +719,21 @@ pub const EXPORT_TASK_COMPLETED_STATUS_MESSAGE: &str = "Completed successfully";
 /// after that it reaches `COMPLETED`.
 ///
 /// AWS documents no duration for an export, only that the call "is an asynchronous call",
-/// so these spans are THE EMULATOR'S OWN CHOICE: each is deliberately not zero, so a caller
-/// that reads or cancels the task straight after creating it still observes `PENDING` and
-/// the state rules that go with it. The instants both fall due at are stored on the record
-/// and never slept on.
-pub const EXPORT_TASK_RUNNING_DELAY_MS: i64 = 250;
+/// so these spans are THE EMULATOR'S OWN CHOICE. Each is a WHOLE span of the length this
+/// emulator gives a transition the clock owes, not a fraction of a client round-trip, which
+/// is what makes the statuses the model calls active observable: a caller that creates an
+/// export and then reads, cancels or polls it over one or more further API calls still finds
+/// it `PENDING` and then `RUNNING`, and so still meets the state rules those statuses carry —
+/// chief among them that "each account can only have one active (RUNNING or PENDING) export
+/// task at a time", a limit a task settling inside one round-trip could never impose. The
+/// instants both fall due at are stored on the record and never slept on.
+pub const EXPORT_TASK_RUNNING_DELAY_MS: i64 = 3_000;
 
 /// See [`EXPORT_TASK_RUNNING_DELAY_MS`]: the further span a `RUNNING` export task takes to
-/// reach `COMPLETED`.
-pub const EXPORT_TASK_COMPLETION_DELAY_MS: i64 = 250;
+/// reach `COMPLETED`. An export finishes moving data only after it has started moving it, so
+/// this span follows that one instead of overlapping it, and a task is therefore active for
+/// both of them together.
+pub const EXPORT_TASK_COMPLETION_DELAY_MS: i64 = 3_000;
 
 /// The `destinationPrefix` an export task gets when the create names none: "If you don't
 /// specify a value, the default is exportedlogs" (`CreateExportTask$destinationPrefix`).
