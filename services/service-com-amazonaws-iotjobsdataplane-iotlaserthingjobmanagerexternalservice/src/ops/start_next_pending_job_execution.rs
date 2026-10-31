@@ -89,7 +89,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{MAX_STEP_TIMEOUT_MINUTES, MIN_STEP_TIMEOUT_MINUTES, STATUS_IN_PROGRESS};
+use crate::state::STATUS_IN_PROGRESS;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -179,21 +179,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The model declares no bound on `stepTimeoutInMinutes`, but the member
-        // documents one (1..10080), so the refusal is this operation's own.
-        if let Some(minutes) = input.step_timeout_in_minutes {
-            if !(MIN_STEP_TIMEOUT_MINUTES..=MAX_STEP_TIMEOUT_MINUTES).contains(&minutes) {
-                return Err(
-                    StartNextPendingJobExecutionErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            message: Some(format!(
-                                "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, got {minutes}"
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
+        // The model declares no bound on `stepTimeoutInMinutes`, so the range the
+        // member documents is the handler's to apply — the same range
+        // `UpdateJobExecution` applies, checked by the one shared
+        // [`crate::state::check_step_timeout_minutes`]. Only that operation's member
+        // documents the cancelling value, which is what the `false` says: here every
+        // value outside the documented range is refused.
+        if let Err(reason) =
+            crate::state::check_step_timeout_minutes(input.step_timeout_in_minutes, false)
+        {
+            return Err(
+                StartNextPendingJobExecutionErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(reason),
+                    },
+                )
+                .into(),
+            );
         }
 
         // A `statusDetails` map is checked against the bounds a job execution's

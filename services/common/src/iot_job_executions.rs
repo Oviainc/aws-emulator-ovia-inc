@@ -143,6 +143,46 @@ pub fn check_status_details(details: Option<&HashMap<String, String>>) -> Result
     Ok(())
 }
 
+/// Check a request's `stepTimeoutInMinutes` against the range the member documents —
+/// [`MIN_STEP_TIMEOUT_MINUTES`]..=[`MAX_STEP_TIMEOUT_MINUTES`] ("Valid values for this
+/// parameter range from 1 to 10080") — and answer `Err` with the reason the caller
+/// reports as its modelled client error. An absent member arms and cancels nothing and
+/// is therefore always acceptable.
+///
+/// The range is the ONE rule both operations that accept the member apply, so it lives
+/// here once; what differs between them is whether
+/// [`CANCEL_STEP_TIMER_MINUTES`] is also a value the member admits, which is
+/// `cancel_accepted`: only `UpdateJobExecution$stepTimeoutInMinutes` documents it ("A
+/// value of -1 is also valid and will cancel the current step timer"), so a start that
+/// arms a timer for the first time has no timer to cancel and the value is outside its
+/// member's documented range like any other. The message names exactly what the caller's
+/// own member admits, so each operation's refusal reads as its own.
+///
+/// The model declares no `range` constraint on `StepTimeoutInMinutes`, so the framework's
+/// constraint walk reports nothing about the value and the bound is the handler's to
+/// apply.
+pub fn check_step_timeout_minutes(
+    minutes: Option<i64>,
+    cancel_accepted: bool,
+) -> Result<(), String> {
+    let Some(minutes) = minutes else {
+        return Ok(());
+    };
+    if (MIN_STEP_TIMEOUT_MINUTES..=MAX_STEP_TIMEOUT_MINUTES).contains(&minutes)
+        || (cancel_accepted && minutes == CANCEL_STEP_TIMER_MINUTES)
+    {
+        return Ok(());
+    }
+    if cancel_accepted {
+        return Err(format!(
+            "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, or {CANCEL_STEP_TIMER_MINUTES} to cancel the step timer, got {minutes}"
+        ));
+    }
+    Err(format!(
+        "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, got {minutes}"
+    ))
+}
+
 /// The `versionNumber` a freshly created execution carries: "Job execution versions
 /// are incremented each time they are updated by a device"
 /// (`JobExecution$versionNumber`), and a created execution has had no device update.

@@ -118,10 +118,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{
-    CANCEL_STEP_TIMER_MINUTES, MAX_STEP_TIMEOUT_MINUTES, MIN_STEP_TIMEOUT_MINUTES,
-    STATUS_IN_PROGRESS,
-};
+use crate::state::STATUS_IN_PROGRESS;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -237,23 +234,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The model declares no bound on `stepTimeoutInMinutes`, but the member
-        // documents 1..10080 plus -1 ("will cancel the current step timer").
-        if let Some(minutes) = input.step_timeout_in_minutes {
-            let acceptable = minutes == CANCEL_STEP_TIMER_MINUTES
-                || (MIN_STEP_TIMEOUT_MINUTES..=MAX_STEP_TIMEOUT_MINUTES).contains(&minutes);
-            if !acceptable {
-                // A bound on the request's own member: no stored execution has been
-                // read yet, so this refusal reports none.
-                return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
-                    RefusalDocument::message_only(InvalidRequestException {
-                        message: Some(format!(
-                            "stepTimeoutInMinutes must be between {MIN_STEP_TIMEOUT_MINUTES} and {MAX_STEP_TIMEOUT_MINUTES}, or {CANCEL_STEP_TIMER_MINUTES} to cancel the step timer, got {minutes}"
-                        )),
-                    }),
-                )
-                .into());
-            }
+        // The model declares no bound on `stepTimeoutInMinutes`, so the range the
+        // member documents is the handler's to apply — the same range
+        // `StartNextPendingJobExecution` applies, checked by the one shared
+        // [`crate::state::check_step_timeout_minutes`]. This member additionally
+        // documents -1 ("will cancel the current step timer"), which is what the
+        // `true` says, and the refusal it answers with names it.
+        if let Err(reason) =
+            crate::state::check_step_timeout_minutes(input.step_timeout_in_minutes, true)
+        {
+            // A bound on the request's own member: no stored execution has been
+            // read yet, so this refusal reports none.
+            return Err(UpdateJobExecutionErrorModeled::InvalidRequestException(
+                RefusalDocument::message_only(InvalidRequestException {
+                    message: Some(reason),
+                }),
+            )
+            .into());
         }
 
         let mut state = state.lock();

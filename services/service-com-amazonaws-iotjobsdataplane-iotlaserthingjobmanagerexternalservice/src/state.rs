@@ -20,8 +20,9 @@
 use crate::ops::types::{JobExecution, JobExecutionState, JobExecutionSummary};
 
 pub use service_common::iot_job_executions::{
-    check_command_parameter_names, check_status_details, is_pending_status, is_terminal_status,
-    now_epoch_seconds, transition_refusal, JobExecutionRecord, JobExecutionStore, StartedCommand,
+    check_command_parameter_names, check_status_details, check_step_timeout_minutes,
+    is_pending_status, is_terminal_status, now_epoch_seconds, transition_refusal,
+    JobExecutionRecord, JobExecutionStore, StartedCommand,
     CANCEL_STEP_TIMER_MINUTES, COMMAND_PARAMETER_NAME_PATTERN, FIRST_EXECUTION_NUMBER,
     FIRST_VERSION_NUMBER, MAX_COMMAND_PARAMETER_NAME_LEN,
     MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING, MAX_PENDING_EXECUTIONS_PER_THING,
