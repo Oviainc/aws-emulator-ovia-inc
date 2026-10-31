@@ -257,7 +257,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A keyspace whose own deletion is already in progress takes no new type, for the
         // same reason it takes no new table: it and everything in it are on their way out.
         // That is the modelled conflict — "you try to perform an action and the same or a
-        // different action is already in progress".
+        // different action is already in progress". A keyspace in any other status takes
+        // the type, including the `CREATING` its own create leaves it in.
         if keyspace.is_deleting() {
             return Err(CreateTypeErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::keyspace_deleting_rejection(&input.keyspace_name)),

@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/a_keyspace_takes_a_new_resource_before_it_settles.rs"]
+mod a_keyspace_takes_a_new_resource_before_it_settles;
 #[path = "all/auto_scaling_propagation.rs"]
 mod auto_scaling_propagation;
 #[path = "all/cdc_specification_tags_on_update.rs"]
@@ -49,6 +51,11 @@ mod get_keyspace;
 mod get_table_auto_scaling_settings_unconfigured;
 #[path = "all/keyspace_table_lifecycle.rs"]
 mod keyspace_table_lifecycle;
+// Emptied, not deleted: this suite's tests moved to
+// `all/a_keyspace_takes_a_new_resource_before_it_settles.rs` (the declaration above), and
+// the layout check requires every file under `tests/all/` to be declared here.
+#[path = "all/keyspace_takes_a_new_resource_only_when_active.rs"]
+mod keyspace_takes_a_new_resource_only_when_active;
 #[path = "all/list_keyspaces.rs"]
 mod list_keyspaces;
 #[path = "all/list_types.rs"]

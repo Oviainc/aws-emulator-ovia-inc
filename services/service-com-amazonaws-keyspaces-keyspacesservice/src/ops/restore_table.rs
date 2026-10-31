@@ -525,7 +525,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A target keyspace whose own deletion is already in progress takes no restored
         // table, for the same reason it takes no created one: it and everything in it are
         // on their way out. That is the modelled conflict — "you try to perform an action
-        // and the same or a different action is already in progress".
+        // and the same or a different action is already in progress". A target keyspace in
+        // any other status takes the restored table, including the `CREATING` its own
+        // create leaves it in.
         if target_keyspace.is_deleting() {
             return Err(RestoreTableErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::keyspace_deleting_rejection(

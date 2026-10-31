@@ -363,6 +363,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // everything in it are on their way out, so storing one would create a table that
         // vanishes with the keyspace. That is the modelled conflict — "you try to perform
         // an action and the same or a different action is already in progress".
+        //
+        // A keyspace in any OTHER status takes the table, including the `CREATING` its own
+        // create leaves it in and the `UPDATING` a replication change leaves it in: Amazon
+        // Keyspaces accepts a table into a keyspace whose creation has only just been
+        // accepted (`tests/all/a_keyspace_takes_a_new_resource_before_it_settles.rs` pins
+        // that, for this operation and for its siblings).
         if keyspace.is_deleting() {
             return Err(CreateTableErrorModeled::ConflictException(ConflictException {
                 message: Some(crate::state::keyspace_deleting_rejection(&input.keyspace_name)),
