@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 BatchCreateBillingAdjustmentRequestErrorModeled::ValidationException(
                     crate::state::validation_exception(
-                        "BILLING_ADJUSTMENTS_LIMIT_EXCEEDED",
+                        crate::state::REASON_BILLING_ADJUSTMENTS_LIMIT_EXCEEDED,
                         "billingAdjustmentRequestEntries",
                     ),
                 )
@@ -376,15 +376,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // request is created, and the entry that would have created one is
             // refused on the batch's own per-entry error channel. Re-checked per
             // entry, because one call may carry up to
-            // `BILLING_ADJUSTMENT_BATCH_LIMIT` of them.
+            // `BILLING_ADJUSTMENT_BATCH_LIMIT` of them. Worded like every other
+            // validation refusal of this channel — the modelled
+            // `ValidationExceptionReason` for a bound on billing adjustments,
+            // then the crate's own sentence for a store that is full — because a
+            // per-entry error carries no `reason` member of its own.
             if store.billing_adjustment_requests.len()
                 >= crate::state::BILLING_ADJUSTMENT_REQUEST_QUOTA
             {
                 errors.push(BatchCreateBillingAdjustmentError {
                     code: crate::state::BILLING_ADJUSTMENT_ERROR_VALIDATION.to_string(),
-                    message: format!(
-                        "this account already holds the maximum of {} billing adjustment requests",
-                        crate::state::BILLING_ADJUSTMENT_REQUEST_QUOTA
+                    message: crate::state::billing_adjustment_entry_message(
+                        crate::state::REASON_BILLING_ADJUSTMENTS_LIMIT_EXCEEDED,
+                        crate::state::store_full_message(
+                            crate::state::RESOURCE_TYPE_BILLING_ADJUSTMENT_REQUEST,
+                            crate::state::BILLING_ADJUSTMENT_REQUEST_QUOTA,
+                        ),
                     ),
                     client_token: entry.client_token.clone(),
                 });

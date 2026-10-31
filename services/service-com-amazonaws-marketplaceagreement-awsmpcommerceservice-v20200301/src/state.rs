@@ -755,6 +755,18 @@ pub const REASON_EXCEEDED_MAXIMUM_ADJUSTMENT_AMOUNT: &str =
 /// an amount at all (the modelled `INVALID_ADJUSTMENT_AMOUNT`).
 pub const REASON_INVALID_ADJUSTMENT_AMOUNT: &str = "INVALID_ADJUSTMENT_AMOUNT";
 
+/// The `ValidationExceptionReason` for a submit that asks for more billing
+/// adjustment requests than are allowed — one call carrying more entries than
+/// [`BILLING_ADJUSTMENT_BATCH_LIMIT`], and an entry that would take the store
+/// past [`BILLING_ADJUSTMENT_REQUEST_QUOTA`].
+///
+/// The one value `ValidationExceptionReason` publishes about a bound on billing
+/// adjustments at all (`smithy_query(query="shape",
+/// shape="ValidationExceptionReason")` lists
+/// `BILLING_ADJUSTMENTS_LIMIT_EXCEEDED`), so it is the value a client branches
+/// on for either bound.
+pub const REASON_BILLING_ADJUSTMENTS_LIMIT_EXCEEDED: &str = "BILLING_ADJUSTMENTS_LIMIT_EXCEEDED";
+
 /// How many characters of an amount a request names this service accepts, for
 /// EVERY member that carries one (`adjustmentAmount`, `chargeAmount` — both
 /// target `PositiveAmountUpto8Decimals`).
@@ -4489,16 +4501,29 @@ pub fn unsupported_action() -> ValidationException {
     }
 }
 
+/// How this service states that a store already holds the most records this
+/// emulator keeps: the maximum, the kind of record (a `ResourceType` value) and
+/// what the caller can do about it.
+///
+/// The crate's ONE wording for that condition, whatever channel reports it — the
+/// modelled exception a bounded create answers ([`store_full`]) and the
+/// per-entry refusal a batch reports on its own `errors` channel state the same
+/// sentence, differing only in the number and the noun of the store that filled
+/// up.
+pub fn store_full_message(resource_type: &str, quota: usize) -> String {
+    format!(
+        "this emulator already holds the maximum of {quota} {resource_type} records; \
+         release some before creating another"
+    )
+}
+
 /// The `ThrottlingException` a create answers when its store already holds the
 /// most records the emulator keeps: the request is declined, and nothing is
 /// stored, rather than letting state grow without end.
 pub fn store_full(resource_type: &str, quota: usize) -> ThrottlingException {
     ThrottlingException {
         request_id: Some(next_request_id()),
-        message: Some(format!(
-            "this emulator already holds the maximum of {quota} {resource_type} records; \
-             release some before creating another"
-        )),
+        message: Some(store_full_message(resource_type, quota)),
     }
 }
 

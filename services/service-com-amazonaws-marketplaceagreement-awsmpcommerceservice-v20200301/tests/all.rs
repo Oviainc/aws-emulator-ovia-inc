@@ -29,6 +29,8 @@ mod agreement_lifecycle;
 mod agreement_parties;
 #[path = "all/agreement_renewals.rs"]
 mod agreement_renewals;
+#[path = "all/billing_adjustment_entry_reasons.rs"]
+mod billing_adjustment_entry_reasons;
 #[path = "all/billing_adjustments.rs"]
 mod billing_adjustments;
 #[path = "all/cancellation_request_decisions.rs"]
