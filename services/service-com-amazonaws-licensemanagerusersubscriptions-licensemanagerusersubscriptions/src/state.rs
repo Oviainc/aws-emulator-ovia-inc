@@ -24,9 +24,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Filter, IdentityProvider, IdentityProviderSummary, InstanceSummary, InstanceUserSummary,
-    LicenseServer, LicenseServerEndpoint, LicenseServerSettings, ProductUserSummary, ServerEndpoint,
-    Settings, SERVER_TYPE_VALUES,
+    CredentialsProvider, Filter, IdentityProvider, IdentityProviderSummary, InstanceSummary,
+    InstanceUserSummary, LicenseServer, LicenseServerEndpoint, LicenseServerSettings,
+    ProductUserSummary, ServerEndpoint, ServerSettings, Settings, SERVER_TYPE_VALUES,
 };
 
 /// The status a registration carries while its VPC endpoints are being provisioned.
@@ -2610,6 +2610,39 @@ pub fn names_other_option(named: Option<&str>, stored: Option<&str>) -> bool {
 /// neither narrows what was resolved.
 pub fn names_other_domain(named: Option<&str>, stored: Option<&str>) -> bool {
     names_other_option(domain_key(named).as_deref(), domain_key(stored).as_deref())
+}
+
+/// The license-server settings a request NAMES, reduced to one comparable value.
+///
+/// `LicenseServerSettings` is a tree of structures and unions — the type of license server
+/// and, under it, the credentials provider license-server user administration runs
+/// through — and every part of it is a `@required` member of what the endpoint was BUILT
+/// from, not a comment on an endpoint that already exists. So settings that are not a
+/// stored endpoint's name no endpoint this service holds, which is the decision
+/// [`names_other`] makes for a member addressed on its own.
+///
+/// The ONE place that tree is reduced to a value two of them can be compared by, so no
+/// resolution can compare one part of it and ignore the rest.
+pub fn license_server_settings_key(settings: &LicenseServerSettings) -> String {
+    let ServerSettings::RdsSalSettings(rds_sal) = &settings.server_settings;
+    format!(
+        "{}/RdsSalSettings/{}",
+        settings.server_type,
+        credentials_provider_key(&rds_sal.rds_sal_credentials_provider)
+    )
+}
+
+/// One `CredentialsProvider` reference, reduced for the same comparison: the union member
+/// the request chose and the secret that member names.
+///
+/// `SecretsManagerCredentialsProvider$SecretId` is not `@required`, so a provider that
+/// names no secret is its own value rather than equal to one that names any secret id.
+pub fn credentials_provider_key(provider: &CredentialsProvider) -> String {
+    let CredentialsProvider::SecretsManagerCredentialsProvider(secret) = provider;
+    match secret.secret_id.as_deref() {
+        Some(secret_id) => format!("SecretsManagerCredentialsProvider/secret/{secret_id}"),
+        None => "SecretsManagerCredentialsProvider/no-secret".to_string(),
+    }
 }
 
 /// The identity of the product subscription a request addresses, or a record holds.

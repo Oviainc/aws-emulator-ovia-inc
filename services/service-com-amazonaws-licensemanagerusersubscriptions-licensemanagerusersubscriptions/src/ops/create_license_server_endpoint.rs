@@ -21,6 +21,18 @@
 //! is also what schedules that owed transition — so the pending guard comes with the
 //! write rather than from a second call here.
 //!
+//! `@idempotent` makes a REPEAT create for a pair state already holds an endpoint for
+//! answer with that endpoint instead of minting a second one — a repeat of the create
+//! that minted it, that is. `LicenseServerSettings` is what the endpoint was built from
+//! (its `ServerSettings` carry the credentials provider license-server user
+//! administration runs through), so a request whose settings are not the stored
+//! endpoint's names no endpoint state holds
+//! ([`crate::state::license_server_settings_key`], the one place those settings are
+//! compared): the pair is taken by an endpoint built from other settings, and this
+//! surface has neither a second endpoint for one pair nor an update for the endpoint it
+//! holds, so the request is refused with the modelled `ConflictException` rather than
+//! answered — and told nothing changed — against a record it does not name.
+//!
 //! The license servers reached through the endpoint are provisioned here too — one host
 //! per subnet the resolved registration provisions into — and persisted with the record,
 //! so `ListLicenseServerEndpoints` reports the same hosts, and the same addresses, on
@@ -196,15 +208,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `@idempotent`: a repeat create for the same (identity provider, server type)
-        // answers with the endpoint already in state instead of minting a second one.
-        // The endpoint's tags are therefore whatever the create that MINTED the record
-        // supplied; a repeat request's `Tags` map does not re-tag it, because the repeat
-        // creates nothing (use `TagResource` to change an existing endpoint's tags).
+        // answers with the endpoint already in state instead of minting a second one —
+        // but only when it really is a repeat of the create that MINTED that endpoint.
+        // `LicenseServerSettings` is what the endpoint was built from, so settings that
+        // are not the stored endpoint's name no endpoint state holds
+        // (`crate::state::license_server_settings_key`): the pair is taken by an endpoint
+        // built from other settings, and this surface has neither a second endpoint for
+        // the pair nor an update for the one it holds, so such a request conflicts with
+        // the endpoint in state rather than being answered against a record it does not
+        // name. `Tags` are not part of which endpoint a request names — they are written
+        // and read on the tagging surface, with its own operations — so the endpoint's
+        // tags are whatever the create that minted the record supplied; a repeat
+        // request's `Tags` map does not re-tag it, because the repeat creates nothing
+        // (use `TagResource` to change an existing endpoint's tags).
         let key = (input.identity_provider_arn.clone(), server_type.clone());
-        if let Some(existing) = state.license_server_endpoint_index.get(&key) {
+        if let Some(existing) = state.license_server_endpoint_index.get(&key).cloned() {
+            let named = crate::state::license_server_settings_key(&input.license_server_settings);
+            let names_other_endpoint = state
+                .license_server_endpoints
+                .get(&existing)
+                .is_none_or(|record| {
+                    crate::state::license_server_settings_key(&record.settings) != named
+                });
+            if names_other_endpoint {
+                return Err(settings_conflict(&server_type, &existing));
+            }
             return Ok(CreateLicenseServerEndpointOutput {
                 identity_provider_arn: Some(input.identity_provider_arn.clone()),
-                license_server_endpoint_arn: Some(existing.clone()),
+                license_server_endpoint_arn: Some(existing),
             });
         }
 
@@ -273,6 +304,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn identity_provider_not_valid() -> CreateLicenseServerEndpointError {
     CreateLicenseServerEndpointErrorModeled::ValidationException(ValidationException {
         message: Some(crate::state::IDENTITY_PROVIDER_NOT_VALID.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ConflictException` for a create whose `(IdentityProviderArn, ServerType)`
+/// pair already carries an endpoint built from OTHER `LicenseServerSettings`: the request
+/// conflicts with the state that endpoint is in, exactly as a second registration for an
+/// occupied `(identity provider, product)` pair conflicts with the registration in state.
+///
+/// It names the endpoint the pair holds and nothing out of the settings themselves — that
+/// payload is a reference to a credentials secret.
+fn settings_conflict(server_type: &str, existing: &str) -> CreateLicenseServerEndpointError {
+    CreateLicenseServerEndpointErrorModeled::ConflictException(ConflictException {
+        message: Some(format!(
+            "the identity provider already has a {server_type} license server endpoint as \
+             {existing}, created with other license server settings"
+        )),
     })
     .into()
 }

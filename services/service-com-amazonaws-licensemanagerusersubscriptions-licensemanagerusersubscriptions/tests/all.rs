@@ -41,6 +41,8 @@ mod instance_status_check_date;
 mod instances_come_from_the_ec2_fleet;
 #[path = "all/license_based_subscription_expiry.rs"]
 mod license_based_subscription_expiry;
+#[path = "all/license_server_endpoint_create_names_its_settings.rs"]
+mod license_server_endpoint_create_names_its_settings;
 #[path = "all/license_server_endpoint_delete_resolution.rs"]
 mod license_server_endpoint_delete_resolution;
 #[path = "all/license_server_endpoint_deletion.rs"]
