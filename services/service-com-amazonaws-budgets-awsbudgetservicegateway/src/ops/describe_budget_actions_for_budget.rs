@@ -215,11 +215,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MaxResults`' own `@range(max: 100)` ([`crate::state::MAX_RESULTS_CEILING`]).
         let (page, next_token) = crate::state::page(
             &actions,
-            Some(crate::state::page_size(
+            crate::state::page_size(
                 input.max_results,
                 None,
                 crate::state::MAX_RESULTS_CEILING,
-            )),
+            ),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {

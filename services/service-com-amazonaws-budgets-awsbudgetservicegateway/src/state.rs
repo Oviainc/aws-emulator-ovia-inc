@@ -1626,17 +1626,16 @@ pub fn decode_next_token(token: &str) -> Option<usize> {
 
 /// One page of `items`, plus the token for the page after it.
 ///
-/// `max_results` is the EFFECTIVE page size: the modelled `@paginated` page size (already
-/// range-checked at the boundary), resolved by [`page_size`] against the default and the
-/// ceiling the calling operation's own `MaxResults` member documents, so the page it
-/// serves is one AWS can produce. `None` means "every remaining item", which is what a
-/// list with no page size at all is served. `next_token` is the token a previous page
-/// returned. `None` is returned when `next_token` does not decode, or decodes to an
-/// offset this list never had a page at — which the caller reports as
-/// `InvalidNextTokenException`.
+/// `max_results` is the EFFECTIVE page size, and the only shape it takes: whatever the
+/// request named (or did not), [`page_size`] has already resolved it against the default
+/// and the ceiling the calling operation's own `MaxResults` member documents, so the page
+/// this serves is one AWS can produce and no caller resolves that size itself.
+/// `next_token` is the token a previous page returned. `None` is returned when
+/// `next_token` does not decode, or decodes to an offset this list never had a page at —
+/// which the caller reports as `InvalidNextTokenException`.
 pub fn page<T: Clone>(
     items: &[T],
-    max_results: Option<i32>,
+    max_results: i32,
     next_token: Option<&str>,
 ) -> Option<(Vec<T>, Option<String>)> {
     let start = match next_token {
@@ -1652,13 +1651,11 @@ pub fn page<T: Clone>(
         }
         None => 0,
     };
-    let per_page = match max_results {
-        // At least one item per page: a zero page would hand back a token pointing at
-        // the same offset, which is a caller loop that never terminates. The modelled
-        // `@range(min: 1)` already makes this unreachable from the wire.
-        Some(max) => usize::try_from(max).unwrap_or(1).max(1),
-        None => items.len(),
-    };
+    // At least one item per page: a zero page would hand back a token pointing at the
+    // same offset, which is a caller loop that never terminates. [`page_size`] already
+    // clamps to at least one, so this only restates that floor for a negative width no
+    // resolution can produce.
+    let per_page = usize::try_from(max_results).unwrap_or(1).max(1);
     let end = start.saturating_add(per_page).min(items.len());
     let next = (end < items.len()).then(|| encode_next_token(end));
     Some((items[start..end].to_vec(), next))

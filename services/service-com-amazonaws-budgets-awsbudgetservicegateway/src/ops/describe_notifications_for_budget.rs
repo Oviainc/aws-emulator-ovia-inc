@@ -212,9 +212,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|held| crate::state::project_notification(&budget, &held.notification))
             .collect();
+        // `MaxResults` documents no default here, so an absent one is served the biggest
+        // page this operation can report: its own `@range(max: 100)`
+        // ([`crate::state::MAX_RESULTS_CEILING`]), which is at least as many
+        // notifications as one budget holds.
         let (page, next_token) = crate::state::page(
             &notifications,
-            input.max_results,
+            crate::state::page_size(
+                input.max_results,
+                None,
+                crate::state::MAX_RESULTS_CEILING,
+            ),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {

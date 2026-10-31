@@ -6,9 +6,10 @@
 //!
 //! RULE: a paginated read whose `MaxResults` member documents a default page size
 //! serves at most that many entries to a request that names none, and a `NextToken`
-//! while entries remain; a read whose member documents no default serves every
-//! remaining entry. Each test asserts that over a table of operations and page sizes,
-//! not one request.
+//! while entries remain; a read whose member documents no default serves a full page at
+//! that member's published `@range(max)` — every remaining entry, for the lists this
+//! suite pages, which are shorter than that maximum. Each test asserts that over a table
+//! of operations and page sizes, not one request.
 //!
 //! The harness (`router`, `call`, `caller_account`) is the lifecycle suite's, so every
 //! suite in this target drives the service exactly the same way.

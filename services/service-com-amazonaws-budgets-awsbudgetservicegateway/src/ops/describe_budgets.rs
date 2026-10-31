@@ -196,11 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let budgets = crate::state::budgets_for_account(&store, &input.account_id, now);
         let (page, next_token) = crate::state::page(
             &budgets,
-            Some(crate::state::page_size(
+            crate::state::page_size(
                 input.max_results,
                 Some(DEFAULT_MAX_RESULTS),
                 MAX_RESULTS_CEILING,
-            )),
+            ),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {

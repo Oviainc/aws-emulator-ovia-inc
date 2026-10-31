@@ -89,6 +89,8 @@ mod notification_threshold_identity;
 mod notification_update;
 #[path = "all/page_size_resolution.rs"]
 mod page_size_resolution;
+#[path = "all/per_notification_page_sizes.rs"]
+mod per_notification_page_sizes;
 #[path = "all/percentage_budget_limit_amount.rs"]
 mod percentage_budget_limit_amount;
 #[path = "all/request_borne_refusal_precedence.rs"]

@@ -207,11 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for is projected rather than every notification the account holds.
         let (page, next_token) = crate::state::page(
             &found,
-            Some(crate::state::page_size(
+            crate::state::page_size(
                 input.max_results,
                 Some(DEFAULT_MAX_RESULTS),
                 MAX_RESULTS_CEILING,
-            )),
+            ),
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {
