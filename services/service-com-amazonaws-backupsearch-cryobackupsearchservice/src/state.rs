@@ -228,14 +228,24 @@ pub fn export_status_refusal_message(status: &str) -> String {
 /// export job's `RUNNING` -> `COMPLETED` after `StartSearchResultExportJob`).
 ///
 /// AWS documents no duration for any of them — how long a scan or an export takes
-/// depends on the backups in scope — so this span is CHOSEN, not modelled: a few
-/// seconds, which is this emulator's span for a transition the clock owes. It replaces
-/// the sub-second span this crate used before, which a single client round trip could
-/// outrun: the span has to be long enough that a client doing what AWS supports back to
-/// back — start a job and cancel it, start a job and poll it — still finds the job in the
-/// phase the call before it put the job in, rather than past the whole scan. Nothing
-/// sleeps for it: the due instant is stored and compared against the clock.
-pub const TRANSITION_DELAY: Duration = Duration::from_secs(3);
+/// depends on the backups in scope, and the service's own scans run for far longer than
+/// anything here — so this span is CHOSEN, not modelled: a few seconds, which is this
+/// emulator's span for a transition the clock owes.
+///
+/// WHICH few seconds is decided by the gap between two calls of ONE client. The phases a
+/// job walks are the window every operation that acts on a job still on its way to a
+/// terminal status has — `StopSearchJob` above all, which a job whose scan has ended
+/// refuses with a conflict — so a span the client's NEXT call can outrun turns a cancel
+/// the service accepts into that refusal, for no reason the client can see. That gap is
+/// not one round trip: a client gets its own work, its intervening calls, its retries and
+/// a loaded host in between, which is seconds and not milliseconds. So this span sits at
+/// the long end of the few seconds the emulator gives a transition it chooses — it
+/// replaces first the sub-second span this crate used (outrun by a single round trip) and
+/// then the shorter few-second one (outrun by a client whose next call came several
+/// seconds after the start) — while staying short enough that every phase is a status a
+/// poller passing through observes rather than one it waits out. Nothing sleeps for it:
+/// the due instant is stored and compared against the clock.
+pub const TRANSITION_DELAY: Duration = Duration::from_secs(5);
 
 /// How long after `StartSearchJob` the clock owes the job [`RUNNING`], i.e. how long it
 /// sits in [`CREATING`] first.
@@ -245,6 +255,10 @@ pub const TRANSITION_DELAY: Duration = Duration::from_secs(3);
 /// one [`TRANSITION_DELAY`] and the scan's terminal status is owed a further span after
 /// it: both transient phases a scan passes through are therefore observable for a whole
 /// span each, the first one by a caller acting straight after the start call.
+///
+/// The two spans TOGETHER are the window a client has to act on a job it started before
+/// the scan ends — what `StopSearchJob` is accepted in — so what each of them has to
+/// outlast is the gap between that client's two calls (see [`TRANSITION_DELAY`]).
 pub const CREATING_DELAY: Duration = TRANSITION_DELAY;
 
 /// How long a `ClientToken` of this service takes part in idempotency, measured from
