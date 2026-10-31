@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/channel_configuration_lookup_order.rs"]
 mod channel_configuration_lookup_order;
+#[path = "all/channel_configuration_pair_lookup.rs"]
+mod channel_configuration_pair_lookup;
 #[path = "all/channel_configuration_workspace_precondition.rs"]
 mod channel_configuration_workspace_precondition;
 #[path = "all/channel_role_account.rs"]
