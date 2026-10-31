@@ -304,21 +304,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Every table of the keyspace is replicated to the added Region(s), so a table
-        // that is itself mid-change makes this the modelled conflict, exactly as a
-        // keyspace that is not `ACTIVE` does above.
-        if let Some(busy) = keyspace
-            .tables
-            .values()
-            .find(|table| table.status != crate::state::TABLE_STATUS_ACTIVE)
-        {
+        // Every table of the keyspace is replicated to the added Region(s), and so is
+        // every user-defined type a table of it uses, so a resource of the keyspace that
+        // is not settled makes this the modelled conflict, exactly as a keyspace that is
+        // not `ACTIVE` does above. Which resource that is comes from the keyspace itself
+        // ([`crate::state::Keyspace::resource_not_active`]) rather than from a scan this
+        // handler walks over one kind of resource only — the same way the other
+        // keyspace-wide write, `DeleteKeyspace`, asks its own question of the keyspace.
+        if let Some((kind, name, status)) = keyspace.resource_not_active() {
             return Err(UpdateKeyspaceErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
-                    "Table '{}.{}' is in status {} and the keyspace cannot be replicated \
-                     to another Region until every table is {}.",
+                    "{kind} '{}.{name}' is in status {status} and the keyspace cannot be \
+                     replicated to another Region until every table and type in it is {}.",
                     input.keyspace_name,
-                    busy.table_name,
-                    busy.status,
                     crate::state::TABLE_STATUS_ACTIVE
                 )),
             })

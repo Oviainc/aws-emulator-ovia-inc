@@ -110,6 +110,8 @@ mod tagging_a_deleting_resource;
 mod type_lifecycle;
 #[path = "all/update_keyspace.rs"]
 mod update_keyspace;
+#[path = "all/update_keyspace_unsettled_resources.rs"]
+mod update_keyspace_unsettled_resources;
 #[path = "all/update_table.rs"]
 mod update_table;
 #[path = "all/update_table_add_columns_types.rs"]

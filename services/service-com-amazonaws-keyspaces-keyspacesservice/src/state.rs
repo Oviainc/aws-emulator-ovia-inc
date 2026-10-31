@@ -999,14 +999,48 @@ impl Keyspace {
     /// Tables first, then types, in each map's one total order, so the same keyspace
     /// always names the same blocking resource.
     pub fn resource_in_flight(&self) -> Option<(&'static str, &str, &str)> {
+        self.first_resource(is_in_flight_status)
+    }
+
+    /// The first resource of this keyspace that is not settled — a table or type whose
+    /// status is anything but `ACTIVE` — as the same triple
+    /// [`resource_in_flight`][Self::resource_in_flight] answers with.
+    ///
+    /// This is the WIDER question: a resource that is already `DELETING` is not settled
+    /// either, so it is named here although it is on its way out and so does not count as
+    /// in flight. A keyspace-wide change that every resource of the keyspace has to take
+    /// along with it — `UpdateKeyspace` "adds a new Amazon Web Services Region to the
+    /// keyspace ... Amazon Keyspaces is going to replicate all tables in the keyspace to
+    /// the new Region" — cannot be applied to a resource that is not settled, whichever
+    /// unsettled status that resource holds, so that is the question this answers.
+    ///
+    /// Tables first, then types, exactly as above.
+    pub fn resource_not_active(&self) -> Option<(&'static str, &str, &str)> {
+        // `ACTIVE` has the same spelling in the model's `TableStatus` and `TypeStatus`
+        // value sets, so one comparison answers for either kind of resource — as it does
+        // in [`is_in_flight_status`] for the transient statuses.
+        self.first_resource(|status| status != TABLE_STATUS_ACTIVE)
+    }
+
+    /// The first table of this keyspace whose status `blocked` answers true for, else the
+    /// first such type: what kind it is (`"Table"` or `"Type"`), its name, and that
+    /// status.
+    ///
+    /// The ONE walk over a keyspace's resources the questions above are asked through, so
+    /// they differ only in the predicate and can never disagree about which resource of a
+    /// keyspace they name.
+    fn first_resource(
+        &self,
+        blocked: impl Fn(&str) -> bool,
+    ) -> Option<(&'static str, &str, &str)> {
         self.tables
             .values()
-            .find(|table| is_in_flight_status(&table.status))
+            .find(|table| blocked(&table.status))
             .map(|table| ("Table", table.table_name.as_str(), table.status.as_str()))
             .or_else(|| {
                 self.types
                     .values()
-                    .find(|udt| is_in_flight_status(&udt.status))
+                    .find(|udt| blocked(&udt.status))
                     .map(|udt| ("Type", udt.type_name.as_str(), udt.status.as_str()))
             })
     }
