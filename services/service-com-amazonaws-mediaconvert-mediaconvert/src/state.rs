@@ -67,7 +67,9 @@
 //! * `ListJobs` orders the jobs, over at most `MAX_JOBS` records, and returns at most
 //!   one page of twenty, through [`page_of_jobs`]. `SearchJobs` goes through the same
 //!   function, over the same bounded record set, with the input-file test
-//!   ([`JobRecord::matches_input_file`]) narrowing it further. `StartJobsQuery` walks the same record
+//!   ([`JobRecord::matches_input_file`]) narrowing it further; which jobs the filters either
+//!   of them carries keep is [`jobs_matching`], the one place that states that set.
+//!   `StartJobsQuery` walks the same record
 //!   set ONCE, when the query is started, evaluating at most [`MAX_JOBS_QUERY_TERMS`]
 //!   filter terms per record, and stores only the one page of ids it selected; no later
 //!   call re-runs that match, so no request's cost grows with the number of stored
@@ -3426,9 +3428,10 @@ impl JobRecord {
     pub fn matches_filter(&self, key: &str, value: &str) -> bool {
         match key {
             // "Your Queue's name or ARN", so either form resolves to the name of the
-            // queue this job was sent to.
-            JOBS_QUERY_FILTER_KEY_QUEUE => self.queue == queue_name_from_reference(value),
-            JOBS_QUERY_FILTER_KEY_STATUS => self.status == value,
+            // queue this job was sent to, and the name is then compared by the one test
+            // every jobs reader narrowing on a queue takes.
+            JOBS_QUERY_FILTER_KEY_QUEUE => self.matches_queue(queue_name_from_reference(value)),
+            JOBS_QUERY_FILTER_KEY_STATUS => self.matches_status(value),
             // "Your input file URL, or PARTIAL input file name" — so a containment test
             // over the inputs' `FileInput`, not an equality one.
             JOBS_QUERY_FILTER_KEY_FILE_INPUT => self.matches_input_file(value),
@@ -3453,6 +3456,32 @@ impl JobRecord {
             // refused it.
             _ => false,
         }
+    }
+
+    /// Whether this job was sent to the queue `name` names.
+    ///
+    /// Every jobs reader that narrows on a queue takes this one test — `ListJobs`'s and
+    /// `SearchJobs`'s `queue` members, through [`jobs_matching`], and the jobs query's
+    /// `queue` filter key — so the comparison is against the queue NAME stored on the job,
+    /// exactly as its creator wrote it, and the three cannot drift apart. Which members
+    /// may arrive as an ARN instead is each member's own documentation, so reducing a
+    /// reference to a name stays with the reader that read it
+    /// ([`queue_name_from_reference`]) and is never done to a value a member offers only
+    /// the name form of.
+    pub fn matches_queue(&self, name: &str) -> bool {
+        self.queue == name
+    }
+
+    /// Whether this job's current status is `status`.
+    ///
+    /// The one status test every jobs reader takes, for the same reason
+    /// [`Self::matches_queue`] is one: `ListJobs`'s and `SearchJobs`'s `status` members,
+    /// through [`jobs_matching`], and the jobs query's `status` filter key. It compares
+    /// against the status the record carries NOW — the one [`Self::view`] reports, after
+    /// the clock's due transitions have been materialised — so no reader reports a job
+    /// under a status another would not.
+    pub fn matches_status(&self, status: &str) -> bool {
+        self.status == status
     }
 
     /// Whether any input of this job names a file whose `FileInput` CONTAINS `needle`.
@@ -3758,6 +3787,41 @@ pub fn page_of_records<'a, R: PagedRecord>(
         records: page.to_vec(),
         next_token,
     }
+}
+
+/// The jobs the filters a paged jobs reader carries keep, out of every job the account
+/// holds.
+///
+/// ONE place that owns the SET a filtering jobs reader reports, as [`records_listed_by`]
+/// owns the set a `listBy` listing reports and [`page_of_records`] the ordering, the cursor
+/// and the page size, so no two jobs readers can drift:
+///
+/// * every filter the request carries NARROWS the set, so a job is kept only when it
+///   satisfies all of them, and a filter the request leaves out narrows nothing;
+/// * `queue` keeps the jobs sent to exactly that queue ([`JobRecord::matches_queue`]),
+///   compared by queue name — a member that also offers the ARN form is reduced to the name
+///   by the reader that read it ([`queue_name_from_reference`]), because only a member whose
+///   own documentation offers that form may be reduced;
+/// * `status` keeps the jobs in exactly that status ([`JobRecord::matches_status`]);
+/// * `input_file` keeps the jobs one of whose inputs CONTAINS it
+///   ([`JobRecord::matches_input_file`]), since such a member is "your input file URL or
+///   your partial input file name".
+///
+/// `ListJobs` and `SearchJobs` both narrow the job set here, each passing the filters its
+/// own members offer; the jobs query takes the very same three tests one at a time
+/// ([`JobRecord::matches_filter`]), because its filter list combines them with OR rather
+/// than AND.
+pub fn jobs_matching<'a>(
+    jobs: impl Iterator<Item = &'a JobRecord> + 'a,
+    queue: Option<&'a str>,
+    status: Option<&'a str>,
+    input_file: Option<&'a str>,
+) -> impl Iterator<Item = &'a JobRecord> + 'a {
+    jobs.filter(move |job| {
+        queue.is_none_or(|name| job.matches_queue(name))
+            && status.is_none_or(|want| job.matches_status(want))
+            && input_file.is_none_or(|file| job.matches_input_file(file))
+    })
 }
 
 /// The page of `jobs` a paged jobs reader reports, through [`page_of_records`].

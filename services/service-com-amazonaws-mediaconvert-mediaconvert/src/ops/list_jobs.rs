@@ -188,6 +188,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already made due at `now`, which were owed whether or not anybody polled.
         state.settle(now);
 
+        // Each filter the request carries NARROWS the job set, and which jobs that leaves
+        // is the state module's (`crate::state::jobs_matching`), shared with every other
+        // jobs reader that narrows on these details; only the FORM each of this
+        // operation's own members offers is read here.
+        //
         // "Optional. Provide a queue name to get back only jobs from that queue": this
         // member offers the NAME form only, so the value selects on the stored queue name
         // byte for byte and no other form of reference is reduced out of it. The ARN form
@@ -195,7 +200,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ("Provide a queue name, or a queue ARN") and the jobs query's `queue` filter key
         // ("Your Queue's name or ARN") — and reducing it here would also make a queue
         // whose own name is ARN-shaped unselectable, because a queue's name is stored
-        // exactly as its creator wrote it. `status` is one `JobStatus`.
+        // exactly as its creator wrote it. `status` is one `JobStatus`. This listing offers
+        // no input-file filter, so it narrows on nothing there.
         let queue = input.queue.clone();
         let status = input.status.clone();
 
@@ -212,11 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         let page = crate::state::page_of_jobs(
-            state
-                .jobs
-                .values()
-                .filter(|job| queue.as_deref().is_none_or(|name| job.queue == name))
-                .filter(|job| status.as_deref().is_none_or(|want| job.status == want)),
+            crate::state::jobs_matching(
+                state.jobs.values(),
+                queue.as_deref(),
+                status.as_deref(),
+                None,
+            ),
             input.order.as_deref(),
             resume_from.as_ref(),
             input.max_results,

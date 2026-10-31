@@ -200,9 +200,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Optionally filter results further according to input file, queue, or status":
         // each filter the request carries NARROWS the set, so a job is reported only when
-        // it satisfies every one of them.
+        // it satisfies every one of them. Which jobs that leaves is the state module's
+        // ([`crate::state::jobs_matching`]), shared with every other jobs reader that
+        // narrows on these details, so only the FORM each of this operation's own members
+        // offers is read here.
         //
-        // `queue` is "a queue name, or a queue ARN"; `status` is one `JobStatus`.
+        // `queue` is "a queue name, or a queue ARN", so a reference in either form is
+        // reduced to the queue's name before the shared test compares it.
         let queue = input
             .queue
             .as_deref()
@@ -227,16 +231,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         let page = crate::state::page_of_jobs(
-            state
-                .jobs
-                .values()
-                .filter(|job| queue.as_deref().is_none_or(|name| job.queue == name))
-                .filter(|job| status.as_deref().is_none_or(|want| job.status == want))
-                .filter(|job| {
-                    input_file
-                        .as_deref()
-                        .is_none_or(|file| job.matches_input_file(file))
-                }),
+            crate::state::jobs_matching(
+                state.jobs.values(),
+                queue.as_deref(),
+                status.as_deref(),
+                input_file.as_deref(),
+            ),
             input.order.as_deref(),
             resume_from.as_ref(),
             input.max_results,

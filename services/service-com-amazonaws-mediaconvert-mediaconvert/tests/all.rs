@@ -127,6 +127,8 @@ mod resource_projection_defaults;
 mod resource_share;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/shared_job_filters.rs"]
+mod shared_job_filters;
 #[path = "all/shared_next_token_refusal.rs"]
 mod shared_next_token_refusal;
 #[path = "all/shared_not_found_refusal.rs"]
