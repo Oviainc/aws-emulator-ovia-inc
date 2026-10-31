@@ -282,17 +282,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         let mut answer = updated_cluster_output(existing);
                         // The status this call answered: the clock settles the
                         // cluster back to `ACTIVE` and a later update moves it
-                        // again, neither of which is this request's result. A
-                        // served update always records that status, so a record
-                        // without it is refused rather than answered with the
-                        // live cluster's.
-                        let Some(status) = recorded.answered(crate::state::STATUS_MEMBER) else {
+                        // again, neither of which is this request's result. It
+                        // comes off the record through the one codec every
+                        // status-only record is written and read with
+                        // ([`crate::state::RecordedStatus`]); `None` is a record
+                        // missing the member a served update always keeps, so
+                        // there is nothing to serve here and the live cluster's
+                        // status is not it.
+                        let Some(answered) =
+                            crate::state::RecordedStatus::from_record(&recorded)
+                        else {
                             return Err(UpdateClusterErrorModeled::InternalServerException(
                                 crate::state::recorded_result_unavailable(),
                             )
                             .into());
                         };
-                        answer.status = status.to_string();
+                        answer.status = answered.status;
                         return Ok(answer);
                     }
                 }
@@ -431,8 +436,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &region,
                     token,
                     fingerprint,
-                    crate::state::RecordedCall::new(&input.identifier)
-                        .answering(crate::state::STATUS_MEMBER, &updated.status),
+                    crate::state::RecordedStatus {
+                        status: updated.status.clone(),
+                    }
+                    .into_record(&input.identifier),
                 );
         }
         Ok(updated)

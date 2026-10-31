@@ -279,16 +279,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             created_stream_output(&input.cluster_identifier, existing);
                         // The status this call answered: the clock settles the
                         // stream to `ACTIVE` afterwards, which is not what this
-                        // request produced. A served create always records that
-                        // status, so a record without it is refused rather than
-                        // answered with the live stream's.
-                        let Some(status) = recorded.answered(crate::state::STATUS_MEMBER) else {
+                        // request produced. It comes off the record through the
+                        // one codec every status-only record is written and read
+                        // with ([`crate::state::RecordedStatus`]); `None` is a
+                        // record missing the member a served create always
+                        // keeps, so there is nothing to serve here and the live
+                        // stream's status is not it.
+                        let Some(answered) =
+                            crate::state::RecordedStatus::from_record(&recorded)
+                        else {
                             return Err(CreateStreamErrorModeled::InternalServerException(
                                 crate::state::recorded_result_unavailable(),
                             )
                             .into());
                         };
-                        answer.status = status.to_string();
+                        answer.status = answered.status;
                         return Ok(answer);
                     }
                 }
@@ -374,8 +379,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &region,
                     token,
                     fingerprint,
-                    crate::state::RecordedCall::new(&stream_identifier)
-                        .answering(crate::state::STATUS_MEMBER, &created.status),
+                    crate::state::RecordedStatus {
+                        status: created.status.clone(),
+                    }
+                    .into_record(&stream_identifier),
                 );
         }
         Ok(created)

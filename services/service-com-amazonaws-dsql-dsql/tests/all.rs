@@ -89,6 +89,8 @@ mod shared_page_walk;
 mod shared_recorded_delete;
 #[path = "all/shared_recorded_policy_write.rs"]
 mod shared_recorded_policy_write;
+#[path = "all/shared_recorded_status.rs"]
+mod shared_recorded_status;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_deletion.rs"]

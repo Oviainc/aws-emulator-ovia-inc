@@ -32,7 +32,9 @@
 //! builds. The answer a served policy write keeps
 //! ([`RecordedPolicyWrite`]) lives here on the same terms — both policy writers
 //! record and read back the same version member — and so does the answer a
-//! served `CreateCluster` keeps
+//! call whose only un-derivable member is the status it reported keeps
+//! ([`RecordedStatus`]), on the same terms again, and the answer a served
+//! `CreateCluster` keeps
 //! ([`RecordedClusterCreation`]), as does the
 //! refusal every replay path gives for a record that does not hold a member the
 //! original call answered ([`recorded_result_unavailable`]), so no two of them
@@ -2707,6 +2709,43 @@ impl RecordedPolicyWrite {
     pub fn from_record(recorded: &RecordedCall) -> Option<Self> {
         Some(Self {
             policy_version: recorded.answered(POLICY_VERSION_MEMBER)?.to_string(),
+        })
+    }
+}
+
+/// What a served call whose only un-derivable answer is a status answered, as
+/// its `clientToken` ledger keeps it.
+///
+/// A status is the one member of such a call's output the store no longer
+/// determines when its retry arrives: the clock settles the resource on from the
+/// status the call reported, and a later call moves it again, so neither the
+/// status the resource carries by then nor its absence is what that request
+/// answered. So the one member these calls answer ([`STATUS_MEMBER`]) is kept on
+/// the record, and this is the one codec that writes and reads it:
+/// [`Self::into_record`] on the call that serves the request,
+/// [`Self::from_record`] on its retry. Each handler keeps only the shape of its
+/// own output — which names the resource (and, for a nested one, its parent) its
+/// own way — and lifts the missing-member refusal into its own error channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedStatus {
+    /// The status the call answered.
+    pub status: String,
+}
+
+impl RecordedStatus {
+    /// This answer as the ledger stores it, against the `resource` the call
+    /// acted on.
+    pub fn into_record(self, resource: &str) -> RecordedCall {
+        RecordedCall::new(resource).answering(STATUS_MEMBER, &self.status)
+    }
+
+    /// The answer `recorded` holds, or `None` when it does not hold the member
+    /// such a call records — a record a handler has to refuse over rather than
+    /// answer the live resource's status from, since a served call always
+    /// records the status it answered.
+    pub fn from_record(recorded: &RecordedCall) -> Option<Self> {
+        Some(Self {
+            status: recorded.answered(STATUS_MEMBER)?.to_string(),
         })
     }
 }
