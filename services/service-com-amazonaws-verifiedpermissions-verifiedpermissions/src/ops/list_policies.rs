@@ -175,6 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ]))
         })?;
 
+        // A `policyTemplateId` the caller writes is a REFERENCE to a template,
+        // not necessarily its id, so it is resolved against this store before it
+        // is matched against what the links persist — the same reading every
+        // other `policyTemplateId` member of the service gets.
+        let filter_template_id = filter_template_id(store, input.filter.as_ref());
+
         // `policies` is a `BTreeMap`, so the enumeration order is stable across
         // calls, and the page — its size, its boundary and the cursor that
         // resumes it — is built by the service's one pagination rule.
@@ -183,7 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &cursor,
             input.max_results,
             crate::state::DEFAULT_PAGE_SIZE,
-            |policy| matches_filter(policy, input.filter.as_ref()),
+            |policy| {
+                matches_filter(policy, input.filter.as_ref(), filter_template_id.as_deref())
+            },
             policy_item,
         );
 
@@ -194,9 +202,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The template id `filter.policyTemplateId` NAMES in `store`, or `None` when
+/// the filter sets no such member.
+///
+/// `PolicyFilter$policyTemplateId` targets the same `PolicyTemplateId` shape as
+/// the identifier members of `GetPolicyTemplate` and its siblings, so the
+/// reference forms a caller may write here are the same ones
+/// [`crate::state::PolicyStore::resolve_policy_template_id`] accepts: a template
+/// id, or `name/<policyTemplateName>` naming one.
+///
+/// A reference that names no template in this store is kept AS WRITTEN: it is
+/// then matched against the links' stored ids and selects nothing, which is what
+/// a filter naming a template the store does not hold selects. The model gives
+/// this member no error, so an unmatched filter is an empty page, not a refusal.
+fn filter_template_id(
+    store: &crate::state::PolicyStore,
+    filter: Option<&PolicyFilter>,
+) -> Option<String> {
+    let reference = filter?.policy_template_id.as_deref()?;
+    Some(
+        store
+            .resolve_policy_template_id(reference)
+            .unwrap_or_else(|| reference.to_string()),
+    )
+}
+
 /// Does `policy` pass `filter`? An absent filter matches everything, and every
 /// member a filter sets must match (the members are ANDed).
-fn matches_filter(policy: &crate::state::Policy, filter: Option<&PolicyFilter>) -> bool {
+///
+/// `filter_template_id` is `filter.policyTemplateId` already resolved to a
+/// template id by [`filter_template_id`], because resolving a reference needs
+/// the store and matching a policy does not.
+fn matches_filter(
+    policy: &crate::state::Policy,
+    filter: Option<&PolicyFilter>,
+    filter_template_id: Option<&str>,
+) -> bool {
     let Some(filter) = filter else {
         return true;
     };
@@ -205,7 +246,7 @@ fn matches_filter(policy: &crate::state::Policy, filter: Option<&PolicyFilter>) 
             return false;
         }
     }
-    if let Some(policy_template_id) = filter.policy_template_id.as_deref() {
+    if let Some(policy_template_id) = filter_template_id {
         // Only a template-linked policy was instantiated from a template, so
         // this member selects the policies that follow exactly that template.
         if policy.policy_template_id() != Some(policy_template_id) {
