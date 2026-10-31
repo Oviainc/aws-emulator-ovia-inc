@@ -1,0 +1,40 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cognito-identity__dynamodb.leading-keys-condition-scopes-query-to-the-callers-identity-id
+Issue-Key: cognito-identity__dynamodb.leading-keys-condition-scopes-query-to-the-callers-identity-id|_poll_until#30|Timeout|time.sleep(interval_s)
+Issue-Commit: ea226a61fd4fc055bb456ff32cf72ea13892c65d
+
+# cognito-identity__dynamodb: the dynamodb:LeadingKeys-scoped Cognito session check now reaches no verdict at all — it hangs to the 60 s harness cap (1 cause)
+
+> _Note: this issue was identified against the code base at commit `ea226a61fd4fc055bb456ff32cf72ea13892c65d`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetCredentialsForIdentity
+
+## Description
+ONE root cause (cause 1 of 1).
+
+AWS: the canonical Cognito-Identity multi-tenant flow completes synchronously, well inside a one-minute budget: CreateIdentityPool(AllowUnauthenticatedIdentities=true) -> two GetId calls minting two distinct guest IdentityIds -> CreateRole trusting cognito-identity.amazonaws.com for sts:AssumeRoleWithWebIdentity with an inline policy allowing dynamodb:Query and dynamodb:GetItem on the table under Condition ForAllValues:StringEquals {"dynamodb:LeadingKeys": ["${cognito-identity.amazonaws.com:sub}"]} -> SetIdentityPoolRoles -> GetCredentialsForIdentity, which answers a Credentials structure carrying AccessKeyId/SecretKey/SessionToken for an assumed-role session (arn:aws:sts::<account>:assumed-role/<role>/CognitoIdentityCredentials). A DynamoDB client signed with those credentials then reads its OWN partition (HTTP 200, one item) and is refused HTTP 400 AccessDeniedException on another identity's partition, with the message "User: <session arn> is not authorized to perform: dynamodb:Query on resource: <table arn> because no identity-based policy allows the dynamodb:Query action" (and the same template with dynamodb:GetItem). Every leg answers; nothing in the flow is long-running.
+Emulator: the check produces NO verdict — it is killed by the harness at the 60 s cap ("Check timed out after 60.0s"), so some leg of this flow never answers in a form the flow can proceed from. Recorded behavior only for the stall point: the check wraps three legs in poll loops with 300 s budgets (table ACTIVE, credentials carrying a SessionToken, and identity A's first own-partition Query), and any one of those never satisfying its predicate — or answering ClientError on every attempt — consumes the whole budget and is cut off at 60 s. Hypothesis (not stated by the recording): GetCredentialsForIdentity never returns Credentials with a usable SessionToken, or the DynamoDB data plane refuses every request signed with the vended session, so the own-partition poll spins; this is consistent with the open cognito-identity findings that a vended session is not an STS assumed-role session (access key ids prefixed 'EMUL'/'EMULATOR' rather than 'ASIA').
+Why: this is the single most documented way to isolate per-user rows in DynamoDB. A client cannot verify it at all against this emulator: instead of a pass or a clean refusal it gets a hang, so a CI job wiring up Cognito-scoped DynamoDB access gets a timeout with no diagnosis, and the cross-tenant isolation contract is unobservable in either direction.
+Regression note / why this is net-new: open issue 20261025T005354Z-cognito-identity-dynamodb-a-cognito-vended-session-queries.md carries this check id in its Issue-Trace-Ids, but its replay key is the cross-identity assertion "_refusal#38|AssertionError|expected the call to be refused, but it SUCCEEDED" — i.e. the check then RAN and over-permitted. It no longer reaches that assertion at all, so the suite does not report it as OWNED by that issue and that issue's key no longer matches the observed failure: the flow now stalls EARLIER, which is a distinct, harder failure (no verdict vs. a wrong verdict) and must be closed before the LeadingKeys contract can even be graded again. Related but not covering: 20261028T040721Z-cognito-identity-cognito-idp-iam-getcredentialsforidentity-vends-an.md and 20261029T071507Z-cognito-identity-getcredentialsforidentity-under-a-token-role-mapping.md (vended access key id is not an STS 'ASIA' key) and 20261031T102348Z-dynamodb-iam-sts-dynamodb-data-plane-authorization-ignores-session-policies-and.md (DynamoDB-side condition context) — none carries this check's replay key or its hang.
+Fix: two components. (1) the cognito-identity GetCredentialsForIdentity handler — it must answer promptly with a real assumed-role session for the pool's mapped role, carrying the identity's sub in the session context, and never leave a caller polling for a Credentials/SessionToken that does not arrive. (2) the DynamoDB data-plane authorization path for Query/GetItem — it must accept requests signed with that session for the caller's own leading key (so the in-check positive control completes) and refuse the cross-identity read 400 AccessDeniedException with AWS's fixed "User: ... is not authorized to perform: <action> on resource: <table arn> because no identity-based policy allows the <action> action" wording, where the session ARN, action and table ARN come from the request and state.
+Traces: cognito-identity__dynamodb.leading-keys-condition-scopes-query-to-the-callers-identity-id.
+
+## Evidence
+Replay of suite simparity-behavioral-aws-v1:
+
+cognito-identity__dynamodb.leading-keys-condition-scopes-query-to-the-callers-identity-id [mismatch]
+  Error: Check timed out after 60.0s
+
+No assertion was reached, so the check reports no comparison at all. The check's own structure localizes the stall to one of its three 300 s poll loops (_poll_until): "table <t> to become ACTIVE before any item is written", "credentials to be vended for guest identity <id>" (predicate: 'Credentials' in response and Credentials['SessionToken'] truthy), and "identity A's session to be allowed its own partition" (ClientError on each attempt counts as not-yet). Every other leg of the flow is a single call with no retry, so none of them can consume the budget.
+
+Contrast with the previous recorded failure of the same check (open issue 20261025T005354Z-cognito-identity-dynamodb-a-cognito-vended-session-queries.md, Issue-Key cognito-identity__dynamodb.leading-keys-condition-scopes-query-to-the-callers-identity-id|_refusal#38|AssertionError): there the flow completed and the cross-identity Query returned 200 with the other identity's item. It no longer gets that far.
+
+## Steps to Reproduce
+1. Boot the emulator and replay the check id in trace_ids; observe it consume the whole 60 s budget with no assertion reached.
+2. Manual repro, timing each call: create a DynamoDB table keyed on UserId (HASH, S) + ItemId (RANGE, S), PAY_PER_REQUEST, and wait for ACTIVE. CreateIdentityPool with AllowUnauthenticatedIdentities=true. Call GetId twice with no Logins -> expect two distinct IdentityIds. PutItem one item per identity under UserId=<identity id>.
+3. CreateRole trusting Principal {"Federated": "cognito-identity.amazonaws.com"} for sts:AssumeRoleWithWebIdentity with the pool as :aud and amr 'unauthenticated'; PutRolePolicy allowing dynamodb:Query and dynamodb:GetItem on the table ARN with Condition ForAllValues:StringEquals dynamodb:LeadingKeys = ${cognito-identity.amazonaws.com:sub}; SetIdentityPoolRoles {unauthenticated: <role arn>}.
+4. Call GetCredentialsForIdentity for identity A -> expect a Credentials structure with AccessKeyId/SecretKey/SessionToken for an assumed-role session; note whether it ever arrives.
+5. With a DynamoDB client signed by those credentials, Query UserId=<identity A> -> expect 200 with exactly A's item (the leg the check polls up to 300 s for). Then Query UserId=<identity B> and GetItem the B key -> expect 400 AccessDeniedException with the 'not authorized to perform: dynamodb:Query|dynamodb:GetItem' message. Whichever of steps 4-5 does not answer is the stall.
