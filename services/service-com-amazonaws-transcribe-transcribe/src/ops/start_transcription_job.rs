@@ -460,7 +460,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         }
 
-        let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
         // "To make a StartTranscriptionJob request, you must first upload your media
@@ -491,6 +490,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.media,
         );
 
+        // The clock is read HERE, after the cross-service read above and with nothing
+        // awaited between this and the insert below: every decision taken from it — the
+        // state the clock already owes the resources this job names, how many jobs of
+        // this family are being processed, and the instants this record's own
+        // transitions fall due at — belongs to the moment the record is stored, so a
+        // transition that fell due while the media was being resolved is not judged as
+        // still pending and a stored job's completion is never already due (see
+        // [`crate::state::JOB_TRANSITION_DELAY`]). This is the order every create and
+        // start of this service reads its clock in.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // A job may only apply a custom vocabulary, custom vocabulary filter or custom

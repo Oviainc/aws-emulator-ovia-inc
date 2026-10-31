@@ -45,6 +45,8 @@ mod channel_definition_distinctness;
 mod client_error_wire_status;
 #[path = "all/clock_owed_record_access.rs"]
 mod clock_owed_record_access;
+#[path = "all/clock_read_after_the_cross_service_read.rs"]
+mod clock_read_after_the_cross_service_read;
 #[path = "all/delete_requires_the_entity.rs"]
 mod delete_requires_the_entity;
 #[path = "all/describe_language_model.rs"]
