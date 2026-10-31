@@ -14,6 +14,11 @@
 //! also records the device it came from and answers with that device's
 //! `NewDeviceMetadata` when the pool did not recognise it.
 //!
+//! A pool whose `LambdaConfig` names a `PreAuthentication` function has that function
+//! gate the password sign-in, and one that names a pre-token-generation function has it
+//! gate the tokens a password sign-in or a refresh mints
+//! ([`crate::state::lambda_triggers`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -298,26 +303,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let auth_parameters = input.auth_parameters.unwrap_or_default();
-        let mut guard = state.lock();
+        let client_metadata = input.client_metadata.as_ref();
+        // The app client in the body names the pool, and is the client id the event a
+        // trigger receives reports as its caller; `ClientMetadata` is the "input for any
+        // custom workflows that this action triggers" that reaches the function too.
+        let caller =
+            crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id));
 
         // `AuthFlow` is an enumerated member, so the boundary validator has already
         // refused any value outside `AuthFlowType`.
         match input.auth_flow.as_str() {
-            USER_PASSWORD_AUTH => password_sign_in(
-                &mut guard,
-                &input.client_id,
-                &auth_parameters,
-                now,
-                ctx.credential_store(),
-            ),
-            USER_AUTH => email_otp_sign_in(&mut guard, &input.client_id, &auth_parameters, now),
-            REFRESH_TOKEN_AUTH | REFRESH_TOKEN => refresh_sign_in(
-                &mut guard,
-                &input.client_id,
-                &auth_parameters,
-                &input.auth_flow,
-                now,
-            ),
+            USER_PASSWORD_AUTH => {
+                password_sign_in(
+                    &state,
+                    ctx,
+                    &input.client_id,
+                    &auth_parameters,
+                    client_metadata,
+                    caller,
+                    now,
+                )
+                .await
+            }
+            USER_AUTH => {
+                email_otp_sign_in(&mut state.lock(), &input.client_id, &auth_parameters, now)
+            }
+            REFRESH_TOKEN_AUTH | REFRESH_TOKEN => {
+                refresh_sign_in(
+                    &state,
+                    ctx,
+                    &input.client_id,
+                    &auth_parameters,
+                    client_metadata,
+                    caller,
+                    &input.auth_flow,
+                    now,
+                )
+                .await
+            }
             // "`ADMIN_USER_PASSWORD_AUTH` is a flow type of `AdminInitiateAuth` and
             // isn't valid for InitiateAuth. `ADMIN_NO_SRP_AUTH` is a legacy server-side
             // username-password flow and isn't valid for InitiateAuth."
@@ -340,6 +363,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// This service's state, as the handler holds it under the lock.
 type State =
     crate::state::ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState;
+
+/// This service's store in the shared engine, which the handler locks once per phase: the
+/// state the sign-in is decided from, and the state the tokens are minted into, with the
+/// pool's Lambda triggers invoked in between on no lock at all.
+type Store = ::engine::ServiceState<State>;
+
+/// What a gating trigger's failure is for THIS operation: the modelled error each outcome
+/// amounts to, carrying the message the invocation built.
+///
+/// Both triggers of this path sit BEFORE the outcome they can modify, so a failure of
+/// either is a sign-in that does not happen: no token is minted and none is answered.
+fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> InitiateAuthError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            InitiateAuthErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            InitiateAuthErrorModeled::UnexpectedLambdaException(UnexpectedLambdaException {
+                message: Some(message),
+            })
+            .into()
+        }
+    }
+}
 
 /// `AuthFlowType`'s client-side username-password flow.
 const USER_PASSWORD_AUTH: &str = "USER_PASSWORD_AUTH";
@@ -388,12 +440,20 @@ const DEVICE_KEY: &str = "DEVICE_KEY";
 ///
 /// The password is checked against the one STORED for the user, and the app client the
 /// request names is what resolves the pool.
-fn password_sign_in(
-    state: &mut State,
+///
+/// The stored state decides the sign-in under ONE lock, which is released before the
+/// pool's own Lambda triggers are invoked: the pre-authentication trigger gates the sign-in
+/// this request asked for, and the pre-token-generation trigger gates the tokens a complete
+/// one mints, so neither is waited on while every other request of this service waits for
+/// the lock.
+async fn password_sign_in(
+    store: &Store,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
     client_id: &str,
     auth_parameters: &::std::collections::HashMap<String, String>,
+    client_metadata: Option<&::std::collections::HashMap<String, String>>,
+    caller: crate::state::lambda_triggers::Caller<'_>,
     now: ::std::time::SystemTime,
-    credentials: &::emulator_server::CredentialStore,
 ) -> Result<InitiateAuthOutput, InitiateAuthError> {
     let username = auth_parameters
         .get("USERNAME")
@@ -403,6 +463,7 @@ fn password_sign_in(
         .ok_or_else(|| missing_auth_parameter("PASSWORD", USER_PASSWORD_AUTH))?;
 
     let outcome = {
+        let state = &mut *store.lock();
         let pool = state
             .pool_of_client(client_id)
             .ok_or_else(|| client_not_found(client_id))?;
@@ -462,6 +523,32 @@ fn password_sign_in(
         }
     };
 
+    // The request has proved it holds this user's password, so the sign-in it asked for has
+    // reached the pre-authentication stage: the trigger there "can evaluate and modify user
+    // sign-in events" (`LambdaConfigType$PreAuthentication`), so nothing further happens
+    // until the function the pool names has allowed it.
+    let (user_pool_id, username) = match &outcome {
+        Outcome::Challenge {
+            user_pool_id,
+            username,
+            ..
+        }
+        | Outcome::Authenticate {
+            user_pool_id,
+            username,
+        } => (user_pool_id.clone(), username.clone()),
+    };
+    crate::state::lambda_triggers::fire_pre_authentication(
+        ctx,
+        store,
+        &user_pool_id,
+        &username,
+        caller,
+        client_metadata,
+    )
+    .await
+    .map_err(trigger_failed)?;
+
     match outcome {
         Outcome::Challenge {
             user_pool_id,
@@ -470,7 +557,7 @@ fn password_sign_in(
             user_attributes,
             session_validity,
         } => {
-            let session = state.start_session(
+            let session = store.lock().start_session(
                 now,
                 crate::state::AuthSession {
                     user_pool_id,
@@ -500,8 +587,31 @@ fn password_sign_in(
             user_pool_id,
             username,
         } => {
+            // The authentication is complete, so the tokens it answers with are the next
+            // stage, and the pre-token-generation trigger gates them: "called after user
+            // authentication flows have completed" is this generation's own documented
+            // trigger source.
+            crate::state::lambda_triggers::fire_pre_token_generation(
+                ctx,
+                store,
+                &user_pool_id,
+                &username,
+                crate::state::lambda_triggers::TokenGeneration::Authentication,
+                caller,
+                client_metadata,
+            )
+            .await
+            .map_err(trigger_failed)?;
+
+            let state = &mut *store.lock();
             let mut authentication_result = state
-                .issue_tokens(&user_pool_id, client_id, &username, now, credentials)
+                .issue_tokens(
+                    &user_pool_id,
+                    client_id,
+                    &username,
+                    now,
+                    ctx.credential_store(),
+                )
                 .ok_or_else(internal_error)?;
             // The sign-in is complete, so the device it came from is now part of
             // this user's state on a pool that remembers devices, and the key of a
@@ -651,10 +761,20 @@ fn email_otp_sign_in(
 /// client at all is refused as invalid. `auth_flow` is the member the request actually
 /// named, so a refusal echoes `REFRESH_TOKEN_AUTH` or its `REFRESH_TOKEN` alias as
 /// submitted.
-fn refresh_sign_in(
-    state: &mut State,
+///
+/// A refresh mints tokens, so it reaches the pre-token-generation stage — "called when a
+/// user tries to refresh the identity and access tokens" is this generation's own
+/// documented trigger source — and the trigger there gates the tokens, with the state lock
+/// released for the invocation. A refresh is not a sign-in event, so no pre-authentication
+/// trigger fires for it.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_sign_in(
+    store: &Store,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
     client_id: &str,
     auth_parameters: &::std::collections::HashMap<String, String>,
+    client_metadata: Option<&::std::collections::HashMap<String, String>>,
+    caller: crate::state::lambda_triggers::Caller<'_>,
     auth_flow: &str,
     now: ::std::time::SystemTime,
 ) -> Result<InitiateAuthOutput, InitiateAuthError> {
@@ -663,6 +783,7 @@ fn refresh_sign_in(
         .ok_or_else(|| missing_auth_parameter("REFRESH_TOKEN", auth_flow))?;
 
     let (user_pool_id, username) = {
+        let state = &*store.lock();
         let pool = state
             .pool_of_client(client_id)
             .ok_or_else(|| client_not_found(client_id))?;
@@ -712,7 +833,20 @@ fn refresh_sign_in(
         (user_pool_id, user.username.clone())
     };
 
-    let authentication_result = state
+    crate::state::lambda_triggers::fire_pre_token_generation(
+        ctx,
+        store,
+        &user_pool_id,
+        &username,
+        crate::state::lambda_triggers::TokenGeneration::RefreshTokens,
+        caller,
+        client_metadata,
+    )
+    .await
+    .map_err(trigger_failed)?;
+
+    let authentication_result = store
+        .lock()
         .refresh_tokens(&user_pool_id, client_id, &username, now, refresh_token)
         .ok_or_else(internal_error)?;
     Ok(authenticated(authentication_result))

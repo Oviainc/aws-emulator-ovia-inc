@@ -20,7 +20,10 @@ aws-smithy-types = { workspace = true }
 # Invoking a user pool's configured Lambda triggers, over the in-process callback
 # into this same emulator (`src/state/lambda_triggers.rs`).
 aws-sdk-lambda = { version = "1", default-features = false }
-tokio = { workspace = true }
+# `time` on top of the workspace features: a user-pool Lambda trigger invocation is
+# bounded by Amazon Cognito's own trigger budget (`src/state/lambda_triggers.rs`), which
+# `tokio::time::timeout` applies.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }

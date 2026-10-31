@@ -11,6 +11,9 @@
 //! `CONFIRMED`; a challenge this emulator never issues has no session to
 //! resume, so it is refused rather than signed in.
 //!
+//! A pool whose `LambdaConfig` names a pre-token-generation function has that function
+//! gate the tokens the answered challenge mints ([`crate::state::lambda_triggers`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -319,147 +322,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| missing_parameter("Session"))?;
         let responses = input.challenge_responses.clone().unwrap_or_default();
 
-        let mut guard = state.lock();
+        // The response is checked against the stored session, and everything it leaves
+        // behind is written, under ONE lock which this block RELEASES before the pool's own
+        // trigger is invoked: a function is another service's and must not be waited on
+        // while every other request of this one waits for the lock.
+        let username = {
+            let guard = &mut *state.lock();
 
-        // The pool and the app client the request names have to exist before the
-        // session it carries can mean anything.
-        {
-            let pool = guard
-                .pool(&input.user_pool_id)
-                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-            if !pool.clients.contains_key(&input.client_id) {
-                return Err(client_not_found(&input.client_id));
+            // The pool and the app client the request names have to exist before the
+            // session it carries can mean anything.
+            {
+                let pool = guard
+                    .pool(&input.user_pool_id)
+                    .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+                if !pool.clients.contains_key(&input.client_id) {
+                    return Err(client_not_found(&input.client_id));
+                }
             }
-        }
 
-        // The STORED session says which challenge is outstanding and for whom.
-        // A token this emulator never handed out, one the clock has already
-        // expired, or one started for another pool or app client authorizes
-        // nothing.
-        let session = match guard.session(&session_token, now) {
-            crate::state::SessionLookup::Found(session) => session,
-            crate::state::SessionLookup::Expired(_) => return Err(expired_session()),
-            crate::state::SessionLookup::Unknown => return Err(invalid_session()),
-        };
-        if session.user_pool_id != input.user_pool_id || session.client_id != input.client_id {
-            return Err(invalid_session());
-        }
-        // `ChallengeName` is "the name of the challenge that you are responding
-        // to", so it has to name the challenge this session is waiting on.
-        if input.challenge_name != session.challenge_name {
-            return Err(invalid_parameter(format!(
-                "Invalid challenge name provided, this session is waiting for a response to {}",
-                session.challenge_name
-            )));
-        }
-        if session.challenge_name != NEW_PASSWORD_REQUIRED {
-            // No other challenge is started with a session yet, so no stored
-            // state could decide whether a response to it is right.
-            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                "AdminRespondToAuthChallenge with ChallengeName={}",
-                session.challenge_name
-            )));
-        }
-
-        // `NEW_PASSWORD_REQUIRED`: "ChallengeResponses": {"NEW_PASSWORD":
-        // "[new_password]", "USERNAME": "[username]"}, plus
-        // `"userAttributes.[attribute_name]": "[attribute_value]"` for the
-        // attributes the challenge asked for (`ChallengeResponses` in this
-        // service's model).
-        let new_password = responses
-            .get(NEW_PASSWORD)
-            .cloned()
-            .ok_or_else(|| missing_challenge_response(NEW_PASSWORD, &session.challenge_name))?;
-        let requested: ::std::collections::BTreeMap<String, String> = responses
-            .iter()
-            .filter_map(|(key, value)| {
-                key.strip_prefix(USER_ATTRIBUTES_PREFIX)
-                    .map(|name| (name.to_string(), value.clone()))
-            })
-            .collect();
-
-        let pool = guard
-            .pool_mut(&input.user_pool_id)
-            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
-        // A response that names a user is answered only for the user its own
-        // session was started for.
-        if let Some(named) = responses.get(USERNAME) {
-            let session_key = pool.user_storage_key(&session.username);
-            if pool.user_storage_key(named) != session_key {
+            // The STORED session says which challenge is outstanding and for whom.
+            // A token this emulator never handed out, one the clock has already
+            // expired, or one started for another pool or app client authorizes
+            // nothing.
+            let session = match guard.session(&session_token, now) {
+                crate::state::SessionLookup::Found(session) => session,
+                crate::state::SessionLookup::Expired(_) => return Err(expired_session()),
+                crate::state::SessionLookup::Unknown => return Err(invalid_session()),
+            };
+            if session.user_pool_id != input.user_pool_id
+                || session.client_id != input.client_id
+            {
                 return Err(invalid_session());
             }
-        }
-        if let Some(message) = pool.check_password(
-            &new_password,
-            crate::state::PasswordPolicyWording::UserSuppliesPassword,
-        ) {
-            return Err(invalid_password(message));
-        }
-        let requested_names: Vec<String> = requested.keys().cloned().collect();
-        if let Some(unknown) = pool.unknown_attribute(&requested_names) {
-            return Err(invalid_parameter(format!(
-                "Invalid attributes given, {unknown} is not a valid attribute of this user pool"
-            )));
-        }
-
-        // Everything the response would leave behind is computed from the stored
-        // user FIRST, so a response that does not satisfy the challenge writes
-        // nothing at all.
-        let stored = pool.user(&session.username).ok_or_else(user_not_found)?;
-        if !stored.enabled {
-            return Err(not_authorized("User is disabled."));
-        }
-        // The challenge stands only while the stored user still owes a password
-        // change; a password set in the meantime leaves the session stale.
-        if !matches!(
-            stored.status,
-            crate::state::UserStatus::ForceChangePassword | crate::state::UserStatus::ResetRequired
-        ) {
-            return Err(invalid_session());
-        }
-        let username = stored.username.clone();
-        let mut attributes = stored.attributes.clone();
-        for (name, value) in requested {
-            // "In a NEW_PASSWORD_REQUIRED challenge response, you can't modify a
-            // required attribute that already has a value", and
-            // `SchemaAttributeType.Mutable` decides whether any other stored
-            // value may change at all — so an entry for either writes only the
-            // value the user does not have yet.
-            if attributes.contains_key(&name)
-                && (pool.attribute_required(&name) || !pool.attribute_mutable(&name))
-            {
-                continue;
+            // `ChallengeName` is "the name of the challenge that you are responding
+            // to", so it has to name the challenge this session is waiting on.
+            if input.challenge_name != session.challenge_name {
+                return Err(invalid_parameter(format!(
+                    "Invalid challenge name provided, this session is waiting for a response \
+                     to {}",
+                    session.challenge_name
+                )));
             }
-            // An empty value is no value of the attribute, so it is stored for
-            // nobody and takes a held value away
-            // (`crate::state::stored_text`); a required attribute left without
-            // one then leaves the challenge unanswered below.
-            match crate::state::stored_text(Some(value)) {
-                Some(value) => attributes.insert(name, value),
-                None => attributes.remove(&name),
-            };
-        }
-        // The challenge asks for every required attribute the user has no value
-        // for, so one still unset leaves it unanswered.
-        if let Some(missing) = pool.unset_required_attributes(&attributes).first() {
-            return Err(invalid_parameter(format!(
-                "Invalid attributes given, {missing} is missing"
-            )));
-        }
+            if session.challenge_name != NEW_PASSWORD_REQUIRED {
+                // No other challenge is started with a session yet, so no stored
+                // state could decide whether a response to it is right.
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "AdminRespondToAuthChallenge with ChallengeName={}",
+                    session.challenge_name
+                )));
+            }
 
-        let user = pool.user_mut(&username).ok_or_else(user_not_found)?;
-        user.attributes = attributes;
-        // The challenge is answered, so the password the user signs in with from
-        // now on is the one it just chose, and it owes no further change.
-        user.password = Some(new_password);
-        user.password_permanent = true;
-        user.password_set_at = Some(now);
-        user.status = crate::state::UserStatus::Confirmed;
-        user.user_last_modified_date = now;
+            // `NEW_PASSWORD_REQUIRED`: "ChallengeResponses": {"NEW_PASSWORD":
+            // "[new_password]", "USERNAME": "[username]"}, plus
+            // `"userAttributes.[attribute_name]": "[attribute_value]"` for the
+            // attributes the challenge asked for (`ChallengeResponses` in this
+            // service's model).
+            let new_password = responses.get(NEW_PASSWORD).cloned().ok_or_else(|| {
+                missing_challenge_response(NEW_PASSWORD, &session.challenge_name)
+            })?;
+            let requested: ::std::collections::BTreeMap<String, String> = responses
+                .iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix(USER_ATTRIBUTES_PREFIX)
+                        .map(|name| (name.to_string(), value.clone()))
+                })
+                .collect();
 
-        // The session answered its challenge, so it is spent.
-        guard.end_session(&session_token);
-        let authentication_result = guard
+            let pool = guard
+                .pool_mut(&input.user_pool_id)
+                .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+            // A response that names a user is answered only for the user its own
+            // session was started for.
+            if let Some(named) = responses.get(USERNAME) {
+                let session_key = pool.user_storage_key(&session.username);
+                if pool.user_storage_key(named) != session_key {
+                    return Err(invalid_session());
+                }
+            }
+            if let Some(message) = pool.check_password(
+                &new_password,
+                crate::state::PasswordPolicyWording::UserSuppliesPassword,
+            ) {
+                return Err(invalid_password(message));
+            }
+            let requested_names: Vec<String> = requested.keys().cloned().collect();
+            if let Some(unknown) = pool.unknown_attribute(&requested_names) {
+                return Err(invalid_parameter(format!(
+                    "Invalid attributes given, {unknown} is not a valid attribute of this \
+                     user pool"
+                )));
+            }
+
+            // Everything the response would leave behind is computed from the stored
+            // user FIRST, so a response that does not satisfy the challenge writes
+            // nothing at all.
+            let stored = pool.user(&session.username).ok_or_else(user_not_found)?;
+            if !stored.enabled {
+                return Err(not_authorized("User is disabled."));
+            }
+            // The challenge stands only while the stored user still owes a password
+            // change; a password set in the meantime leaves the session stale.
+            if !matches!(
+                stored.status,
+                crate::state::UserStatus::ForceChangePassword
+                    | crate::state::UserStatus::ResetRequired
+            ) {
+                return Err(invalid_session());
+            }
+            let username = stored.username.clone();
+            let mut attributes = stored.attributes.clone();
+            for (name, value) in requested {
+                // "In a NEW_PASSWORD_REQUIRED challenge response, you can't modify a
+                // required attribute that already has a value", and
+                // `SchemaAttributeType.Mutable` decides whether any other stored
+                // value may change at all — so an entry for either writes only the
+                // value the user does not have yet.
+                if attributes.contains_key(&name)
+                    && (pool.attribute_required(&name) || !pool.attribute_mutable(&name))
+                {
+                    continue;
+                }
+                // An empty value is no value of the attribute, so it is stored for
+                // nobody and takes a held value away
+                // (`crate::state::stored_text`); a required attribute left without
+                // one then leaves the challenge unanswered below.
+                match crate::state::stored_text(Some(value)) {
+                    Some(value) => attributes.insert(name, value),
+                    None => attributes.remove(&name),
+                };
+            }
+            // The challenge asks for every required attribute the user has no value
+            // for, so one still unset leaves it unanswered.
+            if let Some(missing) = pool.unset_required_attributes(&attributes).first() {
+                return Err(invalid_parameter(format!(
+                    "Invalid attributes given, {missing} is missing"
+                )));
+            }
+
+            let user = pool.user_mut(&username).ok_or_else(user_not_found)?;
+            user.attributes = attributes;
+            // The challenge is answered, so the password the user signs in with from
+            // now on is the one it just chose, and it owes no further change.
+            user.password = Some(new_password);
+            user.password_permanent = true;
+            user.password_set_at = Some(now);
+            user.status = crate::state::UserStatus::Confirmed;
+            user.user_last_modified_date = now;
+
+            // The session answered its challenge, so it is spent.
+            guard.end_session(&session_token);
+            username
+        };
+
+        // The challenge is answered, so the tokens the sign-in completes with are the next
+        // stage, and the pool's pre-token-generation trigger gates them: "called after the
+        // user is created by an admin. This flow is invoked when the user has to change a
+        // temporary password" is this generation's own documented trigger source.
+        crate::state::lambda_triggers::fire_pre_token_generation(
+            ctx,
+            &state,
+            &input.user_pool_id,
+            &username,
+            crate::state::lambda_triggers::TokenGeneration::NewPasswordChallenge,
+            // An `Admin*` operation is authorized by IAM credentials rather than by an app
+            // client, so the event names no caller client id.
+            crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
+            input.client_metadata.as_ref(),
+        )
+        .await
+        .map_err(trigger_failed)?;
+
+        let authentication_result = state
+            .lock()
             .issue_tokens(
                 &input.user_pool_id,
                 &input.client_id,
@@ -497,6 +531,35 @@ const USERNAME: &str = "USERNAME";
 /// ASKS for those attributes names them under the same prefix, so both sides read
 /// it from the one place.
 const USER_ATTRIBUTES_PREFIX: &str = crate::state::USER_ATTRIBUTES_PREFIX;
+
+/// What a gating trigger's failure is for THIS operation: the modelled error each outcome
+/// amounts to, carrying the message the invocation built.
+///
+/// The challenge this call answered stays answered — the password it set and the spent
+/// session are already persisted — and what the failure changes is what this call ANSWERS:
+/// the trigger sits before the tokens it can modify, so a failure mints none.
+fn trigger_failed(
+    failure: crate::state::lambda_triggers::Failure,
+) -> AdminRespondToAuthChallengeError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            AdminRespondToAuthChallengeErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            AdminRespondToAuthChallengeErrorModeled::UnexpectedLambdaException(
+                UnexpectedLambdaException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
+}
 
 /// This operation's `ResourceNotFoundException` for an absent user pool.
 fn user_pool_not_found(user_pool_id: &str) -> AdminRespondToAuthChallengeError {

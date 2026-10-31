@@ -17,6 +17,9 @@
 //! issued and has since revoked is refused AS revoked, which is a different sentence
 //! from the one a value it cannot resolve at all gets.
 //!
+//! A pool whose `LambdaConfig` names a pre-token-generation function has that function
+//! gate the tokens this refresh mints ([`crate::state::lambda_triggers`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -205,23 +208,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The app client in the body names the pool, and `ClientMetadata` is input for
-        // the Lambda triggers this action would invoke, which this emulator invokes none
-        // of; the credential store is what mints the refresh credential a rotation hands
-        // back.
+        // The app client in the body names the pool, and `ClientMetadata` is the "input
+        // for any custom workflows that this action triggers" that reaches the pool's
+        // configured trigger function; the credential store is what mints the refresh
+        // credential a rotation hands back.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
         let now = ::std::time::SystemTime::now();
-        let mut guard = state.lock();
 
-        // Everything the refresh is decided by is read first, under the one lock, so
-        // nothing is minted for a request a later check refuses.
+        // Everything the refresh is decided by is read first, under ONE lock, so nothing
+        // is minted for a request a later check refuses — and the lock is released before
+        // the pool's own trigger is invoked, so a function is not waited on while every
+        // other request of this service waits for the lock.
         let Refresh {
             user_pool_id,
             username,
             rotation_grace,
-        } = resolve(&guard, &input, now)?;
+        } = resolve(&state.lock(), &input, now)?;
+
+        // The tokens this refresh answers with are the next stage, and the pool's
+        // pre-token-generation trigger gates them: "called when a user tries to refresh the
+        // identity and access tokens" is this generation's own documented trigger source.
+        crate::state::lambda_triggers::fire_pre_token_generation(
+            ctx,
+            &state,
+            &user_pool_id,
+            &username,
+            crate::state::lambda_triggers::TokenGeneration::RefreshTokens,
+            crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id)),
+            input.client_metadata.as_ref(),
+        )
+        .await
+        .map_err(trigger_failed)?;
+
+        let mut guard = state.lock();
 
         // "This operation issues a new refresh token and invalidates the original
         // refresh token after an optional grace period when refresh token rotation is
@@ -274,6 +295,34 @@ struct Refresh {
     user_pool_id: String,
     username: String,
     rotation_grace: Option<::std::time::Duration>,
+}
+
+/// What a gating trigger's failure is for THIS operation: the modelled error each outcome
+/// amounts to, carrying the message the invocation built.
+///
+/// The trigger sits before the tokens it can modify, so a failure of it mints none: the
+/// submitted refresh token is still the one in force.
+fn trigger_failed(
+    failure: crate::state::lambda_triggers::Failure,
+) -> GetTokensFromRefreshTokenError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            GetTokensFromRefreshTokenErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            GetTokensFromRefreshTokenErrorModeled::UnexpectedLambdaException(
+                UnexpectedLambdaException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
 }
 
 /// Resolve the request against stored state: the app client, its secret, the submitted

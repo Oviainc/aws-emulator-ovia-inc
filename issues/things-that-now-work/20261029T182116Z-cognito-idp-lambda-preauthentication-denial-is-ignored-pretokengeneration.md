@@ -47,3 +47,37 @@ Verbatim from the replay:
 1. CreateUserPool with LambdaConfig.PreAuthentication pointing at a function that raises for one username and returns for another; InitiateAuth as the denied user -> expect UserLambdaValidationException and no tokens.
 2. CreateUserPool with LambdaConfig.PreTokenGenerationConfig (V2_0); sign in with a password and then with REFRESH_TOKEN_AUTH; inspect the event the function received -> triggerSource must be TokenGeneration_Authentication / TokenGeneration_RefreshTokens.
 3. Point PreTokenGeneration at a function that sleeps 10s and sign in -> the call must fail quickly, not hang.
+
+## Resolution
+All three causes are fixed in the cognito-idp sign-in path, in the one place a pool's
+`LambdaConfig` member becomes an invocation
+(`services/service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice/src/state/lambda_triggers.rs`):
+
+1. A pool whose `LambdaConfig` names a `PreAuthentication` function now has that function
+   invoked by `InitiateAuth` / `AdminInitiateAuth` once the request has proved it holds the
+   user's password, and the sign-in continues only on a function that RETURNED: a function
+   that reports an error is answered with `UserLambdaValidationException`, and one Lambda
+   could not run or that gave no answer with `UnexpectedLambdaException` — no token is
+   minted either way.
+2. The pre-token-generation trigger is invoked by every operation that mints a sign-in's
+   tokens (`InitiateAuth` password and refresh flows, `AdminInitiateAuth`,
+   `RespondToAuthChallenge`, `AdminRespondToAuthChallenge`, `GetTokensFromRefreshToken`),
+   with the `triggerSource` of the stage that reached it
+   (`TokenGeneration_Authentication`, `TokenGeneration_RefreshTokens`,
+   `TokenGeneration_NewPasswordChallenge`), the event `version` the configured trigger
+   version asks for (the legacy `PreTokenGeneration` member and `V1_0` get `1`, `V2_0` `2`,
+   `V3_0` `3`), the user's group configuration, and — from the second trigger version on —
+   the scopes the access token carries.
+3. Every trigger invocation is bounded by Amazon Cognito's five-second trigger budget: a
+   function that has not answered when it elapses is given up on and the operation is
+   refused rather than held.
+
+The observables these three checks read are still not reachable, and NOT because Cognito
+withholds the invocation: each of them is read from what the trigger function itself did
+(an SQS message its python3.12 handler sends, or the deny it raises), so they need Lambda
+to EXECUTE a deployment package. That is tracked by
+`20261022T213144Z-lambda-invoke-refuses-every-real-invocation-with-notimplemented.md` —
+until it is fixed, Lambda answers `NotImplemented` for every `RequestResponse` invocation,
+which these gating triggers report as the trigger failure it is rather than inventing the
+verdict the function never gave.
+

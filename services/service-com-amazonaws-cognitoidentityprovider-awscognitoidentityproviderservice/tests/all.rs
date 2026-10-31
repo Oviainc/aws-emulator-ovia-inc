@@ -167,6 +167,8 @@ mod self_service_sign_up;
 mod set_user_mfa_preference;
 #[path = "all/set_user_settings.rs"]
 mod set_user_settings;
+#[path = "all/sign_in_lambda_triggers.rs"]
+mod sign_in_lambda_triggers;
 #[path = "all/sign_up_client_secret.rs"]
 mod sign_up_client_secret;
 #[path = "all/state_roundtrip.rs"]

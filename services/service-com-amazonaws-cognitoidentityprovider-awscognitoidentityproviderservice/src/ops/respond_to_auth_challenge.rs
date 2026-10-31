@@ -10,6 +10,9 @@
 //! `ExpiredCodeException`, and a code accepted once completes the sign-in — the
 //! session is spent, so the same code cannot sign in twice.
 //!
+//! A pool whose `LambdaConfig` names a pre-token-generation function has that function
+//! gate the tokens the completed sign-in mints ([`crate::state::lambda_triggers`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -305,10 +308,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The app client in the body names the pool, and `ClientMetadata` is input for
-        // the Lambda triggers this action would invoke, which this emulator invokes none
-        // of; the credential store is what mints the refresh credential a completed
-        // sign-in hands back.
+        // The app client in the body names the pool, and `ClientMetadata` is the "input
+        // for any custom workflows that this action triggers" that reaches the pool's
+        // configured trigger function; the credential store is what mints the refresh
+        // credential a completed sign-in hands back.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -323,100 +326,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .ok_or_else(|| missing_parameter("Session"))?;
         let responses = input.challenge_responses.clone().unwrap_or_default();
+        let caller =
+            crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id));
 
-        let mut guard = state.lock();
-        // This operation models no `UserPoolId`: the app client the request names is
-        // what resolves the pool, and it has to exist before the session it carries can
-        // mean anything.
-        let user_pool_id = guard
-            .pool_of_client(&input.client_id)
-            .ok_or_else(|| client_not_found(&input.client_id))?
-            .id
-            .clone();
+        // The response is checked against the stored session under ONE lock, which is
+        // released before the pool's own trigger is invoked: a function is another
+        // service's and must not be waited on while every other request of this one waits
+        // for the lock.
+        let (user_pool_id, username) = {
+            let guard = &mut *state.lock();
+            // This operation models no `UserPoolId`: the app client the request names is
+            // what resolves the pool, and it has to exist before the session it carries can
+            // mean anything.
+            let user_pool_id = guard
+                .pool_of_client(&input.client_id)
+                .ok_or_else(|| client_not_found(&input.client_id))?
+                .id
+                .clone();
 
-        // The STORED session says which challenge is outstanding and for whom. A token
-        // this emulator never handed out, or one started for another app client,
-        // authorizes nothing.
-        let session = match guard.session(&session_token, now) {
-            crate::state::SessionLookup::Found(session) => session,
-            // A challenge that delivered a code is answerable exactly while its session
-            // lasts, so a closed window is that CODE's expiry: "this exception is
-            // thrown if a code has expired" (`ExpiredCodeException`). A challenge that
-            // delivered none has no code to expire, so its session expiry is reported
-            // as the session's.
-            crate::state::SessionLookup::Expired(expired) => {
-                return Err(if expired.code.is_some() {
-                    expired_code()
-                } else {
-                    expired_session()
-                });
-            }
-            crate::state::SessionLookup::Unknown => return Err(invalid_session()),
-        };
-        if session.user_pool_id != user_pool_id || session.client_id != input.client_id {
-            return Err(invalid_session());
-        }
-        // `ChallengeName` is "the name of the challenge that you are responding to", so
-        // it has to name the challenge this session is waiting on.
-        if input.challenge_name != session.challenge_name {
-            return Err(invalid_parameter(format!(
-                "Invalid challenge name provided, this session is waiting for a response to {}",
-                session.challenge_name
-            )));
-        }
-        if session.challenge_name != EMAIL_OTP {
-            // No other challenge this emulator starts carries state a response to it
-            // could be checked against.
-            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
-                "RespondToAuthChallenge with ChallengeName={}",
-                session.challenge_name
-            )));
-        }
-
-        // `EMAIL_OTP`: `"ChallengeResponses": {"EMAIL_OTP_CODE": "[code]", "USERNAME":
-        // "[username]"}` (`ChallengeResponses` in this service's model).
-        let presented = responses
-            .get(EMAIL_OTP_CODE)
-            .ok_or_else(|| missing_challenge_response(EMAIL_OTP_CODE, &session.challenge_name))?;
-        // A response that names a user is answered only for the user its own session
-        // was started for.
-        if let Some(named) = responses.get(USERNAME) {
-            let pool = guard
-                .pool(&user_pool_id)
-                .ok_or_else(|| client_not_found(&input.client_id))?;
-            if pool.user_storage_key(named) != pool.user_storage_key(&session.username) {
+            // The STORED session says which challenge is outstanding and for whom. A token
+            // this emulator never handed out, or one started for another app client,
+            // authorizes nothing.
+            let session = match guard.session(&session_token, now) {
+                crate::state::SessionLookup::Found(session) => session,
+                // A challenge that delivered a code is answerable exactly while its
+                // session lasts, so a closed window is that CODE's expiry: "this exception
+                // is thrown if a code has expired" (`ExpiredCodeException`). A challenge
+                // that delivered none has no code to expire, so its session expiry is
+                // reported as the session's.
+                crate::state::SessionLookup::Expired(expired) => {
+                    return Err(if expired.code.is_some() {
+                        expired_code()
+                    } else {
+                        expired_session()
+                    });
+                }
+                crate::state::SessionLookup::Unknown => return Err(invalid_session()),
+            };
+            if session.user_pool_id != user_pool_id || session.client_id != input.client_id {
                 return Err(invalid_session());
             }
-        }
-        // The code is checked against the one the challenge DELIVERED. A wrong code
-        // leaves the session standing — answering it is what spends it — so the caller
-        // can present the right one while the session lasts.
-        let code = session.code.as_ref().ok_or_else(invalid_session)?;
-        if code.code != *presented {
-            return Err(code_mismatch());
-        }
+            // `ChallengeName` is "the name of the challenge that you are responding to", so
+            // it has to name the challenge this session is waiting on.
+            if input.challenge_name != session.challenge_name {
+                return Err(invalid_parameter(format!(
+                    "Invalid challenge name provided, this session is waiting for a response \
+                     to {}",
+                    session.challenge_name
+                )));
+            }
+            if session.challenge_name != EMAIL_OTP {
+                // No other challenge this emulator starts carries state a response to it
+                // could be checked against.
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "RespondToAuthChallenge with ChallengeName={}",
+                    session.challenge_name
+                )));
+            }
 
-        // The user the session names may have been disabled, reset or deleted since the
-        // challenge was started, so the sign-in is refused on the stored user's own
-        // state just as the one that started it was.
-        let user = guard
-            .pool(&user_pool_id)
-            .and_then(|pool| pool.user(&session.username))
-            .ok_or_else(user_not_found)?;
-        if !user.enabled {
-            return Err(not_authorized("User is disabled."));
-        }
-        match user.status {
-            crate::state::UserStatus::ResetRequired => return Err(password_reset_required()),
-            crate::state::UserStatus::Unconfirmed => return Err(user_not_confirmed()),
-            _ => {}
-        }
-        let username = user.username.clone();
+            // `EMAIL_OTP`: `"ChallengeResponses": {"EMAIL_OTP_CODE": "[code]", "USERNAME":
+            // "[username]"}` (`ChallengeResponses` in this service's model).
+            let presented = responses.get(EMAIL_OTP_CODE).ok_or_else(|| {
+                missing_challenge_response(EMAIL_OTP_CODE, &session.challenge_name)
+            })?;
+            // A response that names a user is answered only for the user its own session
+            // was started for.
+            if let Some(named) = responses.get(USERNAME) {
+                let pool = guard
+                    .pool(&user_pool_id)
+                    .ok_or_else(|| client_not_found(&input.client_id))?;
+                if pool.user_storage_key(named) != pool.user_storage_key(&session.username) {
+                    return Err(invalid_session());
+                }
+            }
+            // The code is checked against the one the challenge DELIVERED. A wrong code
+            // leaves the session standing — answering it is what spends it — so the caller
+            // can present the right one while the session lasts.
+            let code = session.code.as_ref().ok_or_else(invalid_session)?;
+            if code.code != *presented {
+                return Err(code_mismatch());
+            }
 
-        // The challenge is answered, so the session is spent: the same code cannot
-        // complete a second sign-in.
-        guard.end_session(&session_token);
-        let authentication_result = guard
+            // The user the session names may have been disabled, reset or deleted since the
+            // challenge was started, so the sign-in is refused on the stored user's own
+            // state just as the one that started it was.
+            let user = guard
+                .pool(&user_pool_id)
+                .and_then(|pool| pool.user(&session.username))
+                .ok_or_else(user_not_found)?;
+            if !user.enabled {
+                return Err(not_authorized("User is disabled."));
+            }
+            match user.status {
+                crate::state::UserStatus::ResetRequired => {
+                    return Err(password_reset_required());
+                }
+                crate::state::UserStatus::Unconfirmed => return Err(user_not_confirmed()),
+                _ => {}
+            }
+            let username = user.username.clone();
+
+            // The challenge is answered, so the session is spent: the same code cannot
+            // complete a second sign-in.
+            guard.end_session(&session_token);
+            (user_pool_id, username)
+        };
+
+        // The challenge the sign-in asked for is answered, so the tokens it completes with
+        // are the next stage, and the pool's pre-token-generation trigger gates them:
+        // "called after user authentication flows have completed" is this generation's own
+        // documented trigger source.
+        crate::state::lambda_triggers::fire_pre_token_generation(
+            ctx,
+            &state,
+            &user_pool_id,
+            &username,
+            crate::state::lambda_triggers::TokenGeneration::Authentication,
+            caller,
+            input.client_metadata.as_ref(),
+        )
+        .await
+        .map_err(trigger_failed)?;
+
+        let authentication_result = state
+            .lock()
             .issue_tokens(
                 &user_pool_id,
                 &input.client_id,
@@ -447,6 +480,35 @@ const EMAIL_OTP_CODE: &str = "EMAIL_OTP_CODE";
 
 /// The `ChallengeResponses` entry naming the user a response is for.
 const USERNAME: &str = "USERNAME";
+
+/// What a gating trigger's failure is for THIS operation: the modelled error each outcome
+/// amounts to, carrying the message the invocation built.
+///
+/// The challenge this call answered stays answered — its session is spent either way — and
+/// what the failure changes is what this call ANSWERS: the trigger sits before the tokens
+/// it can modify, so a failure mints none.
+fn trigger_failed(
+    failure: crate::state::lambda_triggers::Failure,
+) -> RespondToAuthChallengeError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            RespondToAuthChallengeErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            RespondToAuthChallengeErrorModeled::UnexpectedLambdaException(
+                UnexpectedLambdaException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
+}
 
 /// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
 fn client_not_found(client_id: &str) -> RespondToAuthChallengeError {

@@ -12,6 +12,11 @@
 //! records the device it came from and answers with that device's
 //! `NewDeviceMetadata` when the pool did not recognise it.
 //!
+//! A pool whose `LambdaConfig` names a `PreAuthentication` function has that function
+//! gate the sign-in, and one that names a pre-token-generation function has it gate the
+//! tokens a completed sign-in mints
+//! ([`crate::state::lambda_triggers`]).
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -317,6 +322,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let auth_parameters = input.auth_parameters.unwrap_or_default();
+        let client_metadata = input.client_metadata.as_ref();
+        // An `Admin*` operation is authorized by IAM credentials rather than by an app
+        // client, so the event a trigger receives names no caller client id;
+        // `ClientMetadata` is the "input for any custom workflows that this action
+        // triggers" that reaches the function.
+        let caller = crate::state::lambda_triggers::Caller::of(ctx.parts(), None);
         let username = auth_parameters
             .get("USERNAME")
             .ok_or_else(|| missing_auth_parameter("USERNAME", &input.auth_flow))?
@@ -326,8 +337,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| missing_auth_parameter("PASSWORD", &input.auth_flow))?
             .clone();
 
-        let mut guard = state.lock();
+        // The stored state decides this sign-in under ONE lock, which the block RELEASES
+        // before the pool's own Lambda triggers are invoked: a function is another
+        // service's and must not be waited on while every other request of this one waits
+        // for the lock.
         let outcome = {
+            let guard = &mut *state.lock();
             let pool = guard
                 .pool(&input.user_pool_id)
                 .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
@@ -390,6 +405,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The request has proved it holds this user's password, so the sign-in it asked for
+        // has reached the pre-authentication stage: the trigger there "can evaluate and
+        // modify user sign-in events" (`LambdaConfigType$PreAuthentication`), so nothing
+        // further happens until the function the pool names has allowed it.
+        let signing_in = match &outcome {
+            Outcome::Challenge { username, .. } | Outcome::Authenticate { username } => {
+                username.clone()
+            }
+        };
+        crate::state::lambda_triggers::fire_pre_authentication(
+            ctx,
+            &state,
+            &input.user_pool_id,
+            &signing_in,
+            caller,
+            client_metadata,
+        )
+        .await
+        .map_err(trigger_failed)?;
+
         match outcome {
             Outcome::Challenge {
                 username,
@@ -397,7 +432,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 user_attributes,
                 session_validity,
             } => {
-                let session = guard.start_session(
+                let session = state.lock().start_session(
                     now,
                     crate::state::AuthSession {
                         user_pool_id: input.user_pool_id.clone(),
@@ -425,6 +460,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             }
             Outcome::Authenticate { username } => {
+                // The authentication is complete, so the tokens it answers with are the
+                // next stage, and the pre-token-generation trigger gates them: "called
+                // after user authentication flows have completed" is this generation's own
+                // documented trigger source.
+                crate::state::lambda_triggers::fire_pre_token_generation(
+                    ctx,
+                    &state,
+                    &input.user_pool_id,
+                    &username,
+                    crate::state::lambda_triggers::TokenGeneration::Authentication,
+                    caller,
+                    client_metadata,
+                )
+                .await
+                .map_err(trigger_failed)?;
+
+                let guard = &mut *state.lock();
                 let mut authentication_result = guard
                     .issue_tokens(
                         &input.user_pool_id,
@@ -508,6 +560,32 @@ fn user_not_found() -> AdminInitiateAuthError {
         message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
+}
+
+/// What a gating trigger's failure is for THIS operation: the modelled error each
+/// outcome amounts to, carrying the message the invocation built.
+///
+/// Both triggers of this path sit BEFORE the outcome they can modify, so a failure of
+/// either is a sign-in that does not happen: no token is minted and none is answered.
+fn trigger_failed(
+    failure: crate::state::lambda_triggers::Failure,
+) -> AdminInitiateAuthError {
+    match failure {
+        crate::state::lambda_triggers::Failure::Reported(message) => {
+            AdminInitiateAuthErrorModeled::UserLambdaValidationException(
+                UserLambdaValidationException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        crate::state::lambda_triggers::Failure::NotInvokable(message) => {
+            AdminInitiateAuthErrorModeled::UnexpectedLambdaException(UnexpectedLambdaException {
+                message: Some(message),
+            })
+            .into()
+        }
+    }
 }
 
 /// The refusal for a wrong password: `NotAuthorizedException`, which is also
