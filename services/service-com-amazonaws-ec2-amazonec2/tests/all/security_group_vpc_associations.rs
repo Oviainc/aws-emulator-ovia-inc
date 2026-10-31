@@ -26,7 +26,15 @@
 //! 6. an association cannot outlive either side of its pair: deleting the security group or
 //!    the VPC takes it with them;
 //! 7. the report PAGES: `MaxResults` cuts the page and the `NextToken` it answers walks the
-//!    rest, each association reported exactly once.
+//!    rest, each association reported exactly once;
+//! 8. `DisassociateSecurityGroupVpc` TAKES AN ASSOCIATION DOWN: it answers the association in
+//!    the non-terminal `disassociating` state and the CLOCK, not a caller, moves it to
+//!    `disassociated`, after which the group is no longer usable in that VPC and the pair can
+//!    be associated again — and no other association moves;
+//! 9. a disassociate the service cannot satisfy is REFUSED with the code and the wording EC2
+//!    answers that refusal class with, and writes nothing — an id that resolves to no VPC or
+//!    no security group, a pair the account holds no association for, and an association a
+//!    network interface of that VPC still depends on.
 //!
 //! Each table row is a distinct input along what those rules generalise over — which group,
 //! which VPC, how many associations one group holds, which filter selects and on what value,
@@ -37,10 +45,12 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use service_com_amazonaws_ec2_amazonec2::state::TRANSITION_DELAY;
+use ec2::ops::types::GroupIdentifier;
+use ec2::state::{NETWORK_INTERFACE_TYPE_INTERFACE, NetworkInterfaceSpec, TRANSITION_DELAY};
+use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, error_code, error_message, filters};
+use super::ec2_query::{call, element, elements, error_code, error_message, filters};
 use super::wire::{Param, child, child_text, document, param};
 
 /// The Region every call here is signed for.
@@ -51,6 +61,12 @@ const ASSOCIATING: &str = "associating";
 
 /// The state the clock then owes it.
 const ASSOCIATED: &str = "associated";
+
+/// The state an association a disassociate has just asked to take down is in.
+const DISASSOCIATING: &str = "disassociating";
+
+/// The state the clock then owes it — the one in which the pair is no longer associated.
+const DISASSOCIATED: &str = "disassociated";
 
 /// One association as the wire reports it: the pair it joins, the two owning accounts and
 /// its state.
@@ -230,6 +246,66 @@ async fn reported_pairs(case: &str, router: &MultiServiceRouter) -> Vec<(String,
         .into_iter()
         .map(|association| (association.group_id, association.vpc_id))
         .collect()
+}
+
+/// `DisassociateSecurityGroupVpc` for one pair, with whatever extra parameters the case
+/// needs. The pair is the whole request, so it carries the same fields an associate does.
+async fn disassociate(
+    router: &MultiServiceRouter,
+    group_id: &str,
+    vpc_id: &str,
+    extra: &[Param],
+) -> (u16, String) {
+    action(
+        router,
+        "DisassociateSecurityGroupVpc",
+        &associate_params(group_id, vpc_id, extra),
+    )
+    .await
+}
+
+/// One disassociate that must succeed, with the `State` it answered.
+async fn disassociate_ok(
+    case: &str,
+    router: &MultiServiceRouter,
+    group_id: &str,
+    vpc_id: &str,
+) -> String {
+    let (status, body) = disassociate(router, group_id, vpc_id, &[]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from DisassociateSecurityGroupVpc, got {status} \
+         with body {body}"
+    );
+    element(&body, "state").unwrap_or_else(|| panic!("case {case:?}: no state in {body}"))
+}
+
+/// The state the report carries for one pair, or `None` when it reports no such pair.
+async fn reported_state(
+    case: &str,
+    router: &MultiServiceRouter,
+    group_id: &str,
+    vpc_id: &str,
+) -> Option<String> {
+    reported(case, router, &[])
+        .await
+        .into_iter()
+        .find(|association| association.group_id == group_id && association.vpc_id == vpc_id)
+        .map(|association| association.state)
+}
+
+/// The ids of the security groups `GetSecurityGroupsForVpc` reports as usable in `vpc_id` —
+/// the reader that answers what an association is FOR, so a disassociation is shown to take
+/// the group's usability with it rather than only to relabel a record.
+async fn usable_group_ids(case: &str, router: &MultiServiceRouter, vpc_id: &str) -> Vec<String> {
+    let body = ok(
+        case,
+        router,
+        "GetSecurityGroupsForVpc",
+        &[param("VpcId", vpc_id)],
+    )
+    .await;
+    elements(&body, "groupId")
 }
 
 // ---------------------------------------------------------------------------
@@ -852,4 +928,405 @@ async fn the_report_pages_over_every_association_exactly_once() {
             "case {case:?}: expected the whole report once, got {walked:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 8: the disassociate takes an association down, and the clock completes it
+// ---------------------------------------------------------------------------
+
+/// The rule: a disassociate leaves the association it names in the non-terminal
+/// `disassociating` state and the CLOCK, not a second call, moves it to `disassociated` —
+/// after which the group is no longer usable in that VPC and the pair can be associated
+/// afresh, while every other association of the account stays where it was.
+///
+/// The rows differ in the state the association had reached when it was taken down (settled,
+/// and still `associating`), in which group holds it, and in whether the group holds another
+/// association beside the one taken down.
+#[tokio::test]
+async fn the_disassociate_takes_the_association_down_and_the_clock_completes_it() {
+    let router = emulator();
+
+    let home = create_vpc("the home VPC", &router, "10.71.0.0/16").await;
+    let settled = create_vpc("the VPC of a settled association", &router, "10.72.0.0/16").await;
+    let transient = create_vpc("the VPC of a new association", &router, "10.73.0.0/16").await;
+    let second_of_two = create_vpc("the second VPC a group reaches", &router, "10.74.0.0/16").await;
+    let untouched = create_vpc("the VPC nothing lets go of", &router, "10.75.0.0/16").await;
+    let group = create_group("the group", &router, "first", &home).await;
+    let other_group = create_group("another group", &router, "second", &home).await;
+
+    // One association nothing here takes down, so every row can be shown to move its own
+    // association and no other.
+    associate_ok(
+        "the association that stands throughout",
+        &router,
+        &other_group,
+        &untouched,
+    )
+    .await;
+    past_the_transition().await;
+
+    // (the case, the group, the VPC, whether the association is left to settle first)
+    let rows: [(&str, &str, &str, bool); 3] = [
+        ("a settled association", &group, &settled, true),
+        (
+            "an association the clock has not established yet",
+            &group,
+            &transient,
+            false,
+        ),
+        (
+            "one of the two associations a group holds",
+            &other_group,
+            &second_of_two,
+            true,
+        ),
+    ];
+
+    for (case, group_id, vpc_id, settle) in rows {
+        let written = associate_ok(case, &router, group_id, vpc_id).await;
+        assert_eq!(
+            written, ASSOCIATING,
+            "case {case:?}: expected the new association in {ASSOCIATING}, got {written:?}"
+        );
+        if settle {
+            past_the_transition().await;
+            let before = reported_state(case, &router, group_id, vpc_id).await;
+            assert_eq!(
+                before.as_deref(),
+                Some(ASSOCIATED),
+                "case {case:?}: the association must be {ASSOCIATED:?} before it is taken \
+                 down, got {before:?}"
+            );
+        }
+
+        // The disassociate answers the NON-TERMINAL state: the association it names is on
+        // its way down rather than already gone.
+        let answered = disassociate_ok(case, &router, group_id, vpc_id).await;
+        assert_eq!(
+            answered, DISASSOCIATING,
+            "case {case:?}: expected {DISASSOCIATING:?} from the disassociate, got \
+             {answered:?}"
+        );
+
+        // The same transient state through the STORE, read inside the span that call
+        // started: the reader reports what the writer answered rather than a state nobody
+        // waited for.
+        let in_flight = reported_state(case, &router, group_id, vpc_id).await;
+        assert_eq!(
+            in_flight.as_deref(),
+            Some(DISASSOCIATING),
+            "case {case:?}: the report must carry {DISASSOCIATING:?} while the clock owes \
+             the move, got {in_flight:?}"
+        );
+
+        past_the_transition().await;
+        let completed = reported_state(case, &router, group_id, vpc_id).await;
+        assert_eq!(
+            completed.as_deref(),
+            Some(DISASSOCIATED),
+            "case {case:?}: the clock must complete the move to {DISASSOCIATED:?}, got \
+             {completed:?}"
+        );
+
+        // Nothing else moved: the association no row takes down is still established.
+        let standing = reported_state(case, &router, &other_group, &untouched).await;
+        assert_eq!(
+            standing.as_deref(),
+            Some(ASSOCIATED),
+            "case {case:?}: the untouched association must still be {ASSOCIATED:?}, got \
+             {standing:?}"
+        );
+    }
+
+    // What the association was FOR goes with it: the group is no longer one of the groups
+    // usable in that VPC, while it is still usable in the VPC it was created in.
+    let usable = usable_group_ids("after the disassociation", &router, &settled).await;
+    assert!(
+        !usable.contains(&group),
+        "case {case:?}: a disassociated group must not be usable in the vpc {settled}, got \
+         {usable:?}",
+        case = "after the disassociation"
+    );
+    let at_home = usable_group_ids("the group's own VPC", &router, &home).await;
+    assert!(
+        at_home.contains(&group),
+        "case {case:?}: the group must still be usable in the vpc it was created in, got \
+         {at_home:?}",
+        case = "the group's own VPC"
+    );
+
+    // And the pair can be associated AFRESH: a record the disassociation finished with is no
+    // association, so associating it again starts its own clock and ends usable again.
+    let again = associate_ok("associated again", &router, &group, &settled).await;
+    assert_eq!(
+        again, ASSOCIATING,
+        "case {case:?}: expected {ASSOCIATING:?} from the second associate, got {again:?}",
+        case = "associated again"
+    );
+    past_the_transition().await;
+    let restored = reported_state("associated again", &router, &group, &settled).await;
+    assert_eq!(
+        restored.as_deref(),
+        Some(ASSOCIATED),
+        "case {case:?}: the new association must reach {ASSOCIATED:?}, got {restored:?}",
+        case = "associated again"
+    );
+    let usable_again = usable_group_ids("associated again", &router, &settled).await;
+    assert!(
+        usable_again.contains(&group),
+        "case {case:?}: the re-associated group must be usable in the vpc {settled} again, \
+         got {usable_again:?}",
+        case = "associated again"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 9: a disassociate the service cannot satisfy is refused, and writes nothing
+// ---------------------------------------------------------------------------
+
+/// The rule: a disassociate the service cannot satisfy answers the code and wording EC2
+/// answers that refusal class with, built from the request's own values, and leaves every
+/// association exactly as it was — including under `DryRun`, which asks whether the request
+/// WOULD have succeeded.
+///
+/// The rows differ in WHAT cannot be satisfied: a parameter left out, a `VpcId` that resolves
+/// to no VPC (at each malformed shape and each published id length), a `GroupId` that
+/// resolves to no group, a pair the account holds no association for (never associated, the
+/// VPC the group was created in, and one whose disassociation has already completed), and an
+/// association a network interface of that VPC still depends on.
+#[tokio::test]
+async fn a_disassociate_the_service_cannot_satisfy_is_refused_and_writes_nothing() {
+    let (router, engine) = super::ec2_query::emulator();
+
+    let home = create_vpc("the home VPC", &router, "10.81.0.0/16").await;
+    let other = create_vpc("another VPC", &router, "10.82.0.0/16").await;
+    let never = create_vpc("a VPC nothing is associated with", &router, "10.83.0.0/16").await;
+    let group = create_group("the group", &router, "first", &home).await;
+    let released = create_group("the group that let go", &router, "second", &home).await;
+
+    // One association that stands, and one whose disassociation the clock has already
+    // completed — so the refusals below are shown to leave a store with both in it alone.
+    associate_ok("the association that stands", &router, &group, &other).await;
+    associate_ok("the association that is let go", &router, &released, &other).await;
+    past_the_transition().await;
+    disassociate_ok("the association that is let go", &router, &released, &other).await;
+    past_the_transition().await;
+    let before = reported("before the refusals", &router, &[]).await;
+
+    let not_associated = |group_id: &str, vpc_id: &str| {
+        format!(
+            "Value ({vpc_id}) for parameter vpcId is invalid. The security group \
+             '{group_id}' is not associated with that VPC"
+        )
+    };
+
+    let rows: [RefusalRow<'_>; 12] = [
+        (
+            "no GroupId at all",
+            String::new(),
+            other.clone(),
+            "MissingParameter",
+            "The request must contain the parameter groupId".to_string(),
+        ),
+        (
+            "no VpcId at all",
+            group.clone(),
+            String::new(),
+            "MissingParameter",
+            "The request must contain the parameter vpcId".to_string(),
+        ),
+        (
+            "a well-formed long VPC id no VPC has",
+            group.clone(),
+            "vpc-0a1b2c3d4e5f60718".to_string(),
+            "InvalidVpcID.NotFound",
+            "The vpc ID 'vpc-0a1b2c3d4e5f60718' does not exist".to_string(),
+        ),
+        (
+            "a well-formed short VPC id no VPC has",
+            group.clone(),
+            "vpc-9f8e7d6c".to_string(),
+            "InvalidVpcID.NotFound",
+            "The vpc ID 'vpc-9f8e7d6c' does not exist".to_string(),
+        ),
+        (
+            "a value that is no VPC id at all",
+            group.clone(),
+            "not-a-vpc".to_string(),
+            "InvalidVpcID.NotFound",
+            "The vpc ID 'not-a-vpc' does not exist".to_string(),
+        ),
+        (
+            "the prefix with no digits as the group id",
+            "sg-".to_string(),
+            other.clone(),
+            "InvalidGroupId.Malformed",
+            "Invalid id: \"sg-\"".to_string(),
+        ),
+        (
+            "a group id suffix of neither published length",
+            "sg-0a1b2c".to_string(),
+            other.clone(),
+            "InvalidGroupId.Malformed",
+            "Invalid id: \"sg-0a1b2c\"".to_string(),
+        ),
+        (
+            "another resource's id as the group id",
+            "vpc-0a1b2c3d4e5f60718".to_string(),
+            other.clone(),
+            "InvalidGroupId.Malformed",
+            "Invalid id: \"vpc-0a1b2c3d4e5f60718\"".to_string(),
+        ),
+        (
+            "a well-formed group id no group has",
+            "sg-0a1b2c3d4e5f60718".to_string(),
+            other.clone(),
+            "InvalidGroup.NotFound",
+            "The security group 'sg-0a1b2c3d4e5f60718' does not exist".to_string(),
+        ),
+        (
+            "a pair that was never associated",
+            group.clone(),
+            never.clone(),
+            "InvalidParameterValue",
+            not_associated(&group, &never),
+        ),
+        (
+            "the VPC the group was created in",
+            group.clone(),
+            home.clone(),
+            "InvalidParameterValue",
+            not_associated(&group, &home),
+        ),
+        (
+            "a pair whose disassociation has completed",
+            released.clone(),
+            other.clone(),
+            "InvalidParameterValue",
+            not_associated(&released, &other),
+        ),
+    ];
+
+    for (case, group_id, vpc_id, code, message) in rows {
+        for (how, extra) in [
+            ("as sent", Vec::new()),
+            ("under DryRun", vec![param("DryRun", "true")]),
+        ] {
+            let (status, body) = disassociate(&router, &group_id, &vpc_id, &extra).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?} {how}: expected HTTP 400, got {status} with body {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                code,
+                "case {case:?} {how}: expected {code}, got body {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                message,
+                "case {case:?} {how}: expected the message {message:?}, got body {body}"
+            );
+        }
+        let after = reported(case, &router, &[]).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused disassociate must write nothing, expected {before:?}, \
+             got {after:?}"
+        );
+    }
+
+    // A request that WOULD have succeeded answers `DryRunOperation` and writes nothing: the
+    // association it names is still established afterwards.
+    let (dry_status, dry_body) =
+        disassociate(&router, &group, &other, &[param("DryRun", "true")]).await;
+    assert_eq!(
+        dry_status, 412,
+        "case {case:?}: expected HTTP 412, got {dry_status} with body {dry_body}",
+        case = "a dry run that would have succeeded"
+    );
+    assert_eq!(
+        error_code(&dry_body),
+        "DryRunOperation",
+        "case {case:?}: expected DryRunOperation, got body {dry_body}",
+        case = "a dry run that would have succeeded"
+    );
+    let after_dry_run = reported("after the dry run", &router, &[]).await;
+    assert_eq!(
+        after_dry_run, before,
+        "case {case:?}: a dry run must write nothing, expected {before:?}, got \
+         {after_dry_run:?}",
+        case = "a dry run that would have succeeded"
+    );
+
+    // "You cannot disassociate the security group if any Elastic network interfaces in the
+    // associated VPC are still associated with the security group"
+    // (`DisassociateSecurityGroupVpc`). An interface of that VPC naming the group is seeded
+    // through the store's own writer seam, because `CreateNetworkInterface` takes only the
+    // groups of the interface's own VPC today.
+    let case = "an interface of the VPC still names the group";
+    let subnet_body = ok(
+        case,
+        &router,
+        "CreateSubnet",
+        &[param("VpcId", &other), param("CidrBlock", "10.82.1.0/24")],
+    )
+    .await;
+    let subnet_id = element(&subnet_body, "subnetId")
+        .unwrap_or_else(|| panic!("case {case:?}: no subnetId in {subnet_body}"));
+    let interface_id = ec2::state::service_state(&*engine)
+        .expect("the EC2 store")
+        .lock()
+        .insert_network_interface(NetworkInterfaceSpec {
+            subnet_id,
+            vpc_id: other.clone(),
+            availability_zone: element(&subnet_body, "availabilityZone").unwrap_or_default(),
+            availability_zone_id: element(&subnet_body, "availabilityZoneId").unwrap_or_default(),
+            region: REGION.to_string(),
+            interface_type: NETWORK_INTERFACE_TYPE_INTERFACE.to_string(),
+            groups: vec![GroupIdentifier {
+                group_id: Some(group.clone()),
+                group_name: Some("first".to_string()),
+            }],
+            ..NetworkInterfaceSpec::default()
+        })
+        .expect("the store holds the seeded network interface");
+    let (held_status, held_body) = disassociate(&router, &group, &other, &[]).await;
+    assert_eq!(
+        held_status, 400,
+        "case {case:?}: expected HTTP 400 while {interface_id} holds the group, got \
+         {held_status} with body {held_body}"
+    );
+    assert_eq!(
+        error_code(&held_body),
+        "DependencyViolation",
+        "case {case:?}: expected DependencyViolation, got body {held_body}"
+    );
+    assert_eq!(
+        error_message(&held_body),
+        format!("resource {group} has a dependent object"),
+        "case {case:?}: unexpected message, got body {held_body}"
+    );
+    let after_dependency = reported(case, &router, &[]).await;
+    assert_eq!(
+        after_dependency, before,
+        "case {case:?}: a refused disassociate must write nothing, expected {before:?}, got \
+         {after_dependency:?}"
+    );
+
+    // And once nothing of that VPC holds the group any more, the same call goes through —
+    // so the refusal above was the dependency and not the request.
+    ok(
+        case,
+        &router,
+        "DeleteNetworkInterface",
+        &[param("NetworkInterfaceId", &interface_id)],
+    )
+    .await;
+    let answered = disassociate_ok(case, &router, &group, &other).await;
+    assert_eq!(
+        answered, DISASSOCIATING,
+        "case {case:?}: expected {DISASSOCIATING:?} once nothing holds the group, got \
+         {answered:?}"
+    );
 }

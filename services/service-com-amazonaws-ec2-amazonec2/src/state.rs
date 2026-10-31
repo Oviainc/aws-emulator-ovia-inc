@@ -139,15 +139,17 @@
 //! A security group can also be made usable in a VPC it was not created in:
 //! [`ComAmazonawsEc2Amazonec2State::security_group_vpc_associations`] holds those
 //! associations, keyed by the (`GroupId`, `VpcId`) pair an association IS, as a
-//! [`SecurityGroupVpcAssociationRecord`] — the one fact the modelled
-//! `SecurityGroupVpcAssociation` shape carries no member for, the instant its `associating`
-//! -> `associated` move falls due, on the same monotonic clock and the same
+//! [`SecurityGroupVpcAssociationRecord`] — the facts the modelled
+//! `SecurityGroupVpcAssociation` shape carries no member for, the instants its `associating`
+//! -> `associated` and, once a disassociate has asked for one, its `disassociating` ->
+//! `disassociated` moves fall due, on the same monotonic clock and the same
 //! [`TRANSITION_DELAY`] as every other move this store owes. The two accounts the shape
 //! reports are NOT copied onto the record: they are the owners of the group and of the VPC,
 //! which this store already holds, so
 //! [`ComAmazonawsEc2Amazonec2State::security_group_vpc_association_view`] derives them on
-//! read and `AssociateSecurityGroupVpc` and `DescribeSecurityGroupVpcAssociations` cannot
-//! report one association differently. An association cannot outlive either side of the
+//! read and `AssociateSecurityGroupVpc`, `DisassociateSecurityGroupVpc` and
+//! `DescribeSecurityGroupVpcAssociations` cannot report one association differently. An
+//! association cannot outlive either side of the
 //! pair, so [`ComAmazonawsEc2Amazonec2State::remove_security_group`] and
 //! [`ComAmazonawsEc2Amazonec2State::remove_vpc`] drop the ones they orphan.
 //!
@@ -19883,6 +19885,14 @@ pub const SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATING: &str = "associating"
 /// An association that is established: that same enum's `associated` member.
 pub const SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
 
+/// An association that is being taken down: that same enum's `disassociating` member.
+pub const SECURITY_GROUP_VPC_ASSOCIATION_STATE_DISASSOCIATING: &str = "disassociating";
+
+/// An association that has been taken down: that same enum's `disassociated` member — the
+/// state `DisassociateSecurityGroupVpc`'s clock-owed move ends in, and the one in which the
+/// pair holds the group in no VPC and may be associated again.
+pub const SECURITY_GROUP_VPC_ASSOCIATION_STATE_DISASSOCIATED: &str = "disassociated";
+
 /// The largest number of security group VPC associations this in-memory store holds.
 ///
 /// A capacity bound in the same style as [`MAX_SECURITY_GROUPS`], not an AWS quota: each
@@ -19894,8 +19904,8 @@ pub const SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
 /// resource-specific code for.
 pub const MAX_SECURITY_GROUP_VPC_ASSOCIATIONS: usize = 2_500;
 
-/// One stored security group VPC association: the instant the clock owes it its
-/// `associating` -> `associated` move.
+/// One stored security group VPC association: the instants the clock owes it its
+/// `associating` -> `associated` and `disassociating` -> `disassociated` moves.
 ///
 /// The pair is the key of
 /// [`ComAmazonawsEc2Amazonec2State::security_group_vpc_associations`] and is not repeated on
@@ -19910,16 +19920,38 @@ pub struct SecurityGroupVpcAssociationRecord {
     /// only ever compared against the clock, never reported, so a wall-clock adjustment
     /// cannot move an association back to `associating`.
     pub associated_at: Instant,
+    /// The instant from which this association's `disassociating` -> `disassociated` move is
+    /// due, and `None` for as long as nothing has asked for the association to be taken
+    /// down. Monotonic on the same terms as [`Self::associated_at`]; set once, by the
+    /// disassociate, and cleared only by an associate that establishes the pair afresh.
+    pub disassociated_at: Option<Instant>,
 }
 
 impl SecurityGroupVpcAssociationRecord {
     /// The association's `SecurityGroupVpcAssociationState` at `now`.
+    ///
+    /// A disassociation takes over the record's state: once one is owed, the association is
+    /// `disassociating` until it falls due and `disassociated` after it, whatever the
+    /// association's own move had reached.
     pub fn state_at(&self, now: Instant) -> &'static str {
-        if now < self.associated_at {
-            SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATING
-        } else {
-            SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATED
+        match self.disassociated_at {
+            Some(disassociated_at) if now < disassociated_at => {
+                SECURITY_GROUP_VPC_ASSOCIATION_STATE_DISASSOCIATING
+            }
+            Some(_) => SECURITY_GROUP_VPC_ASSOCIATION_STATE_DISASSOCIATED,
+            None if now < self.associated_at => SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATING,
+            None => SECURITY_GROUP_VPC_ASSOCIATION_STATE_ASSOCIATED,
         }
+    }
+
+    /// Whether this association still joins its pair at `now`: everything up to and
+    /// including `disassociating` does, and only a completed disassociation does not.
+    ///
+    /// The ONE definition of "the group is associated with that VPC", so the operation that
+    /// establishes an association and the one that takes it down cannot disagree about
+    /// whether the account holds one.
+    pub fn joins_its_pair_at(&self, now: Instant) -> bool {
+        self.state_at(now) != SECURITY_GROUP_VPC_ASSOCIATION_STATE_DISASSOCIATED
     }
 }
 
@@ -19975,11 +20007,59 @@ impl ComAmazonawsEc2Amazonec2State {
     ) -> SecurityGroupVpcAssociation {
         let record = SecurityGroupVpcAssociationRecord {
             associated_at: now + TRANSITION_DELAY,
+            // An associate ESTABLISHES the pair, so whatever a disassociation of an earlier
+            // association of the same pair left owed is no longer owed: the record that
+            // replaces it starts its own `associating` -> `associated` move with nothing
+            // pending against it.
+            disassociated_at: None,
         };
         let view = self.security_group_vpc_association_view(group_id, vpc_id, &record, now);
         self.security_group_vpc_associations
             .insert((group_id.to_string(), vpc_id.to_string()), record);
         view
+    }
+
+    /// Whether the account holds an association of `group_id` with `vpc_id` at `now`.
+    ///
+    /// Asked by both writers of the store: an associate has nothing to establish for a pair
+    /// this answers `true` for, and a disassociate has nothing to take down for a pair it
+    /// answers `false` for. [`SecurityGroupVpcAssociationRecord::joins_its_pair_at`] is where
+    /// "holds" is defined, so neither can read it differently.
+    pub fn holds_security_group_vpc_association(
+        &self,
+        group_id: &str,
+        vpc_id: &str,
+        now: Instant,
+    ) -> bool {
+        self.security_group_vpc_associations
+            .get(&(group_id.to_string(), vpc_id.to_string()))
+            .is_some_and(|record| record.joins_its_pair_at(now))
+    }
+
+    /// Start the disassociation of `group_id` from `vpc_id` at `now`, and answer the
+    /// association as of that instant, or `None` when the account holds no such association.
+    ///
+    /// "Note that the disassociation is asynchronous and you can check the status of the
+    /// request with DescribeSecurityGroupVpcAssociations"
+    /// (`DisassociateSecurityGroupVpc`): the association is left in the non-terminal
+    /// `disassociating` state with the clock owing it `disassociated` one
+    /// [`TRANSITION_DELAY`] later — the same span every other clock-owed move of this crate
+    /// takes — so a caller reading straight after the write still sees `disassociating`, and
+    /// no second call is needed to finish it.
+    pub fn disassociate_security_group_vpc_association(
+        &mut self,
+        group_id: &str,
+        vpc_id: &str,
+        now: Instant,
+    ) -> Option<SecurityGroupVpcAssociation> {
+        let key = (group_id.to_string(), vpc_id.to_string());
+        let record = self.security_group_vpc_associations.get_mut(&key)?;
+        if !record.joins_its_pair_at(now) {
+            return None;
+        }
+        record.disassociated_at = Some(now + TRANSITION_DELAY);
+        let record = record.clone();
+        Some(self.security_group_vpc_association_view(group_id, vpc_id, &record, now))
     }
 
     /// Every security group VPC association the account holds as of `now`, in (`GroupId`,
@@ -20978,6 +21058,30 @@ impl ComAmazonawsEc2Amazonec2State {
                     .any(|group| group.group_id.as_deref() == Some(group_id))
             })
             .map(|(network_interface_id, _)| network_interface_id.clone())
+            .collect()
+    }
+
+    /// The network interfaces of `vpc_id` that still name the security group `group_id`
+    /// among their `NetworkInterface$Groups`.
+    ///
+    /// "You cannot disassociate the security group if any Elastic network interfaces in the
+    /// associated VPC are still associated with the security group"
+    /// (`DisassociateSecurityGroupVpc`) — what an interface naming the group IS stays
+    /// [`Self::network_interfaces_with_security_group`]'s one definition, narrowed here to
+    /// the VPC the interfaces live in.
+    pub fn network_interfaces_in_vpc_with_security_group(
+        &self,
+        vpc_id: &str,
+        group_id: &str,
+    ) -> Vec<String> {
+        self.network_interfaces_with_security_group(group_id)
+            .into_iter()
+            .filter(|network_interface_id| {
+                self.network_interfaces
+                    .get(network_interface_id)
+                    .and_then(|interface| interface.vpc_id.as_deref())
+                    == Some(vpc_id)
+            })
             .collect()
     }
 

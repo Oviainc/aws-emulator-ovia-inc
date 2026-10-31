@@ -12,7 +12,8 @@
 //!
 //! Implemented here together with its reader `DescribeSecurityGroupVpcAssociations`, whose
 //! own stub issue this change closes: without the write there is nothing for that read to
-//! report. `DisassociateSecurityGroupVpc` stays a stub, with its own issue.
+//! report. `DisassociateSecurityGroupVpc` takes an association back down, through the same
+//! store and the same view.
 //!
 //! ## Reaching this service's state
 //!
@@ -212,11 +213,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An association IS the pair, so a pair the account already holds one for has
         // nothing to establish: a repeat is refused with `Resource.AlreadyAssociated`
         // rather than restarting the association's clock, which would move an `associated`
-        // association back to `associating` for every later reader.
-        if store
-            .security_group_vpc_associations
-            .contains_key(&(input.group_id.clone(), input.vpc_id.clone()))
-        {
+        // association back to `associating` for every later reader. An association the
+        // clock has not finished taking down is still one the account holds
+        // (`SecurityGroupVpcAssociationRecord::joins_its_pair_at`), so it is refused on the
+        // same terms; a pair whose disassociation HAS completed holds the group in no VPC,
+        // so associating it again is a fresh association rather than a repeat.
+        let now = ::std::time::Instant::now();
+        if store.holds_security_group_vpc_association(&input.group_id, &input.vpc_id, now) {
             return Err(state::resource_already_associated(format!(
                 "The security group '{group_id}' is already associated with the vpc \
                  '{vpc_id}'",
@@ -246,7 +249,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sees `associating`. "The state of the association" (`$State`) is taken off the
         // record that was just stored, so this operation and
         // `DescribeSecurityGroupVpcAssociations` cannot report one association differently.
-        let now = ::std::time::Instant::now();
         let association =
             store.insert_security_group_vpc_association(&input.group_id, &input.vpc_id, now);
         Ok(AssociateSecurityGroupVpcOutput {
