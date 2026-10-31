@@ -500,6 +500,29 @@ pub fn fingerprint<T: std::fmt::Debug>(value: &T) -> String {
     hex::encode(digest)
 }
 
+/// The digest the client-token ledger compares for a request, taken over the
+/// request AS THE HANDLER READS IT.
+///
+/// A client token exists so a retry of ONE request is replayed rather than acted
+/// on twice, so what the ledger has to tell apart is requests the service acts
+/// on differently ([`TokenOutcome::ParameterMismatch`]). `as_read` is where a
+/// handler states that reading of its own input: the client token itself, which
+/// is not part of the request it ties, and every member the handler NORMALISES
+/// before acting — the accounts an association request names
+/// ([`distinct_account_ids`]), a member read only by membership
+/// ([`canonical_membership`]) — carry the normalised value in the probe. Two
+/// spellings of one request therefore replay, exactly as two spellings of one
+/// query continue one page walk ([`page_fingerprint`]), while every difference
+/// the service does act on still digests differently and is still refused.
+pub fn request_fingerprint<T: Clone + std::fmt::Debug>(
+    input: &T,
+    as_read: impl FnOnce(&mut T),
+) -> String {
+    let mut probe = input.clone();
+    as_read(&mut probe);
+    fingerprint(&probe)
+}
+
 /// The fingerprint a paginated listing binds into the page tokens it mints: the
 /// name of the operation that issued the token, together with the query the walk
 /// was taken for.

@@ -41,6 +41,8 @@ mod automation_rule_preview;
 mod automation_rule_preview_summaries;
 #[path = "all/automation_rule_validation.rs"]
 mod automation_rule_validation;
+#[path = "all/client_token_request_spellings.rs"]
+mod client_token_request_spellings;
 #[path = "all/cross_operation_page_tokens.rs"]
 mod cross_operation_page_tokens;
 #[path = "all/disassociated_member_initiation.rs"]

@@ -203,9 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let account_id = crate::state::caller_account_id();
-        let mut probe = input.clone();
-        probe.client_token = None;
-        let request_fingerprint = crate::state::fingerprint(&probe);
+        // The request as THIS handler reads it, which is what its client token
+        // ties (`crate::state::request_fingerprint`): only the token itself is
+        // left out. The one other member, `status`, is stored as sent, so it is
+        // not normalised here and another status is another request.
+        let request_fingerprint = crate::state::request_fingerprint(&input, |probe| {
+            probe.client_token = None;
+        });
         let client_token = input.client_token.as_deref();
 
         let mut guard = state.lock();

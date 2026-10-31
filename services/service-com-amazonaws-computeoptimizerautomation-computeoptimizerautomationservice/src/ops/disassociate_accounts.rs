@@ -203,9 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request first names them (`crate::state::distinct_account_ids`).
         let requested = crate::state::distinct_account_ids(&input.account_ids);
 
-        let mut probe = input.clone();
-        probe.client_token = None;
-        let request_fingerprint = crate::state::fingerprint(&probe);
+        // The request as THIS handler reads it, which is what its client token
+        // ties (`crate::state::request_fingerprint`): the accounts it names, so
+        // a retry that spells the same accounts with a repeated id is replayed
+        // rather than refused as a different request. The ORDER the request
+        // first names them in stays part of the fingerprint, because the answer
+        // below reports the accounts in exactly that order.
+        let request_fingerprint = crate::state::request_fingerprint(&input, |probe| {
+            probe.client_token = None;
+            probe.account_ids = requested.clone();
+        });
         let client_token = input.client_token.as_deref();
 
         let mut guard = state.lock();

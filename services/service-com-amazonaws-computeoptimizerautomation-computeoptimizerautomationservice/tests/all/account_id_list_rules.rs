@@ -40,7 +40,10 @@ fn member_account_ids(n: usize) -> Vec<String> {
 /// The ids `account_ids` names, each once and in the order it first names them —
 /// what both operations must act on and report, computed here independently of
 /// the service.
-fn first_named_once(account_ids: &[String]) -> Vec<String> {
+///
+/// `pub(crate)` so the sibling suites about what an association request NAMES
+/// read a list the same way rather than each growing a copy of this.
+pub(crate) fn first_named_once(account_ids: &[String]) -> Vec<String> {
     let mut distinct: Vec<String> = Vec::new();
     for account_id in account_ids {
         if !distinct.iter().any(|kept| kept == account_id) {
@@ -51,7 +54,9 @@ fn first_named_once(account_ids: &[String]) -> Vec<String> {
 }
 
 /// The `accountIds` a response reports, in the order it reports them.
-fn reported_account_ids(body: &Value) -> Vec<String> {
+///
+/// `pub(crate)` for the same reason as [`first_named_once`].
+pub(crate) fn reported_account_ids(body: &Value) -> Vec<String> {
     member(body, "accountIds")
         .as_array()
         .map(|ids| {
@@ -62,17 +67,11 @@ fn reported_account_ids(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The message an error body carries, under either casing of the member.
-fn error_message(body: &Value) -> String {
-    body.get("message")
-        .or_else(|| body.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
 /// The two operations that read an `accountIds` list of this service.
-const ASSOCIATION_OPERATIONS: [&str; 2] = ["AssociateAccounts", "DisassociateAccounts"];
+///
+/// `pub(crate)` so a sibling suite about a rule BOTH of them follow drives the
+/// same pair.
+pub(crate) const ASSOCIATION_OPERATIONS: [&str; 2] = ["AssociateAccounts", "DisassociateAccounts"];
 
 /// The wording a refusal of this member carries, as the service reports a
 /// constraint the model cannot express: the member's path and the requirement it
@@ -141,7 +140,7 @@ async fn both_association_operations_refuse_the_same_account_id_lists() {
                  error, got {body}"
             );
             assert_eq!(
-                error_message(&body),
+                crate::error_payloads::error_message(&body),
                 expected_message,
                 "case {case:?}/{operation}: expected {expected_message:?}, got {body}"
             );

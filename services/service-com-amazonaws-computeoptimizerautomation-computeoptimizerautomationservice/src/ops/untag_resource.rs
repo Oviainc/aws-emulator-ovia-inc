@@ -202,9 +202,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(message));
         }
 
-        let mut probe = input.clone();
-        probe.client_token = None;
-        let request_fingerprint = crate::state::fingerprint(&probe);
+        // The request as THIS handler reads it, which is what its client token
+        // ties (`crate::state::request_fingerprint`): the removal below keeps
+        // every tag whose key the list does not CONTAIN, so `tagKeys` names a
+        // set — neither the order it spells the keys in nor a key it repeats
+        // changes which tags are removed or what the call answers, and a retry
+        // spelling that set differently is replayed rather than refused
+        // (`crate::state::canonical_membership`).
+        let request_fingerprint = crate::state::request_fingerprint(&input, |probe| {
+            probe.client_token = None;
+            probe.tag_keys = crate::state::canonical_membership(&probe.tag_keys);
+        });
         let client_token = input.client_token.as_deref();
 
         let mut guard = state.lock();
