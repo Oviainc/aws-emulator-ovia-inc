@@ -31,7 +31,9 @@
 //!   with" — numbered as `PipelineDetail$PipelineId` numbers a channel's
 //!   pipelines, so an alert cannot be associated with a pipeline the channel's
 //!   class does not give it ([`super::ChannelRecord::raise_alert`] records no
-//!   such alert at all).
+//!   such alert at all, and a class the channel is LATER given decides the
+//!   association just the same, so the log is read through
+//!   [`super::ChannelRecord::reportable_alerts`] rather than directly).
 //!
 //! WHO WRITES IT: an alert is the SERVICE's observation of a condition on a
 //! channel — the real one raises one when the media it is ingesting or pushing
@@ -198,7 +200,13 @@ impl ChannelAlerts {
     /// The order a reader walks the log in, and so the sequence `ListAlerts`
     /// paginates over. Oldest first, which is why appending an alert cannot
     /// change where an already-handed-out page boundary falls.
-    pub fn in_set_order(&self, filter: Option<&str>) -> Vec<&ChannelAlertRecord> {
+    ///
+    /// The log alone, so this is NOT what an operation reports: an alert names a
+    /// pipeline of the channel, which only the channel record knows, so a
+    /// reporting operation reads the log through
+    /// [`super::ChannelRecord::reportable_alerts`] — the one place that rule is
+    /// applied.
+    pub(crate) fn in_set_order(&self, filter: Option<&str>) -> Vec<&ChannelAlertRecord> {
         let mut ordered: Vec<&ChannelAlertRecord> = self
             .alerts
             .iter()

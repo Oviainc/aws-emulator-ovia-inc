@@ -117,8 +117,9 @@
 //! has observed on that channel, which `ListAlerts` reports. Nothing in this
 //! emulator ingests media, so no operation observes an alert condition and the
 //! log stays empty unless [`ChannelRecord::raise_alert`] is called — a read
-//! reports what the log holds and never invents an alert for a channel that is
-//! merely running.
+//! reports what the log holds for the pipelines the channel's class gives it
+//! ([`ChannelRecord::reportable_alerts`]) and never invents an alert for a
+//! channel that is merely running.
 //!
 //! The monitor side of the service lives here as well: one
 //! [`CloudWatchAlarmTemplateGroupRecord`] per created cloudwatch alarm template
@@ -1469,7 +1470,8 @@ pub struct ChannelRecord {
     /// channel for the same reason the schedule does. Empty until something
     /// raises an alert on this channel ([`Self::raise_alert`]); see the
     /// [`channel_alerts`] module for why nothing in this emulator does so on its
-    /// own.
+    /// own. Read for reporting through [`Self::reportable_alerts`], which is
+    /// where an alert's pipeline is resolved against this channel's class.
     pub alerts: ChannelAlerts,
     /// The thumbnail frames this channel's pipelines have captured, oldest
     /// first — the [`thumbnails`] slice's store. Nothing in this emulator
@@ -1570,6 +1572,35 @@ impl ChannelRecord {
     /// ([`Self::pipelines`]), so a request may name it.
     pub fn has_pipeline(&self, pipeline: i32) -> bool {
         self.pipelines().contains(&pipeline)
+    }
+
+    /// The alerts of this channel's log that a `StateFilter` admits and this
+    /// channel has the pipeline for, in the order the service set them — what
+    /// `ListAlerts` reports.
+    ///
+    /// `ChannelAlert$PipelineId` is "The ID of the pipeline this alert is
+    /// associated with", and the pipelines a channel has are the ones its class
+    /// gives it ([`Self::pipelines`]), so the rule [`Self::raise_alert`] applies
+    /// when an alert is recorded is applied again at every READING of the log:
+    /// the class a later write stores is what decides which pipelines the
+    /// channel has, and an alert associated with one it has not got describes
+    /// nothing the channel is running. Whatever state the alert is in, since the
+    /// pipeline it names is what the association is.
+    ///
+    /// The record itself is KEPT, exactly as the address a dropped pipeline
+    /// egressed from is ([`Self::egress_endpoints`]) and as the frames it
+    /// captured are ([`Self::latest_thumbnail`]), so a channel put back into the
+    /// class that gives it that pipeline reports its alerts again.
+    pub fn reportable_alerts(&self, filter: Option<&str>) -> Vec<&ChannelAlertRecord> {
+        self.alerts
+            .in_set_order(filter)
+            .into_iter()
+            .filter(|alert| {
+                alert
+                    .pipeline_id
+                    .is_none_or(|pipeline| self.has_pipeline(pipeline))
+            })
+            .collect()
     }
 
     /// How many of this channel's pipelines are healthy — the

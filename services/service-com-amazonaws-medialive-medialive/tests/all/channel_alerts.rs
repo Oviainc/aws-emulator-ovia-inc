@@ -37,11 +37,16 @@ use crate::wire::{call, error_code, error_message, medialive_with_engine, DEFAUL
 
 /// The engine the router under test was built on, so a suite can record on it
 /// the alerts no operation of this emulator produces.
-type Engine = Arc<engine::InMemoryEngine>;
+///
+/// The seeding helpers below are `pub(crate)` because
+/// `crate::channel_class_pipeline_scope` — the suite for what a channel's CLASS
+/// does to the alerts it reports — reads the same log through the same writer,
+/// so the two cannot disagree about how an alert gets into it.
+pub(crate) type Engine = Arc<engine::InMemoryEngine>;
 
 /// A created channel of `class` (absent for the service's default), answering
 /// its id.
-async fn channel(router: &MultiServiceRouter, name: &str, class: Option<&str>) -> String {
+pub(crate) async fn channel(router: &MultiServiceRouter, name: &str, class: Option<&str>) -> String {
     let mut request = json!({
         "name": name,
         "encoderSettings": crate::support::channel_encoder_settings(),
@@ -62,7 +67,7 @@ async fn channel(router: &MultiServiceRouter, name: &str, class: Option<&str>) -
 
 /// An instant `offset` seconds into a fixed base, so the set order a suite seeds
 /// is the order it asserts and nothing depends on the wall clock.
-fn at(offset: u64) -> SystemTime {
+pub(crate) fn at(offset: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_700_000_000 + offset)
 }
 
@@ -70,7 +75,7 @@ fn at(offset: u64) -> SystemTime {
 /// the `Id` it minted — and `None` when the writer refuses the pipeline the
 /// observation named, which is the invariant
 /// `an_alert_is_recorded_only_for_a_pipeline_the_channel_class_gives_it` reads.
-fn try_raise(
+pub(crate) fn try_raise(
     engine: &Engine,
     channel_id: &str,
     alert_type: &str,
@@ -88,7 +93,7 @@ fn try_raise(
 }
 
 /// [`try_raise`] for a seeding call that must have been recorded.
-fn raise(
+pub(crate) fn raise(
     engine: &Engine,
     channel_id: &str,
     alert_type: &str,
@@ -103,7 +108,7 @@ fn raise(
 
 /// Clear a recorded alert — "the alert is no longer happening" — as of
 /// `cleared_at`.
-fn clear(engine: &Engine, channel_id: &str, alert_id: &str, cleared_at: SystemTime) {
+pub(crate) fn clear(engine: &Engine, channel_id: &str, alert_id: &str, cleared_at: SystemTime) {
     let store = service_state_in(&**engine, DEFAULT_REGION).expect("the medialive store");
     let mut store = store.lock();
     let channel = store
@@ -117,7 +122,7 @@ fn clear(engine: &Engine, channel_id: &str, alert_id: &str, cleared_at: SystemTi
 }
 
 /// How many alerts the channel's log holds, whatever state they are in.
-fn logged(engine: &Engine, channel_id: &str) -> usize {
+pub(crate) fn logged(engine: &Engine, channel_id: &str) -> usize {
     let store = service_state_in(&**engine, DEFAULT_REGION).expect("the medialive store");
     let store = store.lock();
     store
@@ -129,7 +134,7 @@ fn logged(engine: &Engine, channel_id: &str) -> usize {
 /// `ListAlerts` as a client calls it: GET /prod/channels/{ChannelId}/alerts with
 /// the request's `@httpQuery` members
 /// (`smithy_query(query="operation", operation="ListAlerts")`).
-async fn list(
+pub(crate) async fn list(
     router: &MultiServiceRouter,
     channel_id: &str,
     query: &[(&str, String)],
@@ -148,12 +153,12 @@ async fn list(
 
 /// The `alerts` the response reported, as JSON objects in the order they were
 /// reported.
-fn reported(body: &Value) -> Vec<Value> {
+pub(crate) fn reported(body: &Value) -> Vec<Value> {
     body["alerts"].as_array().cloned().unwrap_or_default()
 }
 
 /// The `id` of each reported alert, in the order they were reported.
-fn reported_ids(body: &Value) -> Vec<String> {
+pub(crate) fn reported_ids(body: &Value) -> Vec<String> {
     reported(body)
         .iter()
         .map(|alert| alert["id"].as_str().unwrap_or_default().to_string())

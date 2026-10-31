@@ -38,6 +38,16 @@
 //! modelled `UnprocessableEntityException` (422), exactly as `UpdateChannel`
 //! refuses a configuration that would strand one.
 //!
+//! The channel's ALERT log carries the same `PipelineId` association
+//! (`ChannelAlert$PipelineId`, "The ID of the pipeline this alert is associated
+//! with"), and nothing a caller can do deletes an alert, so the class this
+//! operation stores is not held back by one: the log is kept as the history it
+//! is, and every reading of it resolves an alert's pipeline against the class
+//! the channel has (`ChannelRecord::reportable_alerts`), so `ListAlerts` reports
+//! an alert of a pipeline this class drops no more than `DescribeChannel`
+//! reports that pipeline's detail or egress address — and a channel put back
+//! into the class that gives it that pipeline reports them all again.
+//!
 //! The id is resolved through the shared channel-mutation guard
 //! (`state::mutable_channel`), so a channel whose delete this service has
 //! accepted — readable in `DELETING` and then in the terminal `DELETED` — names

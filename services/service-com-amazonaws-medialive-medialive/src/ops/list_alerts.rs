@@ -13,6 +13,12 @@
 //! no `ChannelRecord::raise_alert` has written lists no alerts, which is the
 //! store's answer and not a fixed one.
 //!
+//! An alert's `PipelineId` is "The ID of the pipeline this alert is associated
+//! with", and the pipelines a channel has are the ones its `ChannelClass` gives
+//! it, so the log is read through `ChannelRecord::reportable_alerts`: a pipeline
+//! the channel's CURRENT class has not got is not one an alert of it can be
+//! associated with, whichever class the alert was recorded under.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -216,7 +222,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let reportable = channel.alerts.in_set_order(state_filter);
+        // The alerts the channel reports: the log, narrowed by the request's
+        // `StateFilter` and by the pipelines the channel's class gives it.
+        // `ChannelAlert$PipelineId` is "The ID of the pipeline this alert is
+        // associated with", and a pipeline the class has not got is not one an
+        // alert of this channel can be associated with — the rule the store
+        // applies when an alert is recorded, asked again here because a later
+        // class write is what decides which pipelines the channel has.
+        let reportable = channel.reportable_alerts(state_filter);
         // The page the cursor reports, and the token beside it — absent on the
         // last page, which the shared rule decides.
         let (alerts, next_token): (Vec<ChannelAlert>, Option<String>) =
