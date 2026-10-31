@@ -53,7 +53,12 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 
 /// The region every request here is signed for, and so the region the stack's resources and
 /// their ARNs belong to.
-const REGION: &str = "us-west-2";
+///
+/// `pub(crate)` because the suites that reuse the wire helpers below assert on the ARNs and
+/// hosts a resource of that Region carries
+/// ([`crate::cloudformation_search_indexing_pipeline_outputs`]): one Region, named once, so a
+/// suite's expectations cannot be signed for one Region and written for another.
+pub(crate) const REGION: &str = "us-west-2";
 
 /// How long one poll of a stack waits before asking again.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);

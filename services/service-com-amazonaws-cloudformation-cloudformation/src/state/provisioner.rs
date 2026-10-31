@@ -3637,6 +3637,42 @@ const DOMAIN_NON_CREATE_PROPERTIES: &[&str] = &["DomainName", "Tags", "SkipShard
 /// entries `Fn::GetAtt` reads one at a time through `DomainEndpoints.<key>`.
 const DOMAIN_ENDPOINTS_ATTRIBUTE: &str = "DomainEndpoints";
 
+/// The attribute that type publishes the DUAL-STACK endpoint of a domain under, and the
+/// `DomainStatus` member the owning service reports it as: "if `IPAddressType` [is] set to
+/// `dualstack`, a version 2 domain endpoint is provisioned. This endpoint functions like a
+/// normal endpoint, except that it works with both IPv4 and IPv6 IP addresses"
+/// (`smithy_query(query="doc",shape="DomainStatus",member="EndpointV2")` of that service's
+/// model) — so a domain that service provisions no version 2 endpoint for publishes no such
+/// host, and the attribute stays unset rather than carrying the IPv4 one.
+const DOMAIN_ENDPOINT_V2: (&str, &str) = ("DomainEndpointV2", "EndpointV2");
+
+/// The attributes that type publishes as NESTED members of a container the owning service
+/// reports about the domain, each read through the dotted path `Fn::GetAtt` names it by
+/// (`ServiceSoftwareOptions.CurrentVersion`), exactly as a `DomainEndpoints.<key>` entry is.
+///
+/// `(the container the service reports, the members of it the type publishes)`. The member
+/// names are that container's own, from the owning service's model
+/// (`smithy_query(query="shape",shape="ServiceSoftwareOptions,AdvancedSecurityOptions")`):
+/// the service-software record every full descriptor of a domain carries, and the one
+/// fine-grained-access-control member of the type's published set. A member the service does
+/// not report leaves its attribute unset.
+const DOMAIN_NESTED_ATTRIBUTES: &[(&str, &[&str])] = &[
+    (
+        "ServiceSoftwareOptions",
+        &[
+            "AutomatedUpdateDate",
+            "Cancellable",
+            "CurrentVersion",
+            "Description",
+            "NewVersion",
+            "OptionalDeployment",
+            "UpdateAvailable",
+            "UpdateStatus",
+        ],
+    ),
+    ("AdvancedSecurityOptions", &["AnonymousAuthDisableDate"]),
+];
+
 /// The properties of an `AWS::OpenSearchService::Domain` whose `CreateDomain` member is
 /// modelled a STRING carrying a JSON document, so the property's value is sent as that
 /// document's TEXT and not as the JSON the template spelled it with
@@ -3716,6 +3752,14 @@ async fn create_domain(
 /// carry — the public endpoint of a domain reached inside a VPC — leaves its attribute unset
 /// rather than guessed.
 ///
+/// The REST of the type's published set is read off that same answer, so every attribute it
+/// publishes carries the value that service holds rather than nothing: the dual-stack host
+/// ([`DOMAIN_ENDPOINT_V2`]) and the members the type publishes as nested paths through a
+/// container the answer carries ([`DOMAIN_NESTED_ATTRIBUTES`]) — the domain's service-software
+/// record and its anonymous-auth migration date. Each is recorded under the dotted name
+/// `Fn::GetAtt` reads it by, exactly as a `DomainEndpoints.<key>` entry is, and a member the
+/// service does not report is left absent rather than invented.
+///
 /// A domain reached inside a VPC publishes its hosts in `DomainStatus$Endpoints` instead,
 /// "the key-value pair that exists if the OpenSearch Service domain uses VPC endpoints",
 /// which is this type's [`DOMAIN_ENDPOINTS_ATTRIBUTE`] return value. `Fn::GetAtt` reads one
@@ -3739,6 +3783,26 @@ fn domain_created(resource_type: &str, status: &Value) -> Created {
     }
     if let Some(endpoint) = status.get("Endpoint").and_then(Value::as_str) {
         attributes.insert("DomainEndpoint".to_string(), endpoint.to_string());
+    }
+    // The address the domain is reached on is part of its identity, like the ARN and the id
+    // above, so it is recorded unconditionally: the attribute ceiling below bounds the
+    // open-ended parts of the set, never these.
+    let (dual_stack_attribute, dual_stack_member) = DOMAIN_ENDPOINT_V2;
+    if let Some(endpoint) = status.get(dual_stack_member).and_then(Value::as_str) {
+        attributes.insert(dual_stack_attribute.to_string(), endpoint.to_string());
+    }
+    for (container, members) in DOMAIN_NESTED_ATTRIBUTES {
+        let Some(reported) = status.get(*container) else {
+            continue;
+        };
+        for member in *members {
+            if attributes.len() >= super::template::MAX_ATTRIBUTES_PER_RESOURCE {
+                break;
+            }
+            if let Some(text) = reported.get(*member).and_then(scalar_text) {
+                attributes.insert(format!("{container}.{member}"), text);
+            }
+        }
     }
     for (key, host) in status
         .get("Endpoints")

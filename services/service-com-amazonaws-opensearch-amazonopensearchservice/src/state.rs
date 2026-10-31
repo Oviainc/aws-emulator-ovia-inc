@@ -5455,6 +5455,30 @@ impl Domain {
         Some(endpoints)
     }
 
+    /// The DUAL-STACK host a domain reached on a PUBLIC endpoint is also reachable on,
+    /// as `DomainStatus$EndpointV2` reports it — or `None` for a domain that has no
+    /// version 2 endpoint.
+    ///
+    /// "If `IPAddressType` [is] set to `dualstack`, a version 2 domain endpoint is
+    /// provisioned. This endpoint functions like a normal endpoint, except that it works
+    /// with both IPv4 and IPv6 IP addresses": so the domains that have one are exactly
+    /// the `dualstack` ones, and the host is the IPv4 endpoint's own label under the
+    /// service's dual-stack domain ([`dual_stack_host`]) — the same endpoint, reached
+    /// over both families, rather than a second one.
+    ///
+    /// A VPC-access domain has no public host of either version: it publishes both of
+    /// its hosts in [`Self::vpc_access_endpoints`] instead, the dual-stack one under
+    /// `vpcv2`.
+    pub fn public_endpoint_v2(&self) -> Option<String> {
+        if self.vpc_options.is_some()
+            || self.ip_address_type.as_deref() != Some(IP_ADDRESS_TYPE_DUALSTACK)
+        {
+            return None;
+        }
+        let label = self.endpoint.split('.').next()?;
+        (!label.is_empty()).then(|| dual_stack_host(label, &self.region))
+    }
+
     /// This domain as `DomainStatus` — what `CreateDomain`, `DescribeDomain` and
     /// `DeleteDomain` answer with.
     pub fn to_status(&self) -> DomainStatus {
@@ -5475,11 +5499,12 @@ impl Domain {
             endpoint: vpc_access_endpoints
                 .is_none()
                 .then(|| self.endpoint.clone()),
-            // `EndpointV2` is the dual-stack PUBLIC endpoint, provisioned by the part
-            // of the service this slice does not model; a VPC-access domain has no
-            // public host of either version and reports its dual-stack host in
-            // `Endpoints` below, under `vpcv2`.
-            endpoint_v2: None,
+            // `EndpointV2` is the dual-stack PUBLIC endpoint, which a domain whose
+            // `IPAddressType` is `dualstack` is provisioned beside its IPv4 one
+            // ([`Self::public_endpoint_v2`]); a VPC-access domain has no public host of
+            // either version and reports its dual-stack host in `Endpoints` below,
+            // under `vpcv2`.
+            endpoint_v2: self.public_endpoint_v2(),
             // "The key-value pair that exists if the OpenSearch Service domain uses VPC
             // endpoints": present for a VPC-access domain and absent for a public one.
             // A service-managed VPC endpoint is a resource of its own, reported by
@@ -9583,7 +9608,21 @@ pub fn vpc_access_endpoint(suffix: &str, region: &str) -> String {
 /// `vpc-endpoint-h2dsd34efgyghrtguk5gt6j2foh4.aos.us-east-1.on.aws`: the SAME opaque
 /// id as the IPv4 host, under the service's dual-stack domain.
 pub fn vpc_access_endpoint_v2(suffix: &str, region: &str) -> String {
-    format!("vpc-endpoint-{suffix}.aos.{region}.on.aws")
+    dual_stack_host(&format!("vpc-endpoint-{suffix}"), region)
+}
+
+/// One host of this service's DUAL-STACK domain: the label a domain is reached under over
+/// IPv4, under `aos.<region>.on.aws` instead of the Region's `es` endpoint prefix.
+///
+/// The dual-stack domain is the one `DomainStatus$Endpoints`' own `vpcv2` example names
+/// (`vpc-endpoint-<opaque-id>.aos.<region>.on.aws`), and the label is the IPv4 host's
+/// because the version 2 endpoint IS that endpoint: "it functions like a normal endpoint,
+/// except that it works with both IPv4 and IPv6 IP addresses"
+/// (`DomainStatus$EndpointV2`). The one place that knows that domain, so the host a
+/// VPC-access domain publishes in its map and the one a public domain publishes as its
+/// `EndpointV2` cannot be built differently.
+fn dual_stack_host(label: &str, region: &str) -> String {
+    format!("{label}.aos.{region}.on.aws")
 }
 
 /// The connection endpoint a service-managed VPC endpoint is reached on.

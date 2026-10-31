@@ -15,7 +15,9 @@
 //!
 //! * which access members a domain reports is decided by whether it holds
 //!   `VPCOptions` and by its `IPAddressType`, over a table spanning both axes and
-//!   differing in how many subnets and security groups a VPC domain names;
+//!   differing in how many subnets and security groups a VPC domain names — a public
+//!   domain reports its IPv4 `Endpoint`, and `EndpointV2` beside it exactly when it is
+//!   `dualstack`, while a VPC one reports its hosts in the `Endpoints` map instead;
 //! * the hosts are per-domain and stable: two VPC domains publish different ones, and
 //!   repeated reads — before and after the provisioning span settles — publish the
 //!   same ones;
@@ -43,6 +45,10 @@ const IPV4_SUFFIX: &str = ".us-east-1.es.amazonaws.com";
 /// `DomainStatus$Endpoints`'s own `vpcv2` example
 /// (`vpc-endpoint-<opaque-id>.aos.<region>.on.aws`).
 const DUALSTACK_SUFFIX: &str = ".aos.us-east-1.on.aws";
+
+/// `IPAddressType`'s `dualstack` value, the setting that gives a domain a second,
+/// dual-stack host beside its IPv4 one.
+const DUALSTACK: &str = "dualstack";
 
 /// One domain to create: how it is reached, and the `Endpoints` keys the rule says it
 /// publishes.
@@ -80,7 +86,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "public, dualstack",
             vpc_options: None,
-            ip_address_type: Some("dualstack"),
+            ip_address_type: Some(DUALSTACK),
             endpoints_keys: &[],
         },
         Row {
@@ -118,7 +124,7 @@ fn rows() -> Vec<Row> {
                 "SubnetIds": ["subnet-00000000000000004", "subnet-00000000000000005"],
                 "SecurityGroupIds": ["sg-00000000000000003"],
             })),
-            ip_address_type: Some("dualstack"),
+            ip_address_type: Some(DUALSTACK),
             endpoints_keys: &[ENDPOINTS_KEY_VPC, ENDPOINTS_KEY_VPC_DUALSTACK],
         },
     ]
@@ -209,6 +215,27 @@ fn assert_rule(status: &Value, row: &Row, name: &str, case: &str) -> Vec<(String
             endpoint.starts_with(&format!("search-{name}-")) && endpoint.ends_with(IPV4_SUFFIX),
             "case {case:?}: expected search-{name}-<suffix>{IPV4_SUFFIX}, got {endpoint:?}"
         );
+        // "If IPAddressType [is] set to dualstack, a version 2 domain endpoint is
+        // provisioned. This endpoint functions like a normal endpoint, except that it
+        // works with both IPv4 and IPv6 IP addresses" (`DomainStatus$EndpointV2`): so a
+        // dual-stack public domain publishes that host — the IPv4 endpoint's own label
+        // under the service's dual-stack domain — and an IPv4 one publishes none.
+        let dual_stack = status["EndpointV2"].as_str();
+        if row.ip_address_type == Some(DUALSTACK) {
+            let label = endpoint.split('.').next().unwrap_or_default();
+            assert_eq!(
+                dual_stack,
+                Some(format!("{label}{DUALSTACK_SUFFIX}").as_str()),
+                "case {case:?}: expected the dual-stack endpoint {label}{DUALSTACK_SUFFIX} \
+                 beside {endpoint:?}, got {dual_stack:?}"
+            );
+        } else {
+            assert_eq!(
+                dual_stack, None,
+                "case {case:?}: a domain that is not dualstack has no version 2 endpoint, \
+                 got {dual_stack:?}"
+            );
+        }
     } else {
         // A VPC-access domain has no public host: the map is the only place its
         // reachable hosts are published.

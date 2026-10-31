@@ -213,6 +213,8 @@ mod sam_transform;
 mod scan_and_registry_reads;
 #[path = "all/scratch.rs"]
 mod scratch;
+#[path = "all/search_indexing_pipeline_outputs.rs"]
+mod search_indexing_pipeline_outputs;
 #[path = "all/section_loop_expansion.rs"]
 mod section_loop_expansion;
 #[path = "all/stack_delete_failure_reason.rs"]
