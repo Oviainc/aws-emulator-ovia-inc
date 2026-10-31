@@ -21,13 +21,23 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `service-common` carries this tree's ONE caller-supplied-ARN parse, which the
+# component and image-recipe operations read a submitted ARN's Region, account and
+# resource fields through instead of splitting the value again.
+service-common = { path = "../common" }
+# A component document is a YAML document ("Component data contains inline YAML document
+# content for the component"), and the component TYPE and its parameter details are read
+# out of it. yaml-rust2 is the pure-Rust YAML 1.2 implementation the other services that
+# read caller-supplied YAML in this workspace use.
+yaml-rust2 = { version = "0.10", default-features = false }
+# The digest a `ListImageRecipes` page token carries over its own payload, so a token
+# this emulator did not issue is refused instead of being read as a page position.
+sha2 = { workspace = true }
+# The same token's payload travels as hex, rather than through a hand-rolled encoding.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

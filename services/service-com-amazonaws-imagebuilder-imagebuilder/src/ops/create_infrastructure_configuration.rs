@@ -310,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let fingerprint = crate::state::create_request_fingerprint(&input);
+        let fingerprint = crate::state::infrastructure_configuration_request_fingerprint(&input);
         let arn = crate::state::infrastructure_configuration_arn(&region, &input.name);
 
         // The idempotency check, the name-uniqueness check and the insert happen under
@@ -366,7 +366,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateInfrastructureConfigurationErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: Some(crate::state::store_full_message()),
+                        message: Some(crate::state::infrastructure_configuration_store_full_message()),
                     },
                 )
                 .into(),

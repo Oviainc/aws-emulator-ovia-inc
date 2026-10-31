@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Forgets the component build version this service's state holds and echoes the ARN it
+//! removed.
+//!
+//! A component a stored image recipe still includes is not deleted:
+//! `ResourceDependencyException` is the modelled answer for "a resource with a dependency
+//! that prohibits this action", and a recipe reaches a build version whenever one of its
+//! component references MATCHES it — a wildcard reference answers with whichever build is
+//! newest, so every build it matches is still in use. An ARN nothing is stored under, and
+//! one of another Region, delete nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +167,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteComponent"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteComponentErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The dependency check and the removal happen under ONE lock, so a recipe cannot
+        // be created against a component between the two.
+        let mut store = state.lock();
+
+        // The modelled input is a BUILD version ARN, so exactly one stored component can
+        // answer it.
+        if store
+            .component(&input.component_build_version_arn, &region)
+            .is_none()
+        {
+            return Err(DeleteComponentErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::component_not_found_message(
+                        &input.component_build_version_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if let Some(recipe_arn) = store
+            .recipe_depending_on_component(&input.component_build_version_arn)
+            .map(|recipe| recipe.arn.clone())
+        {
+            return Err(DeleteComponentErrorModeled::ResourceDependencyException(
+                ResourceDependencyException {
+                    message: Some(crate::state::component_in_use_message(
+                        &input.component_build_version_arn,
+                        &recipe_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let removed = store.remove_component(&input.component_build_version_arn, &region);
+        drop(store);
+
+        Ok(DeleteComponentOutput {
+            request_id: Some(crate::state::new_request_id()),
+            // The ARN of the record this call removed, read back from it rather than
+            // echoed from the request.
+            component_build_version_arn: removed.map(|record| record.arn),
+        })
     }
 }

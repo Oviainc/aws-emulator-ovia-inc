@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the component build version this service's state then holds, so a later
+//! `GetComponent` reports what this request stored.
+//!
+//! The rules it follows, each from the modelled documentation quoted beside it:
+//!
+//! * the document is named by "exactly one of the following methods": `data` or `uri`,
+//!   so naming both or neither is `InvalidParameterCombinationException`;
+//! * `semanticVersion`'s three assignable nodes each take an integer up to 2^30-1, so a
+//!   version past that bound is `InvalidVersionNumberException`;
+//! * the component TYPE is read from the document, never submitted: "If the document
+//!   contains a single phase named test, the component type is TEST. Otherwise, the
+//!   component type is BUILD". A component named by `uri` carries no document this
+//!   emulator can read — the document lives in Amazon S3, which nothing here fetches —
+//!   so its type is the one the rule's "Otherwise" gives, its `parameters` are absent,
+//!   and `GetComponent` reports no `data` for it: what the request carried, and nothing
+//!   invented for a document nobody read. The `uri` itself is still checked for the form
+//!   the member documents, and the round-trip test covers that row;
+//! * the ARN is derived from a NORMALIZED form of the name plus the version and the
+//!   build number, and a repeat of one name+version pair "creates a new build version
+//!   for it. If the content is also identical to the latest build version, the request
+//!   fails because the component already exists" — reported as `ResourceInUseException`,
+//!   the one resource-state error this operation declares;
+//! * `clientToken` is an idempotency token: a retry carrying it answers with the
+//!   ORIGINAL response, and the same token carrying different creation parameters is
+//!   `IdempotentParameterMismatchException`;
+//! * `dryRun` validates the request and then answers `DryRunOperationException`, having
+//!   stored nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -238,18 +257,246 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComponent"))
+        // Every modelled constraint on this input — `name`'s pattern, the version
+        // pattern, the string lengths, the `Platform` enum, the 1..25 / 1..50 bounds —
+        // has been refused by the centralized walk before this body runs, so what is
+        // checked here is only what the model cannot say.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateComponentErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // "The component is based on a YAML document that you specify using exactly one
+        // of the following methods" — inline `data`, or a `uri` pointing at one.
+        let document_source = match (input.data.as_deref(), input.uri.as_deref()) {
+            (Some(data), None) => DocumentSource::Inline(data),
+            (None, Some(uri)) => DocumentSource::Uri(uri),
+            _ => {
+                return Err(
+                    CreateComponentErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(crate::state::component_data_or_uri_message()),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        // The modelled version pattern admits any digits at all; the documented bound on
+        // each assigned node is read here.
+        if crate::state::parse_semantic_version(&input.semantic_version).is_none() {
+            return Err(
+                CreateComponentErrorModeled::InvalidVersionNumberException(
+                    InvalidVersionNumberException {
+                        message: Some(crate::state::invalid_version_number_message(
+                            &input.semantic_version,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // What the stored component derives from the document. A `uri` points at a
+        // document in Amazon S3 that this emulator does not read, so the URI is checked
+        // for the form the member documents and the component carries the type a
+        // document that is not a lone `test` phase has.
+        let document = match document_source {
+            DocumentSource::Inline(data) => {
+                // The refusal text is this service's own statement of what a component
+                // document has to be, so it is returned as the message rather than
+                // re-worded here.
+                crate::state::parse_component_document(data).map_err(|why| {
+                    CreateComponentErrorModeled::InvalidRequestException(InvalidRequestException {
+                        message: Some(why),
+                    })
+                })?
+            }
+            DocumentSource::Uri(uri) => {
+                if !is_s3_url(uri) {
+                    return Err(CreateComponentErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(crate::state::component_uri_message(uri)),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::ComponentDocument {
+                    component_type: crate::state::COMPONENT_TYPE_BUILD.to_string(),
+                    parameters: None,
+                }
+            }
+        };
+
+        let fingerprint = crate::state::component_request_fingerprint(&input);
+        let normalized = crate::state::normalized_name(&input.name);
+
+        // The idempotency check, the content check, the build numbering and the insert
+        // happen under ONE lock, so two creates of the same name+version are serialized
+        // and each gets its own build number.
+        let mut store = state.lock();
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — down to its
+        // `requestId`. The same token carrying different creation parameters is the
+        // modelled mismatch instead.
+        if let Some(receipt) = store.create_receipt(
+            crate::state::CREATE_COMPONENT_OPERATION,
+            &region,
+            &input.client_token,
+        ) {
+            if receipt.fingerprint != fingerprint {
+                return Err(
+                    CreateComponentErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(CreateComponentOutput {
+                request_id: Some(receipt.request_id.clone()),
+                client_token: Some(receipt.client_token.clone()),
+                component_build_version_arn: Some(receipt.arn.clone()),
+                latest_version_references: None,
+            });
+        }
+
+        // A repeat of one name+version pair creates the NEXT build version — unless its
+        // content is identical to the latest build version, in which case "the request
+        // fails because the component already exists". What a request says about the
+        // component is exactly the rendering the idempotency check compares, so the two
+        // agree on what "identical" means. This operation declares no
+        // `ResourceAlreadyExistsException` — its sibling `CreateImageRecipe` does — so the
+        // already-exists condition is reported under the resource-state error it does
+        // declare.
+        if let Some(latest) =
+            store.latest_component_build(&region, &normalized, &input.semantic_version)
+        {
+            if stored_component_fingerprint(latest) == fingerprint {
+                return Err(CreateComponentErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(crate::state::component_already_exists_message(&latest.arn)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The store is finite: a create that would take it past this emulator's own cap
+        // is refused rather than growing it. Checked BEFORE the dry-run branch, so a dry
+        // run reports the same outcome the real create would have.
+        if store.component_store_is_full() {
+            return Err(
+                CreateComponentErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::component_store_full_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `dryRun`: "Validates the required permissions and request parameters without
+        // performing the operation. If validation succeeds, the operation returns a
+        // DryRunOperationException error response." Nothing has been written by here —
+        // including the request's receipt, so a dry run leaves the token free for the
+        // real request.
+        if input.dry_run {
+            return Err(
+                CreateComponentErrorModeled::DryRunOperationException(DryRunOperationException {
+                    message: Some(crate::state::dry_run_message()),
+                })
+                .into(),
+            );
+        }
+
+        let build_version =
+            store.next_component_build_version(&region, &normalized, &input.semantic_version);
+        let arn = crate::state::component_build_version_arn(
+            &region,
+            &input.name,
+            &input.semantic_version,
+            build_version,
+        );
+        let request_id = crate::state::new_request_id();
+        let client_token = input.client_token.clone();
+
+        store.insert_component(
+            crate::state::ComponentRecord {
+                arn: arn.clone(),
+                region,
+                name: input.name,
+                version: input.semantic_version,
+                build_version,
+                description: input.description,
+                change_description: input.change_description,
+                component_type: document.component_type,
+                platform: input.platform,
+                supported_os_versions: input.supported_os_versions,
+                owner: ::engine::EMULATOR_ACCOUNT_ID.to_string(),
+                data: input.data,
+                uri: input.uri,
+                kms_key_id: input.kms_key_id,
+                parameters: document.parameters,
+                date_created: crate::state::iso8601(::std::time::SystemTime::now()),
+                tags: input.tags.map(crate::state::into_ordered_tags),
+            },
+            &client_token,
+            fingerprint,
+            request_id.clone(),
+        );
+
+        Ok(CreateComponentOutput {
+            request_id: Some(request_id),
+            client_token: Some(client_token),
+            component_build_version_arn: Some(arn),
+            latest_version_references: None,
+        })
     }
+}
+
+/// Which of the two documented methods named this component's document.
+enum DocumentSource<'request> {
+    /// `data`: "inline YAML document content for the component".
+    Inline(&'request str),
+    /// `uri`: "the uri of a YAML component document file".
+    Uri(&'request str),
+}
+
+/// Whether `uri` is an S3 URL of the form the `uri` member documents
+/// (`s3://bucket/key`): the scheme, a bucket and a non-empty key.
+fn is_s3_url(uri: &str) -> bool {
+    let Some(path) = uri.strip_prefix(crate::state::COMPONENT_URI_SCHEME) else {
+        return false;
+    };
+    path.split_once('/')
+        .is_some_and(|(bucket, key)| !bucket.is_empty() && !key.is_empty())
+}
+
+/// The stored component rendered the way a request that would create it renders, so "the
+/// content is also identical to the latest build version" is one comparison rather than a
+/// second rule.
+fn stored_component_fingerprint(record: &crate::state::ComponentRecord) -> String {
+    crate::state::component_request_fingerprint(&CreateComponentInput {
+        name: record.name.clone(),
+        semantic_version: record.version.clone(),
+        description: record.description.clone(),
+        change_description: record.change_description.clone(),
+        platform: record.platform.clone(),
+        supported_os_versions: record.supported_os_versions.clone(),
+        data: record.data.clone(),
+        uri: record.uri.clone(),
+        kms_key_id: record.kms_key_id.clone(),
+        tags: record.tags.clone().map(|tags| tags.into_iter().collect()),
+        // Neither is part of the rendering: the token is the key it is compared under,
+        // and `dryRun` describes the call rather than the component.
+        client_token: String::new(),
+        dry_run: false,
+    })
 }

@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateImageRecipe
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateImageRecipe`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateImageRecipe::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the image recipe this service's state then holds, so a later
+//! `GetImageRecipe` reports what this request stored.
+//!
+//! The rules it follows, each from the modelled documentation quoted beside it:
+//!
+//! * `semanticVersion`'s three nodes are the caller's to ASSIGN — "you can assign any
+//!   positive integer value, including zero. The upper limit is 2^30-1" — so a node past
+//!   that bound, and the `x` wildcard the version pattern admits for FILTERING, are
+//!   `InvalidVersionNumberException`;
+//! * every `componentArn` must name a stored component, resolved the way every other
+//!   component reference is, each component named only once "regardless of version", at
+//!   most the documented 20 per recipe, and the components of one recipe all target one
+//!   platform — which is the platform the recipe reports;
+//! * the ARN is derived from a NORMALIZED form of the name plus the version, so a second
+//!   create of one name+version pair is `ResourceAlreadyExistsException`;
+//! * `clientToken` is an idempotency token: a retry carrying it answers with the
+//!   ORIGINAL response, and the same token carrying different creation parameters is
+//!   `IdempotentParameterMismatchException`;
+//! * `dryRun` validates the request and then answers `DryRunOperationException`, having
+//!   stored nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -235,18 +247,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateImageRecipe` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateImageRecipeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateImageRecipe"))
+        // Every modelled constraint on this input — `name`'s pattern, the version
+        // pattern, the string lengths, the list and map bounds — has been refused by the
+        // centralized walk before this body runs, so what is checked here is only what
+        // the model cannot say.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateImageRecipeErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The modelled `WildcardVersionNumber` admits an `x` node, which is a FILTERING
+        // pattern: the three nodes of a version a create assigns are integers inside the
+        // documented bound, and nothing else.
+        if crate::state::parse_semantic_version(&input.semantic_version).is_none() {
+            return Err(
+                CreateImageRecipeErrorModeled::InvalidVersionNumberException(
+                    InvalidVersionNumberException {
+                        message: Some(crate::state::invalid_version_number_message(
+                            &input.semantic_version,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let fingerprint = crate::state::image_recipe_request_fingerprint(&input);
+        let arn = crate::state::image_recipe_arn(&region, &input.name, &input.semantic_version);
+
+        // "A recipe can contain a maximum of 20 build and test components in any
+        // combination, by default." The modelled list carries no maximum of its own, so
+        // the documented quota is read here — BEFORE the store is reached, so the work one
+        // create spends resolving references is bounded by a constant.
+        let submitted_components = input.components.as_ref().map_or(0, Vec::len);
+        if submitted_components > crate::state::MAX_RECIPE_COMPONENTS {
+            return Err(
+                CreateImageRecipeErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::too_many_recipe_components_message(
+                            submitted_components,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The idempotency check, the component resolution, the uniqueness check and the
+        // insert happen under ONE lock, so concurrent creates are serialized: the first
+        // to take the lock stores the recipe and every other one sees it.
+        let mut store = state.lock();
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — down to its
+        // `requestId`.
+        if let Some(receipt) = store.create_receipt(
+            crate::state::CREATE_IMAGE_RECIPE_OPERATION,
+            &region,
+            &input.client_token,
+        ) {
+            if receipt.fingerprint != fingerprint {
+                return Err(
+                    CreateImageRecipeErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(CreateImageRecipeOutput {
+                request_id: Some(receipt.request_id.clone()),
+                client_token: Some(receipt.client_token.clone()),
+                image_recipe_arn: Some(receipt.arn.clone()),
+                latest_version_references: None,
+            });
+        }
+
+        if store.image_recipes.contains_key(&arn) {
+            return Err(
+                CreateImageRecipeErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(crate::state::image_recipe_exists_message(
+                            &input.name,
+                            &input.semantic_version,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every component the recipe includes has to BE a stored component, resolved the
+        // way every other component reference is — so a reference naming nothing, or a
+        // component of another Region, is refused rather than stored. "You can specify
+        // each component only once in a recipe, regardless of version", so a name named
+        // twice is refused too. The platform the recipe reports is the platform those
+        // components target, so a list spanning two platforms names no platform the recipe
+        // could have.
+        let mut platform: Option<String> = None;
+        let mut included: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
+        for configuration in input.components.iter().flatten() {
+            let Some(component) =
+                store.resolve_component(&configuration.component_arn, &region)
+            else {
+                return Err(CreateImageRecipeErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::unknown_component_reference_message(
+                            &configuration.component_arn,
+                        )),
+                    },
+                )
+                .into());
+            };
+            if !included.insert(crate::state::normalized_name(&component.name)) {
+                return Err(CreateImageRecipeErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::duplicate_recipe_component_message(
+                            &component.name,
+                        )),
+                    },
+                )
+                .into());
+            }
+            match platform.as_deref() {
+                None => platform = Some(component.platform.clone()),
+                Some(named) if named == component.platform => {}
+                Some(named) => {
+                    return Err(CreateImageRecipeErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(crate::state::mixed_component_platforms_message(
+                                named,
+                                &component.platform,
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            }
+        }
+
+        // The store is finite: a create that would take it past this emulator's own cap
+        // is refused rather than growing it. Checked BEFORE the dry-run branch, so a dry
+        // run reports the same outcome the real create would have.
+        if store.image_recipe_store_is_full() {
+            return Err(
+                CreateImageRecipeErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::image_recipe_store_full_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `dryRun`: "Validates the required permissions and request parameters without
+        // performing the operation. If validation succeeds, the operation returns a
+        // DryRunOperationException error response." Nothing has been written by here —
+        // including the request's receipt, so a dry run leaves the token free for the
+        // real request.
+        if input.dry_run {
+            return Err(CreateImageRecipeErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(crate::state::dry_run_message()),
+                },
+            )
+            .into());
+        }
+
+        let request_id = crate::state::new_request_id();
+        let client_token = input.client_token.clone();
+
+        store.insert_image_recipe(
+            crate::state::ImageRecipeRecord {
+                arn: arn.clone(),
+                region,
+                name: input.name,
+                version: input.semantic_version,
+                description: input.description,
+                platform,
+                owner: ::engine::EMULATOR_ACCOUNT_ID.to_string(),
+                components: input.components,
+                parent_image: input.parent_image,
+                block_device_mappings: input.block_device_mappings,
+                working_directory: input.working_directory,
+                additional_instance_configuration: input.additional_instance_configuration,
+                ami_tags: input.ami_tags.map(crate::state::into_ordered_tags),
+                ami_watermarks: input.ami_watermarks,
+                tags: input.tags.map(crate::state::into_ordered_tags),
+                date_created: crate::state::iso8601(::std::time::SystemTime::now()),
+            },
+            &client_token,
+            fingerprint,
+            request_id.clone(),
+        );
+
+        Ok(CreateImageRecipeOutput {
+            request_id: Some(request_id),
+            client_token: Some(client_token),
+            image_recipe_arn: Some(arn),
+            latest_version_references: None,
+        })
     }
 }
