@@ -26,6 +26,11 @@
 //! Rule 1 reaches `DescribeInstanceEventWindows`'s own target filters too: what an
 //! association writes is what that describe narrows by.
 //!
+//! Rules 2 and 3 are asked ACROSS a SEQUENCE of calls as well as within one: what successive
+//! associations leave the window carrying is the union of the resources they named, the same
+//! set however they grouped, ordered or repeated them, and the span before `active` is owed by
+//! every one of them — not only by the first.
+//!
 //! Each table row is a distinct input along what the rules generalise over — which type of
 //! target, how many of them, which tag shape, which of the two calls, whether the target is
 //! already held, each published bound and one past it — so no row is the specification.
@@ -865,5 +870,202 @@ async fn a_dry_run_changes_no_target() {
         target,
         Some(held.clone()),
         "a dry-run disassociation must leave every target on the window"
+    );
+}
+
+/// Which kind of target a row of the accumulation table names, as three distinct targets of
+/// that kind: an index picks one of the three, so ONE table of call shapes drives every kind
+/// of target a window takes.
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    Instances,
+    Tags,
+    Hosts,
+}
+
+/// The three tag targets the [`Kind::Tags`] rows select by. Each carries a key of its own, so
+/// each is a target of its own under the key/value pair a tag target is compared by.
+const TAG_TARGETS: [(&str, &str); 3] =
+    [("Name", "web"), ("Team", "payments"), ("Stage", "production")];
+
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Instances => "instance ids",
+            Kind::Tags => "instance tags",
+            Kind::Hosts => "Dedicated Host ids",
+        }
+    }
+
+    /// The target naming the resources `indices` picks out of the seeded ones.
+    fn target(self, indices: &[usize], instances: &[String], hosts: &[String]) -> Target {
+        let pick = |ids: &[String]| -> Vec<String> {
+            indices.iter().map(|index| ids[*index].clone()).collect()
+        };
+        match self {
+            Kind::Instances => Target::of_instances(&pick(instances)),
+            Kind::Tags => Target::of_tags(
+                &indices
+                    .iter()
+                    .map(|index| TAG_TARGETS[*index])
+                    .collect::<Vec<_>>(),
+            ),
+            Kind::Hosts => Target::of_hosts(&pick(hosts)),
+        }
+    }
+}
+
+/// `target` with each of its three sets in a canonical order.
+///
+/// A target is a SET of resources, so which call named which resource is not part of what the
+/// window carries afterwards; comparing two targets as sets is what lets one expectation
+/// serve every grouping and ordering of the calls that wrote them.
+fn as_sets(target: &Target) -> Target {
+    let mut sorted = target.clone();
+    sorted.instance_ids.sort();
+    sorted.tags.sort();
+    sorted.dedicated_host_ids.sort();
+    sorted
+}
+
+/// Rule 3 ACROSS CALLS: "associates one or more targets with an event window" ADDS to what
+/// the window already carries, so after any number of associations the window carries the
+/// union of the resources they named — the same set however those calls grouped, ordered or
+/// repeated them — and `DescribeInstanceEventWindows` reports that union too.
+///
+/// One row per shape of the call sequence that builds one three-resource target (how many
+/// calls, how the resources are grouped, which order they are named in, whether two calls
+/// overlap), against each of the three kinds of target, so no single sequence is the
+/// specification.
+#[tokio::test]
+async fn associations_leave_the_window_the_union_of_what_they_named() {
+    let router = emulator();
+    let instances = launch_instances(&router, 3).await;
+    let hosts = allocate_hosts(&router, 3).await;
+
+    let sequences: Vec<(&str, Vec<Vec<usize>>)> = vec![
+        ("all three in one call", vec![vec![0, 1, 2]]),
+        ("one, then the other two", vec![vec![0], vec![1, 2]]),
+        ("two, then the third", vec![vec![0, 1], vec![2]]),
+        ("one at a time, in order", vec![vec![0], vec![1], vec![2]]),
+        ("one at a time, in reverse", vec![vec![2], vec![1], vec![0]]),
+        ("two calls that overlap", vec![vec![0, 1], vec![1, 2]]),
+    ];
+
+    for kind in [Kind::Instances, Kind::Tags, Kind::Hosts] {
+        for (shape, calls) in &sequences {
+            let case = format!("{} associated {shape}", kind.label());
+            let window_id = create_window(&router, "union").await;
+            // The resources named so far, in the order the calls named them: what the window
+            // must carry after each one.
+            let mut named: Vec<usize> = Vec::new();
+            for group in calls {
+                let (status, body) =
+                    associate(&router, &window_id, &kind.target(group, &instances, &hosts)).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: association of {group:?} must succeed, got {status} \
+                     with body {body}"
+                );
+                for index in group {
+                    if !named.contains(index) {
+                        named.push(*index);
+                    }
+                }
+                let union = as_sets(&kind.target(&named, &instances, &hosts));
+                let reported = reported_target(&case, &body).map(|target| as_sets(&target));
+                assert_eq!(
+                    reported,
+                    Some(union),
+                    "case {case:?}: after associating {group:?} the window must carry \
+                     {named:?} and nothing else, got {reported:?} in body {body}"
+                );
+            }
+
+            let all = as_sets(&kind.target(&[0, 1, 2], &instances, &hosts));
+            let (described_target, _) = described(&case, &router, &window_id).await;
+            let described_sets = described_target.as_ref().map(as_sets);
+            assert_eq!(
+                described_sets,
+                Some(all),
+                "case {case:?}: the describe must report every resource the calls named, \
+                 got {described_sets:?}"
+            );
+        }
+    }
+}
+
+/// Rule 2 ACROSS CALLS: the span before `active` is owed by EVERY association and not only by
+/// the first, so a window that has already reached `active` reports `associating` again once a
+/// further association is made, carries the grown target while it does, and is moved back to
+/// `active` by the clock rather than by a caller.
+#[tokio::test]
+async fn a_further_association_owes_the_move_to_active_again() {
+    let router = emulator();
+    let instances = launch_instances(&router, 2).await;
+    let window_id = create_window(&router, "again").await;
+
+    let (status, body) = associate(
+        &router,
+        &window_id,
+        &Target::of_instances(&instances[..1]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the first association must succeed, got {status} with body {body}"
+    );
+    past_the_transition().await;
+    let (_, state) = described("the first association", &router, &window_id).await;
+    assert_eq!(
+        state, INSTANCE_EVENT_WINDOW_STATE_ACTIVE,
+        "case \"the first association\": the clock must move the window to active before the \
+         further association, got {state:?}"
+    );
+
+    let (status, body) = associate(
+        &router,
+        &window_id,
+        &Target::of_instances(&instances[1..2]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the further association must succeed, got {status} with body {body}"
+    );
+    let both = Target::of_instances(&instances[..2]);
+    assert_eq!(
+        reported_state("the further association", &body),
+        INSTANCE_EVENT_WINDOW_STATE_ASSOCIATING,
+        "case \"the further association\": a further association must hand an active window \
+         back associating, got body {body}"
+    );
+    let (target, state) = described("the further association", &router, &window_id).await;
+    let reported = target.as_ref().map(as_sets);
+    assert_eq!(
+        state, INSTANCE_EVENT_WINDOW_STATE_ASSOCIATING,
+        "case \"the further association\": the describe must report the window associating \
+         until the span has passed, got {state:?}"
+    );
+    assert_eq!(
+        reported,
+        Some(as_sets(&both)),
+        "case \"the further association\": an associating window already carries both \
+         instances, got {reported:?}"
+    );
+
+    past_the_transition().await;
+    let (target, state) = described("after the further span", &router, &window_id).await;
+    let reported = target.as_ref().map(as_sets);
+    assert_eq!(
+        state, INSTANCE_EVENT_WINDOW_STATE_ACTIVE,
+        "case \"after the further span\": the clock must move the window to active again, \
+         got {state:?}"
+    );
+    assert_eq!(
+        reported,
+        Some(as_sets(&both)),
+        "case \"after the further span\": the move to active must not change the window's \
+         targets, got {reported:?}"
     );
 }
