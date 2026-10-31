@@ -2273,6 +2273,12 @@ pub fn is_arn_for(value: &str, service: &str) -> bool {
 /// A WELL-FORMED ARN the store holds nothing at is a different answer: the
 /// resource is absent, so that one keeps [`RESOURCE_DOES_NOT_EXIST`] and the
 /// modelled 404. One seam, so every ARN-carrying member renders the one form.
+///
+/// What it judges is the ARN's GRAMMAR and its service field, nothing narrower. A
+/// member documented as carrying the ARN of one KIND of resource needs that kind
+/// judged as well, which is what [`s3_bucket_arn`] does for the one member this
+/// service documents as a bucket ARN: reach for that one, not this, whenever a
+/// member names a kind.
 pub fn arn_syntax_refusal(member: &str, value: &str, service: &str) -> Option<String> {
     (!is_arn_for(value, service)).then(|| invalid_parameter_because(member, INVALID_ARN))
 }
@@ -2285,9 +2291,35 @@ pub fn arn_syntax_refusal(member: &str, value: &str, service: &str) -> Option<St
 /// read through the one shared ARN parse. A value naming an object
 /// (`…:::bucket/key`) or an access point (`…:accesspoint/name`) is not a bucket
 /// ARN this emulator addresses a bucket by, so neither is reported.
+///
+/// This is the ONE parse of a bucket-ARN-typed member: the handler refuses what
+/// it rejects ([`s3_bucket_arn`]) and the file resolution addresses the bucket it
+/// reports ([`take_on_custom_plugin_file`]), so the refusal and the read cannot
+/// disagree about what a bucket ARN is.
 pub fn s3_bucket_name(value: &str) -> Option<&str> {
     let bucket = ::service_common::arn::parse_of(value, S3_ARN_SERVICE)?.resource;
     (!bucket.is_empty() && !bucket.contains(['/', ':'])).then_some(bucket)
+}
+
+/// The bucket the member `member` names, or the message a refusal of that member
+/// carries when its value is not the ARN of an S3 BUCKET.
+///
+/// A member documented as carrying the ARN of one kind of resource names a
+/// resource of that kind or nothing at all: an `s3` ARN whose resource field is
+/// an object under a bucket (`…:::bucket/key`) or a sub-resource such as an
+/// access point (`…:accesspoint/name`) addresses no bucket, so it is incorrect
+/// INPUT and is refused on the member that carried it with [`INVALID_ARN`] and
+/// the modelled 400 — the same reason and the same
+/// `Invalid parameter <member>: <reason>` form every other ARN-typed member of
+/// this service renders ([`arn_syntax_refusal`]). The model types every such
+/// member a plain `__string` with no `@pattern`, so the handler is where it has
+/// to be refused.
+///
+/// Reporting the bucket rather than just a verdict is what keeps the check and
+/// the later read on ONE parse ([`s3_bucket_name`]): a caller cannot accept a
+/// value the resolution then cannot address.
+pub fn s3_bucket_arn<'a>(member: &str, value: &'a str) -> Result<&'a str, String> {
+    s3_bucket_name(value).ok_or_else(|| invalid_parameter_because(member, INVALID_ARN))
 }
 
 /// The member a refusal of the custom plugin's file blames: the request's
@@ -2421,6 +2453,11 @@ pub enum CustomPluginFileVerdict {
 /// byte count ([`digest_plugin_file`]), so no copy of the whole artifact is
 /// built however large it is and nothing of it is stored in this service.
 ///
+/// The `bucket` to read from is the one the caller's `bucketArn` names, parsed
+/// out of it by [`s3_bucket_name`] — the parse this request was already judged
+/// by ([`s3_bucket_arn`]), passed in rather than taken again here, so there is no
+/// second reading of the member that could accept what the first refused.
+///
 /// The verdict is read from S3's own error CODE and never from the HTTP status:
 /// a request that reached no S3 at all is a 404 too, so a status cannot tell S3
 /// reporting an unreadable object from this emulator failing to ask. That is why
@@ -2431,15 +2468,11 @@ pub enum CustomPluginFileVerdict {
 pub async fn take_on_custom_plugin_file(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    bucket: &str,
     location: &S3Location,
 ) -> CustomPluginFileVerdict {
     use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
-    // The caller has already refused a `bucketArn` that is not a bucket ARN with
-    // its own message, so a value that names no bucket is not re-judged here.
-    let Some(bucket) = s3_bucket_name(&location.bucket_arn) else {
-        return CustomPluginFileVerdict::Unknown;
-    };
     let mut read = s3_client(ctx, region)
         .get_object()
         .bucket(bucket)

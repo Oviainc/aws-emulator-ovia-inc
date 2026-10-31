@@ -16,8 +16,10 @@
 //!    `Invalid parameter bucketArn: Invalid ARN.`). The table below spans every
 //!    operation and member this holds for, not just the one the issue cited.
 //! 2. A member that must carry an ARN for the service to use the resource it names is
-//!    refused as a bad request when it is not an ARN at all — and accepted for every
-//!    partition, so the rule is the ARN grammar and not one literal prefix.
+//!    refused as a bad request when it is not an ARN of that resource — not an ARN at all,
+//!    an ARN of another service, or an `s3` ARN naming something other than a bucket — and
+//!    accepted for every partition, so the rule is the ARN grammar and the resource it
+//!    names, never one literal prefix.
 //! 3. `ListTagsForResource` reports exactly the tags the create stored, for either
 //!    taggable resource, and an empty tag set is a different answer from a resource that
 //!    is not there.
@@ -195,16 +197,20 @@ async fn every_parameter_rejection_names_the_parameter_it_refused() {
     ));
     let forged_tokens = ["not-a-token", "6161", forged_keyed.as_str()];
 
-    // bucketArns that are not ARNs: empty, a bare name, a non-ARN sentence, too few
-    // fields, an empty partition, an empty resource, and an ARN of another service.
+    // bucketArns that name no S3 bucket: empty, a bare name, a non-ARN sentence, too few
+    // fields, an empty partition, an empty resource, an ARN of another service, and two
+    // `s3` ARNs whose resource field names something other than a bucket — an object under
+    // one, and an access point.
     let malformed_bucket_arns = [
-        "",
-        "plugin-bucket",
-        "not-an-arn",
-        "arn:aws:s3::plugin-bucket",
-        "arn::s3:::plugin-bucket",
-        "arn:aws:s3:::",
-        "arn:aws:sqs:::plugin-bucket",
+        String::new(),
+        "plugin-bucket".to_string(),
+        "not-an-arn".to_string(),
+        "arn:aws:s3::plugin-bucket".to_string(),
+        "arn::s3:::plugin-bucket".to_string(),
+        "arn:aws:s3:::".to_string(),
+        "arn:aws:sqs:::plugin-bucket".to_string(),
+        "arn:aws:s3:::bucket/prefix".to_string(),
+        format!("arn:aws:s3:{REGION}:{ACCOUNT}:accesspoint/plugins"),
     ];
 
     // What a row expects of the message's reason part.
@@ -472,18 +478,19 @@ async fn a_rejection_against_stored_state_names_its_parameter_too() {
 async fn a_bucket_arn_in_any_partition_is_accepted() {
     let emulator = emulator();
 
-    // Every row is a well-formed S3 bucket ARN: the three partitions AWS publishes
-    // (`aws`, `aws-cn`, `aws-us-gov`), a bucket name at one character, and a resource
-    // carrying a path — the ARN grammar is what decides, never one literal prefix.
+    // Every row is a well-formed S3 BUCKET ARN: the three partitions AWS publishes
+    // (`aws`, `aws-cn`, `aws-us-gov`), a bucket name at one character, and one carrying
+    // the characters a bucket name may hold — the ARN grammar is what decides, never one
+    // literal prefix. A value whose resource field names something other than a bucket is
+    // refused instead, which `custom_plugin_bucket_arn_names_a_bucket.rs` pins.
     let accepted = [
         ("the commercial partition", "arn:aws:s3:::plugin-bucket"),
         ("the China partition", "arn:aws-cn:s3:::plugin-bucket"),
         ("the GovCloud partition", "arn:aws-us-gov:s3:::plugin-bucket"),
         ("a one-character bucket name", "arn:aws:s3:::b"),
-        ("a resource carrying a path", "arn:aws:s3:::bucket/prefix"),
         (
-            "an access point style ARN, region and account filled",
-            &format!("arn:aws:s3:{REGION}:{ACCOUNT}:accesspoint/plugins"),
+            "a bucket name carrying dots and digits",
+            "arn:aws:s3:::plugin.bucket-2024",
         ),
     ];
 

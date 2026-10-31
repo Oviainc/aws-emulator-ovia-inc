@@ -3,10 +3,14 @@
 //! @op CreateCustomPlugin
 //! Stores a custom plugin under a freshly minted `customPluginArn` and answers with the
 //! identity the service assigned it. The plugin's artifact is taken on at create time, so
-//! the file `location` names has to resolve first: it is read through the framework's
+//! the file `location` names has to resolve first, and it is refused on two counts. The
+//! `bucketArn` has to be the ARN of an S3 BUCKET: a value naming an object under a bucket,
+//! or a sub-resource such as an access point, addresses no bucket and is a
+//! `BadRequestException`. The object that bucket holds is then read through the framework's
 //! IN-PROCESS callback into the Amazon S3 service mounted beside this one (no socket is
-//! opened), and a location that store reports as unreadable is a `BadRequestException` with
-//! nothing stored. Taking the file on is also what fixes the revision's `fileDescription`:
+//! opened), and a location that store reports as unreadable is a `BadRequestException` too,
+//! with nothing stored. Taking the file on is also what fixes the revision's
+//! `fileDescription`:
 //! the MD5 digest and the size of the artifact's bytes are computed here and kept on the
 //! record, so every later read of the revision reports the file it was built from. A name
 //! identifies at most one plugin, so a repeat of a stored name is a
@@ -210,20 +214,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The plugin's file is named by an S3 bucket ARN plus a key; a
-        // `bucketArn` that is not an ARN at all names no bucket, so the request
-        // is refused rather than stored. The model types the member as a plain
-        // `__string`, so the framework cannot refuse it at the boundary.
-        if let Some(message) = crate::state::arn_syntax_refusal(
+        // The plugin's file is named by an S3 BUCKET ARN plus a key, so the
+        // member is satisfied only by an ARN that names a bucket: a value that
+        // is not an ARN at all, an ARN of another service, and an `s3` ARN whose
+        // resource is an object under a bucket or a sub-resource such as an
+        // access point all address no bucket, so the request is refused rather
+        // than stored. The model types the member as a plain `__string`, so the
+        // framework cannot refuse it at the boundary. The parse that answers
+        // this is the one the file resolution below addresses the bucket by
+        // (`crate::state::s3_bucket_arn`), so nothing is accepted here that the
+        // read cannot then ask about.
+        let bucket = match crate::state::s3_bucket_arn(
             "bucketArn",
             &input.location.s3_location.bucket_arn,
-            crate::state::S3_ARN_SERVICE,
         ) {
-            return Err(CreateCustomPluginErrorModeled::BadRequestException(BadRequestException {
-                message: Some(message),
-            })
-            .into());
-        }
+            Ok(bucket) => bucket,
+            Err(message) => {
+                return Err(CreateCustomPluginErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        };
 
         // The service takes the plugin's artifact on when the plugin is created,
         // so the file has to resolve BEFORE anything is minted: a location
@@ -251,6 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let file = match crate::state::take_on_custom_plugin_file(
             ctx,
             &region,
+            bucket,
             &input.location.s3_location,
         )
         .await
