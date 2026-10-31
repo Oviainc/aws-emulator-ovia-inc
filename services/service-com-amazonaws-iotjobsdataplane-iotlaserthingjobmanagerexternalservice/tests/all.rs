@@ -45,6 +45,8 @@ mod start_next_against_a_passed_deadline;
 mod state_roundtrip;
 #[path = "all/status_details_modeled_constraints.rs"]
 mod status_details_modeled_constraints;
+#[path = "all/status_details_refusal_names_one_offender.rs"]
+mod status_details_refusal_names_one_offender;
 #[path = "all/step_timeout_bound_is_shared.rs"]
 mod step_timeout_bound_is_shared;
 // The harness the suites above share: the emulator, its HTTP calls and the

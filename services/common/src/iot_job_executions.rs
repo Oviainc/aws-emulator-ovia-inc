@@ -110,11 +110,23 @@ pub fn transition_refusal(current: &str, requested: &str) -> Option<String> {
 /// request carries is the map the record will hold, and repeated updates cannot
 /// accumulate details without bound. An absent member changes nothing and is
 /// therefore always acceptable.
+///
+/// A map carrying SEVERAL inadmissible pairs is refused for the FIRST of them in
+/// NAME order, so one request has one answer: the reason quotes the offending pair's
+/// own name, and a `HashMap`'s iteration order is a function of its hasher's seed
+/// rather than of the keys it holds, so walking the map as it arrives would let two
+/// byte-identical requests — and the same request in two processes — be refused with
+/// two different messages. Sorting the names first is the same normalisation every
+/// other place that turns one of these maps into an answer applies (the record keeps
+/// its own details in a [`BTreeMap`], and the shared constraint walk sorts a map's
+/// entries before it echoes them).
 pub fn check_status_details(details: Option<&HashMap<String, String>>) -> Result<(), String> {
     let Some(details) = details else {
         return Ok(());
     };
-    for (name, value) in details {
+    let mut pairs: Vec<(&String, &String)> = details.iter().collect();
+    pairs.sort_unstable_by_key(|(name, _)| *name);
+    for (name, value) in pairs {
         let name_len = name.chars().count();
         if name_len > MAX_STATUS_DETAIL_NAME_LEN {
             return Err(format!(
@@ -1278,6 +1290,135 @@ mod tests {
                 "case {case:?}: the name test and the check must agree, got {}",
                 is_modeled_status_detail_name(name)
             );
+        }
+    }
+
+    /// RULE: a refusal that quotes part of a supplied map picks what it quotes from
+    /// the map's CONTENT and not from the order it is held in, so a map carrying
+    /// several inadmissible pairs is refused for the first of them in NAME order —
+    /// the same answer however the map was built.
+    ///
+    /// The rows span the offender count, the kind of bound each offender breaks (a
+    /// name past the key shape's length, a name outside its pattern, a value past
+    /// the published ceiling) and the orderings the names can stand in (case,
+    /// digits, punctuation, one name a prefix of another). Each row is built from
+    /// every rotation of its pairs, in a fresh map each time, because a `HashMap`'s
+    /// iteration order is a function of its hasher's seed rather than of its keys.
+    #[test]
+    fn a_status_details_refusal_names_one_offender_whatever_the_map_order() {
+        let over_long_value = "v".repeat(MAX_STATUS_DETAIL_VALUE_LEN + 1);
+        let over_value_len = MAX_STATUS_DETAIL_VALUE_LEN + 1;
+        let just_over_long_name = "n".repeat(MAX_STATUS_DETAIL_NAME_LEN + 1);
+        let far_over_long_name = "n".repeat(MAX_STATUS_DETAIL_NAME_LEN * 2);
+
+        // One row: the case, the pairs the request carries and the one reason it is
+        // refused for.
+        type Row<'r> = (&'r str, Vec<(&'r str, &'r str)>, String);
+
+        let rows: Vec<Row<'_>> = vec![
+            (
+                "two over-bound values",
+                vec![
+                    ("alpha", over_long_value.as_str()),
+                    ("beta", over_long_value.as_str()),
+                ],
+                format!(
+                    "the statusDetails value for alpha is {over_value_len} characters, over the \
+                     {MAX_STATUS_DETAIL_VALUE_LEN} character maximum"
+                ),
+            ),
+            (
+                "names differing only in case, ordered by byte",
+                vec![
+                    ("alpha", over_long_value.as_str()),
+                    ("Zebra", over_long_value.as_str()),
+                ],
+                format!(
+                    "the statusDetails value for Zebra is {over_value_len} characters, over the \
+                     {MAX_STATUS_DETAIL_VALUE_LEN} character maximum"
+                ),
+            ),
+            (
+                "names differing in a digit, one a prefix of another",
+                vec![
+                    ("step-2", over_long_value.as_str()),
+                    ("step-10", over_long_value.as_str()),
+                    ("step-1", over_long_value.as_str()),
+                ],
+                format!(
+                    "the statusDetails value for step-1 is {over_value_len} characters, over the \
+                     {MAX_STATUS_DETAIL_VALUE_LEN} character maximum"
+                ),
+            ),
+            (
+                "one over-bound value among admissible pairs",
+                vec![
+                    ("aaa", "v"),
+                    ("mmm", over_long_value.as_str()),
+                    ("zzz", "v"),
+                ],
+                format!(
+                    "the statusDetails value for mmm is {over_value_len} characters, over the \
+                     {MAX_STATUS_DETAIL_VALUE_LEN} character maximum"
+                ),
+            ),
+            (
+                "a name outside the pattern beside an over-bound value",
+                vec![("bad name", "v"), ("zz", over_long_value.as_str())],
+                format!(
+                    "the statusDetails name bad name is not 1..{MAX_STATUS_DETAIL_NAME_LEN} \
+                     characters matching {STATUS_DETAIL_NAME_PATTERN}"
+                ),
+            ),
+            (
+                "an over-bound name beside an over-bound value",
+                vec![
+                    (just_over_long_name.as_str(), "v"),
+                    ("alpha", over_long_value.as_str()),
+                ],
+                format!(
+                    "the statusDetails value for alpha is {over_value_len} characters, over the \
+                     {MAX_STATUS_DETAIL_VALUE_LEN} character maximum"
+                ),
+            ),
+            (
+                "two over-bound names of different lengths",
+                vec![
+                    (far_over_long_name.as_str(), "v"),
+                    (just_over_long_name.as_str(), "v"),
+                ],
+                format!(
+                    "a statusDetails name of {} characters is over the \
+                     {MAX_STATUS_DETAIL_NAME_LEN} character maximum",
+                    MAX_STATUS_DETAIL_NAME_LEN + 1
+                ),
+            ),
+            (
+                "two names outside the pattern",
+                vec![("step.name", "v"), ("étape", "v")],
+                format!(
+                    "the statusDetails name step.name is not 1..{MAX_STATUS_DETAIL_NAME_LEN} \
+                     characters matching {STATUS_DETAIL_NAME_PATTERN}"
+                ),
+            ),
+        ];
+
+        for (case, pairs, expected) in &rows {
+            for rotation in 0..pairs.len() {
+                let details: HashMap<String, String> = pairs
+                    .iter()
+                    .cycle()
+                    .skip(rotation)
+                    .take(pairs.len())
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect();
+                let answered = check_status_details(Some(&details));
+                assert_eq!(
+                    answered,
+                    Err(expected.clone()),
+                    "case {case:?} (rotation {rotation}): expected {expected:?}, got {answered:?}"
+                );
+            }
         }
     }
 
