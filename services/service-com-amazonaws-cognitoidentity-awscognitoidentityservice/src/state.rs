@@ -778,6 +778,26 @@ pub const MAX_TAGS_PER_IDENTITY_POOL: usize = 50;
 /// rather than a tag this service stores.
 pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 
+/// How AWS words the refusal of a request that would MUTATE a tag lying in the namespace it
+/// reserves for its own ([`RESERVED_TAG_KEY_PREFIX`]) — assigning one, or removing one.
+///
+/// Fixed text with no request- or state-derived part: the reservation is about WHO the
+/// caller is (an end user rather than AWS itself), so the refusal says that and names
+/// neither the key the request carried nor the resource it addressed. Shared by every
+/// operation of this service that writes a resource's tag set, so they answer alike.
+pub const SYSTEM_TAG_MUTATION_MESSAGE: &str =
+    "Caller is an end user and not allowed to mutate system tags";
+
+/// How AWS words the refusal of a `ResourceArn` that is not an ARN of a resource of this
+/// service: the ARN is read by the authorization layer in front of the operation, before
+/// any resource is looked up, and that layer reports that the ARN it was handed failed its
+/// validation.
+///
+/// Fixed text, naming nothing of the value it was handed — the ARN is the caller's own
+/// input and the refusal adds nothing by echoing it. Shared by every operation of this
+/// service that takes a `ResourceArn`, because the layer that reads it is the same one.
+pub const ARN_VALIDATION_FAILED_MESSAGE: &str = "ARN in SecureServiceAuthStrategy failed validation:";
+
 /// Whether `tag_key` lies in the AWS-reserved tag namespace ([`RESERVED_TAG_KEY_PREFIX`]).
 ///
 /// The prefix is matched case-insensitively — the reservation is on the namespace, not on
@@ -820,6 +840,50 @@ pub fn validation_errors_detected(detected: usize, violations: &[String]) -> Str
         if detected == 1 { "" } else { "s" },
         violations.join("; ")
     )
+}
+
+/// The refusal of a MAP member whose KEY is outside the constraints its key shape declares:
+/// the framework's envelope and clause over the map MEMBER, quoting the map the request
+/// sent and listing what a key of it has to satisfy.
+///
+/// A map's key is the one modelled constraint the validating walk ahead of a handler does
+/// not report — it treats a key as a path segment rather than as a constrained leaf — so the
+/// HANDLER applies the key shape's own bounds and words the refusal with this. Both halves
+/// are the shared renderings (`service_common::validation_message::map_key_refusal_quoting`
+/// for the sentence and `service_common::validation::rendered_map` for the value), so a
+/// clause a handler of this service words and one restored from the walk state one map the
+/// same way.
+///
+/// `key_length` is the key shape's declared `@length` and `key_pattern` its declared
+/// `@pattern`, unanchored as a refusal of this service quotes an expression
+/// ([`crate::service::validation`]) — and `None` for a key shape that declares none.
+pub fn map_key_constraint_refusal(
+    member_path: &str,
+    submitted: &BTreeMap<String, String>,
+    key_length: &::std::ops::RangeInclusive<usize>,
+    key_pattern: Option<&str>,
+) -> String {
+    let quoted = rendered_map(submitted);
+    ::service_common::validation_message::map_key_refusal_quoting(
+        member_path,
+        Some(&quoted),
+        *key_length.start() as i64,
+        *key_length.end() as i64,
+        key_pattern,
+    )
+}
+
+/// `submitted` as a constraint refusal quotes a map: `{<key>=<value>, …}`, through the one
+/// renderer of that form (`service_common::validation::rendered_map`). The entries are in
+/// key order, which is the order a `BTreeMap` holds them in and the one order a request's
+/// map can be stated in twice — the request's own map is unordered by the time a handler
+/// reads it.
+pub fn rendered_map(submitted: &BTreeMap<String, String>) -> String {
+    let entries: Vec<(&str, &str)> = submitted
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    ::service_common::validation::rendered_map(&entries)
 }
 
 /// The punctuation an AWS tag key admits beside letters, digits and separators. AWS's

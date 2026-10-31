@@ -44,6 +44,12 @@
 //! string-rendered (a list of structures), or one the leaf caps truncated, keeps the
 //! framework's own summary rather than an echo stating fewer elements than were sent.
 //!
+//! A MAP member is the same story with the other summary — `<n> entries` — and the value
+//! AWS echoes there is the map, rendered the way a map renders: `{<key>=<value>, …}`
+//! ([`rendered_map`]). It is rendered only for a caller that asks
+//! ([`refusing_violations_with_mapped_echoes`]), so a service whose recordings show the
+//! valueless clause keeps it.
+//!
 //! # The bounds this module states
 //!
 //! The framework's cap is a RESOURCE bound as well as a rendering choice: a request whose
@@ -307,6 +313,43 @@ pub fn refusing_violations_with_echoes_over<O: Operation>(
         .collect()
 }
 
+/// As [`refusing_violations_with_echoes`], with a MAP rendered as the entries it holds
+/// ([`rendered_map`]) instead of reported [`SubmittedEcho::Unrendered`] — and with every
+/// LIST of scalars the request carried, keyed by the member path the walk reports that list
+/// at ([`submitted_lists`]).
+///
+/// For a service whose recordings show a clause on a COLLECTION member quoting that
+/// collection. Its two halves are the two ways such a clause arises: a `@length` on a map or
+/// a list is checked on the member, so the only rendering the framework has for it is the
+/// size, and a clause quoting the size states a value no caller sent (the ECHO answers
+/// that); while a constraint broken by a list's ELEMENTS is reported by the framework at the
+/// element and by AWS at the list, where the value is the whole list, which no violation
+/// carries at all (the LISTS answer that).
+///
+/// The map entries are stated in KEY order, which is the one order one request's map can be
+/// stated in twice: the map reaches this walk as the built input's own unordered map, so the
+/// order its entries were written in is not the order the request carried them in. Which
+/// order the service being reproduced prints them in is a fact about THAT service's own
+/// renderer and is not recoverable here. Everything else is
+/// [`refusing_violations_with_echoes`]'s: the same collecting walk, the same violations, the
+/// same per-value and per-message echo bounds.
+#[must_use]
+pub fn refusing_violations_with_mapped_echoes<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> (Vec<(Violation, SubmittedEcho)>, HashMap<String, String>) {
+    let refusing = violations_in::<O>(protocol, req, Echoes::MappedRenderings);
+    let lists = refusing.lists;
+    (
+        refusing
+            .violations
+            .into_iter()
+            .zip(refusing.echoes)
+            .collect(),
+        lists,
+    )
+}
+
 /// As [`refusing_violations_with_echoes_over`], with a STRUCTURE rendered over EVERY member
 /// its shape declares — one the request left unset as `null` — and with a structure reached
 /// as a struct MEMBER rendered too, under the shape name its own members carry.
@@ -411,6 +454,9 @@ pub(crate) enum Echoes {
     /// As [`Self::Renderings`], over as many member positions as the SERVICE states
     /// ([`with_submitted_echoes_over`]) instead of [`MAX_RECORDED_LEAVES`].
     RenderingsOver(usize),
+    /// As [`Self::Renderings`], with a MAP rendered as the entries it holds
+    /// ([`refusing_violations_with_mapped_echoes`]).
+    MappedRenderings,
     /// As [`Self::RenderingsOver`], with a structure rendered over every member its shape
     /// declares ([`refusing_violations_with_declared_echoes_over`]).
     DeclaredRenderingsOver(usize),
@@ -440,6 +486,21 @@ pub(crate) enum StructureForm {
     /// ([`refusing_violations_with_printed_echoes_over`]). A shape it does not name renders
     /// as [`Self::EveryMemberDeclared`] renders it.
     MembersPrinted(PrintedMembers),
+}
+
+/// Whether a MAP is RENDERED inside a clause, or reported as a value this walk states
+/// nothing for.
+///
+/// The two are different claims about the service being reproduced — a clause quoting the
+/// map it refused, and one naming the member alone — so the caller states the form its
+/// recordings show rather than this walk picking one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MapForm {
+    /// A map has no rendering: a clause states [`SubmittedEcho::Unrendered`] for one.
+    #[default]
+    Unrendered,
+    /// A map renders as the entries it holds, in key order ([`rendered_map`]).
+    Entries,
 }
 
 /// The ONE collecting walk this crate performs: every violation that refuses `req` before
@@ -510,6 +571,33 @@ pub(crate) fn violations_in<O: Operation>(
                         echoes,
                     }
                 }
+                Echoes::MappedRenderings => {
+                    // The lists are only ever READ for a violation found on a list ELEMENT,
+                    // so a request that broke no such constraint pays nothing for them.
+                    let wanted = violations
+                        .iter()
+                        .any(|violation| list_of_element(&violation.path).is_some());
+                    let lists = if wanted {
+                        submitted_lists(&input, O::INPUT_SCHEMA)
+                    } else {
+                        HashMap::new()
+                    };
+                    let (violations, echoes) = echoed_over(
+                        violations,
+                        &input,
+                        O::INPUT_SCHEMA,
+                        MAX_RECORDED_LEAVES,
+                        StructureForm::MembersSet,
+                        MapForm::Entries,
+                    )
+                    .into_iter()
+                    .unzip();
+                    Refusing {
+                        violations,
+                        lists,
+                        echoes,
+                    }
+                }
                 Echoes::DeclaredRenderingsOver(max_positions) => {
                     let (violations, echoes) = echoed_over(
                         violations,
@@ -517,6 +605,7 @@ pub(crate) fn violations_in<O: Operation>(
                         O::INPUT_SCHEMA,
                         max_positions,
                         StructureForm::EveryMemberDeclared,
+                        MapForm::Unrendered,
                     )
                     .into_iter()
                     .unzip();
@@ -533,6 +622,7 @@ pub(crate) fn violations_in<O: Operation>(
                         O::INPUT_SCHEMA,
                         max_positions,
                         StructureForm::MembersPrinted(printed),
+                        MapForm::Unrendered,
                     )
                     .into_iter()
                     .unzip();
@@ -743,19 +833,21 @@ pub fn with_submitted_echoes_over(
         schema,
         max_positions,
         StructureForm::MembersSet,
+        MapForm::Unrendered,
     )
 }
 
-/// [`with_submitted_echoes_over`], with the STRUCTURE form the caller states.
+/// [`with_submitted_echoes_over`], with the STRUCTURE and MAP forms the caller states.
 ///
-/// The one body both echo modes run: the walk, the path spelling and the echo bounds are
-/// the same, so the two forms cannot drift into two walks.
+/// The one body every echo mode runs: the walk, the path spelling and the echo bounds are
+/// the same, so the forms cannot drift into several walks.
 fn echoed_over(
     violations: Vec<Violation>,
     input: &dyn SerializableStruct,
     schema: &Schema,
     max_positions: usize,
     structures: StructureForm,
+    maps: MapForm,
 ) -> Vec<(Violation, SubmittedEcho)> {
     // A refusal that states no value at all (an absent `@required` member is the common
     // case) is not worth a walk over the whole input.
@@ -765,7 +857,7 @@ fn echoed_over(
             .map(|violation| (violation, SubmittedEcho::Absent))
             .collect();
     }
-    let renderings = renderings_in(input, schema, max_positions, structures);
+    let renderings = renderings_in(input, schema, max_positions, structures, maps);
     // ONE pass over the renderings builds the lookup, so the cost is O(positions) rather
     // than O(violations x positions).
     let mut by_path: HashMap<&str, Option<&str>> = HashMap::new();
@@ -890,6 +982,22 @@ fn collection_count(stored: &str) -> Option<usize> {
 /// the form AWS echoes a list-valued member back in.
 fn rendered_list(elements: &[&str]) -> String {
     format!("[{}]", elements.join(", "))
+}
+
+/// `entries` as a map renders: `{<key>=<value>, …}` over the entries in the order given —
+/// the form AWS echoes a map-valued member back in.
+///
+/// `pub` because the one constraint class no walk ahead of a handler reports is a map's KEY
+/// (the walk treats it as a path segment), so the HANDLER that applies the key shape's
+/// constraints words its own clause and has to quote the map the same way a clause restored
+/// from the walk does ([`refusing_violations_with_mapped_echoes`]).
+#[must_use]
+pub fn rendered_map(entries: &[(&str, &str)]) -> String {
+    let rendered: Vec<String> = entries
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    format!("{{{}}}", rendered.join(", "))
 }
 
 /// `regex` without the whole-value anchors a model adds to express the match AWS's own
@@ -1205,16 +1313,23 @@ pub fn submitted_renderings_over(
     schema: &Schema,
     max_positions: usize,
 ) -> Vec<(String, Option<String>)> {
-    renderings_in(input, schema, max_positions, StructureForm::MembersSet)
+    renderings_in(
+        input,
+        schema,
+        max_positions,
+        StructureForm::MembersSet,
+        MapForm::Unrendered,
+    )
 }
 
-/// [`submitted_renderings_over`], with the STRUCTURE form the caller states: the one walk
-/// both forms run.
+/// [`submitted_renderings_over`], with the STRUCTURE and MAP forms the caller states: the
+/// one walk every form runs.
 fn renderings_in(
     input: &dyn SerializableStruct,
     schema: &Schema,
     max_positions: usize,
     structures: StructureForm,
+    maps: MapForm,
 ) -> Vec<(String, Option<String>)> {
     // The ONLY walk that composes renderings: a caller that reads one named leaf
     // ([`submitted_leaves`], [`submitted_lists`]) pays nothing for them.
@@ -1222,6 +1337,7 @@ fn renderings_in(
         renders: true,
         max_positions: Some(max_positions),
         structures,
+        maps,
         ..SubmittedValues::default()
     };
     let _ = walk.write_struct(schema, input);
@@ -1229,7 +1345,8 @@ fn renderings_in(
 }
 
 /// One child of an open composite: the member name it reported under (absent for a
-/// collection element), the shape that DECLARES that member, and how its value renders.
+/// collection element), the shape that DECLARES that member, the map KEY it was held
+/// under, and how its value renders.
 #[derive(Debug)]
 struct RenderedChild {
     name: Option<String>,
@@ -1239,6 +1356,11 @@ struct RenderedChild {
     /// while the members the structure itself wrote name the structure (see
     /// [`declaring_shape`]).
     declared_by: Option<String>,
+    /// The key of the MAP entry this child is the value of, for a child written inside a
+    /// map frame; `None` everywhere else. A map value is written against the map MEMBER's
+    /// schema, which names the member and not the entry, so the key is the one thing about
+    /// such a child the schema cannot carry.
+    key: Option<String>,
     rendering: Option<String>,
 }
 
@@ -1277,6 +1399,7 @@ impl Composite {
     /// missing a part of itself.
     fn take(&mut self, child: RenderedChild) {
         let bytes = child.name.as_ref().map_or(0, String::len)
+            + child.key.as_ref().map_or(0, String::len)
             + child.rendering.as_ref().map_or(0, String::len);
         if self.children.len() >= MAX_RENDERED_CHILDREN
             || self.bytes + bytes > MAX_RESTORED_ECHO
@@ -1323,6 +1446,38 @@ fn rendered_sequence(children: &[RenderedChild]) -> Option<String> {
         .map(|child| child.rendering.as_deref())
         .collect::<Option<Vec<_>>>()?;
     Some(rendered_list(&elements))
+}
+
+/// `children` as a MAP renders: its entries in KEY order, each `<key>=<value>`, in braces,
+/// through the one renderer of that form ([`rendered_map`]).
+///
+/// `None` when an entry's value has no text rendering, so a map of blobs states no value
+/// rather than one missing an entry, and `None` when the rendering would be longer than
+/// [`MAX_RESTORED_ECHO`] — measured before it is built, so an oversized rendering is never
+/// allocated. A child the walk recorded no key for is not an entry of a map at all, which
+/// is the same `None`.
+///
+/// Why KEY order: see [`refusing_violations_with_mapped_echoes`]. The built input's map is
+/// unordered, so the order the entries were written in is not the request's.
+fn rendered_entries(children: &[RenderedChild]) -> Option<String> {
+    // The braces, plus `<key>=<value>` and `, ` per entry — the same measurement
+    // `rendered_length` makes for a named composite, with the key in place of the member.
+    let mut length = 2;
+    let mut entries: Vec<(&str, &str)> = Vec::with_capacity(children.len());
+    for child in children {
+        if !entries.is_empty() {
+            length += 2; // ", "
+        }
+        let key = child.key.as_deref()?;
+        let value = child.rendering.as_deref()?;
+        length += key.len() + 1 + value.len();
+        if length > MAX_RESTORED_ECHO {
+            return None;
+        }
+        entries.push((key, value));
+    }
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    Some(rendered_map(&entries))
 }
 
 /// `children` as a structure renders: the shape's name over the members that were
@@ -1454,6 +1609,8 @@ struct SubmittedValues {
     /// Which members a STRUCTURE renders over, as the caller stated it
     /// ([`StructureForm`]).
     structures: StructureForm,
+    /// Whether a MAP renders at all, as the caller stated it ([`MapForm`]).
+    maps: MapForm,
     /// The member positions this walk may visit and record, or `None` for
     /// [`MAX_RECORDED_LEAVES`], the count this module states. A caller whose model
     /// declares a collection larger than that count states its own ceiling
@@ -1614,6 +1771,21 @@ impl SubmittedValues {
             self.rendered += bytes;
             self.renderings.push((position, rendering.clone()));
         }
+        // Computed before the composite is borrowed: a map entry's key lives on the frame
+        // stack, not on the child. Read only by the form that renders a map, as the
+        // declaring shape is read only by the forms that name one.
+        let key = match (self.maps, self.collections.last()) {
+            // The entry whose VALUE is being written: the key was captured when the codec
+            // wrote it, just before this value, and is still pending.
+            (
+                MapForm::Entries,
+                Some(Frame::Map {
+                    expecting_key: false,
+                    pending_key,
+                }),
+            ) => pending_key.clone(),
+            _ => None,
+        };
         if let Some(open) = self.open.last_mut() {
             open.take(RenderedChild {
                 name: Self::segment_for(schema),
@@ -1625,6 +1797,7 @@ impl SubmittedValues {
                     }
                     StructureForm::MembersSet => None,
                 },
+                key,
                 rendering,
             });
         }
@@ -1733,9 +1906,14 @@ impl SubmittedValues {
         let rendering = match frame {
             Some(Frame::List { .. }) => rendered_sequence(&composite.children),
             Some(Frame::Struct) => self.rendered_struct(schema, &composite.children),
-            // A map: no rule for how AWS states one inside a clause is known here, so a
-            // clause on a map member states no value rather than a form AWS never emits.
-            _ => None,
+            // A map renders only for a caller that states the form ([`MapForm`]), so a
+            // service whose recordings show the valueless clause keeps it rather than
+            // gaining a form it never emits.
+            Some(Frame::Map { .. }) => match self.maps {
+                MapForm::Entries => rendered_entries(&composite.children),
+                MapForm::Unrendered => None,
+            },
+            None => None,
         };
         rendering.filter(|rendered| rendered.len() <= MAX_RESTORED_ECHO)
     }
@@ -1934,10 +2112,10 @@ impl ShapeSerializer for SubmittedValues {
 mod tests {
     use super::{
         echo_of, is_elision_of, list_of_element, quoted_echo, rendered_declared_structure,
-        rendered_sequence, rendered_structure, unanchored, unanchored_grouping_alternation,
-        Composite, RenderedChild, Submitted, SubmittedEcho, SubmittedValues, MAX_RECORDED_BYTES,
-        MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES, MAX_RECORDED_RENDERINGS,
-        MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
+        rendered_entries, rendered_map, rendered_sequence, rendered_structure, unanchored,
+        unanchored_grouping_alternation, Composite, RenderedChild, Submitted, SubmittedEcho,
+        SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES,
+        MAX_RECORDED_RENDERINGS, MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
     };
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
     use std::collections::HashMap;
@@ -2358,6 +2536,7 @@ mod tests {
         let child = |name: Option<&str>, rendering: Option<&str>| RenderedChild {
             name: name.map(str::to_string),
             declared_by: name.map(|_| "Thing".to_string()),
+            key: None,
             rendering: rendering.map(str::to_string),
         };
         let sequences: [(&str, Vec<RenderedChild>, Option<&str>); 4] = [
@@ -2429,6 +2608,7 @@ mod tests {
         let child = |name: &str, rendering: Option<&str>| RenderedChild {
             name: Some(name.to_string()),
             declared_by: Some("Thing".to_string()),
+            key: None,
             rendering: rendering.map(str::to_string),
         };
         let declared = |names: &[&str]| -> Vec<String> {
@@ -2503,6 +2683,7 @@ mod tests {
         let child = |rendering: &str| RenderedChild {
             name: Some("name".to_string()),
             declared_by: Some("Thing".to_string()),
+            key: None,
             rendering: Some(rendering.to_string()),
         };
 
@@ -2645,6 +2826,77 @@ mod tests {
                 "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }
+    }
+
+    /// RULE: a MAP renders as the entries it holds — `{<key>=<value>, …}` in KEY order —
+    /// for the caller that states that form, and as nothing for the caller that does not;
+    /// an entry whose value has no text rendering, and a child that is no map entry at
+    /// all, suppress the whole rendering rather than state a map missing an entry.
+    ///
+    /// The rows span what the rule generalises over: how many entries the map holds, which
+    /// order they arrived in, and whether every entry can be stated.
+    #[test]
+    fn a_map_renders_as_its_entries_in_key_order() {
+        let entry = |key: Option<&str>, rendering: Option<&str>| RenderedChild {
+            name: Some("tags".to_string()),
+            declared_by: None,
+            key: key.map(str::to_string),
+            rendering: rendering.map(str::to_string),
+        };
+
+        let rows: [(&str, Vec<RenderedChild>, Option<&str>); 6] = [
+            ("no entries", vec![], Some("{}")),
+            (
+                "one entry",
+                vec![entry(Some("a"), Some("1"))],
+                Some("{a=1}"),
+            ),
+            (
+                "entries that arrived in key order",
+                vec![
+                    entry(Some("a"), Some("1")),
+                    entry(Some("b"), Some("2")),
+                    entry(Some("c"), Some("3")),
+                ],
+                Some("{a=1, b=2, c=3}"),
+            ),
+            (
+                "entries that arrived in another order",
+                vec![
+                    entry(Some("c"), Some("3")),
+                    entry(Some("a"), Some("1")),
+                    entry(Some("b"), Some("2")),
+                ],
+                Some("{a=1, b=2, c=3}"),
+            ),
+            (
+                "an entry whose value has no text rendering",
+                vec![entry(Some("a"), Some("1")), entry(Some("b"), None)],
+                None,
+            ),
+            (
+                "a child that is no map entry",
+                vec![entry(None, Some("1"))],
+                None,
+            ),
+        ];
+
+        for (case, children, expected) in rows {
+            let actual = rendered_entries(&children);
+            assert_eq!(
+                actual.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        // The entries a caller renders by hand go through the same renderer, so a clause a
+        // handler words and one restored from the walk state one map the same way.
+        let stated = rendered_map(&[("a", "1"), ("b", "2")]);
+        assert_eq!(
+            stated, "{a=1, b=2}",
+            "case \"stated by a caller\": expected the same form, got {stated}"
+        );
     }
 
     /// RULE: the two renderings drop the SAME pair ([`super::unanchored`]'s positional

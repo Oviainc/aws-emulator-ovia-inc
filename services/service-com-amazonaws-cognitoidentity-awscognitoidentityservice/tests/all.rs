@@ -19,6 +19,8 @@ mod anonymous_credential_exchange;
 mod anonymous_credential_vend;
 #[path = "all/basic_flow_gate.rs"]
 mod basic_flow_gate;
+#[path = "all/constraint_refusal_wording.rs"]
+mod constraint_refusal_wording;
 #[path = "all/control_plane_audit.rs"]
 mod control_plane_audit;
 #[path = "all/custom_role_arn_from_token_roles.rs"]

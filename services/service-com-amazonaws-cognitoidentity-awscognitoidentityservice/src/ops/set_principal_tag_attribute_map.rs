@@ -301,12 +301,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetPrincipalTagAt
 
 /// The MODELLED bounds of a `PrincipalTags` key, from `PrincipalTagID`'s own
 /// `length 1..128` (`smithy_query(query="shape",shape="PrincipalTags")`). Counted in
-/// CHARACTERS, the unit a Smithy length constraint is measured in.
+/// CHARACTERS, the unit a Smithy length constraint is measured in. The key shape declares
+/// no `@pattern`, so a refusal of a key lists these bounds and nothing else.
 const PRINCIPAL_TAG_KEY_LENGTH: ::std::ops::RangeInclusive<usize> = 1..=128;
 
-/// The most entries a `PrincipalTags` map carries, from the modelled `PrincipalTags`'s own
-/// `length 0..50` (the same query).
-const MAX_PRINCIPAL_TAGS: usize = 50;
+/// The member path a refusal names the `PrincipalTags` map at: the member's own name, in
+/// the lowerCamel spelling a constraint clause spells a member in.
+const PRINCIPAL_TAGS_MEMBER_PATH: &str = "principalTags";
 
 /// The `PrincipalTags` map as it will be stored, or the refusal for the first key that is
 /// not a tag key an IAM policy could reference. Values are user attribute (claim) names and
@@ -326,39 +327,30 @@ fn validated_principal_tags(
         })
         .unwrap_or_default();
 
-    // The MODELLED bounds the protocol's boundary walk does not reach. It checks a map's
-    // VALUES against `PrincipalTagValue` before this handler runs, but neither the map's
-    // keys nor the map's own size, so both reach here: a constraint the model states is a
-    // protocol-level refusal — HTTP 400 `ValidationException` naming the member and the
-    // constraint it failed — which is what `Scaffolded::validation` answers.
+    // The one MODELLED bound of this map the protocol's boundary walk does not reach: its
+    // KEYS, which that walk treats as a path segment rather than as a constrained leaf. The
+    // map's own size and its VALUES are checked against `PrincipalTags` and
+    // `PrincipalTagValue` before this handler runs, so neither is re-checked here. A
+    // constraint the model states is a protocol-level refusal — HTTP 400
+    // `ValidationException` naming the member, the map it was handed and what a key of that
+    // map has to satisfy — which is what `Scaffolded::validation` answers.
     //
-    // The map's SIZE is checked FIRST and its refusal names no value: the request's own map
-    // is what a refusal would otherwise render, and nothing bounds how large a map a caller
-    // sends, so rendering it before this check is how a request grows an error message
-    // without limit. Past this check the map is at most
-    // `MAX_PRINCIPAL_TAGS` entries of modelled length, so what follows may name it.
-    if stored.len() > MAX_PRINCIPAL_TAGS {
-        return Err(crate::scaffolded::Scaffolded::validation(format!(
-            "1 validation error detected: Value at 'principalTags' failed to satisfy \
-             constraint: Member must have length less than or equal to {MAX_PRINCIPAL_TAGS}"
-        )));
-    }
-
     // The value named is the MEMBER's own, and a member fails one constraint once, so a map
     // with several keys outside the bound is refused for that one failure rather than once
-    // per key.
+    // per key. Past the boundary walk the map is at most the modelled maximum entries of
+    // modelled length, so quoting it cannot grow a message without bound.
     if stored
         .keys()
         .any(|tag_key| !PRINCIPAL_TAG_KEY_LENGTH.contains(&tag_key.chars().count()))
     {
-        return Err(crate::scaffolded::Scaffolded::validation(format!(
-            "1 validation error detected: Value '{}' at 'principalTags' failed to satisfy \
-             constraint: Map keys must satisfy constraint: [Member must have length less than \
-             or equal to {}, Member must have length greater than or equal to {}]",
-            rendered_map(&stored),
-            PRINCIPAL_TAG_KEY_LENGTH.end(),
-            PRINCIPAL_TAG_KEY_LENGTH.start()
-        )));
+        return Err(crate::scaffolded::Scaffolded::validation(
+            crate::state::map_key_constraint_refusal(
+                PRINCIPAL_TAGS_MEMBER_PATH,
+                &stored,
+                &PRINCIPAL_TAG_KEY_LENGTH,
+                None,
+            ),
+        ));
     }
 
     for tag_key in stored.keys() {
@@ -378,16 +370,6 @@ fn validated_principal_tags(
         }
     }
     Ok(stored)
-}
-
-/// A map as a constraint refusal names the value it was given: `{key=value}` entries,
-/// separated by `, `, in key order so the same request is named the same way twice.
-fn rendered_map(principal_tags: &::std::collections::BTreeMap<String, String>) -> String {
-    let entries: Vec<String> = principal_tags
-        .iter()
-        .map(|(tag_key, attribute)| format!("{tag_key}={attribute}"))
-        .collect();
-    format!("{{{}}}", entries.join(", "))
 }
 
 /// The modelled refusal for a bad input parameter (HTTP 400), carrying what was wrong with

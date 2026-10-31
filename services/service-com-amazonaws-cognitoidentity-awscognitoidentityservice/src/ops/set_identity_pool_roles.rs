@@ -8,7 +8,9 @@
 //!
 //! A role is refused unless it is an IAM role ARN, and a role mapping unless it carries
 //! what the model documents as required for its `Type`; both are
-//! `InvalidParameterException` (HTTP 400), the modelled error for a bad input parameter.
+//! `InvalidParameterException` (HTTP 400), the modelled error for a bad input parameter. A
+//! `Roles` KEY outside the constraints the model states for it is a different refusal: the
+//! protocol's own `ValidationException` (HTTP 400), as for any value the model bounds.
 //!
 //! ## Shape of an operation
 //!
@@ -84,15 +86,27 @@
 use super::types::*;
 
 /// The keys `RolesMap` admits, from the modelled `RoleType`'s own pattern
-/// `^(un)?authenticated$` (`smithy_query(query="shape",shape="RolesMap")`), which the
-/// `Roles` doc states as "either \"authenticated\" or \"unauthenticated\"". The two keys
-/// are the store's own ([`crate::state::AUTHENTICATED_ROLE_TYPE`] /
+/// [`ROLE_TYPE_PATTERN`] (`smithy_query(query="shape",shape="RolesMap")`), which the
+/// `Roles` doc states as "either \"authenticated\" or \"unauthenticated\"". Anchored, that
+/// expression admits exactly these two strings and nothing else, so a key outside this list
+/// is a key outside the shape's constraints. The two keys are the store's own
+/// ([`crate::state::AUTHENTICATED_ROLE_TYPE`] /
 /// [`crate::state::UNAUTHENTICATED_ROLE_TYPE`]), so the key written here is the one a vend
 /// reads the pool's role by.
 const ROLE_TYPES: &[&str] = &[
     crate::state::AUTHENTICATED_ROLE_TYPE,
     crate::state::UNAUTHENTICATED_ROLE_TYPE,
 ];
+
+/// The member path a refusal names the `Roles` map at: the member's own name, in the
+/// lowerCamel spelling a constraint clause spells a member in.
+const ROLES_MEMBER_PATH: &str = "roles";
+
+/// The MODELLED `@length` of a `Roles` KEY, from `RoleType`'s own `length 1..128`
+/// (`smithy_query(query="shape",shape="RolesMap")`), and its MODELLED `@pattern`.
+/// A refusal of a key lists what the key shape requires, so both are read from here.
+const ROLE_TYPE_LENGTH: ::std::ops::RangeInclusive<usize> = 1..=128;
+const ROLE_TYPE_PATTERN: &str = "^(un)?authenticated$";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -323,31 +337,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SetIdentityPoolRo
     }
 }
 
-/// The `Roles` map as it will be stored, or the modelled refusal for the first entry that
-/// does not name an IAM role.
+/// The `Roles` map as it will be stored, or the refusal for the first entry the map may not
+/// carry.
+///
+/// Two refusals, and they are different CLASSES. A KEY outside the constraints `RoleType`
+/// declares breaks a constraint the MODEL states, which is a protocol-level refusal — HTTP
+/// 400 `ValidationException` naming the member, the map it was handed and what a key of that
+/// map has to satisfy ([`crate::state::map_key_constraint_refusal`]) — and reaches a handler
+/// at all only because the validating walk ahead of it treats a map's key as a path segment
+/// rather than as a constrained leaf. A VALUE that is not an IAM role ARN satisfies every
+/// constraint the model states (`ARNString` bounds only the length), so it is this service's
+/// own rule about a well-formed value it cannot serve: the modelled
+/// `InvalidParameterException`.
 fn validated_roles(
     roles: &::std::collections::HashMap<String, String>,
 ) -> Result<::std::collections::BTreeMap<String, String>, SetIdentityPoolRolesError> {
-    let mut validated = ::std::collections::BTreeMap::new();
-    // Ordered, so which entry a multi-entry map is refused for does not depend on the
-    // iteration order of the request's map.
-    let mut entries: Vec<(&String, &String)> = roles.iter().collect();
-    entries.sort_by_key(|(role_type, _)| *role_type);
-    for (role_type, role_arn) in entries {
+    // Ordered, so which entry a multi-entry map is refused for, and the order a refusal
+    // states the map in, do not depend on the iteration order of the request's map.
+    let submitted: ::std::collections::BTreeMap<String, String> = roles
+        .iter()
+        .map(|(role_type, role_arn)| (role_type.clone(), role_arn.clone()))
+        .collect();
+    for (role_type, role_arn) in &submitted {
         if !ROLE_TYPES.contains(&role_type.as_str()) {
-            return Err(invalid_parameter(format!(
-                "Roles key '{role_type}' is not valid: the key must be one of {}.",
-                ROLE_TYPES.join(", ")
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::map_key_constraint_refusal(
+                    ROLES_MEMBER_PATH,
+                    &submitted,
+                    &ROLE_TYPE_LENGTH,
+                    Some(&::service_common::validation::unanchored(ROLE_TYPE_PATTERN)),
+                ),
+            ));
         }
         if !crate::state::is_iam_role_arn(role_arn) {
             return Err(invalid_parameter(format!(
                 "Roles['{role_type}'] value '{role_arn}' is not a valid IAM role ARN."
             )));
         }
-        validated.insert(role_type.clone(), role_arn.clone());
     }
-    Ok(validated)
+    // Every key and value was admitted, so the map as submitted is the map as stored.
+    Ok(submitted)
 }
 
 /// The `RoleMappings` map as it will be stored, or the modelled refusal for the first

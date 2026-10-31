@@ -223,13 +223,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> TagResource<Eng> 
         // `ARNString` constrains only the length (20..2048), so the ARN's own form is this
         // service's rule — the same rule `ListTagsForResource` reads a `ResourceArn` by: a
         // `ResourceArn` that is not an identity-pool ARN of this service names no resource
-        // at all, which is a bad input parameter rather than a missing resource.
+        // at all, which is a bad input parameter rather than a missing resource. The ARN is
+        // read before any resource is looked up, so the refusal is the one fixed sentence
+        // that layer states ([`crate::state::ARN_VALIDATION_FAILED_MESSAGE`]).
         let Some(identity_pool_id) = crate::state::identity_pool_id_from_arn(&input.resource_arn)
         else {
-            return Err(invalid_parameter(format!(
-                "ResourceArn '{}' is not the ARN of an Amazon Cognito identity pool.",
-                input.resource_arn
-            )));
+            return Err(invalid_parameter(
+                crate::state::ARN_VALIDATION_FAILED_MESSAGE.to_string(),
+            ));
         };
 
         // The tags themselves are checked before the pool is looked up, and everything is
@@ -257,11 +258,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> TagResource<Eng> 
 
         for (tag_key, _) in &requested {
             if crate::state::is_reserved_tag_key(tag_key) {
-                return Err(invalid_parameter(format!(
-                    "Tags key '{tag_key}' is not valid: the '{}' prefix is reserved for Amazon \
-                     Web Services use.",
-                    crate::state::RESERVED_TAG_KEY_PREFIX
-                )));
+                return Err(invalid_parameter(
+                    crate::state::SYSTEM_TAG_MUTATION_MESSAGE.to_string(),
+                ));
             }
         }
 

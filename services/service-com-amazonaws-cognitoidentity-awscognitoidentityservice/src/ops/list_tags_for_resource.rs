@@ -207,15 +207,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ListTagsForResour
         // `ARNString` constrains only the length (20..2048), so the ARN's own form is
         // this service's rule: a `ResourceArn` that is not an identity-pool ARN of this
         // service names no resource at all, which is a bad input parameter rather than a
-        // missing resource.
+        // missing resource. The ARN is read before any resource is looked up, so the
+        // refusal is the one fixed sentence that layer states
+        // ([`crate::state::ARN_VALIDATION_FAILED_MESSAGE`]), as it is for the two tag
+        // writes on the same ARN.
         let Some(identity_pool_id) = crate::state::identity_pool_id_from_arn(&input.resource_arn)
         else {
             return Err(ListTagsForResourceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "ResourceArn '{}' is not the ARN of an Amazon Cognito identity pool.",
-                        input.resource_arn
-                    )),
+                    message: Some(crate::state::ARN_VALIDATION_FAILED_MESSAGE.to_string()),
                 },
             )
             .into());

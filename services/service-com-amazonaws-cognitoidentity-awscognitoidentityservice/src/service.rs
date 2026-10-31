@@ -55,10 +55,10 @@
 //! (the header alone — `awsJson1_1` has no envelope element for the id) and wires it at
 //! the two layers every response of this service passes through:
 //!
-//! * [`RequestIdHeaderOperation`], the wrapper [`Service::override_operation`] hands the
-//!   router in place of each modelled operation, covers everything an operation answers —
-//!   a success, a modelled error, and a constraint refusal raised while that operation
-//!   was being served;
+//! * [`validation::QuotingSubmittedValues`], the wrapper [`Service::override_operation`]
+//!   hands the router in place of each modelled operation, covers everything an operation
+//!   answers — a success, a modelled error, and a constraint refusal raised for that
+//!   operation's request;
 //! * [`RequestIdEnvelopeDefinition::header_only`], the definition wrapper
 //!   [`Service::definition`] hands back, covers a response NO operation produced: a
 //!   routing failure, a transport failure detected up front, and a pre-dispatch
@@ -74,21 +74,45 @@
 //! renderers write the body alone. [`error_type_header`] owns that header, at the same two
 //! layers and wrapped around the same two request-id reporters, so one response names both
 //! the request it answers and the exception it answers with.
+//!
+//! ## Stating the value a constraint refusal is about
+//!
+//! A clause about a COLLECTION member states the collection the request carried, which the
+//! framework's constraint walk has no rendering for and `override_refusal` cannot reach:
+//! [`validation`] owns that, in the per-operation wrapper this file hands the router.
 
 pub mod error_type_header;
+pub mod validation;
 
 /// The table of the status rule [`crate::scaffolded::wire_status`] states — test-only, the
 /// rule itself living beside the error channel it renders.
 #[cfg(test)]
 mod modeled_error_status;
 
-use error_type_header::{ErrorTypeHeaderDefinition, ErrorTypeHeaderOperation};
-use service_common::query_error_envelope::{RequestIdEnvelopeDefinition, RequestIdHeaderOperation};
+use error_type_header::ErrorTypeHeaderDefinition;
+use service_common::query_error_envelope::RequestIdEnvelopeDefinition;
 use smithy_server_runtime::{
-    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service, Violation,
-    ViolationKind,
+    http, ErasedOperation, ErasedServiceDefinition, OperationRoutingTable, Refusal, Refused,
+    Service,
 };
 use std::sync::Arc;
+use validation::QuotingSubmittedValues;
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`QuotingSubmittedValues`] and keyed by its operation shape name — the routing key
+/// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(QuotingSubmittedValues::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
+}
 
 /// The `com-amazonaws-cognitoidentity-awscognitoidentityservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -100,10 +124,14 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// response no operation produced still names the request it answers and the exception
     /// it is refused with.
     entry: ErrorTypeHeaderDefinition<RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>>,
-    /// Serves every modelled operation, so each response an operation produced names the
-    /// request it answers and, when it is a failure, the exception shape it names in its
-    /// body. Held, not built per request: `override_operation` hands back a borrow of it.
-    request_id: ErrorTypeHeaderOperation<RequestIdHeaderOperation>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`QuotingSubmittedValues`] — so a refusal states the value the request carried, and
+    /// every response names the request it answers and the exception it is refused with.
+    /// Keyed by the routing key the protocol resolves — the key the generated table uses —
+    /// and built from the SAME shared engine, so a wrapped operation reads and writes the
+    /// one store. Held on the service because [`Service::override_operation`] hands back a
+    /// borrow of `self`.
+    quoting_submitted_values: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -111,11 +139,39 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut quoting_submitted_values = OperationRoutingTable::new();
+        wrap_operations!(
+            quoting_submitted_values,
+            engine,
+            create_identity_pool::CreateIdentityPool,
+            delete_identities::DeleteIdentities,
+            delete_identity_pool::DeleteIdentityPool,
+            describe_identity::DescribeIdentity,
+            describe_identity_pool::DescribeIdentityPool,
+            get_credentials_for_identity::GetCredentialsForIdentity,
+            get_id::GetId,
+            get_identity_pool_roles::GetIdentityPoolRoles,
+            get_open_id_token::GetOpenIdToken,
+            get_open_id_token_for_developer_identity::GetOpenIdTokenForDeveloperIdentity,
+            get_principal_tag_attribute_map::GetPrincipalTagAttributeMap,
+            list_identities::ListIdentities,
+            list_identity_pools::ListIdentityPools,
+            list_tags_for_resource::ListTagsForResource,
+            lookup_developer_identity::LookupDeveloperIdentity,
+            merge_developer_identities::MergeDeveloperIdentities,
+            set_identity_pool_roles::SetIdentityPoolRoles,
+            set_principal_tag_attribute_map::SetPrincipalTagAttributeMap,
+            tag_resource::TagResource,
+            unlink_developer_identity::UnlinkDeveloperIdentity,
+            unlink_identity::UnlinkIdentity,
+            untag_resource::UntagResource,
+            update_identity_pool::UpdateIdentityPool,
+        );
         Self {
             entry: ErrorTypeHeaderDefinition::new(RequestIdEnvelopeDefinition::header_only(
                 crate::ServiceDefinition::new(engine),
             )),
-            request_id: ErrorTypeHeaderOperation::new(RequestIdHeaderOperation),
+            quoting_submitted_values,
         }
     }
 }
@@ -164,19 +220,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
         //
-        // NOT a re-route: the operation served is the one this service's own routing
-        // table names for the request, reached through the shared
-        // `RequestIdHeaderOperation` — the one place every operation's response passes,
-        // so no operation can answer without naming the request it answered. A request
-        // the table does not answer declines here exactly as it would there, leaving the
-        // router's routing-error path (which names the request itself, through the
-        // definition wrapper) unchanged. The wrapper declares no auth schemes of its
-        // own, so the modelled operation's still decide and this service's anonymous
-        // credential exchange stays anonymous.
-        self.entry
-            .inner()
-            .routes(req)
-            .then_some(&self.request_id as &dyn ErasedOperation)
+        // NOT a re-route: the operation served is the one the generated routing table names
+        // for this request, wrapped so that a refusal states the value the request carried
+        // and so that every response names the request it answers and the exception it is
+        // refused with (see [`validation::QuotingSubmittedValues`]) — the one place every
+        // operation's response passes. The routing DECISION stays the model's: the key is
+        // resolved by its own protocol, and a request the generated table does not answer
+        // declines here, leaving the router's routing-error path (which names the request
+        // itself, through the definition wrapper) unchanged. The wrapper declares the
+        // wrapped operation's own auth schemes, so this service's anonymous credential
+        // exchange stays anonymous.
+        if !self.entry.inner().routes(req) {
+            return None;
+        }
+        let operation = self.entry.protocol().routing_key(req).ok()?;
+        self.quoting_submitted_values.get(operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -192,10 +250,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service did not issue). A client branches on the code, and the two refusals
         // are different things.
         match refusal {
-            Refusal::Invalid(violations) => Some(Refused {
-                code: "ValidationException".to_string(),
-                message: validation_error_message(violations),
-            }),
+            // The clauses, the envelope and the code are the shared renderings, as they are
+            // for a refusal the per-operation wrapper words ([`validation`]); what cannot be
+            // stated here is the one half that needs the REQUEST — the collection a clause
+            // is about — because this seam is handed the violations alone.
+            Refusal::Invalid(_) => validation::stated_refusal(refusal),
             // Authentication is the emulator's to answer, not this service's.
             _ => None,
         }
@@ -227,44 +286,6 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
-    }
-}
-
-/// The message a constraint refusal carries: how many of the request's values failed,
-/// then one clause per failure — each naming the member, the value the request gave it
-/// and the requirement that value failed, so the caller can fix the request from the text
-/// alone.
-///
-/// The count prefix is part of what a caller reads, so it is stated here rather than left
-/// to the framework's per-violation clause, and the clauses are joined in the order the
-/// validating walk found them.
-fn validation_error_message(violations: &[Violation]) -> String {
-    let clauses: Vec<String> = violations.iter().map(validation_error_clause).collect();
-    let errors = if clauses.len() == 1 { "error" } else { "errors" };
-    format!(
-        "{} validation {errors} detected: {}",
-        clauses.len(),
-        clauses.join("; ")
-    )
-}
-
-/// One failure's clause. The framework writes the sentence; the only thing restated here
-/// is a `@pattern`, which a refusal quotes as the EXPRESSION a value must match rather
-/// than as the model's anchored literal — the anchors are what makes it a whole-value
-/// match, which "must satisfy regular expression pattern" already says.
-fn validation_error_clause(violation: &Violation) -> String {
-    let clause = violation.message();
-    match &violation.kind {
-        ViolationKind::Pattern(pattern) => {
-            let unanchored = pattern.trim_start_matches('^').trim_end_matches('$');
-            // Only the clause's trailing pattern is rewritten, so a value that happens to
-            // read like the pattern is still echoed exactly as the request sent it.
-            match clause.strip_suffix(pattern.as_str()) {
-                Some(head) => format!("{head}{unanchored}"),
-                None => clause,
-            }
-        }
-        _ => clause,
     }
 }
 

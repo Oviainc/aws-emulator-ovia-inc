@@ -63,6 +63,8 @@
 //! the HANDLER applies the key shape's own constraints. [`map_key_refusal`] is the message
 //! it states — the framework's envelope and clause, over the map member, listing what a key
 //! has to satisfy — so a request refused for its key reads like one refused for its value.
+//! [`map_key_refusal_quoting`] is the same message for a service whose recordings QUOTE the
+//! map that key was held in, and for a key shape that declares no `@pattern`.
 //!
 //! The last difference this module owns is WHERE a constraint broken by a collection's
 //! ELEMENTS is stated. The framework reports such a violation at the offending element —
@@ -148,6 +150,46 @@ fn collection_length_clause(violation: &Violation) -> Option<String> {
         .iter()
         .find_map(|suffix| collection_size(stored, suffix))?;
     valueless_clause(violation)
+}
+
+/// `violation` with the value half of its clause replaced by the COLLECTION the caller
+/// submitted, where the framework's walk stored its own summary of one.
+///
+/// The other direction from [`collection_length_clause`], for a service whose recordings
+/// QUOTE the collection rather than dropping the value half: the walk renders a list as
+/// `<n> items` and a map as `<n> entries`, neither of which any caller sent, while the echo
+/// ([`crate::validation::SubmittedEcho`], collected by the walk that owns every bound on
+/// what one clause may quote) is the collection itself.
+///
+/// ONLY that one clause is touched: a violation whose stored value is already the caller's
+/// own bytes keeps it, and a collection the walk could not render — one past the bounds that
+/// walk states, or one whose elements have no text rendering — keeps the summary rather than
+/// losing the clause altogether.
+///
+/// THE HOME for this restoring rule, beside the two readings of the summary it rests on:
+/// `services/service-com-amazonaws-eventbridge-awsevents/src/service.rs` carries its own
+/// inlined copy, written before this module had one, and is to be MIGRATED onto this entry
+/// point rather than copied again.
+#[must_use]
+pub fn quoting_the_submitted_collection(
+    violation: Violation,
+    echo: crate::validation::SubmittedEcho,
+) -> Violation {
+    let summarised = violation.value.as_deref().is_some_and(|stored| {
+        matches!(
+            violation.kind,
+            ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+        ) && COLLECTION_SIZE_SUFFIXES
+            .iter()
+            .any(|suffix| collection_size(stored, suffix).is_some())
+    });
+    match echo {
+        crate::validation::SubmittedEcho::Rendered(value) if summarised => Violation {
+            value: Some(value),
+            ..violation
+        },
+        _ => violation,
+    }
 }
 
 /// The clause `violation` states with its VALUE half dropped — `Value at '<member path>'
@@ -296,13 +338,43 @@ pub fn map_key_refusal(
     max_length: i64,
     pattern: &str,
 ) -> String {
-    let requirements = [
-        requirement(ViolationKind::MaxLength(max_length)),
-        requirement(ViolationKind::MinLength(min_length)),
-        requirement(ViolationKind::Pattern(pattern.to_string())),
-    ];
+    map_key_refusal_quoting(member_path, None, min_length, max_length, Some(pattern))
+}
+
+/// As [`map_key_refusal`], with the two halves of the clause a service's own recordings
+/// decide: the MAP the offending key was held in, quoted as the value the clause is about
+/// ([`crate::validation::rendered_map`] renders one), and the key shape's `@pattern` listed
+/// only where that shape declares one.
+///
+/// `value` is `None` for the service whose recordings show the valueless clause — a map has
+/// no scalar rendering, which is the same half [`collection_length_clause`] drops for a
+/// map's own `@length` — and `Some` for the one whose recordings quote the map. `pattern` is
+/// `None` for a key shape that declares none, so the bracketed list names what that shape
+/// actually requires and nothing more.
+#[must_use]
+pub fn map_key_refusal_quoting(
+    member_path: &str,
+    value: Option<&str>,
+    min_length: i64,
+    max_length: i64,
+    pattern: Option<&str>,
+) -> String {
+    let requirements: Vec<String> = [
+        Some(requirement(ViolationKind::MaxLength(max_length))),
+        Some(requirement(ViolationKind::MinLength(min_length))),
+        pattern.map(|pattern| requirement(ViolationKind::Pattern(pattern.to_string()))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    // The value half is the framework's own spelling of one, so a clause about a key reads
+    // like a clause about a member the walk reported.
+    let stated_value = match value {
+        Some(value) => format!("Value '{value}' at"),
+        None => "Value at".to_string(),
+    };
     let clause = format!(
-        "Value at '{member_path}' failed to satisfy constraint: Map keys must satisfy \
+        "{stated_value} '{member_path}' failed to satisfy constraint: Map keys must satisfy \
          constraint: {}",
         bracketed_findings(&requirements)
     );
@@ -593,6 +665,26 @@ pub fn aws_validation_refusal_over_elements(
     input_schemas: &[&'static Schema],
     quote_pattern: impl Fn(&str) -> String,
 ) -> Option<Refused> {
+    aws_validation_refusal_over_elements_quoting(refusal, input_schemas, quote_pattern, |_| None)
+}
+
+/// [`aws_validation_refusal_over_elements`], with the COLLECTION a grouped clause quotes
+/// decided by the caller.
+///
+/// The one half those recordings do not agree on: a service whose clause states the
+/// collection its elements belong to passes the value that member held, which no violation
+/// carries and which only the request can answer — `quoted_collection` is asked for it, by
+/// the member path the clause is stated at, and `None` keeps the valueless clause
+/// [`aws_validation_refusal_over_elements`] states. The collection is rendered the way AWS
+/// renders one (`crate::validation::submitted_lists`, which collects exactly that from the
+/// request under bounds of its own). Everything else is that function's: the same grouping,
+/// the same element sets read off the same schemas, the same envelope.
+pub fn aws_validation_refusal_over_elements_quoting(
+    refusal: &Refusal,
+    input_schemas: &[&'static Schema],
+    quote_pattern: impl Fn(&str) -> String,
+    quoted_collection: impl Fn(&str) -> Option<String>,
+) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
@@ -603,7 +695,14 @@ pub fn aws_validation_refusal_over_elements(
     let mut stated: HashSet<String> = HashSet::new();
     for violation in &restated_violations(violations, quote) {
         let clause = list_of_element(&violation.path)
-            .and_then(|collection| element_set_clause(collection, input_schemas, quote))
+            .and_then(|collection| {
+                element_set_clause(
+                    collection,
+                    input_schemas,
+                    quote,
+                    quoted_collection(collection).as_deref(),
+                )
+            })
             .or_else(|| collection_length_clause(violation))
             .unwrap_or_else(|| violation.message());
         // An identical clause is stated once: the member is named once however many of
@@ -636,10 +735,14 @@ fn requoted(violation: &Violation, quote_pattern: &dyn Fn(&str) -> String) -> Vi
 
 /// The clause stated at `collection` for a constraint its elements broke, or `None` when
 /// the handed-over schemas declare no single element constraint set for that member.
+///
+/// `quoted` is the collection as the clause quotes it, and `None` states no value at all —
+/// see [`aws_validation_refusal_over_elements_quoting`].
 fn element_set_clause(
     collection: &str,
     input_schemas: &[&'static Schema],
     quote_pattern: &dyn Fn(&str) -> String,
+    quoted: Option<&str>,
 ) -> Option<String> {
     let mut declared = input_schemas
         .iter()
@@ -648,8 +751,14 @@ fn element_set_clause(
     if declared.any(|other| other != set) {
         return None;
     }
+    // The value half is the framework's own spelling of one, so a grouped clause reads like
+    // a clause about a member the walk reported.
+    let stated_value = match quoted {
+        Some(value) => format!("Value '{value}' at"),
+        None => "Value at".to_string(),
+    };
     Some(format!(
-        "Value at '{collection}' failed to satisfy constraint: {ELEMENT_SET_OPEN}{}]",
+        "{stated_value} '{collection}' failed to satisfy constraint: {ELEMENT_SET_OPEN}{}]",
         set.join(", ")
     ))
 }
@@ -755,8 +864,9 @@ mod tests {
     use super::{
         aws_validation_refusal, aws_validation_refusal_over_elements, aws_validation_refusal_with,
         aws_validation_refusal_withholding, aws_validation_refusal_withholding_with,
-        enum_value_not_found, envelope_over, map_key_refusal,
-        pattern_mismatch, property_count_refusal, string_too_long, string_too_short,
+        enum_value_not_found, envelope_over, map_key_refusal, map_key_refusal_quoting,
+        pattern_mismatch, property_count_refusal, quoting_the_submitted_collection,
+        string_too_long, string_too_short,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -773,6 +883,74 @@ mod tests {
             path: path.to_owned(),
             kind,
             value: Some(value.to_owned()),
+        }
+    }
+
+    /// RULE: the value half of a clause about a COLLECTION is replaced by the collection
+    /// the caller submitted, and only there: a clause whose stored value is already the
+    /// caller's own bytes, and a collection the walk could not render, keep what they had.
+    ///
+    /// The rows span both collection summaries the walk writes, both `@length` bounds, a
+    /// value that is not a summary at all, a violation of another class, and an echo the
+    /// walk could not produce.
+    #[test]
+    fn a_clause_about_a_collection_quotes_the_collection_that_was_submitted() {
+        use crate::validation::SubmittedEcho;
+
+        // (case, the violation's kind, its stored value, the echo, the value stated)
+        let rows: [(&str, ViolationKind, &str, SubmittedEcho, &str); 6] = [
+            (
+                "a list over its maximum",
+                ViolationKind::MaxLength(1),
+                "2 items",
+                SubmittedEcho::Rendered("[a, b]".to_string()),
+                "[a, b]",
+            ),
+            (
+                "an empty list under its minimum",
+                ViolationKind::MinLength(1),
+                "0 items",
+                SubmittedEcho::Rendered("[]".to_string()),
+                "[]",
+            ),
+            (
+                "a map over its maximum",
+                ViolationKind::MaxLength(1),
+                "2 entries",
+                SubmittedEcho::Rendered("{a=1, b=2}".to_string()),
+                "{a=1, b=2}",
+            ),
+            (
+                "a value that is the caller's own bytes",
+                ViolationKind::MaxLength(1),
+                "a-name",
+                SubmittedEcho::Rendered("a-name".to_string()),
+                "a-name",
+            ),
+            (
+                "a violation of another class",
+                ViolationKind::Pattern("[a-z]+".to_string()),
+                "2 items",
+                SubmittedEcho::Rendered("[a, b]".to_string()),
+                "2 items",
+            ),
+            (
+                "a collection the walk could not render",
+                ViolationKind::MaxLength(1),
+                "2 items",
+                SubmittedEcho::Unrendered,
+                "2 items",
+            ),
+        ];
+
+        for (case, kind, stored, echo, expected) in rows {
+            let stated = quoting_the_submitted_collection(violation("tags", kind, stored), echo);
+            assert_eq!(
+                stated.value.as_deref(),
+                Some(expected),
+                "case {case:?}: expected {expected:?}, got {:?}",
+                stated.value
+            );
         }
     }
 
@@ -815,6 +993,84 @@ mod tests {
             assert_eq!(
                 stated, expected,
                 "case {case:?}: expected {expected:?}, got {stated:?}"
+            );
+        }
+    }
+
+    /// RULE: the same refusal QUOTES the map the key was held in for the service whose
+    /// recordings show that half, and lists the `@pattern` only where the key shape
+    /// declares one — everything else (the envelope, the member path, the requirement
+    /// sentences) is the same rendering.
+    ///
+    /// The rows differ along whether the map is quoted, how many entries it holds and
+    /// whether the key shape carries a pattern, so neither half is baked into the other.
+    #[test]
+    fn a_quoted_map_key_refusal_states_the_map_it_refused() {
+        /// One row: the member path, the map as quoted (`None` for the valueless clause),
+        /// the key shape's `@length` bounds and its `@pattern`, and the message stated.
+        struct Row {
+            case: &'static str,
+            member_path: &'static str,
+            value: Option<&'static str>,
+            min: i64,
+            max: i64,
+            pattern: Option<&'static str>,
+            expected: &'static str,
+        }
+
+        let rows = [
+            Row {
+                case: "a key shape with a pattern, quoting the map",
+                member_path: "roles",
+                value: Some("{nonsense=arn:aws:iam::000000000000:role/R}"),
+                min: 1,
+                max: 128,
+                pattern: Some("(un)?authenticated"),
+                expected: "1 validation error detected: Value \
+                           '{nonsense=arn:aws:iam::000000000000:role/R}' at 'roles' failed to \
+                           satisfy constraint: Map keys must satisfy constraint: [Member must \
+                           have length less than or equal to 128, Member must have length \
+                           greater than or equal to 1, Member must satisfy regular expression \
+                           pattern: (un)?authenticated]",
+            },
+            Row {
+                case: "a key shape with no pattern, quoting a two-entry map",
+                member_path: "principalTags",
+                value: Some("{a=sub, b=aud}"),
+                min: 1,
+                max: 128,
+                pattern: None,
+                expected: "1 validation error detected: Value '{a=sub, b=aud}' at \
+                           'principalTags' failed to satisfy constraint: Map keys must satisfy \
+                           constraint: [Member must have length less than or equal to 128, \
+                           Member must have length greater than or equal to 1]",
+            },
+            Row {
+                case: "no map quoted at all",
+                member_path: "principalTags",
+                value: None,
+                min: 1,
+                max: 128,
+                pattern: None,
+                expected: "1 validation error detected: Value at 'principalTags' failed to \
+                           satisfy constraint: Map keys must satisfy constraint: [Member must \
+                           have length less than or equal to 128, Member must have length \
+                           greater than or equal to 1]",
+            },
+        ];
+
+        for row in rows {
+            let stated = map_key_refusal_quoting(
+                row.member_path,
+                row.value,
+                row.min,
+                row.max,
+                row.pattern,
+            );
+            assert_eq!(
+                stated, row.expected,
+                "case {:?}: expected {:?}, got {stated:?}",
+                row.case, row.expected
             );
         }
     }

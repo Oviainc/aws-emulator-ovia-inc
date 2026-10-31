@@ -312,35 +312,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // own `DeveloperProviderName`, and its value is the developer user identifier.
         // `Logins` is a MAP, so one request cannot carry two entries for one developer
         // provider: "You can only specify one developer provider as part of the Logins
-        // map" holds by construction. A pool that names no developer provider, or a
-        // `Logins` naming none, is a bad input parameter rather than a missing resource.
+        // map" holds by construction. A pool that names no developer provider, and a
+        // `Logins` naming none of the pool's own, are the SAME refusal to a caller — the
+        // developer provider this call is about is not one this pool supports — so both
+        // answer the one fixed sentence every operation of this service that resolves a
+        // developer provider answers ([`crate::state::UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE`]),
+        // which names neither the provider the request carried nor the pool's own.
         let Some(developer_provider) = pool.developer_provider_name.clone() else {
-            return Err(
-                GetOpenIdTokenForDeveloperIdentityErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(format!(
-                            "Invalid value for parameter Logins: identity pool '{}' has no \
-                             DeveloperProviderName, so no login can name a developer provider.",
-                            input.identity_pool_id
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(unsupported_developer_provider());
         };
         let Some(developer_user_identifier) = input.logins.get(&developer_provider).cloned() else {
-            return Err(
-                GetOpenIdTokenForDeveloperIdentityErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(format!(
-                            "Invalid value for parameter Logins: it must carry an entry for the \
-                             developer provider '{developer_provider}' of identity pool '{}'.",
-                            input.identity_pool_id
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(unsupported_developer_provider());
         };
 
         // Every login the call presents — the developer one and any public provider beside
@@ -597,4 +579,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             token: Some(token),
         })
     }
+}
+
+/// The modelled refusal of a request whose developer provider is not the one its identity
+/// pool is configured with (HTTP 400): a bad input parameter, which is what the caller has
+/// to fix, carrying the one fixed sentence this service states for it.
+fn unsupported_developer_provider() -> GetOpenIdTokenForDeveloperIdentityError {
+    GetOpenIdTokenForDeveloperIdentityErrorModeled::InvalidParameterException(
+        InvalidParameterException {
+            message: Some(crate::state::UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE.to_string()),
+        },
+    )
+    .into()
 }

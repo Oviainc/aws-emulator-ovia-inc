@@ -23,13 +23,14 @@
 //! body: an SDK resolving the error shape, a proxy or a log pipeline routing on headers.
 //!
 //! This module completes that envelope at the two layers every response of this service
-//! passes through, each wrapping the shared request-id reporter of
+//! passes through, beside the shared request-id reporter of
 //! `service_common::query_error_envelope` so one response names both the request it
 //! answers and the exception it answers with:
 //!
-//! * [`ErrorTypeHeaderOperation`], the wrapper `Service::override_operation` hands the
-//!   router, covers everything an operation answers — a success (untouched), a modelled
-//!   error, and a constraint refusal raised while that operation was being served;
+//! * [`with_error_type_header`], which the per-operation wrapper
+//!   `Service::override_operation` hands the router applies, covers everything an operation
+//!   answers — a success (untouched), a modelled error, and a constraint refusal raised for
+//!   that operation's request;
 //! * [`ErrorTypeHeaderDefinition`], the wrapper `Service::definition` hands back, covers a
 //!   response NO operation produced: a routing failure, a transport failure detected up
 //!   front, and a pre-dispatch authentication refusal.
@@ -42,8 +43,7 @@
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use serde_json::Value;
 use smithy_server_runtime::{
-    BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, OperationRoutingTable,
-    ServerHttpProtocol, Service, ServiceIdentity,
+    ErasedServiceDefinition, OperationRoutingTable, ServerHttpProtocol, ServiceIdentity,
 };
 
 /// The header a response names its exception shape in.
@@ -123,41 +123,6 @@ pub fn with_error_type_header(mut resp: RtResponse) -> RtResponse {
         .headers_mut()
         .try_insert(ERROR_TYPE_HEADER, error_type_value(&shape));
     resp
-}
-
-/// Serves a request through the wrapped operation, then names the exception shape in the
-/// response's header.
-///
-/// It stores no operation of its own and makes no routing decision: the inner wrapper is
-/// the shared request-id reporter, which serves the operation this service's own routing
-/// table names for the request. So the framework still owns the whole
-/// deserialize → validate → handle → serialize sequence and every status, shape and
-/// message it answers with; this wrapper owns one header.
-pub struct ErrorTypeHeaderOperation<Inner>(Inner);
-
-impl<Inner> ErrorTypeHeaderOperation<Inner> {
-    /// Wrap `inner`, adding the exception's name to every failure it answers.
-    pub fn new(inner: Inner) -> Self {
-        Self(inner)
-    }
-}
-
-impl<Inner: ErasedOperation> ErasedOperation for ErrorTypeHeaderOperation<Inner> {
-    fn run<'r>(
-        &'r self,
-        svc: &'r dyn Service,
-        req: &'r RtRequest,
-        ctx: &'r OperationContext<'r>,
-    ) -> BoxFuture<'r, RtResponse> {
-        Box::pin(async move { with_error_type_header(self.0.run(svc, req, ctx).await) })
-    }
-
-    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
-        // Whatever the wrapped operation declares — which is itself "defer to the modelled
-        // operation the routing key names", so wrapping cannot weaken a model-declared
-        // scheme and this service's anonymous credential exchange stays anonymous.
-        self.0.auth_schemes()
-    }
 }
 
 /// A service's definition with its framework-level error renderers wrapped, so a response
