@@ -68,6 +68,11 @@ pub const ACTION_GET_TEMPLATE: &str = "indices:admin/index_template/get";
 /// master user holds, which is why the security API is reachable by nobody else.
 pub const ACTION_SECURITY_CONFIG: &str = "cluster:admin/security/config/update";
 
+/// The role the cluster grants every permission, from the security plugin's predefined
+/// roles: `all_access`. It is the role the control plane binds a domain's MASTER USER to,
+/// which is why the master is reported holding it.
+pub const ALL_ACCESS_ROLE: &str = "all_access";
+
 /// One role of a domain's security configuration, as its security API holds it.
 ///
 /// The definition is kept VERBATIM as the document that was written, because the API
@@ -202,19 +207,34 @@ pub fn security_api_refusal(domain: &Domain, principal_arn: &str) -> Option<Stri
 /// with. Every value comes from the request.
 #[must_use]
 pub fn no_permissions(principal_arn: &str, action: &str) -> String {
-    // The subject's own name is the first identity; the rest are what the authentication
-    // backend asserted for it, which is what `backend_roles` carries.
-    let identities = identities(principal_arn);
-    let backend_roles = identities
-        .iter()
-        .skip(1)
-        .cloned()
-        .collect::<Vec<String>>()
-        .join(", ");
     format!(
-        "no permissions for [{action}] and User [name={principal_arn}, \
-         backend_roles=[{backend_roles}], requestedTenant=null]"
+        "no permissions for [{action}] and {}",
+        user_description(principal_arn)
     )
+}
+
+/// How the security plugin DESCRIBES the user a request speaks for: its own name, the
+/// backend roles it arrived with and the tenant it asked for.
+///
+/// One wording, because two answers carry it: the `security_exception` a refusal states
+/// ([`no_permissions`]) and the `user` the plugin's own `authinfo` reports
+/// ([`crate::service::domain_rest`]) — so what a caller is told it is cannot differ
+/// between the two.
+#[must_use]
+pub fn user_description(principal_arn: &str) -> String {
+    format!(
+        "User [name={principal_arn}, backend_roles=[{}], requestedTenant=null]",
+        backend_roles(principal_arn).join(", ")
+    )
+}
+
+/// The backend roles a request signed as `principal_arn` arrives with: the identities the
+/// authentication backend asserts for it BESIDE its own name ([`identities`]), which for
+/// an AWS principal is the IAM role a session speaks for — the identity a role mapping is
+/// written with.
+#[must_use]
+pub fn backend_roles(principal_arn: &str) -> Vec<String> {
+    identities(principal_arn).into_iter().skip(1).collect()
 }
 
 #[cfg(test)]
@@ -273,6 +293,39 @@ mod tests {
             assert!(
                 message.contains(part),
                 "case {part:?}: expected the refusal to carry it, got {message:?}"
+            );
+        }
+    }
+
+    /// RULE: the user the plugin describes carries the same name and backend roles a
+    /// refusal names, so `authinfo` and a `security_exception` cannot disagree about who
+    /// the caller is.
+    #[test]
+    fn the_user_description_is_the_one_a_refusal_names() {
+        // (the case, the principal, the backend roles it arrives with)
+        let rows: &[(&str, &str, &[&str])] = &[
+            (
+                "an assumed-role session",
+                "arn:aws:sts::000000000000:assumed-role/search-reader/session-1",
+                &["arn:aws:iam::000000000000:role/search-reader"],
+            ),
+            (
+                "an IAM role",
+                "arn:aws:iam::000000000000:role/search-reader",
+                &[],
+            ),
+        ];
+        for (case, principal, expected) in rows {
+            let described = user_description(principal);
+            assert!(
+                no_permissions(principal, ACTION_SEARCH).contains(&described),
+                "case {case:?}: expected the refusal to carry the description \
+                 {described:?}"
+            );
+            let answered = backend_roles(principal);
+            assert_eq!(
+                answered, *expected,
+                "case {case:?}: expected the backend roles {expected:?}, got {answered:?}"
             );
         }
     }

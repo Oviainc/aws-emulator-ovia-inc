@@ -39,6 +39,17 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two of those seams are taken for a second reason: a DOMAIN this service creates
+//! publishes the endpoint "used to submit index, search, and data upload requests"
+//! (`DomainStatus$Endpoint`), and that host is not this API's endpoint — so the front
+//! door could resolve no target service for a request addressed to it and answered
+//! `404 UnknownService`, for the one address this service told the caller to use.
+//! [`can_handle`](Service::can_handle) also claims a request addressed to a domain this
+//! service HOLDS, and [`domain_rest`] is what resolves and serves it: as an OPERATION
+//! for a request presenting a SigV4 credential, so the emulator verifies the signature
+//! and the handler can resolve which principal signed, and from
+//! [`override_routing_error`](Service::override_routing_error) for one presenting none.
 
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,

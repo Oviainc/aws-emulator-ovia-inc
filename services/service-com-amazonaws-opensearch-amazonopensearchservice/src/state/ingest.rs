@@ -279,12 +279,11 @@ fn provisioned_domain<'s>(
 
 /// Whether the principal the producer writes as may write this document.
 ///
-/// IAM's own order, through the one shared evaluator: an explicit `Deny` on either side
-/// refuses, otherwise an `Allow` from the domain's access policy or from the principal's
-/// identity policies grants it. With neither stating anything, the request is granted only
-/// where this emulator holds NO evidence at all — no access policy on the domain and no
-/// identity policy for the principal — because refusing on absent evidence would deny a
-/// write AWS permits.
+/// The decision is [`iam_decision`], the ONE reading of what IAM allows a data-plane
+/// request of this service — a producer's write here and a signed request to the domain's
+/// own REST surface alike — so the two cannot answer differently. A write nothing allows
+/// is refused the way the engine refuses an unauthorized request, with a
+/// `security_exception`.
 fn authorize(
     write: &DocumentWrite<'_>,
     domain_arn: &str,

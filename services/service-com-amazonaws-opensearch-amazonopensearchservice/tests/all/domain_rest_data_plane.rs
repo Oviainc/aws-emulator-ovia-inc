@@ -68,6 +68,16 @@ fn master_user_arn() -> String {
     ::service_common::caller_principal::ambient_user_arn()
 }
 
+/// The ARN of the SESSION that credential speaks for — the principal
+/// `sts:GetCallerIdentity` reports for it, which is the name the cluster knows the caller
+/// by.
+fn delivery_session_arn() -> String {
+    format!(
+        "arn:aws:sts::{}:assumed-role/{DELIVERY_ROLE}/{SESSION}",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// Record the assumed-role session [`SESSION_KEY_ID`] speaks for, as `sts:AssumeRole`
 /// records one.
 fn given_session(emulator: &Emulator) {
@@ -85,7 +95,7 @@ fn given_session(emulator: &Emulator) {
             identity: sts::Identity {
                 user_id: sts::role_id(&role_arn),
                 account: account.to_string(),
-                arn: format!("arn:aws:sts::{account}:assumed-role/{DELIVERY_ROLE}/{SESSION}"),
+                arn: delivery_session_arn(),
             },
             kind: sts::SessionKind::AssumedRole,
             source_identity: None,
@@ -1153,5 +1163,176 @@ async fn fine_grained_access_control_decides_every_request_to_the_domain() {
         open.status, 200,
         "case \"a domain without the boundary\": expected it to serve, got {} with {:?}",
         open.status, open.body
+    );
+}
+
+/// RULE: the security plugin answers `authinfo` for the AUTHENTICATED user whatever
+/// permissions that user holds — it is the route a client checks its own identity with
+/// before it asks for anything — and what it reports is read from the request's principal
+/// and the domain's own security configuration: the user, the backend roles its
+/// credential speaks for, and the roles the mappings bind it to.
+///
+/// The rows span who can ask: the master user, a principal no mapping binds — which is
+/// refused every other route while this one answers it — and that same principal once a
+/// mapping binds it.
+#[tokio::test]
+async fn the_security_plugin_tells_every_authenticated_caller_who_it_is() {
+    let emulator = Emulator::new();
+    let created = emulator
+        .create(json!({
+            "DomainName": "who-am-i",
+            "AdvancedSecurityOptions": {
+                "Enabled": true,
+                "InternalUserDatabaseEnabled": false,
+                "MasterUserOptions": { "MasterUserARN": master_user_arn() }
+            }
+        }))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case \"CreateDomain with fine-grained access control\": got {} with {:?}",
+        created.status, created.body
+    );
+    let host = endpoint_of(&emulator, "who-am-i");
+    given_session(&emulator);
+    given_data_plane_policy(&emulator);
+
+    /// The route under test.
+    const AUTHINFO: &str = "/_plugins/_security/authinfo";
+
+    // The principal no mapping binds is refused every route the boundary covers — and
+    // answered this one, which is what lets a client confirm its credential works at all
+    // before it is told what it may do with it.
+    let refused = rest(
+        &emulator,
+        SESSION_KEY_ID,
+        &host,
+        "POST",
+        "/catalog/_search",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        (refused.status, error_type(&refused)),
+        (403, "security_exception".to_string()),
+        "case \"an unmapped principal searching\": got {} with {:?}",
+        refused.status,
+        refused.body
+    );
+
+    // What the plugin tells each caller it is.
+    struct Told {
+        case: &'static str,
+        key: &'static str,
+        user: String,
+        backend_roles: Vec<String>,
+        roles: Vec<String>,
+    }
+    let rows: Vec<Told> = vec![
+        Told {
+            case: "the master user",
+            key: DEFAULT_ACCESS_KEY_ID,
+            user: master_user_arn(),
+            // A long-term IAM credential speaks for the user itself, so it presents no
+            // backend role beside its own name.
+            backend_roles: Vec::new(),
+            roles: vec!["all_access".to_string()],
+        },
+        Told {
+            case: "a principal no mapping binds",
+            key: SESSION_KEY_ID,
+            user: delivery_session_arn(),
+            // An assumed-role session presents the ROLE it is a session of, which is the
+            // identity a role mapping names.
+            backend_roles: vec![delivery_role_arn()],
+            roles: Vec::new(),
+        },
+    ];
+    for Told {
+        case,
+        key,
+        user,
+        backend_roles,
+        roles,
+    } in &rows
+    {
+        let answered = rest(&emulator, key, &host, "GET", AUTHINFO, None).await;
+        assert_eq!(
+            answered.status, 200,
+            "case {case:?}: expected the plugin to answer who the caller is, got {} with \
+             {:?}",
+            answered.status, answered.body
+        );
+        assert_eq!(
+            answered.body["user_name"].as_str(),
+            Some(user.as_str()),
+            "case {case:?}: expected the user {user:?}, got {:?}",
+            answered.body
+        );
+        assert_eq!(
+            answered.body["user"].as_str(),
+            Some(
+                format!(
+                    "User [name={user}, backend_roles=[{}], requestedTenant=null]",
+                    backend_roles.join(", ")
+                )
+                .as_str()
+            ),
+            "case {case:?}: expected the user description the cluster states, got {:?}",
+            answered.body
+        );
+        assert_eq!(
+            answered.body["backend_roles"],
+            json!(backend_roles),
+            "case {case:?}: expected the backend roles {backend_roles:?}, got {:?}",
+            answered.body
+        );
+        assert_eq!(
+            answered.body["roles"],
+            json!(roles),
+            "case {case:?}: expected the roles {roles:?}, got {:?}",
+            answered.body
+        );
+    }
+
+    // Binding the role to a security role is what `roles` reports next: what the plugin
+    // tells a caller it holds is the mappings as they stand.
+    let mapped = rest(
+        &emulator,
+        DEFAULT_ACCESS_KEY_ID,
+        &host,
+        "PUT",
+        "/_plugins/_security/api/rolesmapping/readall",
+        Some(json!({ "backend_roles": [delivery_role_arn()] })),
+    )
+    .await;
+    assert_eq!(
+        mapped.status, 201,
+        "case \"the master user binding the role\": got {} with {:?}",
+        mapped.status, mapped.body
+    );
+    let bound = rest(&emulator, SESSION_KEY_ID, &host, "GET", AUTHINFO, None).await;
+    assert_eq!(
+        (bound.status, bound.body["roles"].clone()),
+        (200, json!(["readall"])),
+        "case \"a principal a mapping binds\": expected the role it was bound to, got {:?}",
+        bound.body
+    );
+    assert_eq!(
+        bound.body["backend_roles"],
+        json!([delivery_role_arn()]),
+        "case \"a principal a mapping binds\": expected its backend role unchanged, got \
+         {:?}",
+        bound.body
+    );
+
+    // The route takes a GET and nothing else, and on a domain the boundary is not
+    // switched on for there is no security plugin to ask at all.
+    let written = rest(&emulator, DEFAULT_ACCESS_KEY_ID, &host, "PUT", AUTHINFO, None).await;
+    assert_eq!(
+        written.status, 405,
+        "case \"a method the route does not take\": expected the engine's refusal, got {} \
+         with {:?}",
+        written.status, written.body
     );
 }

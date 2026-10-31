@@ -494,6 +494,14 @@ fn serve_resolved(domain: &mut Domain, request: &Request<'_>, now: SystemTime) -
         },
         ["_index_template", name] => template_request(domain, request, name, false),
         ["_template", name] => template_request(domain, request, name, true),
+        // The security plugin's own "who am I". It is NOT guarded: the plugin answers it
+        // for the authenticated user whatever roles that user holds, which is what makes
+        // it the route a client checks its own identity and permissions with before it
+        // asks for anything. The IAM decision above still applies to it.
+        ["_plugins", "_security", "authinfo"] => match request.method {
+            "GET" => ok(&auth_info(domain, request)),
+            _ => wrong_method(request, "GET"),
+        },
         ["_plugins", "_security", "api", "roles", name] => security_role(domain, request, name),
         ["_plugins", "_security", "api", "rolesmapping", name] => {
             security_role_mapping(domain, request, name)
@@ -555,6 +563,40 @@ fn guarded(
         return error(403, ingest::SECURITY_EXCEPTION, &reason);
     }
     answer(domain)
+}
+
+/// `GET /_plugins/_security/authinfo` — who the caller is, as the security plugin knows
+/// it.
+///
+/// The one route of the plugin that is answered for the authenticated user whatever
+/// permissions it holds, which is what a client checks its own identity with: it names
+/// the user, the BACKEND ROLES that user arrived with — for an AWS principal, the IAM
+/// identities its credential speaks for, which is what a role mapping names it by
+/// ([`fgac::backend_roles`]) — and the security roles this domain's mappings bind it to.
+///
+/// Every value is read from the request's principal and the domain's own security
+/// configuration.
+fn auth_info(domain: &Domain, request: &Request<'_>) -> Value {
+    let mut roles = fgac::mapped_roles(domain, request.principal);
+    // The master user holds the all-permitting role: that is the mapping the control
+    // plane itself makes when `MasterUserOptions` names a principal.
+    if fgac::is_master(domain, request.principal) && !roles.iter().any(|role| role == fgac::ALL_ACCESS_ROLE) {
+        roles.insert(0, fgac::ALL_ACCESS_ROLE.to_string());
+    }
+    // "user_requested_tenant" is the tenant this request asked for, and it asked for
+    // none; the tenant a user always has is its own.
+    let mut tenants = ::serde_json::Map::new();
+    tenants.insert(request.principal.to_string(), Value::Bool(true));
+    json!({
+        "user": fgac::user_description(request.principal),
+        "user_name": request.principal,
+        "user_requested_tenant": Value::Null,
+        "backend_roles": fgac::backend_roles(request.principal),
+        "custom_attribute_names": Vec::<String>::new(),
+        "roles": roles,
+        "tenants": Value::Object(tenants),
+        "principal": Value::Null,
+    })
 }
 
 /// The cluster banner a `GET /` answers: what this cluster IS, from the domain's own
