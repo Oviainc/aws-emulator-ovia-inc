@@ -208,6 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // ONE reading of the clock for this request: whether the administrative
+        // scope governing the policy is in force at this instant is what decides
+        // the refusal below.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A policy the administrative scope governing it does not cover is
         // view-only, so the removal is refused on the SAME shared rule the edit
@@ -217,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) = store
             .policies
             .get(&input.policy_id)
-            .and_then(|existing| store.policy_mutation_refusal(existing))
+            .and_then(|existing| store.policy_mutation_refusal(existing, now))
         {
             return Err(DeletePolicyErrorModeled::InvalidOperationException(refusal).into());
         }

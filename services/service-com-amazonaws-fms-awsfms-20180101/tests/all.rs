@@ -197,6 +197,12 @@ mod collection_scoped_page_tokens;
 #[path = "all/notification_channel_arn_form.rs"]
 mod notification_channel_arn_form;
 
+// Declared here too, outside the sorted list below, for the reason stated above:
+// inserting a `mod` into that list collides with every other fms suite landing
+// in the same window. The suite itself is an ordinary `tests/all/<name>.rs` file.
+#[path = "all/admin_scope_in_force_after_onboarding.rs"]
+mod admin_scope_in_force_after_onboarding;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

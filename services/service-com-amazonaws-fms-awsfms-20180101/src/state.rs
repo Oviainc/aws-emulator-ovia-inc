@@ -1915,6 +1915,42 @@ impl ComAmazonawsFmsAwsfms20180101State {
         self.policy_scope_accounts(policy, now).contains(account)
     }
 
+    /// The `AdminScope` that narrows what the CALLING account may manage AT
+    /// `now`, or `None` when nothing narrows it then.
+    ///
+    /// An account `PutAdminAccount` onboarded carries an `AdminScope` — "the
+    /// resources that the specified Firewall Manager administrator can manage"
+    /// — but holding the record is not the same as the scope being IN FORCE:
+    /// only an administrator whose `OrganizationStatus` is
+    /// [`ORGANIZATION_STATUS_ONBOARDING_COMPLETE`] "can perform actions on the
+    /// resources defined in their AdminScope" (`AdminAccountSummary$Status`),
+    /// so a record that is still [`ORGANIZATION_STATUS_ONBOARDING`], or on its
+    /// way out ([`OrganizationAdminRecord::is_leaving_at`]), governs nothing
+    /// yet or nothing any more. Answering `None` then leaves the caller
+    /// administering the organization as its default administrator, whose
+    /// scope "allows administration of all policy types, accounts,
+    /// organizational units, and Regions" ([`default_admin_scope`]) and which
+    /// nothing can narrow.
+    ///
+    /// The ONE place that question is answered, so every reader that derives a
+    /// status or a refusal from an administrative scope
+    /// ([`Self::policy_status`], [`Self::resource_set_status`]) applies the
+    /// same in-force rule [`Self::managing_admin_accounts`] applies to the very
+    /// same record, and no two readers of one administrator can disagree about
+    /// whether its scope counts.
+    ///
+    /// It takes `now` for the reason [`OrganizationAdminRecord::status_at`]
+    /// does: the status is CLOCK-derived, so one request decides from ONE
+    /// reading of a clock that is not monotonic. It settles nothing — the
+    /// status it answers from is derived either way, and a reporting read must
+    /// leave the store exactly as it was.
+    pub fn governing_admin_scope(&self, now: SystemTime) -> Option<&AdminScope> {
+        self.organization_admins
+            .get(::engine::emulator_account_id())
+            .filter(|admin| admin.status_at(now) == ORGANIZATION_STATUS_ONBOARDING_COMPLETE)
+            .map(|admin| &admin.admin_scope)
+    }
+
     /// The `CustomerPolicyStatus` of one stored policy: SERVICE-DERIVED, from
     /// the administrative scope that governs the policy rather than from
     /// anything a caller sent.
@@ -1926,12 +1962,11 @@ impl ComAmazonawsFmsAwsfms20180101State {
     /// [`POLICY_STATUS_OUT_OF_ADMIN_SCOPE`] otherwise, where "the administrator
     /// can view the policy, but they can't edit or delete" it.
     ///
-    /// The governing scope is the CALLING account's own `AdminScope` when
-    /// `PutAdminAccount` configured one for it ("the resources that the
-    /// specified Firewall Manager administrator can manage"). With none, the
-    /// caller administers the organization as its default administrator, which
-    /// "has full administrative scope that allows administration of all policy
-    /// types, accounts, organizational units, and Regions"
+    /// The governing scope is the CALLING account's own `AdminScope` while that
+    /// scope is IN FORCE ([`Self::governing_admin_scope`]). With none in force,
+    /// the caller administers the organization as its default administrator,
+    /// which "has full administrative scope that allows administration of all
+    /// policy types, accounts, organizational units, and Regions"
     /// ([`default_admin_scope`]) — nothing can narrow it, so every policy is in
     /// it. `PutAdminAccount` refuses to configure a scope for the default
     /// administrator's account, so the two cases cannot overlap.
@@ -1939,13 +1974,18 @@ impl ComAmazonawsFmsAwsfms20180101State {
     /// Derived on every read, so narrowing an administrator's scope moves the
     /// policies it no longer covers out of scope and widening it moves them
     /// back, and no two readers of one policy can report different statuses.
-    pub fn policy_status(&self, record: &PolicyRecord) -> &'static str {
-        let Some(admin) = self.organization_admins.get(::engine::emulator_account_id()) else {
+    ///
+    /// It takes `now` because the scope in force is clock-derived: one request
+    /// decides from ONE reading of a clock that is not monotonic, so the status
+    /// a handler reports and the refusal it builds from that status cannot
+    /// straddle the instant the administrator's onboarding completes.
+    pub fn policy_status(&self, record: &PolicyRecord, now: SystemTime) -> &'static str {
+        let Some(scope) = self.governing_admin_scope(now) else {
             return POLICY_STATUS_ACTIVE;
         };
         let security_service_type = record.policy.security_service_policy_data.r#type.as_str();
-        if admin_scope_manages_policy_type(&admin.admin_scope, security_service_type)
-            && admin_scope_manages_region(&admin.admin_scope, &record.region)
+        if admin_scope_manages_policy_type(scope, security_service_type)
+            && admin_scope_manages_region(scope, &record.region)
         {
             POLICY_STATUS_ACTIVE
         } else {
@@ -1970,20 +2010,23 @@ impl ComAmazonawsFmsAwsfms20180101State {
     /// member's own documentation names only "an admin's Region scope".
     ///
     /// The governing scope is resolved exactly as a policy's is: the CALLING
-    /// account's own `AdminScope` when `PutAdminAccount` configured one for it,
-    /// and otherwise the full scope of the organization's default administrator
-    /// ([`default_admin_scope`]), which nothing can narrow — so every resource
-    /// set is in it.
+    /// account's own `AdminScope` while it is in force
+    /// ([`Self::governing_admin_scope`]), and otherwise the full scope of the
+    /// organization's default administrator ([`default_admin_scope`]), which
+    /// nothing can narrow — so every resource set is in it.
     ///
     /// Derived on every read, so narrowing an administrator's scope moves the
     /// resource sets it no longer covers out of scope and widening it moves them
     /// back, and no two readers of one resource set can report different
     /// statuses.
-    pub fn resource_set_status(&self, record: &ResourceSetRecord) -> &'static str {
-        let Some(admin) = self.organization_admins.get(::engine::emulator_account_id()) else {
+    ///
+    /// It takes `now` for the reason [`Self::policy_status`] does: the scope in
+    /// force is clock-derived.
+    pub fn resource_set_status(&self, record: &ResourceSetRecord, now: SystemTime) -> &'static str {
+        let Some(scope) = self.governing_admin_scope(now) else {
             return RESOURCE_SET_STATUS_ACTIVE;
         };
-        if admin_scope_manages_region(&admin.admin_scope, &record.region) {
+        if admin_scope_manages_region(scope, &record.region) {
             RESOURCE_SET_STATUS_ACTIVE
         } else {
             RESOURCE_SET_STATUS_OUT_OF_ADMIN_SCOPE
@@ -2018,8 +2061,9 @@ impl ComAmazonawsFmsAwsfms20180101State {
     pub fn policy_mutation_refusal(
         &self,
         record: &PolicyRecord,
+        now: SystemTime,
     ) -> Option<InvalidOperationException> {
-        if self.policy_status(record) != POLICY_STATUS_OUT_OF_ADMIN_SCOPE {
+        if self.policy_status(record, now) != POLICY_STATUS_OUT_OF_ADMIN_SCOPE {
             return None;
         }
         Some(out_of_admin_scope_refusal(
@@ -2056,8 +2100,9 @@ impl ComAmazonawsFmsAwsfms20180101State {
     pub fn resource_set_mutation_refusal(
         &self,
         record: &ResourceSetRecord,
+        now: SystemTime,
     ) -> Option<InvalidOperationException> {
-        if self.resource_set_status(record) != RESOURCE_SET_STATUS_OUT_OF_ADMIN_SCOPE {
+        if self.resource_set_status(record, now) != RESOURCE_SET_STATUS_OUT_OF_ADMIN_SCOPE {
             return None;
         }
         Some(out_of_admin_scope_refusal(

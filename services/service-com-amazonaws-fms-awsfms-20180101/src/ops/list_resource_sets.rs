@@ -173,12 +173,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // ONE reading of the clock for this request: the authorization gate and
+        // the derived status of every resource set reported both decide from it.
+        let now = ::std::time::SystemTime::now();
         let store = state.lock();
         // The authorization gate, BEFORE any member of the request is examined
         // and before any of the store's contents is reported, so a bad
         // `NextToken` and a well-formed request get the same refusal from an
         // unauthorized caller.
-        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+        crate::state::require_administrator_at(
+            &store,
+            &crate::state::request_region(ctx.parts()),
+            now,
+        )?;
 
         // A token this service did not mint for a resource-set page names no page
         // boundary. The refusal is a bad request, not an invented page: the
@@ -217,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_sets: Vec<ResourceSetSummary> = remaining
             .by_ref()
             .take(page_size)
-            .map(|(_, record)| record.summary(store.resource_set_status(record)))
+            .map(|(_, record)| record.summary(store.resource_set_status(record, now)))
             .collect();
         // A token only when a resource set is left AFTER this page, so the last
         // page carries none.

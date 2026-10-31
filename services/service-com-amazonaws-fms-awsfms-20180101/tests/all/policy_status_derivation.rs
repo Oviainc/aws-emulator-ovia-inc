@@ -36,6 +36,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_fms_awsfms_20180101::ops::types::CUSTOMER_POLICY_STATUS_VALUES;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::admin_account_scopes::wait_out_the_onboarding;
 use crate::policy_lifecycle::{
     call, call_in, emulator, emulator_with_administrator, ACCOUNT, REGION,
 };
@@ -166,8 +167,29 @@ async fn summary_policy_status(
 }
 
 /// Onboard the CALLING account as a delegated administrator holding `scope`,
-/// which is the only way the scope governing its policies is narrowed.
+/// which is the only way the scope governing its policies is narrowed, and wait
+/// out the onboarding the call started.
+///
+/// The wait is part of the step, not a convenience: an onboarded
+/// administrator's `AdminScope` is in force only once its `OrganizationStatus`
+/// has reached `ONBOARDING_COMPLETE`, the status in which the account "can
+/// perform actions on the resources defined in their AdminScope"
+/// (`AdminAccountSummary$Status`), so the scope governs nothing until the clock
+/// has completed the onboarding. What the readers report while that onboarding
+/// is still in flight is the sibling suite
+/// [`crate::admin_scope_in_force_after_onboarding`].
 pub(crate) async fn put_admin_scope(router: &MultiServiceRouter, case: &str, scope: &Value) {
+    put_admin_scope_without_waiting(router, case, scope).await;
+    wait_out_the_onboarding();
+}
+
+/// [`put_admin_scope`] without the wait: the onboarding is left in flight, so
+/// the scope the call recorded is not in force yet.
+pub(crate) async fn put_admin_scope_without_waiting(
+    router: &MultiServiceRouter,
+    case: &str,
+    scope: &Value,
+) {
     let (status, body) = call(
         router,
         "PutAdminAccount",

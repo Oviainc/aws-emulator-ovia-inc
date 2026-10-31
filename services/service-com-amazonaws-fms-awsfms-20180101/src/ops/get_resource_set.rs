@@ -159,9 +159,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // ONE reading of the clock for this request: the authorization gate and
+        // the derived status both decide from it.
+        let now = ::std::time::SystemTime::now();
         let store = state.lock();
         // The authorization gate, BEFORE the identifier is looked up.
-        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+        crate::state::require_administrator_at(
+            &store,
+            &crate::state::request_region(ctx.parts()),
+            now,
+        )?;
 
         let Some(record) = store.resource_sets.get(&input.identifier) else {
             return Err(GetResourceSetErrorModeled::ResourceNotFoundException(
@@ -172,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceSetStatus` is DERIVED on this read, from the administrative
         // scope governing the resource set — never read back off the stored
         // document.
-        let resource_set_status = store.resource_set_status(record);
+        let resource_set_status = store.resource_set_status(record, now);
         Ok(GetResourceSetOutput {
             resource_set: record.resource_set(resource_set_status),
             resource_set_arn: record.arn.clone(),

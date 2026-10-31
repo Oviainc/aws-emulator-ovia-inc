@@ -574,7 +574,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // being invited to fetch a fresher token and try again — and
                 // before anything is written, so the stored document and its
                 // token are left exactly as they were.
-                if let Some(refusal) = store.policy_mutation_refusal(existing) {
+                if let Some(refusal) = store.policy_mutation_refusal(existing, now) {
                     return Err(PutPolicyErrorModeled::InvalidOperationException(refusal).into());
                 }
                 if requested_token.as_deref() != Some(existing.update_token.as_str()) {
@@ -642,7 +642,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = record.policy_arn.clone();
         // The derived status, read from the store the same way every other
         // reader of this policy reads it.
-        let policy_status = store.policy_status(&record);
+        let policy_status = store.policy_status(&record, now);
         let output = PutPolicyOutput {
             policy: Some(record.policy(policy_status)),
             policy_arn: Some(record.policy_arn.clone()),

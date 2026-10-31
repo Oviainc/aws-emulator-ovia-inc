@@ -181,13 +181,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // ONE reading of the clock for this request: the authorization gate and
+        // the derived status of every policy reported both decide from it.
+        let now = ::std::time::SystemTime::now();
         let store = state.lock();
         // The authorization gate, BEFORE any member of the request is examined
         // and before any of the store's contents is reported, so a bad
         // `NextToken` and a well-formed request get the same refusal from an
         // unauthorized caller — and an empty page cannot be mistaken for "you are
         // not the administrator".
-        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+        crate::state::require_administrator_at(
+            &store,
+            &crate::state::request_region(ctx.parts()),
+            now,
+        )?;
 
         // A token this service did not mint names no page boundary — and
         // neither does one it minted for ANOTHER of its collections. This page is
@@ -229,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `PolicyStatus` is derived from the store for the summary exactly
             // as `GetPolicy` derives it for the policy, so a page cannot report
             // a status a read of the same policy disagrees with.
-            .map(|(_, record)| record.summary(store.policy_status(record)))
+            .map(|(_, record)| record.summary(store.policy_status(record, now)))
             .collect();
         // A token only when a policy is left AFTER this page, so the last page
         // carries none.

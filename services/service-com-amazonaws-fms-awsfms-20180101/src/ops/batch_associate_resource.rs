@@ -266,7 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) = store
             .resource_sets
             .get(&id)
-            .and_then(|existing| store.resource_set_mutation_refusal(existing))
+            .and_then(|existing| store.resource_set_mutation_refusal(existing, now))
         {
             return Err(
                 BatchAssociateResourceErrorModeled::InvalidOperationException(refusal).into(),

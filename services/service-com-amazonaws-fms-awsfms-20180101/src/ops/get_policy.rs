@@ -164,6 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // ONE reading of the clock for this request: the derived status depends
+        // on whether the calling administrator's scope is in force at this
+        // instant.
+        let now = ::std::time::SystemTime::now();
         let store = state.lock();
         // `PolicyId` is an opaque lookup key: the store decides the answer, and
         // an id no stored policy carries is the modelled not-found.
@@ -177,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `PolicyStatus` is SERVICE-DERIVED — "whether the policy is in or
             // out of an admin's policy or Region scope" — so it is read from
             // the store, never from the document the policy was written with.
-            policy: Some(record.policy(store.policy_status(record))),
+            policy: Some(record.policy(store.policy_status(record, now))),
             policy_arn: Some(record.policy_arn.clone()),
         })
     }

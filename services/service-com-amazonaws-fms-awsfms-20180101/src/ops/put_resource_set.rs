@@ -252,7 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // that, rather than being invited to resend with a fresher token
                 // — and before anything is written, so the stored document and
                 // its token are left exactly as they were.
-                if let Some(refusal) = store.resource_set_mutation_refusal(existing) {
+                if let Some(refusal) = store.resource_set_mutation_refusal(existing, now) {
                     return Err(
                         PutResourceSetErrorModeled::InvalidOperationException(refusal).into(),
                     );
@@ -361,7 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Derived from the administrative scope governing the resource set, on
         // this read of it, exactly as `GetResourceSet` and the `ListResourceSets`
         // summary derive it: a write does not get to report a status of its own.
-        let resource_set_status = store.resource_set_status(&record);
+        let resource_set_status = store.resource_set_status(&record, now);
         let output = PutResourceSetOutput {
             resource_set: record.resource_set(resource_set_status),
             resource_set_arn: record.arn.clone(),

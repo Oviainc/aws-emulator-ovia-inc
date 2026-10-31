@@ -183,9 +183,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // ONE reading of the clock for this request: the authorization gate and
+        // whether the administrative scope governing the resource set is in force
+        // both decide from it.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // The authorization gate, BEFORE the identifier is looked up.
-        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+        crate::state::require_administrator_at(
+            &store,
+            &crate::state::request_region(ctx.parts()),
+            now,
+        )?;
 
         // A resource set the administrative scope governing it does not cover is
         // view-only, so the removal is refused on the SAME shared rule its edits
@@ -195,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(refusal) = store
             .resource_sets
             .get(&input.identifier)
-            .and_then(|existing| store.resource_set_mutation_refusal(existing))
+            .and_then(|existing| store.resource_set_mutation_refusal(existing, now))
         {
             return Err(
                 DeleteResourceSetErrorModeled::InvalidOperationException(refusal).into(),
