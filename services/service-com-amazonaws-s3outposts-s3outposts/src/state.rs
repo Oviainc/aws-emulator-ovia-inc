@@ -1219,24 +1219,52 @@ where
     ListPage { items, next_token }
 }
 
-/// The Outpost id the inventory listing's cursor names, or `None` when the token
-/// is not one this service issued.
+/// The Outpost id the inventory listing's cursor FORM names, or `None` when the
+/// token is not of the form this listing mints.
 ///
 /// The inventory is keyed by `OutpostId`, so the cursor IS that id — which
 /// `OutpostId`'s `^(op-[a-f0-9]{17}|\d{12}|ec2)$` keeps inside `NextToken`'s own
 /// `^[A-Za-z0-9\+\:\/\=\?\#-_]+$`, so the cursor a response carries is a value
 /// the next request may legally send back.
+///
+/// This is the form alone; which of those ids the listing being resumed could
+/// actually have minted a cursor for is [`outpost_cursor`]'s question, because it
+/// depends on the Region the walk is being resumed in.
 pub fn decode_outpost_cursor(token: &str) -> Option<String> {
     is_outpost_id(token).then(|| token.to_string())
 }
 
 /// The key the Outpost inventory resumes at for `next_token`, or the refusal for
-/// a token this service never issued.
+/// a token this listing never issued — which a token naming an Outpost installed
+/// in another Region is.
+///
+/// A cursor is a position in ONE walk, so it is read in the whole scope that walk
+/// serves and not just checked for its form: this walk reports the Outposts the
+/// `inventory` holds in `region` alone ([`outpost_page`]), and an Outpost is
+/// installed at a site anchored to exactly one Region
+/// ([`OutpostRecord::region`]), so an id the inventory holds in ANOTHER Region
+/// names no place in this walk's order. Resuming there would answer a page of
+/// whatever happens to sort after it — an empty one, reporting that a Region
+/// whose untokened listing reports several S3-capable Outposts reaches none, when
+/// the foreign id sorts last — or ignore the cursor altogether and re-serve the
+/// first page. It is refused instead, exactly as a token of the wrong form is.
+///
+/// An id the inventory holds NOWHERE is deliberately admitted, for the same
+/// reason [`list_page`] resumes at the first key at or after the cursor: the
+/// inventory is the Outposts control plane's own and an Outpost can leave it
+/// between two pages, and that departed record is exactly the one this listing's
+/// cursor names.
 pub fn outpost_cursor(
     next_token: Option<&str>,
     operation: &str,
+    inventory: &OutpostInventory,
+    region: &str,
 ) -> Result<Option<String>, ValidationException> {
-    list_cursor(next_token, operation, decode_outpost_cursor)
+    list_cursor(next_token, operation, |token| {
+        decode_outpost_cursor(token).filter(|outpost_id| {
+            outpost_region(inventory, outpost_id).is_none_or(|home| home == region)
+        })
+    })
 }
 
 /// The page the Outpost inventory serves: the Outposts the inventory holds IN
@@ -1313,6 +1341,12 @@ pub fn decode_endpoint_cursor(token: &str) -> Option<(String, String)> {
 /// The ENDPOINT half is deliberately not resolved: the walk resumes at the first
 /// key at or after the cursor, so a page is still served when the endpoint the
 /// cursor named was deleted between pages.
+///
+/// That tolerance is why an Outpost half the inventory holds NOWHERE is refused
+/// here while [`outpost_cursor`] admits such an id: there the cursor IS the
+/// record's own key, so an id the inventory no longer holds is the record
+/// deleted between pages, whereas here the Outpost half is the SCOPE the walk
+/// runs in, which an Outpost the inventory holds nothing of is no part of.
 pub fn endpoint_cursor(
     next_token: Option<&str>,
     operation: &str,

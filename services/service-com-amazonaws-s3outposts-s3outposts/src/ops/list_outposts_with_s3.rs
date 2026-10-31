@@ -153,12 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The cursor is the Outpost id the next page starts at. A token this
-        // service never issued is refused rather than served as an arbitrary
-        // page.
-        let resume = crate::state::outpost_cursor(input.next_token.as_deref(), Self::NAME)
-            .map_err(ListOutpostsWithS3ErrorModeled::ValidationException)?;
-
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -168,6 +162,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against it, so an Outpost this page leaves out carries no endpoint here
         // any more either.
         let inventory = crate::state::settled_inventory(&*self.engine, &mut store, now);
+
+        // The cursor is the Outpost id the next page starts at, read in the scope
+        // this listing walks: the Outposts the inventory holds in this Region. A
+        // token this listing never issued — one of another form, or one naming an
+        // Outpost installed in another Region, which this Region's walk has no
+        // order over — is refused rather than served as an arbitrary page.
+        let resume = crate::state::outpost_cursor(
+            input.next_token.as_deref(),
+            Self::NAME,
+            &inventory,
+            &region,
+        )
+        .map_err(ListOutpostsWithS3ErrorModeled::ValidationException)?;
 
         // The walk, the page bound, the cursor and the Region a listing serves are
         // the one listing rule this service's listings follow, so they live in
