@@ -288,6 +288,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
         let client_token = input.client_token.as_deref();
+        // This request carries nothing beside the preference its ARN names and the
+        // token, so the ARN the ledger key already states IS the whole request
+        // (`crate::state::empty_request_digest`).
+        let request_digest = crate::state::empty_request_digest();
 
         // The ARN has to name a preference this emulator holds: validation is state
         // ABOUT a preference, so there is nothing to start for one that does not exist.
@@ -314,6 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(arn) = store.replayed_result(
             Self::NAME,
             &input.procurement_portal_preference_arn,
+            &request_digest,
             client_token,
         ) {
             return Ok(SendProcurementPortalValidationOutput {
@@ -372,6 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.record_result(
             Self::NAME,
             &input.procurement_portal_preference_arn,
+            &request_digest,
             client_token,
             &input.procurement_portal_preference_arn,
         );

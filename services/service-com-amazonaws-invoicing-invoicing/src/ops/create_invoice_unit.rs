@@ -163,12 +163,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
         let client_token = input.client_token.as_deref();
+        // What makes this request the request it is, beside the `Name` the ledger key
+        // already states: the configuration and the tags it creates the unit with. A
+        // repeat of the `ClientToken` stating any other configuration is a DIFFERENT
+        // request, so the ledger must not answer it with the ARN of the unit the first
+        // one created. One line per member the model gives this request
+        // (`smithy_query(query="operation", operation="CreateInvoiceUnit")`).
+        let request_digest = {
+            let mut parts: Vec<String> = vec![input.invoice_receiver.clone()];
+            crate::state::push_optional_digest(&mut parts, input.description.as_deref());
+            crate::state::push_flag_digest(&mut parts, Some(input.tax_inheritance_disabled));
+            crate::state::push_invoice_unit_rule_digest(&mut parts, Some(&input.rule));
+            crate::state::push_resource_tags_digest(&mut parts, input.resource_tags.as_deref());
+            crate::state::idempotent_request_digest(&parts)
+        };
 
-        // `@idempotent`: a replay of the same request (same `ClientToken` and the same
-        // `Name` it creates) answers with the ARN the first call minted rather than
-        // minting a second invoice unit. A record whose unit has since been deleted is
-        // not a replay: there is nothing left to answer with, so the request creates.
-        if let Some(arn) = store.replayed_result(Self::NAME, &input.name, client_token) {
+        // `@idempotent`: a replay of the same request (same `ClientToken`, the same
+        // `Name` it creates and the same configuration it creates it with) answers with
+        // the ARN the first call minted rather than minting a second invoice unit. A
+        // record whose unit has since been deleted is not a replay: there is nothing left
+        // to answer with, so the request creates.
+        if let Some(arn) =
+            store.replayed_result(Self::NAME, &input.name, &request_digest, client_token)
+        {
             if store.live_invoice_unit(&arn).is_some() {
                 return Ok(CreateInvoiceUnitOutput {
                     invoice_unit_arn: Some(arn),
@@ -256,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.resource_tags.insert(arn.clone(), tags);
         }
 
-        store.record_result(Self::NAME, &name, client_token, &arn);
+        store.record_result(Self::NAME, &name, &request_digest, client_token, &arn);
         Ok(CreateInvoiceUnitOutput {
             invoice_unit_arn: Some(arn),
         })

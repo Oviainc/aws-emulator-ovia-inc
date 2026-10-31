@@ -216,6 +216,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
         let client_token = input.client_token.as_deref();
+        // What makes this request the request it is, beside the preference its ARN names:
+        // the configuration it writes. A repeat of the `ClientToken` stating any other
+        // configuration is a DIFFERENT request, so the ledger must not answer it with this
+        // one's result and leave that configuration unwritten. One line per member the
+        // model gives this request (`smithy_query(query="operation",
+        // operation="PutProcurementPortalPreference")`), with
+        // `MarketplacePunchOutEnabled`'s documented default applied, so stating that
+        // default and omitting the member are one request here as they are in the write.
+        let request_digest = {
+            let mut parts: Vec<String> = Vec::new();
+            crate::state::push_selector_digest(&mut parts, input.selector.as_ref());
+            crate::state::push_optional_digest(
+                &mut parts,
+                input.procurement_portal_shared_secret.as_deref(),
+            );
+            crate::state::push_optional_digest(
+                &mut parts,
+                input.procurement_portal_instance_endpoint.as_deref(),
+            );
+            crate::state::push_test_env_preference_digest(
+                &mut parts,
+                input.test_env_preference.as_ref(),
+            );
+            crate::state::push_flag_digest(&mut parts, Some(input.einvoice_delivery_enabled));
+            crate::state::push_einvoice_delivery_preference_digest(
+                &mut parts,
+                input.einvoice_delivery_preference.as_ref(),
+            );
+            crate::state::push_flag_digest(
+                &mut parts,
+                Some(input.purchase_order_retrieval_enabled),
+            );
+            crate::state::push_flag_digest(
+                &mut parts,
+                Some(input.marketplace_punch_out_enabled.unwrap_or(false)),
+            );
+            crate::state::push_marketplace_punch_out_preference_digest(
+                &mut parts,
+                input.marketplace_punch_out_preference.as_ref(),
+            );
+            crate::state::push_contacts_digest(&mut parts, &input.contacts);
+            crate::state::idempotent_request_digest(&parts)
+        };
 
         // The ARN has to name a preference this emulator holds: there is no configuration
         // to write on one that does not exist. Checked BEFORE the replay, so a replay
@@ -234,16 +277,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `@idempotent`: a replay — the same `ClientToken` against the same preference —
-        // is the SAME request, so it answers with the ARN the first call returned and the
-        // write happens ONCE. Re-applying the configuration this request states would land
-        // the same members, but it would also be another write of the resource, and the
-        // pair every applied write advances (`Version`, which counts the writes the
-        // resource took, and `LastUpdateDate`) is reported by every reader of it — so a
-        // retried write that was applied twice is observably not a replay.
+        // `@idempotent`: a replay — the same `ClientToken` against the same preference,
+        // stating the same configuration — is the SAME request, so it answers with the ARN
+        // the first call returned and the write happens ONCE. Re-applying the
+        // configuration this request states would land the same members, but it would also
+        // be another write of the resource, and the pair every applied write advances
+        // (`Version`, which counts the writes the resource took, and `LastUpdateDate`) is
+        // reported by every reader of it — so a retried write that was applied twice is
+        // observably not a replay. A repeat of the token stating ANOTHER configuration is
+        // another request, and its write is applied.
         if let Some(arn) = store.replayed_result(
             Self::NAME,
             &input.procurement_portal_preference_arn,
+            &request_digest,
             client_token,
         ) {
             return Ok(PutProcurementPortalPreferenceOutput {
@@ -359,6 +405,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.record_result(
             Self::NAME,
             &input.procurement_portal_preference_arn,
+            &request_digest,
             client_token,
             &input.procurement_portal_preference_arn,
         );

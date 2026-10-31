@@ -176,6 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
         let client_token = input.client_token.as_deref();
+        // This request carries nothing beside the preference its ARN names and the
+        // token, so the ARN the ledger key already states IS the whole request
+        // (`crate::state::empty_request_digest`).
+        let request_digest = crate::state::empty_request_digest();
 
         // `@idempotent`: a replay of the delete (the same `ClientToken` against the same
         // preference) answers with the ARN the first call removed rather than reporting it
@@ -183,6 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(arn) = store.replayed_result(
             Self::NAME,
             &input.procurement_portal_preference_arn,
+            &request_digest,
             client_token,
         ) {
             return Ok(DeleteProcurementPortalPreferenceOutput {
@@ -218,6 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.record_result(
             Self::NAME,
             &input.procurement_portal_preference_arn,
+            &request_digest,
             client_token,
             &input.procurement_portal_preference_arn,
         );

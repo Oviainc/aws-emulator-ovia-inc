@@ -165,14 +165,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
         let client_token = input.client_token.as_deref();
+        // What makes this request the request it is, beside the unit its ARN names: the
+        // configuration it writes. A repeat of the `ClientToken` stating any other
+        // configuration is a DIFFERENT request, so the ledger must not answer it with
+        // this one's result and leave that configuration unwritten. One line per member
+        // the model gives this request
+        // (`smithy_query(query="operation", operation="UpdateInvoiceUnit")`).
+        let request_digest = {
+            let mut parts: Vec<String> = Vec::new();
+            crate::state::push_optional_digest(&mut parts, input.description.as_deref());
+            crate::state::push_flag_digest(&mut parts, input.tax_inheritance_disabled);
+            crate::state::push_invoice_unit_rule_digest(&mut parts, input.rule.as_ref());
+            crate::state::idempotent_request_digest(&parts)
+        };
 
         // `@idempotent`: a replay (the same `ClientToken` against the same invoice
-        // unit) answers with the ARN the first call returned and applies the change
-        // once. The same token against a DIFFERENT unit is a different request and is
-        // applied on its own.
-        if let Some(arn) =
-            store.replayed_result(Self::NAME, &input.invoice_unit_arn, client_token)
-        {
+        // unit stating the same configuration) answers with the ARN the first call
+        // returned and applies the change once. The same token against a DIFFERENT unit,
+        // or stating a different configuration, is a different request and is applied on
+        // its own.
+        if let Some(arn) = store.replayed_result(
+            Self::NAME,
+            &input.invoice_unit_arn,
+            &request_digest,
+            client_token,
+        ) {
             if store.live_invoice_unit(&arn).is_some() {
                 return Ok(UpdateInvoiceUnitOutput {
                     invoice_unit_arn: Some(arn),
@@ -209,6 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.record_result(
             Self::NAME,
             &input.invoice_unit_arn,
+            &request_digest,
             client_token,
             &input.invoice_unit_arn,
         );

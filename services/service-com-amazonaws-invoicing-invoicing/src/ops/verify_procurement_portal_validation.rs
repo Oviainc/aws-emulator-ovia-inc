@@ -18,6 +18,14 @@
 //! write advances `Version` and `LastUpdateDate` the same way the other write that moves a
 //! plane's status does.
 //!
+//! A `ClientToken` on this operation identifies a REPEAT OF ONE REQUEST: a second call
+//! naming the same preference with the same `Code` under that token is answered with the
+//! ARN the first one returned, because that code was already consumed. A call under the
+//! same token submitting a DIFFERENT code is a different request — `Code` is `@required`,
+//! so it is part of what the token identifies — and takes the code check above, which is
+//! what this operation exists to make
+//! ([`crate::state::idempotent_request_digest`]).
+//!
 //! A refused submission counts against the failed-attempt budget of the code currently
 //! outstanding
 //! ([`crate::state::StoredProcurementPortalPreference::failed_verification_attempts`]),
@@ -230,6 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
         let client_token = input.client_token.as_deref();
+        // What makes this request the request it is, beside the preference its ARN names:
+        // the `Code` it submits. `Code` is `@required` on this operation, so a repeat of
+        // the `ClientToken` carrying another code is a DIFFERENT request — the ledger
+        // lookup below must not answer it, or the code check this operation exists to
+        // make would be skipped for it.
+        let request_digest = crate::state::idempotent_request_digest(&[input.code.as_str()]);
 
         // The ARN has to name a preference this emulator holds: there is no validation
         // to complete for one that does not exist, and the model declares
@@ -250,11 +264,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `@idempotent`: a replay (the same `ClientToken` against the same preference)
-        // answers with the ARN the first call returned; the code was already consumed.
+        // `@idempotent`: a replay (the same `ClientToken` against the same preference
+        // with the same `Code`) answers with the ARN the first call returned; that code
+        // was already consumed. A repeat of the token submitting ANOTHER code is not this
+        // request, so it falls through to the code check below and is answered on its own
+        // merits.
         if let Some(arn) = store.replayed_result(
             Self::NAME,
             &input.procurement_portal_preference_arn,
+            &request_digest,
             client_token,
         ) {
             return Ok(VerifyProcurementPortalValidationOutput {
@@ -340,6 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.record_result(
             Self::NAME,
             &input.procurement_portal_preference_arn,
+            &request_digest,
             client_token,
             &input.procurement_portal_preference_arn,
         );

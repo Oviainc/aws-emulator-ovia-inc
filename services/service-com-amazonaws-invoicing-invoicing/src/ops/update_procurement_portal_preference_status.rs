@@ -387,6 +387,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
         let client_token = input.client_token.as_deref();
+        // What makes this request the request it is, beside the preference its ARN
+        // names: the statuses and the reasons it states. A repeat of the `ClientToken`
+        // stating any other move is a DIFFERENT request, so the ledger must not answer
+        // it with this one's result and leave that move unapplied. One line per member
+        // the model gives this request (`smithy_query(query="operation",
+        // operation="UpdateProcurementPortalPreferenceStatus")`).
+        let request_digest = {
+            let mut parts: Vec<String> = Vec::new();
+            crate::state::push_optional_digest(
+                &mut parts,
+                input.einvoice_delivery_preference_status.as_deref(),
+            );
+            crate::state::push_optional_digest(
+                &mut parts,
+                input.einvoice_delivery_preference_status_reason.as_deref(),
+            );
+            crate::state::push_optional_digest(
+                &mut parts,
+                input.purchase_order_retrieval_preference_status.as_deref(),
+            );
+            crate::state::push_optional_digest(
+                &mut parts,
+                input
+                    .purchase_order_retrieval_preference_status_reason
+                    .as_deref(),
+            );
+            crate::state::idempotent_request_digest(&parts)
+        };
 
         // The ARN has to name a preference this emulator holds: there is no status to move
         // on one that does not exist. Checked BEFORE the replay, so a replay against a
@@ -427,13 +455,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `@idempotent`: a replay (the same `ClientToken` against the same preference)
-        // answers with the ARN the first call returned and applies the update once — this
-        // request states only the planes it moves, so re-applying it is not the same as
-        // applying it once, and the resource's `Version` counts the writes it took.
+        // `@idempotent`: a replay (the same `ClientToken` against the same preference
+        // stating the same move) answers with the ARN the first call returned and applies
+        // the update once — this request states only the planes it moves, so re-applying
+        // it is not the same as applying it once, and the resource's `Version` counts the
+        // writes it took. A repeat of the token stating a DIFFERENT move is another
+        // request and is applied on its own.
         if let Some(arn) = store.replayed_result(
             Self::NAME,
             &input.procurement_portal_preference_arn,
+            &request_digest,
             client_token,
         ) {
             return Ok(UpdateProcurementPortalPreferenceStatusOutput {
@@ -555,6 +586,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.record_result(
             Self::NAME,
             &input.procurement_portal_preference_arn,
+            &request_digest,
             client_token,
             &input.procurement_portal_preference_arn,
         );

@@ -81,11 +81,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AccessDeniedException, FeatureConfigurations, InternalServerException, InvoiceConfiguration,
-    InvoiceProfile, InvoiceSummary, InvoiceUnit, InvoiceUnitRule, MarketplacePunchOutPreference,
-    MessageKey, ProcurementPortal, ProcurementPortalPreference,
+    AccessDeniedException, Contact, EinvoiceDeliveryPreference, FeatureConfigurations,
+    InternalServerException, InvoiceConfiguration, InvoiceProfile, InvoiceSummary, InvoiceUnit,
+    InvoiceUnitRule, MarketplacePunchOutPreference, MessageKey, ProcurementPortal,
+    ProcurementPortalPreference, ProcurementPortalPreferenceSelector,
     ProcurementPortalPreferenceSummary, ProcurementPortalSupplier, ResourceNotFoundException,
-    ResourceTag, ValidationException,
+    ResourceTag, TestEnvPreferenceInput, ValidationException,
     EINVOICE_DELIVERY_ATTACHMENT_TYPE_VALUES, EINVOICE_DELIVERY_DOCUMENT_TYPE_VALUES,
     PROCUREMENT_PORTAL_NAME_VALUES,
 };
@@ -119,9 +120,10 @@ pub struct ComAmazonawsInvoicingInvoicingState {
     /// One tag per key: a later write of a key already set replaces that key's value.
     pub resource_tags: BTreeMap<String, BTreeMap<String, String>>,
     /// The result an `@idempotent` operation already produced for a `ClientToken`,
-    /// keyed by `(operation, target, token)`: one token replayed against another
-    /// operation, or against another invoice unit, is a different request and must not
-    /// replay this one's result. Bounded by [`MAX_IDEMPOTENT_RECORDS`].
+    /// keyed by `(operation, target, request digest, token)`: one token replayed against
+    /// another operation, against another invoice unit, or carrying any other request
+    /// than the recorded one is a DIFFERENT request and must not replay this one's
+    /// result. Bounded by [`MAX_IDEMPOTENT_RECORDS`].
     idempotent_results: BTreeMap<IdempotencyKey, String>,
     /// The keys of [`Self::idempotent_results`] in the order they were recorded, so the
     /// oldest record is the one evicted when the bound is reached.
@@ -151,9 +153,15 @@ pub struct ComAmazonawsInvoicingInvoicingState {
 }
 
 /// What an `@idempotent` replay record is keyed by: the operation, the request's target
-/// (the resource it names, the name it creates, or the preference identity it creates)
-/// and the caller's `ClientToken`.
-type IdempotencyKey = (String, String, String);
+/// (the resource it names, the name it creates, or the preference identity it creates),
+/// a digest of the rest of the request ([`idempotent_request_digest`]) and the caller's
+/// `ClientToken`.
+///
+/// The digest is part of the key because a `ClientToken` identifies a REPEAT OF ONE
+/// REQUEST: a record may answer only a request carrying the same members the recorded
+/// call carried, so a token reused with any other member values falls through to the
+/// handler and is served on its own merits.
+type IdempotencyKey = (String, String, String, String);
 
 /// How many invoice units this emulator holds. The model's `ValidationExceptionReason`
 /// declares `maxInvoiceUnitsExceeded`, so the real service refuses a create once its own
@@ -441,13 +449,16 @@ impl ComAmazonawsInvoicingInvoicingState {
         format!("{:06}", mixed % 1_000_000)
     }
 
-    /// The ARN an earlier call of `operation` already returned for this `target` and
-    /// `client_token`, if this is a replay of that request. `None` when the request
-    /// carries no token, or carries one this operation has not seen against this target.
+    /// The ARN an earlier call of `operation` already returned for this `target`,
+    /// `request_digest` and `client_token`, if this is a replay of that request. `None`
+    /// when the request carries no token, or carries one this operation has not seen
+    /// against this target AND this request — a token repeated with a different request
+    /// is not a replay of the recorded one, so the caller's request runs.
     pub fn replayed_result(
         &self,
         operation: &str,
         target: &str,
+        request_digest: &str,
         client_token: Option<&str>,
     ) -> Option<String> {
         let token = client_token?;
@@ -455,18 +466,20 @@ impl ComAmazonawsInvoicingInvoicingState {
             .get(&(
                 operation.to_string(),
                 target.to_string(),
+                request_digest.to_string(),
                 token.to_string(),
             ))
             .cloned()
     }
 
-    /// Record the ARN `operation` returned for this `target` and `client_token`, so a
-    /// replay of that same request answers with this same ARN instead of changing state
-    /// a second time.
+    /// Record the ARN `operation` returned for this `target`, `request_digest` and
+    /// `client_token`, so a replay of that same request answers with this same ARN
+    /// instead of changing state a second time.
     pub fn record_result(
         &mut self,
         operation: &str,
         target: &str,
+        request_digest: &str,
         client_token: Option<&str>,
         arn: &str,
     ) {
@@ -476,6 +489,7 @@ impl ComAmazonawsInvoicingInvoicingState {
         let key = (
             operation.to_string(),
             target.to_string(),
+            request_digest.to_string(),
             token.to_string(),
         );
         if self
@@ -534,6 +548,206 @@ impl ComAmazonawsInvoicingInvoicingState {
             }
         }
         accounts
+    }
+}
+
+/// The REQUEST half of an `@idempotent` replay key ([`IdempotencyKey`]): a stable digest
+/// of the request members the rest of the key does not already name.
+///
+/// A `ClientToken` identifies a REPEAT OF ONE REQUEST, so a recorded result answers only
+/// a request carrying the same members the recorded call carried. A token repeated with
+/// any other member values digests differently, finds no record and is served on its own
+/// merits — including whatever refusal that request earns, because the checks a handler
+/// owes a request are not something an earlier, different request can stand in for.
+///
+/// Every `@idempotent` operation of this service digests its own members through here:
+/// the ones its `target` does not already state, written out member by member at the call
+/// site so the digest is a CONTRACT — a member the model adds to one of those requests is
+/// a line to add there, or two requests differing only in it would share one record.
+///
+/// The parts are length-prefixed, so `["a", "bc"]` and `["ab", "c"]` do not collide, and
+/// the mixing is SHA-256 from the maintained `sha2` crate rather than anything written
+/// here. Digesting rather than keeping the parts bounds the key, whose members are
+/// modelled up to 1024 characters each in lists the model does not bound, and keeps a
+/// member the model marks `@sensitive` from being held a second time.
+pub fn idempotent_request_digest<S: AsRef<str>>(parts: &[S]) -> String {
+    use sha2::Digest;
+
+    let mut digest = sha2::Sha256::new();
+    for part in parts {
+        let part = part.as_ref();
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+/// The digest of a request that is ONLY its target: an `@idempotent` operation whose
+/// input carries nothing beside the resource it names and the `ClientToken`, so the
+/// `target` in the key already states the whole request and there is no further member to
+/// mix in.
+pub fn empty_request_digest() -> String {
+    idempotent_request_digest::<&str>(&[])
+}
+
+/// The digest part an ABSENT optional member contributes, so a request that omits a
+/// member is not the same request as one that sends it empty.
+///
+/// A PRESENT member always contributes its marker and then its value, so the part a value
+/// occupies is never read as this marker however the value is spelled: the parts of one
+/// request decode left to right, member by member, from the markers the pushes below
+/// write.
+const DIGEST_UNSET: &str = "\u{0}unset";
+
+/// Push one optional string member's digest parts.
+pub fn push_optional_digest(parts: &mut Vec<String>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            parts.push("set".to_string());
+            parts.push(value.to_string());
+        }
+        None => parts.push(DIGEST_UNSET.to_string()),
+    }
+}
+
+/// Push one optional boolean member's digest parts: the three values a modelled
+/// `Boolean` member a request may omit can carry.
+pub fn push_flag_digest(parts: &mut Vec<String>, value: Option<bool>) {
+    parts.push(match value {
+        Some(true) => "true".to_string(),
+        Some(false) => "false".to_string(),
+        None => DIGEST_UNSET.to_string(),
+    });
+}
+
+/// Push one optional string-list member's digest parts, ORDER AND COUNT INCLUDED: the
+/// list a request states is the list it states, so neither a reordering nor a repeat is
+/// the same request.
+pub fn push_strings_digest(parts: &mut Vec<String>, values: Option<&[String]>) {
+    match values {
+        Some(values) => {
+            parts.push(values.len().to_string());
+            parts.extend(values.iter().cloned());
+        }
+        None => parts.push(DIGEST_UNSET.to_string()),
+    }
+}
+
+/// Push the digest parts of an `InvoiceUnitRule`, the shape both writes of an invoice
+/// unit carry.
+pub fn push_invoice_unit_rule_digest(parts: &mut Vec<String>, rule: Option<&InvoiceUnitRule>) {
+    match rule {
+        Some(rule) => {
+            push_strings_digest(parts, rule.linked_accounts.as_deref());
+            push_strings_digest(parts, rule.bill_source_accounts.as_deref());
+        }
+        None => parts.push(DIGEST_UNSET.to_string()),
+    }
+}
+
+/// Push the digest parts of a `ResourceTagList`, the shape every create of this service
+/// carries, as the tags the create would STORE: one entry per key, the last value stated
+/// for a key, in key order — the normalisation [`resource_tags_for_new_resource`]
+/// performs. Two repeats that differ only in the order of their tag list, in a key they
+/// state twice, or in stating an empty list rather than none at all, leave the resource
+/// holding the same tags and so are one request here too.
+pub fn push_resource_tags_digest(parts: &mut Vec<String>, tags: Option<&[ResourceTag]>) {
+    let stored: BTreeMap<&str, &str> = tags
+        .unwrap_or_default()
+        .iter()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    parts.push(stored.len().to_string());
+    for (key, value) in stored {
+        parts.push(key.to_string());
+        parts.push(value.to_string());
+    }
+}
+
+/// Push the digest parts of a `ProcurementPortalPreferenceSelector`.
+pub fn push_selector_digest(
+    parts: &mut Vec<String>,
+    selector: Option<&ProcurementPortalPreferenceSelector>,
+) {
+    match selector {
+        Some(selector) => {
+            push_strings_digest(parts, selector.invoice_unit_arns.as_deref());
+            push_strings_digest(parts, selector.seller_of_records.as_deref());
+        }
+        None => parts.push(DIGEST_UNSET.to_string()),
+    }
+}
+
+/// Push the digest parts of a `TestEnvPreferenceInput`.
+pub fn push_test_env_preference_digest(
+    parts: &mut Vec<String>,
+    test_env: Option<&TestEnvPreferenceInput>,
+) {
+    match test_env {
+        Some(test_env) => {
+            parts.push(test_env.buyer_domain.clone());
+            parts.push(test_env.buyer_identifier.clone());
+            parts.push(test_env.supplier_domain.clone());
+            parts.push(test_env.supplier_identifier.clone());
+            push_optional_digest(
+                parts,
+                test_env.procurement_portal_shared_secret.as_deref(),
+            );
+            push_optional_digest(
+                parts,
+                test_env.procurement_portal_instance_endpoint.as_deref(),
+            );
+        }
+        None => parts.push(DIGEST_UNSET.to_string()),
+    }
+}
+
+/// Push the digest parts of an `EinvoiceDeliveryPreference`.
+pub fn push_einvoice_delivery_preference_digest(
+    parts: &mut Vec<String>,
+    preference: Option<&EinvoiceDeliveryPreference>,
+) {
+    match preference {
+        Some(preference) => {
+            push_strings_digest(parts, Some(&preference.einvoice_delivery_document_types));
+            push_strings_digest(
+                parts,
+                preference.einvoice_delivery_attachment_types.as_deref(),
+            );
+            parts.push(preference.protocol.clone());
+            parts.push(preference.purchase_order_data_sources.len().to_string());
+            for source in &preference.purchase_order_data_sources {
+                push_optional_digest(parts, source.einvoice_delivery_document_type.as_deref());
+                push_optional_digest(parts, source.purchase_order_data_source_type.as_deref());
+            }
+            parts.push(preference.connection_testing_method.clone());
+            parts.push(
+                instant_key(&preference.einvoice_delivery_activation_date).to_string(),
+            );
+        }
+        None => parts.push(DIGEST_UNSET.to_string()),
+    }
+}
+
+/// Push the digest parts of a `MarketplacePunchOutPreference`.
+pub fn push_marketplace_punch_out_preference_digest(
+    parts: &mut Vec<String>,
+    preference: Option<&MarketplacePunchOutPreference>,
+) {
+    match preference {
+        Some(preference) => {
+            push_optional_digest(parts, preference.approval_request_redirect_url.as_deref())
+        }
+        None => parts.push(DIGEST_UNSET.to_string()),
+    }
+}
+
+/// Push the digest parts of a `Contacts` list.
+pub fn push_contacts_digest(parts: &mut Vec<String>, contacts: &[Contact]) {
+    parts.push(contacts.len().to_string());
+    for contact in contacts {
+        push_optional_digest(parts, contact.name.as_deref());
+        push_optional_digest(parts, contact.email.as_deref());
     }
 }
 

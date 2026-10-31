@@ -216,6 +216,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(CreateProcurementPortalPreferenceErrorModeled::ValidationException)?;
 
+        // What makes this request the request it is, beside the preference identity the
+        // ledger key already states: the configuration and the tags it creates the
+        // preference with. A repeat of the `ClientToken` stating any other configuration
+        // is a DIFFERENT request, so the ledger must not answer it with the ARN of the
+        // preference the first one created. One line per member the model gives this
+        // request (`smithy_query(query="operation",
+        // operation="CreateProcurementPortalPreference")`); the five the identity is made
+        // of are already in the key. The Marketplace PunchOut pair is digested as the rule
+        // above RESOLVED it, so two requests the create would store identically — one
+        // stating a member's default, one omitting it — are one request here too.
+        let request_digest = {
+            let mut parts: Vec<String> = Vec::new();
+            crate::state::push_selector_digest(&mut parts, input.selector.as_ref());
+            crate::state::push_optional_digest(
+                &mut parts,
+                input.procurement_portal_shared_secret.as_deref(),
+            );
+            crate::state::push_optional_digest(
+                &mut parts,
+                input.procurement_portal_instance_endpoint.as_deref(),
+            );
+            crate::state::push_test_env_preference_digest(
+                &mut parts,
+                input.test_env_preference.as_ref(),
+            );
+            crate::state::push_flag_digest(&mut parts, Some(input.einvoice_delivery_enabled));
+            crate::state::push_einvoice_delivery_preference_digest(
+                &mut parts,
+                input.einvoice_delivery_preference.as_ref(),
+            );
+            crate::state::push_flag_digest(
+                &mut parts,
+                Some(input.purchase_order_retrieval_enabled),
+            );
+            crate::state::push_flag_digest(&mut parts, Some(marketplace_punch_out.enabled));
+            crate::state::push_marketplace_punch_out_preference_digest(
+                &mut parts,
+                marketplace_punch_out.preference.as_ref(),
+            );
+            crate::state::push_contacts_digest(&mut parts, &input.contacts);
+            crate::state::push_resource_tags_digest(&mut parts, input.resource_tags.as_deref());
+            crate::state::idempotent_request_digest(&parts)
+        };
+
         // A resource holds at most `crate::state::MAX_RESOURCE_TAGS` tags however the
         // tags got there — the quota `TagResource` refuses a write past — so a create
         // carrying more distinct keys than that is refused before it mints or persists
@@ -252,11 +296,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let client_token = input.client_token.as_deref();
 
         // `@idempotent`: a replay of the same request (same `ClientToken` against the
-        // same preference identity) answers with the ARN the first call minted rather
-        // than creating a second preference. A record whose preference has since been
-        // deleted is not a replay: there is nothing left to answer with, so the request
-        // creates.
-        if let Some(arn) = store.replayed_result(Self::NAME, &identity, client_token) {
+        // same preference identity with the same configuration) answers with the ARN the
+        // first call minted rather than creating a second preference. A record whose
+        // preference has since been deleted is not a replay: there is nothing left to
+        // answer with, so the request creates.
+        if let Some(arn) =
+            store.replayed_result(Self::NAME, &identity, &request_digest, client_token)
+        {
             if store.procurement_portal_preferences.contains_key(&arn) {
                 return Ok(CreateProcurementPortalPreferenceOutput {
                     procurement_portal_preference_arn: arn,
@@ -377,7 +423,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.resource_tags.insert(arn.clone(), resource_tags);
         }
 
-        store.record_result(Self::NAME, &identity, client_token, &arn);
+        store.record_result(Self::NAME, &identity, &request_digest, client_token, &arn);
         Ok(CreateProcurementPortalPreferenceOutput {
             procurement_portal_preference_arn: arn,
         })
