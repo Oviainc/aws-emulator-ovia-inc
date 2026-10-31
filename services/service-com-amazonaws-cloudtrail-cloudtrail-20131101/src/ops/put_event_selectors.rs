@@ -387,13 +387,14 @@ fn read_configuration(
 /// Check a basic selector set against the documented limits and fill in each member's
 /// documented default, so what is stored is what every later read reports.
 ///
-/// Only the UPPER bound on the selector count is enforced. An EMPTY list is a
-/// configuration in its own right — nothing is logged — and is kept as given: the
-/// recorded behaviour this emulator is measured against distinguishes an empty list from
-/// an absent member and preserves it (corpus check
-/// `cloudtrail.event-selectors-empty-list-vs-absent-field-preserved`), so the "1 to 5"
-/// phrasing in `InvalidEventSelectorsException`'s doc is read as the remedy for too
-/// MANY selectors rather than as a floor.
+/// Two rules are enforced over the set: the UPPER bounds on the selector and
+/// data-resource counts, and that no selector would log NOTHING (see
+/// [`selector_logs_nothing`]). An EMPTY list of selectors is a configuration in its own
+/// right — nothing is logged — and is kept as given: the recorded behaviour this emulator
+/// is measured against distinguishes an empty list from an absent member and preserves it
+/// (corpus check `cloudtrail.event-selectors-empty-list-vs-absent-field-preserved`), so
+/// the "1 to 5" phrasing in `InvalidEventSelectorsException`'s doc is read as the remedy
+/// for too MANY selectors rather than as a floor.
 fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventSelector>, String> {
     // Each count refusal states the REMEDY for the bound it broke, naming that
     // bound — the wording the model's own `InvalidEventSelectorsException` doc
@@ -415,6 +416,17 @@ fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventS
             "Specify a valid number of data resources (1 to {}) for an event selector",
             crate::state::DATA_RESOURCES_PER_TRAIL_LIMIT
         ));
+    }
+
+    // A selector that excludes management events and names no data resource selects
+    // NOTHING, so the trail it is applied to would log nothing at all. That combination
+    // is refused rather than installed — the model's own `InvalidEventSelectorsException`
+    // doc names exactly this case as one of its own ("the combination of event selectors
+    // or advanced event selectors and data resources is not valid") — and the refusal
+    // leaves whatever the trail had configured before untouched, because nothing is
+    // stored until every selector has been read.
+    if selectors.iter().any(selector_logs_nothing) {
+        return Err(NOTHING_LOGGED_MESSAGE.to_string());
     }
 
     selectors
@@ -464,6 +476,30 @@ fn normalize_event_selectors(selectors: Vec<EventSelector>) -> Result<Vec<EventS
             })
         })
         .collect()
+}
+
+/// How CloudTrail words a basic selector that would log nothing: management events
+/// excluded and no data resource named, so the selector selects no event at all.
+///
+/// Entirely fixed text for this error class — it states the rule and names neither the
+/// trail nor any value the request carried.
+const NOTHING_LOGGED_MESSAGE: &str = "Invalid combination of parameters in EventSelectors. \
+     When includeManagementEvents is false, DataResources must not be empty";
+
+/// Whether `selector` would log nothing at all.
+///
+/// A basic selector logs management events, data events for the resources it names, or
+/// both. `IncludeManagementEvents` defaults to
+/// [`crate::state::DEFAULT_INCLUDE_MANAGEMENT_EVENTS`] when the request leaves it out, so
+/// a selector logs nothing exactly when management events are EXCLUDED and it names no
+/// data resource — an absent `DataResources` and an empty list alike, since neither names
+/// one.
+fn selector_logs_nothing(selector: &EventSelector) -> bool {
+    let includes_management = selector
+        .include_management_events
+        .unwrap_or(crate::state::DEFAULT_INCLUDE_MANAGEMENT_EVENTS);
+    let data_resources = selector.data_resources.as_ref().map_or(0, Vec::len);
+    !includes_management && data_resources == 0
 }
 
 /// Check an advanced selector set against the documented limits.

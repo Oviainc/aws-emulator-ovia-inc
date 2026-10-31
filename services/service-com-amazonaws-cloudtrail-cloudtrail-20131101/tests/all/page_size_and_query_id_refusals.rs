@@ -108,6 +108,26 @@ async fn record_events(emulator: &Emulator, count: usize) {
     }
 }
 
+/// A `LookupEvents` request for the WRITE events alone.
+///
+/// Every call this service serves is recorded, a lookup included, so the cases below ask
+/// for the events their own writes made rather than for every event: without the filter a
+/// page walk would also report the records of the lookups the walk itself made, and no
+/// count over the history would be stable. `ReadOnly` is one of the eight lookup
+/// attributes the model's `LookupAttributeKey` declares.
+fn lookup_writes(max_results: Option<i64>, token: Option<&str>) -> Value {
+    let mut body = json!({
+        "LookupAttributes": [{"AttributeKey": "ReadOnly", "AttributeValue": "false"}],
+    });
+    if let Some(max_results) = max_results {
+        body["MaxResults"] = json!(max_results);
+    }
+    if let Some(token) = token {
+        body["NextToken"] = json!(token);
+    }
+    body
+}
+
 /// RULE: a page maximum documented of the results RETURNED bounds the page, not the
 /// request — so a `MaxResults` above it is served with the page capped at the maximum
 /// and a `NextToken` while events remain, and the whole history stays walkable by a
@@ -137,11 +157,9 @@ async fn a_lookup_page_size_above_its_maximum_is_served_with_the_page_capped() {
     ];
 
     for (case, max_results) in rows {
-        let mut body = json!({});
-        if let Some(max_results) = max_results {
-            body["MaxResults"] = json!(max_results);
-        }
-        let reply = emulator.call("LookupEvents", &body).await;
+        let reply = emulator
+            .call("LookupEvents", &lookup_writes(max_results, None))
+            .await;
         // The page the maximum allows, over the events recorded.
         let expected = max_results
             .unwrap_or(LOOKUP_MAX_RESULTS_MAX)
@@ -170,11 +188,12 @@ async fn a_lookup_page_size_above_its_maximum_is_served_with_the_page_capped() {
     let mut token: Option<String> = None;
     for page in 0..=RECORDED_EVENTS {
         let case = format!("walking at MaxResults 1001, page {page}");
-        let mut body = json!({"MaxResults": 1_001});
-        if let Some(token) = &token {
-            body["NextToken"] = json!(token);
-        }
-        let reply = emulator.call("LookupEvents", &body).await;
+        let reply = emulator
+            .call(
+                "LookupEvents",
+                &lookup_writes(Some(1_001), token.as_deref()),
+            )
+            .await;
         let ids = reply.event_ids(&case);
         assert!(
             i64::try_from(ids.len()).expect("a page length fits an i64") <= LOOKUP_MAX_RESULTS_MAX,

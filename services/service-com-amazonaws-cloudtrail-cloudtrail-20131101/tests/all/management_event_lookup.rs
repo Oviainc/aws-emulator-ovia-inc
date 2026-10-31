@@ -9,10 +9,12 @@
 //!
 //! The rules under test, each grounded in this service's Smithy model:
 //!
-//! * a call that CHANGES state is recorded in the account's management-event log —
-//!   successes and refusals alike, the refusal carrying the error code it answered with
-//!   — and `LookupEvents` reports the record;
-//! * a REPORTING call records nothing, so no read changes what a later lookup sees;
+//! * EVERY call this service serves is recorded in the account's management-event log —
+//!   the calls that CHANGE state and the calls that only REPORT it, successes and
+//!   refusals alike, the refusal carrying the error code it answered with — and
+//!   `LookupEvents` reports the record;
+//! * a REPORTING call is recorded as a read (`readOnly` true) and with no
+//!   `responseElements`, which is what the `ReadOnly` lookup attribute filters on;
 //! * "The events list is sorted by time. The most recent event is listed first.";
 //! * `StartTime` / `EndTime` bound the window INCLUSIVELY ("after or at" / "before or
 //!   at"), only the last 90 days are retrievable, and `StartTime` after `EndTime` is an
@@ -32,6 +34,11 @@
 //! ([`service_common::management_events`]) at whole-second times, which is the same store
 //! a served call writes; the cases above them drive real calls, so the recorder and the
 //! reader are both exercised end to end.
+//!
+//! A case that seeds events and then drives several lookups BOUNDS its window around the
+//! instants it seeded, or filters on `ReadOnly`: every lookup is itself a served call and
+//! so is itself recorded, so a window reaching the present holds the records of the
+//! lookups the case has already made.
 //!
 //! The emulator fixture is the crate's shared one (`crate::emulator`); this file adds
 //! only the helpers this suite needs.
@@ -94,6 +101,16 @@ fn text(value: &Value, member: &str) -> String {
         .to_string()
 }
 
+/// `body` with the lookup narrowed to the WRITE events, which is what a case that seeds
+/// events and then drives several lookups asks for: every lookup is itself a served call,
+/// recorded as a READ, so an unfiltered window reaching the present would also hold the
+/// records of the lookups the case has already made. The seeded events are writes, so the
+/// attribute selects exactly them and the window rule under test is unaffected.
+fn only_writes(mut body: Value) -> Value {
+    body["LookupAttributes"] = json!([{"AttributeKey": "ReadOnly", "AttributeValue": "false"}]);
+    body
+}
+
 /// The operations this suite drives on the shared fixture.
 impl Emulator {
     /// `LookupEvents` with `body`, from [`HOME_REGION`].
@@ -104,11 +121,6 @@ impl Emulator {
     /// Write `call` into the shared log as served at `at`, and answer its event id.
     fn seed(&self, call: ServedApiCall, at: SystemTime) -> String {
         self.management_event_log().lock().record(call, at)
-    }
-
-    /// How many records the log holds.
-    fn recorded(&self) -> usize {
-        self.management_event_log().lock().len()
     }
 }
 
@@ -172,10 +184,11 @@ fn cloud_trail_event(event: &Value, case: &str) -> Value {
 #[tokio::test]
 async fn a_served_write_is_recorded_and_reported() {
     let emulator = Emulator::new();
+    let trail = "audited-trail";
     let created = emulator
         .call(
             "CreateTrail",
-            &json!({"Name": "audited-trail", "S3BucketName": "my-bucket"}),
+            &json!({"Name": trail, "S3BucketName": "my-bucket"}),
         )
         .await;
     let trail_arn = text(created.expect_ok("CreateTrail"), "TrailARN");
@@ -208,9 +221,12 @@ async fn a_served_write_is_recorded_and_reported() {
             .is_some_and(|seconds| seconds > 0.0),
         "case EventTime: expected the instant the call was served, got {event:?}"
     );
+    // `Resource$ResourceName` is "the name of the resource referenced by the event …
+    // user-created names", so the record names the trail by its NAME whichever form the
+    // caller addressed it in.
     assert_eq!(
         event.get("Resources"),
-        Some(&json!([{"ResourceType": "AWS::CloudTrail::Trail", "ResourceName": trail_arn}])),
+        Some(&json!([{"ResourceType": "AWS::CloudTrail::Trail", "ResourceName": trail}])),
         "case Resources: expected the created trail, got {event:?}"
     );
 
@@ -309,12 +325,6 @@ async fn every_mutating_operation_records_its_call() {
     let emulator = Emulator::new();
     let trail = "audited-lifecycle";
     let absent = "no-such-trail";
-    let arn_of = |name: &str| {
-        format!(
-            "arn:aws:cloudtrail:{HOME_REGION}:{}:trail/{name}",
-            engine::emulator_account_id()
-        )
-    };
     let create = json!({"Name": trail, "S3BucketName": "my-bucket"});
     let row = |case, operation, request, failure, addressed| ServedCase {
         case,
@@ -392,7 +402,13 @@ async fn every_mutating_operation_records_its_call() {
             ),
         }
 
-        let events = emulator.lookup(&json!({})).await.events(case);
+        // Filtered to the WRITES: the lookup each row makes is itself a served call and
+        // so is itself recorded, so counting over every event would count this suite's
+        // own reads.
+        let writes = json!({
+            "LookupAttributes": [{"AttributeKey": "ReadOnly", "AttributeValue": "false"}],
+        });
+        let events = emulator.lookup(&writes).await.events(case);
         assert_eq!(
             events.len(),
             index + 1,
@@ -414,7 +430,7 @@ async fn every_mutating_operation_records_its_call() {
             recorded.get("Resources"),
             Some(&json!([{
                 "ResourceType": "AWS::CloudTrail::Trail",
-                "ResourceName": arn_of(addressed),
+                "ResourceName": addressed,
             }])),
             "case {case:?}: expected the addressed trail, got {recorded:?}"
         );
@@ -432,10 +448,15 @@ async fn every_mutating_operation_records_its_call() {
     }
 }
 
-/// A REPORTING call records nothing: reading the trail registry, or looking events up,
-/// leaves every later lookup answering exactly what it answered before.
+/// Every REPORTING call is recorded too — as a READ: `readOnly` true and no
+/// `responseElements` — which is what makes a client's own `Get*` / `List*` /
+/// `Describe*` traffic auditable and what the `ReadOnly` lookup attribute filters on.
+///
+/// The rows are the implemented reporting operations of this service, `LookupEvents`
+/// itself included: a lookup is a served call like any other, so it is recorded like any
+/// other.
 #[tokio::test]
-async fn reporting_calls_do_not_change_what_a_later_lookup_sees() {
+async fn every_reporting_operation_is_recorded_as_a_read() {
     let emulator = Emulator::new();
     emulator
         .call(
@@ -445,28 +466,73 @@ async fn reporting_calls_do_not_change_what_a_later_lookup_sees() {
         .await
         .expect_ok("CreateTrail");
 
-    let before = emulator.lookup(&json!({})).await.events("first lookup");
-    for (operation, body) in [
+    // (the operation to drive, its request)
+    let rows = [
         ("GetTrail", json!({"Name": "read-trail"})),
         ("GetTrailStatus", json!({"Name": "read-trail"})),
         ("DescribeTrails", json!({})),
         ("ListTrails", json!({})),
+        ("GetEventSelectors", json!({"TrailName": "read-trail"})),
         ("LookupEvents", json!({})),
-    ] {
+    ];
+    for (operation, body) in &rows {
         emulator
-            .call(operation, &body)
+            .call(operation, body)
             .await
             .expect_ok(&format!("{operation} as a read"));
-        let after = emulator.lookup(&json!({})).await.events("lookup after a read");
+    }
+
+    // Found the way a client finds its own read: a lookup by event name.
+    for (operation, _) in &rows {
+        let found = emulator
+            .lookup(&json!({
+                "LookupAttributes": [{"AttributeKey": "EventName", "AttributeValue": operation}],
+            }))
+            .await
+            .events(operation);
+        assert!(
+            !found.is_empty(),
+            "case {operation}: a served read must be recorded, got {found:?}"
+        );
+        let recorded = &found[0];
         assert_eq!(
-            after, before,
-            "case {operation}: a read must not change what a later lookup sees"
+            text(recorded, "ReadOnly"),
+            "true",
+            "case {operation}: a call that only reports state is a read event, got \
+             {recorded:?}"
+        );
+        let document = cloud_trail_event(recorded, operation);
+        assert_eq!(
+            document.get("eventName"),
+            Some(&json!(operation)),
+            "case {operation}: the envelope and the document must name one operation, \
+             got {document}"
+        );
+        assert_eq!(
+            document.get("responseElements"),
+            Some(&Value::Null),
+            "case {operation}: a read is recorded with no response elements, got \
+             {document}"
+        );
+        assert_eq!(
+            document.get("errorCode"),
+            None,
+            "case {operation}: a served read carries no error code, got {document}"
         );
     }
+
+    // And the one write is still told apart from every read by the attribute that names
+    // the difference.
+    let writes = emulator
+        .lookup(&json!({
+            "LookupAttributes": [{"AttributeKey": "ReadOnly", "AttributeValue": "false"}],
+        }))
+        .await
+        .event_names("the writes");
     assert_eq!(
-        emulator.recorded(),
-        1,
-        "case reads: only the one write may be recorded"
+        writes,
+        vec!["CreateTrail"],
+        "case the writes: only the create changed state, got {writes:?}"
     );
 }
 
@@ -572,7 +638,7 @@ async fn window_bounds_are_inclusive_and_exact() {
     ];
 
     for (case, body, expected) in cases {
-        let names = emulator.lookup(&body).await.event_names(case);
+        let names = emulator.lookup(&only_writes(body)).await.event_names(case);
         assert_eq!(
             names, expected,
             "case {case:?}: expected {expected:?}, got {names:?}"
@@ -597,10 +663,15 @@ async fn a_start_after_the_end_is_refused() {
             "StartTime": epoch_seconds(base) + start,
             "EndTime": epoch_seconds(base) + end,
         });
-        emulator
-            .lookup(&body)
-            .await
-            .expect_error(case, 400, "InvalidTimeRangeException");
+        let reply = emulator.lookup(&body).await;
+        reply.expect_error(case, 400, "InvalidTimeRangeException");
+        // The fixed sentence for this error class: no part of the window is interpolated
+        // into it, so every inverted window is refused with the same words.
+        assert_eq!(
+            reply.message(),
+            "The start time precedes the end time.",
+            "case {case:?}: expected the refusal's own sentence, got {reply:?}"
+        );
     }
     let body = json!({"StartTime": epoch_seconds(base), "EndTime": epoch_seconds(base)});
     let names = emulator.lookup(&body).await.event_names("equal bounds");
@@ -650,7 +721,13 @@ async fn each_lookup_attribute_filters_on_its_own_field() {
 
     for (key, value, expected) in cases {
         let case = format!("{key}={value}");
-        let body = json!({"LookupAttributes": [{"AttributeKey": key, "AttributeValue": value}]});
+        // Bounded to the instants this case seeded: every lookup below is itself a
+        // served call, recorded as a read at the present instant, so an unbounded
+        // window would also report the lookups this loop has already made.
+        let body = json!({
+            "LookupAttributes": [{"AttributeKey": key, "AttributeValue": value}],
+            "EndTime": epoch_seconds(base + Duration::from_secs(60)),
+        });
         let names = emulator.lookup(&body).await.event_names(&case);
         assert_eq!(
             names, expected,
@@ -743,7 +820,7 @@ async fn event_category_selects_insights_events_only() {
         "case EventCategory=insight: a management call is not an Insights event, got {names:?}"
     );
     let names = emulator
-        .lookup(&json!({}))
+        .lookup(&only_writes(json!({})))
         .await
         .event_names("no EventCategory");
     assert_eq!(
@@ -803,7 +880,7 @@ async fn max_results_bounds_the_page_and_the_token_is_stable() {
         let mut token: Option<String> = None;
         let mut pages = 0;
         loop {
-            let mut body = json!({"MaxResults": page_size});
+            let mut body = only_writes(json!({"MaxResults": page_size}));
             if let Some(token) = &token {
                 body["NextToken"] = json!(token);
             }
@@ -840,7 +917,9 @@ async fn max_results_bounds_the_page_and_the_token_is_stable() {
     }
 
     // A page that holds everything left carries no token.
-    let reply = emulator.lookup(&json!({"MaxResults": 5})).await;
+    let reply = emulator
+        .lookup(&only_writes(json!({"MaxResults": 5})))
+        .await;
     assert_eq!(
         reply.next_token("the whole result set"),
         None,

@@ -18,8 +18,8 @@
 //! * `PutEventSelectors` stores either the basic or the advanced selectors, never both,
 //!   replacing whichever kind was configured before, and fills in each member's
 //!   documented default;
-//! * a selector set outside the documented limits is refused with
-//!   `InvalidEventSelectorsException` and changes nothing;
+//! * a selector set outside the documented limits — or one that would log NOTHING — is
+//!   refused with `InvalidEventSelectorsException` and changes nothing;
 //! * both operations read a trail identifier as a bare name or a trail ARN and refuse a
 //!   malformed one as the form it was written in, while `PutEventSelectors` — unlike the
 //!   read — runs only in the trail's home Region;
@@ -84,6 +84,10 @@ async fn create_trail(emulator: &Emulator, region: &str, request: &Value) -> Str
 
 /// `n` basic event selectors spread over at most the documented maximum, carrying
 /// `data_resources` `DataResource` entries in total.
+///
+/// A selector that carries no data resource INCLUDES management events: one that excludes
+/// them and names no data resource would log nothing at all, which the service refuses, so
+/// a generated selector logs management events exactly when it names no data resource.
 fn selectors_with_data_resources(selectors: usize, data_resources: usize) -> Value {
     let rows: Vec<Value> = (0..selectors)
         .map(|selector| {
@@ -98,7 +102,11 @@ fn selectors_with_data_resources(selectors: usize, data_resources: usize) -> Val
                     })
                 })
                 .collect();
-            json!({"ReadWriteType": "All", "IncludeManagementEvents": false, "DataResources": resources})
+            json!({
+                "ReadWriteType": "All",
+                "IncludeManagementEvents": resources.is_empty(),
+                "DataResources": resources,
+            })
         })
         .collect();
     Value::Array(rows)
@@ -249,13 +257,25 @@ async fn put_event_selectors_round_trips_through_get_event_selectors() {
             ),
         ),
         (
-            "one selector carrying only IncludeManagementEvents".to_string(),
-            json!({"EventSelectors": [{"IncludeManagementEvents": false}]}),
+            // `IncludeManagementEvents` is carried WITH a data resource: a selector that
+            // excludes management events and names no data resource logs nothing and is
+            // refused (see `a_selector_set_outside_the_documented_rules_is_refused`).
+            "one selector excluding management events for one data resource".to_string(),
+            json!({"EventSelectors": [{
+                "IncludeManagementEvents": false,
+                "DataResources": [{
+                    "Type": BASIC_DATA_RESOURCE_TYPES[0],
+                    "Values": ["arn:aws:dynamodb:us-east-1:000000000000:table/orders"],
+                }],
+            }]}),
             (
                 json!([{
                     "ReadWriteType": "All",
                     "IncludeManagementEvents": false,
-                    "DataResources": [],
+                    "DataResources": [{
+                        "Type": BASIC_DATA_RESOURCE_TYPES[0],
+                        "Values": ["arn:aws:dynamodb:us-east-1:000000000000:table/orders"],
+                    }],
                     "ExcludeManagementEventSources": [],
                 }]),
                 Value::Null,
@@ -671,6 +691,16 @@ async fn a_selector_set_outside_the_documented_rules_is_refused() {
         (
             "a management event source that cannot be excluded".to_string(),
             json!({"EventSelectors": [{"ExcludeManagementEventSources": ["s3.amazonaws.com"]}]}),
+            "InvalidEventSelectorsException",
+        ),
+        (
+            // A selector that excludes management events and names no data resource
+            // selects nothing at all; it is refused rather than installed, and the row
+            // below that carries the same `IncludeManagementEvents` WITH a data resource
+            // is served. The exact sentence is pinned in
+            // `tests/all/selectors_that_log_nothing.rs`.
+            "one selector carrying only IncludeManagementEvents false".to_string(),
+            json!({"EventSelectors": [{"IncludeManagementEvents": false}]}),
             "InvalidEventSelectorsException",
         ),
         (

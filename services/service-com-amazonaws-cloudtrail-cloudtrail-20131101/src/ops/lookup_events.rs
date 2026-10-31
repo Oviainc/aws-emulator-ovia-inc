@@ -212,11 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if start > end {
                 return Err(LookupEventsErrorModeled::InvalidTimeRangeException(
                     InvalidTimeRangeException {
-                        message: Some(format!(
-                            "StartTime ({start} ms since the epoch) is after EndTime \
-                             ({end} ms since the epoch): the start of a lookup window \
-                             must not be after its end"
-                        )),
+                        message: Some(INVERTED_TIME_RANGE_MESSAGE.to_string()),
                     },
                 )
                 .into());
@@ -307,6 +303,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// How CloudTrail words a lookup window whose `StartTime` is after its `EndTime`: the
+/// fixed sentence for that error class, carrying no part of the request.
+///
+/// `InvalidTimeRangeException` "occurs if the timestamp values are not valid. Either the
+/// start time occurs after the end time, or the time range is outside the range of
+/// possible values", and the recorded refusal of an inverted window is this one sentence.
+const INVERTED_TIME_RANGE_MESSAGE: &str = "The start time precedes the end time.";
 
 /// `MaxResults`'s modelled lower bound (`range 1..50`).
 const MAX_RESULTS_MIN: i32 = 1;

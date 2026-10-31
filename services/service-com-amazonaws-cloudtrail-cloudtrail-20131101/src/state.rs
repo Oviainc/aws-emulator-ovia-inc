@@ -13,8 +13,9 @@
 //! record `LookupEvents` serves. The log itself is the shared
 //! [`service_common::management_events::ManagementEventLog`], because CloudTrail records
 //! the management calls of EVERY service and only the service that served a call knows
-//! it happened; what lives here is how a CloudTrail call is written into it
-//! ([`record_management_event`]), reached from each mutating handler.
+//! it happened; what lives here is how this service REACHES that log
+//! ([`management_event_log`]), which both the audit leg that records a call
+//! (`crate::service::management_events`) and the handler that reports one read it through.
 //!
 //! It owns the CloudTrail Lake registries on the same terms. An event data store
 //! and the queries run against it are named by a dozen operations (`StartQuery`,
@@ -48,9 +49,7 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime};
 
-use service_common::management_events::{
-    recorded_caller, recorded_user_agent, AuditedResource, ManagementEventLog, ServedApiCall,
-};
+use service_common::management_events::ManagementEventLog;
 
 use crate::ops::types::{
     AdvancedEventSelector, AggregationConfiguration, ContextKeySelector, EventDataStore,
@@ -2963,6 +2962,17 @@ impl ResourceKind {
         self.resource_prefix().trim_end_matches('/')
     }
 
+    /// The CloudFormation-style type name CloudTrail reports for this kind of resource in
+    /// an event's `Resources`, which a lookup by `ResourceType` filters on.
+    pub fn audited_resource_type(self) -> &'static str {
+        match self {
+            Self::Trail => TRAIL_RESOURCE_TYPE,
+            Self::EventDataStore => "AWS::CloudTrail::EventDataStore",
+            Self::Dashboard => "AWS::CloudTrail::Dashboard",
+            Self::Channel => "AWS::CloudTrail::Channel",
+        }
+    }
+
     /// How a refusal names this kind of resource in prose.
     ///
     /// CloudTrail's resource-policy surface words a resource it could not find per
@@ -3743,108 +3753,4 @@ pub const EVENT_SOURCE: &str = "cloudtrail.amazonaws.com";
 /// The CloudFormation-style type name of the resource a trail event refers to, as
 /// CloudTrail reports it in an event's `Resources`.
 pub const TRAIL_RESOURCE_TYPE: &str = "AWS::CloudTrail::Trail";
-
-/// The IAM user name a long-term access key speaks for in this emulator — the shared
-/// fact, re-exported so this service's own reader of it keeps reaching it through
-/// `crate::state`.
-pub use service_common::management_events::AMBIENT_USER_NAME;
-
-/// What a handler reports about the call it has just served, for the audit record.
-pub struct ServedCall<'a> {
-    /// The operation's modelled name (`Self::NAME`).
-    pub operation: &'a str,
-    /// The Region the call was served in.
-    pub region: &'a str,
-    /// Whether the call only READ state.
-    pub read_only: bool,
-    /// The resources the call acted on.
-    pub resources: Vec<AuditedResource>,
-    /// The request's parameters, named as the model spells them.
-    pub request_parameters: ::serde_json::Value,
-    /// The values the response carried, or `None` for a call that failed or that
-    /// answers with nothing.
-    pub response_elements: Option<::serde_json::Value>,
-    /// The wire error code the call answered with, if it failed.
-    pub error_code: Option<String>,
-    /// The message that went with it.
-    pub error_message: Option<String>,
-}
-
-/// The `requestParameters` / `responseElements` of an audit record, and the error code
-/// and message a failed call was answered with: the SHARED writers every service that
-/// records a call uses ([`service_common::management_events`]), re-exported so this
-/// service's handlers reach them through `crate::state` beside
-/// [`record_management_event`].
-pub use service_common::management_events::{recorded_failure, recorded_members};
-
-/// The resources an audit record reports for a call that addressed one trail.
-///
-/// A malformed identifier addresses no trail, so such a call is recorded with no
-/// resource rather than with an ARN built from an identifier the service rejected.
-pub fn trail_resources(identifier: &str, request_region: &str) -> Vec<AuditedResource> {
-    parse_trail_identifier(identifier)
-        .ok()
-        .map(|parsed| {
-            AuditedResource::new(
-                TRAIL_RESOURCE_TYPE,
-                trail_arn(parsed.region().unwrap_or(request_region), parsed.name()),
-            )
-        })
-        .into_iter()
-        .collect()
-}
-
-/// Record a call this service served in the account's management-event log, so
-/// `LookupEvents` reports it.
-///
-/// Called from the handlers that CHANGE state. A reporting operation records nothing:
-/// an audit record is state, and a read must not change what a later reader sees — so
-/// every event this service writes carries `readOnly: false`.
-///
-/// Recording is best-effort by design: an engine that carries no log (a unit test
-/// constructing an operation over a bare engine) still serves the call, because failing
-/// a caller's write because the audit log is unreachable would be a worse answer than
-/// serving it unrecorded.
-pub fn record_management_event<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    parts: &http::request::Parts,
-    call: ServedCall<'_>,
-) {
-    let Some(log) = management_event_log(engine) else {
-        // Not silent: an unrecorded audit write leaves no trace in the log by
-        // definition, so it leaves one here instead.
-        ::tracing::warn!(
-            operation = call.operation,
-            "the engine carries no management-event log: the call was served unrecorded"
-        );
-        return;
-    };
-    let caller = recorded_caller(parts);
-    log.lock().record(
-        ServedApiCall {
-            event_name: call.operation.to_string(),
-            event_source: EVENT_SOURCE.to_string(),
-            aws_region: call.region.to_string(),
-            read_only: call.read_only,
-            access_key_id: caller.access_key_id,
-            user_name: caller.user_name,
-            principal_type: caller.principal_type.to_string(),
-            // The unique id of the IAM entity a long-term key speaks for is IAM's to
-            // mint, and this service does not resolve one, so the record leaves it out
-            // rather than naming a principal nothing resolves.
-            principal_id: None,
-            // A call to this service is signed with an AWS credential, so its caller is
-            // no federated user an external provider authenticated.
-            identity_provider: None,
-            account_id: ::engine::emulator_account_id().to_string(),
-            user_agent: recorded_user_agent(parts),
-            resources: call.resources,
-            request_parameters: call.request_parameters,
-            response_elements: call.response_elements,
-            error_code: call.error_code,
-            error_message: call.error_message,
-        },
-        SystemTime::now(),
-    );
-}
 

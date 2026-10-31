@@ -57,12 +57,14 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod management_events;
+
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints;
+use service_common::audited_operation::AuditedDefinition;
 use smithy_server_runtime::{
-    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
-    OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation,
-    ViolationKind,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, ErasedServiceDefinition, Operation,
+    OperationContext, Refusal, Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -399,30 +401,11 @@ fn invalid_event_selectors(violations: &[Violation]) -> Option<Refused> {
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
-    /// The operations whose input carries a tag list, each the operation the generated
-    /// table holds wrapped in [`InModelledEnvelope`] and built from the SAME shared
-    /// engine, so a wrapped operation reads and writes the one store. Keyed by the
-    /// operation shape name, which is the key the generated table uses.
-    in_modelled_envelope: OperationRoutingTable,
-}
-
-/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
-/// [`InModelledEnvelope`] and keyed by its operation shape name — the name
-/// `service_common::rpc_target` reads out of an `X-Amz-Target` and the generated table
-/// is keyed by.
-macro_rules! wrap_operations {
-    ($table:expr, $engine:expr, $refusal:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
-        $(
-            $table.add_operation(
-                stringify!($operation),
-                ::std::boxed::Box::new(InModelledEnvelope::new(
-                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
-                    $refusal,
-                )) as ::std::boxed::Box<dyn ErasedOperation>,
-            );
-        )+
-    };
+    /// The generated entry, routing through this service's AUDITED operations: every call
+    /// it serves is a management event of this service, recorded in the account's event
+    /// history where `LookupEvents` reads it (see [`management_events`]). Identity, the
+    /// protocol and every framework error renderer stay the generated entry's.
+    entry: AuditedDefinition<crate::ServiceDefinition<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -430,49 +413,33 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
-        let mut in_modelled_envelope = OperationRoutingTable::new();
-        // Every operation whose input carries a tag list — the `TagsList` of the
-        // tagging pair and of the three creates that seed tags, and `CreateChannel`'s
-        // `Tags` (`smithy_query(query="digest")`). An operation that takes no tag
-        // cannot break a tag's length, so it is not wrapped and keeps the generated
-        // table's own entry.
-        wrap_operations!(
-            in_modelled_envelope,
-            engine,
-            ModelledRefusal::InvalidTagParameter,
-            add_tags::AddTags,
-            create_channel::CreateChannel,
-            create_dashboard::CreateDashboard,
-            create_event_data_store::CreateEventDataStore,
-            create_trail::CreateTrail,
-            remove_tags::RemoveTags,
-        );
-        // Every operation whose model declares `InvalidMaxResultsException` for the
-        // member it declares as its `@paginated` `pageSize`, and whose page-size upper
-        // bound the service enforces on the REQUEST
-        // (`smithy_query(query="operation", operation="ListQueries,ListEventDataStores")`).
-        // Three paged operations are deliberately absent:
+        // Every operation of this service, served through the audit recorder — and, for
+        // the operations that need it, through [`InModelledEnvelope`] INSIDE that
+        // recorder. Which operations are wrapped in which modelled refusal is stated
+        // once, in [`management_events::audited_table`]:
         //
-        // * a paged operation whose model does NOT declare the shape keeps the
-        //   framework's own refusal, because answering a code its model does not carry
-        //   would be the same defect in the other direction;
-        // * `GetQueryResults`, whose `MaxQueryResults` its `@paginated` trait does not
-        //   name as a page size at all, so a value outside that member's range is the
-        //   generic `ValidationException` envelope the framework renders;
-        // * `LookupEvents`, whose maximum is stated of the results RETURNED ("The
-        //   default number of results returned is 50, with a maximum of 50 possible"),
-        //   so a larger limit is served with a capped page instead of being refused —
-        //   the member carries `skip_validation` and the handler caps the page.
-        wrap_operations!(
-            in_modelled_envelope,
-            engine,
-            ModelledRefusal::InvalidMaxResults,
-            list_event_data_stores::ListEventDataStores,
-            list_queries::ListQueries,
-        );
+        // * the operations whose input carries a tag list — the `TagsList` of the
+        //   tagging pair and of the three creates that seed tags, and `CreateChannel`'s
+        //   `Tags` (`smithy_query(query="digest")`). An operation that takes no tag
+        //   cannot break a tag's length, so it is not wrapped;
+        // * the operations whose model declares `InvalidMaxResultsException` for the
+        //   member it declares as its `@paginated` `pageSize`
+        //   (`smithy_query(query="operation", operation="ListQueries,ListEventDataStores")`).
+        //   Three paged operations are deliberately absent there:
+        //
+        //   - a paged operation whose model does NOT declare the shape keeps the
+        //     framework's own refusal, because answering a code its model does not carry
+        //     would be the same defect in the other direction;
+        //   - `GetQueryResults`, whose `MaxQueryResults` its `@paginated` trait does not
+        //     name as a page size at all, so a value outside that member's range is the
+        //     generic `ValidationException` envelope the framework renders;
+        //   - `LookupEvents`, whose maximum is stated of the results RETURNED ("The
+        //     default number of results returned is 50, with a maximum of 50 possible"),
+        //     so a larger limit is served with a capped page instead of being refused —
+        //     the member carries `skip_validation` and the handler caps the page.
+        let audited = management_events::audited_table(&engine);
         Self {
-            entry: crate::ServiceDefinition::new(engine),
-            in_modelled_envelope,
+            entry: AuditedDefinition::new(crate::ServiceDefinition::new(engine), audited),
         }
     }
 
@@ -666,15 +633,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service, or an operation this model does not bind, still falls through to the
         // framework's own routing (and its routing error).
         //
-        // The operation that name resolves to is the generated table's own: for an
-        // operation whose input carries a tag list it is served through
-        // `InModelledEnvelope`, which refuses a tag outside its modelled length in
-        // this service's own error shape and hands every other request to the very
-        // same generated operation. Nothing is re-routed.
+        // The operation that name resolves to is the AUDITED table's own (see
+        // [`management_events`]) — the same table this service's definition routes every
+        // other request through, so no request reaches a path that records nothing. For
+        // an operation whose input carries a tag list the audited call sits inside
+        // `InModelledEnvelope`, which refuses a tag outside its modelled length in this
+        // service's own error shape and hands every other request to the very same
+        // generated operation. Nothing is re-routed.
         let operation = service_common::rpc_target::requested_operation(req, self.shape_id())?;
-        self.in_modelled_envelope
-            .get(operation)
-            .or_else(|| self.entry.routing_table().get(operation))
+        self.entry.routing_table().get(operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

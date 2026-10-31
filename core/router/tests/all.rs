@@ -33,6 +33,12 @@ mod codepipeline_execution_controls;
 // and the sorted `i…` span are both regions concurrently landing suites add their line to.
 #[path = "all/iam_management_events.rs"]
 mod iam_management_events;
+// Declared in this same head region, for the reason the entry above records: the appended
+// tail and the sorted `s…` span are both regions concurrently landing suites add their line
+// to. `sts_management_events` pins that an STS call — a read-only one included — is in
+// CloudTrail event history, and that no credential material reaches a record.
+#[path = "all/sts_management_events.rs"]
+mod sts_management_events;
 // Declared here, at the head, for the reason the entries below record: the appended tail
 // and the sorted `a…` span are both regions concurrently landing suites add their line to.
 #[path = "all/assembled_router_refusal_identities.rs"]

@@ -134,12 +134,16 @@ impl<Eng: Send + Sync + 'static> AuditedService for RdsAudit<Eng> {
 
     fn resources(
         &self,
+        operation: &str,
         request_parameters: &serde_json::Value,
         region: &str,
     ) -> Vec<AuditedResource> {
         // The two resources whose ARN this service mints, named by the member every
-        // operation that addresses one carries. A call that names neither records no
-        // resource rather than one built from a member whose resource kind is unknown.
+        // operation that addresses one carries. The member alone names the resource
+        // kind here, so which operation served the call does not enter into it. A call
+        // that names neither records no resource rather than one built from a member
+        // whose resource kind is unknown.
+        let _ = operation;
         let mut addressed = Vec::new();
         if let Some(identifier) = Self::named(
             request_parameters,

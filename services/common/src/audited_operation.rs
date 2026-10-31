@@ -161,12 +161,18 @@ pub trait AuditedService: Send + Sync + 'static {
     /// CloudTrail reports in an event's `Resources`, which a lookup by `ResourceName` or
     /// `ResourceType` filters on. The default is none: a service that can name the
     /// resource a call addressed overrides this.
+    ///
+    /// `operation` is the modelled name of the operation that served the call, because
+    /// which resource a parameter names can be the OPERATION's fact rather than the
+    /// member's: one member name (`Name`) addresses a different kind of resource on each
+    /// of the creates that carry it.
     fn resources(
         &self,
+        operation: &str,
         request_parameters: &serde_json::Value,
         region: &str,
     ) -> Vec<crate::management_events::AuditedResource> {
-        let _ = (request_parameters, region);
+        let _ = (operation, request_parameters, region);
         Vec::new()
     }
 
@@ -302,7 +308,7 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
             identity_provider: None,
             account_id: self.service.account_id(),
             user_agent: crate::management_events::recorded_user_agent(ctx.parts()),
-            resources: self.service.resources(request_parameters, &region),
+            resources: self.service.resources(O::NAME, request_parameters, &region),
             aws_region: region,
             request_parameters: request_parameters.clone(),
             response_elements,

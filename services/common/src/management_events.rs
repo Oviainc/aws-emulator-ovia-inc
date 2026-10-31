@@ -615,7 +615,9 @@ impl ::aws_smithy_schema::serde::ShapeSerializer for RecordedShape<'_> {
         schema: &::aws_smithy_schema::Schema,
         value: &::aws_smithy_types::DateTime,
     ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
-        // The same ISO 8601 rendering an event's own `eventTime` carries.
+        // The ISO 8601 `<date>T<time>Z` rendering, carrying the value's own resolution:
+        // this is a member the CALL carried, so what is recorded is the instant the caller
+        // sent rather than the second-resolution form an event's own `eventTime` has.
         let rendered = value
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
             .unwrap_or_default();
@@ -750,8 +752,12 @@ pub struct ServedApiCall {
     /// `userIdentity.type` — one of the `PRINCIPAL_TYPE_*` constants.
     pub principal_type: String,
     /// The unique identifier of the entity that made the call, as CloudTrail reports it in
-    /// `userIdentity.principalId`. `None` for a caller whose principal this emulator
-    /// cannot identify, which is what leaves the field out of the record.
+    /// `userIdentity.principalId`. `None` leaves the resolution to the record: the
+    /// principal a long-term credential speaks for is the account's own IAM user, whose
+    /// unique id is stated once by [`crate::caller_principal`], and a principal this
+    /// emulator cannot identify at all is recorded without the field. A recorder that
+    /// knows an id of its own — one it minted for a federated session, say — states it
+    /// here.
     pub principal_id: Option<String>,
     /// The EXTERNAL identity provider that authenticated the caller, for a call made on
     /// behalf of a federated user: CloudTrail reports it as `userIdentity.identityProvider`
@@ -820,11 +826,36 @@ impl ManagementEvent {
             "accountId".to_string(),
             serde_json::Value::String(call.account_id.clone()),
         );
-        if let Some(principal_id) = &call.principal_id {
+        // The IAM entity the call's principal IS, for the one principal this emulator can
+        // resolve: a long-term credential speaks for the account's single IAM user, whose
+        // ARN and unique id are stated once by [`crate::caller_principal`] — the same two
+        // values STS answers `GetCallerIdentity` with and IAM holds for that user. So a
+        // client that reads its own identity finds its calls' records naming it, rather
+        // than a `userIdentity` that names a user without naming who it is. A principal
+        // this emulator cannot resolve (a session, an unsigned request) is left without
+        // either field rather than given a made-up one.
+        let ambient_principal = call.principal_type == PRINCIPAL_TYPE_IAM_USER
+            && call.user_name.as_deref() == Some(AMBIENT_USER_NAME);
+        if ambient_principal {
             identity.insert(
-                "principalId".to_string(),
-                serde_json::Value::String(principal_id.clone()),
+                "arn".to_string(),
+                serde_json::Value::String(crate::caller_principal::ambient_user_arn()),
             );
+        }
+        match (&call.principal_id, ambient_principal) {
+            (Some(principal_id), _) => {
+                identity.insert(
+                    "principalId".to_string(),
+                    serde_json::Value::String(principal_id.clone()),
+                );
+            }
+            (None, true) => {
+                identity.insert(
+                    "principalId".to_string(),
+                    serde_json::Value::String(crate::caller_principal::ambient_user_id()),
+                );
+            }
+            (None, false) => {}
         }
         if let Some(access_key_id) = &call.access_key_id {
             identity.insert(
@@ -1031,10 +1062,21 @@ impl ManagementEventLog {
     }
 }
 
-/// Render `at` the way a CloudTrail event's `eventTime` carries it (ISO 8601, e.g.
-/// `2026-10-22T22:04:46Z`).
+/// Render `at` the way a CloudTrail event's `eventTime` carries it: ISO 8601 at
+/// WHOLE-SECOND resolution, `2026-10-22T22:04:46Z`.
+///
+/// The resolution is part of the format, not an accident of the clock: an event document's
+/// `eventTime` is the `yyyy-MM-dd'T'HH:mm:ss'Z'` form CloudTrail publishes for it (the
+/// pattern the CloudTrail event schema states for the member), so a consumer parsing it
+/// with that pattern reads every record this emulator writes. The instant is TRUNCATED to
+/// the second rather than rounded, so a rendered time never names an instant later than
+/// the call it records.
 fn iso8601(at: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from(at)
+    let whole_seconds = at
+        .duration_since(UNIX_EPOCH)
+        .map(|since| UNIX_EPOCH + Duration::from_secs(since.as_secs()))
+        .unwrap_or(at);
+    ::aws_smithy_types::DateTime::from(whole_seconds)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_default()
 }

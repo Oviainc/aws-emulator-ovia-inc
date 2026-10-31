@@ -177,3 +177,12 @@ mod dashboard_update_status;
 // request or of the dashboard interpolated into it.
 #[path = "all/dashboard_termination_protection_wording.rs"]
 mod dashboard_termination_protection_wording;
+// `event_history_of_every_served_call` pins that EVERY call this service serves — a read
+// as much as a write — is in event history, that an unfiltered window reports what was
+// recorded, and that a record names the resource its call addressed.
+#[path = "all/event_history_of_every_served_call.rs"]
+mod event_history_of_every_served_call;
+// `selectors_that_log_nothing` pins the refusal of a basic event selector that would log
+// nothing at all, and that the refusal leaves the trail's selectors untouched.
+#[path = "all/selectors_that_log_nothing.rs"]
+mod selectors_that_log_nothing;

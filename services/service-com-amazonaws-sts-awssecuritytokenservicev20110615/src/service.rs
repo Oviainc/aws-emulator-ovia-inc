@@ -42,6 +42,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod management_events;
 pub mod message_text;
 pub mod sensitive_members;
 
@@ -291,23 +292,6 @@ fn addresses_unattributed_query_request(parts: &http::request::Parts) -> bool {
         && form_encoded
 }
 
-/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
-/// [`StatedPerOperation`] and keyed by its operation shape name — the routing key
-/// [`smithy_server_runtime::ServerHttpProtocol::routing_key`] resolves and the generated
-/// table is keyed by.
-macro_rules! wrap_operations {
-    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
-        $(
-            $table.add_operation(
-                stringify!($operation),
-                ::std::boxed::Box::new(StatedPerOperation::new(
-                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
-                )) as ::std::boxed::Box<dyn ErasedOperation>,
-            );
-        )+
-    };
-}
-
 /// One modelled operation, served so that a refused request is stated the way AWS states
 /// it: with the value as SUBMITTED between the quotes.
 ///
@@ -451,10 +435,12 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// it. One instance for every request, as the framework's own protocols are
     /// ("Server protocols are stateless").
     protocol: QuerySignedCalls,
-    /// Every modelled operation of this service, each wrapped in [`StatedPerOperation`]
-    /// and keyed by the routing key the protocol resolves — the table
-    /// [`Service::override_operation`] serves a request from, so a refused request is
-    /// stated with the value it was refused for whichever operation it named.
+    /// Every modelled operation of this service, each served AUDITED — the call is
+    /// recorded in the account's event history (see [`management_events`]) — and inside
+    /// that, wrapped in [`StatedPerOperation`]; keyed by the routing key the protocol
+    /// resolves. It is the table [`Service::override_operation`] serves a request from, so
+    /// a refused request is stated with the value it was refused for whichever operation
+    /// it named, and no served call goes unrecorded.
     stated: smithy_server_runtime::OperationRoutingTable,
 }
 
@@ -463,22 +449,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
-        let mut stated = smithy_server_runtime::OperationRoutingTable::new();
-        wrap_operations!(
-            stated,
-            engine,
-            assume_role::AssumeRole,
-            assume_role_with_saml::AssumeRoleWithSAML,
-            assume_role_with_web_identity::AssumeRoleWithWebIdentity,
-            assume_root::AssumeRoot,
-            decode_authorization_message::DecodeAuthorizationMessage,
-            get_access_key_info::GetAccessKeyInfo,
-            get_caller_identity::GetCallerIdentity,
-            get_delegated_access_token::GetDelegatedAccessToken,
-            get_federation_token::GetFederationToken,
-            get_session_token::GetSessionToken,
-            get_web_identity_token::GetWebIdentityToken,
-        );
+        let stated = management_events::audited_table(&engine);
         Self {
             entry: ::service_common::query_error_envelope::RequestIdEnvelopeDefinition::new(
                 message_text::StatedMessageDefinition::new(Arc::clone(&engine)),
@@ -571,14 +542,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Every modelled operation is served WRAPPED. This is NOT a re-route: the key is
-        // the one this service's own protocol resolves — which reads the call from the
-        // query string when that is where SigV4 put it and from the form-encoded BODY
-        // otherwise (see [`QuerySignedCalls`]) — and the operation it names is the one
-        // served, wrapped in [`StatedPerOperation`] so a refused request quotes the value
-        // it refused. A key the model does not name resolves to `None` here exactly as it
-        // does in the generated table, which leaves the request on the router's own
-        // routing-error path and this service's protocol-correct answer.
+        // Every modelled operation is served AUDITED and WRAPPED. This is NOT a re-route:
+        // the key is the one this service's own protocol resolves — which reads the call
+        // from the query string when that is where SigV4 put it and from the form-encoded
+        // BODY otherwise (see [`QuerySignedCalls`]) — and the operation it names is the one
+        // served, recorded as a management event of this service and wrapped in
+        // [`StatedPerOperation`] so a refused request quotes the value it refused. A key
+        // the model does not name resolves to `None` here exactly as it does in the
+        // generated table, which leaves the request on the router's own routing-error path
+        // and this service's protocol-correct answer.
         let action = self.protocol.routing_key(req).ok()?;
         self.stated.get(action)
     }
