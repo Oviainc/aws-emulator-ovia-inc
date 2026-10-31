@@ -21,11 +21,14 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. This service uses it: every request is checked for the `@required`
+//!   members its body left out BEFORE the operation runs, because the generated
+//!   deserializer stops at the first one and AWS states them all (see
+//!   [`validation::AbsentMemberGate`]). A request that left none out reaches the
+//!   generated handler untouched.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran; delegated to [`validation::refused`], which states the
+//!   refusal in this service's own dialect of the AWS validation envelope.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -39,6 +42,8 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+
+mod validation;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -80,6 +85,20 @@ fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> 
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// States every `@required` member a `PutActionInteractions` request left out, before
+    /// the handler runs; see [`validation::AbsentMemberGate`]. Held on the service because
+    /// [`Service::override_operation`] hands back a borrow of `&self`.
+    put_action_interactions_gate: validation::AbsentMemberGate<
+        crate::ops::put_action_interactions::PutActionInteractions<Eng>,
+    >,
+    /// The same gate for `PutActions`.
+    put_actions_gate: validation::AbsentMemberGate<crate::ops::put_actions::PutActions<Eng>>,
+    /// The same gate for `PutEvents`.
+    put_events_gate: validation::AbsentMemberGate<crate::ops::put_events::PutEvents<Eng>>,
+    /// The same gate for `PutItems`.
+    put_items_gate: validation::AbsentMemberGate<crate::ops::put_items::PutItems<Eng>>,
+    /// The same gate for `PutUsers`.
+    put_users_gate: validation::AbsentMemberGate<crate::ops::put_users::PutUsers<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -89,6 +108,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            put_action_interactions_gate: validation::AbsentMemberGate::new(),
+            put_actions_gate: validation::AbsentMemberGate::new(),
+            put_events_gate: validation::AbsentMemberGate::new(),
+            put_items_gate: validation::AbsentMemberGate::new(),
+            put_users_gate: validation::AbsentMemberGate::new(),
         }
     }
 }
@@ -127,26 +151,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request this service routes is checked for the `@required` members its
+        // body left out before the operation runs: absence is found while READING a
+        // request and the generated deserializer stops at the first member it cannot
+        // fill, so the refusal seam would see one absent member however many were
+        // omitted. The gate states them all and hands a request that left none out to
+        // the generated handler. Which operation a request names is the model's own
+        // routing key, so no route table is restated here.
+        match self.definition().protocol().routing_key(req).ok()? {
+            "PutActionInteractions" => Some(&self.put_action_interactions_gate),
+            "PutActions" => Some(&self.put_actions_gate),
+            "PutEvents" => Some(&self.put_events_gate),
+            "PutItems" => Some(&self.put_items_gate),
+            "PutUsers" => Some(&self.put_users_gate),
+            _ => None,
+        }
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it. This service states one dialect of the AWS validation envelope for
+        // every constrained member of every operation — see [`validation::refused`],
+        // which the pre-handler gate above answers with too, so one request cannot be
+        // refused in two wordings.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

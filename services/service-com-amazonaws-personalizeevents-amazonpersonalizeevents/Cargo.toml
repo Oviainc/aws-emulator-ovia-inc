@@ -8,6 +8,8 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The shared AWS validation-envelope renderer every service words a boundary refusal with.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
