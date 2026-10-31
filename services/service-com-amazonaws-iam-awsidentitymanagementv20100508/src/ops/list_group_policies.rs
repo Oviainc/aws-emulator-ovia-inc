@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         // `ctx` carries request metadata only; this read is driven entirely by its
         // input and the store.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListGroupPoliciesErrorModeled::ServiceFailureException(
@@ -206,6 +206,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A read: it reports the names the account holds and writes nothing.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any name is reported, so a caller that may not list a group's
+        // embedded policies learns that it may not, never whether that group exists. The
+        // decision is made on the ARN of the group the request addresses — the held
+        // group's own ARN, or, for a name the account holds no group under, the ARN that
+        // name would carry at the default path, since there is no other path to attribute
+        // it to. A refusal names that group as the request named it.
+        let resource = store.groups.get(&group_key).map_or_else(
+            || crate::state::group_arn(crate::state::DEFAULT_PATH, &input.group_name),
+            |group| group.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_GROUP_POLICIES,
+            &resource,
+            &format!("group {}", input.group_name),
+        )?;
+
         if !store.groups.contains_key(&group_key) {
             return Err(ListGroupPoliciesErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

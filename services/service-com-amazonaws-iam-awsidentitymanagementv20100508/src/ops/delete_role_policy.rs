@@ -170,9 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        // `ctx` carries request metadata only; this deletion is driven entirely by its
-        // input and the store.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        // `ctx` is read for the signing principal the call is authorized against; what is
+        // deleted is named by the request and resolved in the store.
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteRolePolicyErrorModeled::ServiceFailureException(
@@ -188,6 +188,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // case, so the role is looked up by its case-folded name. A name the account
         // holds no role under "referenced a resource entity that does not exist".
         let role_key = crate::state::name_key(&input.role_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any document is removed. The decision is made on the ARN of
+        // the role the document is embedded in — the held role's own ARN, or, for a name
+        // the account holds no role under, the ARN that name would carry at the default
+        // path, since there is no other path to attribute it to. A refusal names that
+        // role as the request named it (`role Deployer`) rather than by ARN, and leaves
+        // the role's inline policies untouched.
+        let resource = store.roles.get(&role_key).map_or_else(
+            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
+            |role| role.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_ROLE_POLICY,
+            &resource,
+            &format!("role {}", input.role_name),
+        )?;
+
         let Some(role) = store.roles.get(&role_key) else {
             return Err(DeleteRolePolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

@@ -143,10 +143,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "The policies are supplied as a list of one or more strings": every document
-        // this operation reports on is named by the request, so neither the store nor
-        // the request metadata is reached — unlike `GetContextKeysForPrincipalPolicy`,
-        // which has an entity to look up.
-        let _ = (ctx, &self.engine);
+        // this operation reports on is named by the request, so the store is reached only
+        // for the authorization decision below — unlike `GetContextKeysForPrincipalPolicy`,
+        // which also has an entity to look up.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetContextKeysForCustomPolicyErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any key is reported. This call names no entity of the account
+        // and the Service Authorization Reference lists no resource type for the action,
+        // so a statement permits it only by covering every resource. The guard is a
+        // TEMPORARY, so the store lock is held for the decision alone and is already
+        // released before the caller's own documents below are read.
+        crate::state::authorization::authorize(
+            &state.lock(),
+            ctx,
+            crate::state::authorization::GET_CONTEXT_KEYS_FOR_CUSTOM_POLICY,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+        )?;
 
         // Each entry has to BE an IAM JSON policy document — "each document is
         // specified as a string containing the complete, valid JSON text of an IAM

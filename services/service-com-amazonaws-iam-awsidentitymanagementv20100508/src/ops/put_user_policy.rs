@@ -176,7 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutUserPolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -187,8 +186,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
+        // The LOOKUP comes first but the answer to it is withheld until the call has
+        // been authorized, because IAM decides a call against the caller's policies
+        // before it reads the resource.
         let key = crate::state::name_key(&input.user_name);
-        if !store.users.contains_key(&key) {
+        let held = store.users.get(&key);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before any document is embedded. The decision is made on the ARN
+        // of the user the document is put on — the held user's own ARN, or, for a name
+        // the account holds no user under, the ARN that name would carry at the default
+        // path, since there is no other path to attribute it to. A refusal names that
+        // user as the request named it (`user Bob`) rather than by ARN, and leaves the
+        // user's inline policies untouched, because the decision precedes the write.
+        let resource = held.map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::PUT_USER_POLICY,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+
+        if held.is_none() {
             return Err(PutUserPolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(

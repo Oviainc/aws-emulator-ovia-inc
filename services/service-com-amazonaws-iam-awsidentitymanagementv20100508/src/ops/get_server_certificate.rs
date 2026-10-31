@@ -140,8 +140,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetServerCertificateErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -155,10 +153,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // certificate is keyed by the case-folded name `UploadServerCertificate` stored it
         // under, which is the handle this request names it by.
         let store = state.lock();
-        let Some(held) = store
-            .server_certificates
-            .get(&crate::state::name_key(&input.server_certificate_name))
-        else {
+        let key = crate::state::name_key(&input.server_certificate_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the certificate is reported, so a caller that may not read a
+        // server certificate learns that it may not, never whether the account holds it.
+        // The decision is made on the ARN the held certificate carries, or, for a name the
+        // account holds none under, on the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names the certificate
+        // as the request named it rather than by ARN.
+        let resource = store.server_certificates.get(&key).map_or_else(
+            || {
+                crate::state::server_certificate_arn(
+                    crate::state::DEFAULT_PATH,
+                    &input.server_certificate_name,
+                )
+            },
+            |certificate| certificate.metadata.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_SERVER_CERTIFICATE,
+            &resource,
+            &format!("server certificate {}", input.server_certificate_name),
+        )?;
+
+        let Some(held) = store.server_certificates.get(&key) else {
             return Err(GetServerCertificateErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(

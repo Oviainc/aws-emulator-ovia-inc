@@ -161,9 +161,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only: nothing about a boundary depends on it —
-        // IAM is global and the role is named by the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DeleteRolePermissionsBoundaryErrorModeled::ServiceFailureException(
@@ -183,6 +180,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than the name being called unknown, exactly as `PutRolePermissionsBoundary`
         // resolves the same member.
         let role_key = crate::state::name_key(&input.role_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the boundary is removed. The decision is made on the ARN of
+        // the role whose boundary the request addresses — the held role's own ARN, or, for
+        // a name the account holds no role under, the ARN that name would carry at the
+        // default path, since there is no other path to attribute it to. A refusal names
+        // that role as the request named it (`role Deployer`) rather than by ARN, and
+        // leaves the boundary in force, because the decision is made before the write.
+        let resource = store.roles.get(&role_key).map_or_else(
+            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
+            |role| role.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_ROLE_PERMISSIONS_BOUNDARY,
+            &resource,
+            &format!("role {}", input.role_name),
+        )?;
+
         let Some(path) = store
             .roles
             .get(&role_key)

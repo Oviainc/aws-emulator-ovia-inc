@@ -163,11 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        // `ctx` carries request metadata only; nothing about this deletion depends on it —
-        // IAM is global, and both the group and the policy are named by the request.
+        // `ctx` is read for the signing principal the call is authorized against; what is
+        // deleted — the group and the policy — is named by the request.
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteGroupPolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -188,9 +187,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The group is named (friendly name, not ARN) and IAM entity names "are not
         // distinguished by case", so the case-folded name is the identity. A name the
         // account holds no group under "referenced a resource entity that does not
-        // exist", worded as `PutGroupPolicy` and `GetGroupPolicy` word the same absence.
+        // exist", worded as `PutGroupPolicy` and `GetGroupPolicy` word the same absence —
+        // an answer withheld until the call has been authorized, because IAM decides a
+        // call against the caller's policies before it reads the resource.
         let group_key = crate::state::name_key(&input.group_name);
-        if !store.groups.contains_key(&group_key) {
+        let held = store.groups.get(&group_key);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any document is removed. The decision is made on the ARN of
+        // the group the document is embedded in — the held group's own ARN, or, for a
+        // name the account holds no group under, the ARN that name would carry at the
+        // default path, since there is no other path to attribute it to. A refusal names
+        // that group as the request named it (`group Admins`) rather than by ARN, and
+        // leaves the group's inline policies untouched.
+        let resource = held.map_or_else(
+            || crate::state::group_arn(crate::state::DEFAULT_PATH, &input.group_name),
+            |group| group.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_GROUP_POLICY,
+            &resource,
+            &format!("group {}", input.group_name),
+        )?;
+
+        if held.is_none() {
             return Err(not_found(format!(
                 "The group with name {} cannot be found.",
                 input.group_name

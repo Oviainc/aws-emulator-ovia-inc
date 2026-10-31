@@ -239,6 +239,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the password is changed. The call is taken on the caller's own
+        // user, so the decision is made on that user's ARN and the refusal names that
+        // user as the ACCOUNT holds it — the stored spelling, since IAM names "are not
+        // distinguished by case" and no request spelling exists here to echo. Nothing is
+        // changed when it refuses.
+        let held = store.users.get(&user_key);
+        let resource = held.map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &user_key),
+            |user| user.arn.clone(),
+        );
+        let named_as = held.map_or_else(
+            || user_key.clone(),
+            |user| user.user_name.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::CHANGE_PASSWORD,
+            &resource,
+            &format!("user {named_as}"),
+        )?;
+
         // The key's user, as the account holds it: the name the not-found refusal below
         // is worded from, in the case the account stores rather than any a request
         // spelled.

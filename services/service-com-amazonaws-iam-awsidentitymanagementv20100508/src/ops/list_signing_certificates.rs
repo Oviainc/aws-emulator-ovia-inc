@@ -235,6 +235,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any certificate is reported. The decision is made on the ARN of
+        // the user the certificates belong to — the held user's own ARN, or, for a name the
+        // account holds no user under, the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names that user as
+        // the request named it.
+        let named_user = input.user_name.as_deref().unwrap_or(&user_key).to_string();
+        let resource = store.users.get(&user_key).map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &named_user),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_SIGNING_CERTIFICATES,
+            &resource,
+            &format!("user {named_user}"),
+        )?;
+
         // The certificates reported are those of an IAM user the account holds: a name
         // the account does not hold names no user whose certificates could be reported,
         // which is the one modelled client error this operation declares.

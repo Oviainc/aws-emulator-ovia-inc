@@ -153,9 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only: nothing about a boundary depends on it —
-        // IAM is global and the user is named by the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DeleteUserPermissionsBoundaryErrorModeled::ServiceFailureException(
@@ -171,8 +168,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IAM entity names "are not distinguished by case", so the user is found under
         // the case-folded name whatever case the request spelled it in; a name the
         // account holds no user under "referenced a resource entity that does not exist",
-        // worded as every reader of a user in this crate words that absence.
+        // worded as every reader of a user in this crate words that absence — an answer
+        // withheld until the call has been authorized, because IAM decides a call against
+        // the caller's policies before it reads the resource.
         let key = crate::state::name_key(&input.user_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the boundary is removed. The decision is made on the ARN of
+        // the user whose boundary the request addresses — the held user's own ARN, or, for
+        // a name the account holds no user under, the ARN that name would carry at the
+        // default path, since there is no other path to attribute it to. A refusal names
+        // that user as the request named it (`user Bob`) rather than by ARN, and leaves
+        // the boundary in force, because the decision is made before the write.
+        let resource = store.users.get(&key).map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_USER_PERMISSIONS_BOUNDARY,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+
         let Some(user) = store.users.get_mut(&key) else {
             return Err(
                 DeleteUserPermissionsBoundaryErrorModeled::NoSuchEntityException(

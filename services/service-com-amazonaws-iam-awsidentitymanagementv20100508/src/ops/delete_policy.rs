@@ -169,9 +169,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; a delete addressed by ARN depends on
-        // none of it — IAM is global, so not even the region comes from the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeletePolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -215,6 +212,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is deleted, and before the STORE is consulted for the
+        // policy — so a caller that may not delete a policy learns that it may not, never
+        // whether the account holds that policy. (The refusals above are about the ARN the
+        // request itself supplied, which the caller already knows.) The decision is made
+        // on the ARN the request addresses, while the refusal NAMES the entity that ARN
+        // identifies.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_POLICY,
+            &input.policy_arn,
+            &format!("policy {}", input.policy_arn),
+        )?;
 
         // The delete is addressed exactly as a read of the same ARN is, so it reaches
         // the one record `GetPolicy` reports; an ARN the account holds no policy under

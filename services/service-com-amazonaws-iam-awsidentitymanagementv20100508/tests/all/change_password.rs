@@ -177,6 +177,11 @@ async fn user_with_password(
 
 /// Mint an access key for `user` and answer its id.
 async fn user_key(router: &MultiServiceRouter, case: &str, user: &str) -> String {
+    // `ChangePassword` is itself an IAM call the caller's policies decide, so the signing
+    // user needs that one grant for a change of its own password to be served. It is
+    // fixture: what each row is about is which password is in force.
+    crate::identity_policy_enforcement::grant_action(router, case, user, "iam:ChangePassword")
+        .await;
     let (status, minted) = call(router, "CreateAccessKey", &[("UserName", user)]).await;
     assert_eq!(
         status, 200,

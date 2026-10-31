@@ -93,6 +93,11 @@ async fn user_with_keys(
     // so the user is given the grant AWS requires for that read. The grant is the
     // fixture: what each row is about is whether the key still resolves to its user.
     grant_get_user(router, case, user).await;
+    // `DeleteAccessKey` is itself an IAM call the caller's policies decide, so a user that
+    // deletes one of its own keys needs that grant too. Both grants are fixture: what each
+    // row is about is which key is reachable, not which permission is held.
+    crate::identity_policy_enforcement::grant_action(router, case, user, "iam:DeleteAccessKey")
+        .await;
     for index in 0..count {
         let (status, created) = call(router, "CreateAccessKey", &[("UserName", user)]).await;
         assert_eq!(
@@ -247,19 +252,28 @@ async fn a_deleted_key_frees_the_quota_and_the_user() {
                 "case {case:?}: expected remaining key {index} to delete, got {status}: {body}"
             );
         }
-        // An inline policy is a dependent of its user too, so the fixture grant comes
+        // An inline policy is a dependent of its user too, so the fixture grants come
         // off before the delete under test: what this row is about is the last ACCESS
         // KEY no longer holding the user back.
-        let (status, removed) = call(
-            &router,
-            "DeleteUserPolicy",
-            &[("UserName", requested_name), ("PolicyName", GET_USER_GRANT_NAME)],
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: the fixture DeleteUserPolicy must succeed, got {status}: {removed}"
-        );
+        for policy_name in [
+            GET_USER_GRANT_NAME.to_string(),
+            crate::identity_policy_enforcement::grant_action_policy_name("iam:DeleteAccessKey"),
+        ] {
+            let (status, removed) = call(
+                &router,
+                "DeleteUserPolicy",
+                &[
+                    ("UserName", requested_name),
+                    ("PolicyName", policy_name.as_str()),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the fixture DeleteUserPolicy {policy_name:?} must succeed, \
+                 got {status}: {removed}"
+            );
+        }
         let (status, body) = call(&router, "DeleteUser", &[("UserName", requested_name)]).await;
         assert_eq!(
             status, 200,

@@ -213,6 +213,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the password is removed. The decision is made on the ARN of the
+        // user the password belongs to — the held user's own ARN, or, for a name the
+        // account holds no user under, the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names that user as
+        // the request named it, and removes nothing.
+        let named_user = input.user_name.as_deref().unwrap_or(&user_key).to_string();
+        let resource = store.users.get(&user_key).map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &named_user),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_LOGIN_PROFILE,
+            &resource,
+            &format!("user {named_user}"),
+        )?;
+
         // A login profile exists only as the password of a user the account holds, so a
         // delete naming an absent user is not found and removes nothing — the same
         // refusal the create, the read and the update answer with. IAM entity names

@@ -170,9 +170,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it — IAM is global
-        // and the provider is named by the ARN the request carries.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 AddClientIDToOpenIDConnectProviderErrorModeled::ServiceFailureException(
@@ -207,6 +204,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so two racing registrations are applied one after the other and the provider
         // ends up carrying both client IDs rather than one overwriting the other's list.
         let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any client ID is registered, and before the store is consulted
+        // for the provider. The decision is made on the ARN the request addresses, and the
+        // refusal names the resource the way every other call on an OIDC provider names
+        // it; a refused call registers nothing.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::ADD_CLIENT_ID_TO_OPEN_ID_CONNECT_PROVIDER,
+            &input.open_id_connect_provider_arn,
+            &format!("oidc-provider {}", input.open_id_connect_provider_arn),
+        )?;
         let Some(provider) = store
             .open_id_connect_providers
             .get_mut(&input.open_id_connect_provider_arn)

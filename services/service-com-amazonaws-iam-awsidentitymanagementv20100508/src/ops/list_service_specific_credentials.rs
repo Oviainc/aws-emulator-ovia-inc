@@ -262,6 +262,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         };
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any credential is reported. The decision is made on the ARN of
+        // the user whose credentials are asked for — the held user's own ARN, or, for a
+        // name the account holds no user under, the ARN that name would carry at the
+        // default path; a request for EVERY user's credentials is not taken on one entity,
+        // so it is decided against every resource. A refusal names the user as the request
+        // named it.
+        let (resource, named_as) = match &user_filter {
+            Some(user_key) => {
+                let named_user = input
+                    .user_name
+                    .as_deref()
+                    .unwrap_or(user_key.as_str())
+                    .to_string();
+                let arn = store.users.get(user_key).map_or_else(
+                    || crate::state::user_arn(crate::state::DEFAULT_PATH, &named_user),
+                    |user| user.arn.clone(),
+                );
+                (arn, format!("user {named_user}"))
+            }
+            None => (
+                crate::state::authorization::ACCOUNT_WIDE_RESOURCE.to_string(),
+                crate::state::authorization::ACCOUNT_WIDE_RESOURCE.to_string(),
+            ),
+        };
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_SERVICE_SPECIFIC_CREDENTIALS,
+            &resource,
+            &named_as,
+        )?;
+
         // A named user must exist: the operation reports the credentials of an IAM
         // user, and a name the account does not hold names no user to report on.
         if let (Some(user_key), Some(user_name)) = (&user_filter, &input.user_name) {

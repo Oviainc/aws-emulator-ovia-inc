@@ -163,8 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ListServerCertificateTagsErrorModeled::ServiceFailureException(
@@ -192,6 +190,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it reports the tags the certificate persists and writes nothing, so a
         // later caller sees exactly what this one did.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any tag is reported, and before the STORE's answer about the
+        // certificate is given away — so a caller that may not read a certificate's tags
+        // learns that it may not, never whether the account holds that certificate. The
+        // decision is made on the ARN the held certificate carries, or, for a name the
+        // account holds none under, on the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to.
+        let resource = store
+            .server_certificates
+            .get(&certificate_key)
+            .map_or_else(
+                || {
+                    crate::state::server_certificate_arn(
+                        crate::state::DEFAULT_PATH,
+                        &input.server_certificate_name,
+                    )
+                },
+                |certificate| certificate.metadata.arn.clone(),
+            );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_SERVER_CERTIFICATE_TAGS,
+            &resource,
+            &format!("server certificate {}", input.server_certificate_name),
+        )?;
+
         // The entity is resolved FIRST, so a name the account holds no certificate for is
         // the entity-absent error whatever else the request carries — the precedence the
         // other tag-listing operations in this crate report.

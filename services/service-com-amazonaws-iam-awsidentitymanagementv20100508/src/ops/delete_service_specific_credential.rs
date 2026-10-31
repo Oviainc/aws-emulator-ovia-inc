@@ -201,6 +201,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is removed. The decision is made on the ARN of the
+        // user the credential belongs to — the held user's own ARN, or, for a name the
+        // account holds no user under, the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names that user as
+        // the request named it, and removes nothing.
+        let named_user = input.user_name.as_deref().unwrap_or(&user_key).to_string();
+        let resource = store.users.get(&user_key).map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &named_user),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_SERVICE_SPECIFIC_CREDENTIAL,
+            &resource,
+            &format!("user {named_user}"),
+        )?;
+
         // The credential belongs to a user the account holds. IAM entity names "are not
         // distinguished by case", so the lookup is on the case-folded key; the name the
         // held record carries is what a refusal naming the user reports for a caller that

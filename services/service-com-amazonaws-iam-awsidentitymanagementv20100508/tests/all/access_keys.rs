@@ -282,6 +282,16 @@ async fn an_omitted_name_mints_the_key_for_the_signing_user() {
             "case {stored_name:?}: CreateUser must succeed, got {status}: {body}"
         );
         grant_get_user(&router, stored_name, stored_name).await;
+        // `CreateAccessKey` is itself an IAM call the caller's policies decide, so the
+        // signing user needs that one grant for a nameless mint of its own key to be
+        // served; the mint is what this suite is about, not the permission.
+        crate::identity_policy_enforcement::grant_action(
+            &router,
+            stored_name,
+            stored_name,
+            "iam:CreateAccessKey",
+        )
+        .await;
         let (status, first) = call(&router, "CreateAccessKey", &[("UserName", stored_name)]).await;
         assert_eq!(
             status, 200,

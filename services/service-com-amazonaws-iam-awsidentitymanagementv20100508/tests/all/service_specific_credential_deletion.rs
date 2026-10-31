@@ -433,6 +433,16 @@ async fn an_omitted_name_deletes_the_signing_users_credential() {
         ("Nameless_Two", "logs.amazonaws.com"),
     ] {
         create_user(&router, user).await;
+        // `DeleteServiceSpecificCredential` is itself an IAM call the caller's policies
+        // decide, so the signing user needs that one grant. It is fixture: what this row
+        // is about is WHOSE credentials a nameless delete reaches.
+        crate::identity_policy_enforcement::grant_action(
+            &router,
+            user,
+            user,
+            "iam:DeleteServiceSpecificCredential",
+        )
+        .await;
         let (status, key) = call(&router, "CreateAccessKey", &[("UserName", user)]).await;
         assert_eq!(
             status, 200,

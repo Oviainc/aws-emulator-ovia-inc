@@ -346,25 +346,64 @@ pub(crate) const GET_USER_GRANT_NAME: &str = "allow-getuser";
 /// user holding none cannot read even itself. Every suite that uses the nameless
 /// `GetUser` as its "which user does this key resolve to" probe needs that grant as a
 /// FIXTURE — it is not what those suites are about — so the grant is written once here,
-/// beside the other authorization fixtures.
+/// beside the other authorization fixtures. It is [`grant_under`] for that one action,
+/// filed under the name [`GET_USER_GRANT_NAME`] the suites that take it off again name.
 pub(crate) async fn grant_get_user(router: &MultiServiceRouter, case: &str, user_name: &str) {
+    grant_under(router, case, user_name, GET_USER_GRANT_NAME, "iam:GetUser").await;
+}
+
+/// The policy name [`grant_action`] puts its grant under, so a suite that goes on to
+/// delete the user can take the grant off again first.
+pub(crate) fn grant_action_policy_name(iam_action: &str) -> String {
+    format!("allow-{}", iam_action.replace(':', "-"))
+}
+
+/// Put on `user_name`, under the inline policy `policy_name`, an `Allow` of `iam_action`
+/// on every resource.
+///
+/// The ONE implementation of "give the fixture principal the permission the call under
+/// test needs"; [`grant_get_user`] and [`grant_action`] differ only in the name they file
+/// the grant under.
+async fn grant_under(
+    router: &MultiServiceRouter,
+    case: &str,
+    user_name: &str,
+    policy_name: &str,
+    iam_action: &str,
+) {
     let (status, put) = call(
         router,
         "PutUserPolicy",
         &[
             ("UserName", user_name),
-            ("PolicyName", GET_USER_GRANT_NAME),
-            (
-                "PolicyDocument",
-                &statement("Allow", "iam:GetUser", "*"),
-            ),
+            ("PolicyName", policy_name),
+            ("PolicyDocument", &statement("Allow", iam_action, "*")),
         ],
     )
     .await;
     assert_eq!(
         status, 200,
-        "case {case:?}: the fixture PutUserPolicy must succeed, got {status}: {put}"
+        "case {case:?}: the fixture PutUserPolicy {policy_name:?} must succeed, \
+         got {status}: {put}"
     );
+}
+
+/// Put on `user_name` the grant AWS requires for a signed call of `iam_action`.
+///
+/// The same FIXTURE role [`grant_get_user`] plays, for the suites whose subject is not
+/// authorization at all: IAM authorizes its own API, so a principal that holds no
+/// identity-based policy cannot make the call under test — not even on itself — and a
+/// suite about something else has to give it the one permission that call needs. The
+/// policy name is derived from the action, so two grants on one user do not overwrite
+/// each other.
+pub(crate) async fn grant_action(
+    router: &MultiServiceRouter,
+    case: &str,
+    user_name: &str,
+    iam_action: &str,
+) {
+    let policy_name = grant_action_policy_name(iam_action);
+    grant_under(router, case, user_name, &policy_name, iam_action).await;
 }
 
 /// RULE: a call signed by an IAM user is decided against that user's identity-based

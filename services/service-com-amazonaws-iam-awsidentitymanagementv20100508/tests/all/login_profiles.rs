@@ -491,6 +491,18 @@ async fn an_omitted_name_serves_the_signing_user() {
             case.stored_name
         );
         let signing_key = element(&key, "AccessKeyId");
+        // Both calls below are IAM calls the caller's policies decide, so the signing user
+        // needs those two grants. They are fixture: what this row is about is WHOSE
+        // profile a nameless create and read reach.
+        for action in ["iam:CreateLoginProfile", "iam:GetLoginProfile"] {
+            crate::identity_policy_enforcement::grant_action(
+                &router,
+                case.stored_name,
+                case.stored_name,
+                action,
+            )
+            .await;
+        }
 
         let mut params: Vec<(&str, &str)> = vec![("Password", &case.password)];
         if let Some(reset) = case.reset_required {

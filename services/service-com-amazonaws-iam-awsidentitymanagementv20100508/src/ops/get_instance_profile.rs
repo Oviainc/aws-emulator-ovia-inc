@@ -141,8 +141,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it — IAM is global.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetInstanceProfileErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -159,6 +157,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // back is the role as the account holds it now, not a copy taken when it was bound.
         let store = state.lock();
         let key = crate::state::name_key(&input.instance_profile_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the profile is reported, so a caller that may not read an
+        // instance profile learns that it may not, never whether that profile exists. The
+        // decision is made on the ARN of the profile the request addresses — the held
+        // profile's own ARN, or, for a name the account holds no profile under, the ARN
+        // that name would carry at the default path, since there is no other path to
+        // attribute it to. A refusal names that profile as the request named it
+        // (`instance profile Web`) rather than by ARN.
+        let resource = store.instance_profiles.get(&key).map_or_else(
+            || {
+                crate::state::instance_profile_arn(
+                    crate::state::DEFAULT_PATH,
+                    &input.instance_profile_name,
+                )
+            },
+            |record| record.profile.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_INSTANCE_PROFILE,
+            &resource,
+            &format!("instance profile {}", input.instance_profile_name),
+        )?;
+
         let Some(instance_profile) = store.instance_profile_report(&key) else {
             return Err(GetInstanceProfileErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

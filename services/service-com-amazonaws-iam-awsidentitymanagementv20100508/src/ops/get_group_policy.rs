@@ -153,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetGroupPolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -173,7 +172,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
-        let Some(group) = store.groups.get(&key) else {
+        // The LOOKUP comes first but the answer to it is withheld until the call has
+        // been authorized, because IAM decides a call against the caller's policies
+        // before it reads the resource: a caller that may not read a group's embedded
+        // document learns that it may not, never whether that group exists.
+        let held = store.groups.get(&key);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the document is reported. The decision is made on the ARN of
+        // the group the document is embedded in — the held group's own ARN, or, for a
+        // name the account holds no group under, the ARN that name would carry at the
+        // default path, since there is no other path to attribute it to. A refusal names
+        // that group as the request named it (`group Admins`) rather than by ARN.
+        let resource = held.map_or_else(
+            || crate::state::group_arn(crate::state::DEFAULT_PATH, &input.group_name),
+            |group| group.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_GROUP_POLICY,
+            &resource,
+            &format!("group {}", input.group_name),
+        )?;
+
+        let Some(group) = held else {
             return Err(not_found(format!(
                 "The group with name {} cannot be found.",
                 input.group_name

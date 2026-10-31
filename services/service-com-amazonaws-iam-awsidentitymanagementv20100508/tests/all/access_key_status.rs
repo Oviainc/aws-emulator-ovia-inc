@@ -107,6 +107,11 @@ async fn user_with_keys(
         "case {case:?}: CreateUser must succeed, got {status}: {body}"
     );
     let mut ids = Vec::new();
+    // `UpdateAccessKey` is itself an IAM call the caller's policies decide, so a user that
+    // changes the status of one of its own keys needs that grant. It is fixture: what each
+    // row is about is which key a nameless update reaches.
+    crate::identity_policy_enforcement::grant_action(router, case, user, "iam:UpdateAccessKey")
+        .await;
     for index in 0..count {
         let (status, created) = call(router, "CreateAccessKey", &[("UserName", user)]).await;
         assert_eq!(

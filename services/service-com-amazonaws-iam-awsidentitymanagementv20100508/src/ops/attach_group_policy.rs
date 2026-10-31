@@ -166,9 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing about an attachment depends
-        // on it — IAM is global, and both entities are named by the request. It is
-        // read for the access key id the audit record below names.
+        // `ctx` is read for the signing principal the call is authorized against, and for
+        // the access key id the audit record below names; both entities an attachment
+        // joins are named by the request.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AttachGroupPolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -201,6 +201,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not exist". The STORED name is what the audit line below reports, because
         // the request may have spelled it in another case.
         let group_key = crate::state::name_key(&input.group_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is attached. The decision is made on the ARN of the
+        // group the attachment is made on — the held group's own ARN, or, for a name the
+        // account holds no group under, the ARN that name would carry at the default
+        // path, since there is no other path to attribute it to. A refusal names that
+        // group as the request named it (`group Admins`) rather than by ARN, and leaves
+        // the group's attachments untouched, because the decision precedes the write.
+        let resource = store.groups.get(&group_key).map_or_else(
+            || crate::state::group_arn(crate::state::DEFAULT_PATH, &input.group_name),
+            |group| group.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::ATTACH_GROUP_POLICY,
+            &resource,
+            &format!("group {}", input.group_name),
+        )?;
+
         let Some(group_name) = store.groups.get(&group_key).map(|group| group.group_name.clone())
         else {
             return Err(AttachGroupPolicyErrorModeled::NoSuchEntityException(

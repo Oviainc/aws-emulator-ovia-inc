@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetMFADeviceErrorModeled::ServiceFailureException(
@@ -163,6 +163,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A read: it reports the stored record and writes nothing.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything about the device is reported, and before the store is
+        // consulted for it. "For this API, we only accept FIDO security key ARNs", so the
+        // serial the request addresses the device by IS the ARN the decision is made
+        // against; the refusal names the device as the request named it.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_MFA_DEVICE,
+            &input.serial_number,
+            &format!("mfa device {}", input.serial_number),
+        )?;
 
         // The device the serial number names, among the FIDO security keys the account
         // holds — the only kind this API serves. A serial naming none of them is one this

@@ -164,9 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing about the delete depends on it —
-        // IAM is global, and the profile is named by the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteInstanceProfileErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -180,6 +177,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IAM entity names "are not distinguished by case", so the delete finds the
         // profile under the case-folded name whatever case it spelled it in.
         let key = crate::state::name_key(&input.instance_profile_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is deleted. The decision is made on the ARN of the
+        // instance profile the request addresses — the held profile's own ARN, or, for a
+        // name the account holds no profile under, the ARN that name would carry at the
+        // default path, since there is no other path to attribute it to. A refusal names
+        // that profile as the request named it (`instance profile Web`) rather than by
+        // ARN, and leaves the account's profiles as they were.
+        let resource = store.instance_profiles.get(&key).map_or_else(
+            || {
+                crate::state::instance_profile_arn(
+                    crate::state::DEFAULT_PATH,
+                    &input.instance_profile_name,
+                )
+            },
+            |record| record.profile.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_INSTANCE_PROFILE,
+            &resource,
+            &format!("instance profile {}", input.instance_profile_name),
+        )?;
+
         let Some(held) = store.instance_profiles.get(&key) else {
             return Err(DeleteInstanceProfileErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

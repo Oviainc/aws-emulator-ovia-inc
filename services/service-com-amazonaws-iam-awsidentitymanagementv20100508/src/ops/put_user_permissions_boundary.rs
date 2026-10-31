@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ctx` carries request metadata only: nothing about a boundary depends on
         // it — IAM is global, and both the user and the policy are named by the
         // request.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutUserPermissionsBoundaryErrorModeled::ServiceFailureException(
@@ -206,6 +206,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account holds no user under "referenced a resource entity that does not
         // exist".
         let user_key = crate::state::name_key(&input.user_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the boundary is set. The decision is made on the ARN of the
+        // user whose boundary the request addresses — the held user's own ARN, or, for a
+        // name the account holds no user under, the ARN that name would carry at the
+        // default path, since there is no other path to attribute it to. A refusal names
+        // that user as the request named it (`user Bob`) rather than by ARN, and leaves
+        // the boundary in force, because the decision is made before the write.
+        let resource = store.users.get(&user_key).map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::PUT_USER_PERMISSIONS_BOUNDARY,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+
         if !store.users.contains_key(&user_key) {
             return Err(PutUserPermissionsBoundaryErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

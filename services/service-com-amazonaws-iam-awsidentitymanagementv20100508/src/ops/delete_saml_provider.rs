@@ -203,6 +203,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // update any roles that reference the SAML provider resource's ARN as a principal
         // in their trust policies".
         let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the provider is deleted, and before the store is consulted for
+        // it. The decision is made on the ARN the request addresses, while the refusal
+        // NAMES the entity that ARN identifies; a refused call deletes nothing.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_SAML_PROVIDER,
+            &input.saml_provider_arn,
+            &format!("saml-provider {}", input.saml_provider_arn),
+        )?;
         if store
             .saml_providers
             .remove(&input.saml_provider_arn)

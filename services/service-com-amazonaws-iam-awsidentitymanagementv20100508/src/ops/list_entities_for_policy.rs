@@ -178,9 +178,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; what this reports comes from the store
-        // and the request's own filtering and paging members.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListEntitiesForPolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -271,6 +268,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it reports the entities the account relates to this policy and
         // writes nothing.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any entity is reported, and before the STORE is consulted for
+        // the policy — so a caller that may not list a policy's entities learns that it
+        // may not, never whether the account holds that policy. The decision is made on
+        // the ARN the request addresses, while the refusal NAMES the entity that ARN
+        // identifies.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_ENTITIES_FOR_POLICY,
+            &input.policy_arn,
+            &format!("policy {}", input.policy_arn),
+        )?;
 
         // A managed policy relates an entity only if the policy EXISTS. An
         // AWS-managed policy (account segment `aws`) belongs to AWS rather than to

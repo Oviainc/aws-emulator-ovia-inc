@@ -159,9 +159,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing about a membership depends on it —
-        // IAM is global, and both entities are named by the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(RemoveUserFromGroupErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -177,6 +174,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under "referenced a resource entity that does not exist", the same two lookups
         // and the same two sentences `AddUserToGroup` makes.
         let group_key = crate::state::name_key(&input.group_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the membership is removed. The decision is made on the ARN of
+        // the group the user is removed from — the held group's own ARN, or, for a name the
+        // account holds no group under, the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names that group as
+        // the request named it (`group Admins`) rather than by ARN, and leaves the group's
+        // members untouched, because the decision is made before the write.
+        let resource = store.groups.get(&group_key).map_or_else(
+            || crate::state::group_arn(crate::state::DEFAULT_PATH, &input.group_name),
+            |group| group.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::REMOVE_USER_FROM_GROUP,
+            &resource,
+            &format!("group {}", input.group_name),
+        )?;
+
         if !store.groups.contains_key(&group_key) {
             return Err(RemoveUserFromGroupErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

@@ -183,8 +183,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 AddRoleToInstanceProfileErrorModeled::ServiceFailureException(
@@ -200,6 +198,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both entities are resolved out of the one store that records what the
         // account holds, under the case-folded key every IAM name is keyed by.
         let profile_key = crate::state::name_key(&input.instance_profile_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the binding is written. The decision is made on the ARN of the
+        // instance profile the role is added to — the held profile's own ARN, or, for a
+        // name the account holds no profile under, the ARN that name would carry at the
+        // default path, since there is no other path to attribute it to. A refusal names
+        // that profile as the request named it (`instance profile Web`) rather than by
+        // ARN, and leaves the profile's roles untouched.
+        let resource = store.instance_profiles.get(&profile_key).map_or_else(
+            || {
+                crate::state::instance_profile_arn(
+                    crate::state::DEFAULT_PATH,
+                    &input.instance_profile_name,
+                )
+            },
+            |record| record.profile.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::ADD_ROLE_TO_INSTANCE_PROFILE,
+            &resource,
+            &format!("instance profile {}", input.instance_profile_name),
+        )?;
+
         if !store.instance_profiles.contains_key(&profile_key) {
             return Err(AddRoleToInstanceProfileErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

@@ -286,11 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it — the
-        // principal, the actions, the resources and the extra documents are all named
-        // by the request. A simulation reports what the policies in force WOULD decide
-        // for the principal the request names, which is not the caller's own identity.
-        let _ = ctx;
+        // `ctx` is read for the signing principal the CALL is authorized against: a
+        // simulation reports what the policies in force WOULD decide for the principal
+        // the request names, which is not the caller's own identity — but asking for that
+        // report is itself an IAM call, and IAM authorizes its own API.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The operation models no `ServiceFailureException`; its own server-side
             // failure is `PolicyEvaluationException`, "the request failed because a
@@ -441,6 +440,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // decisions below are made.
         let (documents, sources, attached_boundary): (Vec<String>, Vec<String>, Option<String>) = {
             let store = state.lock();
+            // IAM authorizes its own API: the signing principal's identity-based policies
+            // are evaluated before the simulation reads any document, and before the
+            // store is consulted for the principal — so a caller that may not simulate a
+            // principal's policies learns that it may not, never whether the account
+            // holds that principal. The decision is made on the ARN the request addresses.
+            crate::state::authorization::authorize(
+                &store,
+                ctx,
+                crate::state::authorization::SIMULATE_PRINCIPAL_POLICY,
+                &input.policy_source_arn,
+            )?;
             let Some(carried) = store.principal_sourced_policies(&input.policy_source_arn) else {
                 return Err(SimulatePrincipalPolicyErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {

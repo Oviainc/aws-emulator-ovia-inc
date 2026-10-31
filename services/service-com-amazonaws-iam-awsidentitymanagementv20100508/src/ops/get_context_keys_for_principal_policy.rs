@@ -179,9 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it — the
-        // principal and the extra policies are both named by the request.
-        let _ = ctx;
+        // `ctx` is read for the signing principal the CALL is authorized against; the
+        // principal this reports ON, and the extra policies, are named by the request.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetContextKeysForPrincipalPolicyErrorModeled::ServiceFailureException(
@@ -235,6 +234,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it reports the context keys the stored policies reference and
         // writes nothing.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any key is reported, and before the store is consulted for the
+        // principal — so a caller that may not read a principal's policies learns that it
+        // may not, never whether the account holds that principal. The decision is made on
+        // the ARN the request addresses.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::GET_CONTEXT_KEYS_FOR_PRINCIPAL_POLICY,
+            &input.policy_source_arn,
+        )?;
+
         let Some(carried) = store.principal_policies(&input.policy_source_arn) else {
             return Err(
                 GetContextKeysForPrincipalPolicyErrorModeled::NoSuchEntityException(

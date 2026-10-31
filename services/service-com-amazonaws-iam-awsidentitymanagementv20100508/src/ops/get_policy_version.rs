@@ -169,9 +169,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; a read addressed by ARN depends on
-        // none of it.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetPolicyVersionErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -199,6 +196,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved the one way every managed-policy read resolves it, so AWS's own
         // policies are served from the catalog beside the account's.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the version is reported, and before the STORE is consulted for
+        // the policy — so a caller that may not read a version of a policy learns that it
+        // may not, never whether the account holds that policy. The decision is made on
+        // the ARN the request addresses, while the refusal NAMES the entity that ARN
+        // identifies.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_POLICY_VERSION,
+            &input.policy_arn,
+            &format!("policy {}", input.policy_arn),
+        )?;
+
         let Some(resolved) = store.resolve_policy(&input.policy_arn) else {
             // An ARN this service can resolve no policy under "referenced a resource
             // entity that does not exist" — the refusal this operation models for a

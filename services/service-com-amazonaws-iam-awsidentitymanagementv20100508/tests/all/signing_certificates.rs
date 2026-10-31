@@ -334,6 +334,23 @@ async fn an_omitted_name_resolves_the_signing_user() {
             case.stored_name
         );
         let signing_key = element(&created, "AccessKeyId");
+        // Each call below is itself an IAM call the caller's policies decide, so the
+        // signing user needs those grants. They are fixture: what this row is about is
+        // WHICH user a nameless signing-certificate call resolves to.
+        for action in [
+            "iam:UploadSigningCertificate",
+            "iam:ListSigningCertificates",
+            "iam:UpdateSigningCertificate",
+            "iam:DeleteSigningCertificate",
+        ] {
+            crate::identity_policy_enforcement::grant_action(
+                &router,
+                case.stored_name,
+                case.stored_name,
+                action,
+            )
+            .await;
+        }
 
         let certificate = case.certificate(1);
         let params = vec![param("CertificateBody", &certificate)];
@@ -628,6 +645,16 @@ async fn signing_key_for(
         return None;
     }
     let stored = format!("{}-{row}", claimant.stored);
+    // `UploadSigningCertificate` is itself an IAM call the caller's policies decide, so a
+    // claimant that signs for itself needs that one grant. It is fixture: what each row is
+    // about is which user holds the certificate.
+    crate::identity_policy_enforcement::grant_action(
+        router,
+        case,
+        &stored,
+        "iam:UploadSigningCertificate",
+    )
+    .await;
     let (status, key) = call(router, "CreateAccessKey", &[("UserName", &stored)]).await;
     assert_eq!(
         status, 200,

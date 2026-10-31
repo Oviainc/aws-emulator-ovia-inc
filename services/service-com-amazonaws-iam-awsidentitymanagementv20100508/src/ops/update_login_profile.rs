@@ -194,6 +194,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
         let user_key = crate::state::name_key(&input.user_name);
 
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the password is changed. The decision is made on the ARN of the
+        // user the password belongs to — the held user's own ARN, or, for a name the
+        // account holds no user under, the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names that user as
+        // the request named it, and changes nothing.
+        let resource = store.users.get(&user_key).map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::UPDATE_LOGIN_PROFILE,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+
         // A login profile exists only as the password of a user the account holds, so
         // an update naming an absent user is not found and changes nothing — the same
         // refusal `CreateLoginProfile` and `GetLoginProfile` answer with.

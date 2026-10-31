@@ -529,7 +529,26 @@ async fn a_withheld_member_is_omitted_from_a_record_entirely() {
         secret: minted_secret,
     });
 
-    // Both passwords a change carries, on a request the user itself signs.
+    // Both passwords a change carries, on a request the user itself signs. `ChangePassword`
+    // is itself an IAM call the caller's policies decide, so the user is given that one
+    // grant first — fixture, not what this row is about.
+    let (status, body) = audited
+        .call(
+            "PutUserPolicy",
+            &[
+                ("UserName", "audit-secrets"),
+                ("PolicyName", "allow-changepassword"),
+                (
+                    "PolicyDocument",
+                    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:ChangePassword","Resource":"*"}]}"#,
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: the fixture grant must be served, got {status} with {body}"
+    );
     let changed_password = "Ch4nge-pl41nt3xt";
     let (status, body) = audited
         .call_as(

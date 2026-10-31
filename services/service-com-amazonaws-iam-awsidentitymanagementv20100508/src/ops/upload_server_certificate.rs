@@ -222,9 +222,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it — IAM is global,
-        // so not even the ARN's region segment comes from the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UploadServerCertificateErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -330,6 +327,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = (!tags.is_empty()).then_some(tags);
 
         let mut store = state.lock();
+
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before the certificate is stored, and before the store is consulted for a name
+        // collision — so a caller that may not upload a certificate learns that it may
+        // not, never which names the account already holds. The decision is made on the
+        // ARN the certificate WOULD carry, with the tags the request attaches handed to
+        // the gate, because they are part of the request a statement may be conditioned on
+        // (`aws:RequestTag/<key>`, `aws:TagKeys`). Nothing is stored when it refuses.
+        crate::state::authorization::authorize_written(
+            &store,
+            ctx,
+            crate::state::authorization::UPLOAD_SERVER_CERTIFICATE,
+            &crate::state::server_certificate_arn(&path, &input.server_certificate_name),
+            &format!("server certificate {}", input.server_certificate_name),
+            crate::state::authorization::WrittenTags::Pairs(
+                tags.as_deref().unwrap_or_default(),
+            ),
+        )?;
 
         // The certificate is named by its `ServerCertificateName`, which is unique within
         // the account and not distinguished by case, so a second upload under a held name

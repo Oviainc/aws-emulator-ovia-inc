@@ -163,9 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it — IAM is global
-        // and the provider is named by the ARN the request carries.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DeleteOpenIDConnectProviderErrorModeled::ServiceFailureException(
@@ -203,8 +200,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // client IDs, thumbprints and tags) are forgotten, nothing that NAMES the provider
         // is touched, and an ARN the account holds no provider for is answered as the
         // deletion it already is.
-        state
-            .lock()
+        let mut store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the record is forgotten. The decision is made on the ARN the
+        // request addresses, and the refusal names the resource the way every other call
+        // on an OIDC provider names it; a refused call forgets nothing, because the
+        // decision is made before the write.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_OPEN_ID_CONNECT_PROVIDER,
+            &input.open_id_connect_provider_arn,
+            &format!("oidc-provider {}", input.open_id_connect_provider_arn),
+        )?;
+        store
             .open_id_connect_providers
             .remove(&input.open_id_connect_provider_arn);
 

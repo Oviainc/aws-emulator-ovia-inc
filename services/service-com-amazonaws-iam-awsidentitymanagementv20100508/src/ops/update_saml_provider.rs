@@ -222,6 +222,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // concurrent updates of one provider are serialized rather than refused.
         let mut store = state.lock();
 
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is updated, and before the store is consulted for the
+        // provider. The decision is made on the ARN the request addresses, while the
+        // refusal NAMES the entity that ARN identifies; a refused call updates nothing.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::UPDATE_SAML_PROVIDER,
+            &input.saml_provider_arn,
+            &format!("saml-provider {}", input.saml_provider_arn),
+        )?;
+
         // The write is addressed exactly as a read of the same ARN is, so it reaches the
         // one record `GetSAMLProvider` reports; for an ARN the account holds no provider
         // under, what IAM found no manifest for is the ARN the request named — the wording

@@ -64,6 +64,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The name that stands for EVERY SAML provider in the account, so
+/// [`crate::state::saml_provider_arn`] builds the ARN of the provider COLLECTION rather
+/// than of one provider: this operation names no provider, so the collection is what a
+/// statement has to cover to permit it, and what the refusal names. It is the same
+/// wildcard `ListOpenIDConnectProviders` is authorized on through
+/// `crate::state::ANY_OPEN_ID_CONNECT_PROVIDER`, stated here because the two ARN
+/// grammars are built by different functions.
+const ANY_SAML_PROVIDER: &str = "*";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -136,7 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answer is read out of the account's state: the model declares an empty input for
         // this operation (`smithy_query(query="operation",
         // operation="ListSAMLProviders")`), so there is nothing to filter or page by.
-        let _ = (&input, ctx);
+        let _ = &input;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListSAMLProvidersErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -158,6 +167,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant — and each is taken from the stored record, so it agrees with what
         // `GetSAMLProvider` reports for the same provider.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any provider is reported, so a caller that may not make this
+        // call learns that rather than learning which providers the account holds. The
+        // request names no provider, so the resource the decision is made on — and the one
+        // the refusal names — is EVERY provider in the account: the `saml-provider` ARN
+        // with its name a wildcard.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_SAML_PROVIDERS,
+            &crate::state::saml_provider_arn(ANY_SAML_PROVIDER),
+        )?;
         let saml_provider_list: Vec<SAMLProviderListEntry> = store
             .saml_providers
             .iter()

@@ -192,9 +192,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; a read addressed by ARN depends on
-        // none of it.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetHumanReadableSummaryErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -223,10 +220,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // access alone, and the resolution is the crate's one
         // ARN-to-delegation-request lookup, so an ARN carrying another account's id
         // resolves here exactly as it does for every other reader.
-        let holds_request = state
-            .lock()
-            .delegation_request_by_arn(&input.entity_arn)
-            .is_some();
+        let holds_request = {
+            let store = state.lock();
+            // IAM authorizes its own API: the signing principal's identity-based policies
+            // are evaluated before any summary is served, and before the store is
+            // consulted for the request — so a caller that may not read a summary learns
+            // that it may not, never whether the account holds that entity. The decision
+            // is made on the ARN the request addresses.
+            crate::state::authorization::authorize_named(
+                &store,
+                ctx,
+                crate::state::authorization::GET_HUMAN_READABLE_SUMMARY,
+                &input.entity_arn,
+                &input.entity_arn,
+            )?;
+            store
+                .delegation_request_by_arn(&input.entity_arn)
+                .is_some()
+        };
 
         // A request the account does not hold "referenced a resource entity that does
         // not exist", and "the error message describes the resource": the entity type

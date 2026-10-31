@@ -153,8 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetOpenIDConnectProviderErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -186,6 +184,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource" (`NoSuchEntityException`): IAM describes a missing OIDC provider by the
         // ARN the request named it with.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the provider is reported, and before the store is consulted for
+        // it — so a caller that may not read a provider learns that it may not, never
+        // whether the account holds that provider. The decision is made on the ARN the
+        // request addresses, and the refusal names the resource the way every other call
+        // on an OIDC provider names it.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_OPEN_ID_CONNECT_PROVIDER,
+            &input.open_id_connect_provider_arn,
+            &format!("oidc-provider {}", input.open_id_connect_provider_arn),
+        )?;
+
         let Some(provider) = store
             .open_id_connect_providers
             .get(&input.open_id_connect_provider_arn)

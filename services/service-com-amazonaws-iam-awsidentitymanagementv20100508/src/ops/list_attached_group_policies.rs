@@ -168,9 +168,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; what this reports comes from the
-        // store and the request's own paging members.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 ListAttachedGroupPoliciesErrorModeled::ServiceFailureException(
@@ -187,9 +184,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // IAM entity names "are not distinguished by case", so the case-folded name
         // is the identity; a name the account holds no group under "referenced a
-        // resource entity that does not exist".
+        // resource entity that does not exist". The LOOKUP comes first but the answer
+        // to it is withheld until the call has been authorized, because IAM decides a
+        // call against the caller's policies before it reads the resource: a caller
+        // that may not list a group's attachments learns that it may not, never whether
+        // that group exists.
         let group_key = crate::state::name_key(&input.group_name);
-        if !store.groups.contains_key(&group_key) {
+        let held = store.groups.get(&group_key);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before any attachment is reported. The decision is made on the
+        // ARN of the group the request addresses — the held group's own ARN, or, for a
+        // name the account holds no group under, the ARN that name would carry at the
+        // default path, since there is no other path to attribute it to. A refusal
+        // names that group as the request named it (`group Admins`) rather than by ARN.
+        let resource = held.map_or_else(
+            || crate::state::group_arn(crate::state::DEFAULT_PATH, &input.group_name),
+            |group| group.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_ATTACHED_GROUP_POLICIES,
+            &resource,
+            &format!("group {}", input.group_name),
+        )?;
+
+        if held.is_none() {
             return Err(ListAttachedGroupPoliciesErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(

@@ -186,6 +186,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under the case-folded name whatever case it spelled it in.
         let key = crate::state::name_key(&input.role_name);
 
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any deletion task is recorded. The decision is made on the ARN
+        // of the role the request addresses — the held role's own ARN, or, for a name the
+        // account holds no role under, the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names that role as
+        // the request named it, and records nothing.
+        let resource = store.roles.get(&key).map_or_else(
+            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
+            |role| role.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_SERVICE_LINKED_ROLE,
+            &resource,
+            &format!("role {}", input.role_name),
+        )?;
+
         // "If you call this operation more than once for the same service-linked role and
         // an earlier deletion task is not complete, then the DeletionTaskId of the
         // earlier request is returned": the repeat records nothing and answers with the

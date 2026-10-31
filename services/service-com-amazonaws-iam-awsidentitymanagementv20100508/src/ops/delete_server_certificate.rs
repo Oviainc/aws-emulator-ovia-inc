@@ -194,16 +194,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let mut store = state.lock();
+        let certificate_key = crate::state::name_key(&input.server_certificate_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is deleted. The decision is made on the ARN the held
+        // certificate carries, or, for a name the account holds none under, on the ARN
+        // that name would carry at the default path, since there is no other path to
+        // attribute it to. A refusal names the certificate as the request named it, and
+        // deletes nothing.
+        let resource = store.server_certificates.get(&certificate_key).map_or_else(
+            || {
+                crate::state::server_certificate_arn(
+                    crate::state::DEFAULT_PATH,
+                    &input.server_certificate_name,
+                )
+            },
+            |certificate| certificate.metadata.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DELETE_SERVER_CERTIFICATE,
+            &resource,
+            &format!("server certificate {}", input.server_certificate_name),
+        )?;
 
         // IAM entity names "are not distinguished by case", so the delete reaches the
         // certificate under the case-folded name `UploadServerCertificate` stored it under,
         // whatever case this request spells it in. Removing that entry is what deletes the
         // certificate: its metadata, its PEM material and its tags are all members of the
         // one record, so none of them outlives it.
-        let Some(removed) = store
-            .server_certificates
-            .remove(&crate::state::name_key(&input.server_certificate_name))
-        else {
+        let Some(removed) = store.server_certificates.remove(&certificate_key) else {
             // A name the account holds no certificate for "referenced a resource entity
             // that does not exist" (`NoSuchEntityException`), worded as every operation
             // naming a server certificate by name words that absence.

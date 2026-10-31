@@ -156,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         // `ctx` carries request metadata only; this read is driven entirely by its
         // input and the store.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListRolePoliciesErrorModeled::ServiceFailureException(
@@ -199,6 +199,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A read: it reports the names the account holds and writes nothing.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any name is reported, so a caller that may not list a role's
+        // embedded policies learns that it may not, never whether that role exists. The
+        // decision is made on the ARN of the role the request addresses — the held role's
+        // own ARN, or, for a name the account holds no role under, the ARN that name would
+        // carry at the default path, since there is no other path to attribute it to. A
+        // refusal names that role as the request named it.
+        let resource = store.roles.get(&role_key).map_or_else(
+            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
+            |role| role.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_ROLE_POLICIES,
+            &resource,
+            &format!("role {}", input.role_name),
+        )?;
+
         if !store.roles.contains_key(&role_key) {
             return Err(ListRolePoliciesErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

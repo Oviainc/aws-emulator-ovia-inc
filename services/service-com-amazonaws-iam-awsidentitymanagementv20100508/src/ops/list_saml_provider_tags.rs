@@ -164,8 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing here depends on it.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListSAMLProviderTagsErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -228,6 +226,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A read: it reports the tags the provider persists and writes nothing, so a
         // later caller sees exactly what this one did.
         let store = state.lock();
+
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before any tag is reported, and before the store is consulted for the provider,
+        // so a caller that may not read a provider's tags learns that it may not rather
+        // than whether the account holds that provider. The decision is made on the ARN
+        // the request addresses, while the refusal NAMES the entity that ARN identifies.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::LIST_SAML_PROVIDER_TAGS,
+            &input.saml_provider_arn,
+            &format!("saml-provider {}", input.saml_provider_arn),
+        )?;
+
         let Some(provider) = store.saml_providers.get(&input.saml_provider_arn) else {
             return Err(ListSAMLProviderTagsErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

@@ -407,6 +407,18 @@ async fn an_omitted_name_deletes_the_signing_users_password() {
             "case {name:?}: the signing key must be minted, got {status}: {key}"
         );
         let signing_key = element(&key, "AccessKeyId");
+        // Both calls below are IAM calls the caller's policies decide, so the signing user
+        // needs those two grants. They are fixture: what this row is about is WHOSE
+        // password a nameless delete reaches.
+        for action in ["iam:DeleteLoginProfile", "iam:GetLoginProfile"] {
+            crate::identity_policy_enforcement::grant_action(
+                &router,
+                &name,
+                case.stored_name,
+                action,
+            )
+            .await;
+        }
 
         let (status, deleted) =
             call_signed_by(&router, Some(&signing_key), "DeleteLoginProfile", &[]).await;

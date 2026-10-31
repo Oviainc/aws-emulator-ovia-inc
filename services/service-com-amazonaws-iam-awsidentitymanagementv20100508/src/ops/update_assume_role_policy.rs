@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         // `ctx` carries request metadata only; this operation is driven entirely by
         // its input and the store.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateAssumeRolePolicyErrorModeled::ServiceFailureException(
@@ -200,6 +200,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolves is still "a resource entity that does not exist" here, as that
         // function's own documentation records.
         let key = crate::state::name_key(&input.role_name);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the trust policy is replaced. The decision is made on the ARN
+        // of the role the request addresses — the held role's own ARN, or, for a name the
+        // account holds no role under, the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names that role as
+        // the request named it (`role Deployer`) rather than by ARN, and leaves the trust
+        // policy as it was, because the decision is made before the write.
+        let resource = store.roles.get(&key).map_or_else(
+            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
+            |role| role.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::UPDATE_ASSUME_ROLE_POLICY,
+            &resource,
+            &format!("role {}", input.role_name),
+        )?;
         let Some(role) = store.roles.get(&key) else {
             return Err(UpdateAssumeRolePolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

@@ -194,6 +194,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is minted. The decision is made on the ARN of the user
+        // the credential belongs to — the held user's own ARN, or, for a name the account
+        // holds no user under, the ARN that name would carry at the default path, since
+        // there is no other path to attribute it to. A refusal names that user as the
+        // request named it, and mints nothing.
+        let resource = store
+            .users
+            .get(&crate::state::name_key(&input.user_name))
+            .map_or_else(
+                || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+                |user| user.arn.clone(),
+            );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::CREATE_SERVICE_SPECIFIC_CREDENTIAL,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+
         // The credential belongs to a STORED IAM user: the new credentials "have the
         // same permissions as the associated user", so a name the account does not
         // hold has no permissions to carry.

@@ -219,7 +219,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateServiceLinkedRoleErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -263,6 +262,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let path = crate::state::service_linked_role_path(&input.aws_service_name);
 
         let mut store = state.lock();
+
+        // IAM authorizes its own API: the caller's identity-based policies are evaluated
+        // before the role is created, and before the store is consulted for a name
+        // collision — so a caller that may not create a service-linked role learns that it
+        // may not, never which names the account already holds. The decision is made on
+        // the ARN the role WOULD carry, and the refusal names it as the create names it.
+        // Nothing is created when it refuses.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::CREATE_SERVICE_LINKED_ROLE,
+            &crate::state::role_arn(&path, &role_name),
+            &format!("role {role_name}"),
+        )?;
 
         // IAM entity names are unique within the account and "are not
         // distinguished by case", so the case-folded name is the identity. A second

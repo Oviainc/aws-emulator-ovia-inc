@@ -157,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 GetServiceLinkedRoleDeletionStatusErrorModeled::ServiceFailureException(
@@ -190,6 +189,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before any status is reported. This call names a deletion TASK rather
+        // than one entity of the account, and the Service Authorization Reference lists no
+        // resource type for the action, so a statement permits it only by covering every
+        // resource.
+        crate::state::authorization::authorize(
+            &store,
+            ctx,
+            crate::state::authorization::GET_SERVICE_LINKED_ROLE_DELETION_STATUS,
+            crate::state::authorization::ACCOUNT_WIDE_RESOURCE,
+        )?;
 
         let Some(task) = store
             .service_linked_role_deletions

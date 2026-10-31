@@ -154,9 +154,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; a read addressed by ARN depends on
-        // none of it.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetPolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -183,6 +180,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // catalog entry, with the attachment and permissions-boundary counts taken
         // from the live state — and writes nothing.
         let store = state.lock();
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before the policy is reported, and before the STORE is consulted for
+        // it — so a caller that may not read a policy learns that it may not, never
+        // whether the account holds it. The decision is made on the ARN the request
+        // addresses, while the refusal NAMES the entity that ARN identifies.
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::GET_POLICY,
+            &input.policy_arn,
+            &format!("policy {}", input.policy_arn),
+        )?;
+
         if let Some(resolved) = store.resolve_policy(&input.policy_arn) {
             return Ok(GetPolicyOutput {
                 policy: Some(resolved.policy),

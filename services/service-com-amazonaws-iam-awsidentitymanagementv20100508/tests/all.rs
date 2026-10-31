@@ -155,6 +155,8 @@ mod open_id_connect_providers;
 mod organization_root_access_features;
 #[path = "all/organizations_access_report_generation.rs"]
 mod organizations_access_report_generation;
+#[path = "all/own_api_authorization_coverage.rs"]
+mod own_api_authorization_coverage;
 #[path = "all/permissions_boundary_ceiling.rs"]
 mod permissions_boundary_ceiling;
 #[path = "all/policies_granting_service_access.rs"]

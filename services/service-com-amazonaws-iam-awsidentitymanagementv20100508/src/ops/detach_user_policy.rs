@@ -167,9 +167,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing about a detachment depends on it —
-        // IAM is global, and both entities are named by the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DetachUserPolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -199,9 +196,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The user is named (friendly name, not ARN) and IAM entity names "are not
         // distinguished by case", so the case-folded name is the identity. A name the
-        // account holds no user under "referenced a resource entity that does not exist".
+        // account holds no user under "referenced a resource entity that does not exist" —
+        // an answer withheld until the call has been authorized, because IAM decides a
+        // call against the caller's policies before it reads the resource.
         let user_key = crate::state::name_key(&input.user_name);
-        let Some(user) = store.users.get(&user_key) else {
+        let held = store.users.get(&user_key);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies are
+        // evaluated before anything is detached. The decision is made on the ARN of the
+        // user the detachment is made on — the held user's own ARN, or, for a name the
+        // account holds no user under, the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names that user as
+        // the request named it (`user Bob`) rather than by ARN, and leaves the user's
+        // attachments untouched, because the decision is made before the write.
+        let resource = held.map_or_else(
+            || crate::state::user_arn(crate::state::DEFAULT_PATH, &input.user_name),
+            |user| user.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::DETACH_USER_POLICY,
+            &resource,
+            &format!("user {}", input.user_name),
+        )?;
+
+        let Some(user) = held else {
             return Err(DetachUserPolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(

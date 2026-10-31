@@ -496,6 +496,16 @@ async fn an_omitted_name_resolves_the_signing_users_credential() {
         ("Signer_Two", "logs.amazonaws.com", Form::LongTermApiKey),
     ] {
         create_user(&router, user).await;
+        // `ResetServiceSpecificCredential` is itself an IAM call the caller's policies
+        // decide, so the signing user needs that one grant. It is fixture: what this row
+        // is about is WHOSE credential a nameless reset reaches.
+        crate::identity_policy_enforcement::grant_action(
+            &router,
+            user,
+            user,
+            "iam:ResetServiceSpecificCredential",
+        )
+        .await;
         let (status, key) = call(&router, "CreateAccessKey", &[("UserName", user)]).await;
         assert_eq!(
             status, 200,

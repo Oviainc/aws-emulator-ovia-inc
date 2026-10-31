@@ -176,9 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; nothing about an attachment depends
-        // on it — IAM is global, and both entities are named by the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(AttachRolePolicyErrorModeled::ServiceFailureException(
                 ServiceFailureException {
@@ -208,9 +205,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The role is named (friendly name, not ARN) and IAM entity names "are not
         // distinguished by case", so the case-folded name is the identity. A name
         // the account holds no role under "referenced a resource entity that does
-        // not exist".
+        // not exist" — an answer withheld until the call has been authorized, because
+        // IAM decides a call against the caller's policies before it reads the
+        // resource.
         let role_key = crate::state::name_key(&input.role_name);
-        let Some(role) = store.roles.get(&role_key) else {
+        let held = store.roles.get(&role_key);
+
+        // IAM authorizes its own API: the signing principal's identity-based policies
+        // are evaluated before anything is attached. The decision is made on the ARN of
+        // the role the attachment is made on — the held role's own ARN, or, for a name
+        // the account holds no role under, the ARN that name would carry at the default
+        // path, since there is no other path to attribute it to. A refusal names that
+        // role as the request named it (`role Deployer`) rather than by ARN, and leaves
+        // the role's attachments untouched, because the decision precedes the write.
+        let resource = held.map_or_else(
+            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
+            |role| role.arn.clone(),
+        );
+        crate::state::authorization::authorize_named(
+            &store,
+            ctx,
+            crate::state::authorization::ATTACH_ROLE_POLICY,
+            &resource,
+            &format!("role {}", input.role_name),
+        )?;
+
+        let Some(role) = held else {
             return Err(AttachRolePolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(
