@@ -37,6 +37,8 @@ mod harvest_job_rejections;
 mod harvest_jobs;
 #[path = "all/harvest_source_deleted.rs"]
 mod harvest_source_deleted;
+#[path = "all/harvest_source_window_closed.rs"]
+mod harvest_source_window_closed;
 #[path = "all/harvest_startover.rs"]
 mod harvest_startover;
 #[path = "all/ingest_credentials.rs"]

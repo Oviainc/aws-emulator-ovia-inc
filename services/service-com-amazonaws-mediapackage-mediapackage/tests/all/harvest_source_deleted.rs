@@ -51,7 +51,9 @@ const CONTROL_JOB: &str = "control-job";
 /// One `CreateHarvestJob` body: the window and the destination are fixed here, because
 /// what they generalise over is the harvest-job suite's own subject
 /// (`tests/all/harvest_jobs.rs`); what this suite varies is the jobs' number and status.
-fn job_body(id: &str, endpoint: &str) -> Value {
+///
+/// Shared with the sibling suite; see [`create_endpoint_in`].
+pub(crate) fn job_body(id: &str, endpoint: &str) -> Value {
     json!({
         "id": id,
         "originEndpointId": endpoint,
@@ -66,7 +68,9 @@ fn job_body(id: &str, endpoint: &str) -> Value {
 }
 
 /// Create the channel `id` in `region`, failing the test if that does not succeed.
-async fn create_channel_in(router: &MultiServiceRouter, region: &str, id: &str) {
+///
+/// Shared with the sibling suite; see [`create_endpoint_in`].
+pub(crate) async fn create_channel_in(router: &MultiServiceRouter, region: &str, id: &str) {
     let body = json!({ "id": id });
     let (status, body) = call_in(router, region, "POST", "/channels", Some(&body)).await;
     assert_eq!(
@@ -77,7 +81,10 @@ async fn create_channel_in(router: &MultiServiceRouter, region: &str, id: &str) 
 
 /// Create the origin endpoint `id` of `channel` in `region`, failing the test if that does
 /// not succeed.
-async fn create_endpoint_in(router: &MultiServiceRouter, region: &str, id: &str, channel: &str) {
+///
+/// Shared with the sibling suite for the OTHER write that takes a harvest's source away
+/// (`tests/all/harvest_source_window_closed.rs`), so the two drive the same fixture.
+pub(crate) async fn create_endpoint_in(router: &MultiServiceRouter, region: &str, id: &str, channel: &str) {
     // A harvest exports the content the endpoint's STARTOVER window retains, so a
     // harvestable endpoint keeps one: `tests/all/harvest_startover.rs` is the suite for
     // that precondition.
@@ -102,7 +109,9 @@ async fn create_endpoint_in(router: &MultiServiceRouter, region: &str, id: &str,
 
 /// Submit the harvest job `id` on `endpoint` in `region`, asserting it was accepted and
 /// started out harvesting, and answer the record the submit returned.
-async fn submit(router: &MultiServiceRouter, region: &str, id: &str, endpoint: &str) -> Value {
+///
+/// Shared with the sibling suite; see [`create_endpoint_in`].
+pub(crate) async fn submit(router: &MultiServiceRouter, region: &str, id: &str, endpoint: &str) -> Value {
     let (status, created) = call_in(
         router,
         region,
@@ -126,13 +135,13 @@ async fn submit(router: &MultiServiceRouter, region: &str, id: &str, endpoint: &
 }
 
 /// The status a `DescribeHarvestJob` body reports.
-fn status_of(body: &Value) -> Option<&str> {
+pub(crate) fn status_of(body: &Value) -> Option<&str> {
     body.get("status").and_then(Value::as_str)
 }
 
 /// `body` without its `status`: everything about a job record that a status transition must
 /// leave exactly as the submit stored it.
-fn without_status(body: &Value) -> Value {
+pub(crate) fn without_status(body: &Value) -> Value {
     let mut copy = body.clone();
     if let Some(object) = copy.as_object_mut() {
         object.remove("status");
@@ -371,12 +380,14 @@ async fn removing_an_endpoint_fails_the_harvests_still_running_against_it() {
     }
 }
 
-/// The Region pairs the scope is driven over: the Region the endpoint is removed in
-/// ("home") and a second Region holding the same ids ("foreign"). The rows span the
-/// emulator's own default Region as home and as foreign, two Regions on different
-/// continents, and two Regions sharing a prefix — so a scope comparing Region prefixes
-/// would fail a row.
-const REGION_PAIRS: &[(&str, &str)] = &[
+/// The Region pairs the scope is driven over: the Region the write that takes the harvest
+/// source away is served in ("home") and a second Region holding the same ids ("foreign").
+/// The rows span the emulator's own default Region as home and as foreign, two Regions on
+/// different continents, and two Regions sharing a prefix — so a scope comparing Region
+/// prefixes would fail a row.
+///
+/// Shared with the sibling suite; see [`create_endpoint_in`].
+pub(crate) const REGION_PAIRS: &[(&str, &str)] = &[
     ("eu-west-1", "us-east-1"),
     ("us-east-1", "eu-central-1"),
     ("us-east-1", "us-east-2"),

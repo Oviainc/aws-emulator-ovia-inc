@@ -2,7 +2,11 @@
 
 //! @op UpdateOriginEndpoint
 //! Merges an OriginEndpoint's updated configuration into the stored record — including
-//! the playback URL it re-derives — so every later read renders the update.
+//! the playback URL it re-derives — so every later read renders the update. An update
+//! that leaves the endpoint retaining no startover window takes away the already-published
+//! content a harvest exports, so it settles the jobs still harvesting the endpoint exactly
+//! as `DeleteOriginEndpoint` does
+//! ([`crate::state::ComAmazonawsMediapackageMediapackageState::fail_harvests_of_origin_endpoint`]).
 //!
 //! ## Shape of an operation
 //!
@@ -395,9 +399,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same member set as a created one and no projection of it can differ.
         crate::state::apply_origin_endpoint_defaults(record);
 
+        // Whether the endpoint this write LEAVES retains a startover (time-shift) window,
+        // read off the stored record once its defaults are filled: that window is the
+        // already-published content a harvest exports, so this is what decides below
+        // whether the write took a harvest's source away.
+        let retains_startover_content = record.startover_enabled();
+
         // Rendered from the STORED record, so this response and every later
         // DescribeOriginEndpoint/ListOriginEndpoints are the same bytes.
         let endpoint = record.to_origin_endpoint();
+
+        // A harvest exports content the endpoint has already published, which the endpoint
+        // keeps only for as long as its startover window retains it — so a write that
+        // leaves the endpoint retaining nothing takes that source away exactly as removing
+        // the endpoint does, and a job still harvesting it can never carry the harvest out.
+        // Those jobs are settled by the same helper `DeleteOriginEndpoint` settles them
+        // with, rather than left reporting work in progress against a source that holds
+        // nothing while a submission naming the very same endpoint is refused. The clock's
+        // own owed transitions are materialised first, so a job the clock had already
+        // finished keeps the status the clock gave it and only the unfinished jobs move.
+        if !retains_startover_content {
+            state.settle_harvest_jobs(std::time::SystemTime::now());
+            state.fail_harvests_of_origin_endpoint(&region, &id);
+        }
         Ok(UpdateOriginEndpointOutput {
             arn: endpoint.arn,
             authorization: endpoint.authorization,

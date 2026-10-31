@@ -2747,17 +2747,23 @@ impl ComAmazonawsMediapackageMediapackageState {
     }
 
     /// Fail every harvest job OF `region` that has not finished harvesting the origin
-    /// endpoint `origin_endpoint_id`, because that endpoint is being removed.
+    /// endpoint `origin_endpoint_id`, because that endpoint no longer holds content for
+    /// it to export.
     ///
-    /// A harvest exports content the origin endpoint has already published, so a job that
-    /// has not reached a terminal status when its source endpoint is removed can never
-    /// carry that harvest out: it reaches [`HARVEST_FAILED`] — the modelled status for a
-    /// harvest that did not produce its output — and owes no further transition, instead
-    /// of reporting work in progress, and later an outcome, for a source this service no
-    /// longer holds.
+    /// A harvest exports content the origin endpoint has already published, which the
+    /// endpoint keeps only for as long as its startover window
+    /// ([`OriginEndpointRecord::startover_enabled`]) retains it, so a job that has not
+    /// reached a terminal status when a write takes that source away — the endpoint
+    /// removed, or its startover window left retaining nothing — can never carry that
+    /// harvest out: it reaches [`HARVEST_FAILED`] — the modelled status for a harvest that
+    /// did not produce its output — and owes no further transition, instead of reporting
+    /// work in progress, and later an outcome, for content this service no longer holds.
+    ///
+    /// Called by every write that can take the source away, so the two paths cannot
+    /// disagree about what becomes of the jobs.
     ///
     /// Only the unfinished jobs move. A job that already reached a terminal status
-    /// finished its harvest while the endpoint was there, and the record of a submitted
+    /// finished while the endpoint still held its content, and the record of a submitted
     /// harvest is HISTORY, not a reference this service resolves on a read: the stored
     /// `origin_endpoint_id` "cannot be changed after the HarvestJob is submitted", no
     /// operation of this service removes a stored job, and every read keeps reporting the
