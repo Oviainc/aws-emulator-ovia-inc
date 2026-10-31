@@ -209,17 +209,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The role is named (friendly name, not ARN) and IAM entity names "are not
         // distinguished by case", so the case-folded name is the identity.
         let role_key = crate::state::name_key(&input.role_name);
+        // Which role the request addresses, and under which path the account or the
+        // owning service holds it: the one reading in `crate::state` every protection in
+        // this crate shares (`addressed_role_path`).
+        let addressed_path = store.addressed_role_path(&input.role_name);
 
         // IAM authorizes its own API: the signing principal's identity-based policies are
         // evaluated before the boundary is set. The decision is made on the ARN of the
-        // role whose boundary the request addresses — the held role's own ARN, or, for a
-        // name the account holds no role under, the ARN that name would carry at the
+        // role whose boundary the request addresses — the ARN of the path it is held under,
+        // or, for a name nothing holds, the ARN that name would carry at the
         // default path, since there is no other path to attribute it to. A refusal names
         // that role as the request named it (`role Deployer`) rather than by ARN, and
         // leaves the boundary in force, because the decision is made before the write.
-        let resource = store.roles.get(&role_key).map_or_else(
-            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
-            |role| role.arn.clone(),
+        let resource = crate::state::role_arn(
+            addressed_path
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_PATH),
+            &input.role_name,
         );
         crate::state::authorization::authorize_named(
             &store,
@@ -230,19 +236,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         // The role's PATH is what tells this operation whether the role is
-        // service-linked. The account's own record answers first; failing that, a role
-        // name AWS PUBLISHES for a service still names a role — the one that service
-        // keeps provisioned, which `GetRole` reports — so its path is read from there
-        // rather than the name being called unknown. A name neither the account nor any
-        // service holds "referenced a resource entity that does not exist".
-        let Some(path) = store
-            .roles
-            .get(&role_key)
-            .map(|role| role.path.clone())
-            .or_else(|| {
-                crate::state::service_provisioned_role(&input.role_name).map(|role| role.path)
-            })
-        else {
+        // service-linked, read above through the one reading in `crate::state` every
+        // protection in this crate shares. A name neither the account nor any service
+        // holds "referenced a resource entity that does not exist".
+        let Some(path) = addressed_path else {
             return Err(PutRolePermissionsBoundaryErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(

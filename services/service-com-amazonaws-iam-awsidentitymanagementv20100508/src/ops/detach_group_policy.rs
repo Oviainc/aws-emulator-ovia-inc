@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("group {}", input.group_name),
         )?;
 
-        let Some(group) = held else {
+        if held.is_none() {
             return Err(DetachGroupPolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(
@@ -230,14 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        };
-        let group_name = group.group_name.clone();
+        }
 
         // "Removes the specified managed policy from the specified IAM group": what goes
         // is the ATTACHMENT the group carries, read and written through the one set
         // `AttachGroupPolicy` fills and `ListAttachedGroupPolicies` reports. A policy the
         // group does not carry "referenced a resource entity that does not exist", worded
-        // as `DetachRolePolicy` words the same absence for a role.
+        // as this crate words the absence of the policy a `PolicyArn` names
+        // (`crate::state::policy_not_found`), the sentence `DetachRolePolicy` and
+        // `DetachUserPolicy` answer the same absence with.
         let detached = store
             .group_attached_policies
             .get_mut(&group_key)
@@ -245,10 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !detached {
             return Err(DetachGroupPolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!(
-                        "Policy {} was not found attached to group {group_name}.",
-                        input.policy_arn
-                    )),
+                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
                 },
             )
             .into());

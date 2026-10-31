@@ -312,26 +312,24 @@ async fn an_update_changes_no_other_roles_description() {
     }
 }
 
-/// RULE: a name the ACCOUNT does not hold "referenced a resource entity that does not
-/// exist" — the modelled `NoSuchEntityException` (HTTP 404) — and the call persists
-/// nothing, including for a role name AWS publishes for a service but this account has
-/// never created.
+/// RULE: a name NEITHER the ACCOUNT holds NOR a service keeps provisioned "referenced a
+/// resource entity that does not exist" — the modelled `NoSuchEntityException` (HTTP 404)
+/// — and the call persists nothing.
 #[tokio::test]
 async fn updating_a_role_the_account_does_not_hold_is_not_found() {
     let router = router();
     create_role(&router, "HeldRole", "/").await;
 
-    // Rows: a plain absent name, names one character either side of a held one, the
-    // whole admitted alphabet, and a name AWS PUBLISHES for a service's own
-    // service-linked role, which this account has not created
-    // (`state::service_provisioned_role`'s documentation: an update "keeps answering
-    // from the store alone", so such a name is NoSuchEntity here).
+    // Rows: a plain absent name, names one character either side of a held one, and the
+    // whole admitted alphabet. A role name AWS PUBLISHES for a service's own
+    // service-linked role is NOT among them: that name resolves to the role the service
+    // keeps provisioned, whose description IS the account's to set
+    // (`updating_a_service_linked_roles_description_is_served`).
     let absent = [
         "absent",
         "HeldRol",
         "HeldRoles",
         "role_with+every=allowed.char@-",
-        "AWSServiceRoleForBackup",
     ];
     for role_name in absent {
         let (status, body) = update(&router, role_name, "a description for nothing").await;
@@ -365,17 +363,25 @@ async fn updating_a_role_the_account_does_not_hold_is_not_found() {
 /// RULE: a description is a setting of the account's own record of a role, not the
 /// permissions or trust relationship a service-linked role protects — so this update is
 /// served for such a role exactly as for any other, and a later `GetRole` reports the
-/// text it wrote.
+/// text it wrote. It is served whichever way the account comes to hold the role: one it
+/// created through `CreateServiceLinkedRole`, and one the owning service keeps
+/// provisioned under the name AWS publishes, which this update makes the account's own
+/// record of.
 #[tokio::test]
 async fn updating_a_service_linked_roles_description_is_served() {
     let router = router();
 
-    // Rows spanning the service the role is linked to.
+    // Rows spanning the service the role is linked to, and HOW the account comes to hold
+    // it: `(the role name, the service-linked path it must keep)`. The first three are
+    // created here; the last two are names AWS publishes that nothing created (source:
+    // `state::PUBLISHED_SERVICE_LINKED_ROLE_NAMES`, the catalog
+    // `tests/all/service_provisioned_roles.rs` pins).
     let principals = [
         "lambda.amazonaws.com",
         "elasticbeanstalk.amazonaws.com",
         "autoscaling.amazonaws.com",
     ];
+    let mut rows: Vec<(String, String)> = Vec::new();
     for principal in principals {
         let (status, created) = call(
             &router,
@@ -387,10 +393,23 @@ async fn updating_a_service_linked_roles_description_is_served() {
             status, 200,
             "case {principal:?}: CreateServiceLinkedRole must succeed, got {status}: {created}"
         );
-        let role_name = element(&created, "RoleName");
+        rows.push((
+            element(&created, "RoleName"),
+            format!("/aws-service-role/{principal}/"),
+        ));
+    }
+    rows.push((
+        "AWSServiceRoleForECS".to_string(),
+        "/aws-service-role/ecs.amazonaws.com/".to_string(),
+    ));
+    rows.push((
+        "AWSServiceRoleForComputeOptimizer".to_string(),
+        "/aws-service-role/compute-optimizer.amazonaws.com/".to_string(),
+    ));
 
+    for (role_name, expected_path) in rows {
         for (description_case, description) in descriptions() {
-            let case = format!("{principal} / {description_case}");
+            let case = format!("{role_name} / {description_case}");
             let (status, body) = update(&router, &role_name, &description).await;
             assert_eq!(
                 status, 200,
@@ -413,12 +432,11 @@ async fn updating_a_service_linked_roles_description_is_served() {
         // The role is still the service's own: what makes it a service-linked role is
         // its path, which this update does not touch.
         let (status, body) = call(&router, "GetRole", &[("RoleName", &role_name)]).await;
-        assert_eq!(status, 200, "case {principal:?}: GetRole failed: {body}");
+        assert_eq!(status, 200, "case {role_name:?}: GetRole failed: {body}");
         let path = element(&body, "Path");
         assert_eq!(
-            path,
-            format!("/aws-service-role/{principal}/"),
-            "case {principal:?}: expected the service-linked path to be untouched, got \
+            path, expected_path,
+            "case {role_name:?}: expected the service-linked path to be untouched, got \
              {path:?}"
         );
     }

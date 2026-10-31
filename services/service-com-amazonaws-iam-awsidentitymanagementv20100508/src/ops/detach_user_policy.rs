@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("user {}", input.user_name),
         )?;
 
-        let Some(user) = held else {
+        if held.is_none() {
             return Err(DetachUserPolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(
@@ -231,14 +231,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        };
-        let user_name = user.user_name.clone();
+        }
 
         // "Removes the specified managed policy from the specified user": what goes is the
         // ATTACHMENT the user carries, read and written through the one set
         // `AttachUserPolicy` fills and `ListAttachedUserPolicies` reports. A policy the
         // user does not carry "referenced a resource entity that does not exist", worded
-        // as `DetachRolePolicy` words the same absence for a role.
+        // as this crate words the absence of the policy a `PolicyArn` names
+        // (`crate::state::policy_not_found`), the sentence `DetachRolePolicy` and
+        // `DetachGroupPolicy` answer the same absence with.
         let detached = store
             .user_attached_policies
             .get_mut(&user_key)
@@ -246,10 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !detached {
             return Err(DetachUserPolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!(
-                        "Policy {} was not found attached to user {user_name}.",
-                        input.policy_arn
-                    )),
+                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
                 },
             )
             .into());

@@ -18,11 +18,12 @@
 //! 3. a policy document past a size quota names the QUOTA where the quota is the account's
 //!    (a managed policy's `PolicySize`) and the ENTITY where it is the entity's (an inline
 //!    policy's, in `bytes`), and a document that is no IAM policy is refused with one fixed
-//!    sentence per defect and per document CLASS — `Syntax errors in policy.` for an
-//!    identity or resource policy that does not parse as a JSON object, `This policy
-//!    contains invalid Json` for a role's trust policy that does not, `Policy has no
-//!    statements` for an object carrying no `Statement` — carrying nothing of the document
-//!    and nothing of the member that supplied it.
+//!    sentence per defect and per document CLASS — an identity or resource policy this
+//!    emulator cannot read as a policy is `Syntax errors in policy.` whether it failed to
+//!    parse or carried no `Statement`, while a role's TRUST policy tells the two apart,
+//!    `This policy contains invalid Json` for one that does not parse and `Policy has no
+//!    statements` for an object carrying no `Statement` — each carrying nothing of the
+//!    document and nothing of the member that supplied it.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over: which
 //! operation of the family is called, which entity kind is addressed, the way the
@@ -68,8 +69,9 @@ const POLICY_HAS_NO_STATEMENTS: &str = "Policy has no statements";
 /// way.
 const TRUST_POLICY_INVALID_JSON: &str = "This policy contains invalid Json";
 
-/// The operations of this service whose document is a role's trust policy, so the
-/// unparseable-document row expects the trust-policy sentence for them.
+/// The operations of this service whose document is a role's trust policy, so a document
+/// this emulator cannot read as a policy at all expects the trust-policy validator's
+/// sentence for them rather than the identity-policy validator's.
 const TRUST_POLICY_WRITERS: &[&str] = &["CreateRole", "UpdateAssumeRolePolicy"];
 
 /// What AWS answers a delete whose entity still carries one class of dependent:
@@ -529,33 +531,36 @@ async fn a_policy_document_past_a_quota_names_the_quota_it_broke() {
 
 /// RULE 3 (the malformed half): a value supplied where an IAM policy document is expected
 /// is refused with ONE fixed sentence per defect and per document class — an identity or
-/// resource policy that does not parse as a JSON object is `Syntax errors in policy.`, a
-/// role's trust policy that does not is `This policy contains invalid Json`, a JSON object
-/// carrying no `Statement` is `Policy has no statements` — whichever operation and
-/// whichever member supplied it.
+/// resource policy this emulator cannot read as a policy is `Syntax errors in policy.`
+/// whether it failed to parse or carried no `Statement`, while a role's trust policy is
+/// read by IAM's own trust-policy validator, which answers `This policy contains invalid
+/// Json` for the first and `Policy has no statements` for the second — whichever operation
+/// and whichever member supplied it.
 #[tokio::test]
 async fn a_document_that_is_no_policy_is_refused_with_one_sentence_per_defect() {
     // The rows span the whole class each defect generalises over: text that is not JSON at
     // all, JSON that is a list, a number or a string rather than an object, an empty
     // object, and an object carrying every top-level element of the grammar EXCEPT
-    // `Statement`.
+    // `Statement`. The third column is the sentence the TRUST-policy validator answers,
+    // which is the only one that tells the two defects apart; every other member's is
+    // `SYNTAX_ERRORS_IN_POLICY`.
     let defects: &[(&str, &str, &str)] = &[
-        ("not JSON at all", "trust me", SYNTAX_ERRORS_IN_POLICY),
+        ("not JSON at all", "trust me", TRUST_POLICY_INVALID_JSON),
         (
             "an unterminated object",
             r#"{"Version":"2012-10-17""#,
-            SYNTAX_ERRORS_IN_POLICY,
+            TRUST_POLICY_INVALID_JSON,
         ),
         (
             "a JSON list",
             r#"[{"Effect":"Allow"}]"#,
-            SYNTAX_ERRORS_IN_POLICY,
+            TRUST_POLICY_INVALID_JSON,
         ),
-        ("a JSON number", "17", SYNTAX_ERRORS_IN_POLICY),
+        ("a JSON number", "17", TRUST_POLICY_INVALID_JSON),
         (
             "a JSON string",
             r#""Statement""#,
-            SYNTAX_ERRORS_IN_POLICY,
+            TRUST_POLICY_INVALID_JSON,
         ),
         ("an empty object", "{}", POLICY_HAS_NO_STATEMENTS),
         (
@@ -659,15 +664,14 @@ async fn a_document_that_is_no_policy_is_refused_with_one_sentence_per_defect() 
             );
             let message = element(&body, "Message");
             // A role's trust policy is read by IAM's trust-policy validator, which words
-            // an unparseable document its own way; every other member here takes an
-            // identity or resource policy. An object carrying no `Statement` is reported
-            // the same way for both classes.
-            let expected = if TRUST_POLICY_WRITERS.contains(action)
-                && *expected == SYNTAX_ERRORS_IN_POLICY
-            {
-                TRUST_POLICY_INVALID_JSON
-            } else {
+            // each of these two defects its own way; every other member here takes an
+            // identity or resource policy, whose validator gives no diagnosis of a
+            // document it cannot read as a policy at all and answers one sentence for
+            // both.
+            let expected = if TRUST_POLICY_WRITERS.contains(action) {
                 *expected
+            } else {
+                SYNTAX_ERRORS_IN_POLICY
             };
             assert_eq!(
                 message, expected,

@@ -1001,6 +1001,41 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
 }
 
+/// Record, in the IAM store of the same engine, the role session the credential `minted`
+/// was vended for, so a request signed with it is judged on that role's policies.
+///
+/// Which principal an access key id speaks for is a question about the account's
+/// identities, and IAM answers it: its own authorizer resolves a long-term key through the
+/// registry `iam:CreateAccessKey` wrote, and a TEMPORARY credential of a role session
+/// through this record ([`IamState::record_role_session`]) — the permissions in force on
+/// such a session are the role's ("the temporary security credentials … have the
+/// permissions of the role", `AssumeRole`). The session itself stays this service's, which
+/// is why only the two facts an IAM decision needs travel: the principal the session is,
+/// and the role it is of.
+///
+/// Nothing is recorded for a session that is not a role's — `GetSessionToken` and
+/// `GetFederationToken` vend no `role_arn` — and nothing at all when the engine carries no
+/// IAM store. Call it with the session registry's lock already GIVEN UP, so no handler
+/// holds the IAM lock and the session lock at once.
+pub fn publish_role_session(
+    iam: Option<&::engine::ServiceState<IamState>>,
+    minted: &MintedSession,
+    now: SystemTime,
+) {
+    let (Some(iam), Some(role_arn)) = (iam, minted.session.role_arn.as_ref()) else {
+        return;
+    };
+    iam.lock().record_role_session(
+        &minted.session.access_key_id,
+        ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::RoleSessionRecord {
+            session_arn: minted.session.identity.arn.clone(),
+            role_arn: role_arn.clone(),
+            expires: ::aws_smithy_types::DateTime::from_secs(unix_seconds(minted.session.expires_at)),
+        },
+        ::aws_smithy_types::DateTime::from_secs(unix_seconds(now)),
+    );
+}
+
 /// The identity a LONG-TERM access key speaks for: the IAM user that holds it.
 ///
 /// "Returns details about the IAM user or role whose credentials are used to call the

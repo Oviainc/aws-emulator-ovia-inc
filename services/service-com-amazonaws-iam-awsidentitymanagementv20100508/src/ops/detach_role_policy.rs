@@ -208,17 +208,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account holds no role under "referenced a resource entity that does not
         // exist".
         let role_key = crate::state::name_key(&input.role_name);
+        // Which role the request addresses, and under which path the account or the
+        // owning service holds it: the one reading in `crate::state` every protection in
+        // this crate shares (`addressed_role_path`).
+        let addressed_path = store.addressed_role_path(&input.role_name);
 
         // IAM authorizes its own API: the signing principal's identity-based policies are
         // evaluated before anything is detached. The decision is made on the ARN of the
-        // role the detachment is made on — the held role's own ARN, or, for a name the
-        // account holds no role under, the ARN that name would carry at the default path,
+        // role the detachment is made on — the ARN of the path it is held under, or, for a
+        // name nothing holds, the ARN that name would carry at the default path,
         // since there is no other path to attribute it to. A refusal names that role as
         // the request named it (`role Deployer`) rather than by ARN, and leaves the
         // role's attachments untouched, because the decision precedes the write.
-        let resource = store.roles.get(&role_key).map_or_else(
-            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
-            |role| role.arn.clone(),
+        let resource = crate::state::role_arn(
+            addressed_path
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_PATH),
+            &input.role_name,
         );
         crate::state::authorization::authorize_named(
             &store,
@@ -228,32 +234,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("role {}", input.role_name),
         )?;
 
-        let Some(role) = store.roles.get(&role_key) else {
+        // "Service-linked roles are protected Amazon Web Services resources. Only the
+        // service that depends on the service-linked role can modify … the role on
+        // your behalf" (`UnmodifiableEntityException`), and detaching a managed policy
+        // modifies the role's permission policy — so this caller, which is not that
+        // service, cannot. The refusal is stated in the one sentence this service words
+        // that protection with (`crate::state::protected_role_message`). Whether a role
+        // is one a service links to itself is carried by its path, read above through the
+        // one reading every protection in this crate shares.
+        if addressed_path
+            .as_deref()
+            .is_some_and(crate::state::is_service_linked_role_path)
+        {
+            return Err(DetachRolePolicyErrorModeled::UnmodifiableEntityException(
+                UnmodifiableEntityException {
+                    message: Some(crate::state::protected_role_message(&input.role_name)),
+                },
+            )
+            .into());
+        }
+
+        if !store.roles.contains_key(&role_key) {
             return Err(DetachRolePolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(
                         "The role with name {} cannot be found.",
                         input.role_name
                     )),
-                },
-            )
-            .into());
-        };
-        let role_name = role.role_name.clone();
-        // Whether a role is one a service links to itself is carried by its path, read
-        // through the one definition of that rule in `crate::state`.
-        let service_linked = crate::state::is_service_linked_role_path(&role.path);
-
-        // "Service-linked roles are protected Amazon Web Services resources. Only the
-        // service that depends on the service-linked role can modify … the role on
-        // your behalf" (`UnmodifiableEntityException`), and detaching a managed policy
-        // modifies the role's permission policy — so this caller, which is not that
-        // service, cannot. The refusal is stated in the one sentence this service words
-        // that protection with (`crate::state::protected_role_message`).
-        if service_linked {
-            return Err(DetachRolePolicyErrorModeled::UnmodifiableEntityException(
-                UnmodifiableEntityException {
-                    message: Some(crate::state::protected_role_message(&input.role_name)),
                 },
             )
             .into());
@@ -264,7 +271,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // depends on that policy — `ListAttachedRolePolicies` stops reporting it, and
         // `DeleteRole`'s conflict guard, which reads this very set, no longer counts
         // it against the role. A policy the role does not carry "referenced a
-        // resource entity that does not exist".
+        // resource entity that does not exist", worded as this crate words the absence
+        // of the policy a `PolicyArn` names (`crate::state::policy_not_found`): what the
+        // request addresses is that policy, so the sentence carries the ARN it supplied
+        // and nothing of the role.
         let detached = store
             .role_attached_policies
             .get_mut(&role_key)
@@ -272,10 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !detached {
             return Err(DetachRolePolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!(
-                        "Policy {} was not found attached to role {role_name}.",
-                        input.policy_arn
-                    )),
+                    message: Some(crate::state::policy_not_found(&input.policy_arn)),
                 },
             )
             .into());

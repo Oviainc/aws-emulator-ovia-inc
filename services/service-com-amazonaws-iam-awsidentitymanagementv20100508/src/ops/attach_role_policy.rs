@@ -209,18 +209,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IAM decides a call against the caller's policies before it reads the
         // resource.
         let role_key = crate::state::name_key(&input.role_name);
-        let held = store.roles.get(&role_key);
+        // Which role the request addresses, and under which path the account or the
+        // owning service holds it: the one reading in `crate::state` every protection in
+        // this crate shares (`addressed_role_path`).
+        let addressed_path = store.addressed_role_path(&input.role_name);
 
         // IAM authorizes its own API: the signing principal's identity-based policies
         // are evaluated before anything is attached. The decision is made on the ARN of
-        // the role the attachment is made on — the held role's own ARN, or, for a name
-        // the account holds no role under, the ARN that name would carry at the default
-        // path, since there is no other path to attribute it to. A refusal names that
+        // the role the attachment is made on — the ARN of the path it is held under, or,
+        // for a name nothing holds, the ARN that name would carry at the default path,
+        // since there is no other path to attribute it to. A refusal names that
         // role as the request named it (`role Deployer`) rather than by ARN, and leaves
         // the role's attachments untouched, because the decision precedes the write.
-        let resource = held.map_or_else(
-            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
-            |role| role.arn.clone(),
+        let resource = crate::state::role_arn(
+            addressed_path
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_PATH),
+            &input.role_name,
         );
         crate::state::authorization::authorize_named(
             &store,
@@ -230,29 +235,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("role {}", input.role_name),
         )?;
 
-        let Some(role) = held else {
+        // "Service-linked roles are protected Amazon Web Services resources. Only
+        // the service that depends on the service-linked role can modify … the role
+        // on your behalf" (`UnmodifiableEntityException`), and attaching a managed
+        // policy modifies the role's permission policy. The role's PATH is what says
+        // it is service-linked, read above through the one reading every protection in
+        // this crate shares, and the refusal is stated in the one sentence this service
+        // words that protection with (`crate::state::protected_role_message`).
+        if addressed_path
+            .as_deref()
+            .is_some_and(crate::state::is_service_linked_role_path)
+        {
+            return Err(AttachRolePolicyErrorModeled::UnmodifiableEntityException(
+                UnmodifiableEntityException {
+                    message: Some(crate::state::protected_role_message(&input.role_name)),
+                },
+            )
+            .into());
+        }
+
+        if !store.roles.contains_key(&role_key) {
             return Err(AttachRolePolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(
                         "The role with name {} cannot be found.",
                         input.role_name
                     )),
-                },
-            )
-            .into());
-        };
-
-        // "Service-linked roles are protected Amazon Web Services resources. Only
-        // the service that depends on the service-linked role can modify … the role
-        // on your behalf" (`UnmodifiableEntityException`), and attaching a managed
-        // policy modifies the role's permission policy. The role's PATH is what says
-        // it is service-linked, and the refusal is stated in the one sentence this
-        // service words that protection with
-        // (`crate::state::protected_role_message`).
-        if crate::state::is_service_linked_role_path(&role.path) {
-            return Err(AttachRolePolicyErrorModeled::UnmodifiableEntityException(
-                UnmodifiableEntityException {
-                    message: Some(crate::state::protected_role_message(&input.role_name)),
                 },
             )
             .into());

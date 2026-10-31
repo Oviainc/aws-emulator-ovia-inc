@@ -243,6 +243,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(why) => return Err(crate::scaffolded::Scaffolded::validation(why.message())),
         };
 
+        // The credential this call vends speaks for the role it is a session of, which is
+        // what IAM's own authorizer judges a request signed with it on
+        // (`crate::state::publish_role_session`). The session lock is given up first, so
+        // this handler never holds the IAM lock and the session lock at once.
+        drop(registry);
+        crate::state::publish_role_session(
+            crate::state::iam_state(&*self.engine).as_ref(),
+            &minted,
+            now,
+        );
         Ok(GetDelegatedAccessTokenOutput {
             credentials: Some(minted.credentials),
             // "The Amazon Resource Name (ARN) of the principal that was assumed when

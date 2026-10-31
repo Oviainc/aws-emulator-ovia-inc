@@ -228,7 +228,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         let role_key = crate::state::name_key(&input.role_name);
-        let Some(role_path) = store.roles.get(&role_key).map(|role| role.path.clone()) else {
+        // Which role the request addresses, and under which path the account or the
+        // owning service holds it, is the one reading in `crate::state` every protection
+        // in this crate shares (`addressed_role_path`): a role name AWS PUBLISHES for a
+        // service still names a role — the one that service keeps provisioned, which
+        // `GetRole` reports — and a name neither the account nor any service holds
+        // "referenced a resource entity that does not exist".
+        let Some(role_path) = store.addressed_role_path(&input.role_name) else {
             return Err(
                 RemoveRoleFromInstanceProfileErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {

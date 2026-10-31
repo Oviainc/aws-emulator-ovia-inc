@@ -21,14 +21,20 @@
 //!
 //! The four pieces, each held in exactly one place:
 //!
-//! 1. **who** — the IAM user the request's SigV4 access key id belongs to, read out of
+//! 1. **who** — the principal the request's SigV4 access key id speaks for: the IAM user
+//!    that holds a LONG-TERM key, read out of
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::access_keys`], the same
-//!    map `GetUser` and `CreateAccessKey` resolve a nameless caller through;
+//!    map `GetUser` and `CreateAccessKey` resolve a nameless caller through, or — for a
+//!    TEMPORARY credential — the role session that key was vended for, read out of
+//!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::role_sessions`], the
+//!    record the vending operation leaves in this store;
 //! 2. **what it may do** — the identity-based documents in force on that principal, from
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::principal_policies`],
 //!    which for a user is the UNION of the documents embedded in and attached to the user
-//!    itself and those in force on every group it belongs to, so a policy just put grants
-//!    immediately and one just deleted stops granting immediately;
+//!    itself and those in force on every group it belongs to, and for a role session the
+//!    ROLE's — "the temporary security credentials … have the permissions of the role"
+//!    (`AssumeRole`) — so a policy just put grants immediately and one just deleted stops
+//!    granting immediately;
 //! 3. **the ceiling on it** — the permissions boundary in force on that principal, from
 //!    [`super::ComAmazonawsIamAwsidentitymanagementv20100508State::permissions_boundary_in_force`],
 //!    which sets the maximum permissions those documents can grant and grants nothing
@@ -76,11 +82,13 @@
 //!
 //! ## The callers that are not IAM users
 //!
-//! * **A credential no IAM user owns.** The emulator's own published credential, and a
-//!   session credential STS minted, are not keys this account's `access_keys` map holds.
-//!   They carry no identity-based policies at all, which is the position AWS account root
-//!   credentials are in, so such a request is allowed rather than refused on evidence
-//!   that does not exist.
+//! * **A credential this account holds no identity for.** The emulator's own published
+//!   credential is not a key this account's `access_keys` map holds, and no role session
+//!   was vended for it. It carries no identity-based policies at all, which is the position
+//!   AWS account root credentials are in, so such a request is allowed rather than refused
+//!   on evidence that does not exist. The same holds for a session credential of an
+//!   identity that is not a role of this account — a federated user — and for a role
+//!   session whose role has since been deleted.
 //! * **A principal holding a grant this emulator cannot read.** An AWS-managed policy is
 //!   owned by AWS, so the account's store holds no document for it and
 //!   `principal_policies` reports it as uncarried. A principal with such an attachment is
@@ -93,7 +101,7 @@
 
 use ::service_common::iam_authorization::{self as iam, Decision};
 
-use crate::ops::types::{DelegationRequest, Tag, User};
+use crate::ops::types::{DelegationRequest, Role, Tag, User};
 use crate::scaffolded::AccessDenied;
 
 use super::{ComAmazonawsIamAwsidentitymanagementv20100508State as IamState, PrincipalPolicies};
@@ -237,11 +245,10 @@ const PUBLISHED_REQUEST_KEYS: &[&str] = &[
 /// The condition keys a request that reaches THIS decision structurally cannot carry, so
 /// that a clause over one of them is decided from its absence rather than left undecided.
 ///
-/// A call this gate judges was signed with an IAM user's long-term access key, which
-/// carries no multi-factor claim ("this key is not present when the request is made using
-/// long-term credentials") and no session's issue time or source identity; this emulator
-/// holds no organization, so no principal of it is in one; and nothing reaches it through
-/// a VPC endpoint, which is what the `aws:SourceVpce` family of keys describes.
+/// This emulator holds no organization, so no principal of it is in one; and nothing
+/// reaches it through a VPC endpoint, which is what the `aws:SourceVpce` family of keys
+/// describes. Neither depends on what the request was signed with; the keys that describe
+/// the CREDENTIAL are published separately ([`LONG_TERM_CREDENTIAL_ABSENT_KEYS`]).
 ///
 /// Every OTHER key stays undeclared, and a clause over one of those is left UNDECIDED by
 /// the evaluation — fail-closed in both directions — because for those absence from the
@@ -250,16 +257,29 @@ const PUBLISHED_REQUEST_KEYS: &[&str] = &[
 /// `aws:RequestedRegion`, `aws:SecureTransport` and their peers, and this gate must not
 /// decide a clause over them from their absence here.
 const PUBLISHED_ABSENT_KEYS: &[&str] = &[
-    "aws:MultiFactorAuthPresent",
-    "aws:MultiFactorAuthAge",
-    "aws:TokenIssueTime",
-    "aws:SourceIdentity",
-    "aws:FederatedProvider",
     "aws:PrincipalOrgID",
     "aws:PrincipalOrgPaths",
     "aws:SourceVpce",
     "aws:SourceVpc",
     "aws:VpcSourceIp",
+];
+
+/// The condition keys a request signed with an IAM user's LONG-TERM access key cannot
+/// carry: it carries no multi-factor claim ("this key is not present when the request is
+/// made using long-term credentials") and no session's issue time, source identity or
+/// federating provider, because it is no session at all.
+///
+/// A request signed with a role session's TEMPORARY credential does carry values for these
+/// — the session was issued at an instant, and may have been issued with a source identity
+/// — and this gate holds no record of them, so for such a caller they stay undeclared and
+/// a clause over one of them is left undecided, which withholds a grant and keeps a
+/// refusal.
+const LONG_TERM_CREDENTIAL_ABSENT_KEYS: &[&str] = &[
+    "aws:MultiFactorAuthPresent",
+    "aws:MultiFactorAuthAge",
+    "aws:TokenIssueTime",
+    "aws:SourceIdentity",
+    "aws:FederatedProvider",
 ];
 
 /// The tags a request WRITES, which is where `aws:RequestTag/<key>` and `aws:TagKeys` come
@@ -305,7 +325,30 @@ impl WrittenTags<'_> {
     }
 }
 
-/// The condition context a request signed by `user` against `resource` carries, and the
+/// WHO a signed request speaks for, as the decision reads it: the entity whose own
+/// condition keys describe the caller.
+///
+/// The two credentials that reach this gate carrying identity-based policies, which IAM
+/// describes differently: an IAM user's own long-term access key, and the temporary
+/// credential of a session of one of the account's roles, whose permissions are the
+/// ROLE's.
+#[derive(Debug, Clone, Copy)]
+enum Caller<'a> {
+    /// An IAM user of this account, resolved from the long-term access key it holds.
+    User(&'a User),
+    /// A session of one of the account's roles, resolved from the record the operation
+    /// that vended the credential left ([`super::RoleSessionRecord`]): the role whose
+    /// policies the call is judged on, and the session's own name.
+    RoleSession {
+        /// The role the session is of.
+        role: &'a Role,
+        /// The session name the vending call carried, which is what IAM spells into the
+        /// session's unique id after the role's own.
+        session_name: &'a str,
+    },
+}
+
+/// The condition context a request by `caller` against `resource` carries, and the
 /// keys it declares it models: everything IAM knows about the call at the instant it is
 /// decided, which is where a policy variable's value and a `Condition` clause's value both
 /// come from (see the module docs).
@@ -317,27 +360,48 @@ impl WrittenTags<'_> {
 /// nothing it holds, a clause over one of its tags stays undecided, which is the
 /// fail-closed reading the shared evaluation gives every key this emulator cannot answer
 /// for. The keys no such request carries at all are declared beside them
-/// ([`PUBLISHED_ABSENT_KEYS`]).
+/// ([`PUBLISHED_ABSENT_KEYS`], and for a long-term key the ones that describe a session's
+/// credential, [`LONG_TERM_CREDENTIAL_ABSENT_KEYS`]).
+///
+/// A ROLE SESSION is described by what IAM publishes for one: `aws:userid` is "the unique
+/// identifier of the current user", which for an assumed-role session is the role's own id
+/// and the session name after it, and there is no `aws:username` — a session is not a user,
+/// so that key is left undeclared rather than answered as absent. Its principal TAGS are
+/// the role's tags AND the session's, and the session's are not this store's to read, so
+/// that family is left undeclared too: a clause over one of them stays undecided, which
+/// withholds a grant and keeps a refusal.
 ///
 /// The principal's and the target's tags are the ones they hold NOW — nothing in the
 /// request carries them — so retagging either side changes what the same unchanged request
 /// decides, and untagging it takes the value away again.
 fn request_context(
     store: &IamState,
-    user: &User,
+    caller: Caller<'_>,
     resource: &str,
     written: WrittenTags<'_>,
 ) -> (Vec<(String, String)>, Vec<&'static str>) {
-    let mut context = vec![
-        (USER_NAME_KEY.to_string(), user.user_name.clone()),
-        (USER_ID_KEY.to_string(), user.user_id.clone()),
-    ];
-    let mut published = PUBLISHED_PRINCIPAL_KEYS.to_vec();
-    for tag in user.tags.iter().flatten() {
-        context.push((
-            format!("{PRINCIPAL_TAG_PREFIX}{}", tag.key),
-            tag.value.clone(),
-        ));
+    let mut context = Vec::new();
+    let mut published = Vec::new();
+    match caller {
+        Caller::User(user) => {
+            context.push((USER_NAME_KEY.to_string(), user.user_name.clone()));
+            context.push((USER_ID_KEY.to_string(), user.user_id.clone()));
+            published.extend_from_slice(PUBLISHED_PRINCIPAL_KEYS);
+            for tag in user.tags.iter().flatten() {
+                context.push((
+                    format!("{PRINCIPAL_TAG_PREFIX}{}", tag.key),
+                    tag.value.clone(),
+                ));
+            }
+            published.extend_from_slice(LONG_TERM_CREDENTIAL_ABSENT_KEYS);
+        }
+        Caller::RoleSession { role, session_name } => {
+            context.push((
+                USER_ID_KEY.to_string(),
+                format!("{}:{session_name}", role.role_id),
+            ));
+            published.push(USER_ID_KEY);
+        }
     }
     // The tags of the entity the request addresses, under both spellings of the key: one
     // tag, two names for it. Declared only where that tag set is the account's to read.
@@ -422,11 +486,11 @@ pub fn authorize_written(
         return Ok(());
     };
     let SigningPrincipal {
-        user,
+        caller,
         arn: principal,
         policies,
     } = signer;
-    let (context, published) = request_context(store, user, resource, written);
+    let (context, published) = request_context(store, caller, resource, written);
 
     let principals = [principal.clone()];
     // What the policies in force are decided against BESIDES the action and the resource:
@@ -696,7 +760,7 @@ pub fn delegation_permission_check(
         return PERMISSION_CHECK_ALLOWED;
     };
     let SigningPrincipal {
-        user,
+        caller,
         arn: principal,
         policies,
     } = signer;
@@ -709,7 +773,7 @@ pub fn delegation_permission_check(
         // knowledge of the caller, of the ask's own target and of the clock (see
         // [`request_context`]). A permission check writes no tags, so the ask carries
         // none either.
-        let (ask_context, published) = request_context(store, user, resource, WrittenTags::None);
+        let (ask_context, published) = request_context(store, caller, resource, WrittenTags::None);
         let request = iam::Request::new(action, resource, &principals)
             .with_context(&ask_context)
             .with_published_keys(&published);
@@ -741,32 +805,61 @@ pub fn delegation_permission_check(
 }
 
 /// What a signed request is judged on, resolved once from the access key it carries:
-/// the IAM user it speaks for and the identity-based documents in force on that user.
+/// the principal it speaks for and the identity-based documents in force on that
+/// principal.
 #[derive(Debug)]
 struct SigningPrincipal<'a> {
-    /// The stored IAM user the signing access key belongs to — what the condition keys
-    /// describing the caller are read from ([`request_context`]).
-    user: &'a User,
-    /// The ARN of that user — what a refusal names as the caller, and the principal a
-    /// resource-based statement would name.
+    /// The principal the condition keys describing the caller are read from
+    /// ([`request_context`]).
+    caller: Caller<'a>,
+    /// The ARN of that principal — what a refusal names as the caller, and the principal
+    /// a resource-based statement would name. For a role session that is the SESSION's
+    /// ARN, which is what `sts:GetCallerIdentity` reports for the credential and so what
+    /// the caller reads back for the key it signed with.
     arn: String,
     /// The identity-based documents in force on it, and the attachments whose documents
     /// the account does not hold.
     policies: PrincipalPolicies,
 }
 
-/// The IAM user the access key id `access_key_id` belongs to, or `None` when the account
-/// holds no user for that key.
+/// The principal the access key id `access_key_id` speaks for, or `None` when the account
+/// holds no identity for that key.
+///
+/// Two credentials carry identity-based policies: an IAM user's own long-term access key,
+/// resolved through the registry `CreateAccessKey` writes, and the temporary credential of
+/// a session of one of the account's roles, resolved through the record the operation that
+/// vended it left ([`super::ComAmazonawsIamAwsidentitymanagementv20100508State::role_session`]).
+/// A session is judged on the ROLE's policies — "the temporary security credentials …
+/// have the permissions of the role" (`AssumeRole`) — while the refusal names the session,
+/// because that is the principal the request speaks for.
 fn signing_principal<'a>(
     store: &'a IamState,
     access_key_id: &str,
 ) -> Option<SigningPrincipal<'a>> {
-    let record = store.access_keys.get(access_key_id)?;
-    let user = store.users.get(&record.user_key)?;
-    let policies = store.principal_policies(&user.arn)?;
+    if let Some(record) = store.access_keys.get(access_key_id) {
+        let user = store.users.get(&record.user_key)?;
+        let policies = store.principal_policies(&user.arn)?;
+        return Some(SigningPrincipal {
+            caller: Caller::User(user),
+            arn: user.arn.clone(),
+            policies,
+        });
+    }
+    let session = store.role_session(access_key_id, super::now())?;
+    // The role the session is of, addressed by the ARN the account holds it under: a
+    // role deleted since the session was vended leaves the session speaking for an
+    // identity this account no longer holds policies for.
+    let role_name = ::service_common::iam_role::role_name(&session.role_arn)?;
+    let role = store.roles.get(&super::name_key(role_name))?;
+    let policies = store.principal_policies(&role.arn)?;
     Some(SigningPrincipal {
-        user,
-        arn: user.arn.clone(),
+        caller: Caller::RoleSession {
+            role,
+            session_name: ::service_common::iam_role::assumed_role_session_name(
+                &session.session_arn,
+            )?,
+        },
+        arn: session.session_arn.clone(),
         policies,
     })
 }

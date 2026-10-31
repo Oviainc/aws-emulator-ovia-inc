@@ -194,23 +194,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The role is named (friendly name, not ARN) and IAM entity names "are not
-        // distinguished by case", so the case-folded name is the identity. This
-        // operation CHANGES the account's own record of a role, so it answers from
-        // the store alone: a name only `crate::state::service_provisioned_role`
-        // resolves is still "a resource entity that does not exist" here, as that
-        // function's own documentation records.
+        // distinguished by case", so the case-folded name is the identity.
         let key = crate::state::name_key(&input.role_name);
 
+        // Which role the request addresses, and under which path the account or the
+        // owning service holds it: the one reading in `crate::state` every protection in
+        // this crate shares (`addressed_role_path`), so a role name AWS PUBLISHES for a
+        // service still names a role — the one that service keeps provisioned, which
+        // `GetRole` reports.
+        let addressed_path = store.addressed_role_path(&input.role_name);
         // IAM authorizes its own API: the signing principal's identity-based policies are
         // evaluated before the trust policy is replaced. The decision is made on the ARN
-        // of the role the request addresses — the held role's own ARN, or, for a name the
-        // account holds no role under, the ARN that name would carry at the default path,
+        // of the role the request addresses — the ARN of the path it is held under, or,
+        // for a name nothing holds, the ARN that name would carry at the default path,
         // since there is no other path to attribute it to. A refusal names that role as
         // the request named it (`role Deployer`) rather than by ARN, and leaves the trust
         // policy as it was, because the decision is made before the write.
-        let resource = store.roles.get(&key).map_or_else(
-            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
-            |role| role.arn.clone(),
+        let resource = crate::state::role_arn(
+            addressed_path
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_PATH),
+            &input.role_name,
         );
         crate::state::authorization::authorize_named(
             &store,
@@ -219,7 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &resource,
             &format!("role {}", input.role_name),
         )?;
-        let Some(role) = store.roles.get(&key) else {
+        // A name neither the account nor any service holds "referenced a resource entity
+        // that does not exist".
+        let Some(path) = addressed_path else {
             return Err(UpdateAssumeRolePolicyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!(
@@ -230,17 +236,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // Whether a role is one a service links to itself is carried by its path, read
-        // through the one definition of that rule in `crate::state`.
-        let service_linked = crate::state::is_service_linked_role_path(&role.path);
-
         // "Service-linked roles are protected Amazon Web Services resources. Only the
         // service that depends on the service-linked role can modify or delete the role
         // on your behalf" — so a caller's trust-policy update is refused with the
         // modelled `UnmodifiableEntityException`, stated in the one sentence this
         // service words that protection with
         // (`crate::state::protected_role_message`).
-        if service_linked {
+        if crate::state::is_service_linked_role_path(&path) {
             return Err(
                 UpdateAssumeRolePolicyErrorModeled::UnmodifiableEntityException(
                     UnmodifiableEntityException {

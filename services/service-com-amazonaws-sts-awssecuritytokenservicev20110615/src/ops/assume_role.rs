@@ -727,6 +727,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let (session_token_utilization, session_token_size) =
             crate::state::session_token_metrics(&minted.credentials);
+        // The credential this call vends speaks for the role it is a session of, which is
+        // what IAM's own authorizer judges a request signed with it on
+        // (`crate::state::publish_role_session`). The session lock is given up first, so
+        // this handler never holds the IAM lock and the session lock at once.
+        drop(registry);
+        crate::state::publish_role_session(iam.as_ref(), &minted, now);
         Ok(AssumeRoleOutput {
             credentials: Some(minted.credentials),
             assumed_role_user: Some(AssumedRoleUser {

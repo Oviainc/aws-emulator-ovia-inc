@@ -153,11 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The role is named by its friendly name and IAM entity names "are not
-        // distinguished by case", so the case-folded name is the identity. This
-        // operation CHANGES the account's own record of a role, so it answers from the
-        // store alone: a name only `crate::state::service_provisioned_role` resolves is
-        // still "a resource entity that does not exist" here, as that function's own
-        // documentation records.
+        // distinguished by case", so the case-folded name is the identity.
         //
         // "Modifies only the description of a role": the new description REPLACES the
         // one the role held, spelled exactly as the request sent it, and no other member
@@ -170,21 +166,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is updated here like any other: the protected-entity refusal this operation
         // also models guards the calls that change such a role's trust policy, its
         // attached or inline permissions, or its existence (`UpdateAssumeRolePolicy`,
-        // `AttachRolePolicy`, `PutRolePolicy`, `DeleteRole`), not this setting. This
-        // operation "performs the same function as the Description parameter in the
-        // UpdateRole operation", which serves such a role for the same reason.
+        // `AttachRolePolicy`, `PutRolePolicy`, `DeleteRole`), not this setting. "You can
+        // edit the description of a service-linked role" while "you cannot delete or edit
+        // the permissions for this role" ("Using service-linked roles", IAM User Guide),
+        // and recorded behaviour agrees: the trust-policy update of a service-linked role
+        // is refused `UnmodifiableEntity` and the description update that follows it is
+        // served. Which is why this operation resolves such a role through the reading
+        // every protection in this crate shares
+        // (`crate::state::addressed_role_path`) even where the account holds no record of
+        // it yet.
         let key = crate::state::name_key(&input.role_name);
+        let addressed_path = store.addressed_role_path(&input.role_name);
 
         // IAM authorizes its own API: the signing principal's identity-based policies are
         // evaluated before the description is changed. The decision is made on the ARN of
-        // the role the request addresses — the held role's own ARN, or, for a name the
-        // account holds no role under, the ARN that name would carry at the default path,
-        // since there is no other path to attribute it to. A refusal names that role as
-        // the request named it (`role Deployer`) rather than by ARN, and leaves the
+        // the role the request addresses — the ARN of the path it is held under, or, for a
+        // name nothing holds, the ARN that name would carry at the default path, since
+        // there is no other path to attribute it to. A refusal names that role as the
+        // request named it (`role Deployer`) rather than by ARN, and leaves the
         // description as it was, because the decision is made before the write.
-        let resource = store.roles.get(&key).map_or_else(
-            || crate::state::role_arn(crate::state::DEFAULT_PATH, &input.role_name),
-            |role| role.arn.clone(),
+        let resource = crate::state::role_arn(
+            addressed_path
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_PATH),
+            &input.role_name,
         );
         crate::state::authorization::authorize_named(
             &store,
@@ -193,6 +198,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &resource,
             &format!("role {}", input.role_name),
         )?;
+        // The record the description is written on: the account's own where there is one,
+        // and otherwise the record the owning service keeps provisioned, which THIS call
+        // makes the account's record of the role — the write the operation's own contract
+        // mandates is what materialises it, and every other member of that record is the
+        // service's own, carried over unchanged. A name neither the account nor any
+        // service holds "referenced a resource entity that does not exist".
+        if !store.roles.contains_key(&key) {
+            if let Some(provisioned) = crate::state::service_provisioned_role(&input.role_name) {
+                store.roles.insert(key.clone(), provisioned);
+            }
+        }
         let Some(role) = store.roles.get_mut(&key) else {
             return Err(UpdateRoleDescriptionErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {

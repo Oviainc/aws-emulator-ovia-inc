@@ -91,6 +91,26 @@ pub fn instance_profile_name(profile_arn: &str) -> Option<&str> {
 /// it, each in the change that owns its service).
 #[must_use]
 pub fn assumed_role_session_role_name(session_arn: &str) -> Option<&str> {
+    assumed_role_session(session_arn).map(|(role, _)| role)
+}
+
+/// The SESSION name an STS assumed-role session ARN names, when the session is one of
+/// THIS account: everything after the role name, which is the `RoleSessionName` the
+/// vending call carried and may itself contain `/`.
+///
+/// `None` in exactly the cases [`assumed_role_session_role_name`] answers it, since both
+/// read the one form. The session name is what IAM spells into the session's unique id
+/// after the role's own id (`aws:userid` for an assumed-role session is
+/// `<role id>:<session name>`), which is why a service deciding a request from such a
+/// credential reads it here rather than parsing the ARN again.
+#[must_use]
+pub fn assumed_role_session_name(session_arn: &str) -> Option<&str> {
+    assumed_role_session(session_arn).map(|(_, session)| session)
+}
+
+/// The `(role name, session name)` an STS assumed-role session ARN of THIS account
+/// carries: the ONE reading of that form, which both of its readers above take.
+fn assumed_role_session(session_arn: &str) -> Option<(&str, &str)> {
     // The six fields come from the crate's ONE ARN parse (`crate::arn`), which also
     // settles that the value is an ARN of the `sts` vendor at all.
     let arn = crate::arn::parse_of(session_arn, "sts")?;
@@ -103,7 +123,7 @@ pub fn assumed_role_session_role_name(session_arn: &str) -> Option<&str> {
     }
     let named = arn.resource.strip_prefix("assumed-role")?.strip_prefix('/')?;
     let (role, session) = named.split_once('/')?;
-    (!role.is_empty() && !session.is_empty()).then_some(role)
+    (!role.is_empty() && !session.is_empty()).then_some((role, session))
 }
 
 /// The name an IAM ARN of the entity type `entity_type` carries, when the ARN names an
@@ -261,7 +281,10 @@ async fn role_answer(
 
 #[cfg(test)]
 mod tests {
-    use super::{assumed_role_session_role_name, instance_profile_name, role_name, user_name};
+    use super::{
+        assumed_role_session_name, assumed_role_session_role_name, instance_profile_name,
+        role_name, user_name,
+    };
 
     /// The role an STS assumed-role SESSION ARN names: the first segment after
     /// `assumed-role/`, whatever the session name after it, and nothing from any other
@@ -343,6 +366,23 @@ mod tests {
                 read, expected,
                 "case {case:?}: expected {expected:?}, got {read:?}"
             );
+            // The two readings of the ONE form agree about whether the value names a
+            // session at all, and the session name is everything the role name is not:
+            // the segments after it, which may themselves carry `/`.
+            let session = assumed_role_session_name(&value);
+            assert_eq!(
+                session.is_some(),
+                expected.is_some(),
+                "case {case:?}: expected a session name exactly where a role name is read, \
+                 got {session:?}"
+            );
+            if let (Some(role), Some(session)) = (read, session) {
+                assert!(
+                    value.ends_with(&format!("assumed-role/{role}/{session}")),
+                    "case {case:?}: expected the two readings to spell the resource, got \
+                     {role:?} and {session:?}"
+                );
+            }
             // A session ARN names no IAM entity directly: the readings do not cross.
             assert!(
                 read.is_none() || (role_name(&value).is_none() && user_name(&value).is_none()),

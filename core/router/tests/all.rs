@@ -545,6 +545,8 @@ mod iam_role_id_agrees_with_sts;
 // these neighbouring lines are stable.
 #[path = "all/iam_access_key_signs_as_its_user.rs"]
 mod iam_access_key_signs_as_its_user;
+#[path = "all/iam_authorizes_an_assumed_role_session.rs"]
+mod iam_authorizes_an_assumed_role_session;
 #[path = "all/iam_signing_name_routing.rs"]
 mod iam_signing_name_routing;
 #[path = "all/iot_command_deprecation_is_observable_on_the_data_plane.rs"]

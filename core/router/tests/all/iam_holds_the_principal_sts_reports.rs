@@ -49,6 +49,14 @@ const TRUST_POLICY: &str = concat!(
 /// emulator publishes at start is in.
 const LONG_TERM_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 
+/// The grant the fixture role carries so the session minted on it may manage its own
+/// principal: every action of this service, on every resource. IAM decides a call to
+/// itself against the caller's identity-based policies, and a session's are the role's.
+const SELF_MANAGEMENT_POLICY: &str = concat!(
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","#,
+    r#""Action":"iam:*","Resource":"*"}]}"#
+);
+
 /// The type prefix AWS gives an IAM user's unique id, from the IAM "unique identifier
 /// prefixes" table.
 const USER_ID_PREFIX: &str = "AIDA";
@@ -326,6 +334,39 @@ async fn the_principal_sts_reports_is_an_iam_entity_of_the_account() {
         "the fixture CreateRole must succeed, got {status} with body {created}"
     );
     let role_arn = member("the fixture role", &created, "Arn");
+    // IAM authorizes its own API, so the session minted below is a principal that needs a
+    // grant to manage anything — including its own role. The grant is attached as a
+    // MANAGED policy, by the account's own credential, before the role is assumed: an
+    // INLINE one would show up in the `List*Policies` assertions further down, which
+    // compare against exactly the documents each row embeds.
+    let (status, policy) = iam(
+        &router,
+        LONG_TERM_KEY,
+        "CreatePolicy",
+        &[
+            ("PolicyName", "SessionSelfManagement".to_string()),
+            ("PolicyDocument", SELF_MANAGEMENT_POLICY.to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the fixture CreatePolicy must succeed, got {status} with body {policy}"
+    );
+    let (status, attached) = iam(
+        &router,
+        LONG_TERM_KEY,
+        "AttachRolePolicy",
+        &[
+            ("RoleName", "deployer".to_string()),
+            ("PolicyArn", member("the fixture policy", &policy, "Arn")),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the fixture AttachRolePolicy must succeed, got {status} with body {attached}"
+    );
     let (status, assumed) = sts(
         &router,
         LONG_TERM_KEY,

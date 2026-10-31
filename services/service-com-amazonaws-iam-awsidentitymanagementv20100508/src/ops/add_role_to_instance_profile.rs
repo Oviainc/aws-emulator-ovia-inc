@@ -235,7 +235,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let role_key = crate::state::name_key(&input.role_name);
-        let Some(role_path) = store.roles.get(&role_key).map(|role| role.path.clone()) else {
+        // Which role the request addresses, and under which path the account or the
+        // owning service holds it, is the one reading in `crate::state` every protection
+        // in this crate shares (`addressed_role_path`): a role name AWS PUBLISHES for a
+        // service still names a role — the one that service keeps provisioned, which
+        // `GetRole` reports — and a name neither the account nor any service holds
+        // "referenced a resource entity that does not exist".
+        let Some(role_path) = store.addressed_role_path(&input.role_name) else {
             return Err(AddRoleToInstanceProfileErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
                     message: Some(format!("Role {} cannot be found.", input.role_name)),
@@ -286,13 +292,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "An instance profile can contain only one role, and this quota cannot be
         // increased. You can remove the existing role and then add a different role to
-        // an instance profile." (`AddRoleToInstanceProfile` doc.)
+        // an instance profile." (`AddRoleToInstanceProfile` doc.) The refusal names the
+        // quota IAM names for it, in the one place this crate words that sentence
+        // (`crate::state::instance_profile_role_quota_exceeded`).
         if profile.role_keys.len() >= crate::state::MAX_ROLES_PER_INSTANCE_PROFILE {
             return Err(AddRoleToInstanceProfileErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Cannot exceed quota for RolesPerInstanceProfile: {}",
-                        crate::state::MAX_ROLES_PER_INSTANCE_PROFILE
+                    message: Some(crate::state::instance_profile_role_quota_exceeded(
+                        crate::state::MAX_ROLES_PER_INSTANCE_PROFILE,
                     )),
                 },
             )

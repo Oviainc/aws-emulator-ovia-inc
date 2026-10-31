@@ -69,15 +69,18 @@ fn policy_arn(index: usize) -> String {
 }
 
 /// The sentence this service words the absence of an ATTACHMENT with: the policy ARN
-/// exactly as the request supplied it, and the entity named by the kind it is and the
-/// name the account STORES it under.
+/// exactly as the request supplied it, and nothing of the entity the attachment was asked
+/// for on.
 ///
-/// The sentence belongs to the family rather than to one handler, which is why
+/// What a detach addresses is the POLICY, so IAM's `NoSuchEntity` message is the one it
+/// words a `PolicyArn` it cannot serve from with — `state::policy_not_found` — and the
+/// entity name appears nowhere in it. The sentence belongs to the family rather than to
+/// one handler, which is why
 /// [`detaching_a_policy_the_entity_does_not_carry_is_refused`] drives all three detach
 /// operations through it: a wording one of them composes for itself is how the family's
 /// text drifts for a single entity kind.
-fn not_attached_message(policy_arn: &str, entity_kind: &str, entity_name: &str) -> String {
-    format!("Policy {policy_arn} was not found attached to {entity_kind} {entity_name}.")
+fn not_attached_message(policy_arn: &str) -> String {
+    format!("Policy {policy_arn} was not found.")
 }
 
 /// Create a group at `path`.
@@ -403,10 +406,10 @@ async fn the_group_name_is_matched_case_insensitively_and_a_repeat_detach_is_ref
                 "case {case:?}: expected the attachment gone, got {reported:?}"
             );
 
-            // Asking again names an attachment that no longer exists. The sentence
-            // names the group under the case the account STORED it in — the request's
-            // own spelling resolved the group, it did not rename it — and echoes the
-            // ARN exactly as supplied.
+            // Asking again names an attachment that no longer exists. The sentence names
+            // the POLICY the request asked about, echoing the ARN exactly as supplied, and
+            // nothing of the group — so it does not vary with the case the request spelled
+            // the group in.
             let (status, body) = detach(&router, spelling, policy).await;
             assert_eq!(
                 status, 404,
@@ -421,42 +424,38 @@ async fn the_group_name_is_matched_case_insensitively_and_a_repeat_detach_is_ref
             let message = element(&body, "Message");
             assert_eq!(
                 message,
-                not_attached_message(policy, "group", group),
+                not_attached_message(policy),
                 "case {case:?}: expected the family's sentence, got {message:?}"
             );
         }
     }
 }
 
-/// One detach operation of the family: the member it takes its entity under, the kind
-/// its refusal names that entity as, and the fixture entity's stored name.
+/// One detach operation of the family: the member it takes its entity under and the
+/// fixture entity's stored name.
 struct DetachCall {
     action: &'static str,
     entity_member: &'static str,
-    entity_kind: &'static str,
     entity_name: &'static str,
 }
 
 /// Every operation of this service that removes a managed policy's attachment from an
-/// entity (`smithy_query(query="digest")`, the `Detach*Policy` operations), with the
-/// kind its refusal names the entity as.
+/// entity (`smithy_query(query="digest")`, the `Detach*Policy` operations). One refusal
+/// sentence serves all three, because what the request addresses is the policy.
 const DETACH_CALLS: &[DetachCall] = &[
     DetachCall {
         action: "DetachGroupPolicy",
         entity_member: "GroupName",
-        entity_kind: "group",
         entity_name: "UncarriedGroup",
     },
     DetachCall {
         action: "DetachUserPolicy",
         entity_member: "UserName",
-        entity_kind: "user",
         entity_name: "uncarried-user",
     },
     DetachCall {
         action: "DetachRolePolicy",
         entity_member: "RoleName",
-        entity_kind: "role",
         entity_name: "UncarriedRole",
     },
 ];
@@ -524,11 +523,7 @@ async fn detaching_a_policy_the_entity_does_not_carry_is_refused() {
             let message = element(&body, "Message");
             assert_eq!(
                 message,
-                not_attached_message(
-                    policy,
-                    call_under_test.entity_kind,
-                    call_under_test.entity_name
-                ),
+                not_attached_message(policy),
                 "case {case:?}: expected the family's sentence, got {message:?}"
             );
         }

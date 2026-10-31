@@ -26,6 +26,7 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::protected_role_refusals::protected;
 use crate::user_lifecycle::{call, element, elements, error_code, router};
 
 /// The trust policy every role this suite creates starts out with: an IAM policy
@@ -269,26 +270,24 @@ async fn an_update_changes_no_other_roles_trust_policy() {
     }
 }
 
-/// RULE: a name the ACCOUNT does not hold "referenced a resource entity that does not
-/// exist" — the modelled `NoSuchEntityException` (HTTP 404) — and the call persists
-/// nothing, including for a role name AWS publishes for a service but this account has
-/// never created.
+/// RULE: a name the ACCOUNT does not hold and no service keeps provisioned "referenced a
+/// resource entity that does not exist" — the modelled `NoSuchEntityException` (HTTP 404)
+/// — and the call persists nothing.
 #[tokio::test]
 async fn updating_a_role_the_account_does_not_hold_is_not_found() {
     let router = router();
     create_role(&router, "HeldRole", "/").await;
 
-    // Rows: a plain absent name, names one character either side of a held one, the
-    // whole admitted alphabet, and a name AWS PUBLISHES for a service's own
-    // service-linked role, which this account has not created
-    // (`state::service_provisioned_role`'s documentation: an update "keeps answering
-    // from the store alone", so such a name is NoSuchEntity here).
+    // Rows: a plain absent name, names one character either side of a held one, and the
+    // whole admitted alphabet. A role name AWS PUBLISHES for a service's own
+    // service-linked role is NOT among them: that name resolves to the role the service
+    // keeps provisioned, which `updating_a_service_linked_roles_trust_policy_is_refused`
+    // asserts is refused as unmodifiable rather than reported absent.
     let absent = [
         "absent",
         "HeldRol",
         "HeldRoles",
         "role_with+every=allowed.char@-",
-        "AWSServiceRoleForBackup",
     ];
     for role_name in absent {
         let (status, body) = update(&router, role_name, DOCUMENTS[0].1).await;
@@ -373,17 +372,24 @@ async fn a_trust_policy_that_is_not_a_json_policy_is_refused() {
 /// service that depends on the service-linked role can modify or delete the role on
 /// your behalf" — so a caller's update of such a role's trust policy is refused with
 /// the modelled `UnmodifiableEntityException` (HTTP 400) and the role keeps the trust
-/// policy the service's own role carries.
+/// policy the service's own role carries. The protection is about the ROLE, so it holds
+/// both for one this account created through `CreateServiceLinkedRole` and for one a
+/// service keeps provisioned under its published name, which `GetRole` reports without
+/// the account creating anything.
 #[tokio::test]
 async fn updating_a_service_linked_roles_trust_policy_is_refused() {
     let router = router();
 
-    // Rows spanning the service the role is linked to.
+    // Rows spanning the service the role is linked to, and HOW the role came to be: the
+    // first three are created by this account, the last two are names AWS publishes that
+    // nothing here created (source: `state::PUBLISHED_SERVICE_LINKED_ROLE_NAMES`, the
+    // catalog `tests/all/service_provisioned_roles.rs` pins).
     let principals = [
         "lambda.amazonaws.com",
         "elasticbeanstalk.amazonaws.com",
         "autoscaling.amazonaws.com",
     ];
+    let mut roles: Vec<String> = Vec::new();
     for principal in principals {
         let (status, created) = call(
             &router,
@@ -395,11 +401,21 @@ async fn updating_a_service_linked_roles_trust_policy_is_refused() {
             status, 200,
             "case {principal:?}: CreateServiceLinkedRole must succeed, got {status}: {created}"
         );
-        let role_name = element(&created, "RoleName");
+        roles.push(element(&created, "RoleName"));
+    }
+    roles.push("AWSServiceRoleForBackup".to_string());
+    roles.push("AWSServiceRoleForECS".to_string());
+
+    for role_name in roles {
         let held = reported_trust_policy(&router, &role_name).await;
+        assert!(
+            !held.is_empty(),
+            "case {role_name:?}: the role must be reported before its update is refused, \
+             got {held:?}"
+        );
 
         for (document_case, document) in DOCUMENTS.iter().take(3) {
-            let case = format!("{principal} / {document_case}");
+            let case = format!("{role_name} / {document_case}");
             let (status, body) = update(&router, &role_name, document).await;
             assert_eq!(
                 status, 400,
@@ -409,6 +425,12 @@ async fn updating_a_service_linked_roles_trust_policy_is_refused() {
                 error_code(&body),
                 "UnmodifiableEntity",
                 "case {case:?}: expected the modelled awsQuery code, got {body}"
+            );
+            let message = element(&body, "Message");
+            assert_eq!(
+                message,
+                protected(&role_name),
+                "case {case:?}: expected IAM's protected-role sentence, got {message:?}"
             );
             let reported = reported_trust_policy(&router, &role_name).await;
             assert_eq!(

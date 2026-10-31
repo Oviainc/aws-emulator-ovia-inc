@@ -134,6 +134,16 @@ pub const MAX_ROLES_PER_ACCOUNT: usize = 1_000;
 /// cannot be increased."
 pub const MAX_ROLES_PER_INSTANCE_PROFILE: usize = 1;
 
+/// How many temporary role-session credentials this account keeps a record of at once
+/// ([`ComAmazonawsIamAwsidentitymanagementv20100508State::role_sessions`]).
+///
+/// A record is a request-driven insert, so the map needs a declared ceiling; the write
+/// first gives up every record the clock has already expired, which is what normally
+/// keeps it far below this. The value is a chosen emulator ceiling — AWS publishes no
+/// quota on how many sessions of a role may be live — far above any test or demo
+/// workload.
+pub const MAX_ROLE_SESSIONS: usize = 4_096;
+
 /// How many delegation requests one account may hold. AWS's "IAM and STS quotas"
 /// page publishes no figure for a delegation request, so this bound is the
 /// emulator's own: it is what stops the delegation-request map — and the workflow-id
@@ -912,6 +922,35 @@ pub struct AccessKeyRecord {
     pub create_date: ::aws_smithy_types::DateTime,
 }
 
+/// One TEMPORARY credential a role of this account is being used under, keyed in
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::role_sessions`] by the access
+/// key id the session presents.
+///
+/// Which principal an access key id speaks for is a question about the account's
+/// identities, and this store already answers it for a LONG-TERM key through
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::access_keys`]. A credential STS
+/// vends for an assumed role is the other half of that same question: the permissions in
+/// force on such a session are the ROLE's ("the temporary security credentials … have the
+/// permissions of the role", `AssumeRole`), so an authorization decision taken on a
+/// request signed with it has to reach the role the session is of. The session itself
+/// belongs to STS, which is why only the two facts an IAM decision needs are recorded
+/// here — the principal the refusal names, and the role whose policies it is judged on —
+/// written by the operation that mints the session.
+#[derive(Debug, Clone)]
+pub struct RoleSessionRecord {
+    /// The session's own principal, as `sts:AssumeRole` reports it:
+    /// `arn:<partition>:sts::<account>:assumed-role/<role name>/<session name>`. What a
+    /// refusal names as the caller, and what a policy variable over the caller reads.
+    pub session_arn: String,
+    /// The ARN of the IAM role the session is of — the identity whose policies the call
+    /// is judged on, addressed by the ARN the account holds the role under.
+    pub role_arn: String,
+    /// The instant the credential stops being usable, as the minting operation promised
+    /// it. A record past it speaks for nobody: the credential is withdrawn at that
+    /// instant, and the record is kept only until this store next prunes it.
+    pub expires: ::aws_smithy_types::DateTime,
+}
+
 /// One X.509 signing certificate an IAM user holds, keyed in
 /// [`ComAmazonawsIamAwsidentitymanagementv20100508State::signing_certificates`] by its
 /// `CertificateId` — the handle every other operation on one takes
@@ -1527,6 +1566,14 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// owns it. `GetUser` with no `UserName` resolves the caller through this map,
     /// and `CreateAccessKey` is what populates it.
     pub access_keys: BTreeMap<String, AccessKeyRecord>,
+    /// Access key id -> the role session that credential speaks for, for the temporary
+    /// credentials the account's roles are being used under. See [`RoleSessionRecord`]:
+    /// the authorizer resolves a signing principal through this map when the key is not
+    /// a long-term one, and `sts:AssumeRole` (and every other operation that vends an
+    /// assumed-role credential) is what fills it through
+    /// [`Self::record_role_session`]. At most [`MAX_ROLE_SESSIONS`] entries, which the
+    /// same write keeps by pruning the records the clock has already expired.
+    pub role_sessions: BTreeMap<String, RoleSessionRecord>,
     /// `CertificateId` -> the signing certificate's record, including [`name_key`] of
     /// the user that holds it. `UploadSigningCertificate` is what fills this map,
     /// `ListSigningCertificates` pages over it, `UpdateSigningCertificate` moves one
@@ -1821,6 +1868,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             role_inline_policies: BTreeMap::new(),
             group_inline_policies: BTreeMap::new(),
             access_keys: BTreeMap::new(),
+            role_sessions: BTreeMap::new(),
             signing_certificates: BTreeMap::new(),
             login_profiles: BTreeMap::new(),
             service_specific_credentials: BTreeMap::new(),
@@ -2175,6 +2223,86 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         self.access_keys
             .get(access_key_id)
             .is_none_or(|record| record.status == ACCESS_KEY_ACTIVE_STATUS)
+    }
+
+    /// Record the role session the temporary credential `access_key_id` speaks for, so
+    /// a request signed with it is judged on that role's policies
+    /// ([`Self::role_sessions`]).
+    ///
+    /// Called by the operation that MINTS such a credential, which is the only thing
+    /// that knows the session it belongs to. Recording it again under the same key
+    /// replaces the record, because the credential store never hands out an id it is
+    /// already holding one for.
+    ///
+    /// Every record the clock has already expired is pruned first: that credential is
+    /// withdrawn at its expiry whether or not anybody called, so the record speaks for
+    /// nobody past it, and the pruning is what keeps this map's size tied to the sessions
+    /// still in play. At [`MAX_ROLE_SESSIONS`] live records the record given up to make
+    /// room is the one CLOSEST TO EXPIRING, and the session being recorded is always
+    /// recorded: a session this store holds no record of is one the authorizer does not
+    /// bound, so dropping the new record would leave the freshest credential unbounded
+    /// for as long as it lives.
+    pub fn record_role_session(
+        &mut self,
+        access_key_id: &str,
+        session: RoleSessionRecord,
+        now: ::aws_smithy_types::DateTime,
+    ) {
+        self.role_sessions
+            .retain(|_, held| held.expires.secs() > now.secs());
+        while !self.role_sessions.contains_key(access_key_id)
+            && self.role_sessions.len() >= MAX_ROLE_SESSIONS
+        {
+            let earliest = self
+                .role_sessions
+                .iter()
+                .min_by_key(|(key, held)| (held.expires.secs(), (*key).clone()))
+                .map(|(key, _)| key.clone());
+            match earliest {
+                Some(key) => {
+                    self.role_sessions.remove(&key);
+                }
+                None => break,
+            }
+        }
+        self.role_sessions
+            .insert(access_key_id.to_string(), session);
+    }
+
+    /// The role session the temporary credential `access_key_id` speaks for at the
+    /// instant `now`, or `None` when this account holds no live record for that key.
+    ///
+    /// A record whose expiry has passed answers `None`: the credential was withdrawn at
+    /// that instant, so it speaks for nobody. A READ — the record is left where it is,
+    /// and the next [`Self::record_role_session`] prunes it.
+    pub fn role_session(
+        &self,
+        access_key_id: &str,
+        now: ::aws_smithy_types::DateTime,
+    ) -> Option<&RoleSessionRecord> {
+        self.role_sessions
+            .get(access_key_id)
+            .filter(|session| session.expires.secs() > now.secs())
+    }
+
+    /// The PATH of the role `role_name` names, as every operation that PROTECTS a
+    /// service-linked role resolves it: the account's own record first, and failing that
+    /// the record the owning service keeps provisioned under a published service-linked
+    /// role name ([`service_provisioned_role`]). `None` when neither holds a role under
+    /// that name — "a resource entity that does not exist".
+    ///
+    /// The ONE reading of "which role does this request address, and is it a role only
+    /// AWS may change", so the protection cannot drift per handler: `DeleteRole`,
+    /// `UpdateAssumeRolePolicy`, `Put`/`DeleteRolePolicy`, `Attach`/`DetachRolePolicy`,
+    /// `Add`/`RemoveRoleFromInstanceProfile` and the two boundary writes all read it
+    /// here, and pass the answer to [`is_service_linked_role_path`].
+    ///
+    /// A READ: the store is only consulted.
+    pub fn addressed_role_path(&self, role_name: &str) -> Option<String> {
+        self.roles
+            .get(&name_key(role_name))
+            .map(|role| role.path.clone())
+            .or_else(|| service_provisioned_role(role_name).map(|role| role.path))
     }
 
     /// The groups the user keyed by `user_key` belongs to, by the key
@@ -3472,22 +3600,35 @@ const SERVICE_PROVISIONED_ROLE_CREATE_MILLIS: i64 = 0;
 ///
 /// * `GetRole` — the role REPORT — answers the account's own record where there is
 ///   one and this derived record otherwise.
+/// * `UpdateRoleDescription` resolves it and MATERIALISES it as the account's own
+///   record, because a description is the one mutation of a service-linked role its
+///   account may make ("you can edit the description of a service-linked role" while
+///   "you cannot delete or edit the permissions for this role", "Using service-linked
+///   roles", IAM User Guide): the write that operation's contract mandates is what
+///   creates the record, every other member of which is the service's own, carried over
+///   from here.
+/// * The operations that PROTECT a service-linked role resolve it here for that
+///   protection: the role a service keeps provisioned is service-linked by
+///   construction, so a caller's attempt to change it is refused
+///   `UnmodifiableEntityException` ([`protected_role_message`]) rather than reported
+///   absent — the protection is about the ROLE, not about which record resolved it.
+///   `DeleteRole`, `UpdateAssumeRolePolicy`, `Put`/`DeleteRolePolicy`,
+///   `Attach`/`DetachRolePolicy`, `Add`/`RemoveRoleFromInstanceProfile` and the two
+///   boundary writes (`Put`/`DeleteRolePermissionsBoundary`) all read the addressed
+///   role's path through it.
 /// * `CreateServiceLinkedRole` still MINTS the account's own record for such a
 ///   principal and answers 200 rather than refusing the name as taken. That is
 ///   deliberate: the role a service predefines is not a record of the account's, and
 ///   every client that follows a service's documented bootstrap (create the role,
 ///   then read it back under the published name) depends on that create succeeding.
 ///   The created record then supersedes this one for every later read.
-/// * The operations that CHANGE a role or report the ACCOUNT's own record of its
-///   attachments (`DeleteRole`, `UpdateRole`, `UpdateAssumeRolePolicy`,
-///   `UpdateRoleDescription`, `Put`/`Get`/`DeleteRolePolicy`,
-///   `Attach`/`DetachRolePolicy`, `Tag`/`UntagRole`, the `ListRole*` listings and
-///   `ListRoles`) keep answering from the store alone, so a name only this function
-///   resolves is still `NoSuchEntity` there. None of them could legally change a
-///   service-linked role ("only the service that depends on the service-linked role
-///   can modify or delete the role on your behalf"), and reporting the policies a
-///   service attaches to its OWN role would mean inventing a catalog no model in
-///   this repository carries.
+/// * The operations that report the ACCOUNT's own record of a role's attachments or
+///   change a member no protection covers (`UpdateRole`, `Get`/`DeleteRolePolicy`'s
+///   policy lookup, `Tag`/`UntagRole`, the `ListRole*` listings and `ListRoles`) keep
+///   answering from the store alone, so a name only this function resolves is still
+///   `NoSuchEntity` there: reporting the policies, tags or session settings a service
+///   keeps on its OWN role would mean inventing a catalog no model in this repository
+///   carries.
 pub fn service_provisioned_role(role_name: &str) -> Option<Role> {
     let (row, service_principal, published_name) = published_service_linked_role(role_name)?;
     let path = service_linked_role_path(service_principal);
@@ -4849,7 +4990,11 @@ pub fn uncarried_aws_managed_policy(arn: &str, what: &str) -> crate::scaffolded:
 /// request supplied.
 ///
 /// ONE wording, shared by every operation taking a `PolicyArn`, so a read, a tag call
-/// and a delete cannot describe the same missing policy three different ways.
+/// and a delete cannot describe the same missing policy three different ways. It is also
+/// what the DETACH family answers for a policy the named entity does not carry: what such
+/// a request addresses is the policy, so the sentence carries the ARN and nothing of the
+/// entity, which is why `Detach`/`User`/`Role`/`GroupPolicy` all word that absence here
+/// rather than each composing a clause naming its own entity.
 pub fn policy_not_found(arn: &str) -> String {
     format!("Policy {arn} was not found.")
 }
@@ -4967,6 +5112,20 @@ pub const DELETE_CONFLICT_DELETE_SIGNING_CERTIFICATES: &str =
 /// How IAM refuses a delete whose user still has a console password.
 pub const DELETE_CONFLICT_DELETE_LOGIN_PROFILE: &str =
     "Cannot delete entity, must delete login profile first.";
+
+/// The message IAM refuses an add of a role to an instance profile that already holds one
+/// with — the fixed text `Cannot exceed quota for InstanceSessionsPerInstanceProfile: `
+/// and the quota itself.
+///
+/// The quota NAME is what identifies which of the operation's several `LimitExceeded`
+/// causes fired, and the one IAM names for an instance profile that already holds a role
+/// is `InstanceSessionsPerInstanceProfile` — recorded behaviour for a second
+/// `AddRoleToInstanceProfile`. The sentence is shaped like every other
+/// `Cannot exceed quota for <quota>: <limit>` refusal in this crate
+/// ([`policy_size_quota_exceeded`]) and carries nothing of the role or the profile.
+pub fn instance_profile_role_quota_exceeded(quota: usize) -> String {
+    format!("Cannot exceed quota for InstanceSessionsPerInstanceProfile: {quota}")
+}
 
 /// The message IAM refuses a MANAGED policy document past its size quota with — the fixed
 /// text `Cannot exceed quota for PolicySize: ` and the quota itself.
@@ -6032,12 +6191,14 @@ pub fn is_policy_document(document: &str) -> bool {
 
 /// WHY a value supplied where an IAM policy document is expected is not one.
 ///
-/// IAM distinguishes the two, and words each with a sentence of its own
-/// ([`Self::message`]): a text that is no JSON object at all failed to PARSE, while a
-/// JSON object that carries no `Statement` parsed and described no statement. A client
-/// matching the refusal's text is what the distinction is for — the first is a
-/// serialization bug on the caller's side, the second a policy that would grant nothing —
-/// so one sentence for both would lose it.
+/// The decision is one — the document is no policy — and WHICH of these a reader reports
+/// is what lets each validator word it as IAM does: a text that is no JSON object at all
+/// failed to PARSE, while a JSON object that carries no `Statement` parsed and described
+/// no statement. A role's trust policy is read by a validator that words those two apart
+/// ([`PolicyDocumentDefect::trust_policy_message`]) — the first is a serialization bug on
+/// the caller's side, the second a policy that would grant nothing — where the
+/// identity-policy validator answers one sentence for both
+/// ([`PolicyDocumentDefect::message`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyDocumentDefect {
     /// The value does not parse as a JSON object: it is not JSON, or it is JSON that is
@@ -6056,7 +6217,15 @@ pub enum PolicyDocumentDefect {
     NoResources,
 }
 
-/// The fixed sentence IAM refuses a document that does not parse as a JSON object with.
+/// The fixed sentence IAM refuses an identity or resource policy document it cannot read
+/// as a policy with: one that does not parse as a JSON object, and one that parses and
+/// carries no `Statement` element.
+///
+/// IAM's identity-policy validator reports both as a SYNTAX error and gives no diagnosis
+/// at all — recorded behaviour for a `CreatePolicy` whose document is valid JSON carrying
+/// only `Version` — so the whole message is fixed text. The TRUST-policy validator is the
+/// one that tells the two apart ([`TRUST_POLICY_INVALID_JSON`],
+/// [`POLICY_HAS_NO_STATEMENTS`]).
 pub const SYNTAX_ERRORS_IN_POLICY: &str = "Syntax errors in policy.";
 
 /// The fixed sentence IAM refuses a TRUST policy document that does not parse as a JSON
@@ -6069,7 +6238,9 @@ pub const SYNTAX_ERRORS_IN_POLICY: &str = "Syntax errors in policy.";
 /// and nothing of the member that supplied it.
 pub const TRUST_POLICY_INVALID_JSON: &str = "This policy contains invalid Json";
 
-/// The fixed sentence IAM refuses a JSON object carrying no `Statement` element with.
+/// The fixed sentence IAM's TRUST-policy validator refuses a JSON object carrying no
+/// `Statement` element with — recorded behaviour for a `CreateRole` whose
+/// `AssumeRolePolicyDocument` is an object with no `Statement`.
 pub const POLICY_HAS_NO_STATEMENTS: &str = "Policy has no statements";
 
 /// The fixed sentence IAM refuses a statement naming no actions with.
@@ -6080,14 +6251,21 @@ pub const STATEMENT_WITHOUT_ACTIONS: &str = "Policy statement must contain actio
 pub const STATEMENT_WITHOUT_RESOURCES: &str = "Policy statement must contain resources.";
 
 impl PolicyDocumentDefect {
-    /// How IAM words this defect in the modelled `MalformedPolicyDocumentException`: a
-    /// FIXED sentence per defect, carrying nothing of the document and nothing of the
-    /// member that supplied it, so every operation taking a policy document refuses the
-    /// same text for the same defect.
+    /// How IAM words this defect in the modelled `MalformedPolicyDocumentException` for an
+    /// IDENTITY or RESOURCE policy document: a FIXED sentence per defect, carrying nothing
+    /// of the document and nothing of the member that supplied it, so every operation
+    /// taking such a document refuses the same text for the same defect.
+    ///
+    /// A document that is no JSON object and one that carries no `Statement` are both
+    /// reported as the SYNTAX defect here ([`SYNTAX_ERRORS_IN_POLICY`]): this validator
+    /// gives no diagnosis of a document it cannot read as a policy at all, and only the
+    /// statement-level requirements it does read are worded apart
+    /// ([`STATEMENT_WITHOUT_ACTIONS`], [`STATEMENT_WITHOUT_RESOURCES`]). A role's trust
+    /// policy is read by a validator of IAM's own, which words both of those two cases its
+    /// way ([`Self::trust_policy_message`]).
     pub fn message(self) -> &'static str {
         match self {
-            Self::Syntax => SYNTAX_ERRORS_IN_POLICY,
-            Self::NoStatements => POLICY_HAS_NO_STATEMENTS,
+            Self::Syntax | Self::NoStatements => SYNTAX_ERRORS_IN_POLICY,
             Self::NoActions => STATEMENT_WITHOUT_ACTIONS,
             Self::NoResources => STATEMENT_WITHOUT_RESOURCES,
         }
@@ -6097,13 +6275,16 @@ impl PolicyDocumentDefect {
     /// `AssumeRolePolicyDocument`, which `CreateRole` and `UpdateAssumeRolePolicy` write.
     ///
     /// The DECISION is the same one [`policy_document_defect`] makes for every policy
-    /// document; only the sentence for a document that does not parse as a JSON object
-    /// differs, because IAM validates a role's trust policy with a validator of its own
-    /// ([`TRUST_POLICY_INVALID_JSON`]). An object that parses and carries no `Statement`
-    /// is reported as any other policy document carrying none is.
+    /// document; what differs is that IAM validates a role's trust policy with a validator
+    /// of its own, which tells a document that does not parse as a JSON object
+    /// ([`TRUST_POLICY_INVALID_JSON`]) from one that parses and describes no statement
+    /// ([`POLICY_HAS_NO_STATEMENTS`]) — where the identity-policy validator reports one
+    /// sentence for both ([`Self::message`]). The statement-level requirements are worded
+    /// alike for both classes.
     pub fn trust_policy_message(self) -> &'static str {
         match self {
             Self::Syntax => TRUST_POLICY_INVALID_JSON,
+            Self::NoStatements => POLICY_HAS_NO_STATEMENTS,
             other => other.message(),
         }
     }
