@@ -5,23 +5,29 @@
 //! Two layers of this crate judge a `StartDate`/`EndDate`: the shape layer, which refuses
 //! a value that is not a calendar date and a time of day at all before anything is
 //! resolved, and the projection, which needs the instant a date names in order to clip a
-//! series. Both read the SAME documented layout — `yyyy-MM-dd`, a date/time separator,
+//! series.
+//!
+//! Both layers read the SAME documented layout — `yyyy-MM-dd`, a date/time separator,
 //! `HH:mm[:ss]` — so the positions that layout fixes (`-` at index 4 and 7, the separator
 //! at index 10, `:` at index 13 and 16, an ASCII digit everywhere else) are read in one
-//! place, and the two layers differ only where the documentation makes them differ: the
-//! shape layer stops after the minutes and admits the lowercase separator its pattern's
-//! `[Tt]` does, while the instant the projection needs is the full `yyyy-MM-dd'T'HH:mm:ss`.
+//! place, and the two layers differ only in how far the layout must reach: the shape layer
+//! stops after the minutes and leaves the rest to its trailing character class, while the
+//! projection goes on to read the seconds field and the fractional second ISO 8601 adds.
 //!
 //! What that buys, asserted here over a set of values rather than one request:
 //!
 //! 1. A value broken at a position BOTH layers read is refused by the first of them —
 //!    HTTP 400 `ValidationException` — and never reaches the projection, for every
 //!    operation and both date members.
-//! 2. A value the shared positions admit but the stricter, longer layout does not gets
-//!    PAST the shape layer and is the operation's own `InvalidInputException` (400), which
-//!    is the only way the two layers are allowed to disagree.
+//! 2. A value the shared positions admit but which names no instant gets PAST the shape
+//!    layer and is the operation's own `InvalidInputException` (400), which is the only way
+//!    the two layers are allowed to disagree.
 //! 3. A value in the documented layout is read by both layers and answers from the store:
 //!    the window it names clips the stored points.
+//!
+//! The spellings ISO 8601 adds to the documented layout — minute precision, a fractional
+//! second, a lowercase designator, a zone — are read as instants by both layers and are
+//! pinned by `iso8601_date_bounds.rs`, not here.
 //!
 //! Every row drives the service the way a client does: an awsJson1_1 `POST /` through the
 //! real router, so the shape layer, the handler and the projection all run. Both
@@ -228,22 +234,22 @@ async fn a_value_broken_at_a_shared_layout_position_is_refused_by_the_shape_laye
     }
 }
 
-/// Rule 2: a value the shared positions admit, but the stricter instant layout does not,
-/// gets past the shape layer and is the operation's own `InvalidInputException`.
+/// Rule 2: a value the shared positions admit, but which names no instant, gets past the
+/// shape layer and is the operation's own `InvalidInputException`.
 ///
-/// These are the only two differences between the layers — how far the layout must reach,
-/// and whether a lowercase date/time separator is admitted — so each row is a value that
-/// one layer reads as a date and the other does not.
+/// The shape layer's trailing character class admits text ISO 8601 has no field for, and
+/// the positions it reads stop at the minutes, so each row is a value that layer reads as a
+/// date and the projection cannot place on a timeline.
 #[tokio::test]
 async fn a_value_only_the_stricter_layout_refuses_reaches_the_projection() {
     let (engine, router) = harness();
     seed(&engine);
 
     let past_the_shape_layer: [(&str, &str); 4] = [
-        ("no seconds field", "2015-01-01T08:00"),
-        ("a lowercase date/time separator", "2015-01-01t08:00:00"),
-        ("the wrong separator at index 16", "2015-01-01T08:00-00"),
-        ("a zone designator the instant layout omits", "2015-01-01T08:00:00Z"),
+        ("a seconds field written short", "2015-01-01T08:00:0"),
+        ("a trailing word the class admits", "2015-01-01T08:00:00tomorrow"),
+        ("a zone region in brackets", "2015-01-01T08:00:00Z[UTC]"),
+        ("an hour past 23", "2015-01-01T25:00:00"),
     ];
 
     for op in operations() {
@@ -260,7 +266,7 @@ async fn a_value_only_the_stricter_layout_refuses_reaches_the_projection() {
                     error_code(&body),
                     "InvalidInputException",
                     "case {case:?}: the shape layer must admit this spelling and the \
-                     projection refuse it, got {body}"
+                     projection refuse it as naming no instant, got {body}"
                 );
             }
         }

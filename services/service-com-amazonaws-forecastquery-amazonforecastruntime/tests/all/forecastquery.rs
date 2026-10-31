@@ -549,8 +549,8 @@ async fn every_window_is_an_ordered_idempotent_subset_of_the_whole_range() {
     }
 }
 
-/// A date member that is not `yyyy-MM-dd'T'HH:mm:ss` is refused with
-/// `InvalidInputException`, and a calendar-valid one in that format is accepted.
+/// A date member that names no ISO 8601 instant is refused, and a calendar-valid one is
+/// accepted.
 #[tokio::test]
 async fn a_date_outside_the_documented_format_is_refused() {
     let (engine, router) = harness();
@@ -560,14 +560,16 @@ async fn a_date_outside_the_documented_format_is_refused() {
     // Two layers refuse a date, and which one answers is what the expected code says.
     // The SHAPE layer runs first and refuses a value that is not a date and a time of day
     // at all (`crate::state::DATE_TIME_PATTERN`) with `ValidationException`; a value that
-    // IS one but is not the layout this service's points are stored in, or is not a real
-    // instant, reaches the projection and is the operation's own `InvalidInputException`.
-    // Either way the caller gets a 400. `shape_validation.rs` pins the first layer's own
-    // rule, including that it precedes resolving the ARN.
+    // IS one but names no instant — a calendar field out of range, a field written short,
+    // trailing text no ISO 8601 field accounts for — reaches the projection and is the
+    // operation's own `InvalidInputException`. Either way the caller gets a 400.
+    // `shape_validation.rs` pins the first layer's own rule, including that it precedes
+    // resolving the ARN, and `iso8601_date_bounds.rs` pins the spellings that ARE read as
+    // instants.
     let rejected: [(&str, &str); 8] = [
         ("2015-01-01", "ValidationException"), // date only: no time of day
-        ("2015-01-01T08:00", "InvalidInputException"), // a time, but no seconds
-        ("2015-01-01T08:00:00Z", "InvalidInputException"), // a zone the layout omits
+        ("2015-01-01T08:00:0", "InvalidInputException"), // a seconds field written short
+        ("2015-01-01T08:00:00Z[UTC]", "InvalidInputException"), // a zone region in brackets
         ("2015-01-01 08:00:00", "ValidationException"), // space instead of 'T'
         ("2015-13-01T00:00:00", "InvalidInputException"), // month past 12
         ("2015-02-30T00:00:00", "InvalidInputException"), // a day February never has

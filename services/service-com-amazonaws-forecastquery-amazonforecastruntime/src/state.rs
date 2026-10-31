@@ -394,10 +394,10 @@ impl QueryOutcome {
 
 /// One `{Timestamp, Value}` of a stored time series.
 ///
-/// `timestamp` uses the format the model documents for every date in this service:
-/// `yyyy-MM-dd'T'HH:mm:ss`. A stored point whose timestamp does not parse in that format
-/// is not a data point this service can place on a timeline, so the projection skips it
-/// rather than returning an uncomparable value.
+/// `timestamp` uses the layout the model documents for every date in this service:
+/// `yyyy-MM-dd'T'HH:mm:ss`. A stored point whose timestamp names no instant
+/// ([`parse_date_time`]) is not a data point this service can place on a timeline, so the
+/// projection skips it rather than returning an uncomparable value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredPoint {
     pub timestamp: String,
@@ -700,30 +700,39 @@ const LAYOUT_THROUGH_MINUTES: usize = 16;
 /// plus `:ss`.
 const LAYOUT_THROUGH_SECONDS: usize = 19;
 
+/// Index of the date/time separator in the layout [`walks_date_time_layout`] walks: the
+/// `yyyy-MM-dd` date ends here and the time of day starts one byte later.
+const DATE_TIME_SEPARATOR_AT: usize = 10;
+
+/// Nanoseconds in one second, the unit [`parse_date_time`] reports an instant in.
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
+
+/// The seconds field a minute-precision spelling leaves off: the instant a date names is
+/// the same whether its zero seconds are written or implied.
+const IMPLIED_SECONDS: &str = ":00";
+
 /// Whether the first `length` bytes of `bytes` walk the documented date layout:
 /// `yyyy-MM-dd`, a date/time separator, then `HH:mm[:ss]`.
 ///
 /// The ONE place this crate states that layout positionally — `-` at index 4 and 7, the
-/// date/time separator at index 10, `:` at index 13 and, when `length` reaches it, 16, and
-/// an ASCII digit at every other position. Both layers that judge a date read it through
+/// date/time separator (`T`, or the lowercase `t` ISO 8601 and the shape layer's pattern
+/// both admit) at index 10, `:` at index 13 and, when `length` reaches it, 16, and an
+/// ASCII digit at every other position. Both layers that judge a date read it through
 /// here ([`parse_date_time`] for the instant a date names, and
 /// [`matches_date_time_pattern`] for the shape layer's pattern), so a change to how this
 /// crate reads the layout — a separator, a field width, the ASCII-only decision — is made
 /// once and both layers agree.
 ///
-/// The two parameters are the only places the layers differ:
-///
-/// * `length` is how far the layout must reach. `LAYOUT_THROUGH_SECONDS` requires the
-///   seconds field; `LAYOUT_THROUGH_MINUTES` stops after the minutes, leaving whatever
-///   follows to the caller (a trailing character class, or nothing). A longer value is not
-///   refused here — only a shorter one is.
-/// * `admit_lowercase_separator` admits a lowercase `t` at index 10 beside `T`, which the
-///   shape layer's pattern does and the stricter instant layout does not.
+/// `length` is how far the layout must reach, and the only thing the two layers differ
+/// about: `LAYOUT_THROUGH_SECONDS` requires the seconds field, `LAYOUT_THROUGH_MINUTES`
+/// stops after the minutes and leaves whatever follows to the caller (a trailing character
+/// class, a fractional second, or nothing). A longer value is not refused here — only a
+/// shorter one is.
 ///
 /// Walked position by position rather than through a regex engine because the layout is
 /// FIXED: reading each position IS the pattern. It is also ASCII-only, as `\d` is: a value
 /// spelled with non-ASCII digits is not a date this service can place on a timeline.
-fn walks_date_time_layout(bytes: &[u8], length: usize, admit_lowercase_separator: bool) -> bool {
+fn walks_date_time_layout(bytes: &[u8], length: usize) -> bool {
     if bytes.len() < length {
         return false;
     }
@@ -733,46 +742,91 @@ fn walks_date_time_layout(bytes: &[u8], length: usize, admit_lowercase_separator
         .enumerate()
         .all(|(index, byte)| match index {
             4 | 7 => *byte == b'-',
-            10 => *byte == b'T' || (admit_lowercase_separator && *byte == b't'),
+            DATE_TIME_SEPARATOR_AT => *byte == b'T' || *byte == b't',
             13 | 16 => *byte == b':',
             _ => byte.is_ascii_digit(),
         })
 }
 
-/// The instant a `yyyy-MM-dd'T'HH:mm:ss` date names, as seconds on one scale, or `None`
-/// when `value` is not in that format.
+/// The instant an ISO 8601 date-time names — a `StartDate`, an `EndDate` or a stored
+/// point's `Timestamp` — as nanoseconds on one scale, or `None` when the text names no
+/// instant.
 ///
-/// That format is the one the model documents for `StartDate`, `EndDate` and a
-/// `DataPoint`'s `Timestamp`. It is checked in two parts, neither of them hand-rolled
-/// arithmetic:
+/// The model documents these members as "yyyy-MM-dd'T'HH:mm:ss (ISO 8601 format)": that
+/// layout is the EXAMPLE spelling and ISO 8601 is the FORMAT, so a bound spelled any other
+/// way the format allows names the instant its text declares and is read here — the
+/// seconds field left off (minute precision), a fractional second, either case of the
+/// date/time designator, and a zone: the UTC designator in either case, or a numeric UTC
+/// offset. That is also the set the service's own validation pattern admits
+/// ([`DATE_TIME_PATTERN`]) minus the text that names no instant, because a service does not
+/// publish a pattern admitting values its next layer refuses.
 ///
-/// 1. the LAYOUT must be exactly the documented one — read through
-///    [`walks_date_time_layout`], the crate's one statement of it — so a value carrying a
-///    zone or offset, a space instead of `T`, fractional seconds, or a missing field is
-///    refused;
-/// 2. the CALENDAR is then checked by the AWS date type this crate already depends on
-///    (`aws_smithy_types::DateTime`): RFC 3339 is this very layout plus a zone designator,
-///    so appending the UTC one hands that parser exactly what it expects, and it is what
-///    rejects a 30th of February or an hour past 23.
+/// Two steps, and NO hand-written timestamp parser:
 ///
+/// 1. the documented LAYOUT is read through [`walks_date_time_layout`], the crate's one
+///    statement of it, which fixes the date and the time of day through the minutes;
+///    [`IMPLIED_SECONDS`] supplies the seconds field where the spelling leaves it off.
+/// 2. everything that follows the time of day — the zone and the offset it declares, a
+///    fractional second, and the CALENDAR — is read by the AWS date type this crate
+///    already depends on (`aws_smithy_types::DateTime` with `Format::DateTimeWithOffset`),
+///    which is what rejects a 30th of February, an hour past 23, an offset outside its
+///    range, and text trailing the instant. Nothing here reads a zone itself, so the
+///    offset is applied by the same library that validates it.
+///
+/// A spelling declaring no zone is read as UTC, by handing that parser the UTC designator:
 /// Amazon Forecast's predictions are all in the dataset's own timezone (the operation's
-/// doc), so every date in a request and in the stored series is on one scale and comparing
-/// the parsed seconds is what a clip needs.
-pub fn parse_date_time(value: &str) -> Option<i64> {
+/// doc), so a bound without a zone and the stored points are on one scale, which is what a
+/// clip needs. The unit is NANOSECONDS rather than seconds because ISO 8601 admits a
+/// fractional second: truncating one away would make a bound half a second past a point
+/// compare as equal to it.
+pub fn parse_date_time(value: &str) -> Option<i128> {
     let bytes = value.as_bytes();
-    if bytes.len() != LAYOUT_THROUGH_SECONDS {
-        return None;
-    }
-    if !walks_date_time_layout(bytes, LAYOUT_THROUGH_SECONDS, false) {
+    // Every spelling carries the date and the time of day through the minutes.
+    if !walks_date_time_layout(bytes, LAYOUT_THROUGH_MINUTES) {
         return None;
     }
 
-    aws_smithy_types::DateTime::from_str(
-        &format!("{value}Z"),
-        aws_smithy_types::date_time::Format::DateTime,
-    )
-    .ok()
-    .map(|parsed| parsed.secs())
+    // The walk has read ASCII bytes up to its length, so each index below is a character
+    // boundary. Where the seconds field is written, the time of day ends after it; where it
+    // is not, it is implied — and what follows the minutes is then the zone.
+    let (time_of_day, rest) = if walks_date_time_layout(bytes, LAYOUT_THROUGH_SECONDS) {
+        (
+            ::std::borrow::Cow::Borrowed(value.get(..LAYOUT_THROUGH_SECONDS)?),
+            value.get(LAYOUT_THROUGH_SECONDS..)?,
+        )
+    } else {
+        let after_minutes = value.get(LAYOUT_THROUGH_MINUTES..)?;
+        // A fraction belongs to the last field WRITTEN, so after the minutes it is a
+        // fraction of a MINUTE. Every date this service places on a timeline carries
+        // seconds — the documented layout, and every stored point's timestamp — so that
+        // spelling is refused rather than read as a fraction of a second, which would name
+        // a different instant.
+        if after_minutes.starts_with('.') {
+            return None;
+        }
+        (
+            ::std::borrow::Cow::Owned(format!(
+                "{}{IMPLIED_SECONDS}",
+                value.get(..LAYOUT_THROUGH_MINUTES)?
+            )),
+            after_minutes,
+        )
+    };
+
+    // What the caller wrote after the time of day, and then the same text with the UTC
+    // designator appended for a spelling that declares no zone. The first that parses is
+    // the instant the text names, so which zone spellings are read is the date type's
+    // decision and not a second opinion stated here.
+    let as_written = format!("{time_of_day}{rest}");
+    let as_utc = format!("{as_written}Z");
+    let parsed = [as_written, as_utc].into_iter().find_map(|candidate| {
+        aws_smithy_types::DateTime::from_str(
+            &candidate,
+            aws_smithy_types::date_time::Format::DateTimeWithOffset,
+        )
+        .ok()
+    })?;
+    Some(i128::from(parsed.secs()) * NANOS_PER_SECOND + i128::from(parsed.subsec_nanos()))
 }
 
 // ---------------------------------------------------------------------------
@@ -832,14 +886,13 @@ const MAX_ECHOED_VALUE: usize = 256;
 ///
 /// The pattern is a FIXED LAYOUT — `yyyy-MM-dd`, then `T` or `t`, then `HH:mm` — followed
 /// by one character class, so the layout is read through [`walks_date_time_layout`], the
-/// one place this crate states it, admitting the lowercase separator the pattern's `[Tt]`
-/// does and stopping where the fixed part ends.
+/// one place this crate states it, stopping where the fixed part ends.
 ///
 /// Every character after the layout must be one the trailing class admits: ASCII
 /// alphanumeric, or one of `:`, `+`, `-`, `[`, `]`, `.`, `/`.
 fn matches_date_time_pattern(value: &str) -> bool {
     let bytes = value.as_bytes();
-    if !walks_date_time_layout(bytes, LAYOUT_THROUGH_MINUTES, true) {
+    if !walks_date_time_layout(bytes, LAYOUT_THROUGH_MINUTES) {
         return false;
     }
     bytes[LAYOUT_THROUGH_MINUTES..].iter().all(|byte| {
@@ -985,8 +1038,8 @@ pub fn shape_validation_message(
 /// documented default).
 #[derive(Debug, Clone, Copy, Default)]
 struct DateWindow {
-    start: Option<i64>,
-    end: Option<i64>,
+    start: Option<i128>,
+    end: Option<i128>,
 }
 
 impl DateWindow {
@@ -1016,7 +1069,7 @@ impl DateWindow {
 
     /// `points` restricted to this window, ascending by timestamp.
     fn clip(&self, points: &[StoredPoint]) -> Vec<StoredPoint> {
-        let mut kept: Vec<(i64, StoredPoint)> = points
+        let mut kept: Vec<(i128, StoredPoint)> = points
             .iter()
             .filter_map(|point| {
                 let at = parse_date_time(&point.timestamp)?;
@@ -1049,7 +1102,7 @@ pub enum QueryRejection {
     /// `Filters` matched more than one series, so it does not name the single item a
     /// query retrieves.
     AmbiguousFilters { matched: usize },
-    /// A date member that is not `yyyy-MM-dd'T'HH:mm:ss`.
+    /// A date member that names no ISO 8601 instant.
     MalformedDate {
         member: &'static str,
         value: String,

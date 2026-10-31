@@ -23,6 +23,8 @@ mod forecastquery;
 mod invalid_arn_echo_ceiling;
 #[path = "all/invalid_arn_message.rs"]
 mod invalid_arn_message;
+#[path = "all/iso8601_date_bounds.rs"]
+mod iso8601_date_bounds;
 #[path = "all/resource_not_found_message.rs"]
 mod resource_not_found_message;
 #[path = "all/service_claim.rs"]
