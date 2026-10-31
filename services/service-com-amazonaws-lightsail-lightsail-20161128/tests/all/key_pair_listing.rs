@@ -46,7 +46,7 @@ use service_com_amazonaws_lightsail_lightsail_20161128::state::{
     self, StoredKeyPair, StoredLocation, DEFAULT_SSH_KEY_NAME,
 };
 
-use crate::instance_lifecycle::Emulator;
+use crate::instance_lifecycle::{error_code, Emulator};
 use crate::paging::{expected_page_sizes, names};
 
 /// How many key pairs one page of `GetKeyPairs` carries — the handler's OWN
@@ -562,12 +562,13 @@ async fn listing_again_and_from_another_region_changes_nothing() {
 
 /// RULE: an account holding none of that resource reports an empty LIST with no
 /// token, never an absent member — the caller asked what it holds and the answer
-/// is "nothing". A page token for a record it does not hold is the same answer.
+/// is "nothing". A page token names a record it does not hold, though, so a
+/// request carrying one is refused instead.
 #[tokio::test(flavor = "current_thread")]
 async fn an_account_holding_nothing_reports_an_empty_list_and_no_token() {
     let emulator = Emulator::new();
     for include_default in INCLUDE_DEFAULT {
-        for token in [None, Some("zzz-no-such-key-pair")] {
+        for token in [None, Some("")] {
             let body = page(&emulator, None, *include_default, token).await;
             assert_eq!(
                 entries(&body).len(),
@@ -581,13 +582,38 @@ async fn an_account_holding_nothing_reports_an_empty_list_and_no_token() {
                  no nextPageToken, got {body:?}"
             );
         }
+
+        let mut request = serde_json::Map::new();
+        request.insert("pageToken".to_string(), json!("zzz-no-such-key-pair"));
+        if let Some(include) = include_default {
+            request.insert(
+                "includeDefaultKeyPair".to_string(),
+                json!(include),
+            );
+        }
+        let (status, body) = emulator
+            .call("GetKeyPairs", Value::Object(request))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case an empty account at a token naming no key pair with {include_default:?}: \
+             expected the invalid-input status, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidInputException",
+            "case an empty account at a token naming no key pair with {include_default:?}: \
+             expected the modelled InvalidInputException, got {body:?}"
+        );
     }
 }
 
 /// RULE: a page token NAMES a record rather than carrying an index, so resuming
-/// from any stored name reports the reported records from that name onward — the
-/// invariant that keeps a record created or deleted between two pages from making
-/// the walk skip or repeat another one.
+/// from the name of a record this listing REPORTS answers the reported records
+/// from that name onward — the invariant that keeps a record created or deleted
+/// between two pages from making the walk skip or repeat another one — while a
+/// token naming a record this request leaves OUT names no page of it, so it is
+/// refused.
 #[tokio::test(flavor = "current_thread")]
 async fn resuming_from_a_stored_name_reports_that_name_onward() {
     let emulator = Emulator::new();
@@ -600,12 +626,37 @@ async fn resuming_from_a_stored_name_reports_that_name_onward() {
     let records = hold(&emulator, &row).await;
 
     for include_default in INCLUDE_DEFAULT {
-        // Resuming from EVERY seeded name, including the default pair's — a token
-        // for a record this listing leaves out still resumes at the next reported
-        // one.
+        // Resuming from EVERY seeded name, including the default pair's — which
+        // this listing reports only when the request asks for it, so a token
+        // naming it is a page of one request and a refusal of another.
         let reported = expected_names(&records, *include_default);
         for record in &records {
             let token = record.name.as_str();
+            if !reported.iter().any(|name| name == token) {
+                let mut request = serde_json::Map::new();
+                request.insert("pageToken".to_string(), json!(token));
+                if let Some(include) = include_default {
+                    request.insert(
+                        "includeDefaultKeyPair".to_string(),
+                        json!(include),
+                    );
+                }
+                let (status, body) = emulator
+                    .call("GetKeyPairs", Value::Object(request))
+                    .await;
+                assert_eq!(
+                    status, 400,
+                    "case resuming from the unreported {token} with {include_default:?}: expected \
+                     the invalid-input status, got {status} {body:?}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "InvalidInputException",
+                    "case resuming from the unreported {token} with {include_default:?}: expected \
+                     the modelled InvalidInputException, got {body:?}"
+                );
+                continue;
+            }
             let body = page(&emulator, None, *include_default, Some(token)).await;
             let listed = names(&entries(&body));
             let from = reported

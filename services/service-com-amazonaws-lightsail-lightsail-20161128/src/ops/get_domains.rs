@@ -175,29 +175,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region the domain API is served from, so a served request selects
         // every recordset this store holds.
 
-        // `pageToken` is the name the previous page stopped before, so a page is
-        // the stored recordsets from that name onward in the store's own total
-        // order. Using the name rather than an index means a recordset deleted
-        // between two pages cannot make the walk skip or repeat another one. The
-        // walk itself is the ONE page walk every listing of this service shares
+        // `pageToken` NAMES the recordset a page starts at — the name the previous
+        // page reported as its `nextPageToken` — so a page is the stored recordsets
+        // from that one onward in the store's own total order. Naming the recordset
+        // rather than carrying an index means a recordset deleted between two pages
+        // cannot make the walk skip or repeat another one, and a token naming no
+        // recordset is refused rather than resumed at the next name after it. An
+        // absent — or empty — token asks for the first page. The walk itself is
+        // the ONE page walk every listing of this service shares
         // (`crate::state::resource_page`).
-        let page_token = input.page_token.unwrap_or_default();
+        let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             let (domains, next_page_token) = crate::state::resource_page(
-                crate::state::records_from(&store.domains, &page_token),
+                crate::state::records_from(&store.domains, page_token.as_deref()),
+                page_token.as_deref(),
                 crate::state::DOMAIN_PAGE_SIZE,
                 |_, domain| domain.view(),
-            );
-            GetDomainsOutput {
+            )
+            .ok_or_else(|| {
+                invalid(crate::state::invalid_page_token_message(
+                    page_token.as_deref().unwrap_or_default(),
+                    "a domain",
+                ))
+            })?;
+            Ok(GetDomainsOutput {
                 // An account with no recordsets reports an empty list, not an
                 // absent one: the caller asked what it holds, and the answer is
                 // "nothing".
                 domains: Some(domains),
                 next_page_token,
-            }
+            })
         })
-        .ok_or_else(unavailable)
+        .ok_or_else(unavailable)?
     }
 }
 

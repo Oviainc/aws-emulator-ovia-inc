@@ -182,13 +182,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds every distribution of the account and a listing is every record
         // this store has.
 
-        // `pageToken` is the name the previous page stopped before, so a page
-        // is the stored distributions from that name onward in the store's own
-        // total order. Using the name rather than an index means a distribution
-        // deleted between two pages cannot make the walk skip or repeat
-        // another one. The walk itself is the ONE page walk every listing of
-        // this service shares (`crate::state::resource_page`).
-        let page_token = input.page_token.unwrap_or_default();
+        // `pageToken` NAMES the distribution a page starts at — the name the
+        // previous page reported as its `nextPageToken` — so a page is the stored
+        // distributions from that one onward in the store's own total order.
+        // Naming the distribution rather than carrying an index means one deleted
+        // between two pages cannot make the walk skip or repeat another one, and
+        // a token naming no distribution is refused rather than resumed at the
+        // next name after it. An absent — or empty — token asks for the first
+        // page. The walk itself is the ONE page walk every listing of this
+        // service shares (`crate::state::resource_page`).
+        let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             // A named distribution is one record or a refusal: the caller asked
@@ -205,10 +208,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             let (distributions, next_page_token) = crate::state::resource_page(
-                crate::state::records_from(&store.distributions, &page_token),
+                crate::state::records_from(&store.distributions, page_token.as_deref()),
+                page_token.as_deref(),
                 crate::state::DISTRIBUTION_PAGE_SIZE,
                 |_, distribution| distribution.view(),
-            );
+            )
+            .ok_or_else(|| {
+                invalid(crate::state::invalid_page_token_message(
+                    page_token.as_deref().unwrap_or_default(),
+                    "a distribution",
+                ))
+            })?;
             Ok(GetDistributionsOutput {
                 // An account with no distributions reports an empty list, not
                 // an absent one: the caller asked what it has, and the answer

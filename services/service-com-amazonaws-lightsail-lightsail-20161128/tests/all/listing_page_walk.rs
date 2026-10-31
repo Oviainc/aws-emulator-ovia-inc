@@ -12,12 +12,14 @@
 //! Region a request is made in.
 //!
 //! The rule under test, the one every row implements: a page of a listing is the
-//! records that listing reports from the one `pageToken` names onward in the
+//! records that listing reports from the one `pageToken` NAMES onward in the
 //! store's own total order by name, at most the page size of them, and
 //! `nextPageToken` names the FIRST record after the page — absent once none
-//! remain. The walk over a listing's pages is the shared checked one every
-//! listing suite in this target uses (`paging.rs::walk_pages`), wherever it can
-//! read the records a listing reports.
+//! remain. A token is only ever answered by the record it names, so one naming no
+//! record the listing reports is refused with the modelled
+//! `InvalidInputException`. The walk over a listing's pages is the shared checked
+//! one every listing suite in this target uses (`paging.rs::walk_pages`), wherever
+//! it can read the records a listing reports.
 //!
 //! The rows span the listings that rule holds for: a listing of records keyed by
 //! name alone, one of records whose identity includes the Region they were created
@@ -26,7 +28,7 @@
 //! row's store holds one record past a page — the smallest store that makes the
 //! walk issue a token — and each is walked under a TABLE of tokens a caller can
 //! send: none, empty, below every name, on a name, just past a name, on the last
-//! name, and past every name. The expected page of each is computed from the
+//! name, and past every name. What each is answered with is computed from the
 //! records the listing holds rather than written out, so one table serves every
 //! listing whatever its page size and however its records are named.
 //!
@@ -687,21 +689,24 @@ fn name_in(row: &Row, record: &Value, case: &str) -> String {
 }
 
 /// One page of `row`'s listing, in the Region its records belong to, resuming from
-/// `token` when one is given: the names it reported in order, and the token it
-/// named for the page after it.
-async fn page(
+/// `token` when one is given: the HTTP status, the names it reported in order, and
+/// the token it named for the page after it.
+async fn page_result(
     emulator: &Emulator,
     row: &Row,
     case: &str,
     token: Option<&str>,
-) -> (Vec<String>, Option<String>) {
+) -> (u16, Vec<String>, Option<String>, Value) {
     let request = match token {
         Some(token) => json!({"pageToken": token}),
         None => json!({}),
     };
-    let body = emulator
-        .ok_at(None, row.region, row.operation, request)
+    let (status, body) = emulator
+        .call_in(row.region, row.operation, request)
         .await;
+    if status != 200 {
+        return (status, Vec::new(), None, body);
+    }
     let records = body[row.member]
         .as_array()
         .unwrap_or_else(|| {
@@ -715,7 +720,24 @@ async fn page(
         .iter()
         .map(|record| name_in(row, record, case))
         .collect();
-    (names, body["nextPageToken"].as_str().map(str::to_string))
+    let next = body["nextPageToken"].as_str().map(str::to_string);
+    (status, names, next, body)
+}
+
+/// One page of `row`'s listing, requiring success: the names it reported in order,
+/// and the token it named for the page after it.
+async fn page(
+    emulator: &Emulator,
+    row: &Row,
+    case: &str,
+    token: Option<&str>,
+) -> (Vec<String>, Option<String>) {
+    let (status, names, next, body) = page_result(emulator, row, case, token).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected the listing to answer a page, got {status} {body:?}"
+    );
+    (names, next)
 }
 
 /// Every page of `row`'s listing: the names it reported in page order, and the
@@ -759,16 +781,23 @@ async fn walk(emulator: &Emulator, row: &Row, case: &str) -> (Vec<String>, Vec<u
 }
 
 /// The page the rule requires for `token` over the records `held`, in the store's
-/// own order: the records from the first name at or after the token onward, at
-/// most `page_size` of them, and the name of the first record after that page.
-fn expected_page(held: &[String], token: &str, page_size: usize) -> (Vec<String>, Option<String>) {
-    let from: Vec<String> = held
-        .iter()
-        .filter(|name| name.as_str() >= token)
-        .cloned()
-        .collect();
+/// own order: the records from the one it names onward, at most `page_size` of
+/// them, and the name of the first record after that page. `None` where the token
+/// names no record of `held`, which the listing refuses.
+fn expected_page(
+    held: &[String],
+    token: Option<&str>,
+    page_size: usize,
+) -> Option<(Vec<String>, Option<String>)> {
+    let from: Vec<String> = match token.filter(|token| !token.is_empty()) {
+        None => held.to_vec(),
+        Some(token) => {
+            let start = held.iter().position(|name| name.as_str() == token)?;
+            held[start..].to_vec()
+        }
+    };
     let page: Vec<String> = from.iter().take(page_size).cloned().collect();
-    (page, from.get(page_size).cloned())
+    Some((page, from.get(page_size).cloned()))
 }
 
 /// The tokens a caller can send against the records `held`: none at all, the empty
@@ -852,24 +881,44 @@ async fn every_resource_listing_pages_through_the_one_shared_walk() {
         }
 
         // Every token a caller can send lands on the same rule: the page is the
-        // records from that token onward, bounded by the page size, and the next
-        // page starts at the first record after it.
+        // records from the one the token NAMES onward, bounded by the page size,
+        // the next page starts at the first record after it, and a token that
+        // names no record of the listing is refused.
         for (token_case, token) in token_cases(&held) {
             let case = format!("{} with {token_case}", row.operation);
-            let (names, next) = page(&emulator, row, &case, token.as_deref()).await;
-            let (expected, expected_next) = expected_page(
-                &held,
-                token.as_deref().unwrap_or_default(),
-                row.page_size,
-            );
-            assert_eq!(
-                names, expected,
-                "case {case}: expected the records from the token onward, got {names:?}"
-            );
-            assert_eq!(
-                next, expected_next,
-                "case {case}: expected the next page to start at {expected_next:?}, got {next:?}"
-            );
+            match expected_page(&held, token.as_deref(), row.page_size) {
+                Some((expected, expected_next)) => {
+                    let (names, next) = page(&emulator, row, &case, token.as_deref()).await;
+                    assert_eq!(
+                        names, expected,
+                        "case {case}: expected the records from the token onward, got {names:?}"
+                    );
+                    assert_eq!(
+                        next, expected_next,
+                        "case {case}: expected the next page to start at {expected_next:?}, got \
+                         {next:?}"
+                    );
+                }
+                None => {
+                    let (status, _, _, body) =
+                        page_result(&emulator, row, &case, token.as_deref()).await;
+                    assert_eq!(
+                        status, 400,
+                        "case {case}: expected the invalid-input status, got {status} {body:?}"
+                    );
+                    assert_eq!(
+                        error_code(&body),
+                        "InvalidInputException",
+                        "case {case}: expected the modelled InvalidInputException, got {body:?}"
+                    );
+                    assert!(
+                        body["message"].as_str().is_some_and(|message| {
+                            message.contains(token.as_deref().unwrap_or_default())
+                        }),
+                        "case {case}: expected the refusal to name the token sent, got {body:?}"
+                    );
+                }
+            }
         }
 
         // A listing of records whose identity includes a Region reports that

@@ -33,7 +33,7 @@ use service_com_amazonaws_lightsail_lightsail_20161128::state;
 
 // The harness this test target already exposes: a sibling suite drives the
 // service through the same front door rather than standing up a second one.
-use crate::instance_lifecycle::Emulator;
+use crate::instance_lifecycle::{error_code, Emulator};
 
 /// How many disks one page of `GetDisks` carries — the handler's OWN constant, so
 /// the table's rows keep straddling the page boundary whatever it is set to.
@@ -430,11 +430,13 @@ async fn listing_twice_reports_the_same_records() {
 }
 
 /// An empty listing is an empty LIST with no token, never an absent member: the
-/// caller asked what it holds and the answer is "nothing".
+/// caller asked what it holds and the answer is "nothing". A page token, though,
+/// names a disk the account does not hold, so it is refused rather than answered
+/// with an empty page the caller cannot tell from that one.
 #[tokio::test(flavor = "current_thread")]
 async fn an_account_holding_nothing_reports_an_empty_list_and_no_token() {
     let emulator = Emulator::new();
-    for token in [None, Some("anything")] {
+    for token in [None, Some("")] {
         let body = page(&emulator, token).await;
         assert_eq!(
             entries(&body).len(),
@@ -447,6 +449,21 @@ async fn an_account_holding_nothing_reports_an_empty_list_and_no_token() {
              {body:?}"
         );
     }
+
+    let (status, body) = emulator
+        .call("GetDisks", json!({"pageToken": "anything"}))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case an empty account at a token naming no disk: expected the invalid-input status, got \
+         {status} {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidInputException",
+        "case an empty account at a token naming no disk: expected the modelled \
+         InvalidInputException, got {body:?}"
+    );
 }
 
 /// A page token NAMES a record rather than carrying an index, so resuming from

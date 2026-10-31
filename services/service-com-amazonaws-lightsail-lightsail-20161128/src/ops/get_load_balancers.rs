@@ -166,33 +166,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same Region `GetLoadBalancer` addresses one record by name in.
         let region = crate::state::request_region(ctx.parts());
 
-        // `pageToken` is the name the previous page stopped before, so a page is
-        // this Region's stored load balancers from that name onward in the
-        // store's own total order. Using the name rather than an index means a
-        // load balancer deleted between two pages cannot make the walk skip or
-        // repeat another one. The walk itself is the ONE page walk every listing
-        // of this service shares (`crate::state::resource_page`).
-        let page_token = input.page_token.unwrap_or_default();
+        // `pageToken` NAMES the load balancer a page starts at — the name the
+        // previous page reported as its `nextPageToken` — so a page is this
+        // Region's stored load balancers from that one onward in the store's own
+        // total order. Naming the load balancer rather than carrying an index means
+        // one deleted between two pages cannot make the walk skip or repeat another
+        // one, and a token naming no load balancer of this Region is refused rather
+        // than resumed at the next name after it. An absent — or empty — token asks
+        // for the first page. The walk itself is the ONE page walk every listing of
+        // this service shares (`crate::state::resource_page`).
+        let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             let (load_balancers, next_page_token) = crate::state::resource_page(
                 // The store keys load balancers by `(region, name)`, so the walk
                 // takes exactly this Region's load balancers in name order and
                 // leaves the Region behind at the first key of the next one.
-                crate::state::regional_records_from(&store.load_balancers, &region, &page_token),
+                crate::state::regional_records_from(
+                    &store.load_balancers,
+                    &region,
+                    page_token.as_deref(),
+                ),
+                page_token.as_deref(),
                 crate::state::LOAD_BALANCER_PAGE_SIZE,
                 |_, balancer| balancer.view(),
-            );
-            GetLoadBalancersOutput {
+            )
+            .ok_or_else(|| invalid_page_token(page_token.as_deref().unwrap_or_default()))?;
+            Ok(GetLoadBalancersOutput {
                 // A Region with no load balancers reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is
                 // "nothing".
                 load_balancers: Some(load_balancers),
                 next_page_token,
-            }
+            })
         })
-        .ok_or_else(unavailable)
+        .ok_or_else(unavailable)?
     }
+}
+
+/// `pageToken` names no load balancer this listing reports, so there is no page to
+/// answer: the modelled `InvalidInputException`, documented as "user input does
+/// not conform to the validation rules of an input field". The message is built
+/// from the request and says what a page token is.
+fn invalid_page_token(token: &str) -> GetLoadBalancersError {
+    GetLoadBalancersErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(crate::state::invalid_page_token_message(
+            token,
+            "a load balancer",
+        )),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

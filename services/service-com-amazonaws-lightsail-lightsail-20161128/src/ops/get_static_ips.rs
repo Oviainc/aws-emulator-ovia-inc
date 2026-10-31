@@ -168,32 +168,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IP by name alone.
         let _ = ctx;
 
-        // `pageToken` is the name the previous page stopped before, so a page is
-        // the stored static IPs from that name onward in the store's own total
-        // order. Using the name rather than an index means a static IP allocated
-        // or released between two pages cannot make the walk skip or repeat
-        // another one. The walk itself is the ONE page walk every listing of this
-        // service shares (`crate::state::resource_page`).
-        let page_token = input.page_token.unwrap_or_default();
+        // `pageToken` NAMES the static IP a page starts at — the name the previous
+        // page reported as its `nextPageToken` — so a page is the stored static IPs
+        // from that one onward in the store's own total order. Naming the static IP
+        // rather than carrying an index means one allocated or released between two
+        // pages cannot make the walk skip or repeat another one, and a token naming
+        // no static IP is refused rather than resumed at the next name after it. An
+        // absent — or empty — token asks for the first page. The walk itself is the
+        // ONE page walk every listing of this service shares
+        // (`crate::state::resource_page`).
+        let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             let (static_ips, next_page_token) = crate::state::resource_page(
-                crate::state::records_from(&store.static_ips, &page_token),
+                crate::state::records_from(&store.static_ips, page_token.as_deref()),
+                page_token.as_deref(),
                 crate::state::STATIC_IP_PAGE_SIZE,
                 // The SAME view `GetStaticIp` reports: one stored record read by
                 // two operations, never a second rendering of a static IP.
                 |_, static_ip| static_ip.view(),
-            );
-            GetStaticIpsOutput {
+            )
+            .ok_or_else(|| invalid_page_token(page_token.as_deref().unwrap_or_default()))?;
+            Ok(GetStaticIpsOutput {
                 // An account holding no static IP reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is
                 // "nothing".
                 static_ips: Some(static_ips),
                 next_page_token,
-            }
+            })
         })
-        .ok_or_else(unavailable)
+        .ok_or_else(unavailable)?
     }
+}
+
+/// `pageToken` names no static IP this listing reports, so there is no page to
+/// answer: the modelled `InvalidInputException`, documented as "user input does
+/// not conform to the validation rules of an input field". The message is built
+/// from the request and says what a page token is.
+fn invalid_page_token(token: &str) -> GetStaticIpsError {
+    GetStaticIpsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(crate::state::invalid_page_token_message(
+            token,
+            "a static IP",
+        )),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

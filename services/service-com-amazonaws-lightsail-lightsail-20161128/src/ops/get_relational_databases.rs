@@ -172,29 +172,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing here reads the request's credential scope.
         let _ = ctx;
 
-        // `pageToken` is the name the previous page stopped before, so a page is the
-        // stored databases from that name onward in the store's own total order.
-        // Using the name rather than an index means a database deleted between two
-        // pages cannot make the walk skip or repeat another one. The walk itself is
-        // the ONE page walk every listing of this service shares
+        // `pageToken` NAMES the database a page starts at — the name the previous
+        // page reported as its `nextPageToken` — so a page is the stored databases
+        // from that one onward in the store's own total order. Naming the database
+        // rather than carrying an index means a database deleted between two pages
+        // cannot make the walk skip or repeat another one, and a token naming no
+        // database is refused rather than resumed at the next name after it. An
+        // absent — or empty — token asks for the first page. The walk itself is the
+        // ONE page walk every listing of this service shares
         // (`crate::state::resource_page`).
-        let page_token = input.page_token.unwrap_or_default();
+        let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             let (databases, next_page_token) = crate::state::resource_page(
-                crate::state::records_from(&store.relational_databases, &page_token),
+                crate::state::records_from(&store.relational_databases, page_token.as_deref()),
+                page_token.as_deref(),
                 crate::state::RELATIONAL_DATABASE_PAGE_SIZE,
                 |_, database| database.view(),
-            );
-            GetRelationalDatabasesOutput {
+            )
+            .ok_or_else(|| invalid_page_token(page_token.as_deref().unwrap_or_default()))?;
+            Ok(GetRelationalDatabasesOutput {
                 // An account with no databases reports an empty list, not an absent
                 // one: the caller asked what it has, and the answer is "nothing".
                 relational_databases: Some(databases),
                 next_page_token,
-            }
+            })
         })
-        .ok_or_else(unavailable)
+        .ok_or_else(unavailable)?
     }
+}
+
+/// `pageToken` names no database this listing reports, so there is no page to
+/// answer: the modelled `InvalidInputException`, documented as "user input does
+/// not conform to the validation rules of an input field". The message is built
+/// from the request and says what a page token is.
+fn invalid_page_token(token: &str) -> GetRelationalDatabasesError {
+    GetRelationalDatabasesErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(crate::state::invalid_page_token_message(
+            token,
+            "a relational database",
+        )),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

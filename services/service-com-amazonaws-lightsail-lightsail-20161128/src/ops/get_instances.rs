@@ -162,32 +162,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        // `pageToken` is the name the previous page stopped before, so a page is
-        // the stored instances from that name onward in the store's own total
-        // order. Using the name rather than an index means an instance deleted
-        // between two pages cannot make the walk skip or repeat another one. The
-        // walk itself is the ONE page walk every listing of this service shares
+        // `pageToken` NAMES the instance a page starts at — the name the
+        // previous page reported as its `nextPageToken` — so a page is the stored
+        // instances from that one onward in the store's own total order. Naming
+        // the instance rather than carrying an index means an instance deleted
+        // between two pages cannot make the walk skip or repeat another one, and a
+        // token naming no instance is refused rather than resumed at the next name
+        // after it. An absent — or empty — token asks for the first page. The walk
+        // itself is the ONE page walk every listing of this service shares
         // (`crate::state::resource_page`).
-        let page_token = input.page_token.unwrap_or_default();
+        let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             let (instances, next_page_token) = crate::state::resource_page(
-                crate::state::records_from(&store.instances, &page_token),
+                crate::state::records_from(&store.instances, page_token.as_deref()),
+                page_token.as_deref(),
                 crate::state::INSTANCE_PAGE_SIZE,
                 // The SAME view `GetInstance` reports: one stored record read by
                 // two operations, never a second rendering of an instance.
                 |_, instance| store.instance_view_of(instance),
-            );
-            GetInstancesOutput {
+            )
+            .ok_or_else(|| {
+                invalid_page_token(page_token.as_deref().unwrap_or_default())
+            })?;
+            Ok(GetInstancesOutput {
                 // An account with no instances reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is
                 // "nothing".
                 instances: Some(instances),
                 next_page_token,
-            }
+            })
         })
-        .ok_or_else(unavailable)
+        .ok_or_else(unavailable)?
     }
+}
+
+/// `pageToken` names no instance this listing reports, so there is no page to
+/// answer: the modelled `InvalidInputException`, documented as "user input does
+/// not conform to the validation rules of an input field". The message is built
+/// from the request and says what a page token is.
+fn invalid_page_token(token: &str) -> GetInstancesError {
+    GetInstancesErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(crate::state::invalid_page_token_message(token, "an instance")),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

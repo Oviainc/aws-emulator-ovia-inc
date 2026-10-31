@@ -182,38 +182,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let alarm_name = input.alarm_name;
         let monitored_resource_name = input.monitored_resource_name;
 
-        // `pageToken` is the name the previous page stopped before, so a page is
-        // the matching alarms from that name onward in the store's own total
-        // order. Using the name rather than an index means an alarm deleted
-        // between two pages cannot make the walk skip or repeat another one. The
-        // walk itself is the ONE page walk every listing of this service shares
-        // (`crate::state::resource_page`), and the filters narrow WHICH records
-        // it walks, so a page is a full page of matching alarms.
-        let page_token = input.page_token.unwrap_or_default();
+        // `pageToken` NAMES the alarm a page starts at — the name the previous page
+        // reported as its `nextPageToken` — so a page is the matching alarms from
+        // that one onward in the store's own total order. Naming the alarm rather
+        // than carrying an index means an alarm deleted between two pages cannot
+        // make the walk skip or repeat another one, and a token naming no alarm
+        // this request reports is refused rather than resumed at the next name
+        // after it. An absent — or empty — token asks for the first page. The walk
+        // itself is the ONE page walk every listing of this service shares
+        // (`crate::state::resource_page`), and the filters narrow WHICH records it
+        // walks, so a page is a full page of matching alarms.
+        let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             let (alarms, next_page_token) = crate::state::resource_page(
-                crate::state::records_from(&store.alarms, &page_token).filter(|(name, alarm)| {
-                    alarm_name
-                        .as_ref()
-                        .is_none_or(|wanted| wanted.as_str() == *name)
-                        && monitored_resource_name
+                crate::state::records_from(&store.alarms, page_token.as_deref()).filter(
+                    |(name, alarm)| {
+                        alarm_name
                             .as_ref()
-                            .is_none_or(|wanted| wanted == &alarm.monitored_resource.name)
-                }),
+                            .is_none_or(|wanted| wanted.as_str() == *name)
+                            && monitored_resource_name
+                                .as_ref()
+                                .is_none_or(|wanted| wanted == &alarm.monitored_resource.name)
+                    },
+                ),
+                page_token.as_deref(),
                 crate::state::ALARM_PAGE_SIZE,
                 |_, alarm| alarm.view(),
-            );
-            GetAlarmsOutput {
+            )
+            .ok_or_else(|| invalid_page_token(page_token.as_deref().unwrap_or_default()))?;
+            Ok(GetAlarmsOutput {
                 // An account with no matching alarm reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is
                 // "nothing".
                 alarms: Some(alarms),
                 next_page_token,
-            }
+            })
         })
-        .ok_or_else(unavailable)
+        .ok_or_else(unavailable)?
     }
+}
+
+/// `pageToken` names no alarm this listing reports, so there is no page to answer:
+/// the modelled `InvalidInputException`, documented as "user input does not
+/// conform to the validation rules of an input field". The message is built from
+/// the request and says what a page token is.
+fn invalid_page_token(token: &str) -> GetAlarmsError {
+    GetAlarmsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(crate::state::invalid_page_token_message(token, "an alarm")),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

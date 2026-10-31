@@ -36,7 +36,7 @@ use service_com_amazonaws_lightsail_lightsail_20161128::state;
 // The harness and the checked page walk this test target already exposes: a
 // suite drives the service through the same front door, and asserts what the
 // listing reports rather than carrying its own copy of the paging contract.
-use crate::instance_lifecycle::{is_modelled_ipv4, Emulator};
+use crate::instance_lifecycle::{error_code, is_modelled_ipv4, Emulator};
 use crate::paging::{expected_page_sizes, names, walk_pages};
 
 /// How many static IPs one page of `GetStaticIps` carries — the handler's OWN
@@ -328,11 +328,13 @@ async fn listing_again_and_from_another_region_reports_the_same_records() {
 }
 
 /// An empty listing is an empty LIST with no token, never an absent member: the
-/// caller asked what it holds and the answer is "nothing".
+/// caller asked what it holds and the answer is "nothing". A page token names a
+/// static IP the account does not hold, though, so a request carrying one is
+/// refused instead.
 #[tokio::test(flavor = "current_thread")]
 async fn an_account_holding_nothing_reports_an_empty_list_and_no_token() {
     let emulator = Emulator::new();
-    for token in [None, Some("anything")] {
+    for token in [None, Some("")] {
         let body = page(&emulator, None, token).await;
         assert_eq!(
             entries(&body).len(),
@@ -345,6 +347,21 @@ async fn an_account_holding_nothing_reports_an_empty_list_and_no_token() {
              {body:?}"
         );
     }
+
+    let (status, body) = emulator
+        .call("GetStaticIps", json!({"pageToken": "anything"}))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case an empty account at a token naming no static IP: expected the invalid-input \
+         status, got {status} {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidInputException",
+        "case an empty account at a token naming no static IP: expected the modelled \
+         InvalidInputException, got {body:?}"
+    );
 }
 
 /// A page token NAMES a record rather than carrying an index, so resuming from

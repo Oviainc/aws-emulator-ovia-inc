@@ -241,6 +241,8 @@ mod key_pair_listing;
 mod key_pair_read;
 #[path = "all/known_host_keys_delete.rs"]
 mod known_host_keys_delete;
+#[path = "all/listing_page_token_scope.rs"]
+mod listing_page_token_scope;
 #[path = "all/listing_page_walk.rs"]
 mod listing_page_walk;
 #[path = "all/load_balancer_attribute_update.rs"]

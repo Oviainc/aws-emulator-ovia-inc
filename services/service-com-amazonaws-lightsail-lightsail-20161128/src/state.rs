@@ -1129,19 +1129,20 @@ fn catalog_page<T: Clone>(
 /// map's own total order — where a page of a stored-resource listing starts.
 ///
 /// A page token NAMES a record rather than carrying an index, so a record created
-/// or deleted between two pages cannot make the walk skip or repeat another one,
-/// and a token that names no record resumes at the first record after it. An empty
-/// token asks for the first page, because every name sorts at or after it.
+/// or deleted between two pages cannot make the walk skip or repeat another one.
+/// No token asks for the first page; whether the token names a record of the walk
+/// is [`resource_page`]'s to answer, which is why this starts the walk at the first
+/// name at or after it either way.
 ///
 /// TOTAL on every input, including an arbitrary caller-supplied token: the token is
 /// only ever COMPARED against the keys, so there is no indexing, no slicing, no
 /// unwrap and no arithmetic that can overflow or panic.
 pub fn records_from<'a, R>(
     records: &'a BTreeMap<String, R>,
-    page_token: &str,
+    page_token: Option<&str>,
 ) -> impl Iterator<Item = (&'a str, &'a R)> {
     records
-        .range(page_token.to_string()..)
+        .range(page_token.unwrap_or_default().to_string()..)
         .map(|(name, record)| (name.as_str(), record))
 }
 
@@ -1155,10 +1156,10 @@ pub fn records_from<'a, R>(
 pub fn regional_records_from<'a, R>(
     records: &'a BTreeMap<(String, String), R>,
     region: &'a str,
-    page_token: &str,
+    page_token: Option<&str>,
 ) -> impl Iterator<Item = (&'a str, &'a R)> {
     records
-        .range((region.to_string(), page_token.to_string())..)
+        .range((region.to_string(), page_token.unwrap_or_default().to_string())..)
         .take_while(move |((record_region, _), _)| record_region.as_str() == region)
         .map(|((_, name), record)| (name.as_str(), record))
 }
@@ -1167,32 +1168,64 @@ pub fn regional_records_from<'a, R>(
 /// `view_of` reports it, plus the name of the first record AFTER them — named only
 /// while records remain.
 ///
+/// `None` is the answer when `page_token` names no record this listing reports:
+/// there is no page to report, which the caller turns into a refusal. A token is
+/// only ever answered by the record it NAMES — the first record of the page it
+/// opens — so a token the listing never handed out is refused rather than resumed
+/// at the next record after it, which would answer a well-formed page with every
+/// earlier record silently missing. An absent token asks for the first page.
+///
 /// Shared by every stored-resource listing this service pages, so each one walks
 /// its records exactly the same way; [`catalog_page`] is the same walk over this
 /// service's static catalogs. The start of the page comes from [`records_from`] or
 /// [`regional_records_from`], and a listing whose request NARROWS which records it
 /// reports puts that filter on the iterator ([`Iterator::filter`]): the page size
-/// then counts the records reported, and the next page starts at the first record
-/// after them that this listing reports too.
+/// then counts the records reported, the next page starts at the first record
+/// after them that this listing reports too, and a token naming a record this
+/// listing does not report names no page of it.
 ///
-/// TOTAL on every input: records are only ever taken from the iterator in order and
-/// the page is bounded by `page_size`, so there is no indexing, no slicing, no
-/// unwrap and no arithmetic that can overflow or panic. `page_size` is at least
-/// one, so a walk over a listing that holds records always advances.
+/// TOTAL on every input: the token is only ever COMPARED against the names, records
+/// are only ever taken from the iterator in order and the page is bounded by
+/// `page_size`, so there is no indexing, no slicing, no unwrap and no arithmetic
+/// that can overflow or panic. `page_size` is at least one, so a walk over a
+/// listing that holds records always advances.
 pub fn resource_page<'a, R: 'a, T>(
     records: impl IntoIterator<Item = (&'a str, &'a R)>,
+    page_token: Option<&str>,
     page_size: usize,
     mut view_of: impl FnMut(&'a str, &'a R) -> T,
-) -> (Vec<T>, Option<String>) {
+) -> Option<(Vec<T>, Option<String>)> {
     let page_size = page_size.max(1);
+    let mut records = records.into_iter().peekable();
+    if let Some(token) = page_token.filter(|token| !token.is_empty()) {
+        // The walk starts at the first name at or after the token, so the token
+        // names a record of it exactly when that record IS the token.
+        if records.peek().map(|(name, _)| *name) != Some(token) {
+            return None;
+        }
+    }
     let mut page = Vec::new();
     for (name, record) in records {
         if page.len() == page_size {
-            return (page, Some(name.to_string()));
+            return Some((page, Some(name.to_string())));
         }
         page.push(view_of(name, record));
     }
-    (page, None)
+    Some((page, None))
+}
+
+/// The message a stored-resource listing refuses an unrecognised `page_token`
+/// with, where `reported` names what that listing reports ("an instance").
+///
+/// One wording for all of them: the refusal says which token was sent, that it
+/// names nothing the listing reports, and what a page token is — so a caller that
+/// sent a token of another listing, or one it invented, is told what to send
+/// instead.
+pub fn invalid_page_token_message(token: &str, reported: &str) -> String {
+    format!(
+        "pageToken {token:?} does not name {reported} this listing reports; a page token is the \
+         name a previous page reported as nextPageToken"
+    )
 }
 
 // ---------------------------------------------------------------------------

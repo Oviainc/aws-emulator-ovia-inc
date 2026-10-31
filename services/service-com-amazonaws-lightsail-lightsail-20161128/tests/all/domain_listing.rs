@@ -13,8 +13,10 @@
 //! resource type, each entry exactly as the single-record read reports it, in the
 //! store's own name order, carried one page at a time, with `nextPageToken`
 //! NAMING the first record of the page after it while records remain and ABSENT
-//! on the last page — and, being a read, it reports the same records however
-//! often it is called, and follows every later create, edit and delete.
+//! on the last page; a `pageToken` is only ever answered by the record it NAMES,
+//! so one naming no stored record is refused with the modelled
+//! `InvalidInputException` — and, being a read, it reports the same records
+//! however often it is called, and follows every later create, edit and delete.
 //!
 //! The rows span what that rule generalises over: how many zones the account
 //! holds (none, one, exactly a page, one past a page, several pages and a
@@ -30,7 +32,7 @@ use service_com_amazonaws_lightsail_lightsail_20161128::state;
 
 // The harness this test target already exposes: a sibling suite drives the
 // service through the same front door rather than standing up a second one.
-use crate::instance_lifecycle::Emulator;
+use crate::instance_lifecycle::{error_code, Emulator};
 
 /// How many recordsets one page of `GetDomains` carries — the handler's OWN
 /// constant, so the table's rows keep straddling the page boundary whatever it
@@ -383,11 +385,12 @@ async fn listing_twice_reports_the_same_records() {
 
 /// RULE: an empty listing is an empty LIST with no token, never an absent member
 /// and never a refusal: the caller asked what it holds and the answer is
-/// "nothing".
+/// "nothing". A page token names a recordset the account does not hold, though,
+/// so a request carrying one is refused instead.
 #[tokio::test(flavor = "current_thread")]
 async fn an_account_holding_nothing_reports_an_empty_list_and_no_token() {
     let emulator = Emulator::new();
-    for token in [None, Some("anything"), Some("")] {
+    for token in [None, Some("")] {
         let body = page(&emulator, token).await;
         assert_eq!(
             entries(&body).len(),
@@ -400,6 +403,21 @@ async fn an_account_holding_nothing_reports_an_empty_list_and_no_token() {
              {body:?}"
         );
     }
+
+    let (status, body) = emulator
+        .call("GetDomains", json!({"pageToken": "anything"}))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case an empty account at a token naming no recordset: expected the invalid-input \
+         status, got {status} {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidInputException",
+        "case an empty account at a token naming no recordset: expected the modelled \
+         InvalidInputException, got {body:?}"
+    );
 }
 
 /// RULE: a page token NAMES a record rather than carrying an index, so resuming
@@ -434,13 +452,14 @@ async fn resuming_from_a_stored_name_reports_that_name_onward() {
     }
 }
 
-/// RULE (the same one, on a NON-empty account): because the token names a
-/// record rather than indexing one, a token that names NO stored record resumes
-/// at the first stored name after it, and one past every stored name reports
-/// nothing. This is what keeps a page whose first record was deleted between
-/// two calls from skipping the records behind it.
+/// RULE (the same one, on a NON-empty account): because the token NAMES a record
+/// rather than indexing one, a token that names no stored record opens no page of
+/// this listing at all — so it is refused with the modelled
+/// `InvalidInputException` instead of resuming at the first stored name after it,
+/// which would answer a well-formed page with every earlier record silently
+/// missing. Only the empty token, which asks for the first page, is answered.
 #[tokio::test(flavor = "current_thread")]
-async fn a_token_naming_no_stored_record_resumes_at_the_next_stored_name() {
+async fn a_token_naming_no_stored_record_is_refused() {
     let emulator = Emulator::new();
     let row = Row {
         case: "an unstored token",
@@ -451,31 +470,47 @@ async fn a_token_naming_no_stored_record_resumes_at_the_next_stored_name() {
 
     // One token per gap in the stored order: `z07.gap.example` is stored, so
     // `z07a.gap.example` names nothing and sits strictly between it and
-    // `z08.gap.example`. The empty token is the one that precedes every name.
-    let mut cases: Vec<(String, usize)> = vec![(String::new(), 0)];
-    for index in 0..all.len() {
-        cases.push((format!("z{index:02}a.{}", row.suffix), index + 1));
-    }
-    // And a token past every stored name: nothing follows it.
-    cases.push((format!("zz.{}", row.suffix), all.len()));
+    // `z08.gap.example`.
+    let mut tokens: Vec<String> = (0..all.len())
+        .map(|index| format!("z{index:02}a.{}", row.suffix))
+        .collect();
+    // A token past every stored name, and one below every stored name.
+    tokens.push(format!("zz.{}", row.suffix));
+    tokens.push(format!("a-nothing.{}", row.suffix));
 
-    for (token, first) in &cases {
-        let body = page(&emulator, Some(token)).await;
-        let reported = names(&body);
-        let expected: Vec<String> = all[*first..].iter().take(PAGE_SIZE).cloned().collect();
+    for token in &tokens {
+        let (status, body) = emulator
+            .call("GetDomains", json!({"pageToken": token}))
+            .await;
         assert_eq!(
-            reported, expected,
-            "case a token naming nothing ({token:?}): expected the stored names from \
-             {first} onward, got {reported:?}"
+            status, 400,
+            "case a token naming nothing ({token:?}): expected the invalid-input status, got \
+             {status} {body:?}"
         );
-        let remaining = all.len() - *first;
         assert_eq!(
-            body["nextPageToken"].as_str(),
-            (remaining > PAGE_SIZE).then(|| all[first + PAGE_SIZE].as_str()),
-            "case a token naming nothing ({token:?}): expected the next token to name the \
-             first record of the page after it, got {body:?}"
+            error_code(&body),
+            "InvalidInputException",
+            "case a token naming nothing ({token:?}): expected the modelled \
+             InvalidInputException, got {body:?}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(token)),
+            "case a token naming nothing ({token:?}): expected the refusal to name the token \
+             sent, got {body:?}"
         );
     }
+
+    // The refusals left the listing itself untouched: the empty token still
+    // reports the first page.
+    let body = page(&emulator, Some("")).await;
+    let reported = names(&body);
+    let expected: Vec<String> = all.iter().take(PAGE_SIZE).cloned().collect();
+    assert_eq!(
+        reported, expected,
+        "case the empty token after the refusals: expected the first page, got {reported:?}"
+    );
 }
 
 /// RULE: the listing answers from the store, so every later create, recordset

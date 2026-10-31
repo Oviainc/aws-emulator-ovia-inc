@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_lightsail_lightsail_20161128::state;
 
-use crate::instance_lifecycle::Emulator;
+use crate::instance_lifecycle::{error_code, Emulator};
 use crate::paging::expected_page_sizes;
 use crate::snapshot_copy::{wait_for_snapshot_state, Kind as SnapshotKind};
 
@@ -490,13 +490,15 @@ async fn every_kind_of_resource_the_account_holds_contributes_its_name() {
     );
 }
 
-/// RULE: an account holding no resource reports an empty LIST and no token —
-/// whatever page token the request carries, because a token names a name the
-/// account does not hold.
+/// RULE: an account holding no resource reports an empty LIST and no token for
+/// the request that asks for the first page — one carrying no token at all, or an
+/// empty one — while a token names a name the account does not hold, so it is
+/// refused rather than answered with a page the caller cannot tell from a full
+/// one.
 #[tokio::test]
 async fn an_account_holding_nothing_reports_an_empty_list_and_no_token() {
     let emulator = Emulator::new();
-    for token in [None, Some("anything"), Some("zzz-past-the-end")] {
+    for token in [None, Some("")] {
         let case = format!("an empty account at {token:?}");
         let body = page(&emulator, REGION, token).await;
         assert_eq!(
@@ -507,6 +509,22 @@ async fn an_account_holding_nothing_reports_an_empty_list_and_no_token() {
         assert!(
             body["nextPageToken"].is_null(),
             "case {case}: a last page carries no nextPageToken, got {body:?}"
+        );
+    }
+
+    for token in ["anything", "zzz-past-the-end"] {
+        let case = format!("an empty account at the token {token:?}");
+        let (status, body) = emulator
+            .call_in(Some(REGION), "GetActiveNames", json!({"pageToken": token}))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected the invalid-input status, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidInputException",
+            "case {case}: expected the modelled InvalidInputException, got {body:?}"
         );
     }
 }

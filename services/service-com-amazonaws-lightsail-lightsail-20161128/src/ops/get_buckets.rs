@@ -194,13 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let include_connected_resources = input.include_connected_resources.unwrap_or(false);
 
-        // `pageToken` is the name the previous page stopped before, so a page is
-        // this region's stored buckets from that name onward in the store's own
-        // total order. Using the name rather than an index means a bucket deleted
-        // between two pages cannot make the walk skip or repeat another one. The
-        // walk itself is the ONE page walk every listing of this service shares
+        // `pageToken` NAMES the bucket a page starts at — the name the previous
+        // page reported as its `nextPageToken` — so a page is this Region's stored
+        // buckets from that one onward in the store's own total order. Naming the
+        // bucket rather than carrying an index means a bucket deleted between two
+        // pages cannot make the walk skip or repeat another one, and a token naming
+        // no bucket of this Region is refused rather than resumed at the next name
+        // after it. An absent — or empty — token asks for the first page. The walk
+        // itself is the ONE page walk every listing of this service shares
         // (`crate::state::resource_page`).
-        let page_token = input.page_token.unwrap_or_default();
+        let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             // A named bucket is one record or a refusal: the caller asked about a
@@ -224,7 +227,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The store keys buckets by `(region, name)`, so the walk takes
                 // exactly this region's buckets in name order and leaves the
                 // region behind at the first key of the next one.
-                crate::state::regional_records_from(&store.buckets, &region, &page_token),
+                crate::state::regional_records_from(&store.buckets, &region, page_token.as_deref()),
+                page_token.as_deref(),
                 crate::state::BUCKET_PAGE_SIZE,
                 |_, bucket| {
                     bucket.view(
@@ -233,7 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         include_cors,
                     )
                 },
-            );
+            )
+            .ok_or_else(|| {
+                invalid(crate::state::invalid_page_token_message(
+                    page_token.as_deref().unwrap_or_default(),
+                    "a bucket",
+                ))
+            })?;
             Ok(GetBucketsOutput {
                 // A region with no buckets reports an empty list, not an absent
                 // one: the caller asked what it has, and the answer is

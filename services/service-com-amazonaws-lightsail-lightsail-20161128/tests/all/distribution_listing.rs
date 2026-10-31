@@ -10,10 +10,13 @@
 //! harness is the one `instance_lifecycle.rs` already has.
 //!
 //! The rule under test: a paged listing reports the stored records from the
-//! caller's `pageToken` onward in the store's own total order by name, no more
-//! than a page of them at a time, naming the record the next page starts at and
-//! naming none when the page is the last — and, being a REPORTING operation, it
-//! changes nothing a later caller sees.
+//! record the caller's `pageToken` NAMES onward in the store's own total order by
+//! name, no more than a page of them at a time, naming the record the next page
+//! starts at and naming none when the page is the last; a token that names no
+//! stored record opens no page, so it is refused with the modelled
+//! `InvalidInputException` rather than answered with a page every earlier record
+//! is silently missing from — and, being a REPORTING operation, it changes
+//! nothing a later caller sees.
 //!
 //! `distribution_cdn.rs` walks the pages a listing issues tokens for and pins
 //! what one record carries. This suite takes the other half of the same rule: a
@@ -28,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::instance_lifecycle::Emulator;
+use crate::instance_lifecycle::{error_code, Emulator};
 use crate::paging::names;
 
 /// How many distributions one `GetDistributions` page carries
@@ -99,14 +102,23 @@ async fn page(emulator: &Emulator, case: &str, token: Option<&str>) -> (Vec<Valu
     (records, next)
 }
 
-/// One token a caller can send, and the stored names the order puts from there
-/// on.
+/// What a token must be answered with.
+#[derive(Debug, Clone, Copy)]
+enum Expected {
+    /// The stored names the order puts from the record the token names onward.
+    Page(&'static [&'static str]),
+    /// The modelled 400 `InvalidInputException`: the token names no stored
+    /// record, so there is no page to open at it.
+    Refused,
+}
+
+/// One token a caller can send, and what the rule requires for it.
 #[derive(Debug, Clone, Copy)]
 struct TokenCase {
     case: &'static str,
     /// `None` is a request that carries no `pageToken` at all.
     token: Option<&'static str>,
-    expected: &'static [&'static str],
+    expected: Expected,
 }
 
 /// The stored names this suite's token table runs against, fewer than
@@ -125,43 +137,44 @@ const TOKEN_CASES: &[TokenCase] = &[
     TokenCase {
         case: "no token at all",
         token: None,
-        expected: SORTED,
+        expected: Expected::Page(SORTED),
     },
     TokenCase {
         case: "an empty token",
         token: Some(""),
-        expected: SORTED,
+        expected: Expected::Page(SORTED),
     },
     TokenCase {
         case: "a token below every stored name",
         token: Some("cdn-a"),
-        expected: SORTED,
+        expected: Expected::Refused,
     },
     TokenCase {
         case: "a token that is a stored name",
         token: Some("cdn-f"),
-        expected: &["cdn-f", "cdn-h", "cdn-j"],
+        expected: Expected::Page(&["cdn-f", "cdn-h", "cdn-j"]),
     },
     TokenCase {
         case: "a token between two stored names",
         token: Some("cdn-e"),
-        expected: &["cdn-f", "cdn-h", "cdn-j"],
+        expected: Expected::Refused,
     },
     TokenCase {
         case: "a token that is the last stored name",
         token: Some("cdn-j"),
-        expected: &["cdn-j"],
+        expected: Expected::Page(&["cdn-j"]),
     },
     TokenCase {
         case: "a token past every stored name",
         token: Some("cdn-z"),
-        expected: &[],
+        expected: Expected::Refused,
     },
 ];
 
-/// Every row: the page is the stored distributions from the token onward, and —
-/// because the whole store fits in one page from any of these positions — no
-/// next token is named.
+/// Every row: a token that NAMES a stored record opens the page of the records
+/// from it onward — and because the whole store fits in one page from any of
+/// those positions, no next token is named — while a token that names none is
+/// refused.
 #[tokio::test(flavor = "current_thread")]
 async fn a_page_token_names_the_position_a_listing_resumes_at() {
     let emulator = Emulator::new();
@@ -171,18 +184,47 @@ async fn a_page_token_names_the_position_a_listing_resumes_at() {
     }
 
     for row in TOKEN_CASES {
-        let (records, next) = page(&emulator, row.case, row.token).await;
-        let reported = names(&records);
-        assert_eq!(
-            reported, row.expected,
-            "case {}: expected {:?} from the token onward, got {reported:?}",
-            row.case, row.expected
-        );
-        assert_eq!(
-            next, None,
-            "case {}: a page holding every remaining record names no next token, got {next:?}",
-            row.case
-        );
+        match row.expected {
+            Expected::Page(expected) => {
+                let (records, next) = page(&emulator, row.case, row.token).await;
+                let reported = names(&records);
+                assert_eq!(
+                    reported, expected,
+                    "case {}: expected {expected:?} from the token onward, got {reported:?}",
+                    row.case
+                );
+                assert_eq!(
+                    next, None,
+                    "case {}: a page holding every remaining record names no next token, got \
+                     {next:?}",
+                    row.case
+                );
+            }
+            Expected::Refused => {
+                let token = row.token.unwrap_or_default();
+                let (status, body) = emulator
+                    .call("GetDistributions", json!({"pageToken": token}))
+                    .await;
+                assert_eq!(
+                    status, 400,
+                    "case {}: expected the invalid-input status, got {status} {body:?}",
+                    row.case
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "InvalidInputException",
+                    "case {}: expected the modelled InvalidInputException, got {body:?}",
+                    row.case
+                );
+                assert!(
+                    body["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(token)),
+                    "case {}: expected the refusal to name the token sent, got {body:?}",
+                    row.case
+                );
+            }
+        }
     }
 }
 
@@ -233,14 +275,15 @@ async fn a_caller_chosen_token_is_bounded_by_the_page_size() {
     );
 }
 
-/// A store that holds no distribution at all answers an empty list — for a
-/// request with a token as much as for one without — rather than an absent
-/// member or a refusal.
+/// A store that holds no distribution at all answers an empty list — for the
+/// request that asks for the first page, with no token or an empty one — rather
+/// than an absent member or a refusal; a token names a record the store does not
+/// hold, so that request is refused instead.
 #[tokio::test(flavor = "current_thread")]
 async fn an_empty_store_reports_an_empty_listing() {
     let emulator = Emulator::new();
 
-    for token in [None, Some(""), Some("cdn-anything")] {
+    for token in [None, Some("")] {
         let case = format!("an empty store with token {token:?}");
         let (records, next) = page(&emulator, &case, token).await;
         assert!(
@@ -252,6 +295,21 @@ async fn an_empty_store_reports_an_empty_listing() {
             "case {case}: expected no next token, got {next:?}"
         );
     }
+
+    let (status, body) = emulator
+        .call("GetDistributions", json!({"pageToken": "cdn-anything"}))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case an empty store with a token naming no distribution: expected the invalid-input \
+         status, got {status} {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidInputException",
+        "case an empty store with a token naming no distribution: expected the modelled \
+         InvalidInputException, got {body:?}"
+    );
 }
 
 /// Poll the listing until `name` reports `STATUS_DEPLOYED`: the one transition
@@ -298,9 +356,14 @@ async fn reading_the_listing_changes_nothing_a_later_caller_sees() {
 
     // Read it every way this operation can be read, repeatedly.
     for round in 0..3 {
-        for token in [None, Some(""), Some("cdn-d"), Some("cdn-z")] {
+        for token in [None, Some(""), Some("cdn-d")] {
             page(&emulator, &format!("round {round} token {token:?}"), token).await;
         }
+        // A token naming no stored record is refused — and a refusal changes
+        // nothing a later caller sees either.
+        emulator
+            .call("GetDistributions", json!({"pageToken": "cdn-z"}))
+            .await;
         for name in SORTED.iter().take(3) {
             let body = emulator
                 .ok("GetDistributions", json!({"distributionName": name}))

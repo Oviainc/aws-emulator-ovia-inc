@@ -170,33 +170,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region to.
         let region = crate::state::request_region(ctx.parts());
 
-        // `pageToken` is the name the previous page stopped before, so a page is
-        // the account's names from that name onward in the store's own total
-        // order. Using the name rather than an index means a resource created or
-        // deleted between two pages cannot make the walk skip or repeat another
-        // name. The walk itself is the ONE page walk every listing of this
+        // `pageToken` NAMES the name a page starts at — the one the previous page
+        // reported as its `nextPageToken` — so a page is the account's names from
+        // that one onward in the store's own total order. Naming the entry rather
+        // than carrying an index means a resource created or deleted between two
+        // pages cannot make the walk skip or repeat another name, and a token
+        // naming nothing the account holds is refused rather than resumed at the
+        // next name after it. An absent — or empty — token asks for the first
+        // page. The walk itself is the ONE page walk every listing of this
         // service shares (`crate::state::resource_page`).
-        let page_token = input.page_token.unwrap_or_default();
+        let page_token = input.page_token.filter(|token| !token.is_empty());
 
         crate::state::with_state(&*self.engine, |store| {
             let held = store.active_names(&region);
             // A held name IS the record here — this listing reports names rather
             // than resource records — so the set lends each name as both.
             let (active_names, next_page_token) = crate::state::resource_page(
-                held.range(page_token..).map(|name| (name.as_str(), name)),
+                held.range(page_token.clone().unwrap_or_default()..)
+                    .map(|name| (name.as_str(), name)),
+                page_token.as_deref(),
                 crate::state::ACTIVE_NAME_PAGE_SIZE,
                 |_, name| name.clone(),
-            );
-            GetActiveNamesOutput {
+            )
+            .ok_or_else(|| invalid_page_token(page_token.as_deref().unwrap_or_default()))?;
+            Ok(GetActiveNamesOutput {
                 // An account holding no resource reports an empty list, not an
                 // absent one: the caller asked which names are taken, and the
                 // answer is "none".
                 active_names: Some(active_names),
                 next_page_token,
-            }
+            })
         })
-        .ok_or_else(unavailable)
+        .ok_or_else(unavailable)?
     }
+}
+
+/// `pageToken` names nothing this listing reports, so there is no page to answer:
+/// the modelled `InvalidInputException`, documented as "user input does not
+/// conform to the validation rules of an input field". The message is built from
+/// the request and says what a page token is.
+fn invalid_page_token(token: &str) -> GetActiveNamesError {
+    GetActiveNamesErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(crate::state::invalid_page_token_message(
+            token,
+            "a name this account holds",
+        )),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

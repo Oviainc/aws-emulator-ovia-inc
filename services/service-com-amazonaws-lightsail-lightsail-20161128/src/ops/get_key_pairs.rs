@@ -172,13 +172,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `GetKeyPair` addresses one key pair by name alone.
         let _ = ctx;
 
-        // `pageToken` is the name the previous page stopped before, so a page is
-        // the reported key pairs from that name onward in the store's own total
-        // order. Using the name rather than an index means a key pair created or
-        // deleted between two pages cannot make the walk skip or repeat another
-        // one. The walk itself is the ONE page walk every listing of this service
+        // `pageToken` NAMES the key pair a page starts at — the name the previous
+        // page reported as its `nextPageToken` — so a page is the reported key
+        // pairs from that one onward in the store's own total order. Naming the key
+        // pair rather than carrying an index means one created or deleted between
+        // two pages cannot make the walk skip or repeat another one, and a token
+        // naming no key pair this request reports is refused rather than resumed at
+        // the next name after it. An absent — or empty — token asks for the first
+        // page. The walk itself is the ONE page walk every listing of this service
         // shares (`crate::state::resource_page`).
-        let page_token = input.page_token.unwrap_or_default();
+        let page_token = input.page_token.filter(|token| !token.is_empty());
         // "whether to include the default key pair in the response of your
         // request": the account's default pair is reported only when the request
         // asks for it, so a request that does not ask reports the key pairs the
@@ -190,23 +193,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The switch selects which records the listing REPORTS, so it
                 // narrows the walk rather than the page: a page the default pair
                 // is excluded from still carries a full page of the others.
-                crate::state::records_from(&store.key_pairs, &page_token)
+                crate::state::records_from(&store.key_pairs, page_token.as_deref())
                     .filter(|(_, key_pair)| include_default || !key_pair.is_default()),
+                page_token.as_deref(),
                 crate::state::KEY_PAIR_PAGE_SIZE,
                 // The SAME view `GetKeyPair` reports: one stored record read by
                 // two operations, never a second rendering of a key pair.
                 |_, key_pair| key_pair.view(),
-            );
-            GetKeyPairsOutput {
+            )
+            .ok_or_else(|| invalid_page_token(page_token.as_deref().unwrap_or_default()))?;
+            Ok(GetKeyPairsOutput {
                 // An account holding no key pair reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is
                 // "nothing".
                 key_pairs: Some(key_pairs),
                 next_page_token,
-            }
+            })
         })
-        .ok_or_else(unavailable)
+        .ok_or_else(unavailable)?
     }
+}
+
+/// `pageToken` names no key pair this listing reports, so there is no page to
+/// answer: the modelled `InvalidInputException`, documented as "user input does
+/// not conform to the validation rules of an input field". The message is built
+/// from the request and says what a page token is.
+fn invalid_page_token(token: &str) -> GetKeyPairsError {
+    GetKeyPairsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(crate::state::invalid_page_token_message(token, "a key pair")),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The store is unreachable — the engine is not the shared in-memory one. A

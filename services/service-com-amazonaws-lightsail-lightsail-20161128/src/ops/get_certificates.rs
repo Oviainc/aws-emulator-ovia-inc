@@ -192,13 +192,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // current status".
         let statuses = input.certificate_statuses;
         let include_details = input.include_certificate_details;
-        // `pageToken` is the name the previous page stopped before, so a page is
-        // this account's certificates from that name onward in the store's own
-        // total order. Using the name rather than an index means a certificate
+        // `pageToken` NAMES the certificate a page starts at — the name the
+        // previous page reported as its `nextPageToken` — so a page is this
+        // account's certificates from that one onward in the store's own total
+        // order. Naming the certificate rather than carrying an index means one
         // deleted between two pages cannot make the walk skip or repeat another
-        // one. The walk itself is the ONE page walk every listing of this service
-        // shares (`crate::state::resource_page`).
-        let page_token = input.page_token.unwrap_or_default();
+        // one, and a token naming no certificate this request reports is refused
+        // rather than resumed at the next name after it. An absent — or empty —
+        // token asks for the first page. The walk itself is the ONE page walk
+        // every listing of this service shares (`crate::state::resource_page`).
+        let page_token = input.page_token.filter(|token| !token.is_empty());
         let matches_status = |status: Option<&str>| match &statuses {
             None => true,
             Some(wanted) => status.is_some_and(|status| {
@@ -239,8 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The status filter selects which records the listing REPORTS, so
                 // it narrows the walk rather than the page: a page is a full page
                 // of certificates in a wanted status.
-                crate::state::records_from(&store.certificates, &page_token)
+                crate::state::records_from(&store.certificates, page_token.as_deref())
                     .filter(|(_, certificate)| matches_status(Some(certificate.status))),
+                page_token.as_deref(),
                 crate::state::CERTIFICATE_PAGE_SIZE,
                 // The page renders each record through the store's ONE
                 // certificate renderer, the same one the named read above
@@ -249,7 +253,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 |name, certificate| {
                     store.certificate_record_view(name, certificate, include_details)
                 },
-            );
+            )
+            .ok_or_else(|| {
+                invalid(crate::state::invalid_page_token_message(
+                    page_token.as_deref().unwrap_or_default(),
+                    "a certificate",
+                ))
+            })?;
             Ok(GetCertificatesOutput {
                 // An account with no certificates reports an empty list, not an
                 // absent one: the caller asked what it has, and the answer is
