@@ -261,7 +261,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::member_recommendations_of`],
         // which hands back that set ONCE per member recommendation, so a member
         // named twice contributes its resources once: one resource is one entry
-        // of this list.
+        // of this list — and only for a member the store really holds a
+        // recommendation for, since an ARN naming no stored recommendation
+        // names no resources of this organization either.
         let mut matching: Vec<(String, OrganizationRecommendationResourceSummary)> = state
             .member_recommendations_of(identifier)
             .into_iter()

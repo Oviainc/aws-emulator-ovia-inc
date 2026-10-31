@@ -25,6 +25,8 @@ mod cost_optimizing_aggregates;
 mod cursor_scope_encoding;
 #[path = "all/localized_text.rs"]
 mod localized_text;
+#[path = "all/organization_member_not_stored.rs"]
+mod organization_member_not_stored;
 #[path = "all/organization_member_set.rs"]
 mod organization_member_set;
 #[path = "all/organization_prioritized_only.rs"]

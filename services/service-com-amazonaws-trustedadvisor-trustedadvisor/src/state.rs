@@ -887,10 +887,14 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
     ///
     /// An ARN naming no stored organization recommendation aggregates no
     /// member, so the set is empty.
-    pub fn member_recommendations_of(
-        &self,
-        organization_recommendation_arn: &str,
-    ) -> Vec<&str> {
+    ///
+    /// A named ARN the store does not actually hold a recommendation for names
+    /// NOTHING — no account, no lifecycle, no resources — so it is not a member
+    /// of any of those views either: the set is the named ARNs RESOLVED in
+    /// [`recommendations`](Self::recommendations), and an unresolvable one is
+    /// left out, exactly as every other read of a member recommendation in this
+    /// crate treats it.
+    pub fn member_recommendations_of(&self, organization_recommendation_arn: &str) -> Vec<&str> {
         let Some(entry) = self
             .organization_recommendations
             .get(organization_recommendation_arn)
@@ -901,6 +905,7 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
             .member_recommendation_arns
             .iter()
             .map(String::as_str)
+            .filter(|member_arn| self.recommendations.contains_key(*member_arn))
             .collect();
         members.sort_unstable();
         members.dedup();
