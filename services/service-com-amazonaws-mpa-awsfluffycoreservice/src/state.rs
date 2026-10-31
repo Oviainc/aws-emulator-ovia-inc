@@ -170,6 +170,13 @@
 //! are all refused ([`token_key`], [`page_after_position`], [`page_after_key`]) rather
 //! than answered with a page.
 //!
+//! Whether a token was handed out is decided against every record the listing pages over,
+//! never against the narrower set a request's own narrowing admits
+//! ([`page_after_position_where`], [`page_after_seq_where`], which a narrowed listing like
+//! `ListSessions` pages with): the listing holding the record its token names is the whole
+//! test, so a token stays resumable while that record is the resource's, whatever the
+//! request admits and however the record has changed since.
+//!
 //! # Authorization
 //!
 //! This module also owns this service's authorization rules, so every handler states
@@ -641,12 +648,46 @@ where
     T: 'a,
     I: IntoIterator<Item = (u64, &'a T)>,
 {
+    page_after_position_where(listing, ordered, |_| true, after, max_results)
+}
+
+/// One page of the records of `ordered` that `reported` admits, resuming after the
+/// position `after` names: [`page_after_position`] for a listing whose REQUEST narrows
+/// what it reports.
+///
+/// `ordered` is every record this listing pages over, each with its position, and
+/// `reported` is the question the request asks of a record — so the page is the admitted
+/// records ordered after `after`, and the token for the page after names the last one
+/// reported.
+///
+/// A token's provenance is decided against `ordered`, never against the narrower set
+/// `reported` admits: a position was handed out if this listing HOLDS the record it names,
+/// and the request's own narrowing is no part of that. So a token stays resumable for as
+/// long as its record is one of the listing's, whatever the narrowing now admits and
+/// however the record has changed since — a client paging a narrowed listing reaches its
+/// next page rather than being told the token it was just handed was never issued.
+pub fn page_after_position_where<'a, T, I, P>(
+    listing: Listing<'_>,
+    ordered: I,
+    mut reported: P,
+    after: Option<u64>,
+    max_results: i32,
+) -> Result<ListingPage<'a, T>, ValidationException>
+where
+    T: 'a,
+    I: IntoIterator<Item = (u64, &'a T)>,
+    P: FnMut(&'a T) -> bool,
+{
     let mut handed_out = after.is_none();
     let mut records: Vec<(u64, &'a T)> = Vec::new();
     for (position, record) in ordered {
         match after {
             Some(after) if position <= after => handed_out |= position == after,
-            _ => records.push((position, record)),
+            _ => {
+                if reported(record) {
+                    records.push((position, record));
+                }
+            }
         }
     }
     if !handed_out {
@@ -716,9 +757,33 @@ where
     T: SeqOrdered + 'a,
     I: IntoIterator<Item = &'a T>,
 {
-    page_after_position(
+    page_after_seq_where(listing, ordered, |_| true, after, max_results)
+}
+
+/// One page of the records of `ordered` that `reported` admits, resuming after the
+/// position `after` names, for a listing whose records carry their own position
+/// ([`SeqOrdered`]): [`page_after_position_where`] over the stored positions.
+///
+/// The whole of `ordered` is what the token's provenance is decided against, so a
+/// listing narrowed by its request hands `ordered` every record it pages over and asks
+/// `reported` which of them this request wants — rather than narrowing `ordered` itself,
+/// which would make the provenance of its own tokens depend on what the request admits.
+pub fn page_after_seq_where<'a, T, I, P>(
+    listing: Listing<'_>,
+    ordered: I,
+    reported: P,
+    after: Option<u64>,
+    max_results: i32,
+) -> Result<ListingPage<'a, T>, ValidationException>
+where
+    T: SeqOrdered + 'a,
+    I: IntoIterator<Item = &'a T>,
+    P: FnMut(&'a T) -> bool,
+{
+    page_after_position_where(
         listing,
         ordered.into_iter().map(|record| (record.seq(), record)),
+        reported,
         after,
         max_results,
     )

@@ -73,7 +73,7 @@ pub(crate) async fn list_sessions(harness: &Harness, team_arn: &str, body: Value
 }
 
 /// The `SessionArn`s one page reports, in the order the page lists them.
-fn listed_arns(page: &Value) -> Vec<String> {
+pub(crate) fn listed_arns(page: &Value) -> Vec<String> {
     entries(page)
         .iter()
         .map(|entry| text(entry, "SessionArn"))

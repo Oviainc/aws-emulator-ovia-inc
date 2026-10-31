@@ -22,8 +22,14 @@
 //! returned, so the next page is every matching session ordered after it; a client
 //! paging with any `MaxResults` sees each session exactly once. A token this listing did
 //! not hand out — one it cannot read, one another listing (or another team's sessions)
-//! issued, or one naming a position this listing reports no session at — earns
+//! issued, or one naming a position this team holds no session at — earns
 //! `ValidationException` (400) rather than an empty page.
+//!
+//! Which of those a token is is decided against the TEAM's sessions, never against the
+//! narrower set this request's `Filters` admit: the token names a session of this team at
+//! the position it names, so it stays resumable while that session is the team's, whatever
+//! the filters now admit and however the session's status has moved since the page that
+//! handed the token out.
 //!
 //! ## Filters
 //!
@@ -265,19 +271,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The sessions this request asks for, in initiation order, cut into a page by
         // the one paging rule this service's record listings share — which refuses a
         // position no page of this listing handed out rather than answering a page.
-        let matching = state
-            .team_sessions_in_initiation_order(&input.approval_team_arn)
-            .into_iter()
-            .filter(|session| {
-                predicates
-                    .iter()
-                    .all(|predicate| predicate.matches(session))
-            });
-        let page = crate::state::page_after_seq(
+        //
+        // The TEAM's sessions are what that rule is handed, with the request's filters
+        // as the question it asks of each one
+        // ([`crate::state::page_after_seq_where`]): the token's provenance is decided
+        // against the sessions this listing pages over, so a filter — which narrows what
+        // this one request reports and nothing about which tokens this listing issued —
+        // can never turn a token this listing handed out into one it refuses.
+        let page = crate::state::page_after_seq_where(
             crate::state::Listing::Sessions {
                 approval_team_arn: &input.approval_team_arn,
             },
-            matching,
+            state.team_sessions_in_initiation_order(&input.approval_team_arn),
+            |session| {
+                predicates
+                    .iter()
+                    .all(|predicate| predicate.matches(session))
+            },
             after,
             input.max_results,
         )
