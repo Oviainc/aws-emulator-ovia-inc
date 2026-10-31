@@ -579,15 +579,24 @@ fn first_reported_instant(from: i64, shift_secs: i64) -> i64 {
 /// `(ServiceNamespace, ResourceId, ScalableDimension)` triple this request carries — so
 /// the forecast of a resource is the forecast of the instruction naming it, and a plan
 /// holding no instruction for it has no forecast to report.
+///
+/// Which instruction names a resource is [`crate::state::resource_identity`], the one
+/// definition this crate gives that identity — the same one the write paths hold one
+/// instruction per resource by, the update merge pairs instructions by and the paged read
+/// of a plan's resources is ordered and tokenized by — so this read matches by whatever
+/// rule those paths match by.
 fn instruction_for<'a>(
     plan: &'a crate::state::ScalingPlanRecord,
     input: &GetScalingPlanResourceForecastDataInput,
 ) -> Option<&'a ScalingInstruction> {
-    plan.scaling_instructions.iter().find(|instruction| {
-        instruction.service_namespace == input.service_namespace
-            && instruction.resource_id == input.resource_id
-            && instruction.scalable_dimension == input.scalable_dimension
-    })
+    let requested: crate::state::ResourceIdentity<'_> = (
+        input.service_namespace.as_str(),
+        input.resource_id.as_str(),
+        input.scalable_dimension.as_str(),
+    );
+    plan.scaling_instructions
+        .iter()
+        .find(|instruction| crate::state::resource_identity(instruction) == requested)
 }
 
 /// Which of the four modelled `ForecastDataType`s a request asked for.

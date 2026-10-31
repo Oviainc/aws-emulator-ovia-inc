@@ -53,6 +53,8 @@ mod predefined_metric_resource_label_identity;
 mod predictive_scaling_predicate;
 #[path = "all/resource_id_identifies_a_resource.rs"]
 mod resource_id_identifies_a_resource;
+#[path = "all/resource_identity_definition.rs"]
+mod resource_identity_definition;
 #[path = "all/resource_label_format.rs"]
 mod resource_label_format;
 #[path = "all/scaling_instruction_validation.rs"]

@@ -1086,7 +1086,8 @@ const INDEX_SEGMENT: &str = "/index/";
 /// "Each scaling instruction applies to one resource" (`ScalingInstruction` doc), and
 /// that resource is named by the `(ServiceNamespace, ResourceId, ScalableDimension)`
 /// triple — so this is the identity [`validate_scaling_instructions`] holds one
-/// instruction per, and the one the update merge matches on.
+/// instruction per, the one the update merge matches on, and the one the forecast read
+/// takes an instruction by.
 pub type ResourceIdentity<'a> = (&'a str, &'a str, &'a str);
 
 /// The [`ResourceIdentity`] of `instruction`, rendered as one flat string.
@@ -1112,7 +1113,10 @@ pub fn resource_identity_key(instruction: &ScalingInstruction) -> String {
 }
 
 /// The [`ResourceIdentity`] of `instruction`.
-fn resource_identity(instruction: &ScalingInstruction) -> ResourceIdentity<'_> {
+///
+/// Public because the forecast path asks the same question: the forecast of a resource is
+/// the forecast of the instruction whose identity is the triple the request names.
+pub fn resource_identity(instruction: &ScalingInstruction) -> ResourceIdentity<'_> {
     (
         instruction.service_namespace.as_str(),
         instruction.resource_id.as_str(),
