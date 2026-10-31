@@ -27,6 +27,16 @@ use serde_json::json;
 
 use super::emulator::{error_code, error_message, Emulator, REGION};
 
+/// The sentence a (namespace, resource id, dimension) triple that does not describe one
+/// resource between them is refused with: the combination is what is unsupported, so the text
+/// names none of the three.
+const UNSUPPORTED_TRIPLE: &str = "Unsupported service namespace, resource type or scalable \
+                                  dimension";
+
+/// The envelope a resource that cannot carry a scalable target at all is refused with, whose
+/// reason is that resource's own state.
+const VALIDATION_FAILED: &str = "Validation failed for scalable target. Reason: ";
+
 /// What the backing service holds before the registration under test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Setup {
@@ -304,10 +314,17 @@ async fn a_target_is_registered_only_on_a_resource_that_can_carry_it() {
             "case {case:?}: expected a ValidationException, got {body:?}"
         );
         let message = error_message(&body);
+        // WHICH sentence a refusal carries follows which rule refused it: a triple whose
+        // three members do not describe one resource between them is the fixed
+        // unsupported-triple sentence, a resource that cannot carry the target at all is the
+        // "Validation failed for scalable target" envelope with the reason it cannot, and the
+        // remaining rules are about the id itself, so they name it.
         assert!(
-            message.contains(row.resource_id),
-            "case {case:?}: expected the message to name the resource id the request \
-             supplied, got {message:?}"
+            message == UNSUPPORTED_TRIPLE
+                || message.starts_with(VALIDATION_FAILED)
+                || message.contains(row.resource_id),
+            "case {case:?}: expected {UNSUPPORTED_TRIPLE:?}, a {VALIDATION_FAILED:?} refusal or \
+             a message naming the resource id the request supplied, got {message:?}"
         );
         // The refusal is the service's own sentence: never the boundary validator's
         // constraint template, and never a value the caller did not supply (the region the

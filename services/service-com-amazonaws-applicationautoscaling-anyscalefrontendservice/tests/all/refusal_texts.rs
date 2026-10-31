@@ -37,27 +37,31 @@ const DIMENSION_WITHOUT_RESOURCE_ID: &str =
     "Scalable dimension cannot be provided without a resource ID.";
 /// A `NextToken` this service did not issue.
 const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid";
-/// A WRITE addressed to an ARN that names no registered scalable target.
+/// A request addressed to an ARN whose scalable target is gone.
+const TARGET_NOT_FOUND: &str = "Scalable Target not found";
+/// A WRITE addressed to an ARN this service never minted.
 const ACCESS_DENIED: &str = "Access Denied";
 /// A write to the reserved tag namespace.
 const SYSTEM_TAG_KEY_REFUSED: &str = "Caller is an end user and not allowed to mutate system tags";
 /// A tag set over the per-resource maximum.
 const TAG_SET_TOO_LARGE: &str = "The resultant tag set must not have more than 50 user tags.";
 
-/// Assert that `operation` on `request` is refused 400 with `code` and exactly `message`,
-/// and that the message is the service's own sentence rather than a constraint clause.
-async fn refused(
+/// Assert that `operation` on `request` is refused with HTTP `status`, `code` and exactly
+/// `message`, and that the message is the service's own sentence rather than a constraint
+/// clause.
+async fn refused_with_status(
     emulator: &Emulator,
     case: &str,
     operation: &str,
     request: Value,
+    status: u16,
     code: &str,
     message: &str,
 ) {
-    let (status, body) = emulator.call(operation, request).await;
+    let (got, body) = emulator.call(operation, request).await;
     assert_eq!(
-        status, 400,
-        "case {case:?}: expected {operation} to refuse with HTTP 400, got {status} {body:?}"
+        got, status,
+        "case {case:?}: expected {operation} to refuse with HTTP {status}, got {got} {body:?}"
     );
     assert_eq!(
         error_code(&body),
@@ -74,6 +78,19 @@ async fn refused(
         "case {case:?}: expected the service's own sentence, not a constraint clause, got \
          {actual:?}"
     );
+}
+
+/// Assert that `operation` on `request` is refused 400 with `code` and exactly `message`,
+/// and that the message is the service's own sentence rather than a constraint clause.
+async fn refused(
+    emulator: &Emulator,
+    case: &str,
+    operation: &str,
+    request: Value,
+    code: &str,
+    message: &str,
+) {
+    refused_with_status(emulator, case, operation, request, 400, code, message).await;
 }
 
 /// Assert that `operation` on `request` is accepted.
@@ -806,9 +823,11 @@ fn generated_tags(count: usize) -> Value {
 }
 
 /// RULE: the three tagging refusals each carry their own sentence — a WRITE addressed to an
-/// ARN that resolves to no registered target is a permission failure, a tag set over the
-/// per-resource maximum states that maximum, and a key in the reserved namespace is refused
-/// as a system tag — so a client can tell the three apart by text as well as by code.
+/// ARN this service never minted is a permission failure, a tag set over the per-resource
+/// maximum states that maximum, and a key in the reserved namespace is refused as a system
+/// tag — so a client can tell the three apart by text as well as by code. (The other answer a
+/// write has, for an ARN this service minted whose target is gone, is pinned by
+/// `refusal_messages` and `recorded_refusal_wording`.)
 ///
 /// Rows differ along the operation (both mutating tag operations), along how the ARN fails
 /// to resolve, along the batch size either side of the maximum, and along how the reserved
@@ -865,6 +884,17 @@ async fn the_tagging_refusals_are_three_distinct_sentences() {
             json!({"ResourceARN": unknown, "TagKeys": ["team"]}),
             "ValidationException",
             ACCESS_DENIED,
+        )
+        .await;
+        // The READ reports on the resource for every ARN that resolves to none.
+        refused_with_status(
+            &emulator,
+            &format!("ListTagsForResource on {case}"),
+            "ListTagsForResource",
+            json!({"ResourceARN": unknown}),
+            404,
+            "ResourceNotFoundException",
+            TARGET_NOT_FOUND,
         )
         .await;
     }

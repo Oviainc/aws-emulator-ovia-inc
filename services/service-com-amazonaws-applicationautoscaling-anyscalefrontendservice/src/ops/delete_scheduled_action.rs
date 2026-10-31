@@ -227,14 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.scheduled_actions.remove(&key).is_none() {
             return Err(DeleteScheduledActionErrorModeled::ObjectNotFoundException(
                 ObjectNotFoundException {
-                    message: Some(format!(
-                        "No scheduled action found for service namespace: {}, resource ID: {}, \
-                         scalable dimension: {}, scheduled action name: {}",
-                        key.target.service_namespace,
-                        key.target.resource_id,
-                        key.target.scalable_dimension,
-                        key.scheduled_action_name
-                    )),
+                    message: Some(crate::state::scheduled_action_not_registered_message(&key)),
                 },
             )
             .into());

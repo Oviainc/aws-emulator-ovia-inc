@@ -21,6 +21,8 @@ mod customized_metric_alarms;
 mod emulator;
 #[path = "all/predictive_scaling_forecast.rs"]
 mod predictive_scaling_forecast;
+#[path = "all/recorded_refusal_wording.rs"]
+mod recorded_refusal_wording;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 #[path = "all/refusal_texts.rs"]
@@ -41,12 +43,16 @@ mod scaling_activity_status_message;
 mod scaling_policy_preconditions;
 #[path = "all/scheduled_action_deletion.rs"]
 mod scheduled_action_deletion;
+#[path = "all/scheduled_action_dispatch.rs"]
+mod scheduled_action_dispatch;
 #[path = "all/scheduled_action_lifecycle.rs"]
 mod scheduled_action_lifecycle;
 #[path = "all/scheduled_actions.rs"]
 mod scheduled_actions;
 #[path = "all/scheduled_scaling_suspension.rs"]
 mod scheduled_scaling_suspension;
+#[path = "all/service_linked_role.rs"]
+mod service_linked_role;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/step_scaling_execution.rs"]

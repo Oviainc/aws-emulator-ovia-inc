@@ -37,6 +37,10 @@ hex = { workspace = true }
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
+# Registering a scalable target in a namespace creates that namespace's service-linked
+# role in the IAM emulator's own role store, which needs IAM's state TYPE and the
+# helpers that spell a service-linked role's path, trust policy and ARN.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # Parses the `cron(...)` schedule a scheduled action carries (and `chrono`, which it
 # is built on, parses an `at(...)` expression's date and time).
 cron = "0.15"

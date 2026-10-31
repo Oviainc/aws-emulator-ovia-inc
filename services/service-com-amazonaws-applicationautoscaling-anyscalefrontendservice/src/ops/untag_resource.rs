@@ -148,15 +148,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             check_tag_key("tagKeys", key).map_err(validation)?;
         }
 
-        // An engine that holds no state holds no scalable target either: the same
-        // refusal as an ARN that names no registered target (see `tag_resource`).
+        // An engine that holds no state holds no scalable target either, and minted no ARN:
+        // the same refusal as an ARN this service never minted (see `tag_resource`).
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(validation(ACCESS_DENIED));
         };
         let mut state = state.lock();
 
         // Only a target of THIS Region: a scalable target is a regional resource, so
-        // another Region's ARN names none this endpoint holds (see `tag_resource`).
+        // another Region's ARN names none this endpoint holds (see `tag_resource`). Which
+        // refusal an ARN that resolves to no registered target gets follows what it names:
+        // one this service minted is reported as a resource that is gone, one it never
+        // minted as a write it cannot resolve.
         let region = crate::state::request_region(ctx.parts());
         let resolved = state
             .arn_index
@@ -164,7 +167,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|key| key.region == region)
             .cloned();
         let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
-            return Err(validation(ACCESS_DENIED));
+            return Err(if state.is_withdrawn_arn(&input.resource_arn, &region) {
+                target_not_found(&input.resource_arn)
+            } else {
+                validation(ACCESS_DENIED)
+            });
         };
 
         // "To delete a tag, specify the tag key and the Application Auto Scaling
@@ -182,6 +189,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn validation(message: impl Into<String>) -> UntagResourceError {
     UntagResourceErrorModeled::ValidationException(ValidationException {
         message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an ARN this service minted whose
+/// scalable target is no longer registered, reporting that ARN in `ResourceName` (see
+/// `tag_resource`).
+fn target_not_found(resource_arn: &str) -> UntagResourceError {
+    UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE.to_string()),
+        resource_name: Some(resource_arn.to_string()),
     })
     .into()
 }

@@ -228,6 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|(policy_key, record)| (policy_key.clone(), record.policy_type.clone()))
                 .collect();
             state.arn_index.remove(&removed.arn);
+            // The ARN this service minted stays known as one of ITS ARNs, naming a target
+            // that is no longer registered: an operation addressed to it reports the resource
+            // as gone rather than as one this endpoint cannot resolve at all.
+            state.withdraw_arn(removed.arn.clone(), key.clone());
             state.policies.retain(|policy_key, _| policy_key.target != key);
             state
                 .scheduled_actions

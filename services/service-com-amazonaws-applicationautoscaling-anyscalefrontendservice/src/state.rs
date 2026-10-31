@@ -19,7 +19,7 @@
 //! rather than in one operation's file so the six handlers of the target/policy lifecycle
 //! cannot drift from each other.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
@@ -194,6 +194,23 @@ pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     /// `ScalableTargetARN` -> the target it names, so an ARN-addressed operation
     /// (`TagResource` and friends) can resolve a `ResourceARN` back to a target.
     pub arn_index: BTreeMap<String, TargetKey>,
+    /// The ARNs this service MINTED whose scalable target is no longer registered, each
+    /// still naming the target it was minted for.
+    ///
+    /// An ARN-addressed operation has two different answers for an ARN that resolves to no
+    /// registered target, and this is what tells them apart: an ARN this service minted names
+    /// a scalable target that existed, so the answer is that the RESOURCE is gone, while an
+    /// ARN it never minted names nothing it can resolve at all. `DeregisterScalableTarget`
+    /// moves an ARN here as it takes it out of [`Self::arn_index`], and a lookup consults the
+    /// index FIRST, so an ARN that is live again is never read as withdrawn.
+    ///
+    /// Bounded by [`MAX_WITHDRAWN_ARNS`] in the order the ARNs were withdrawn
+    /// ([`Self::withdraw_arn`]), so a long-lived emulator's register/deregister cycles cannot
+    /// grow it without end.
+    pub withdrawn_arns: BTreeMap<String, TargetKey>,
+    /// The order [`Self::withdrawn_arns`] took its entries in, so the oldest is the one the
+    /// ceiling drops.
+    pub withdrawal_order: VecDeque<String>,
     /// Scheduled actions, ordered by (target, action name). `DeregisterScalableTarget`
     /// cascades into this map, so a deregistered target leaves none behind.
     ///
@@ -351,6 +368,27 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
         self.updating.remove(target);
     }
 
+    /// Remember that `arn` was minted for `target` and that the target it names is no longer
+    /// registered. See [`Self::withdrawn_arns`].
+    pub fn withdraw_arn(&mut self, arn: String, target: TargetKey) {
+        if self.withdrawn_arns.insert(arn.clone(), target).is_none() {
+            self.withdrawal_order.push_back(arn);
+        }
+        while self.withdrawal_order.len() > MAX_WITHDRAWN_ARNS {
+            if let Some(oldest) = self.withdrawal_order.pop_front() {
+                self.withdrawn_arns.remove(&oldest);
+            }
+        }
+    }
+
+    /// Whether `arn` is an ARN this service minted in `region` whose scalable target is no
+    /// longer registered. See [`Self::withdrawn_arns`].
+    pub fn is_withdrawn_arn(&self, arn: &str, region: &str) -> bool {
+        self.withdrawn_arns
+            .get(arn)
+            .is_some_and(|target| target.region == region)
+    }
+
     /// Drop the activities that have aged out of the window this service reports over.
     ///
     /// This is owed by the CLOCK, not by the read that calls it: an activity older than
@@ -396,6 +434,16 @@ pub const MAX_SCALABLE_TARGETS: usize = 10_000;
 /// whole policy configuration. See [`MAX_SCALABLE_TARGETS`].
 pub const MAX_SCALING_POLICIES: usize = 20_000;
 
+/// How many WITHDRAWN scalable-target ARNs this store remembers
+/// ([`ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::withdrawn_arns`]).
+///
+/// The EMULATOR's own bound, for the same reason as [`MAX_SCALABLE_TARGETS`]: a register /
+/// deregister cycle mints a new ARN each time, so without a ceiling N cycles would leave N
+/// resident entries for ever. Set to the same number of targets the store holds at once, and
+/// the oldest withdrawal is the one dropped — past it an ARN is answered as one this service
+/// never minted, which is what it can still say about it.
+pub const MAX_WITHDRAWN_ARNS: usize = MAX_SCALABLE_TARGETS;
+
 /// The same bound for scheduled actions, which hang off a target the same way a policy
 /// does and are keyed by a free-form name. See [`MAX_SCALABLE_TARGETS`].
 pub const MAX_SCHEDULED_ACTIONS: usize = 20_000;
@@ -425,12 +473,12 @@ pub const ACTIVITY_RETENTION: Duration = Duration::from_secs(6 * 7 * 24 * 60 * 6
 /// How long after the call that starts it a scaling activity reaches its terminal
 /// status.
 ///
-/// CHOSEN, not documented: on AWS the fulfilment time is the target service's own. The
-/// span is inside this project's 250-750 ms band for a transition the clock owes, so a
-/// caller that reads the activity log straight after the call that moved capacity still
-/// observes the non-terminal activity, and one that reads a moment later sees it
-/// fulfilled.
-pub const ACTIVITY_FULFILMENT: Duration = Duration::from_millis(600);
+/// CHOSEN, not documented: on AWS the fulfilment time is the target service's own. It is this
+/// project's span for a transition the clock owes, so a caller that reads the activity log
+/// straight after the call that moved capacity still observes the non-terminal activity — and
+/// one that POLLS the log, which is how a client watches a scaling activity, still catches
+/// that status between two reads rather than only ever seeing the terminal one.
+pub const ACTIVITY_FULFILMENT: Duration = Duration::from_secs(3);
 
 /// The non-terminal status a capacity movement carries until it is fulfilled, from the
 /// model's `ScalingActivityStatusCode` enum (`SCALING_ACTIVITY_STATUS_CODE_VALUES`).
@@ -590,14 +638,21 @@ fn uuid_shaped_id(seed: &str) -> String {
 /// namespace's own service principal and named for the resource type it scales, so the
 /// name carries that type as a suffix. See [`service_linked_role_name`].
 pub fn service_linked_role_arn(service_namespace: &str) -> String {
-    ::emulator_server::emulator_arn(
-        "iam",
-        "",
-        &format!(
-            "role/aws-service-role/{service_namespace}.application-autoscaling.amazonaws.com/{}",
-            service_linked_role_name(service_namespace)
-        ),
+    use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+
+    // IAM's own two helpers, so the ARN a scalable target reports is the one the role IAM
+    // holds carries ([`ensure_service_linked_role`]) rather than a second spelling of it.
+    iam::role_arn(
+        &iam::service_linked_role_path(&service_linked_role_principal(service_namespace)),
+        &service_linked_role_name(service_namespace),
     )
+}
+
+/// The service principal a namespace's scalable targets are scaled through: the namespace's
+/// own label in front of Application Auto Scaling's principal, which is the form every row of
+/// IAM's published service-linked-role catalog takes for this service.
+pub fn service_linked_role_principal(service_namespace: &str) -> String {
+    format!("{service_namespace}.application-autoscaling.amazonaws.com")
 }
 
 /// The base name every Application Auto Scaling service-linked role starts with.
@@ -631,12 +686,85 @@ const SERVICE_LINKED_ROLE_SUFFIXES: &[(&str, &str)] = &[
 
 /// The name of the service-linked role a namespace's scalable targets are scaled through.
 pub fn service_linked_role_name(service_namespace: &str) -> String {
-    match SERVICE_LINKED_ROLE_SUFFIXES
+    match service_linked_role_suffix(service_namespace) {
+        Some(suffix) => format!("{SERVICE_LINKED_ROLE_BASE}_{suffix}"),
+        None => SERVICE_LINKED_ROLE_BASE.to_string(),
+    }
+}
+
+/// The resource-type label `service_namespace`'s service-linked role is named for. See
+/// [`SERVICE_LINKED_ROLE_SUFFIXES`].
+fn service_linked_role_suffix(service_namespace: &str) -> Option<&'static str> {
+    SERVICE_LINKED_ROLE_SUFFIXES
         .iter()
         .find(|(namespace, _)| *namespace == service_namespace)
-    {
-        Some((_, suffix)) => format!("{SERVICE_LINKED_ROLE_BASE}_{suffix}"),
-        None => SERVICE_LINKED_ROLE_BASE.to_string(),
+        .map(|(_, suffix)| *suffix)
+}
+
+/// The managed policy Application Auto Scaling attaches to the service-linked role of
+/// `service_namespace`, as the ARN IAM files an AWS-managed policy under.
+///
+/// Source: "Service-linked roles for Application Auto Scaling" in the Application Auto Scaling
+/// User Guide, which lists one policy per supported service, each named
+/// `AWSApplicationAutoscaling<resource type>Policy` for the SAME resource-type label its role
+/// name carries ([`SERVICE_LINKED_ROLE_SUFFIXES`]) and filed under the path IAM reserves for
+/// the policies of a service-linked role, so no identity other than that role can take it.
+/// `None` for a namespace with no published role, which has no published policy either.
+pub fn service_linked_role_policy_arn(service_namespace: &str) -> Option<String> {
+    use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+
+    let suffix = service_linked_role_suffix(service_namespace)?;
+    Some(format!(
+        "arn:aws:iam::{}:policy{}AWSApplicationAutoscaling{suffix}Policy",
+        iam::AWS_MANAGED_POLICY_ACCOUNT,
+        iam::SERVICE_LINKED_ROLE_PATH_PREFIX
+    ))
+}
+
+/// Create the service-linked role `service_namespace`'s scalable targets are scaled through,
+/// in IAM, unless the account already holds a role under that name.
+///
+/// "If the service supports service-linked roles, Application Auto Scaling uses a
+/// service-linked role, which it creates if it does not yet exist": the FIRST registration in
+/// a namespace is what brings that namespace's role into the account, so the `RoleARN` a
+/// scalable target reports names a role a client can then read and inspect. The record is
+/// written by IAM's own `insert_service_linked_role`, the one place a service-linked role's
+/// record is built, so it is the record `CreateServiceLinkedRole` would have written — and the
+/// permissions policy the service attaches to its OWN role is attached with it (which is why
+/// this writes the attachment directly: that policy is not one an identity may attach for
+/// itself).
+///
+/// Call it with THIS service's store NOT held: it takes IAM's. It does nothing when this
+/// emulator holds no IAM store, when the account already holds the role, or when the account
+/// is at IAM's own role quota, where a create would have been refused too.
+pub fn ensure_service_linked_role<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    service_namespace: &str,
+) {
+    use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
+
+    let Some(store) = iam::service_state(engine) else {
+        return;
+    };
+    let role_name = service_linked_role_name(service_namespace);
+    let key = iam::name_key(&role_name);
+    let mut store = store.lock();
+    if store.roles.contains_key(&key) || store.roles.len() >= iam::MAX_ROLES_PER_ACCOUNT {
+        return;
+    }
+    let principal = service_linked_role_principal(service_namespace);
+    let role = iam::insert_service_linked_role(&mut store, &principal, &role_name, None);
+    ::tracing::debug!(
+        service_namespace = %service_namespace,
+        role_arn = %role.arn,
+        "the service-linked role this namespace is scaled through was created"
+    );
+    if let Some(policy_arn) = service_linked_role_policy_arn(service_namespace) {
+        store
+            .role_attached_policies
+            .entry(key)
+            .or_default()
+            .insert(policy_arn);
     }
 }
 
@@ -730,6 +858,32 @@ pub fn target_not_registered_message(target: &TargetKey) -> String {
 /// find it, which is `DeregisterScalableTarget`. See [`missing_target_message`].
 pub fn target_not_found_message(target: &TargetKey) -> String {
     missing_target_message(target, "found")
+}
+
+/// The refusal of an operation addressed at a scheduled action no scalable target holds.
+///
+/// The scheduled-action form of [`target_not_registered_message`], and the same template: a
+/// scheduled action's identity is its target's triple plus its own name, so the sentence names
+/// all four, built from the request.
+pub fn scheduled_action_not_registered_message(key: &ScheduledActionKey) -> String {
+    format!(
+        "No scheduled action registered for service namespace: {}, resource ID: {}, scalable \
+         dimension: {}, scheduled action name: {}",
+        key.target.service_namespace,
+        key.target.resource_id,
+        key.target.scalable_dimension,
+        key.scheduled_action_name
+    )
+}
+
+/// How this service refuses a registration whose resource cannot carry a scalable target at
+/// all: the recorded envelope, with the REASON that resource's own state states.
+///
+/// The envelope is fixed and the reason is the variable part, so every such refusal reads the
+/// same way whichever property of the resource made it unscalable — a table in a billing mode
+/// that provisions no throughput being the one this emulator can resolve.
+pub fn scalable_target_validation_failed(reason: &str) -> String {
+    format!("Validation failed for scalable target. Reason: {reason}")
 }
 
 /// `len` lowercase hex characters derived from `seed`, clamped to the 64 characters a
@@ -1032,14 +1186,31 @@ pub fn take_page<T>(
 pub const CAPACITY_RANGE_INVERTED_MESSAGE: &str =
     "Maximum capacity cannot be less than minimum capacity";
 
-/// The message a request addressed to an ARN that names no registered scalable target
-/// carries.
+/// The message a request addressed to an ARN whose scalable target is gone carries.
 ///
-/// The resource a tag operation addresses is the scalable target its `ResourceARN` names,
-/// and either that target is registered or it is not: the refusal states exactly that, and
-/// the ARN asked about is reported in the modelled `ResourceName` member rather than spliced
-/// into the sentence.
+/// The resource a tag operation addresses is the scalable target its `ResourceARN` names, and
+/// either that target is registered or it is not: the refusal states exactly that, and the
+/// ARN asked about is reported in the modelled `ResourceName` member rather than spliced into
+/// the sentence. It is answered through the modelled `ResourceNotFoundException`, whose
+/// `@httpError` is 404, because the ARN satisfies its member's own `@pattern`: what is absent
+/// is the resource, not anything about the request. The READ answers it for every ARN that
+/// resolves to no target; the two WRITES answer it for an ARN this service MINTED and
+/// [`ACCESS_DENIED`] for one it never minted.
 pub const SCALABLE_TARGET_NOT_FOUND_MESSAGE: &str = "Scalable Target not found";
+
+/// The message the two MUTATING tag operations refuse a `ResourceARN` this service never
+/// minted with.
+///
+/// Recorded behaviour: `TagResource` on a well-formed ARN naming a resource that does not
+/// exist is `ValidationException` with `Access Denied`, while the ARN of a scalable target
+/// that WAS registered and has been deregistered is the modelled
+/// `ResourceNotFoundException` ([`SCALABLE_TARGET_NOT_FOUND_MESSAGE`]). The two differ in
+/// what the ARN names: one the service minted identifies a scalable target, and that it is
+/// gone is a report about the resource; one it never minted identifies nothing it can resolve
+/// at all, which a write is refused for without disclosing whether such a resource exists
+/// elsewhere. The ARN is not echoed, and the sentence is the same for every ARN that names
+/// nothing.
+pub const ACCESS_DENIED: &str = "Access Denied";
 
 // ---------------------------------------------------------------------------
 // Shared validation
@@ -1183,9 +1354,20 @@ const RESOURCE_ID_FORMS: &[(&str, &str, &str)] = &[
     ("workspaces", "workspacespool", "workspacespool/{pool id}"),
 ];
 
+/// How this service refuses a (`ServiceNamespace`, `ResourceId`, `ScalableDimension`) triple
+/// whose three members do not describe ONE resource between them.
+///
+/// The three identify the scalable target together — the dimension "consists of the service
+/// namespace, resource type, and scaling property" and the resource id "consists of the
+/// resource type and unique identifier" — so a resource id of another resource type than the
+/// dimension names is not a resource the service supports scaling, which is what the recorded
+/// refusal says. It is FIXED text: it interpolates no member of the request, because it is the
+/// combination rather than any one value that is unsupported.
+pub const UNSUPPORTED_TRIPLE_MESSAGE: &str =
+    "Unsupported service namespace, resource type or scalable dimension";
+
 /// `Ok` when `resource_id` has the form the resource type in `scalable_dimension` documents,
-/// else the `ValidationException` message naming the resource id, the dimension it was paired
-/// with and the form that pairing requires.
+/// else [`UNSUPPORTED_TRIPLE_MESSAGE`].
 pub fn check_resource_id_form(
     service_namespace: &str,
     resource_id: &str,
@@ -1201,11 +1383,7 @@ pub fn check_resource_id_form(
     if matches_resource_id_form(template, resource_id) {
         return Ok(());
     }
-    Err(format!(
-        "ResourceId not valid for ScalableDimension {scalable_dimension}: {resource_id} must \
-         name a resource of type {resource_type} in the {service_namespace} service namespace, \
-         of the form {template}"
-    ))
+    Err(UNSUPPORTED_TRIPLE_MESSAGE.to_string())
 }
 
 /// The function name and qualifier a `lambda` `ResourceId` names: "The resource type is
@@ -1446,11 +1624,10 @@ pub fn resolve_dynamodb_capacity<Eng: Send + Sync + 'static>(
         .filter(|table| !matches!(table.status(now), dynamodb::state::TableStatus::Deleting))
         .ok_or_else(|| format!("DynamoDB table does not exist: {resource_id}"))?;
     if table.provisioned_throughput.is_none() {
-        return Err(format!(
-            "DynamoDB table {resource_id} is in {} billing mode and has no provisioned \
-             throughput to scale",
+        return Err(scalable_target_validation_failed(&format!(
+            "{} table mode is not scalable.",
             table.billing_mode
-        ));
+        )));
     }
     let reads = dimension_scaling_property(scalable_dimension) == "ReadCapacityUnits";
     match index_name {
@@ -3361,53 +3538,31 @@ fn cron_field_parses(index: usize, field: &str) -> bool {
 /// the boundaries for when the recurring action starts and stops". An occurrence whose target
 /// has scheduled scaling SUSPENDED is not initiated, and not replayed when it resumes.
 ///
-/// Every step is fallible on purpose: an action whose schedule, time zone or instants cannot
-/// be computed with is skipped, so no stored record can make this pass fail.
+/// Occurrences are initiated in the order of the instants they were due at ([`due_occurrence`]
+/// decides them all before any is applied), which is the order they took effect in.
 pub fn apply_due_scheduled_actions(
     state: &mut ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState,
     now: SystemTime,
 ) {
-    let keys: Vec<ScheduledActionKey> = state.scheduled_actions.keys().cloned().collect();
-    for key in keys {
+    // WHICH occurrences are due is decided for every stored action first, and they are
+    // initiated afterwards in the order of the INSTANTS they were due at — the order the
+    // clock reached them, which is the order they took effect in, whatever order the actions
+    // were created or named in. Two actions queued against one target therefore leave it at
+    // the bounds the later-scheduled of the two set, and the activity each recorded carries
+    // the instant it acted at.
+    let mut due: Vec<(SystemTime, ScheduledActionKey)> = state
+        .scheduled_actions
+        .iter()
+        .filter_map(|(key, record)| {
+            due_occurrence(record, now).map(|occurrence| (occurrence, key.clone()))
+        })
+        .collect();
+    due.sort();
+    for (occurrence, key) in due {
         let Some(record) = state.scheduled_actions.get(&key) else {
             continue;
         };
-        let Ok(schedule) = parse_schedule(&record.action.schedule) else {
-            continue;
-        };
-        let Ok(timezone) = schedule_timezone(record.action.timezone.as_deref()) else {
-            continue;
-        };
-        let since = record
-            .last_applied
-            .unwrap_or_else(|| system_time_of(&record.action.creation_time));
-        let start = record.action.start_time.as_ref().map(system_time_of);
-        let end = record.action.end_time.as_ref().map(system_time_of);
-        let mut window_start = match start {
-            Some(start) if start > since => start,
-            _ => since,
-        };
         let action = record.action.scalable_target_action.clone();
-        // EVERY occurrence the clock has already made due is materialised in this one
-        // pass, not one per request: a recurring action whose target was not read for
-        // several periods must report the bounds the last due occurrence set, not the
-        // first. The walk is bounded by [`MAX_DUE_OCCURRENCES_PER_PASS`], so a fine-grained
-        // schedule left alone for a long time cannot make one request walk for ever; what
-        // is left is picked up by the next pass.
-        let mut applied = None;
-        for _ in 0..MAX_DUE_OCCURRENCES_PER_PASS {
-            let Some(occurrence) = next_occurrence(&schedule, timezone, window_start) else {
-                break;
-            };
-            if occurrence > now || end.is_some_and(|end| occurrence > end) {
-                break;
-            }
-            applied = Some(occurrence);
-            window_start = occurrence;
-        }
-        let Some(occurrence) = applied else {
-            continue;
-        };
         // "Set the value to true if you don't want Application Auto Scaling to add or remove
         // capacity by initiating scheduled actions" (`SuspendedState$ScheduledScalingSuspended`):
         // while scheduled scaling is suspended on the target, a due occurrence is not
@@ -3472,6 +3627,47 @@ pub fn apply_due_scheduled_actions(
             record.last_applied = Some(occurrence);
         }
     }
+}
+
+/// The instant the LAST occurrence of `record` that the clock has already made due was due
+/// at, or `None` when it has none to initiate yet.
+///
+/// Every occurrence of one action sets the same capacity bounds, so an action whose target
+/// was not read for several periods owes the bounds its LAST due occurrence set, not its
+/// first — which is why the walk runs to the last one and reports its instant, and why
+/// `last_applied` ends there.
+///
+/// Every step is fallible on purpose: an action whose schedule, time zone or instants cannot
+/// be computed with yields nothing, so no stored record can make a pass fail.
+fn due_occurrence(record: &ScheduledActionRecord, now: SystemTime) -> Option<SystemTime> {
+    let schedule = parse_schedule(&record.action.schedule).ok()?;
+    let timezone = schedule_timezone(record.action.timezone.as_deref()).ok()?;
+    let since = record
+        .last_applied
+        .unwrap_or_else(|| system_time_of(&record.action.creation_time));
+    let start = record.action.start_time.as_ref().map(system_time_of);
+    let end = record.action.end_time.as_ref().map(system_time_of);
+    let mut window_start = match start {
+        Some(start) if start > since => start,
+        _ => since,
+    };
+    let mut applied = None;
+    // The walk is bounded by [`MAX_DUE_OCCURRENCES_PER_PASS`], so a fine-grained schedule
+    // left alone for a long time cannot make one request walk for ever; what is left is
+    // picked up by the next pass.
+    for _ in 0..MAX_DUE_OCCURRENCES_PER_PASS {
+        // A schedule with no further occurrence ENDS the walk; it does not discard the
+        // occurrences already found, which an `at(...)` expression would otherwise lose.
+        let Some(occurrence) = next_occurrence(&schedule, timezone, window_start) else {
+            break;
+        };
+        if occurrence > now || end.is_some_and(|end| occurrence > end) {
+            break;
+        }
+        applied = Some(occurrence);
+        window_start = occurrence;
+    }
+    applied
 }
 
 /// How many occurrences of ONE action a single pass materialises.
@@ -3661,15 +3857,3 @@ pub fn check_tag_value(member: &str, key: &str, value: &str) -> Result<(), Strin
          less than or equal to {MAX_TAG_VALUE_CHARS}"
     ))
 }
-
-/// The message the two MUTATING tag operations refuse a `ResourceARN` that names no
-/// registered scalable target with.
-///
-/// Recorded behaviour: `TagResource` on a well-formed ARN that names no registered target
-/// is `ValidationException` with `Access Denied` — the write is answered as a PERMISSION
-/// failure, which is also the only thing the service can say without disclosing whether
-/// that target exists for somebody else. The ARN is not echoed, and the sentence is the
-/// same for every ARN that resolves to nothing. The READ answers the modelled
-/// `ResourceNotFoundException` with [`SCALABLE_TARGET_NOT_FOUND_MESSAGE`] instead: it
-/// reports on the resource, so it says the resource is not there.
-pub const ACCESS_DENIED: &str = "Access Denied";

@@ -415,18 +415,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// `Ok` when `name` is a name the service accepts.
+/// The `@pattern` the model declares on `ScheduledActionName`, as the MODEL declares it.
 ///
-/// The model's own constraint:
-/// `^(?!((^[ ]+.*)|(.*([\u0000-\u001f]|[\u007f-\u009f]|[:/|])+.*)|(.*[ ]+$))).+$` — a
-/// non-empty name that neither starts nor ends with a space and carries no control
-/// character and no `:`, `/` or `|`. It is checked here because the name is a path segment
-/// of the action's own ARN: a name carrying one of those characters would not be
-/// recoverable from it.
+/// The `\uXXXX` escapes are part of the expression's own text, which is why this is a raw
+/// string: a caller comparing the refusal against the published constraint reads the
+/// expression, not the control characters it denotes.
+const SCHEDULED_ACTION_NAME_PATTERN: &str =
+    r"^(?!((^[ ]+.*)|(.*([\u0000-\u001f]|[\u007f-\u009f]|[:/|])+.*)|(.*[ ]+$))).+$";
+
+/// The lowerCamel member path a constraint clause states this member under, which is how the
+/// framework's own validating walk spells a member of an operation's input.
+const SCHEDULED_ACTION_NAME_PATH: &str = "scheduledActionName";
+
+/// `Ok` when `name` satisfies the `@pattern` the model declares on `ScheduledActionName`,
+/// else AWS's constraint-violation message for it.
 ///
-/// The refusal states the rule the name breaks, in prose, and names the name: the pattern
-/// itself is not a sentence a caller can act on, so it is what the message does NOT carry.
+/// [`SCHEDULED_ACTION_NAME_PATTERN`] is a MODELLED constraint, so what refuses it is the
+/// standard constraint-violation message built from the request — the clause naming the
+/// member path, echoing the submitted value and quoting the expression it has to satisfy.
+/// The check runs here rather than at the protocol boundary only because the expression is a
+/// negative lookahead, which the framework's constraint walk cannot compile and therefore
+/// passes over; the sentence it would have written is the one written here, through the
+/// framework's own clause and envelope, so the two cannot drift. The value is echoed in full:
+/// `@length`'s maximum of 256 characters bounds it, and anything longer was already refused
+/// at the boundary by that constraint.
+///
+/// The pattern reads as: a non-empty name that neither starts nor ends with a space and
+/// carries no control character and no `:`, `/` or `|`.
 fn check_scheduled_action_name(name: &str) -> Result<(), String> {
+    use ::aws_smithy_schema_server::constraints::{envelope, Violation, ViolationKind};
+
     /// The characters the pattern's middle alternative forbids anywhere in the name.
     const FORBIDDEN: [char; 3] = [':', '/', '|'];
 
@@ -435,30 +453,20 @@ fn check_scheduled_action_name(name: &str) -> Result<(), String> {
             || character.is_control()
             || ('\u{7f}'..='\u{9f}').contains(&character)
     };
-    let reason = if name.is_empty() {
-        Some("must not be empty".to_string())
-    } else if name.starts_with(' ') || name.ends_with(' ') {
-        Some("must not begin or end with a space".to_string())
-    } else {
-        name.chars()
-            .find(|character| forbidden(*character))
-            .map(|character| {
-                if FORBIDDEN.contains(&character) {
-                    format!("must not contain '{character}'")
-                } else {
-                    format!(
-                        "must not contain the control character U+{:04X}",
-                        character as u32
-                    )
-                }
-            })
-    };
-    match reason {
-        None => Ok(()),
-        Some(reason) => Err(format!(
-            "Invalid scheduled action name: {name}. A scheduled action name {reason}"
-        )),
+    let satisfied = !name.is_empty()
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && !name.chars().any(forbidden);
+    if satisfied {
+        return Ok(());
     }
+    let violations = [Violation {
+        path: SCHEDULED_ACTION_NAME_PATH.to_string(),
+        kind: ViolationKind::Pattern(SCHEDULED_ACTION_NAME_PATTERN.to_string()),
+        value: Some(name.to_string()),
+    }];
+    // `envelope` answers `None` only for an empty set of violations, which this is not.
+    Err(envelope(&violations).unwrap_or_else(|| violations[0].message()))
 }
 
 /// This operation's modelled `ValidationException`, carrying `message`.

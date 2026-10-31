@@ -48,6 +48,11 @@
 //! ([`drive_scaling_clock`]) exists for: without it nothing would execute for a client that
 //! makes no further Application Auto Scaling call.
 //!
+//! A SCHEDULED ACTION is owed by the clock in exactly that sense — its occurrence comes due at
+//! an instant nobody has to call at — so the same pass materialises the occurrences the clock
+//! has made due ([`super::apply_due_scheduled_actions`]) and delivers the capacity they moved,
+//! and the same task keeps watching while the store holds one.
+//!
 //! One transition fires one execution: the instant the alarm last moved into `ALARM` is
 //! recorded on the policy, so no later pass performs the same breach twice. A breach that is
 //! WITHHELD rather than performed is the exception, and is left unconsumed — the alarm is
@@ -172,6 +177,14 @@ pub fn settle_policy_executions<Eng: Send + Sync + 'static>(engine: &Eng, region
     let Some(state) = service_state(engine) else {
         return;
     };
+    // STEP 0, under this service's lock: every scheduled occurrence the clock has already
+    // made due. A scheduled action fires at its own instant, with no alarm and no call
+    // involved, and the capacity it moves is owed to the scaled resource exactly as a policy
+    // execution's is — so it is materialised in the same pass, before the deliveries below.
+    {
+        let mut store = state.lock();
+        super::apply_due_scheduled_actions(&mut store, SystemTime::now());
+    }
     // A capacity movement another call made and the owning service has not been told about
     // yet goes first: it is older than anything this pass is about to perform.
     deliver_pending_capacity(engine, &state);
@@ -233,16 +246,16 @@ fn deliver_pending_capacity<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Start the one in-process task that looks for alarm breaches this store's policies are wired
-/// to, executes the ones the clock has made due, and stands down once the store holds no
-/// policy an alarm could fire or the wake-up cap is reached.
+/// Start the one in-process task that performs what the clock has already made due — the
+/// alarm breaches this store's policies are wired to, and the occurrences of its scheduled
+/// actions — and stands down once the store holds neither, or the wake-up cap is reached.
 ///
-/// A client drives an alarm into `ALARM` in CloudWatch and then watches the resource the
-/// policy scales — it makes no further Application Auto Scaling call — so an execution that
-/// only the next call to this service could perform would never happen at all. This is what
-/// makes the path observable without one. It does not change WHEN an execution happens: the
-/// task calls the same settle every handler calls, which performs what the stored alarm states
-/// have already made due.
+/// A client drives an alarm into `ALARM` in CloudWatch, or queues a scheduled action, and then
+/// watches the resource that gets scaled — it makes no further Application Auto Scaling call —
+/// so work that only the next call to this service could perform would never happen at all.
+/// This is what makes the path observable without one. It does not change WHEN the work
+/// happens: the task calls the same settle every handler calls, which performs what the stored
+/// alarm states and schedules have already made due.
 ///
 /// At most one clock runs per store (the store carries the claim, which a clock whose task has
 /// ended without releasing it does not keep), and with no async runtime to spawn onto there is
@@ -341,8 +354,14 @@ fn set_scaling_clock(
     }
 }
 
-/// Whether this store still holds a policy an alarm could fire — and, when it does not,
-/// RELEASES the clock's claim.
+/// Whether this store still holds work a later pass could reach — a policy an alarm could
+/// fire, or any scheduled action — and, when it does not, RELEASES the clock's claim.
+///
+/// A scheduled action counts whether or not its next occurrence is still ahead: whether one
+/// is takes the schedule, the time zone and the clock to decide, per action, and this is asked
+/// on every wake-up, so the cheap test is the one taken. What it costs is that a store holding
+/// only SPENT one-shot actions keeps the clock waking up until the wake-up cap retires it,
+/// which is bounded and does nothing each time.
 ///
 /// Observing "nothing is wanted" and standing down happen in ONE critical section, which is
 /// what makes the hand-over race-free: a write holds this same lock to store the policy BEFORE
@@ -355,7 +374,11 @@ fn still_wanted_or_release(
     let wanted = store
         .policies
         .values()
-        .any(|record| is_alarm_driven(&record.policy_type));
+        .any(|record| is_alarm_driven(&record.policy_type))
+        // A scheduled action is driven by the CLOCK rather than by a call: a client that
+        // queues one watches the resource it scales, not this service, so without the clock
+        // the occurrence would wait for an Application Auto Scaling call that never comes.
+        || !store.scheduled_actions.is_empty();
     if !wanted {
         release_scaling_clock(store, generation);
     }

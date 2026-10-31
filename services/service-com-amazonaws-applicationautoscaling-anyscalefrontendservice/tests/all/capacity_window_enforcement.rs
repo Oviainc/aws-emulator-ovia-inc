@@ -24,13 +24,14 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::state::ACTIVITY_FULFILMENT;
 
 use super::emulator::{error_code, Emulator};
 
-/// How long a case waits before reading the resource a movement was queued for. It exceeds
-/// the fulfilment span the service gives a movement (600 ms), and nothing sleeps for it
-/// inside the emulator.
-const FULFILMENT_WAIT: Duration = Duration::from_millis(900);
+/// How long a case waits before reading the resource a movement was queued for: the
+/// fulfilment span the service gives a movement, taken from the service's own constant, plus
+/// a margin. Nothing sleeps for it inside the emulator.
+const FULFILMENT_WAIT: Duration = ACTIVITY_FULFILMENT.saturating_add(Duration::from_millis(300));
 
 /// Which service owns the resource a row scales, and therefore where its capacity is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

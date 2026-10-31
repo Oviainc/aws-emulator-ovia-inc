@@ -18,12 +18,14 @@
 //! * a schedule expression that does not parse reports where the parse stopped and the
 //!   token it stopped on, and one that is not a schedule at all is answered with the
 //!   grammar;
-//! * an illegal `ScheduledActionName` states the rule it breaks in prose;
+//! * an illegal `ScheduledActionName` is refused (the modelled-constraint message it carries
+//!   is pinned by the `recorded_refusal_wording` suite);
 //! * a policy configuration that cannot be evaluated is refused with the model's own
 //!   sentence for the rule;
 //! * a tag operation addressed to an ARN that names no registered scalable target says so:
-//!   the READ reports that the resource is not there, while the two WRITES answer the
-//!   recorded permission failure (`refusal_texts` pins that sentence).
+//!   the READ reports that the resource is not there, while the two WRITES report it for an
+//!   ARN this service MINTED and answer the recorded permission failure for one it never
+//!   minted (`refusal_texts` pins that sentence).
 
 use serde_json::{json, Value};
 
@@ -69,6 +71,12 @@ struct DynamoRow {
     expected: &'static str,
 }
 
+/// The sentence a (namespace, resource id, dimension) triple that does not describe one
+/// resource is refused with: the combination is what is unsupported, so the text names none of
+/// the three.
+const UNSUPPORTED_TRIPLE: &str = "Unsupported service namespace, resource type or scalable \
+                                  dimension";
+
 /// The catalog: the four DynamoDB resolution families, each on more than the one resource id
 /// the issue cited, so what is pinned is the sentence rather than one request's values.
 const DYNAMO_ROWS: &[DynamoRow] = &[
@@ -112,26 +120,22 @@ const DYNAMO_ROWS: &[DynamoRow] = &[
         setup: Setup::OnDemand,
         resource_id: "table/orders",
         dimension: "dynamodb:table:WriteCapacityUnits",
-        expected: "DynamoDB table table/orders is in PAY_PER_REQUEST billing mode and has no \
-                   provisioned throughput to scale",
+        expected: "Validation failed for scalable target. Reason: PAY_PER_REQUEST table mode is \
+                   not scalable.",
     },
     DynamoRow {
         case: "a table resource id paired with an index dimension",
         setup: Setup::Provisioned,
         resource_id: "table/orders",
         dimension: "dynamodb:index:ReadCapacityUnits",
-        expected: "ResourceId not valid for ScalableDimension dynamodb:index:ReadCapacityUnits: \
-                   table/orders must name a resource of type index in the dynamodb service \
-                   namespace, of the form table/{table name}/index/{index name}",
+        expected: UNSUPPORTED_TRIPLE,
     },
     DynamoRow {
         case: "an index resource id paired with a table dimension",
         setup: Setup::WithIndex,
         resource_id: "table/orders/index/by-customer",
         dimension: "dynamodb:table:ReadCapacityUnits",
-        expected: "ResourceId not valid for ScalableDimension dynamodb:table:ReadCapacityUnits: \
-                   table/orders/index/by-customer must name a resource of type table in the \
-                   dynamodb service namespace, of the form table/{table name}",
+        expected: UNSUPPORTED_TRIPLE,
     },
 ];
 
@@ -532,27 +536,22 @@ async fn an_expression_that_is_not_a_schedule_is_answered_with_the_grammar() {
 }
 
 #[tokio::test]
-async fn an_illegal_scheduled_action_name_states_the_rule_it_breaks() {
+async fn an_illegal_scheduled_action_name_is_refused_and_a_legal_one_is_stored() {
     let emulator = Emulator::empty();
     let target = emulator.given_target("ecs:service:DesiredCount", 1, 5).await;
 
-    // One row per alternative of the modelled pattern, each with the rule the name breaks.
-    for (case, name, reason) in [
-        ("a slash", "scale-up/weekday", "must not contain '/'"),
-        ("a colon", "scale:up", "must not contain ':'"),
-        ("a pipe", "scale|up", "must not contain '|'"),
-        ("a leading space", " scale-up", "must not begin or end with a space"),
-        ("a trailing space", "scale-up ", "must not begin or end with a space"),
-        (
-            "a C0 control character",
-            "scale\u{1}up",
-            "must not contain the control character U+0001",
-        ),
-        (
-            "a C1 control character",
-            "scale\u{85}up",
-            "must not contain the control character U+0085",
-        ),
+    // One row per alternative of the modelled pattern. What the refusal SAYS is the
+    // modelled-constraint message, which the `recorded_refusal_wording` suite pins (it is the
+    // one refusal of this service that IS the constraint template, because the constraint is
+    // the model's own); what is asserted here is that each alternative is refused at all.
+    for (case, name) in [
+        ("a slash", "scale-up/weekday"),
+        ("a colon", "scale:up"),
+        ("a pipe", "scale|up"),
+        ("a leading space", " scale-up"),
+        ("a trailing space", "scale-up "),
+        ("a C0 control character", "scale\u{1}up"),
+        ("a C1 control character", "scale\u{85}up"),
     ] {
         let mut request = target.clone();
         request["ScheduledActionName"] = json!(name);
@@ -568,17 +567,10 @@ async fn an_illegal_scheduled_action_name_states_the_rule_it_breaks() {
             "case {case:?}: expected a ValidationException, got {body:?}"
         );
         let message = error_message(&body);
-        let expected = format!("Invalid scheduled action name: {name}. A scheduled action name {reason}");
-        assert_eq!(
-            message, expected,
-            "case {case:?}: expected {expected:?}, got {message:?}"
-        );
         assert!(
-            !message.contains("regular expression pattern"),
-            "case {case:?}: expected the rule in prose rather than the raw pattern, got \
-             {message:?}"
+            message.contains(name),
+            "case {case:?}: expected the refusal to echo the submitted name, got {message:?}"
         );
-        assert_service_text(case, &message);
     }
 
     // A name the pattern allows is still accepted.
@@ -619,7 +611,8 @@ const POLICY_ROWS: &[PolicyRow] = &[
                    "PredefinedMetricSpecification": {
                        "PredefinedMetricType": "ALBRequestCountPerTarget"}})
         },
-        expected: "A resource label is required when the metric type is ALBRequestCountPerTarget",
+        expected: "Resource label should be specified for predefined metric type \
+                   ALBRequestCountPerTarget",
     },
     PolicyRow {
         case: "a resource label on a metric that is not counted per target",
@@ -736,12 +729,11 @@ async fn a_policy_configuration_that_cannot_be_evaluated_states_the_documented_r
     }
 }
 
-/// The sentence a READ addressed to an ARN that names no registered scalable target
-/// carries. The two WRITES answer the recorded [`ACCESS_DENIED`] instead.
+/// The sentence a tag operation addressed to an ARN whose scalable target is gone carries.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
 
-/// The sentence a WRITE addressed to such an ARN carries: recorded behaviour for
-/// `TagResource` on a well-formed ARN that names no registered target.
+/// The sentence a WRITE addressed to an ARN this service never minted carries: recorded
+/// behaviour for `TagResource` on a well-formed ARN naming a resource that does not exist.
 const ACCESS_DENIED: &str = "Access Denied";
 
 #[tokio::test]
@@ -786,12 +778,12 @@ async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found(
     );
 
     // Every ARN that names no registered target now, whether it was minted and retired or
-    // never minted at all, is the same answer.
+    // never minted at all, is reported absent by the READ; the two WRITES tell the two apart.
     let never_minted =
         format!("arn:aws:application-autoscaling:{REGION}:000000000000:scalable-target/0123456789abcdef");
-    for (case, resource_arn) in [
-        ("a deregistered target's ARN", arn.clone()),
-        ("an ARN this emulator never minted", never_minted),
+    for (case, resource_arn, minted) in [
+        ("a deregistered target's ARN", arn.clone(), true),
+        ("an ARN this emulator never minted", never_minted, false),
     ] {
         // The read models `ResourceNotFoundException` ("the specified resource doesn't
         // exist"), which is a 404.
@@ -824,11 +816,16 @@ async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found(
         );
         assert_service_text(case, &message);
 
-        // The two writes answer the recorded permission failure instead: a write to a
-        // target the caller holds none of is `Access Denied` (pinned, with the rest of the
-        // tagging sentences, by the `refusal_texts` suite), not a report about the
-        // resource. What is asserted here is that neither is the boundary validator's
-        // template.
+        // The two writes follow what the ARN names: one this service MINTED named a scalable
+        // target, so its target being gone is reported about the resource (the modelled
+        // `ResourceNotFoundException`, a 404); one it never minted names nothing it can
+        // resolve, and the recorded answer for a write through it is the permission failure
+        // `refusal_texts` pins. Neither is the boundary validator's template.
+        let (expected_status, expected_code, expected_message) = if minted {
+            (404, "ResourceNotFoundException", TARGET_NOT_FOUND)
+        } else {
+            (400, "ValidationException", ACCESS_DENIED)
+        };
         for (operation, request) in [
             (
                 "TagResource",
@@ -840,15 +837,20 @@ async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found(
             ),
         ] {
             let (status, body) = emulator.call(operation, request).await;
-            assert!(
-                status == 400 || status == 404,
-                "case {case:?} on {operation}: expected the request to be refused, got \
-                 {status} {body:?}"
+            assert_eq!(
+                status, expected_status,
+                "case {case:?} on {operation}: expected HTTP {expected_status}, got {status} \
+                 {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                expected_code,
+                "case {case:?} on {operation}: expected {expected_code}, got {body:?}"
             );
             let message = error_message(&body);
             assert_eq!(
-                message, ACCESS_DENIED,
-                "case {case:?} on {operation}: expected {ACCESS_DENIED:?}, got {message:?}"
+                message, expected_message,
+                "case {case:?} on {operation}: expected {expected_message:?}, got {message:?}"
             );
             assert_service_text(case, &message);
         }

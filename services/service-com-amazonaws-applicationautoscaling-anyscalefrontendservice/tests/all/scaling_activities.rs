@@ -22,13 +22,15 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::state::ACTIVITY_FULFILMENT;
 
 use crate::emulator::{error_code, Emulator};
 
 /// How long a case waits before expecting an activity to have reached its terminal
-/// status. It must exceed `crate::state::ACTIVITY_FULFILMENT` (600 ms), the span the
-/// service gives a capacity movement, and nothing in the emulator sleeps for it.
-const FULFILMENT_WAIT: Duration = Duration::from_millis(900);
+/// status: the span the service gives a capacity movement, taken from the service's own
+/// constant so the wait cannot drift from it, plus a margin. Nothing in the emulator sleeps
+/// for it.
+const FULFILMENT_WAIT: Duration = ACTIVITY_FULFILMENT.saturating_add(Duration::from_millis(300));
 
 /// Call `RegisterScalableTarget` and assert it succeeded, creating the resource the target
 /// names first where this emulator owns the service that resource lives in.

@@ -650,11 +650,37 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
         "case {case:?}: expected DeregisterScalableTarget to answer 200, got {status} {body:?}"
     );
 
+    // The ARN of the target that WAS registered names a scalable target this service minted,
+    // so every one of the three reports the resource as gone: the modelled
+    // `ResourceNotFoundException` and its HTTP 404.
+    for (operation, request) in [
+        (
+            "TagResource",
+            json!({"ResourceARN": withdrawn, "Tags": {"a": "1"}}),
+        ),
+        (
+            "UntagResource",
+            json!({"ResourceARN": withdrawn, "TagKeys": ["a"]}),
+        ),
+        ("ListTagsForResource", json!({"ResourceARN": withdrawn})),
+    ] {
+        let (status, body) = emulator.call(operation, request).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected {operation} to refuse with HTTP 404, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected {operation} to answer ResourceNotFoundException, got {body:?}"
+        );
+    }
+
     // Every ARN below satisfies the modelled `@pattern`
     // (^arn:.+:application-autoscaling:.+:[0-9]+:scalable-target\/[a-zA-Z0-9-]+$), so
-    // each one reaches the handler rather than the boundary validator.
+    // each one reaches the handler rather than the boundary validator — and none of them is
+    // one this service minted.
     let unresolvable: &[(&str, String)] = &[
-        (case, withdrawn),
         (
             "a well-formed ARN of a target that was never registered",
             format!(
@@ -685,8 +711,9 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
     ];
 
     for (case, arn) in unresolvable {
-        // The two mutating operations model `ValidationException`, which is what the
-        // recorded run shows AWS answering for a resource that does not exist.
+        // None of these ARNs is one this service minted, so the two WRITES are refused as
+        // writes it cannot resolve — the 400 `ValidationException` the recorded run shows —
+        // while the READ reports on the resource.
         for (operation, request) in [
             ("TagResource", json!({"ResourceARN": arn, "Tags": {"a": "1"}})),
             (

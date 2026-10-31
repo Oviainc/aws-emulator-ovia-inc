@@ -74,6 +74,14 @@ impl Emulator {
                 Arc::clone(&engine),
             ),
         );
+        // Registering a scalable target creates that namespace's service-linked role in IAM,
+        // so a suite that reads the role back needs IAM mounted on the same engine — which is
+        // what `core/router` assembles too.
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
         Self { router, engine }
     }
 
@@ -242,6 +250,75 @@ impl Emulator {
             "case {service:?}: expected CreateService to answer 200, got {status} {body:?}"
         );
         format!("service/{cluster}/{service}")
+    }
+
+    /// Call an IAM operation, the way a client asks for one: an awsQuery POST whose
+    /// form-encoded body names the action, answered as the XML text of the response.
+    ///
+    /// IAM speaks awsQuery rather than awsJson, so it does not go through [`Self::dispatch`].
+    pub async fn call_iam(&self, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+        let mut body = format!("Action={action}&Version=2010-05-08");
+        for (name, value) in params {
+            body.push('&');
+            body.push_str(&form_encode(name));
+            body.push('=');
+            body.push_str(&form_encode(value));
+        }
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{REGION}/iam\
+                     /aws4_request, SignedHeaders=host, Signature=0"
+                ),
+            )
+            .body(bytes::Bytes::from(body))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let text = String::from_utf8(response.into_body().to_vec()).expect("a UTF-8 body");
+        (status, text)
+    }
+
+    /// The provisioned read or write capacity DynamoDB reports for a table, or for one of its
+    /// global secondary indexes, as `DescribeTable` answers it.
+    ///
+    /// This is the capacity a `dynamodb:*:*CapacityUnits` scalable target scales, read where a
+    /// client reads it: in the service that owns the table.
+    pub async fn provisioned_capacity(&self, resource_id: &str, reads: bool) -> i64 {
+        let rest = resource_id.trim_start_matches("table/");
+        let (table, index) = match rest.split_once("/index/") {
+            Some((table, index)) => (table, Some(index)),
+            None => (rest, None),
+        };
+        let (status, body) = self
+            .call_dynamodb("DescribeTable", json!({"TableName": table}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {resource_id:?}: expected DescribeTable to answer 200, got {status} {body:?}"
+        );
+        let throughput = match index {
+            None => body["Table"]["ProvisionedThroughput"].clone(),
+            Some(index) => body["Table"]["GlobalSecondaryIndexes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|described| described["IndexName"] == json!(index))
+                .map(|described| described["ProvisionedThroughput"].clone())
+                .unwrap_or(Value::Null),
+        };
+        let member = if reads {
+            "ReadCapacityUnits"
+        } else {
+            "WriteCapacityUnits"
+        };
+        throughput[member].as_i64().unwrap_or_else(|| {
+            panic!("case {resource_id:?}: expected a {member}, got {throughput:?}")
+        })
     }
 
     /// The `desiredCount` ECS reports for one service, as `DescribeServices` answers it.
@@ -674,6 +751,21 @@ pub fn at_schedule_in(due_in: std::time::Duration) -> (String, std::time::System
         .format("%Y-%m-%dT%H:%M:%S")
     );
     (schedule, at)
+}
+
+/// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC 3986's
+/// unreserved characters literal, which is how a client encodes an awsQuery parameter.
+fn form_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
 }
 
 /// The `__type` discriminator an awsJson error body carries, without its namespace.

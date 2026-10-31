@@ -182,8 +182,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // An engine that holds no state holds no scalable target either, so an ARN
-        // addressed to it resolves to nothing — the same refusal as an ARN that names no
-        // registered target, rather than a server error this operation does not model.
+        // addressed to it resolves to nothing — and it minted none, which is the refusal
+        // below, rather than a server error this operation does not model.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(validation(ACCESS_DENIED));
         };
@@ -191,13 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ResourceARN` "identifies the Application Auto Scaling scalable target that
         // you want to apply tags to", and the only ARNs that identify one are those
-        // `RegisterScalableTarget` minted and `DeregisterScalableTarget` has not
-        // withdrawn. The recorded behaviour for a well-formed ARN naming no registered
-        // target is a 400 `ValidationException` carrying `Access Denied`: a WRITE to a
-        // target the caller holds none of is answered as a permission failure, not as a
-        // report that the resource is absent (which is what the READ answers, see
-        // `list_tags_for_resource`). A scalable target is regional, so an ARN of another
-        // Region identifies no target this endpoint holds either.
+        // `RegisterScalableTarget` minted. Which refusal an ARN that resolves to no
+        // registered target gets follows WHAT IT NAMES, and the recorded behaviour of the
+        // two is different: an ARN this service minted named a scalable target, so the
+        // answer is the modelled `ResourceNotFoundException` ("the specified resource
+        // doesn't exist", HTTP 404) — the resource is gone; an ARN it never minted
+        // identifies nothing it can resolve, and a WRITE through it is refused as
+        // `Access Denied` without disclosing whether such a resource exists elsewhere. A
+        // scalable target is regional, so an ARN of another Region is neither: this
+        // endpoint minted none of it.
         let region = crate::state::request_region(ctx.parts());
         let resolved = state
             .arn_index
@@ -205,7 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|key| key.region == region)
             .cloned();
         let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
-            return Err(validation(ACCESS_DENIED));
+            return Err(if state.is_withdrawn_arn(&input.resource_arn, &region) {
+                target_not_found(&input.resource_arn)
+            } else {
+                validation(ACCESS_DENIED)
+            });
         };
 
         // The merge is computed before anything is stored: "To add a tag, specify a new
@@ -241,6 +247,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn validation(message: impl Into<String>) -> TagResourceError {
     TagResourceErrorModeled::ValidationException(ValidationException {
         message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an ARN this service minted whose
+/// scalable target is no longer registered, reporting that ARN in `ResourceName` — "the name
+/// of the Application Auto Scaling resource. This value is an Amazon Resource Name (ARN)".
+fn target_not_found(resource_arn: &str) -> TagResourceError {
+    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE.to_string()),
+        resource_name: Some(resource_arn.to_string()),
     })
     .into()
 }

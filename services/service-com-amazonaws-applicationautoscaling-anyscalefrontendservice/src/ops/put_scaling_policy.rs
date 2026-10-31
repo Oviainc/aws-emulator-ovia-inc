@@ -535,8 +535,12 @@ fn check_target_tracking_config(
             let is_alb = predefined.predefined_metric_type == ALB_REQUEST_COUNT_PER_TARGET;
             match (is_alb, predefined.resource_label.as_deref()) {
                 (true, None) => {
+                    // The recorded sentence for a predefined metric type whose series
+                    // cannot be resolved without the resource the label names. It states
+                    // the metric type from the request, so it names whichever type needs
+                    // one.
                     return Err(validation(format!(
-                        "A resource label is required when the metric type is \
+                        "Resource label should be specified for predefined metric type \
                          {ALB_REQUEST_COUNT_PER_TARGET}"
                     )))
                 }

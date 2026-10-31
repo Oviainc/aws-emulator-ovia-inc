@@ -410,6 +410,10 @@ const QUALIFIER_ROWS: &[QualifierRow] = &[
 #[tokio::test]
 async fn provisioned_concurrency_is_only_scalable_on_a_version_or_an_alias() {
     const DIMENSION: &str = "lambda:function:ProvisionedConcurrency";
+    /// The sentence a (namespace, resource id, dimension) triple that does not describe one
+    /// resource is refused with.
+    const UNSUPPORTED_TRIPLE: &str =
+        "Unsupported service namespace, resource type or scalable dimension";
 
     for row in QUALIFIER_ROWS {
         let case = row.case;
@@ -446,9 +450,15 @@ async fn provisioned_concurrency_is_only_scalable_on_a_version_or_an_alias() {
                 "ValidationException",
                 "case {case:?}: expected a ValidationException, got {body:?}"
             );
+            // An id that is not of the documented FORM is refused as a triple that does not
+            // describe one resource, which names none of the three members; one of the right
+            // form whose qualifier can carry no provisioned concurrency is refused by that
+            // rule, which names the id the request supplied.
+            let message = error_message(&body);
             assert!(
-                error_message(&body).contains(row.resource_id),
-                "case {case:?}: expected the refusal to name the resource id, got {body:?}"
+                message == UNSUPPORTED_TRIPLE || message.contains(row.resource_id),
+                "case {case:?}: expected either {UNSUPPORTED_TRIPLE:?} or a refusal naming the \
+                 resource id, got {body:?}"
             );
             assert!(
                 registered.is_empty(),

@@ -475,6 +475,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::policy_execution::settle_policy_executions(&*self.engine, &region);
         crate::state::policy_execution::drive_scaling_clock(&self.engine, &region);
 
+        // "Application Auto Scaling uses a service-linked role, which it creates if it does
+        // not yet exist": the role this namespace's targets are scaled through is brought
+        // into the account here, so the `RoleARN` the target reports names a role a client
+        // can read. With this service's store released, since the record is IAM's.
+        crate::state::ensure_service_linked_role(&*self.engine, &key.service_namespace);
+
         // The audit record for a state-changing call: who asked, what changed and that it
         // succeeded. Never the caller's secret — only the access key id it presented.
         ::tracing::info!(

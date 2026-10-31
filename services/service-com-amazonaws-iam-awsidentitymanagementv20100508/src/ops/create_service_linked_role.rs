@@ -321,29 +321,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let role = Role {
-            arn: crate::state::role_arn(&path, &role_name),
-            path,
-            role_id: store.next_role_id(),
-            create_date: crate::state::now(),
-            // The service that controls the role is the one that can assume it.
-            assume_role_policy_document: Some(crate::state::service_linked_role_trust_policy(
-                &input.aws_service_name,
-            )),
-            description: input.description,
-            max_session_duration: Some(crate::state::DEFAULT_MAX_SESSION_DURATION_SECONDS),
-            // The create carries neither a boundary nor tags, and a brand-new role
-            // has never been assumed, so there is no last-used activity to report.
-            permissions_boundary: None,
-            tags: None,
-            role_last_used: None,
-            // Only a role created from a role template carries one
-            // (`smithy_query(query="shape", shape="Role")`), which this is not.
-            source_role_template: None,
-            role_name,
-        };
+        // The record itself is built by the one helper that builds a service-linked role's,
+        // so the account's own create and a service linking a role to itself on first use
+        // cannot drift about what such a role carries.
+        let role = crate::state::insert_service_linked_role(
+            &mut store,
+            &input.aws_service_name,
+            &role_name,
+            input.description,
+        );
 
-        store.roles.insert(key, role.clone());
         Ok(CreateServiceLinkedRoleOutput { role: Some(role) })
     }
 }

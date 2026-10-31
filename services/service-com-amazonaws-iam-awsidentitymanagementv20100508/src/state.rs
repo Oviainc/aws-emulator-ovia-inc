@@ -3449,6 +3449,47 @@ pub fn service_linked_role_trust_policy(service_principal: &str) -> String {
     .to_string()
 }
 
+/// Write the service-linked role `role_name`, linked to `service_principal`, into this
+/// account's roles, and answer the record written.
+///
+/// The ONE place a service-linked role's record is built: the path IAM reserves for such a
+/// role, the trust policy that lets the linked service assume it, this store's own id minter
+/// and the default session duration. `CreateServiceLinkedRole` calls it for the account's own
+/// create, and a SERVICE that links a role to itself on first use calls it from its own crate,
+/// so what such a role carries cannot differ between the two.
+///
+/// What this does NOT decide stays with the caller, because the two paths answer them
+/// differently: the role quota, a name the account already holds, and authorization. It
+/// REPLACES a record held under the same name key.
+pub fn insert_service_linked_role(
+    store: &mut ComAmazonawsIamAwsidentitymanagementv20100508State,
+    service_principal: &str,
+    role_name: &str,
+    description: Option<String>,
+) -> Role {
+    let path = service_linked_role_path(service_principal);
+    let role = Role {
+        arn: role_arn(&path, role_name),
+        path,
+        role_id: store.next_role_id(),
+        create_date: now(),
+        // The service that the role is linked to is the one that can assume it.
+        assume_role_policy_document: Some(service_linked_role_trust_policy(service_principal)),
+        description,
+        max_session_duration: Some(DEFAULT_MAX_SESSION_DURATION_SECONDS),
+        // A brand-new role carries neither a boundary nor tags, and has never been assumed,
+        // so there is no last-used activity to report; only a role created from a role
+        // template carries a `SourceRoleTemplate`, which this is not.
+        permissions_boundary: None,
+        tags: None,
+        role_last_used: None,
+        source_role_template: None,
+        role_name: role_name.to_string(),
+    };
+    store.roles.insert(name_key(role_name), role.clone());
+    role
+}
+
 /// What every `DeletionTaskId` starts with: the fixed head of the format
 /// `DeleteServiceLinkedRole$DeletionTaskId` documents the identifier is returned in,
 /// `task/aws-service-role/<service-principal-name>/<role-name>/<task-uuid>`. Its second
