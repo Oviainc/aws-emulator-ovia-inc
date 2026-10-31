@@ -913,16 +913,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         let pending =
             crate::state::notifications::pending(&store, &input.bucket, &[created], correlation);
 
+        // The checksum the DESTINATION object carries, read back off the stored object the
+        // way every other reader of it reports one: "this checksum is only present if the
+        // checksum was uploaded with the object" (`CopyObjectResult$ChecksumCRC32`), and the
+        // copy above stores one exactly when the request named an algorithm or the source
+        // carried a whole-object checksum. `reported_checksums` is the one place an
+        // algorithm is mapped to the member that reports it, so the copy reports its
+        // checksum under the same member a read of the same object does — and the
+        // `ChecksumType` the value was computed under travels with it rather than being
+        // reported on its own.
+        let reported = crate::state::reported_checksums(
+            store
+                .bucket(&input.bucket)
+                .and_then(|bucket| bucket.object(&input.key))
+                .and_then(|stored| stored.checksum.as_ref()),
+        );
+
         let output = CopyObjectOutput {
-            // "Container for all response elements" — the entity tag and last-modified
-            // time of the object this copy created, which is what a client compares a
-            // later read against.
+            // "Container for all response elements" — the entity tag, last-modified
+            // time and checksum of the object this copy created, which is what a client
+            // compares a later read against.
             copy_object_result: Some(CopyObjectResult {
                 e_tag: Some(etag),
                 last_modified: Some(::aws_smithy_types::DateTime::from(last_modified)),
-                // The checksum members need a checksum nothing here computed, so none is
-                // reported rather than invented.
-                ..CopyObjectResult::default()
+                checksum_crc32: reported.crc32,
+                checksum_crc32_c: reported.crc32c,
+                checksum_crc64_nvme: reported.crc64nvme,
+                checksum_sha1: reported.sha1,
+                checksum_sha256: reported.sha256,
+                checksum_sha512: reported.sha512,
+                checksum_md5: reported.md5,
+                checksum_xxhash64: reported.xxhash64,
+                checksum_xxhash3: reported.xxhash3,
+                checksum_xxhash128: reported.xxhash128,
+                checksum_type: reported.checksum_type,
             }),
             // "Version ID of the source object that was copied"
             // (`CopyObjectOutput$CopySourceVersionId`) — read off the stored version the

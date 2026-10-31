@@ -272,12 +272,15 @@ async fn a_listing_reports_every_created_bucket_in_name_order() {
                  BucketRegion, got {:?}",
                 BucketListing::entry_field(entry, "BucketRegion")
             );
-            // Directory buckets only, per `Bucket$BucketArn`.
+            // "The Amazon Resource Name (ARN) of the S3 bucket" (`Bucket$BucketArn`): the
+            // ARN of the bucket the entry reports, which for a general purpose bucket
+            // carries its globally unique name and leaves the Region and account fields
+            // empty.
             assert_eq!(
                 BucketListing::entry_field(entry, "BucketArn"),
-                "",
-                "case {case:?}, bucket {name:?}: a general purpose bucket reports no \
-                 BucketArn, got {:?}",
+                format!("arn:aws:s3:::{name}"),
+                "case {case:?}, bucket {name:?}: the entry must report the bucket's ARN, \
+                 got {:?}",
                 BucketListing::entry_field(entry, "BucketArn")
             );
         }

@@ -232,10 +232,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // member reports (`AccessPointAlias`: "Indicates whether the bucket name used
             // in the request is an access point alias").
             access_point_alias: Some(false),
-            // The remaining three members are documented as directory-bucket only
-            // (`BucketArn`, `BucketLocationName`, `BucketLocationType`), and this
-            // emulator holds general purpose buckets, so none is reported.
-            bucket_arn: None,
+            // "The Amazon Resource Name (ARN) of the S3 bucket" (`BucketArn`), the ARN of
+            // the bucket this read looked up — built from the bucket's own recorded kind
+            // and Region ([`crate::state::Bucket::arn`]), so it is the one string every
+            // reader of that bucket reports and the one a policy or a tag request names it
+            // by.
+            //
+            // Reported for EVERY bucket a read answers for, not only a directory bucket:
+            // S3 answers `x-amz-bucket-arn` for a general purpose bucket too, in the
+            // `arn:aws:s3:::<bucket>` form the member's own pattern admits beside the
+            // `s3express` one (`^arn:[^:]+:(s3|s3express):`) — the member's note is a
+            // sentence about where tagging a bucket by ARN is supported, not about which
+            // bucket a HEAD identifies. Without it a caller that just resolved a bucket
+            // cannot name it to another service, which is the whole of what this member is
+            // for.
+            bucket_arn: Some(bucket.arn(&input.bucket)),
+            // The remaining two members are documented as directory-bucket only
+            // (`BucketLocationName`, `BucketLocationType`), and this emulator holds
+            // general purpose buckets, so neither is reported.
             bucket_location_name: None,
             bucket_location_type: None,
         })

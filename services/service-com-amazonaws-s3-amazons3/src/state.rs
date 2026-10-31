@@ -5311,6 +5311,23 @@ impl Bucket {
         }
     }
 
+    /// The ARN of this bucket, held under the name `name` it is recorded in the store by:
+    /// "the Amazon Resource Name (ARN) of the S3 bucket. ARNs uniquely identify Amazon Web
+    /// Services resources" (`HeadBucketOutput$BucketArn`).
+    ///
+    /// Which form it takes is decided by the bucket's own KIND, not by the operation
+    /// reporting it: a directory bucket is named in the `s3express` namespace, with the
+    /// Region and account its zone is in ([`directory_bucket_arn`]), and a general purpose
+    /// bucket by its globally unique name alone ([`bucket_arn`]). One place, so every
+    /// reader that reports a bucket's ARN reports the same string for the same bucket.
+    pub fn arn(&self, name: &str) -> String {
+        if self.is_directory() {
+            directory_bucket_arn(&self.region, name)
+        } else {
+            bucket_arn(name)
+        }
+    }
+
     /// Whether ACLs are DISABLED on the bucket, i.e. its effective `ObjectOwnership`
     /// setting is [`BUCKET_OWNER_ENFORCED`] — which is what a bucket is CREATED with
     /// unless the create or a later `PutBucketOwnershipControls` names another value.

@@ -75,6 +75,17 @@
 //! [`MODE_HEADER_VALUES`] is the one place that rule lives, and [`mode_headers_folded`] folds
 //! an incoming value onto the model's spelling — only its CASE, so a mode the model does not
 //! list is still refused, and only for an operation whose own input binds that header.
+//!
+//! ## An output that binds NOTHING to the body: a response with no document
+//!
+//! The framework's generic serializer always opens the output shape's element, so an
+//! operation whose every output member is bound to a response HEADER still answers an empty
+//! envelope — `<PutObjectOutput></PutObjectOutput>` for a write whose whole result is its
+//! `ETag` and `x-amz-version-id`. S3 sends no body there at all, and a client that reads the
+//! response DOCUMENT for the write's result finds a document carrying none of it.
+//! [`without_unbound_body`] is the one place that rule lives, keyed on the output SCHEMA so
+//! every such operation answers the same way; an output with a payload member or a member
+//! written into the envelope keeps the document that IS its response.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -1079,6 +1090,40 @@ fn with_attribute_members(mut response: Response) -> Response {
     response
 }
 
+/// `response` with no body at all when the operation's output binds NOTHING to one.
+///
+/// An output every member of which goes out in a response HEADER (or as the response
+/// status) leaves no document to send, and S3 sends none: `PutObject` answers 200 with an
+/// empty payload and its result — the stored object's `ETag`, the `x-amz-version-id` of
+/// the version it created — in those headers (Amazon S3 API Reference, *PutObject* sample
+/// response, whose body is `Content-Length: 0`). The framework's generic restXml
+/// serializer always opens the output shape's element, so unaided such an operation
+/// answers an empty envelope (`<PutObjectOutput></PutObjectOutput>`): a document the API
+/// does not send, and one in which a client that reads the response DOCUMENT for the
+/// write's result finds none of it.
+///
+/// The response's own HEADERS are left exactly as the serializer wrote them, this
+/// service's `content-type` included: a response that carries no body still describes what
+/// a `GET` of the same resource would have answered with, which is what makes a HEAD's
+/// headers worth reading at all.
+///
+/// Keyed on the output SCHEMA rather than on the operation, so every operation whose
+/// result is entirely header-bound answers the same way and no new one has to be added
+/// here. An output with a payload member or any member written into the envelope is
+/// untouched — its body IS the response.
+fn without_unbound_body(mut response: Response, output_schema: &Schema) -> Response {
+    let binds_nothing = output_schema.members().iter().all(|member| {
+        member.http_header().is_some()
+            || member.http_prefix_headers().is_some()
+            || member.http_response_code().is_some()
+    });
+    if !binds_nothing {
+        return response;
+    }
+    *response.body_mut() = SdkBody::empty();
+    response
+}
+
 impl ServerProtocol for UnwrappedXmlRestXml {
     type Request = Request;
     type Response = Response;
@@ -1244,10 +1289,14 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // namespace-aware parser can read it. And a response that reports a
         // `Content-Range` carries PART of the object, which HTTP answers with 206. A
         // timestamp header the model binds in the `date-time` format is re-rendered in it.
+        // An output that binds nothing to the body answers with no body at all.
         Ok(with_request_correlation(
-            with_date_time_timestamp_headers(with_partial_content_status(with_attribute_members(
-                response,
-            ))),
+            without_unbound_body(
+                with_date_time_timestamp_headers(with_partial_content_status(
+                    with_attribute_members(response),
+                )),
+                output_schema,
+            ),
             correlation,
         ))
     }

@@ -231,5 +231,7 @@ mod signature_refusal_wording;
 mod state_roundtrip;
 #[path = "all/version_id_classification.rs"]
 mod version_id_classification;
+#[path = "all/write_response_identity.rs"]
+mod write_response_identity;
 #[path = "all/zz_probe.rs"]
 mod zz_probe;

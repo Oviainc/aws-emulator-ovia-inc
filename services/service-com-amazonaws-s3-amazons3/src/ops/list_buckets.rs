@@ -299,10 +299,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // instant of this read, so two listings report the same date.
                 creation_date: bucket.created_at().map(::aws_smithy_types::DateTime::from),
                 bucket_region: reports_region.then(|| bucket.region.clone()),
-                // "This parameter is only supported for S3 directory buckets"
-                // (`Bucket$BucketArn`), and this store holds general purpose buckets —
-                // which is why `CreateBucket` reports no ARN for one either.
-                bucket_arn: None,
+                // "The Amazon Resource Name (ARN) of the S3 bucket" (`Bucket$BucketArn`) —
+                // the ARN of the bucket this entry reports, built from the bucket's own
+                // recorded kind and Region ([`crate::state::Bucket::arn`]), so a listing
+                // names each bucket exactly as a read of that one bucket does, and for the
+                // same reason `HeadBucket` reports one: a caller that has just discovered a
+                // bucket cannot name it to another service from a bucket name alone.
+                bucket_arn: Some(bucket.arn(name)),
             });
         }
 
