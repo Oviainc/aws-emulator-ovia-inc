@@ -109,6 +109,8 @@ mod state_roundtrip;
 mod store_ceiling_quota_refusals;
 #[path = "all/store_refusal_precedence.rs"]
 mod store_refusal_precedence;
+#[path = "all/tag_bound_refusal_wording.rs"]
+mod tag_bound_refusal_wording;
 #[path = "all/task_namespace_refusals.rs"]
 mod task_namespace_refusals;
 #[path = "all/unissued_page_token_refusal.rs"]

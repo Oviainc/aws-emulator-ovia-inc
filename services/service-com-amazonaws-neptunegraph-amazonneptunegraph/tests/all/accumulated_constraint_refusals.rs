@@ -167,9 +167,20 @@ fn pattern_clause(member: &str, value: &str, model_pattern: &str) -> String {
     )
 }
 
-/// The clause a tag key longer than the stored bound fails.
-fn tag_key_clause(key_chars: usize) -> String {
-    format!("a tag key may be at most {MAX_TAG_KEY_CHARS} characters, got {key_chars}")
+/// The clause a tag key longer than the stored bound fails, restated here independently
+/// of the service's own builders: a bound on a map's KEYS is reported against the member
+/// the map sits at, listing everything a key of that map has to satisfy — the key shape is
+/// `@length(1..128)` and `@pattern("^[a-zA-Z+-=._:/]+$")`
+/// (`smithy_query(query="shape",shape="TagKey")`), the pattern reported without its
+/// anchors as this service reports every pattern — and, being a length bound, states those
+/// requirements without echoing the key that broke one.
+fn tag_key_clause() -> String {
+    format!(
+        "Value at 'tags' failed to satisfy constraint: Map keys must satisfy constraint: \
+         [Member must have length less than or equal to {MAX_TAG_KEY_CHARS}, Member must \
+         have length greater than or equal to 1, Member must satisfy regular expression \
+         pattern: [a-zA-Z+-=._:/]+]"
+    )
 }
 
 /// A tag map whose single key is `key_chars` characters long.
@@ -210,8 +221,9 @@ async fn a_refusal_reports_every_constraint_the_request_broke() {
     let router = emulator();
     let (graph_id, graph_arn) = fixture_graph(&router, "counting-graph").await;
 
-    // A key one character past the stored bound, and one far past it: the clause reports
-    // the length it was given, so the two rows are distinct messages.
+    // A key one character past the stored bound, and one far past it: a refusal states
+    // the bound rather than the length it was given, so both rows must earn the one
+    // clause.
     let one_past = MAX_TAG_KEY_CHARS + 1;
     let far_past = MAX_TAG_KEY_CHARS * 2;
 
@@ -240,7 +252,7 @@ async fn a_refusal_reports_every_constraint_the_request_broke() {
                 "provisionedMemory": MIN_PROVISIONED_MEMORY,
                 "tags": oversized_tags(one_past),
             })),
-            clauses: vec![tag_key_clause(one_past)],
+            clauses: vec![tag_key_clause()],
         },
         // TWO handler-enforced violations, in four different operations: the same two
         // broken members are reported as two clauses by each of them.
@@ -255,7 +267,7 @@ async fn a_refusal_reports_every_constraint_the_request_broke() {
             })),
             clauses: vec![
                 pattern_clause("graphName", "g-reserved", GRAPH_NAME_PATTERN),
-                tag_key_clause(far_past),
+                tag_key_clause(),
             ],
         },
         Row {
@@ -270,7 +282,7 @@ async fn a_refusal_reports_every_constraint_the_request_broke() {
             })),
             clauses: vec![
                 pattern_clause("graphName", "g-reserved", GRAPH_NAME_PATTERN),
-                tag_key_clause(far_past),
+                tag_key_clause(),
             ],
         },
         Row {
@@ -284,7 +296,7 @@ async fn a_refusal_reports_every_constraint_the_request_broke() {
             })),
             clauses: vec![
                 pattern_clause("snapshotName", "gs-reserved", SNAPSHOT_NAME_PATTERN),
-                tag_key_clause(one_past),
+                tag_key_clause(),
             ],
         },
         Row {
@@ -304,7 +316,7 @@ async fn a_refusal_reports_every_constraint_the_request_broke() {
                 "Value 'not-a-bucket-uri' at 'destination' failed to satisfy constraint: \
                  Member must be an Amazon S3 URI of the form s3://bucket[/key-prefix]"
                     .to_string(),
-                tag_key_clause(far_past),
+                tag_key_clause(),
             ],
         },
         // TWO violations of a different pair of classes: a blank member and a documented
@@ -370,7 +382,7 @@ async fn a_refusal_reports_every_constraint_the_request_broke() {
                      Member must be less than or equal to maxProvisionedMemory \
                      ({MIN_PROVISIONED_MEMORY})"
                 ),
-                tag_key_clause(one_past),
+                tag_key_clause(),
             ],
         },
         // TagResource: one handler-enforced violation, reported through the same counting
@@ -380,7 +392,7 @@ async fn a_refusal_reports_every_constraint_the_request_broke() {
             method: "POST",
             path: format!("/tags/{}", encode(&graph_arn)),
             body: Some(json!({"tags": oversized_tags(far_past)})),
-            clauses: vec![tag_key_clause(far_past)],
+            clauses: vec![tag_key_clause()],
         },
         // Controls on the OTHER side of the boundary: the model-driven walk counts the
         // same way, so a refusal cannot be told apart by its count or its form.
@@ -469,7 +481,7 @@ async fn the_same_broken_members_are_counted_the_same_by_every_operation_that_ch
     for (case, graph_name, key_chars) in inputs {
         let expected = expected_envelope(&[
             pattern_clause("graphName", graph_name, GRAPH_NAME_PATTERN),
-            tag_key_clause(key_chars),
+            tag_key_clause(),
         ]);
 
         // Every operation that enforces exactly these two constraints, each sent the same

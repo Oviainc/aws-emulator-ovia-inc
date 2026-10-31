@@ -2425,18 +2425,17 @@ pub fn blank_node_handling_clause(
 ///
 /// The SCHEME is deliberately not constrained: `source` is documented as "an Amazon S3
 /// path, or ... a Neptune database endpoint or snapshot", so no one scheme is required.
-/// The returned requirement never echoes the value — the one that broke the upper bound
-/// is exactly the value that must not be sent back.
+/// Both bounds are worded by the one builder every length refusal of this service is
+/// worded by, so a bound this handler enforces reads exactly as the boundary states the
+/// same class — and the requirement never measures the value back, so the value that
+/// broke the upper bound is not echoed.
 pub fn import_source_requirement(source: &str) -> Option<String> {
     if source.trim().is_empty() {
-        return Some("Member must have length greater than or equal to 1".to_string());
+        return Some(min_length_requirement(1));
     }
     let stored_chars = source.chars().count();
     if stored_chars > MAX_IMPORT_SOURCE_CHARS {
-        return Some(format!(
-            "Member must have length less than or equal to {MAX_IMPORT_SOURCE_CHARS}, \
-             got {stored_chars}"
-        ));
+        return Some(max_length_requirement(MAX_IMPORT_SOURCE_CHARS));
     }
     None
 }
@@ -2545,6 +2544,14 @@ pub const MAX_PRIVATE_GRAPH_ENDPOINTS: usize = 100;
 
 /// From the modelled `TagKey`: `@length(1..128)`.
 pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// From the modelled `TagKey`: `@length(1..128)`'s lower bound.
+pub const MIN_TAG_KEY_CHARS: usize = 1;
+
+/// From the modelled `TagKey`: `@pattern("^[a-zA-Z+-=._:/]+$")`, as the model spells it
+/// (`smithy_query(query="shape",shape="TagKey")`). Reported through
+/// [`pattern_requirement`], which states it the way this service states every pattern.
+pub const TAG_KEY_PATTERN: &str = "^[a-zA-Z+-=._:/]+$";
 
 /// From the modelled `TagValue`: `@length(0..256)`.
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
@@ -3370,16 +3377,28 @@ pub fn private_graph_endpoint_exists_conflict() -> ConflictException {
     precondition_conflict("create the private graph endpoint", "it", "already exists")
 }
 
+/// The member every operation of this service binds a `TagMap` to, which is the member
+/// path every refusal of a tag bound is reported at.
+const TAGS_MEMBER: &str = "tags";
+
 /// Refuse more tag entries on one resource than it may hold ([`MAX_TAGS`]).
 ///
 /// `total` is the number of entries the record would hold AFTER the call, so
 /// `TagResource` checks the merge of what is stored with what it was sent rather than
-/// the request alone. `Err` carries the message, naming the bound it broke, for the
-/// caller to fix the request from.
+/// the request alone. `Err` carries the CLAUSE that states the broken bound, for the
+/// caller's operation to report inside the one envelope every constraint refusal of this
+/// service is counted in.
+///
+/// That clause is the one the boundary validator renders for the same `@length` on the
+/// same member — the entry count as the collection's display form, and the bound as the
+/// requirement — so a caller cannot tell the bound measured on a merge from the bound
+/// measured on a request.
 pub fn bound_tag_count(total: usize) -> Result<(), String> {
     if total > MAX_TAGS {
-        return Err(format!(
-            "tags may carry at most {MAX_TAGS} entries, got {total}"
+        return Err(constraint_clause(
+            TAGS_MEMBER,
+            Some(&format!("{total} entries")),
+            &max_length_requirement(MAX_TAGS),
         ));
     }
     Ok(())
@@ -3391,24 +3410,44 @@ pub fn bound_tag_count(total: usize) -> Result<(), String> {
 ///
 /// Reached by every operation that accepts a `tags` map (`CreateGraph`, `TagResource`),
 /// so the bound on what one record stores is stated once. The model's own `@length`
-/// traits on `TagMap`/`TagKey`/`TagValue` refuse these at the boundary too; the check is
-/// repeated at the growth site so the bound lives beside the write that stores it.
+/// traits on `TagMap`/`TagKey`/`TagValue` refuse the entry count and the values at the
+/// boundary too; the check is repeated at the growth site so the bound lives beside the
+/// write that stores it, and a key is bounded HERE alone, because the boundary's walk
+/// treats a map key as the entry's name rather than as a constrained value.
+///
+/// Every `Err` is a CLAUSE in the one form this service states a constraint violation
+/// in: the entry count through [`bound_tag_count`]; a KEY against the member the map sits
+/// at, listing everything a key of that map has to satisfy ([`map_key_requirement`]),
+/// because no boundary clause for a key exists to read like; and a VALUE at the entry's
+/// own path, which is where the boundary states a constraint an entry's value broke. A
+/// key or value that broke a length bound is exactly what must not be echoed, so those
+/// clauses state the member and the requirement and nothing else ([`length_clause`]).
+///
+/// The keys are checked before the values, and the offending entry is the first in key
+/// order, so one map that breaks either bound twice is refused identically every time
+/// rather than by whichever entry the map happened to yield first.
 pub fn bound_tags(tags: &HashMap<String, String>) -> Result<(), String> {
     bound_tag_count(tags.len())?;
-    for (key, value) in tags {
-        let key_chars = key.chars().count();
-        if key_chars > MAX_TAG_KEY_CHARS {
-            return Err(format!(
-                "a tag key may be at most {MAX_TAG_KEY_CHARS} characters, got {key_chars}"
-            ));
-        }
-        let value_chars = value.chars().count();
-        if value_chars > MAX_TAG_VALUE_CHARS {
-            return Err(format!(
-                "the value of tag '{key}' may be at most {MAX_TAG_VALUE_CHARS} characters, \
-                 got {value_chars}"
-            ));
-        }
+    if tags.keys().any(|key| key.chars().count() > MAX_TAG_KEY_CHARS) {
+        return Err(length_clause(
+            TAGS_MEMBER,
+            &map_key_requirement(&[
+                max_length_requirement(MAX_TAG_KEY_CHARS),
+                min_length_requirement(MIN_TAG_KEY_CHARS),
+                pattern_requirement(TAG_KEY_PATTERN),
+            ]),
+        ));
+    }
+    let oversized_value = tags
+        .iter()
+        .filter(|(_, value)| value.chars().count() > MAX_TAG_VALUE_CHARS)
+        .map(|(key, _)| key)
+        .min();
+    if let Some(key) = oversized_value {
+        return Err(length_clause(
+            &format!("{TAGS_MEMBER}.{key}"),
+            &max_length_requirement(MAX_TAG_VALUE_CHARS),
+        ));
     }
     Ok(())
 }
@@ -3454,6 +3493,40 @@ pub fn pattern_requirement(pattern: &str) -> String {
 /// states are not always the same numeric type.
 pub fn min_value_requirement(min: impl ::std::fmt::Display) -> String {
     format!("Member must have value greater than or equal to {min}")
+}
+
+/// The requirement clause for a MINIMUM-LENGTH violation: the shortest the member
+/// accepts.
+///
+/// The sibling of [`min_value_requirement`], and here for the same reason: a bound the
+/// boundary validator refuses from the model and one an operation enforces itself are
+/// worded by the one builder, so neither side of the boundary can drift from the other.
+pub fn min_length_requirement(min: impl ::std::fmt::Display) -> String {
+    format!("Member must have length greater than or equal to {min}")
+}
+
+/// The requirement clause for a MAXIMUM-LENGTH violation: the longest the member
+/// accepts.
+///
+/// The upper-bound sibling of [`min_length_requirement`]. The clause states the bound
+/// the value had to satisfy and NOT the length it had: a requirement is what the member
+/// accepts, and measuring the rejected value back to the caller is what the value half
+/// of a clause is for.
+pub fn max_length_requirement(max: impl ::std::fmt::Display) -> String {
+    format!("Member must have length less than or equal to {max}")
+}
+
+/// The requirement clause for a constraint on the KEYS of a map member: everything a key
+/// of that map has to satisfy, listed inside the clause that says it is the map's keys
+/// that carry those requirements.
+///
+/// A map's keys reach no boundary refusal at all — the walk in front of a handler treats
+/// a key as the entry's name rather than as a constrained value — so the handler is where
+/// a key's own constraints are applied, and the clause lists the key shape's WHOLE
+/// declared set rather than only the bound that happened to break: the set is what a key
+/// must satisfy, and a caller fixing one key wants all of it.
+pub fn map_key_requirement(requirements: &[String]) -> String {
+    format!("Map keys must satisfy constraint: [{}]", requirements.join(", "))
 }
 
 /// The `ValidationException` message over one or more clauses: how many constraints were
@@ -4511,7 +4584,9 @@ mod tests {
     }
 
     /// The bound on what one stored record's tags may hold, at the limit and one past
-    /// it for the entry count, the key length and the value length.
+    /// it for the entry count, the key length and the value length — and the CLAUSE each
+    /// refusal states, written out here rather than built from the service's own
+    /// builders, so the wording is pinned independently of the code under test.
     #[test]
     fn tag_bounds_accept_the_limit_and_refuse_one_past_it() {
         let map = |pairs: Vec<(String, String)>| -> HashMap<String, String> {
@@ -4523,52 +4598,87 @@ mod tests {
                 .collect())
         };
 
-        // (case, tags, accepted)
-        let cases: Vec<(&str, HashMap<String, String>, bool)> = vec![
-            ("no tags", map(Vec::new()), true),
-            ("at the entry limit", many(MAX_TAGS), true),
-            ("one entry past the limit", many(MAX_TAGS + 1), false),
+        // (case, tags, the clause the refusal states, or `None` when the map is accepted)
+        let cases: Vec<(&str, HashMap<String, String>, Option<String>)> = vec![
+            ("no tags", map(Vec::new()), None),
+            ("at the entry limit", many(MAX_TAGS), None),
+            (
+                "one entry past the limit",
+                many(MAX_TAGS + 1),
+                Some(format!(
+                    "Value '{} entries' at 'tags' failed to satisfy constraint: Member \
+                     must have length less than or equal to {MAX_TAGS}",
+                    MAX_TAGS + 1
+                )),
+            ),
             (
                 "a key at the length limit",
                 map(vec![("k".repeat(MAX_TAG_KEY_CHARS), "v".to_string())]),
-                true,
+                None,
             ),
             (
                 "a key one character past the limit",
                 map(vec![("k".repeat(MAX_TAG_KEY_CHARS + 1), "v".to_string())]),
-                false,
+                Some(format!(
+                    "Value at 'tags' failed to satisfy constraint: Map keys must satisfy \
+                     constraint: [Member must have length less than or equal to \
+                     {MAX_TAG_KEY_CHARS}, Member must have length greater than or equal \
+                     to {MIN_TAG_KEY_CHARS}, Member must satisfy regular expression \
+                     pattern: {}]",
+                    unanchored(TAG_KEY_PATTERN)
+                )),
             ),
             (
                 "a value at the length limit",
                 map(vec![("k".to_string(), "v".repeat(MAX_TAG_VALUE_CHARS))]),
-                true,
+                None,
             ),
             (
                 "a value one character past the limit",
                 map(vec![("k".to_string(), "v".repeat(MAX_TAG_VALUE_CHARS + 1))]),
-                false,
+                Some(format!(
+                    "Value at 'tags.k' failed to satisfy constraint: Member must have \
+                     length less than or equal to {MAX_TAG_VALUE_CHARS}"
+                )),
+            ),
+            (
+                "two oversized values: the entry refused is the first in key order",
+                map(vec![
+                    ("b".to_string(), "v".repeat(MAX_TAG_VALUE_CHARS + 1)),
+                    ("a".to_string(), "v".repeat(MAX_TAG_VALUE_CHARS + 9)),
+                ]),
+                Some(format!(
+                    "Value at 'tags.a' failed to satisfy constraint: Member must have \
+                     length less than or equal to {MAX_TAG_VALUE_CHARS}"
+                )),
             ),
         ];
-        for (case, tags, accepted) in cases {
+        for (case, tags, expected) in cases {
             let actual = bound_tags(&tags);
             assert_eq!(
-                actual.is_ok(),
-                accepted,
-                "case {case:?}: expected accepted={accepted}, got {actual:?}"
+                actual.err(),
+                expected,
+                "case {case:?}: expected {expected:?}"
             );
         }
     }
 
-    /// The post-call entry count `TagResource` checks, at the limit and one past it.
+    /// The post-call entry count `TagResource` checks, at the limit and one past it,
+    /// stating the count it measured in the form a collection's size is reported in.
     #[test]
     fn the_tag_entry_bound_accepts_the_limit_and_refuses_one_past_it() {
         for total in [0, 1, MAX_TAGS - 1, MAX_TAGS, MAX_TAGS + 1, MAX_TAGS * 2] {
+            let expected = (total > MAX_TAGS).then(|| {
+                format!(
+                    "Value '{total} entries' at 'tags' failed to satisfy constraint: \
+                     Member must have length less than or equal to {MAX_TAGS}"
+                )
+            });
             let actual = bound_tag_count(total);
-            let accepted = total <= MAX_TAGS;
             assert_eq!(
-                actual.is_ok(),
-                accepted,
-                "case total={total}: expected accepted={accepted}, got {actual:?}"
+                actual.err(),
+                expected,
+                "case total={total}: expected {expected:?}"
             );
         }
     }

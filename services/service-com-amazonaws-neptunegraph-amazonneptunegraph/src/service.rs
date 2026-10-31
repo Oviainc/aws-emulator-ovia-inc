@@ -80,12 +80,8 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 fn constraint_clause(violation: &Violation) -> Option<String> {
     let requirement = match &violation.kind {
         ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
-        ViolationKind::MinLength(min) => {
-            format!("Member must have length greater than or equal to {min}")
-        }
-        ViolationKind::MaxLength(max) => {
-            format!("Member must have length less than or equal to {max}")
-        }
+        ViolationKind::MinLength(min) => crate::state::min_length_requirement(min),
+        ViolationKind::MaxLength(max) => crate::state::max_length_requirement(max),
         ViolationKind::MinValue(min) => crate::state::min_value_requirement(min),
         ViolationKind::MaxValue(max) => {
             format!("Member must have value less than or equal to {max}")

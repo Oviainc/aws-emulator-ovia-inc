@@ -218,8 +218,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record's tags may hold is stated once, in `crate::state`, and is reached by
         // every operation that accepts a `tags` map.
         if let Some(tags) = input.tags.as_ref() {
-            if let Err(message) = crate::state::bound_tags(tags) {
-                violations.push(message);
+            if let Err(clause) = crate::state::bound_tags(tags) {
+                violations.push(clause);
             }
         }
 
