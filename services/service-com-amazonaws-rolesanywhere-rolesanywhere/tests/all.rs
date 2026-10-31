@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/crl_import_and_read.rs"]
 mod crl_import_and_read;
+#[path = "all/crl_listing.rs"]
+mod crl_listing;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
