@@ -457,11 +457,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every table this create really provisions joins the managed table bucket's
-        // namespace, recorded against the bucket whose configuration created it, and stays in
-        // it until that configuration is deleted — which is what makes a create whose table
-        // name another bucket's configuration holds report the failure above. A table that
+        // namespace and stays in it for as long as this store lives — a table OUTLIVES the
+        // configuration that created it, which is what makes a create whose table name the
+        // namespace already holds report the failure above, whether that name was taken by
+        // another bucket's configuration or by this bucket's own earlier one. A table that
         // FAILED to be created adds nothing: the name was already taken by the table that is
-        // there, and that table's own configuration keeps it.
+        // there.
         let created: Vec<String> = [
             (!journal_taken).then(|| journal_name.clone()),
             recorded
@@ -479,22 +480,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .into_iter()
         .flatten()
         .collect();
-        // The namespace is bounded ([`crate::state::MAX_METADATA_NAMESPACE_TABLES`]): a name
-        // is released only by the delete of the configuration that created it, so a caller
-        // creating configurations for bucket after bucket without deleting any would grow the
-        // record without bound and the ceiling is what keeps it bounded. A create that
-        // would carry it past the maximum is refused with NOTHING recorded — the emulator's
-        // own ceiling, so it goes out through the framework's 400 refusal channel rather
-        // than as an AWS error code, the way this handler's other resource guard does.
-        if created.len() > store.metadata_namespace_room() {
+        // The namespace is bounded ([`crate::state::MAX_METADATA_NAMESPACE_TABLES`]): nothing
+        // releases a name, so a caller creating configurations for bucket after bucket would
+        // grow the record without bound and the ceiling is what keeps it bounded. Only a name
+        // the namespace does NOT already hold takes room in it, so a create colliding with
+        // tables that are already there is judged on what it would really add. A create that
+        // would carry the namespace past the maximum is refused with NOTHING recorded — the
+        // emulator's own ceiling, so it goes out through the framework's 400 refusal channel
+        // rather than as an AWS error code, the way this handler's other resource guard does.
+        let takes_room = created
+            .iter()
+            .filter(|name| !store.metadata_namespace_holds(name))
+            .count();
+        if takes_room > store.metadata_namespace_room() {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "the managed table bucket's namespace holds as many metadata tables as this \
                  emulator records ({})",
                 crate::state::MAX_METADATA_NAMESPACE_TABLES
             )));
         }
+        // The ceiling above is the one place that owns the bound: it was measured, under this
+        // same guard, against exactly the names recorded here, so recording them cannot carry
+        // the namespace past the maximum.
         for name in &created {
-            store.record_metadata_namespace_table(name, &input.bucket);
+            store.record_metadata_namespace_table(name);
         }
 
         let Some(bucket) = store.bucket_mut(&input.bucket) else {

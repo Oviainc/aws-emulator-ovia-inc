@@ -197,14 +197,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // subresource delete in this crate: a bucket carrying no configuration is already in
         // the asked-for state, so the call still succeeds.
         //
-        // The TABLES the configuration created go with it — they are the ones S3 Metadata
-        // created for that configuration in the managed table bucket's namespace, so their
-        // names are free again and a fresh `CreateBucketMetadataConfiguration` on the same
-        // bucket provisions its tables rather than finding their names taken. Exactly the
-        // tables THIS bucket's configuration created are released
-        // ([`crate::state::ComAmazonawsS3Amazons3State::delete_metadata_configuration`] does
-        // both halves under the one guard), so a configuration whose own table could not be
-        // created leaves the name of the table that is there where it was.
+        // The TABLES the configuration provisioned stay where they are: they are tables of
+        // the AWS-managed table bucket's namespace, and the published provisioning failure
+        // for a name already in it asks the caller to "delete the journal table, and then try
+        // again. To create a new metadata table, you must delete the metadata configuration
+        // for this bucket, and then create a new metadata configuration"
+        // ([`crate::state::METADATA_JOURNAL_TABLE_EXISTS_MESSAGE`]) — so this delete is the
+        // precondition for a new configuration, not the deletion of the leftover table. A
+        // create of the same configuration afterwards is therefore accepted and its journal
+        // table reports that failure, exactly as a create colliding with any other table of
+        // the namespace does.
         //
         // `false` is the bucket this emulator does not hold: the model declares no error for
         // this operation, so it is reported through the unmodelled channel with the code and

@@ -57,6 +57,8 @@ mod bucket_metadata_configuration_deletion;
 mod bucket_metadata_inventory_table_update;
 #[path = "all/bucket_metadata_journal_table_update.rs"]
 mod bucket_metadata_journal_table_update;
+#[path = "all/bucket_metadata_namespace_retention.rs"]
+mod bucket_metadata_namespace_retention;
 #[path = "all/bucket_metrics_configuration.rs"]
 mod bucket_metrics_configuration;
 #[path = "all/bucket_metrics_configuration_listing.rs"]
@@ -95,6 +97,8 @@ mod bucket_versioning;
 mod bucket_website;
 #[path = "all/bucket_website_delete.rs"]
 mod bucket_website_delete;
+#[path = "all/checksum_mode_header_case.rs"]
+mod checksum_mode_header_case;
 #[path = "all/directory_bucket_sessions_and_appends.rs"]
 mod directory_bucket_sessions_and_appends;
 #[path = "all/error_message_envelope.rs"]

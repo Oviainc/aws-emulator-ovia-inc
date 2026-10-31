@@ -15,10 +15,12 @@
 //!    configuration is already in the asked-for state. A bucket this emulator does not hold
 //!    is `NoSuchBucket` (404) and an `x-amz-expected-bucket-owner` that is not the account's
 //!    is `AccessDenied` (403).
-//! 2. The delete takes the tables the configuration created with it: they are the tables S3
-//!    Metadata created for THAT configuration in the managed table bucket's namespace, so an
-//!    identical create afterwards provisions them again — `CREATING` straight after the
-//!    create and `ACTIVE` once the activation span has passed, with no error reported.
+//! 2. The delete takes ONLY the configuration: the tables it provisioned stay in the managed
+//!    table bucket's namespace, which the published already-exists failure asks the caller to
+//!    delete separately, so an identical create afterwards is accepted and reports its
+//!    journal table `FAILED` with `JournalTableAlreadyExists`. The whole class is pinned by
+//!    [`super::bucket_metadata_namespace_retention`]; this suite keeps the one row that
+//!    follows the delete it is about.
 //! 3. A create whose table name is one the namespace already holds — the namespace is one per
 //!    Region, and two bucket names that differ only in the characters a table name cannot
 //!    carry name the same table — is ACCEPTED with that table reporting `TableStatus`
@@ -27,16 +29,16 @@
 //!    `JournalTableNotAvailable` for an inventory table whose journal table could not be
 //!    created ("an inventory table requires a journal table with an `ACTIVE` status", same
 //!    published list).
-//! 4. A delete releases exactly the tables the configuration it takes away CREATED: deleting
-//!    a configuration whose own table failed to be created leaves the name where it is, so
-//!    the bucket whose table really holds that name still reports it in service and a create
-//!    colliding with it is still answered the same failure.
+//! 4. A delete releases NO name at all: deleting a configuration whose own table failed to be
+//!    created leaves the name with the table that holds it, so the bucket whose table really
+//!    holds that name still reports it in service and a create colliding with it is still
+//!    answered the same failure.
 
 use service_com_amazonaws_s3_amazons3::state::{
     METADATA_INVENTORY_TABLE_EXISTS_CODE, METADATA_INVENTORY_TABLE_EXISTS_MESSAGE,
     METADATA_JOURNAL_TABLE_EXISTS_CODE, METADATA_JOURNAL_TABLE_EXISTS_MESSAGE,
     METADATA_JOURNAL_TABLE_UNAVAILABLE_CODE, METADATA_JOURNAL_TABLE_UNAVAILABLE_MESSAGE,
-    METADATA_TABLE_STATUS_ACTIVE, METADATA_TABLE_STATUS_CREATING, METADATA_TABLE_STATUS_FAILED,
+    METADATA_TABLE_STATUS_ACTIVE, METADATA_TABLE_STATUS_FAILED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -48,7 +50,11 @@ use super::bucket_metadata_configuration::{
 use super::object_and_tagging_roundtrip::text;
 
 /// `DELETE /<bucket>?metadataConfiguration` — `DeleteBucketMetadataConfiguration`.
-async fn delete_metadata_configuration(
+///
+/// `pub(crate)`, like the two readers below it: the namespace-retention suite
+/// ([`super::bucket_metadata_namespace_retention`]) drives the same subresource through the
+/// same harness instead of standing up a second copy of it.
+pub(crate) async fn delete_metadata_configuration(
     router: &MultiServiceRouter,
     bucket: &str,
     headers: &[(&str, &str)],
@@ -65,7 +71,7 @@ async fn delete_metadata_configuration(
 
 /// A `MetadataConfiguration` container: the required journal table, and the optional
 /// inventory and annotation tables when the case asks for them.
-fn payload(inventory: bool, annotation: bool) -> String {
+pub(crate) fn payload(inventory: bool, annotation: bool) -> String {
     let mut body = format!("<MetadataConfiguration xmlns=\"{XMLNS}\">");
     body.push_str(
         "<JournalTableConfiguration><RecordExpiration>\
@@ -92,7 +98,10 @@ fn payload(inventory: bool, annotation: bool) -> String {
 
 /// The `TableStatus`, `ErrorCode` and `ErrorMessage` a read reports for one table container
 /// of the configuration.
-fn reported(body: &str, container: &str) -> (Option<String>, Option<String>, Option<String>) {
+pub(crate) fn reported(
+    body: &str,
+    container: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
     let Some(fragment) = inside(body, container) else {
         return (None, None, None);
     };
@@ -108,7 +117,7 @@ fn reported(body: &str, container: &str) -> (Option<String>, Option<String>, Opt
 
 /// A bucket carrying a metadata configuration whose tables are in service, so a row acts on
 /// the state the API asks a caller to wait for.
-async fn bucket_with_an_active_configuration(
+pub(crate) async fn bucket_with_an_active_configuration(
     router: &MultiServiceRouter,
     bucket: &str,
     inventory: bool,
@@ -259,11 +268,12 @@ type TakenName = (
 );
 
 #[tokio::test]
-async fn an_identical_create_after_a_delete_provisions_its_tables_again() {
+async fn an_identical_create_after_a_delete_still_finds_its_table_names_taken() {
     let router = router();
 
-    // Both optional tables as well as the journal one, so every table the delete released is
-    // provisioned again rather than only the required one.
+    // Both optional tables as well as the journal one, so the names the delete left behind are
+    // read back for every table the configuration provisioned rather than only the required
+    // one.
     for (case, bucket, inventory) in [
         ("a journal table alone", "metadata-recreate-journal", false),
         (
@@ -281,8 +291,9 @@ async fn an_identical_create_after_a_delete_provisions_its_tables_again() {
             text(&deleted)
         );
 
-        // The identical create is accepted and provisions the tables again: the names the
-        // deleted configuration held went with it.
+        // The identical create is ACCEPTED — the bucket carries a configuration again — but
+        // the tables it would provision are still in the managed namespace, which the delete
+        // did not take them out of.
         let recreated =
             create_metadata_configuration(&router, bucket, &[], &payload(inventory, false)).await;
         assert_eq!(
@@ -292,40 +303,52 @@ async fn an_identical_create_after_a_delete_provisions_its_tables_again() {
             text(&recreated)
         );
 
-        let containers: Vec<&str> = match inventory {
-            false => vec!["JournalTableConfigurationResult"],
-            true => vec![
+        let expected: Vec<(&str, &str, &str)> = match inventory {
+            false => vec![(
                 "JournalTableConfigurationResult",
-                "InventoryTableConfigurationResult",
+                METADATA_JOURNAL_TABLE_EXISTS_CODE,
+                METADATA_JOURNAL_TABLE_EXISTS_MESSAGE,
+            )],
+            true => vec![
+                (
+                    "JournalTableConfigurationResult",
+                    METADATA_JOURNAL_TABLE_EXISTS_CODE,
+                    METADATA_JOURNAL_TABLE_EXISTS_MESSAGE,
+                ),
+                (
+                    "InventoryTableConfigurationResult",
+                    METADATA_INVENTORY_TABLE_EXISTS_CODE,
+                    METADATA_INVENTORY_TABLE_EXISTS_MESSAGE,
+                ),
             ],
         };
-        // Straight after the create each table is being created, and once the activation span
-        // has passed each is in service — with nothing reported about a failure either time.
-        for (when, expected) in [
-            ("straight after the create", METADATA_TABLE_STATUS_CREATING),
-            ("after the activation span", METADATA_TABLE_STATUS_ACTIVE),
-        ] {
+        // Provisioning failed, so each table reports the published code and sentence for its
+        // name being taken — before and after the span a successful creation would take, since
+        // nothing is going to create it.
+        for when in ["straight after the create", "after the activation span"] {
             if when == "after the activation span" {
                 wait_for_the_tables();
             }
             let read = get_metadata_configuration(&router, bucket, &[]).await;
             let body = text(&read);
-            for container in &containers {
+            for (container, expected_code, expected_message) in &expected {
                 let (status, code, message) = reported(&body, container);
                 assert_eq!(
                     status.as_deref(),
-                    Some(expected),
-                    "case {case:?} ({when}): {container} must report {expected}, got {body:?}"
+                    Some(METADATA_TABLE_STATUS_FAILED),
+                    "case {case:?} ({when}): {container} must report \
+                     {METADATA_TABLE_STATUS_FAILED}, got {body:?}"
                 );
                 assert_eq!(
-                    code, None,
-                    "case {case:?} ({when}): a table that was created reports no error code, \
-                     got {code:?}"
+                    code.as_deref(),
+                    Some(*expected_code),
+                    "case {case:?} ({when}): expected the {expected_code} error code, got \
+                     {code:?}"
                 );
                 assert_eq!(
-                    message, None,
-                    "case {case:?} ({when}): a table that was created reports no error \
-                     message, got {message:?}"
+                    message.as_deref(),
+                    Some(*expected_message),
+                    "case {case:?} ({when}): expected the published sentence, got {message:?}"
                 );
             }
         }

@@ -64,6 +64,17 @@
 //! mapping lives, and [`published_names_as_members`] normalizes an incoming document onto
 //! the member name the codec binds. Nothing is normalized on the way OUT: no operation in
 //! this service answers a union.
+//!
+//! ## A MODE header, whose value S3 reads case-insensitively
+//!
+//! The last thing this protocol normalizes is in a HEADER rather than in a document. S3 reads
+//! the value of `x-amz-checksum-mode` as the NAME OF A MODE, not as a case-sensitive
+//! identifier: the AWS CLI's own `s3 cp` download path sends it lowercase and AWS serves the
+//! read, while the member's target enum lists the one value `ENABLED`, so matching the value
+//! verbatim refuses `InvalidArgument` for a request every such client sends.
+//! [`MODE_HEADER_VALUES`] is the one place that rule lives, and [`mode_headers_folded`] folds
+//! an incoming value onto the model's spelling — only its CASE, so a mode the model does not
+//! list is still refused, and only for an operation whose own input binds that header.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -772,6 +783,66 @@ pub(super) fn request_query(uri: &str) -> &str {
     }
 }
 
+/// The request headers whose VALUE S3 reads as a MODE NAME rather than as a case-sensitive
+/// identifier, each with the spelling the model gives that mode.
+///
+/// `x-amz-checksum-mode` is the one such header this service binds: it asks for the checksum
+/// the object was stored with ("to retrieve the checksum, this parameter must be enabled",
+/// `ChecksumMode`'s own documentation) and its target enum has exactly ONE permitted value, so
+/// a case-insensitive match cannot be ambiguous. S3 serves the header however a client spells
+/// it — the AWS CLI's own `s3 cp` download path sends `enabled` and AWS answers 200 with the
+/// object's checksum, where refusing it answers `InvalidArgument` for a request AWS accepts.
+/// No other value is accepted: a mode the model does not list is still refused, because only
+/// the CASE is folded here.
+///
+/// Source: the permitted spellings are the GENERATED value set the model's own enum produced
+/// ([`crate::ops::types::CHECKSUM_MODE_VALUES`], `["ENABLED"]`), so a value the enum gains
+/// cannot drift from this fold; the header name is the `@httpHeader` the three operations that
+/// bind the member carry (`GetObject`, `HeadObject`, `GetObjectAnnotation`), and the fold below
+/// is applied only where the operation's own input binds it.
+const MODE_HEADER_VALUES: &[(&str, &[&str])] = &[(
+    "x-amz-checksum-mode",
+    crate::ops::types::CHECKSUM_MODE_VALUES,
+)];
+
+/// `request`'s headers with every [`MODE_HEADER_VALUES`] value the request spells in another
+/// case folded to the model's spelling — or `None` when there is nothing to fold, which is
+/// every request that spells them as the model does and every operation whose input binds no
+/// such header.
+///
+/// Driven off `input_schema`: the fold applies to a header the operation being served really
+/// binds, so a header of that name on an operation that binds no such member is left exactly
+/// as it arrived.
+fn mode_headers_folded(request: &Request, input_schema: &Schema) -> Option<Vec<(String, String)>> {
+    let bound = |name: &str| {
+        input_schema.members().iter().any(|member| {
+            member
+                .http_header()
+                .is_some_and(|header| header.value().eq_ignore_ascii_case(name))
+        })
+    };
+    let folded = |name: &str, value: &str| {
+        MODE_HEADER_VALUES
+            .iter()
+            .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+            .flat_map(|(_, modelled)| modelled.iter())
+            .find(|modelled| **modelled != value && modelled.eq_ignore_ascii_case(value))
+            .copied()
+    };
+    let mut headers = request_headers(request);
+    let mut changed = false;
+    for (name, value) in &mut headers {
+        if !bound(name) {
+            continue;
+        }
+        if let Some(modelled) = folded(name, value) {
+            *value = modelled.to_string();
+            changed = true;
+        }
+    }
+    changed.then_some(headers)
+}
+
 /// A request's headers as `(name, value)` pairs, original case preserved and every value
 /// of a repeated header kept, which is what the binding deserializer needs to bind a
 /// list-typed or prefixed header.
@@ -1047,6 +1118,11 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         let host_style_path = self
             .addressed_in_host(request)
             .map(|bucket| super::path_with_bucket(&bucket, request_path(request.uri())));
+        // The HEADERS the bound members are read from, with a MODE header the request spells
+        // in another case folded to the model's spelling ([`mode_headers_folded`]). `None`
+        // leaves the headers exactly as they arrived, which is every request that needs no
+        // fold.
+        let folded_headers = mode_headers_folded(request, input_schema);
         // Only a request whose BODY IS AN XML DOCUMENT can carry a member the framework's
         // codec cannot bind as the document spells it, and only a body that actually
         // spells one needs normalizing; everything else — every request whose body is not
@@ -1081,7 +1157,7 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                     input_schema.http().map(|http| http.uri()),
                     host_style_path.as_deref().unwrap_or(request_path(uri)),
                     request_query(uri),
-                    request_headers(request),
+                    folded_headers.unwrap_or_else(|| request_headers(request)),
                     OwnedXmlBody {
                         document: document.clone(),
                     },
@@ -1090,21 +1166,31 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 return Ok(Box::new(binding));
             }
         }
-        if let Some(path) = host_style_path {
-            // The framework's own deserializer reads the path off the request, which for a
-            // virtual-hosted-style request carries no bucket, so this one is built over the
-            // normalized path instead. Everything else is the framework's: the same binding
-            // deserializer, over the same query, headers and body.
+        if host_style_path.is_some() || folded_headers.is_some() {
+            // The framework's own deserializer reads the path and the headers off the request,
+            // which for a virtual-hosted-style request carries no bucket in its path and for a
+            // request spelling a mode in another case carries a value the model's enum does not
+            // list — so this one is built over the normalized path and headers instead.
+            // Everything else is the framework's: the same binding deserializer, over the same
+            // query and body.
+            let path = match host_style_path {
+                Some(path) => path,
+                None => request_path(request.uri()).to_string(),
+            };
             let body = request
                 .body()
                 .bytes()
                 .ok_or_else(|| ProtocolError::BodyRead("body is not available as bytes".into()))?;
+            // The body has to be IN MEMORY to be read here, which is the same condition the
+            // framework's own restXml deserializer puts on EVERY request it reads, so this
+            // branch asks no more of a request than the path it stands in for: a body not
+            // available as bytes is refused there too, whatever made this branch the one taken.
             let uri = request.uri();
             let binding = HttpBindingDeserializer::new(
                 input_schema.http().map(|http| http.uri()),
                 &path,
                 request_query(uri),
-                request_headers(request),
+                folded_headers.unwrap_or_else(|| request_headers(request)),
                 OwnedXmlBody {
                     document: body.to_vec(),
                 },
