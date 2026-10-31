@@ -589,6 +589,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .insert(requested.to_string(), id.clone());
         }
 
+        // A property or hierarchy this update drops takes with it every interface
+        // relationship mapping that named it — on whichever side of the
+        // relationship this model stands — for the same reason the composite model
+        // links above are pruned: a mapping naming a member this asset model no
+        // longer declares would name nothing.
+        store.prune_interface_relationship_mappings(&id);
+
         // "Updates an asset model and all of the assets that were created from the
         // model. Each asset created from the model inherits the updated asset
         // model's property and hierarchy definitions."

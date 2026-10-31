@@ -1336,7 +1336,11 @@ impl AssetModelRecord {
 /// The mappings are RESOLVED ONCE, by the call that applies the interface, and
 /// stored: they pair ids of two different models, which nothing else in the
 /// store relates, so a later read reports the pairing the application made
-/// rather than re-deriving one from definitions that may have moved since.
+/// rather than re-deriving one from definitions that may have moved since. What
+/// a later write to either definition does take away is a mapping whose half
+/// that model no longer declares — see
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::prune_interface_relationship_mappings`]
+/// — because such a mapping names nothing.
 #[derive(Debug, Clone)]
 pub struct InterfaceRelationshipRecord {
     /// The stored `assetModelId` of the model the interface is applied to.
@@ -4266,6 +4270,60 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
     ) -> Option<&InterfaceRelationshipRecord> {
         self.interface_relationships
             .get(&interface_relationship_key(asset_model_id, interface_asset_model_id))
+    }
+
+    /// Drop every mapping of every stored interface relationship that names a
+    /// property or a hierarchy `asset_model_id` no longer declares.
+    ///
+    /// A mapping pairs one member of the interface asset model with one member of
+    /// the model the interface is applied to, so it is addressable only while BOTH
+    /// models still declare their half of it: a mapping naming a member the model
+    /// has since dropped would name nothing, exactly as a composite-model link
+    /// pointing at a composite model its asset model no longer holds does. The
+    /// model stands on either side of a relationship — it may implement
+    /// interfaces and, being an interface, be implemented by other models — so
+    /// both halves are checked against it. Asked after a call rewrites this
+    /// model's definition; a model that is GONE takes its relationships whole
+    /// ([`Self::forget_asset_model`]).
+    ///
+    /// Only the mappings are pruned: the relationship itself is the application of
+    /// one model to another, which no change to a definition undoes, and mapping
+    /// nothing is a state an application can already resolve to.
+    pub fn prune_interface_relationship_mappings(&mut self, asset_model_id: &str) {
+        let Some(record) = self.asset_models.get(asset_model_id) else {
+            return;
+        };
+        let declared_properties: Vec<String> = record
+            .properties
+            .iter()
+            .filter_map(|property| property.id.clone())
+            .collect();
+        let declared_hierarchies: Vec<String> = record
+            .hierarchies
+            .iter()
+            .filter_map(|hierarchy| hierarchy.id.clone())
+            .collect();
+        for ((applied_to, interface), relationship) in self.interface_relationships.iter_mut() {
+            let applied_to_side = applied_to == asset_model_id;
+            let interface_side = interface == asset_model_id;
+            if !applied_to_side && !interface_side {
+                continue;
+            }
+            relationship.property_mappings.retain(|mapping| {
+                (!applied_to_side
+                    || declared_properties.contains(&mapping.asset_model_property_id))
+                    && (!interface_side
+                        || declared_properties
+                            .contains(&mapping.interface_asset_model_property_id))
+            });
+            relationship.hierarchy_mappings.retain(|mapping| {
+                (!applied_to_side
+                    || declared_hierarchies.contains(&mapping.asset_model_hierarchy_id))
+                    && (!interface_side
+                        || declared_hierarchies
+                            .contains(&mapping.interface_asset_model_hierarchy_id))
+            });
+        }
     }
 
     /// Resolve a `CustomID` label — a raw id or `externalId:<externalId>` — to a

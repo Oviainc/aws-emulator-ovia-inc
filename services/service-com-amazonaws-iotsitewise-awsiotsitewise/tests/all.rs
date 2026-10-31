@@ -922,3 +922,10 @@ mod session_dataset_data_segment_ingestion;
 #[path = "all/resolve_to_reference.rs"]
 mod resolve_to_reference;
 
+// Declared at the very END of this file, after every suite above, for the reason
+// the notes higher up give: the sorted list and the stretches of declarations
+// ahead of it are where every concurrent iotsitewise change inserts a
+// declaration of its own. Fold it into the sorted list once the churn settles.
+#[path = "all/asset_model_interface_relationship_update.rs"]
+mod asset_model_interface_relationship_update;
+
