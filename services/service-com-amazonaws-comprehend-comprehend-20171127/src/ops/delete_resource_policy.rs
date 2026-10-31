@@ -3,7 +3,7 @@
 //! @op DeleteResourcePolicy
 //! IMPLEMENTED. Removes the resource-based policy a custom model carries and answers
 //! an empty 200; a model that carries none is an idempotent no-op, and an ARN that
-//! names no model is 404 `ResourceNotFoundException`.
+//! names no model is `ResourceNotFoundException`.
 //!
 //! The policy lives on the model's own record
 //! ([`crate::state::DocumentClassifier::resource_policy`]), so this removes exactly

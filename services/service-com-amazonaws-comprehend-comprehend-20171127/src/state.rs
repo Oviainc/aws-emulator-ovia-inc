@@ -119,6 +119,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use regex::Regex;
+use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
@@ -258,6 +260,117 @@ pub fn remove_tags(held: &mut Vec<Tag>, tag_keys: &[String]) {
 /// operations — so no two of them can disclose a different amount about the request.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str =
     "RESOURCE_NOT_FOUND: Could not find specified resource.";
+
+/// The actions a custom-model resource policy can grant.
+///
+/// A model's resource-based policy exists to "authorize an entity in another Amazon
+/// Web Services account to import the custom model, which replicates it in Amazon
+/// Comprehend in their account" (`PutResourcePolicy`'s own documentation), and
+/// importing a model is `ImportModel` — so that is the whole of what such a policy
+/// can allow, and a statement naming any other action names one the service does not
+/// support in this policy.
+pub const SUPPORTED_MODEL_POLICY_ACTIONS: &[&str] = &["comprehend:ImportModel"];
+
+/// The message the `InvalidRequestException` carries when a policy document names an
+/// action a custom-model resource policy cannot grant.
+///
+/// The service's own fixed text behind its `POLICY_INVALID_INPUT` reason code: it
+/// states the class of fault and echoes nothing back from the document, so it is the
+/// same sentence whichever action the policy named.
+pub const UNSUPPORTED_POLICY_ACTION_MESSAGE: &str =
+    "POLICY_INVALID_INPUT: The provided policy uses unsupported action.";
+
+/// The message the `InvalidRequestException` carries when the policy document is not
+/// a JSON document at all.
+///
+/// `ResourcePolicy` is "the JSON resource-based policy to attach to your custom
+/// model", which the member's documentation spells out ("To provide valid JSON for
+/// your policy, enclose the attribute names and values in double quotes"), so a
+/// string that does not parse as JSON is not a policy. Fixed text behind the same
+/// reason code, echoing nothing of the document back.
+pub const MALFORMED_POLICY_MESSAGE: &str =
+    "POLICY_INVALID_INPUT: The provided policy is not valid JSON.";
+
+/// Why the service refuses `policy` as a custom-model resource policy, or `None`
+/// when it accepts the document.
+///
+/// The document is judged on its OWN content, independently of any resource: both
+/// `PutResourcePolicy`'s `ResourcePolicy` and a creation's `ModelPolicy` attach the
+/// same policy, and both are validated before the request's resources are resolved,
+/// so a document the service will not accept earns the same invalid-request refusal
+/// whatever ARN the request named.
+pub fn policy_document_refusal(policy: &str) -> Option<&'static str> {
+    let Ok(document) = serde_json::from_str::<JsonValue>(policy) else {
+        return Some(MALFORMED_POLICY_MESSAGE);
+    };
+    policy_actions(&document)
+        .into_iter()
+        .any(|action| !grants_supported_action(action))
+        .then_some(UNSUPPORTED_POLICY_ACTION_MESSAGE)
+}
+
+/// Every action the statements of `document` name.
+///
+/// A policy document's `Statement` is one statement or a list of them, and a
+/// statement's `Action` is one action or a list of them, so both forms are walked.
+/// A document that names no action at all (no statement, or statements carrying no
+/// `Action`) grants nothing and so names nothing unsupported.
+fn policy_actions(document: &JsonValue) -> Vec<&str> {
+    let statements: Vec<&JsonValue> = match document.get("Statement") {
+        Some(JsonValue::Array(items)) => items.iter().collect(),
+        Some(single) => vec![single],
+        None => Vec::new(),
+    };
+    let mut actions = Vec::new();
+    for statement in statements {
+        match statement.get("Action") {
+            Some(JsonValue::Array(items)) => {
+                actions.extend(items.iter().filter_map(JsonValue::as_str));
+            }
+            Some(JsonValue::String(single)) => actions.push(single.as_str()),
+            _ => {}
+        }
+    }
+    actions
+}
+
+/// Whether `action`, as a policy statement writes it, names at least one of
+/// [`SUPPORTED_MODEL_POLICY_ACTIONS`].
+///
+/// An action in a policy statement is matched case-insensitively and may carry the
+/// `*` (any sequence) and `?` (any one character) wildcards, so a statement allowing
+/// `comprehend:*` or `comprehend:Import*` names the import action a model policy
+/// grants, while one allowing another operation of this service, or another
+/// service's, names none of them.
+///
+/// An action carrying no wildcard — every ordinary statement — is compared directly
+/// and reaches no matching engine at all. One that does carry a wildcard becomes a
+/// linear-time expression over a FIXED, short subject (the supported action names,
+/// which are this file's own constants): the request's part is only the pattern, its
+/// length is already bounded by `Policy`'s modelled 1..20000 constraint, which the
+/// boundary validator applies before any handler runs, and a pattern too large for
+/// the engine's own size limit to compile names no supported action.
+fn grants_supported_action(action: &str) -> bool {
+    if !action.contains(['*', '?']) {
+        return SUPPORTED_MODEL_POLICY_ACTIONS
+            .iter()
+            .any(|supported| supported.eq_ignore_ascii_case(action));
+    }
+    let expression: String = action
+        .chars()
+        .map(|character| match character {
+            '*' => ".*".to_string(),
+            '?' => ".".to_string(),
+            other => regex::escape(&other.to_string()),
+        })
+        .collect();
+    let Ok(pattern) = Regex::new(&format!("(?i)^{expression}$")) else {
+        return false;
+    };
+    SUPPORTED_MODEL_POLICY_ACTIONS
+        .iter()
+        .any(|supported| pattern.is_match(supported))
+}
 
 /// Why a job whose batch run this emulator does not perform ends in the modelled
 /// `FAILED` state, naming the analysis that was not carried out and both S3

@@ -557,7 +557,7 @@ async fn a_request_that_names_no_single_document_or_no_language_is_refused() {
 
 /// An `EndpointArn` names a custom entity recognizer endpoint, and no operation in
 /// this service persists one yet, so every endpoint a caller can name is a resource
-/// that does not exist: the modelled 404, not a 501.
+/// that does not exist: the modelled client refusal, not a 501.
 #[tokio::test]
 async fn an_endpoint_that_does_not_exist_is_reported_as_unavailable() {
     let comprehend = Comprehend::new();
@@ -579,8 +579,8 @@ async fn an_endpoint_that_does_not_exist_is_reported_as_unavailable() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected 404, got {status}: {body}"
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {body}"
         );
         assert_eq!(
             error_code(&body),

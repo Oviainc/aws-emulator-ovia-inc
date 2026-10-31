@@ -177,6 +177,30 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The status this service's frontend answers a modeled failure with, given the
+/// status that failure's shape declares.
+///
+/// Comprehend's `awsJson1_1` frontend serializes a CLIENT refusal with HTTP 400 —
+/// the status the shape's `@error: "client"` kind states — whatever more specific
+/// `@httpError` its shape carries: a refusal the caller can only clear by naming a
+/// different resource (the shapes the model pins at 404 — a resource ARN that names
+/// nothing, a job id that names nothing, a resource that is not available) still
+/// arrives as a modeled 400 client error, so a client branching on the status does
+/// not read it as an endpoint or routing fault. Two statuses are the frontend's own
+/// and are kept: throttling's 429, which is what an SDK's retry classifier reads,
+/// and a server fault's 5xx.
+///
+/// Applied in ONE place — every operation of this service reaches the wire through
+/// [`Scaffolded`] — so no two operations can answer the same class of refusal with
+/// two different statuses.
+fn frontend_status(declared: u16) -> u16 {
+    match declared {
+        429 => 429,
+        client if (400..500).contains(&client) => 400,
+        other => other,
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -282,10 +306,14 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled failure's status is the one THIS SERVICE's frontend renders it with
+    /// ([`frontend_status`]), which is the shape's declared status for everything but
+    /// a client refusal the frontend serializes as a plain 400.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => frontend_status(e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

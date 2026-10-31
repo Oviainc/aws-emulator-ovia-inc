@@ -781,8 +781,8 @@ async fn describe_refuses_a_job_id_it_never_minted() {
             continue;
         }
         assert_eq!(
-            status, 404,
-            "case JobId={case:?}: expected 404, got {status}: {body}"
+            status, 400,
+            "case JobId={case:?}: expected 400, got {status}: {body}"
         );
         assert_eq!(
             error_code(&body),
@@ -802,8 +802,8 @@ async fn describe_refuses_a_job_id_it_never_minted() {
         .call("DescribeSentimentDetectionJob", &json!({ "JobId": job_id }))
         .await;
     assert_eq!(
-        status, 404,
-        "case \"another family's id\": expected 404, got {status}: {body}"
+        status, 400,
+        "case \"another family's id\": expected 400, got {status}: {body}"
     );
 }
 
@@ -1109,7 +1109,7 @@ async fn a_stop_on_a_terminal_job_is_refused_and_changes_nothing() {
 }
 
 /// A stop names a job that must exist: an id this family never minted is refused
-/// with 404 `JobNotFoundException`, whatever form the id takes, and the refusal
+/// with `JobNotFoundException`, whatever form the id takes, and the refusal
 /// echoes none of it.
 #[tokio::test]
 async fn stop_refuses_a_job_id_this_family_never_minted() {
@@ -1161,8 +1161,8 @@ async fn stop_refuses_a_job_id_this_family_never_minted() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case JobId={case:?}: expected 404, got {status}: {body}"
+            status, 400,
+            "case JobId={case:?}: expected 400, got {status}: {body}"
         );
         assert_eq!(
             error_code(&body),

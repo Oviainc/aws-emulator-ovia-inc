@@ -2,8 +2,10 @@
 
 //! @op PutResourcePolicy
 //! IMPLEMENTED. Attaches (or replaces) the one resource-based policy a custom model
-//! carries, minting the fresh `PolicyRevisionId` the modification assigns, and
-//! answers 404 `ResourceNotFoundException` for an ARN that names no model.
+//! carries, minting the fresh `PolicyRevisionId` the modification assigns. The policy
+//! DOCUMENT is validated before the ARN is resolved — a document naming an action a
+//! model policy cannot grant is `InvalidRequestException` whatever the ARN names —
+//! and an ARN that names no model is `ResourceNotFoundException`.
 //!
 //! The policy lives on the model's own record
 //! ([`crate::state::DocumentClassifier::resource_policy`]), so it is the same policy
@@ -168,6 +170,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("The service store is unavailable. Retry your request.".to_string()),
             })
         })?;
+
+        // The POLICY DOCUMENT is judged FIRST, on its own content: it is a property of
+        // the request, not of any resource, so a document this service will not attach
+        // is an invalid request whatever ARN the request went on to name — and a
+        // request whose policy is wrong is told so rather than being answered about
+        // the ARN. Only a document the service would attach makes the ARN worth
+        // resolving.
+        if let Some(message) = crate::state::policy_document_refusal(&input.resource_policy) {
+            return Err(PutResourcePolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message.to_string()),
+                    reason: None,
+                    detail: None,
+                },
+            )
+            .into());
+        }
 
         let now = SystemTime::now();
         let mut store = state.lock();

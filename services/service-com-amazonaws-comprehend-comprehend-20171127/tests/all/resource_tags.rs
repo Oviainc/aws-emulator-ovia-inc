@@ -10,7 +10,8 @@
 //! creating operation's `Tags` persisted as much as the ones a later `TagResource`
 //! associated), and `UntagResource` removes exactly the keys `TagKeys` names. A
 //! `ResourceArn` that names no resource this service holds is refused by all three
-//! with `ResourceNotFoundException` (HTTP 404). The map is bounded at 50 tags per
+//! with `ResourceNotFoundException` (HTTP 400, the status this service's frontend
+//! answers a client refusal with). The map is bounded at 50 tags per
 //! resource counting BOTH the tags a resource already holds and the ones the request
 //! brings (`TooManyTagsException`, HTTP 400), and a removal naming more than 50 tag
 //! keys is refused with `TooManyTagKeysException` (HTTP 400).
@@ -356,8 +357,8 @@ async fn every_tagging_operation_refuses_an_arn_naming_no_resource() {
         ] {
             let (status, response) = comprehend.call(operation, &body).await;
             assert_eq!(
-                status, 404,
-                "case {case:?} / {operation}: expected 404, got {status}: {response}"
+                status, 400,
+                "case {case:?} / {operation}: expected 400, got {status}: {response}"
             );
             assert_eq!(
                 error_code(&response),

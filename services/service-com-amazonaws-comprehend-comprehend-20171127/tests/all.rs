@@ -27,6 +27,8 @@ mod batch_sentiment;
 mod batch_syntax;
 #[path = "all/classifier_training.rs"]
 mod classifier_training;
+#[path = "all/client_refusals.rs"]
+mod client_refusals;
 #[path = "all/comprehend_client.rs"]
 mod comprehend_client;
 #[path = "all/detect_pii_entities.rs"]

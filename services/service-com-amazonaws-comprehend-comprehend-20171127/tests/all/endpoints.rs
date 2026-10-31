@@ -816,7 +816,7 @@ async fn a_create_that_names_no_usable_model_is_refused() {
                 "ModelArn": document_classifier_arn(REGION, "never-created", None),
                 "DesiredInferenceUnits": 1,
             }),
-            404,
+            400,
             "ResourceNotFoundException",
             None,
         ),
@@ -827,7 +827,7 @@ async fn a_create_that_names_no_usable_model_is_refused() {
                 "ModelArn": document_classifier_arn(REGION, "reviews-classifier", Some("v9")),
                 "DesiredInferenceUnits": 1,
             }),
-            404,
+            400,
             "ResourceNotFoundException",
             None,
         ),
@@ -840,7 +840,7 @@ async fn a_create_that_names_no_usable_model_is_refused() {
                 ),
                 "DesiredInferenceUnits": 1,
             }),
-            404,
+            400,
             "ResourceNotFoundException",
             None,
         ),
@@ -853,7 +853,7 @@ async fn a_create_that_names_no_usable_model_is_refused() {
                 ),
                 "DesiredInferenceUnits": 1,
             }),
-            404,
+            400,
             "ResourceNotFoundException",
             None,
         ),
@@ -998,8 +998,8 @@ async fn describing_an_endpoint_that_does_not_exist_is_refused() {
             .call("DescribeEndpoint", &json!({ "EndpointArn": arn }))
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status}: {body}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status}: {body}"
         );
         assert_eq!(
             error_code(&body),

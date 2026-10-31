@@ -357,8 +357,8 @@ async fn describe_refuses_a_job_id_this_family_never_minted() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {job_id:?}: expected 404, got {status}: {body}"
+            status, 400,
+            "case {job_id:?}: expected 400, got {status}: {body}"
         );
         assert_eq!(
             error_code(&body),

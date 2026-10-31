@@ -4,7 +4,7 @@
 //! IMPLEMENTED. Reports the resource-based policy a custom model carries, with the
 //! revision id and the creation and modification instants of the version attached;
 //! a model carrying none is a 200 reporting no policy, and an ARN that names no
-//! model is 404 `ResourceNotFoundException`.
+//! model is `ResourceNotFoundException`.
 //!
 //! The reader for `PutResourcePolicy` and `CreateDocumentClassifier`'s
 //! `ModelPolicy`: all three read and write the one policy on the model's own record

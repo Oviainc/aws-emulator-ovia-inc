@@ -134,7 +134,7 @@ async fn a_value_inside_a_published_range_bound_is_not_refused() {
     // the status it must get instead: `ListSentimentDetectionJobs` is implemented
     // and answers 200, while `CreateEndpoint` gets past validation and is then
     // refused for the model it names — a classifier this store does not hold — with
-    // 404 `ResourceNotFoundException`. Either way the request was not refused as
+    // `ResourceNotFoundException`. Either way the request was not refused as
     // invalid.
     let absent_model = format!(
         "arn:aws:comprehend:{REGION}:{ACCOUNT_ID}:document-classifier/absent-classifier"
@@ -169,7 +169,7 @@ async fn a_value_inside_a_published_range_bound_is_not_refused() {
                 "ModelArn": absent_model.clone(),
                 "DesiredInferenceUnits": 1,
             }),
-            404,
+            400,
             Some("ResourceNotFoundException"),
         ),
         (
@@ -180,7 +180,7 @@ async fn a_value_inside_a_published_range_bound_is_not_refused() {
                 "ModelArn": absent_model.clone(),
                 "DesiredInferenceUnits": 4096,
             }),
-            404,
+            400,
             Some("ResourceNotFoundException"),
         ),
     ] {

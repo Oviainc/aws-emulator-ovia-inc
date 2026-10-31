@@ -8,8 +8,10 @@
 //! mints a fresh `PolicyRevisionId`; a `Describe` reports exactly the document that
 //! was attached, with that revision and the creation and modification instants; a
 //! `Delete` removes it and is a no-op for a model carrying none; and all three answer
-//! 404 `ResourceNotFoundException` — with the service's FIXED message, which echoes
-//! nothing from the request — for an ARN that names no model.
+//! `ResourceNotFoundException` — the service's client refusal, HTTP 400, with its
+//! FIXED message, which echoes nothing from the request — for an ARN that names no
+//! model. A `Put` judges the POLICY DOCUMENT before it resolves the ARN, so a
+//! document the service will not attach is an invalid request whatever the ARN names.
 //!
 //! Every suite is a TABLE: the policy documents differ along their shape, their size
 //! (both modelled length bounds) and their characters, and the models differ along
@@ -495,8 +497,8 @@ async fn every_resource_policy_operation_refuses_an_arn_that_names_no_model() {
             }
             let (status, response) = comprehend.call(operation, &body).await;
             assert_eq!(
-                status, 404,
-                "case {operation}/{arn:?}: expected 404, got {status}: {response}"
+                status, 400,
+                "case {operation}/{arn:?}: expected 400, got {status}: {response}"
             );
             assert_eq!(
                 error_code(&response),
@@ -531,7 +533,7 @@ async fn every_resource_policy_operation_refuses_an_arn_that_names_no_model() {
         let (status, response) = comprehend
             .call("DescribeResourcePolicy", &json!({ "ResourceArn": live }))
             .await;
-        if status == 404 {
+        if status == 400 {
             assert_eq!(
                 error_message(&response),
                 RESOURCE_NOT_FOUND_MESSAGE,

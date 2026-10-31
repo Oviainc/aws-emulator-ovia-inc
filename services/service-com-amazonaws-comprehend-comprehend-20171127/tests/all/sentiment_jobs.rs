@@ -336,8 +336,8 @@ async fn describe_and_stop_refuse_an_unknown_job_id() {
                 .call(operation, &json!({ "JobId": job_id }))
                 .await;
             assert_eq!(
-                status, 404,
-                "case {operation} with {job_id:?}: expected 404, got {status}: {body}"
+                status, 400,
+                "case {operation} with {job_id:?}: expected 400, got {status}: {body}"
             );
             assert_eq!(
                 error_code(&body),
@@ -504,8 +504,8 @@ async fn the_record_store_is_bounded_and_evicts_oldest_first() {
             .call("DescribeSentimentDetectionJob", &json!({ "JobId": job_id }))
             .await;
         assert_eq!(
-            status, 404,
-            "case \"evicted job {index}\": expected 404, got {status}: {body}"
+            status, 400,
+            "case \"evicted job {index}\": expected 400, got {status}: {body}"
         );
         // Its idempotency-index entry went with it, so the token mints a new job.
         let mut body = submission("only the required members");

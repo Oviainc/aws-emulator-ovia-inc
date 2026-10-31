@@ -758,6 +758,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `ModelPolicy` is "the resource-based policy to attach to your custom model":
+        // the same document `PutResourcePolicy` attaches, judged by the same rule and
+        // at the same point — on its own content, before any of the request's
+        // resources are resolved.
+        if let Some(policy) = input.model_policy.as_deref() {
+            if let Some(message) = crate::state::policy_document_refusal(policy) {
+                return Err(
+                    CreateDocumentClassifierErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(message.to_string()),
+                            reason: None,
+                            detail: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // The training data the model documents as required for the data format the
         // request asks for: `DataFormat` defaults to `COMPREHEND_CSV`, which "requires
         // the S3Uri parameter in your request", while `AUGMENTED_MANIFEST` "requires

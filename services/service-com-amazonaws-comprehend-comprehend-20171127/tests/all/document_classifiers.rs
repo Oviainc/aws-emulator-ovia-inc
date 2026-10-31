@@ -262,8 +262,8 @@ async fn the_reads_refuse_an_arn_no_classifier_was_created_under() {
                 .call(operation, &json!({ "DocumentClassifierArn": arn }))
                 .await;
             assert_eq!(
-                status, 404,
-                "case {operation} with {arn:?}: expected 404, got {status}: {body}"
+                status, 400,
+                "case {operation} with {arn:?}: expected 400, got {status}: {body}"
             );
             assert_eq!(
                 error_code(&body),
@@ -1273,7 +1273,7 @@ async fn a_classifier_is_deleted_only_once_its_training_has_ended() {
                 &json!({ "DocumentClassifierArn": arn }),
             )
             .await;
-        if status == 404 {
+        if status == 400 {
             assert_eq!(
                 error_code(&body),
                 "ResourceNotFoundException",
@@ -1283,7 +1283,7 @@ async fn a_classifier_is_deleted_only_once_its_training_has_ended() {
         }
         assert_eq!(
             status, 200,
-            "case \"delete then read\": expected 200 or 404, got {status}: {body}"
+            "case \"delete then read\": expected 200 or 400, got {status}: {body}"
         );
         assert_eq!(
             body["DocumentClassifierProperties"]["Status"].as_str(),
