@@ -3549,6 +3549,52 @@ pub fn is_control_arn(identifier: &str) -> bool {
     control_reference(identifier).is_some()
 }
 
+/// Why a `controlIdentifier` a caller sent names no catalog control, carrying the wording
+/// the refusal reports.
+///
+/// The member has exactly TWO readings when it resolves to nothing, and they are different
+/// failures: a value in one of the published control ARN forms that the catalog holds no
+/// entry for REFERENCES a control that does not exist, while a value that is not a control
+/// reference at all never named a control and is a malformed input. Which of the two a
+/// value is depends on the value alone, so it is settled here rather than at each call
+/// site; every handler reading this member maps the variant to its OWN operation's modelled
+/// error — the not-found error for [`Self::NoSuchControl`], the validation error for
+/// [`Self::NotAControlReference`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnresolvedControlIdentifier {
+    /// A control ARN, in either published form, that names no catalog entry.
+    NoSuchControl(String),
+    /// A value that is not a control ARN at all.
+    NotAControlReference(String),
+}
+
+/// The catalog entry a caller-supplied `controlIdentifier` names, or why it names none
+/// ([`UnresolvedControlIdentifier`]).
+///
+/// The one place a caller's `controlIdentifier` is turned into the control it names, so the
+/// same value is classified the same way wherever it is read and whatever other members
+/// accompany it: a request that also names the enablement another way is compared against
+/// the control this resolved to, never told its identifier mismatches when the identifier
+/// names no control at all.
+pub fn catalogued_control(
+    control_identifier: &str,
+) -> Result<&'static CatalogControl, UnresolvedControlIdentifier> {
+    match resolve_control(control_identifier) {
+        Some(control) => Ok(control),
+        None if is_control_arn(control_identifier) => Err(
+            UnresolvedControlIdentifier::NoSuchControl(format!(
+                "no control matches controlIdentifier {control_identifier}"
+            )),
+        ),
+        None => Err(UnresolvedControlIdentifier::NotAControlReference(format!(
+            "controlIdentifier {control_identifier:?} is not the ARN of an AWS Control \
+             Tower control; a control is named by its control ARN, \
+             arn:aws:controltower:<region>::control/<CONTROL_NAME>, or by its control \
+             catalog ARN, arn:aws:controlcatalog:::control/<id>"
+        ))),
+    }
+}
+
 /// How a control ARN names its control: by name in the AWS Control Tower form, by opaque
 /// id in the AWS Control Catalog form.
 enum ControlReference<'a> {

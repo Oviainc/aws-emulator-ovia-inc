@@ -196,35 +196,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `controlIdentifier` and `targetIdentifier` are typed as the generic
         // `ControlIdentifier`/`TargetIdentifier`, whose pattern cannot express either kind
         // of resource, so these are the handler's to check.
-        let control = match crate::state::resolve_control(&input.control_identifier) {
-            Some(control) => control,
-            // A control ARN that names no catalog control is a reference to a resource that
-            // does not exist; anything else is not a control reference at all, which is a
-            // malformed input rather than a missing resource.
-            None if crate::state::is_control_arn(&input.control_identifier) => {
+        // A control ARN that names no catalog control is a reference to a resource that
+        // does not exist; anything else is not a control reference at all, which is a
+        // malformed input rather than a missing resource. That classification of this
+        // member lives in one place, so every handler reading a `controlIdentifier`
+        // answers the same value the same way.
+        let control = match crate::state::catalogued_control(&input.control_identifier) {
+            Ok(control) => control,
+            Err(crate::state::UnresolvedControlIdentifier::NoSuchControl(message)) => {
                 return Err(EnableControlErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "no control matches controlIdentifier {}",
-                            input.control_identifier
-                        ),
-                    },
+                    ResourceNotFoundException { message },
                 )
                 .into());
             }
-            None => {
-                return Err(EnableControlErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "controlIdentifier {:?} is not the ARN of an AWS Control Tower \
-                             control; a control is named by its control ARN, \
-                             arn:aws:controltower:<region>::control/<CONTROL_NAME>, or by \
-                             its control catalog ARN, arn:aws:controlcatalog:::control/<id>",
-                            input.control_identifier
-                        ),
-                    },
-                )
-                .into());
+            Err(crate::state::UnresolvedControlIdentifier::NotAControlReference(message)) => {
+                return Err(
+                    EnableControlErrorModeled::ValidationException(ValidationException {
+                        message,
+                    })
+                    .into(),
+                );
             }
         };
 

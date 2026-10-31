@@ -888,6 +888,345 @@ async fn a_teardown_removes_only_the_enablement_it_names() {
     );
 }
 
+/// One row of the `controlIdentifier` classification table: a value, and the answer the
+/// rule gives it.
+struct IdentifierRow {
+    case: &'static str,
+    control_identifier: String,
+    status: u16,
+    code: &'static str,
+}
+
+/// A control ARN, in either published form, that the catalog publishes NO entry for: the
+/// rows whose answer is the 404 of a reference to a control that does not exist. Each value
+/// is checked against `state::CONTROL_CATALOG` — the catalog the handler resolves a
+/// `controlIdentifier` against — rather than assumed unpublished, and the rows vary the ARN
+/// form, the shape of the unpublished name and the published entry they are derived from.
+fn unpublished_control_identifiers() -> Vec<IdentifierRow> {
+    let published_name = plain_control(0).name;
+    let published_id = plain_control(0).catalog_id;
+    let rows = vec![
+        IdentifierRow {
+            case: "a control ARN whose name the catalog does not publish",
+            control_identifier: control("AWS-GR_NO_SUCH_CONTROL"),
+            status: 404,
+            code: "ResourceNotFoundException",
+        },
+        IdentifierRow {
+            case: "a control ARN whose name is a published name with one character appended",
+            control_identifier: control(&format!("{published_name}X")),
+            status: 404,
+            code: "ResourceNotFoundException",
+        },
+        IdentifierRow {
+            case: "a control ARN whose name is a published name with its last character cut",
+            control_identifier: control(&published_name[..published_name.len() - 1]),
+            status: 404,
+            code: "ResourceNotFoundException",
+        },
+        IdentifierRow {
+            case: "a control catalog ARN whose id the catalog does not publish",
+            control_identifier: catalog_arn("zzzzzzzzzzzzzzzzzzzzzzzzzz"),
+            status: 404,
+            code: "ResourceNotFoundException",
+        },
+        IdentifierRow {
+            case: "a control catalog ARN whose id is a published id with its first character \
+                   rotated",
+            control_identifier: catalog_arn(&format!("0{}", &published_id[1..])),
+            status: 404,
+            code: "ResourceNotFoundException",
+        },
+    ];
+    for row in &rows {
+        let resource = row
+            .control_identifier
+            .rsplit('/')
+            .next()
+            .expect("a control ARN carries a resource segment");
+        assert!(
+            !CONTROL_CATALOG
+                .iter()
+                .any(|entry| entry.name == resource || entry.catalog_id == resource),
+            "case {:?}: this row needs a control the catalog does NOT publish, but it \
+             publishes {resource:?}",
+            row.case
+        );
+    }
+    rows
+}
+
+/// Values that are NOT a control reference at all: the rows whose answer is the 400 of a
+/// malformed input. The forms come from `state::is_control_arn` — a control is named by
+/// `arn:<partition>:controltower:<region>::control/<NAME>` or
+/// `arn:<partition>:controlcatalog:::control/<id>`, neither naming an account — so a row
+/// breaks one segment of a form at a time, including values whose RESOURCE segment is a
+/// published control's.
+fn non_control_references(target: &str, enabled_arn: &str) -> Vec<IdentifierRow> {
+    let published = plain_control(0);
+    vec![
+        IdentifierRow {
+            case: "an organizational unit's ARN, which names a target rather than a control",
+            control_identifier: target.to_string(),
+            status: 400,
+            code: "ValidationException",
+        },
+        IdentifierRow {
+            case: "the enablement's own ARN, which names an enablement rather than a control",
+            control_identifier: enabled_arn.to_string(),
+            status: 400,
+            code: "ValidationException",
+        },
+        IdentifierRow {
+            case: "another service's ARN",
+            control_identifier: "arn:aws:iam::123456789012:role/ControlTowerAdmin".to_string(),
+            status: 400,
+            code: "ValidationException",
+        },
+        IdentifierRow {
+            case: "a published control's name under an ARN that names an ACCOUNT, which no \
+                   control ARN does",
+            control_identifier: format!(
+                "arn:aws:controltower:us-west-2:123456789012:control/{}",
+                published.name
+            ),
+            status: 400,
+            code: "ValidationException",
+        },
+        IdentifierRow {
+            case: "a published control's name lowercased, which is no control name",
+            control_identifier: control(&published.name.to_lowercase()),
+            status: 400,
+            code: "ValidationException",
+        },
+        IdentifierRow {
+            case: "a published catalog id under a control catalog ARN naming a REGION, which \
+                   that global catalog does not",
+            control_identifier: format!(
+                "arn:aws:controlcatalog:us-west-2::control/{}",
+                published.catalog_id
+            ),
+            status: 400,
+            code: "ValidationException",
+        },
+        IdentifierRow {
+            case: "a control catalog ARN whose resource is not a 26-character catalog id",
+            control_identifier: catalog_arn("tooshorttobeanid"),
+            status: 400,
+            code: "ValidationException",
+        },
+        IdentifierRow {
+            case: "an ARN at exactly the member's length min of 20",
+            control_identifier: arn_of_length(20),
+            status: 400,
+            code: "ValidationException",
+        },
+        IdentifierRow {
+            case: "an ARN at exactly the member's length max of 2048",
+            control_identifier: arn_of_length(2048),
+            status: 400,
+            code: "ValidationException",
+        },
+    ]
+}
+
+/// RULE: a `controlIdentifier` is classified by what IT names, whatever other members of
+/// the request accompany it — a control ARN, in either form AWS publishes, that names no
+/// catalogued control references a resource that does not exist (404
+/// `ResourceNotFoundException`), while a value that is no control reference at all is a
+/// malformed input (400 `ValidationException`). Only an identifier that DOES name a
+/// catalogued control is then compared with the enablement the request names another way,
+/// and disagreeing there is the mismatch `ValidationException` (400).
+///
+/// Asserted over the three addressing forms that carry the member (the control/target pair,
+/// `enabledControlIdentifier` + `controlIdentifier`, and all three members) and over
+/// `EnableControl`, which reads the same member: one value, one answer, down to the message.
+#[tokio::test]
+async fn a_control_identifier_is_classified_by_what_it_names() {
+    let router = emulator();
+
+    let entry = plain_control(0);
+    let other = plain_control(1);
+    let target = ou("g001");
+    let (arn, _) = enable(
+        &router,
+        serde_json::json!({
+            "controlIdentifier": control(entry.name),
+            "targetIdentifier": target,
+        }),
+    )
+    .await;
+    // Past the settle span, so no refusal below can be an in-flight enable's 409.
+    tokio::time::sleep(past_the_settle_span()).await;
+
+    let mut rows = unpublished_control_identifiers();
+    rows.extend(non_control_references(&target, &arn));
+
+    for row in &rows {
+        let case = row.case;
+        let identifier = &row.control_identifier;
+        // The three ways a `DisableControl` request carries this member, plus the sibling
+        // operation that reads it. Every one of them answers the value itself, so all four
+        // answers must agree.
+        let addressed: Vec<(&str, &str, serde_json::Value)> = vec![
+            (
+                "the control/target pair",
+                "/disable-control",
+                serde_json::json!({
+                    "controlIdentifier": identifier,
+                    "targetIdentifier": target,
+                }),
+            ),
+            (
+                "enabledControlIdentifier with controlIdentifier",
+                "/disable-control",
+                serde_json::json!({
+                    "enabledControlIdentifier": arn,
+                    "controlIdentifier": identifier,
+                }),
+            ),
+            (
+                "all three members",
+                "/disable-control",
+                serde_json::json!({
+                    "enabledControlIdentifier": arn,
+                    "controlIdentifier": identifier,
+                    "targetIdentifier": target,
+                }),
+            ),
+            (
+                "EnableControl, which reads the same member",
+                "/enable-control",
+                serde_json::json!({
+                    "controlIdentifier": identifier,
+                    "targetIdentifier": ou("g002"),
+                }),
+            ),
+        ];
+
+        let mut answers: Vec<(&str, u16, Option<String>, String)> = Vec::new();
+        for (form, path, body) in addressed {
+            let refused = call(&router, path, body).await;
+            assert_eq!(
+                (refused.status, refused.error_code.as_deref()),
+                (row.status, Some(row.code)),
+                "case {case:?} addressed by {form}: expected {} {}, got {:?} body {:?}",
+                row.status,
+                row.code,
+                (refused.status, refused.error_code.as_deref()),
+                refused.body
+            );
+            let message = refused.string("message");
+            assert!(
+                message.contains(identifier.as_str()),
+                "case {case:?} addressed by {form}: the refusal must name the identifier it \
+                 refused, got {message:?}"
+            );
+            answers.push((form, refused.status, refused.error_code.clone(), message));
+        }
+        let (first_form, first_status, first_code, first_message) = answers[0].clone();
+        for (form, status, code, message) in &answers[1..] {
+            assert_eq!(
+                (*status, code.as_deref(), message.as_str()),
+                (first_status, first_code.as_deref(), first_message.as_str()),
+                "case {case:?}: {form} must answer this identifier exactly as {first_form} \
+                 does, got {:?}",
+                (*status, code.as_deref(), message.as_str())
+            );
+        }
+    }
+
+    // An identifier that DOES name a catalogued control, but not this enablement's, is the
+    // mismatch — in either published form, and whether or not the target is sent too.
+    for (case, body) in [
+        (
+            "another catalogued control by its control ARN",
+            serde_json::json!({
+                "enabledControlIdentifier": arn,
+                "controlIdentifier": control(other.name),
+            }),
+        ),
+        (
+            "another catalogued control by its control catalog ARN",
+            serde_json::json!({
+                "enabledControlIdentifier": arn,
+                "controlIdentifier": catalog_arn(other.catalog_id),
+                "targetIdentifier": target,
+            }),
+        ),
+        (
+            "a mandatory catalogued control, which this enablement is not of",
+            serde_json::json!({
+                "enabledControlIdentifier": arn,
+                "controlIdentifier": control(mandatory_control().name),
+            }),
+        ),
+    ] {
+        let refused = disable(&router, body).await;
+        assert_refused(case, &refused, 400, "ValidationException");
+        let message = refused.string("message");
+        assert!(
+            message.contains(entry.name),
+            "case {case:?}: a mismatch must report the control this enablement IS of, got \
+             {message:?}"
+        );
+    }
+
+    // Not one of those refusals tore anything down or started an operation.
+    assert!(
+        teardown_records(&router).await.is_empty(),
+        "no refusal may append a DISABLE_CONTROL record, got {:?}",
+        teardown_records(&router).await
+    );
+    let reported = details(&router, &arn).await;
+    assert_eq!(
+        status(&reported),
+        Some("SUCCEEDED"),
+        "the enablement no accepted call touched must still be SUCCEEDED, got {reported:?}"
+    );
+
+    // And an identifier that names the enablement's OWN control passes the cross-check, in
+    // either published form.
+    for (index, control_identifier) in [control(entry.name), catalog_arn(entry.catalog_id)]
+        .into_iter()
+        .enumerate()
+    {
+        let case = &control_identifier;
+        let accepted_target = ou(&format!("g1{index}"));
+        let (accepted_arn, _) = enable(
+            &router,
+            serde_json::json!({
+                "controlIdentifier": control(entry.name),
+                "targetIdentifier": accepted_target,
+            }),
+        )
+        .await;
+        tokio::time::sleep(past_the_settle_span()).await;
+
+        let disabled = disable(
+            &router,
+            serde_json::json!({
+                "enabledControlIdentifier": accepted_arn,
+                "controlIdentifier": control_identifier,
+                "targetIdentifier": accepted_target,
+            }),
+        )
+        .await;
+        assert_eq!(
+            disabled.status, 200,
+            "case {case:?}: an identifier naming this enablement's own control must be \
+             accepted, got {} body {:?}",
+            disabled.status, disabled.body
+        );
+        assert!(
+            is_operation_identifier(&disabled.string("operationIdentifier")),
+            "case {case:?}: an accepted teardown must return an operation identifier, got \
+             {:?}",
+            disabled.body
+        );
+    }
+}
+
 /// `EnableControl` for one row WITHOUT asserting it succeeded, for the cases whose subject
 /// is that a pair is still enabled.
 async fn enable_row_refused(router: &MultiServiceRouter, row: &Row) -> Answer {

@@ -223,10 +223,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // identifier resolves to rather than as text, because one control is
                 // published under two ARN forms.
                 if let Some(control_identifier) = &input.control_identifier {
-                    let named = crate::state::resolve_control(control_identifier);
-                    if named.is_none()
-                        || named != crate::state::resolve_control(&enabled.control_identifier)
-                    {
+                    // WHAT that member names is settled before it is compared with
+                    // anything, by the one classification every reader of this member
+                    // applies: a control ARN naming no catalog control is a reference to a
+                    // resource that does not exist, and a value that is no control
+                    // reference at all is a malformed input. Only a value that does name a
+                    // control can disagree with this enablement's, which is what the
+                    // mismatch below reports.
+                    let named = control_of(control_identifier)?;
+                    if Some(named) != crate::state::resolve_control(&enabled.control_identifier) {
                         return Err(DisableControlErrorModeled::ValidationException(
                             ValidationException {
                                 message: format!(
@@ -280,39 +285,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 };
 
-                // A control ARN that names no catalog control is a reference to a resource
-                // that does not exist; anything else is not a control reference at all,
-                // which is a malformed input rather than a missing resource — the same
-                // reading `EnableControl` gives this member.
-                let control = match crate::state::resolve_control(control_identifier) {
-                    Some(control) => control,
-                    None if crate::state::is_control_arn(control_identifier) => {
-                        return Err(DisableControlErrorModeled::ResourceNotFoundException(
-                            ResourceNotFoundException {
-                                message: format!(
-                                    "no control matches controlIdentifier \
-                                     {control_identifier}"
-                                ),
-                            },
-                        )
-                        .into());
-                    }
-                    None => {
-                        return Err(DisableControlErrorModeled::ValidationException(
-                            ValidationException {
-                                message: format!(
-                                    "controlIdentifier {control_identifier:?} is not the \
-                                     ARN of an AWS Control Tower control; a control is \
-                                     named by its control ARN, \
-                                     arn:aws:controltower:<region>::control/<CONTROL_NAME>, \
-                                     or by its control catalog ARN, \
-                                     arn:aws:controlcatalog:::control/<id>"
-                                ),
-                            },
-                        )
-                        .into());
-                    }
-                };
+                // The same classification of this member as the path above: a control ARN
+                // naming no catalog control is a reference to a resource that does not
+                // exist, anything else is not a control reference at all — the reading
+                // `EnableControl` gives this member too.
+                let control = control_of(control_identifier)?;
 
                 let Some(enabled) = store.enabled_control_on_target(control, target_identifier)
                 else {
@@ -392,6 +369,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation_identifier,
         })
     }
+}
+
+/// The catalog control `control_identifier` names, as this operation's modelled errors
+/// report a value that names none.
+///
+/// The classification itself is [`crate::state::catalogued_control`], the one reading of
+/// this member: a control ARN the catalog publishes no entry for references a control that
+/// does not exist (`ResourceNotFoundException`), and a value that is not a control
+/// reference at all is a malformed input (`ValidationException`). Both of this handler's
+/// paths resolve the member through here, so the answer to one value does not depend on
+/// which other members the request carries.
+fn control_of(
+    control_identifier: &str,
+) -> Result<&'static crate::state::CatalogControl, DisableControlError> {
+    crate::state::catalogued_control(control_identifier).map_err(|unresolved| match unresolved {
+        crate::state::UnresolvedControlIdentifier::NoSuchControl(message) => {
+            DisableControlErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message,
+            })
+            .into()
+        }
+        crate::state::UnresolvedControlIdentifier::NotAControlReference(message) => {
+            DisableControlErrorModeled::ValidationException(ValidationException { message }).into()
+        }
+    })
 }
 
 /// The members of this request that carry a value, as the refusal above lists them back to
