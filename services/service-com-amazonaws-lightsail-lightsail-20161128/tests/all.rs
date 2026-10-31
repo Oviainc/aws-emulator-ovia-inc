@@ -105,6 +105,8 @@ mod container_service_operation_log;
 mod container_service_powers;
 #[path = "all/container_service_public_domain_certificate.rs"]
 mod container_service_public_domain_certificate;
+#[path = "all/container_service_public_domain_name_rule.rs"]
+mod container_service_public_domain_name_rule;
 #[path = "all/container_service_public_endpoint.rs"]
 mod container_service_public_endpoint;
 #[path = "all/container_service_update.rs"]

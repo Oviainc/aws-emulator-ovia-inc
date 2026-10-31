@@ -191,7 +191,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the centralized walk refused anything outside them before this body
         // ran. What is left is what the model cannot express: the power must
         // name one this service serves, and the caller-sized collection of
-        // public domain names must be within its bound. Both are resolved
+        // public domain names must be within its bound and list domain names.
+        // Both are resolved
         // BEFORE the store is reached, so a request with one bad member changes
         // none of the others either. WHICH certificate those names may be keyed
         // by is the store's business, asked below.

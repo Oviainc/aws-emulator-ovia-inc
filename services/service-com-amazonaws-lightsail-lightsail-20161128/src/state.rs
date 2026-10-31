@@ -10280,12 +10280,23 @@ fn validate_success_codes(codes: &str) -> Result<(), String> {
 }
 
 /// The public domain names `requested` carries, or a refusal when it carries more
-/// than [`MAX_PUBLIC_DOMAIN_NAMES`] of them.
+/// than [`MAX_PUBLIC_DOMAIN_NAMES`] of them or one of them is not a domain name.
 ///
-/// This is the half of the rule the REQUEST decides on its own. Whether the
-/// certificate each group of names is keyed by is one the account holds and the
-/// certificate authority has issued is decided by the store — see
+/// This is the ONE owner of the half of the rule the REQUEST decides on its own,
+/// whichever operation records those names: how many names the map may carry, and
+/// that every name listed under a key is a domain name — the member is "the public
+/// domain names to use with the container service, such as example.com and
+/// www.example.com" — asked of [`validate_domain_name`], this crate's one checker
+/// of that (which is also what refuses the wildcard forms the certificate
+/// documentation says are not supported, because `*` is not a character a DNS
+/// label carries). Whether the certificate each group of names is keyed by is one
+/// the account holds and the certificate authority has issued is decided by the
+/// store — see
 /// [`ComAmazonawsLightsailLightsail20161128State::unusable_public_domain_certificate`].
+///
+/// How many names the map carries is bounded BEFORE a single one is examined, so
+/// the per-name walk below is bounded by [`MAX_PUBLIC_DOMAIN_NAMES`] rather than
+/// by what the caller sent.
 pub fn public_domain_names_from_request(
     requested: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
@@ -10305,6 +10316,14 @@ pub fn public_domain_names_from_request(
             "publicDomainNames carries {total} domain names, more than the \
              {MAX_PUBLIC_DOMAIN_NAMES} a container service accepts"
         ));
+    }
+    for domain in names.values().flatten() {
+        validate_domain_name(domain).map_err(|detail| {
+            format!(
+                "publicDomainNames entry '{domain}' is not a public domain name of a \
+                 container service: {detail}"
+            )
+        })?;
     }
     Ok(names)
 }

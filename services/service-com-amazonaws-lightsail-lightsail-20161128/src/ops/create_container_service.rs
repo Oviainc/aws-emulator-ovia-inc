@@ -224,8 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // bounded AND collapsed by key here: the tags of a resource obey one
         // rule whether a create or a later tag change put them there.
         let tags = crate::state::tags_created_from(input.tags.as_deref()).map_err(invalid)?;
-        // How many public domain names the request may carry is decided by the
-        // request alone; WHICH certificate each group of them may be keyed by is
+        // How many public domain names the request may carry, and that each one
+        // is a domain name, is decided by the request alone; WHICH certificate
+        // each group of them may be keyed by is
         // decided by the certificates this account holds, so that half of the
         // rule is asked of the store below.
         let public_domain_names =
