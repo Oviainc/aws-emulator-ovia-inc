@@ -58,3 +58,51 @@ Cause 3 — fixture observabilityadmin-telemetry-pipeline-workflow, step task#5,
 2. Cause 1: replay fixture observabilityadmin-telemetry-pipeline-error-paths step task#6 — POST /ValidateTelemetryPipelineConfiguration with a Configuration.Body that parses but declares no top-level 'pipeline' section (the recorded body is the bare scalar 'this-is-not-a-valid-pipeline-definition'). Expect 200 with exactly one error: Reason 'MISSING_FIELD', Message "required property 'pipeline' not found", FieldMap {'name': 'pipeline'}. The emulator answers UNKNOWN_PROPERTY with FieldMap {'path': 'root'}.
 3. Cause 2: replay fixture observabilityadmin-telemetry-pipeline-workflow step task#3 — POST /ValidateTelemetryPipelineConfiguration with the recorded multi-defect pipeline document (restricted data-source/processor combinations, unknown processor-position properties, and absent 'source'/'sink' sections). Compare the full Errors list against the nine recorded entries: check the reason tokens, the per-entry FieldMap keys ('name' for MISSING_FIELD, 'path' for a processor position, the restriction descriptors for DATA_SOURCE_PROCESSOR_RESTRICTED) and the entry count.
 4. Cause 3: replay fixture observabilityadmin-telemetry-pipeline-workflow step task#5 — CreateTelemetryPipeline, wait for the pipeline to reach ACTIVE, then POST /GetTelemetryPipeline with its identifier and inspect the body: Pipeline.ConfigurationSummary must be present with Sources/DataSources/Processors/ProcessorCount/Sinks derived from the stored configuration body, and Pipeline.StatusReason.Description must be exactly 'Pipeline is active and processing data'.
+
+## Resolution
+
+Cause 1 and Cause 3 are FIXED, and so is the part of Cause 2 that is a defect of this
+emulator's own reporting. One part of Cause 2 is deliberately NOT written, and is
+recorded here so a later reader is not told it works.
+
+* **Cause 1 — FIXED.** The pipeline schema requires the document to declare its pipeline
+  (`PIPELINE_PROPERTY` in `src/ops/validate_telemetry_pipeline_configuration.rs`), so a
+  parsed document that declares none is now reported as that property being absent —
+  `MISSING_FIELD`, message "required property 'pipeline' not found", `FieldMap
+  {"name": "pipeline"}` — instead of as the properties of a section the document never
+  declared. Fixture observabilityadmin-telemetry-pipeline-error-paths replays clean.
+* **Cause 2 — the `FieldMap` inversion is FIXED.** An absent required property is now
+  reported by the property's own NAME, under the report's `name` key
+  (`missing_field`), for every required property of the document and of a section,
+  and the two recorded `MISSING_FIELD` entries of fixture
+  observabilityadmin-telemetry-pipeline-workflow step task#3 (`{"name": "source"}` and
+  `{"name": "sink"}`) now match. A defect of a property the document DOES declare keeps
+  the `path` key, named relative to the document's own pipeline, which is the form the
+  recorded `processor[<i>]` entries use.
+* **Cause 2 — the `DATA_SOURCE_PROCESSOR_RESTRICTED` pass is NOT written (DECLINED).**
+  The recorded step's other seven entries are failures of the real service's
+  per-source-type schema BRANCHES: five `DATA_SOURCE_PROCESSOR_RESTRICTED` entries whose
+  `FieldMap` carries a `(source_type, data_source_name, allowed_processor(s))` triple —
+  `cloudwatch_logs`/`aws_cloudtrail`/`ocsf`, `amazon_vpc_flow`/`parse_vpc/ocsf`,
+  `amazon_cloudfront`/`parse_cloudfront/ocsf`, ... — and two `UNKNOWN_PROPERTY` entries
+  reporting the document's `lowercase_string`/`uppercase_string` processor positions as
+  names that schema does not define. None of those facts is in this service's Smithy
+  model (the operation's whole closure exposes only
+  `ValidationError{Message,Reason,FieldMap}`), none is stated by the submitted document,
+  and the processor names the recording reports as undefined are ones this emulator DOES
+  run — so emitting those entries would mean transcribing the real service's
+  allowed-processor catalog from this one recording rather than implementing a rule. It
+  was left unwritten; `$.Errors[*]` therefore still diverges for that step.
+* **Cause 3 — FIXED.** The read's pipeline now carries a `ConfigurationSummary`: the
+  model snapshot is kept exactly as shipped (it binds that shape only to the listing
+  shape), so the member rides on `TelemetryPipelineProjection` beside the members the
+  snapshot declares — see the crate README's table — and `src/state.rs` derives it
+  from the stored configuration document: one `Sources` entry per source plugin, one
+  `DataSources` entry per data source those sources declare (a source declaring none
+  reporting the one `DataSource$Name`'s documentation says its KIND of source reports), the
+  processor names in document order, their count and the sink plugin names. The status
+  reason for an `ACTIVE` pipeline is AWS's own sentence. After the fix the replay's
+  remaining difference in that body is `$.Pipeline.ConfigurationSummary.DataSources[*]`:
+  the recorded data-source name is the pipeline name the fixture GENERATES per run, so it
+  is a per-run value and not a requirement — `Sources`, `Processors`, `ProcessorCount`,
+  `Sinks` and `StatusReason.Description` all match.

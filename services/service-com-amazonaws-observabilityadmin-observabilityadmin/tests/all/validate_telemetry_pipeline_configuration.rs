@@ -19,12 +19,14 @@
 //!    against;
 //! 3. a document that WAS read is checked against the SCHEMA a pipeline definition
 //!    follows, one reported error per problem: a required property the document does not
-//!    declare (`MISSING_FIELD`), a property the schema does not define (`UNKNOWN_PROPERTY`,
-//!    carrying the path it is written at), a property carrying a number of items the
-//!    schema does not allow, a POSITION of the processor sequence this emulator cannot
-//!    run (its own category, since the document may be one the real service accepts),
-//!    and every field naming an ARN carrying one — the IAM role syntax where the field
-//!    names the role a plugin assumes;
+//!    declare (`MISSING_FIELD`, carrying that property's own NAME — the `pipeline` the
+//!    schema requires of a document that declares none, and the `source`/`sink` a
+//!    section it does declare is missing), a property the schema does not define
+//!    (`UNKNOWN_PROPERTY`, carrying the path it is written at), a property carrying a
+//!    number of items the schema does not allow, a POSITION of the processor sequence
+//!    this emulator cannot run (its own category, since the document may be one the real
+//!    service accepts), and every field naming an ARN carrying one — the IAM role syntax
+//!    where the field names the role a plugin assumes;
 //! 4. nothing is stored and nothing is created: the call leaves the store exactly as it
 //!    found it, so the same call answers the same way twice.
 
@@ -344,51 +346,47 @@ async fn every_defect_of_a_document_is_reported_against_its_field() {
         (
             "a document that is not a mapping",
             "just some text\n".to_string(),
-            vec![(MISSING_FIELD, "source"), (MISSING_FIELD, "sink")],
+            vec![(MISSING_FIELD, "name")],
         ),
         (
             "an empty document declaring no pipeline",
             " \n".to_string(),
-            vec![(MISSING_FIELD, "source"), (MISSING_FIELD, "sink")],
+            vec![(MISSING_FIELD, "name")],
         ),
         (
             "a mapping declaring no pipeline section",
             "version: \"2\"\ntags:\n  owner: team\n".to_string(),
-            vec![
-                (UNKNOWN_PROPERTY, "path"),
-                (MISSING_FIELD, "source"),
-                (MISSING_FIELD, "sink"),
-            ],
+            vec![(UNKNOWN_PROPERTY, "path"), (MISSING_FIELD, "name")],
         ),
         (
             "a top-level pipeline with no source",
             "processor:\n  - parse_json: {}\nsink:\n  - cloudwatch_logs: {}\n".to_string(),
-            vec![(MISSING_FIELD, "source")],
+            vec![(MISSING_FIELD, "name")],
         ),
         (
             "a top-level pipeline with no sink",
             "source:\n  http: {}\nprocessor:\n  - parse_json: {}\n".to_string(),
-            vec![(MISSING_FIELD, "sink")],
+            vec![(MISSING_FIELD, "name")],
         ),
         (
             "a named section with neither a source nor a sink",
             "log-pipeline:\n  processor:\n    - parse_json: {}\n".to_string(),
-            vec![(MISSING_FIELD, "sink"), (MISSING_FIELD, "source")],
+            vec![(MISSING_FIELD, "name"), (MISSING_FIELD, "name")],
         ),
         (
             "a section naming two sources",
             "source:\n  http: {}\n  s3: {}\nsink:\n  - cloudwatch_logs: {}\n".to_string(),
-            vec![(VALIDATION_ERROR, "source")],
+            vec![(VALIDATION_ERROR, "path")],
         ),
         (
             "a section naming two sinks",
             "source:\n  http: {}\nsink:\n  - cloudwatch_logs: {}\n  - s3: {}\n".to_string(),
-            vec![(VALIDATION_ERROR, "sink")],
+            vec![(VALIDATION_ERROR, "path")],
         ),
         (
             "a source that names no plugin at all",
             "source:\nsink:\n  - cloudwatch_logs: {}\n".to_string(),
-            vec![(VALIDATION_ERROR, "source")],
+            vec![(VALIDATION_ERROR, "path")],
         ),
         (
             "a processor this emulator does not run",
@@ -444,7 +442,7 @@ async fn every_defect_of_a_document_is_reported_against_its_field() {
         (
             "a section with a processor defect AND no sink",
             "source:\n  http: {}\nprocessor:\n  - grok: {}\n".to_string(),
-            vec![(UNSUPPORTED_PROCESSOR, "path"), (MISSING_FIELD, "sink")],
+            vec![(UNSUPPORTED_PROCESSOR, "path"), (MISSING_FIELD, "name")],
         ),
         (
             "a role ARN that is not an ARN at all",
@@ -505,7 +503,7 @@ async fn every_defect_of_a_document_is_reported_against_its_field() {
             "source:\n  http: {}\n  s3: {}\nsink:\n  - cloudwatch_logs:\n      \
                sts_role_arn: not-an-arn\n"
                 .to_string(),
-            vec![(INVALID_PATTERN, "sts_role_arn"), (VALIDATION_ERROR, "source")],
+            vec![(INVALID_PATTERN, "sts_role_arn"), (VALIDATION_ERROR, "path")],
         ),
     ] {
         let (status, response) = validate(&emulator, &configuration).await;
@@ -579,6 +577,227 @@ async fn a_pattern_defect_names_the_value_its_path_and_the_constraint() {
         assert!(
             message.contains("pattern") && message.contains("^arn:"),
             "case {case:?}: expected the message to carry the constraint, got {message}"
+        );
+    }
+}
+
+/// Every `ValidationError` of `response` whose `FieldMap` is keyed by `key`, as
+/// `(Message, the value under that key)` pairs, sorted so a case asserts the SET of
+/// defects rather than the order two independent checks ran in.
+fn keyed(case: &str, response: &Value, key: &str) -> Vec<(String, String)> {
+    let errors = response
+        .get("Errors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut reported: Vec<(String, String)> = errors
+        .iter()
+        .filter_map(|error| {
+            let value = error.pointer(&format!("/FieldMap/{key}"))?;
+            let value = value.as_str().unwrap_or_else(|| {
+                panic!("case {case:?}: a FieldMap entry carries text, got {error:?}")
+            });
+            let message = error
+                .get("Message")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: every defect says what is wrong, got {error:?}")
+                });
+            Some((message.to_string(), value.to_string()))
+        })
+        .collect();
+    reported.sort();
+    reported
+}
+
+/// An ABSENT required property is reported by the property's own NAME: the `MISSING_FIELD`
+/// defect's `FieldMap` carries that name under the report's `name` key, and the message
+/// names the same property — so a client reads which field to add out of the entry
+/// rather than guessing it out of a path.
+///
+/// What the schema requires of a DOCUMENT is the pipeline itself, so a document that
+/// declares none is reported as the `pipeline` property being absent; what it requires of
+/// a section the document does declare is that section's `source` and `sink`.
+///
+/// The rows differ along what the rule generalises over: how the document fails to
+/// declare a pipeline (a scalar, nothing at all, a mapping of other properties, a
+/// sequence), which required property of a declared pipeline is missing (its source, its
+/// sink, both), how many of them are, and where the document writes that pipeline (under
+/// the property the schema requires, at the top level, under another name).
+#[tokio::test]
+async fn an_absent_required_property_is_reported_by_its_name() {
+    let emulator = emulator();
+
+    for (case, configuration, missing) in [
+        (
+            "a body that parses as a bare scalar",
+            "not-a-pipeline-definition\n".to_string(),
+            vec!["pipeline"],
+        ),
+        ("a body that declares nothing at all", " \n".to_string(), vec!["pipeline"]),
+        (
+            "a mapping of properties none of which is a pipeline",
+            "version: \"2\"\nowner: team\n".to_string(),
+            vec!["pipeline"],
+        ),
+        (
+            "a body that parses as a sequence",
+            "- cloudwatch_logs\n- s3\n".to_string(),
+            vec!["pipeline"],
+        ),
+        (
+            "a declared pipeline missing both of its required properties",
+            "pipeline:\n  processor:\n    - parse_json: {}\n".to_string(),
+            vec!["sink", "source"],
+        ),
+        (
+            "a declared pipeline missing only its sink",
+            "pipeline:\n  source:\n    http: {}\n  processor:\n    - parse_json: {}\n".to_string(),
+            vec!["sink"],
+        ),
+        (
+            "a pipeline written at the top level, missing only its source",
+            "processor:\n  - parse_json: {}\nsink:\n  - cloudwatch_logs: {}\n".to_string(),
+            vec!["source"],
+        ),
+        (
+            "a section the document declares under another name, missing its source",
+            "log-pipeline:\n  sink:\n    - cloudwatch_logs: {}\n".to_string(),
+            vec!["source"],
+        ),
+        (
+            "a pipeline declaring everything the schema requires of it",
+            top_level("processor:\n  - parse_json: {}\n"),
+            vec![],
+        ),
+    ] {
+        let (status, response) = validate(&emulator, &configuration).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a defect is reported, not refused; got {status} {response:?}"
+        );
+        let mut expected: Vec<(String, String)> = missing
+            .into_iter()
+            .map(|property: &str| {
+                (
+                    format!("required property '{property}' not found"),
+                    property.to_string(),
+                )
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(
+            keyed(case, &response, "name"),
+            expected,
+            "case {case:?}: expected those absent properties for {configuration:?}, \
+             got {response:?}"
+        );
+    }
+}
+
+/// Every OTHER defect of a property is reported by WHERE the property is written: the
+/// `FieldMap` carries that path under the report's `path` key, named relative to the
+/// pipeline the defect is in — the document's own pipeline is the document, so a
+/// position of its processor sequence is `processor[<i>]`, while a section the document
+/// declares under another name prefixes its own.
+///
+/// The rows differ along what the rule generalises over: which kind of defect is reported
+/// (a property the schema does not define, a property carrying a number of items the
+/// schema does not allow, a processor position this emulator cannot run), where in the
+/// document it sits (at the root, inside the pipeline the schema's property declares,
+/// inside a section declared under another name), and which position of the sequence it
+/// is.
+#[tokio::test]
+async fn a_defect_of_a_property_is_reported_by_where_it_is_written() {
+    let emulator = emulator();
+
+    for (case, configuration, expected) in [
+        (
+            "a property the schema does not define beside the document's pipeline",
+            "owner: team\npipeline:\n  source:\n    http: {}\n  sink:\n    \
+               - cloudwatch_logs: {}\n"
+                .to_string(),
+            vec!["root"],
+        ),
+        (
+            "a property the schema does not define inside the document's pipeline",
+            "pipeline:\n  source:\n    http: {}\n  retention: 30\n  sink:\n    \
+               - cloudwatch_logs: {}\n"
+                .to_string(),
+            vec!["retention"],
+        ),
+        (
+            "a processor position of the document's own pipeline",
+            "pipeline:\n  source:\n    http: {}\n  processor:\n    - grok: {}\n  sink:\n    \
+               - cloudwatch_logs: {}\n"
+                .to_string(),
+            vec!["processor[0]"],
+        ),
+        (
+            "the second position of that sequence",
+            "pipeline:\n  source:\n    http: {}\n  processor:\n    - parse_json: {}\n    \
+               - grok: {}\n  sink:\n    - cloudwatch_logs: {}\n"
+                .to_string(),
+            vec!["processor[1]"],
+        ),
+        (
+            "two positions of that sequence, each in its own right",
+            "pipeline:\n  source:\n    http: {}\n  processor:\n    - grok: {}\n    \
+               - geoip: {}\n  sink:\n    - cloudwatch_logs: {}\n"
+                .to_string(),
+            vec!["processor[0]", "processor[1]"],
+        ),
+        (
+            "a property the schema does not define inside a section declared under \
+             another name",
+            "log-pipeline:\n  source:\n    http: {}\n  retries: 3\n  sink:\n    \
+               - cloudwatch_logs: {}\n"
+                .to_string(),
+            vec!["log-pipeline.retries"],
+        ),
+        (
+            "a processor position of a section declared under another name",
+            "log-pipeline:\n  source:\n    http: {}\n  processor:\n    - grok: {}\n  \
+               sink:\n    - cloudwatch_logs: {}\n"
+                .to_string(),
+            vec!["log-pipeline.processor[0]"],
+        ),
+        (
+            "a property carrying more items than the schema allows, in the document's \
+             pipeline",
+            "pipeline:\n  source:\n    http: {}\n    s3: {}\n  sink:\n    \
+               - cloudwatch_logs: {}\n"
+                .to_string(),
+            vec!["source"],
+        ),
+        (
+            "the same property defect in a section declared under another name",
+            "log-pipeline:\n  source:\n    http: {}\n    s3: {}\n  sink:\n    \
+               - cloudwatch_logs: {}\n"
+                .to_string(),
+            vec!["log-pipeline.source"],
+        ),
+        (
+            "a pipeline whose every property the schema defines",
+            top_level("processor:\n  - parse_json: {}\n"),
+            vec![],
+        ),
+    ] {
+        let (status, response) = validate(&emulator, &configuration).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a defect is reported, not refused; got {status} {response:?}"
+        );
+        let mut reported: Vec<String> = keyed(case, &response, "path")
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+        reported.sort();
+        let mut expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+        expected.sort();
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected those paths for {configuration:?}, got {response:?}"
         );
     }
 }

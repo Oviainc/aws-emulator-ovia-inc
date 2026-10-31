@@ -3,9 +3,17 @@
 //! @op GetTelemetryPipeline
 //!
 //! Answers the ONE stored pipeline record the identifier names in the region the
-//! request was signed for — its configuration, its tags, its timestamps and the
-//! status derived from the clock — and a modelled 404 when no such record exists.
-//! A read, so it stores nothing.
+//! request was signed for — its configuration, the summary of that configuration's own
+//! components, its tags, its timestamps and the status derived from the clock — and a
+//! modelled 404 when no such record exists. A read, so it stores nothing.
+//!
+//! `Pipeline.ConfigurationSummary` is DERIVED from the stored configuration document
+//! ([`crate::state::StoredTelemetryPipeline::configuration_summary`]), which is the
+//! whole point of the member: the alternative for a caller rendering the pipeline's
+//! shape is re-parsing the document body itself. The model snapshot does not declare it
+//! on this shape, so it rides on
+//! [`crate::ops::types::TelemetryPipelineProjection`] beside the members the snapshot
+//! does declare — see that type and the crate README.
 //!
 //! The emulator verifies every request's signature centrally and models no IAM policy
 //! evaluation, so the modelled `AccessDeniedException` is deliberately unreachable

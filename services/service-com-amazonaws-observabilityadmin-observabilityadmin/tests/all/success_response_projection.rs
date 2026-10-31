@@ -582,14 +582,17 @@ async fn a_configuration_problem_is_reported_in_the_schemas_own_vocabulary() {
                     undefined("not-a-pipeline"),
                     json!({ "path": "root" }),
                 ),
-                ("MISSING_FIELD", missing("source"), json!({ "source": "root" })),
-                ("MISSING_FIELD", missing("sink"), json!({ "sink": "root" })),
+                (
+                    "MISSING_FIELD",
+                    missing("pipeline"),
+                    json!({ "name": "pipeline" }),
+                ),
             ],
         },
         SchemaError {
             case: "a top-level pipeline with no sink",
             body: "source:\n  http: {}\n",
-            expected: vec![("MISSING_FIELD", missing("sink"), json!({ "sink": "root" }))],
+            expected: vec![("MISSING_FIELD", missing("sink"), json!({ "name": "sink" }))],
         },
         SchemaError {
             case: "a named section with a property the schema does not define",
@@ -598,7 +601,7 @@ async fn a_configuration_problem_is_reported_in_the_schemas_own_vocabulary() {
             expected: vec![(
                 "UNKNOWN_PROPERTY",
                 undefined("retries"),
-                json!({ "path": "log-pipeline" }),
+                json!({ "path": "log-pipeline.retries" }),
             )],
         },
         SchemaError {
@@ -607,7 +610,7 @@ async fn a_configuration_problem_is_reported_in_the_schemas_own_vocabulary() {
             expected: vec![(
                 "MISSING_FIELD",
                 missing("source"),
-                json!({ "source": "log-pipeline" }),
+                json!({ "name": "source" }),
             )],
         },
         SchemaError {
@@ -616,7 +619,7 @@ async fn a_configuration_problem_is_reported_in_the_schemas_own_vocabulary() {
             expected: vec![(
                 "PIPELINE_CONFIGURATION_VALIDATION_ERROR",
                 "must have at least 1 items but found 0".to_string(),
-                json!({ "source": "root" }),
+                json!({ "path": "source" }),
             )],
         },
         SchemaError {
@@ -625,7 +628,7 @@ async fn a_configuration_problem_is_reported_in_the_schemas_own_vocabulary() {
             expected: vec![(
                 "PIPELINE_CONFIGURATION_VALIDATION_ERROR",
                 "must have at most 1 items but found 2".to_string(),
-                json!({ "sink": "root" }),
+                json!({ "path": "sink" }),
             )],
         },
         SchemaError {
@@ -635,7 +638,7 @@ async fn a_configuration_problem_is_reported_in_the_schemas_own_vocabulary() {
             expected: vec![(
                 "PIPELINE_CONFIGURATION_VALIDATION_ERROR",
                 "must have at most 1 items but found 3".to_string(),
-                json!({ "source": "root" }),
+                json!({ "path": "source" }),
             )],
         },
         SchemaError {
@@ -650,7 +653,7 @@ async fn a_configuration_problem_is_reported_in_the_schemas_own_vocabulary() {
                 (
                     "MISSING_FIELD",
                     missing("sink"),
-                    json!({ "sink": "log-pipeline" }),
+                    json!({ "name": "sink" }),
                 ),
             ],
         },

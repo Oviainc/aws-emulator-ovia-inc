@@ -26,6 +26,17 @@ service-com-amazonaws-observabilityadmin-observabilityadmin/
     └── ops/              # ONE FILE PER OPERATION
 ```
 
+## Where this emulator answers a member the model snapshot does not declare
+
+The model JSON in `smithy-model/` is kept EXACTLY as shipped — nothing in this crate
+edits it. Where a RECORDED live response carries a member the snapshot's shape does not
+declare, the member rides on a projection type beside the generated one, which writes
+the generated members first and then adds its own. Every such member is listed here:
+
+| Shape | Member | How, and why |
+|---|---|---|
+| `com.amazonaws.observabilityadmin#TelemetryPipeline` | `ConfigurationSummary` (target `com.amazonaws.observabilityadmin#ConfigurationSummary`) | A recorded `GetTelemetryPipeline` for an active pipeline answers `Pipeline.ConfigurationSummary` with the components of the stored configuration document; the snapshot binds that shape only to `TelemetryPipelineSummary`, the LISTING shape. `TelemetryPipelineProjection` in `src/ops/types/get_telemetry_pipeline_types.rs` carries it: the generated `TelemetryPipeline` writes the eight members the snapshot declares, and the projection adds this one under its own member schema. The value is derived from the stored document by `src/state.rs`'s `configuration_summary`; `tests/all/pipeline_configuration_summary.rs` holds the rule it follows. |
+
 ## Implementing an operation
 
 Each file in `src/ops/` owns exactly one operation and declares which one

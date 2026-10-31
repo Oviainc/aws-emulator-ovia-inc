@@ -343,14 +343,14 @@ pub(crate) enum Node {
 }
 
 impl Node {
-    fn as_str(&self) -> Option<&str> {
+    pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Self::Scalar { text, .. } => Some(text.as_str()),
             _ => None,
         }
     }
 
-    fn as_sequence(&self) -> Option<&[Node]> {
+    pub(crate) fn as_sequence(&self) -> Option<&[Node]> {
         match self {
             Self::Sequence(items) => Some(items.as_slice()),
             _ => None,
@@ -706,6 +706,33 @@ fn chain_of_sections(entries: &[(String, Node)]) -> Result<Vec<(&str, &Node)>, S
         ));
     }
     Ok(chain)
+}
+
+/// The pipeline sections a document declares, in document order, each with the name it
+/// declares that section under — EMPTY for a document that writes its one pipeline at
+/// the top level.
+///
+/// A document that writes its `source`/`processor`/`sink` at the top level IS one
+/// pipeline section; otherwise every mapping entry whose value carries one of those
+/// keys is a section, and each of those is a pipeline in its own right. A document that
+/// declares neither declares NO pipeline, so the list is empty: what such a document is
+/// missing is the pipeline itself, which is what
+/// [`crate::ops::validate_telemetry_pipeline_configuration`] reports and what
+/// [`processor_chain`] refuses.
+///
+/// `pub(crate)` for the same reason the reader below is: the validator reports defects
+/// in the same sections this operation runs, so both read the document's sections out
+/// of one place rather than out of two that could disagree.
+pub(crate) fn declared_sections(root: &Node) -> Vec<(&str, &Node)> {
+    if is_section(root) {
+        return vec![("", root)];
+    }
+    root.as_mapping()
+        .unwrap_or_default()
+        .iter()
+        .filter(|(_, value)| is_section(value))
+        .map(|(name, value)| (name.as_str(), value))
+        .collect()
 }
 
 /// Whether a node is a pipeline section: a mapping carrying a source, a processor

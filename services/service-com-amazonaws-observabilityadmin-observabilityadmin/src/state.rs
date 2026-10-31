@@ -48,9 +48,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::ops::test_telemetry_pipeline::{
+    declared_sections, parse_configuration, Node, PROCESSOR_KEY, SINK_KEY, SOURCE_KEY,
+};
 use crate::ops::types::{
-    CentralizationRule, CentralizationRuleSummary, Encryption, IntegrationSummary, RegionStatus,
-    TelemetryPipeline, TelemetryPipelineConfiguration, TelemetryPipelineStatusReason, TelemetryRule,
+    CentralizationRule, CentralizationRuleSummary, ConfigurationSummary, DataSource, Encryption,
+    IntegrationSummary, RegionStatus, Source, TelemetryPipeline, TelemetryPipelineConfiguration,
+    TelemetryPipelineProjection, TelemetryPipelineStatusReason, TelemetryRule,
     TelemetryRuleSummary, ACTION_VALUES, DELETION_PROTECTION_VALUES, DESTINATION_TYPE_VALUES,
     ENCRYPTED_LOG_GROUP_STRATEGY_VALUES, ENCRYPTION_CONFLICT_RESOLUTION_STRATEGY_VALUES,
     ENCRYPTION_SCOPE_VALUES, ENCRYPTION_STRATEGY_VALUES, FILTER_BEHAVIOR_VALUES,
@@ -204,6 +208,61 @@ pub const PIPELINE_STATUS_CREATING: &str = "CREATING";
 
 /// Status of a pipeline whose creation has come due.
 pub const PIPELINE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `StatusReason$Description` a read reports for an ACTIVE pipeline.
+///
+/// Wholly fixed text, with no part of the request or of the record in it: the sentence
+/// the recorded response carries for this status.
+pub const PIPELINE_ACTIVE_STATUS_REASON: &str = "Pipeline is active and processing data";
+
+/// The `StatusReason$Description` a read reports while the pipeline's creation has not
+/// come due yet. Only the ACTIVE sentence is recorded; this one is this emulator's own,
+/// in the same form, for the status it reports in the meantime.
+pub const PIPELINE_CREATING_STATUS_REASON: &str = "Pipeline is being created";
+
+/// The value a data source's `Type` carries when the configuration document names none
+/// and the source is one that reads log events AWS vends (see
+/// [`VENDED_LOG_SOURCE_PLUGINS`]).
+///
+/// The recorded summary reports this token for such a data source.
+pub const DEFAULT_DATA_SOURCE_TYPE: &str = "default";
+
+/// The property a source plugin lists its data sources under.
+const DATA_SOURCES_KEY: &str = "data_sources";
+
+/// The source plugins that read log events AWS itself vends, as opposed to a
+/// third-party source the pipeline pulls from.
+///
+/// `DataSource`'s own documentation (`smithy_query(query="shape",
+/// shape="DataSource")`) reports a data source differently for the two kinds: "For
+/// CloudWatch Logs sources, this includes both a name and type extracted from the log
+/// event metadata. For third-party sources (such as S3), this includes only a name, with
+/// the type field left empty." `DataSource$Name` adds that for a third-party source the
+/// name "is either the configured `data_source_name` or defaults to the plugin name if
+/// not specified". [`data_source`] below is that split.
+///
+/// The model states no catalogue of source plugins, so this set is not derivable from
+/// it: it holds the AWS-vended source types the recorded validation report names as its
+/// restrictions' own `source_type` descriptors, and a plugin it does not list is read as
+/// a third-party source. A recording naming another vended source type extends it.
+const VENDED_LOG_SOURCE_PLUGINS: &[&str] = &[
+    "cloudwatch_logs",
+    "amazon_vpc_flow",
+    "amazon_cloudfront",
+];
+
+/// The properties a data source's NAME and TYPE are declared under on a source plugin's
+/// own block, which `DataSource`'s documentation names: `Name` "corresponds to the
+/// `data_source_name` from the log event metadata" or is "the configured
+/// `data_source_name`", and `Type` "corresponds to the `data_source_type`".
+const DATA_SOURCE_NAME_KEY: &str = "data_source_name";
+const DATA_SOURCE_TYPE_KEY: &str = "data_source_type";
+
+/// The properties an ENTRY of a `data_sources` list declares its name and type under:
+/// inside that list each entry is a data source already, so it carries the modelled
+/// member names rather than repeating the `data_source_` prefix.
+const NAME_KEY: &str = "name";
+const TYPE_KEY: &str = "type";
 
 /// The `ResourceType` a modelled error names the telemetry-pipeline RESOURCE by —
 /// its own API name, for the reason [`RULE_RESOURCE_TYPE`] states.
@@ -515,8 +574,8 @@ impl StoredTelemetryPipeline {
     /// reported".
     pub fn status_reason_at(&self, now_ms: i64) -> TelemetryPipelineStatusReason {
         let description = match self.status_at(now_ms) {
-            PIPELINE_STATUS_CREATING => "The pipeline is being created.",
-            PIPELINE_STATUS_ACTIVE => "The pipeline is active.",
+            PIPELINE_STATUS_CREATING => PIPELINE_CREATING_STATUS_REASON,
+            PIPELINE_STATUS_ACTIVE => PIPELINE_ACTIVE_STATUS_REASON,
             // Unreachable while a stored pipeline reports one of the two statuses
             // above: a status added here needs its own sentence rather than
             // inheriting another status's.
@@ -539,21 +598,201 @@ impl StoredTelemetryPipeline {
             .collect()
     }
 
-    /// This record as the `TelemetryPipeline` a read reports, as it stands at
-    /// `now_ms`.
-    pub fn as_pipeline(&self, now_ms: i64) -> TelemetryPipeline {
-        TelemetryPipeline {
-            created_time_stamp: Some(self.created_timestamp_ms),
-            last_update_time_stamp: Some(self.last_update_timestamp_ms),
-            arn: Some(self.arn.clone()),
-            name: Some(self.name.clone()),
-            configuration: Some(TelemetryPipelineConfiguration {
-                body: self.configuration_body.clone(),
-            }),
-            status: Some(self.status_at(now_ms).to_string()),
-            status_reason: Some(self.status_reason_at(now_ms)),
-            tags: Some(self.tag_map()),
+    /// The `ConfigurationSummary` this pipeline's stored configuration document
+    /// declares: see [`configuration_summary`].
+    pub fn configuration_summary(&self) -> Option<ConfigurationSummary> {
+        configuration_summary(self)
+    }
+
+    /// This record as the pipeline a read reports, as it stands at `now_ms`: every
+    /// member the model snapshot's `TelemetryPipeline` shape declares, plus the
+    /// `ConfigurationSummary` the recorded responses carry beside them (see
+    /// [`TelemetryPipelineProjection`]).
+    pub fn as_pipeline(&self, now_ms: i64) -> TelemetryPipelineProjection {
+        TelemetryPipelineProjection {
+            pipeline: TelemetryPipeline {
+                created_time_stamp: Some(self.created_timestamp_ms),
+                last_update_time_stamp: Some(self.last_update_timestamp_ms),
+                arn: Some(self.arn.clone()),
+                name: Some(self.name.clone()),
+                configuration: Some(TelemetryPipelineConfiguration {
+                    body: self.configuration_body.clone(),
+                }),
+                status: Some(self.status_at(now_ms).to_string()),
+                status_reason: Some(self.status_reason_at(now_ms)),
+                tags: Some(self.tag_map()),
+            },
+            configuration_summary: self.configuration_summary(),
         }
+    }
+}
+
+/// The `ConfigurationSummary` of the pipeline `record`: the components its stored
+/// configuration document declares, so a caller can render the pipeline's shape without
+/// re-parsing the document itself.
+///
+/// Every member is DERIVED from the document, through the one bounded reader this crate
+/// has ([`parse_configuration`], which `TestTelemetryPipeline` and
+/// `ValidateTelemetryPipelineConfiguration` read the same documents with):
+///
+/// * `Sources` is one entry per source plugin a section declares. `Source`'s own
+///   documentation says the pipeline "currently supports a single source per pipeline,
+///   but is structured as a list to accommodate multiple pipelines in the
+///   configuration", so the list spans the sections the document declares.
+/// * `DataSources` is one entry per data source those source plugins declare, each with
+///   the name and the type it was declared with. A source that declares none still has
+///   one, named the way `DataSource$Name`'s documentation says that source kind names
+///   it: see [`undeclared_data_source`].
+/// * `Processors` is the processor names in document order and `ProcessorCount` is how
+///   many there are, so the two never disagree.
+/// * `Sinks` is the sink plugin names those sections declare.
+///
+/// A body the reader cannot read declares no components, so it has no summary: a
+/// document that was never parsed is a different observation from one declaring nothing.
+fn configuration_summary(record: &StoredTelemetryPipeline) -> Option<ConfigurationSummary> {
+    let root = parse_configuration(&record.configuration_body).ok()?;
+    let mut sources = Vec::new();
+    let mut data_sources = Vec::new();
+    let mut processors = Vec::new();
+    let mut sinks = Vec::new();
+
+    for (_, section) in declared_sections(&root) {
+        for (plugin, options) in plugins_declared(section.get(SOURCE_KEY)) {
+            sources.push(Source {
+                r#type: Some(plugin.to_string()),
+            });
+            data_sources.extend(data_sources_declared(plugin, options, &record.name));
+        }
+        processors.extend(
+            processors_declared(section.get(PROCESSOR_KEY))
+                .into_iter()
+                .map(str::to_string),
+        );
+        for (plugin, _) in plugins_declared(section.get(SINK_KEY)) {
+            sinks.push(plugin.to_string());
+        }
+    }
+
+    Some(ConfigurationSummary {
+        // The reader this walked bounds a document to `MAX_CONFIGURATION_NODES` nodes,
+        // which is far inside `i32`, so the count is the list's length; the fallback
+        // only keeps the cast total.
+        processor_count: Some(i32::try_from(processors.len()).unwrap_or(i32::MAX)),
+        sources: Some(sources),
+        data_sources: Some(data_sources),
+        processors: Some(processors),
+        sinks: Some(sinks),
+    })
+}
+
+/// The plugins one `source` or `sink` property declares, each with the options it
+/// carries: the entries of the mapping a source is written as, and the entries of each
+/// mapping of the sequence a sink is written as — the two forms this format writes a
+/// plugin in.
+fn plugins_declared(property: Option<&Node>) -> Vec<(&str, &Node)> {
+    let Some(property) = property else {
+        return Vec::new();
+    };
+    match property {
+        Node::Mapping(entries) => entries
+            .iter()
+            .map(|(plugin, options)| (plugin.as_str(), options))
+            .collect(),
+        Node::Sequence(items) => items
+            .iter()
+            .flat_map(|item| plugins_declared(Some(item)))
+            .collect(),
+        Node::Null | Node::Scalar { .. } => Vec::new(),
+    }
+}
+
+/// The processor names a section's `processor` sequence declares, in document order: the
+/// name each position names, whether that position carries the processor's options (a
+/// mapping) or only its name (a scalar).
+fn processors_declared(property: Option<&Node>) -> Vec<&str> {
+    let Some(Node::Sequence(items)) = property else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .flat_map(|item| match item {
+            Node::Mapping(entries) => entries
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<&str>>(),
+            Node::Scalar { text, .. } => vec![text.as_str()],
+            Node::Null | Node::Sequence(_) => Vec::new(),
+        })
+        .collect()
+}
+
+/// The data sources the source plugin `plugin` declares in `options`, for a pipeline
+/// named `pipeline`.
+///
+/// A source declares them as the entries of its `data_sources` list — each entry either
+/// the data source's name on its own or a mapping carrying that name and its type — or
+/// as the `data_source_name`/`data_source_type` pair `DataSource`'s own documentation
+/// names, on the plugin's own block. A source declaring neither still has one data
+/// source, and what it is named and typed is [`data_source`]'s business.
+fn data_sources_declared(plugin: &str, options: &Node, pipeline: &str) -> Vec<DataSource> {
+    let declared = options
+        .get(DATA_SOURCES_KEY)
+        .and_then(Node::as_sequence)
+        .unwrap_or_default();
+    if declared.is_empty() {
+        return vec![data_source(
+            plugin,
+            pipeline,
+            declared_text(options, DATA_SOURCE_NAME_KEY),
+            declared_text(options, DATA_SOURCE_TYPE_KEY),
+        )];
+    }
+    declared
+        .iter()
+        .map(|entry| match entry.as_str() {
+            // An entry that is just a name names the data source and declares no type.
+            Some(name) => data_source(plugin, pipeline, Some(name), None),
+            None => data_source(
+                plugin,
+                pipeline,
+                declared_text(entry, NAME_KEY)
+                    .or_else(|| declared_text(entry, DATA_SOURCE_NAME_KEY)),
+                declared_text(entry, TYPE_KEY)
+                    .or_else(|| declared_text(entry, DATA_SOURCE_TYPE_KEY)),
+            ),
+        })
+        .collect()
+}
+
+/// The text `node` declares under `key`, for a mapping that declares one as a scalar.
+fn declared_text<'a>(node: &'a Node, key: &str) -> Option<&'a str> {
+    node.get(key).and_then(Node::as_str)
+}
+
+/// One data source of a summary: the name and the type the document declared for it, and
+/// what each is when the document declared it not.
+///
+/// `DataSource`'s documentation splits BOTH of those by the KIND of source, which is why
+/// the source plugin and the pipeline's name reach here. For a source reading log events
+/// AWS vends ([`VENDED_LOG_SOURCE_PLUGINS`]), the data source "includes both a name and
+/// type extracted from the log event metadata": those events are the ones vended for the
+/// pipeline itself, so a name the document leaves out is the pipeline's own and a type it
+/// leaves out is [`DEFAULT_DATA_SOURCE_TYPE`]. "For third-party sources (such as S3),
+/// this includes only a name", which "defaults to the plugin name if not specified",
+/// "with the type field left empty" — so such a source reports no type at all unless the
+/// document declares one.
+fn data_source(
+    plugin: &str,
+    pipeline: &str,
+    name: Option<&str>,
+    declared_type: Option<&str>,
+) -> DataSource {
+    let vended = VENDED_LOG_SOURCE_PLUGINS.contains(&plugin);
+    DataSource {
+        name: Some(name.unwrap_or(if vended { pipeline } else { plugin }).to_string()),
+        r#type: declared_type
+            .map(str::to_string)
+            .or_else(|| vended.then(|| DEFAULT_DATA_SOURCE_TYPE.to_string())),
     }
 }
 

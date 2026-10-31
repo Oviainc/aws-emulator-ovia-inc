@@ -19,13 +19,19 @@
 //! * the body is not a document this emulator reads — a syntax error, an alias, or
 //!   nesting past what it reads — which is the one defect reported for such a body,
 //!   since a body that was never read has no fields to report anything else against;
-//! * the document declares no pipeline, or its sections do not form ONE chain: a sink
-//!   naming a section the document does not declare, a cycle, a fan-out to two
-//!   pipelines, or a section nothing reaches;
+//! * the document declares no pipeline at all, which is the one property the pipeline
+//!   schema requires of a DOCUMENT (`pipeline`) being absent, and the only defect
+//!   reported for such a document: a document that declares no pipeline has no
+//!   section whose own properties could be reported;
+//! * the sections the document does declare do not form ONE chain: a sink naming a
+//!   section the document does not declare, a cycle, a fan-out to two pipelines, or a
+//!   section nothing reaches;
 //! * a section does not declare a property the pipeline schema requires of it, or
 //!   declares one the schema does not define, or declares one carrying a number of
 //!   items the schema does not allow — each reported the way a schema validator
-//!   reports that keyword, at the path in the document it is about;
+//!   reports that keyword: an ABSENT required property under the report's `name` key,
+//!   which is the property's own name, and everything else at the PATH in the document
+//!   it is about, named relative to the document's own pipeline;
 //! * a position of a section's `processor` sequence names a processor, or an option,
 //!   this emulator does not run, which carries its own reason code because the document
 //!   may be one the real service accepts — the schema catalogue the real service
@@ -117,8 +123,8 @@ use ::std::sync::LazyLock;
 use ::regex::Regex;
 
 use crate::ops::test_telemetry_pipeline::{
-    is_section, parse_configuration, processor_chain, step_defect, Node, PROCESSOR_KEY, SINK_KEY,
-    SOURCE_KEY,
+    declared_sections, is_section, parse_configuration, processor_chain, step_defect, Node,
+    PROCESSOR_KEY, SINK_KEY, SOURCE_KEY,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -228,6 +234,21 @@ const BODY_FIELD: &str = "Configuration.Body";
 /// The path a report names the document's own root by.
 const ROOT_PATH: &str = "root";
 
+/// The property a configuration document declares its pipeline under, which is the one
+/// property the schema requires of the DOCUMENT: a document declaring no pipeline is
+/// reported as this property being absent, and the recorded report names exactly this
+/// property for such a document.
+const PIPELINE_PROPERTY: &str = "pipeline";
+
+/// The `FieldMap` key an absent required property is reported under: what such a defect
+/// is about is the property's NAME, so that is the key and the name is its value.
+const NAME_KEY: &str = "name";
+
+/// The `FieldMap` key every other defect of a property is reported under: WHERE in the
+/// document the property is written, which is what tells two properties of one name
+/// apart.
+const PATH_KEY: &str = "path";
+
 /// The one property a configuration document carries beside its pipeline sections:
 /// the format's version key.
 const VERSION_KEY: &str = "version";
@@ -309,12 +330,13 @@ fn configuration_defects(body: &str) -> Vec<ValidationError> {
         Err(why) => return vec![defect(BODY_FIELD, REASON_PARSE_ERROR, why)],
     };
 
-    let mut defects = schema_defects(&root);
+    let sections = declared_sections(&root);
+    let mut defects = schema_defects(&root, &sections);
     // The chain is a property of the document as a whole: which section reads which.
     // A document that declares no section has no chain to report anything about —
-    // what it is missing is the section's own required properties, which
-    // `schema_defects` has just reported.
-    if declares_section(&root) {
+    // what it is missing is the pipeline itself, which `schema_defects` has just
+    // reported.
+    if !sections.is_empty() {
         if let Err(why) = processor_chain(&root) {
             defects.push(defect(BODY_FIELD, REASON_VALIDATION_ERROR, why));
         }
@@ -326,7 +348,11 @@ fn configuration_defects(body: &str) -> Vec<ValidationError> {
 /// Every defect the document has against the schema's properties: the required ones it
 /// does not declare, the ones the schema does not define, the ones carrying a number of
 /// items the schema does not allow, and the processors this emulator does not run.
-fn schema_defects(root: &Node) -> Vec<ValidationError> {
+///
+/// `sections` is the pipeline sections the document declares
+/// ([`declared_sections`]), read once by the caller because the chain check needs the
+/// same answer.
+fn schema_defects(root: &Node, sections: &[(&str, &Node)]) -> Vec<ValidationError> {
     let mut defects = Vec::new();
     let entries = root.as_mapping().unwrap_or_default();
     let root_is_section = is_section(root);
@@ -347,55 +373,57 @@ fn schema_defects(root: &Node) -> Vec<ValidationError> {
         }
     }
 
-    for (path, section) in sections(root) {
-        // A named section's own properties are checked against the same section
-        // schema; the root's were checked above, where the version key is defined too.
-        if path != ROOT_PATH {
+    if sections.is_empty() {
+        // The document declares no pipeline, so the property the schema requires of a
+        // document is what is absent — not the properties of a section the document
+        // never declared.
+        defects.push(missing_field(PIPELINE_PROPERTY));
+        return defects;
+    }
+
+    for (name, section) in sections {
+        let prefix = defect_prefix(name);
+        // A section the document declares under a NAME is checked against the same
+        // section schema; a document writing its pipeline at the top level had those
+        // properties checked by the root walk above, where the version key is defined
+        // too.
+        if !name.is_empty() {
             for (property, _) in section.as_mapping().unwrap_or_default() {
                 if !SECTION_PROPERTIES.contains(&property.as_str()) {
-                    defects.push(unknown_property(property, &path));
+                    defects.push(unknown_property(property, &property_path(prefix, property)));
                 }
             }
         }
-        defects.extend(section_defects(&path, section, &mut patterns));
+        defects.extend(section_defects(prefix, section, &mut patterns));
     }
     defects
 }
 
-/// The pipeline sections of a document, each with the path a defect of it is reported
-/// at.
+/// The prefix a defect INSIDE the section declared under `name` is reported at.
 ///
-/// A document writing its `source`/`processor`/`sink` at the top level IS one pipeline
-/// section, reported at the document's root; otherwise every mapping entry carrying one
-/// of those keys is a named section, and each of them is a pipeline in its own right,
-/// reported at its own name. A document that declares neither is still read as the
-/// single-pipeline form — it is a pipeline with nothing in it, so what it is missing is
-/// reported rather than the document being dismissed.
-fn sections(root: &Node) -> Vec<(String, &Node)> {
-    if is_section(root) {
-        return vec![(ROOT_PATH.to_string(), root)];
+/// The document's own pipeline — the one it declares under the [`PIPELINE_PROPERTY`]
+/// the schema requires, and the one a document writing its `source`/`processor`/`sink`
+/// at the top level is — carries no prefix: a defect in it is named relative to the
+/// document, which is how the recorded report names a processor position
+/// (`processor[0]`). Any OTHER section the document declares is a pipeline of its own,
+/// so a defect in it is named under that section's name, which is what tells the two
+/// sections' defects apart.
+fn defect_prefix(name: &str) -> &str {
+    if name == PIPELINE_PROPERTY {
+        return "";
     }
-    let named: Vec<(String, &Node)> = root
-        .as_mapping()
-        .unwrap_or_default()
-        .iter()
-        .filter(|(_, value)| is_section(value))
-        .map(|(name, value)| (name.clone(), value))
-        .collect();
-    if named.is_empty() {
-        return vec![(ROOT_PATH.to_string(), root)];
-    }
-    named
+    name
 }
 
-/// Whether the document declares a pipeline section at all.
-fn declares_section(root: &Node) -> bool {
-    is_section(root)
-        || root
-            .as_mapping()
-            .unwrap_or_default()
-            .iter()
-            .any(|(_, value)| is_section(value))
+/// The path the property `property` of the section at `prefix` is WRITTEN at, which is
+/// what a defect of that property is reported by: the property's own name inside the
+/// document's pipeline, and that name under its section's for any other section — the
+/// same relative naming a processor position takes ([`processor_path`]).
+fn property_path(prefix: &str, property: &str) -> String {
+    if prefix.is_empty() {
+        return property.to_string();
+    }
+    format!("{prefix}.{property}")
 }
 
 /// One defect per property of `section` that the schema requires and the section does
@@ -405,21 +433,21 @@ fn declares_section(root: &Node) -> bool {
 /// A property the section does not declare at all is a MISSING one; a property it
 /// declares that names no plugin, or more than the schema allows, is a property whose
 /// VALUE is wrong, and is reported as the item count it carries.
-fn section_defects(path: &str, section: &Node, patterns: &mut usize) -> Vec<ValidationError> {
+fn section_defects(prefix: &str, section: &Node, patterns: &mut usize) -> Vec<ValidationError> {
     let mut defects = Vec::new();
     for property in REQUIRED_SECTION_PROPERTIES {
         let Some(value) = section.get(property) else {
-            defects.push(missing_field(property, path));
+            defects.push(missing_field(property));
             continue;
         };
         let named = plugins_named(value);
         if named < MIN_PLUGINS_PER_PROPERTY {
-            defects.push(too_few_items(property, path, named));
+            defects.push(too_few_items(&property_path(prefix, property), named));
         } else if named > MAX_PLUGINS_PER_PROPERTY {
-            defects.push(too_many_items(property, path, named));
+            defects.push(too_many_items(&property_path(prefix, property), named));
         }
     }
-    defects.extend(processor_defects(path, section, patterns));
+    defects.extend(processor_defects(prefix, section, patterns));
     defects
 }
 
@@ -434,7 +462,7 @@ fn section_defects(path: &str, section: &Node, patterns: &mut usize) -> Vec<Vali
 /// schema's "not defined" one: the catalogue the real service validates a processor
 /// NAME against is not in this service's model, and the document may well be one it
 /// accepts — what this emulator knows is which processors IT runs.
-fn processor_defects(path: &str, section: &Node, patterns: &mut usize) -> Vec<ValidationError> {
+fn processor_defects(prefix: &str, section: &Node, patterns: &mut usize) -> Vec<ValidationError> {
     let Some(Node::Sequence(items)) = section.get(PROCESSOR_KEY) else {
         return Vec::new();
     };
@@ -449,34 +477,33 @@ fn processor_defects(path: &str, section: &Node, patterns: &mut usize) -> Vec<Va
             };
             step_defect(name, options, patterns)
                 .err()
-                .map(|why| unsupported_processor(&processor_path(path, index), why))
+                .map(|why| unsupported_processor(&processor_path(prefix, index), why))
         })
         .collect()
 }
 
-/// The path of the `processor` entry at `index` of the section at `path`.
-fn processor_path(path: &str, index: usize) -> String {
-    if path == ROOT_PATH {
+/// The path of the `processor` entry at `index` of the section at `prefix`.
+fn processor_path(prefix: &str, index: usize) -> String {
+    if prefix.is_empty() {
         return format!("{PROCESSOR_KEY}[{index}]");
     }
-    format!("{path}.{PROCESSOR_KEY}[{index}]")
+    format!("{prefix}.{PROCESSOR_KEY}[{index}]")
 }
 
 /// The defect of a required property the document does not declare, worded the way a
 /// schema validator words it.
 ///
-/// The `FieldMap` names the missing property and says where it was expected, since a
-/// document with two sections can be missing the same property twice. The property
-/// name as the KEY is what the recorded response carries; the path as its value is
-/// this emulator's choice of the fact to report under it, read the same way
-/// [`unknown_property`]'s recorded `path` entry is.
-fn missing_field(property: &str, path: &str) -> ValidationError {
+/// The `FieldMap` carries the missing property's own NAME, under the [`NAME_KEY`] the
+/// recorded report keys such a defect by: the one variable part of this defect is the
+/// name of the property the document failed to declare, which is what a console or CLI
+/// reads to point at the field to add.
+fn missing_field(property: &str) -> ValidationError {
     ValidationError {
         message: Some(format!("required property '{property}' not found")),
         reason: Some(REASON_MISSING_FIELD.to_string()),
         field_map: Some(HashMap::from([(
+            NAME_KEY.to_string(),
             property.to_string(),
-            path.to_string(),
         )])),
     }
 }
@@ -491,7 +518,10 @@ fn unknown_property(property: &str, path: &str) -> ValidationError {
              additional properties"
         )),
         reason: Some(REASON_UNKNOWN_PROPERTY.to_string()),
-        field_map: Some(HashMap::from([("path".to_string(), path.to_string())])),
+        field_map: Some(HashMap::from([(
+            PATH_KEY.to_string(),
+            path.to_string(),
+        )])),
     }
 }
 
@@ -502,40 +532,44 @@ fn unsupported_processor(path: &str, why: String) -> ValidationError {
     ValidationError {
         message: Some(why),
         reason: Some(REASON_UNSUPPORTED_PROCESSOR.to_string()),
-        field_map: Some(HashMap::from([("path".to_string(), path.to_string())])),
+        field_map: Some(HashMap::from([(
+            PATH_KEY.to_string(),
+            path.to_string(),
+        )])),
     }
 }
 
 /// The defect of a property carrying more items than the schema allows for it, worded
-/// the way a schema validator words it.
+/// the way a schema validator words it, and reported at the path the property is written
+/// at — what is wrong is that property's VALUE, so the report names where it is.
 ///
 /// The CATEGORY is this service's own: the recording shows that wording only under a
 /// data-source restriction's reason, which this problem is not, and the reason the real
 /// service answers for a plain item-count violation is not in the model — so nothing
 /// here claims it was verified.
-fn too_many_items(property: &str, path: &str, found: usize) -> ValidationError {
+fn too_many_items(path: &str, found: usize) -> ValidationError {
     ValidationError {
         message: Some(format!(
             "must have at most {MAX_PLUGINS_PER_PROPERTY} items but found {found}"
         )),
         reason: Some(REASON_VALIDATION_ERROR.to_string()),
         field_map: Some(HashMap::from([(
-            property.to_string(),
+            PATH_KEY.to_string(),
             path.to_string(),
         )])),
     }
 }
 
 /// The defect of a property carrying fewer items than the schema allows for it, worded
-/// the way a schema validator words it.
-fn too_few_items(property: &str, path: &str, found: usize) -> ValidationError {
+/// and keyed the way [`too_many_items`] is.
+fn too_few_items(path: &str, found: usize) -> ValidationError {
     ValidationError {
         message: Some(format!(
             "must have at least {MIN_PLUGINS_PER_PROPERTY} items but found {found}"
         )),
         reason: Some(REASON_VALIDATION_ERROR.to_string()),
         field_map: Some(HashMap::from([(
-            property.to_string(),
+            PATH_KEY.to_string(),
             path.to_string(),
         )])),
     }

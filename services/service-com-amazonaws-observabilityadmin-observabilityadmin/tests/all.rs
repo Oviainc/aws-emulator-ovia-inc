@@ -14,6 +14,9 @@
 #[path = "all/centralization_rules.rs"]
 mod centralization_rules;
 
+#[path = "all/pipeline_configuration_summary.rs"]
+mod pipeline_configuration_summary;
+
 #[path = "all/refusal_contract.rs"]
 mod refusal_contract;
 
