@@ -79,6 +79,8 @@ mod durable_execution_stop;
 mod event_source_mapping_delete_in_use;
 #[path = "all/event_source_mapping_deletion.rs"]
 mod event_source_mapping_deletion;
+#[path = "all/event_source_mapping_duplicate_source.rs"]
+mod event_source_mapping_duplicate_source;
 #[path = "all/event_source_mapping_event_counts.rs"]
 mod event_source_mapping_event_counts;
 #[path = "all/event_source_mapping_metrics_scope.rs"]

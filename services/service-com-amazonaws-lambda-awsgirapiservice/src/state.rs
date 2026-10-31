@@ -5359,6 +5359,110 @@ pub fn duplicate_event_source_mapping_message(
     )
 }
 
+/// WHICH RECORDS a mapping reads — the identity a second `CreateEventSourceMapping` for
+/// one function is judged a duplicate by.
+///
+/// "Creates a mapping between an event source and an Lambda Event Function": the source
+/// is either the resource `EventSourceArn` names or a self-managed Apache Kafka cluster,
+/// which has no ARN and is named by its brokers instead ("The list of bootstrap servers
+/// for your Kafka brokers"). Inside either, a mapping on a Kafka source consumes the one
+/// `Topics` entry and a mapping on an Amazon MQ broker the one `Queues` entry the request
+/// named ("The name of the Kafka topic", "The name of the Amazon MQ broker destination
+/// queue to consume"), and a source with neither is consumed whole. So the identity is
+/// the source TOGETHER WITH what is consumed inside it: two mappings of one cluster
+/// reading different topics read different records and are different mappings, while two
+/// that agree on all of it would hand one function the same records twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolledEventSource {
+    /// The source, as the refusal names it: the `EventSourceArn`, or the bootstrap
+    /// servers of the self-managed cluster.
+    source: String,
+    /// Whether [`Self::source`] is an ARN, which the two refusal wordings differ on.
+    named_by_arn: bool,
+    /// The `Topics` consumed inside the source, in a fixed order.
+    topics: Vec<String>,
+    /// The `Queues` consumed inside the source, in a fixed order.
+    queues: Vec<String>,
+}
+
+/// What a mapping with these members polls, or `None` when they name no source at all —
+/// nothing another mapping could collide with.
+///
+/// The endpoints and the consumed topics and queues are put in a FIXED order, because
+/// `Endpoints` arrives as a map and the two lists as lists: one cluster and one topic
+/// have to compare equal however the request happened to order them, and the same order
+/// is what the refusal names them in.
+#[must_use]
+pub fn polled_event_source(
+    event_source_arn: Option<&str>,
+    self_managed_event_source: Option<&SelfManagedEventSource>,
+    topics: Option<&[String]>,
+    queues: Option<&[String]>,
+) -> Option<PolledEventSource> {
+    let ordered = |values: &[String]| {
+        let mut values = values.to_vec();
+        values.sort();
+        values.dedup();
+        values
+    };
+    let (source, named_by_arn) = match event_source_arn.filter(|arn| !arn.is_empty()) {
+        Some(event_source_arn) => (event_source_arn.to_string(), true),
+        None => {
+            // `Endpoints` maps each `EndPointType` to the servers of that type, so the
+            // cluster is named by every server under every type it carries.
+            let servers: Vec<String> = self_managed_event_source
+                .and_then(|self_managed| self_managed.endpoints.as_ref())
+                .map(|endpoints| endpoints.values().flatten().cloned().collect())
+                .unwrap_or_default();
+            let servers = ordered(&servers);
+            if servers.is_empty() {
+                return None;
+            }
+            (servers.join(","), false)
+        }
+    };
+    Some(PolledEventSource {
+        source,
+        named_by_arn,
+        topics: ordered(topics.unwrap_or_default()),
+        queues: ordered(queues.unwrap_or_default()),
+    })
+}
+
+impl PolledEventSource {
+    /// The refusal a second `CreateEventSourceMapping` of this source for one function
+    /// earns, built from the mapping that already exists so a caller can converge on it.
+    ///
+    /// The source and what is consumed inside it come from the request; the function and
+    /// the UUID are the existing mapping's, which is the one a caller updates or deletes
+    /// to resolve the collision. A source consumed whole and named by an ARN is reported
+    /// by [`duplicate_event_source_mapping_message`] — the wording RECORDED for it —
+    /// while a source that is read per topic or per queue, or that has no ARN to name, is
+    /// reported with the source, the function and the consumed member named in turn.
+    #[must_use]
+    pub fn duplicate_message(
+        &self,
+        function_arn: &str,
+        function_name: &str,
+        uuid: &str,
+    ) -> String {
+        let consumed = [("topics", &self.topics), ("queues", &self.queues)]
+            .into_iter()
+            .find(|(_, values)| !values.is_empty())
+            .map(|(member, values)| format!(", {member} (\"{}\")", values.join(",")));
+        if consumed.is_none() && self.named_by_arn {
+            return duplicate_event_source_mapping_message(&self.source, function_name, uuid);
+        }
+        format!(
+            "An event source mapping with event source (\"{source}\"), function \
+             (\"{function_arn}\"){consumed} already exists. Please update or delete the \
+             existing mapping with UUID {uuid}",
+            source = self.source,
+            consumed = consumed.unwrap_or_default(),
+        )
+    }
+}
+
 /// What a call on a resource-based policy answers when there is no statement for it to
 /// act on: a REMOVAL always, and a READ of a layer version that has no policy record at
 /// all — one nobody has ever granted anything on.

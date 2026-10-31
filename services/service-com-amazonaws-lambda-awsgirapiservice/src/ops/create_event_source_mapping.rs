@@ -36,6 +36,14 @@
 //! stored (see [`crate::state::event_source_authorization`]), rather than wired up as a
 //! trigger that could never fire.
 //!
+//! One function reads a given set of records through at most one mapping, so a create
+//! that would read records the function is already mapped to is refused with the modelled
+//! `ResourceConflictException` ("The resource already exists, or another operation is in
+//! progress") and nothing is stored. Which records those are is the source TOGETHER WITH
+//! what is consumed inside it — the bootstrap servers for a self-managed Apache Kafka
+//! cluster, which carries no ARN, and the topic or the destination queue for a source read
+//! per topic or per queue (see [`crate::state::polled_event_source`]).
+//!
 //! An accepted mapping on a queue also STARTS POLLING it: "Lambda reads items from the
 //! event source and invokes the function", so this call arms the poll loop
 //! ([`crate::state::drive_sqs_pollers`]) that takes each batch out of the queue and hands
@@ -591,32 +599,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(message));
         }
 
-        // "The resource already exists, or another operation is in progress": one event
-        // source is polled for one function by at most one mapping, so a second create of
-        // the same pair conflicts rather than standing up a second poller over the same
-        // records.
-        if let Some(existing) = store.event_source_mappings.values().find(|mapping| {
-            mapping.event_source_arn.is_some()
-                && mapping.event_source_arn == event_source_arn
-                && mapping.function_arn == function_arn
-        }) {
-            return Err(
-                CreateEventSourceMappingErrorModeled::ResourceConflictException(
-                    ResourceConflictException {
-                        r#type: None,
-                        // The refusal names the pair that collided — the event source and
-                        // the function of the mapping that already exists — beside the
-                        // UUID it is updated or deleted by, so a client holding many
-                        // mappings can tell which one this call ran into.
-                        message: Some(crate::state::duplicate_event_source_mapping_message(
-                            existing.event_source_arn.as_deref().unwrap_or_default(),
-                            &existing.function_name,
-                            &existing.uuid,
-                        )),
-                    },
-                )
-                .into(),
-            );
+        // "The resource already exists, or another operation is in progress": the records
+        // a mapping reads are polled for one function by at most one mapping, so a second
+        // create that would read the SAME records for the same function conflicts rather
+        // than standing up a second poller over them. Which records those are is the
+        // source together with what is consumed inside it — the cluster's bootstrap
+        // servers for a self-managed Apache Kafka source, which carries no ARN at all, and
+        // the topic or the queue for a source that is read per topic or per queue (see
+        // [`crate::state::polled_event_source`]).
+        let polled = crate::state::polled_event_source(
+            event_source_arn.as_deref(),
+            input.self_managed_event_source.as_ref(),
+            input.topics.as_deref(),
+            input.queues.as_deref(),
+        );
+        if let Some(polled) = polled.as_ref() {
+            if let Some(existing) = store.event_source_mappings.values().find(|mapping| {
+                mapping.function_arn == function_arn
+                    && crate::state::polled_event_source(
+                        mapping.event_source_arn.as_deref(),
+                        mapping.self_managed_event_source.as_ref(),
+                        mapping.topics.as_deref(),
+                        mapping.queues.as_deref(),
+                    )
+                    .as_ref()
+                        == Some(polled)
+            }) {
+                return Err(
+                    CreateEventSourceMappingErrorModeled::ResourceConflictException(
+                        ResourceConflictException {
+                            r#type: None,
+                            // The refusal names what collided — the event source, what is
+                            // consumed inside it and the function — beside the UUID of
+                            // the mapping that already holds it, which is the one a
+                            // caller updates or deletes to converge.
+                            message: Some(polled.duplicate_message(
+                                &existing.function_arn,
+                                &existing.function_name,
+                                &existing.uuid,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         // The store is in memory, so the slice refuses past its own ceiling rather than
