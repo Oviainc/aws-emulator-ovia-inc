@@ -220,7 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A media stream is addressed by name within its flow and its `MediaStreamId` is
         // "a unique identifier for the media stream", so neither may repeat within one
-        // flow — including against another entry of the same request. The rule is stated
+        // flow — including against another entry of the same request. A media stream also
+        // carries a tag member of its own (`MediaStreamTags`), which is bounded by the
+        // rules every tag member of a create request is bounded by. Both rules are stated
         // once in `crate::state`, so CreateFlow refuses the same requests this does.
         let mut names: ::std::collections::BTreeSet<String> = flow
             .media_streams

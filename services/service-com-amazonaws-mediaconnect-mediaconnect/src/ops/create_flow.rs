@@ -326,10 +326,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Each sub-resource this request can create carries a tag member of its OWN
-        // (`SourceTags`, `OutputTags`, `EntitlementTags`), and each of those sub-resources
-        // has its own ARN — so each is a resource the tagging operations address, and each
-        // tag map is bounded by the same rules `FlowTags` is (see
-        // `crate::state::tag_set_rejection`). Checked before anything is stored, so a
+        // (`SourceTags`, `OutputTags`, `EntitlementTags`, and the `MediaStreamTags` /
+        // `VpcInterfaceTags` the media stream and VPC interface loops below check through
+        // `crate::state`), and each tag map is bounded by the same rules `FlowTags` is
+        // (see `crate::state::tag_set_rejection`). Checked before anything is stored, so a
         // refused request creates no flow.
         for (index, source) in requested_sources.iter().enumerate() {
             if let Some(rejection) = crate::state::tag_set_rejection(

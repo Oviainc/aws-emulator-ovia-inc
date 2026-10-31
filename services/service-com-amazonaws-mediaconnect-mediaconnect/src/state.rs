@@ -2174,7 +2174,9 @@ impl StoredMediaStream {
 /// A media stream is addressed by name within its flow (RemoveFlowMediaStream and
 /// UpdateFlowMediaStream take `MediaStreamName` as an `@httpLabel`), so an empty name
 /// names no media stream, and its `MediaStreamId` is "a unique identifier for the media
-/// stream" — so neither the name nor the id may repeat within one flow. CreateFlow's
+/// stream" — so neither the name nor the id may repeat within one flow. Its
+/// `MediaStreamTags` is the tag member of a create request, so it is bounded exactly as
+/// every other one is ([`tag_set_rejection`]). CreateFlow's
 /// `MediaStreams` and AddFlowMediaStreams both add media streams to a flow, so both
 /// refuse through this one function and with the same wording: no request can leave a
 /// flow in a state the other operation would never permit.
@@ -2204,7 +2206,14 @@ pub fn media_stream_rejection(
             request.media_stream_id
         ));
     }
-    None
+    // The media stream carries a tag member of its own
+    // (`AddMediaStreamRequest$MediaStreamTags`), kept verbatim on the record this request
+    // stores — so its pairs and their count are bounded by the two rules every tag member
+    // of a create request is bounded by, read from the one place that states them.
+    tag_set_rejection(
+        &format!("media stream {:?}", request.media_stream_name),
+        request.media_stream_tags.as_ref(),
+    )
 }
 
 /// The `Fmt` the service assigns the next media stream of a flow: the lowest RTP
@@ -2332,7 +2341,9 @@ pub const NETWORK_INTERFACE_TYPE_ENA: &str = "ena";
 /// name is "immutable and has to be a unique against other VpcInterfaces in this Flow"
 /// (`VpcInterface$Name`; `VpcInterfaceRequest$Name`: "this name must be unique within the
 /// flow") — so a name the flow already holds, or one another entry of the same request
-/// takes, names an interface that already exists. CreateFlow's `VpcInterfaces` and
+/// takes, names an interface that already exists. Its `VpcInterfaceTags` is the tag member
+/// of a create request, so it is bounded exactly as every other one is
+/// ([`tag_set_rejection`]). CreateFlow's `VpcInterfaces` and
 /// AddFlowVpcInterfaces both add VPC interfaces to a flow, so both refuse through this one
 /// function and with the same wording: no request can leave a flow in a state the other
 /// operation would never permit.
@@ -2354,7 +2365,13 @@ pub fn vpc_interface_rejection(
             request.name
         ));
     }
-    None
+    // The VPC interface carries a tag member of its own
+    // (`VpcInterfaceRequest$VpcInterfaceTags`), bounded by the same two rules as every
+    // other tag member of a create request.
+    tag_set_rejection(
+        &format!("VPC interface {:?}", request.name),
+        request.vpc_interface_tags.as_ref(),
+    )
 }
 
 /// Materialise one `VpcInterfaceRequest` into the VPC interface a flow keeps, with the

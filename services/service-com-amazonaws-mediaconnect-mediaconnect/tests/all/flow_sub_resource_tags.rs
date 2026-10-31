@@ -128,7 +128,7 @@ pub(crate) struct Resource {
 
 /// A deterministic string of `length` ASCII characters, for exercising a documented length
 /// bound rather than one hand-picked spelling.
-fn filler(length: usize, seed: u8) -> String {
+pub(crate) fn filler(length: usize, seed: u8) -> String {
     (0..length)
         .map(|index| char::from(b'a' + ((index as u8).wrapping_add(seed) % 26)))
         .collect()
@@ -500,20 +500,22 @@ pub(crate) async fn assert_tagging_is_not_found(emulator: &Emulator, case: &str,
 /// One row of the bounds table: the tag map a sub-resource's create request carries, and
 /// the status and error code the service answers for it. The accepted status is 201 for
 /// every operation that mints a sub-resource (CreateFlow, AddFlowOutputs, AddFlowSources,
-/// GrantFlowEntitlements all answer 201), so one table serves the create path and the add
-/// path alike.
-struct TagMemberCase {
-    case: &'static str,
-    tags: Value,
-    status: u16,
-    code: Option<&'static str>,
+/// GrantFlowEntitlements, AddFlowMediaStreams and AddFlowVpcInterfaces all answer 201), so
+/// one table serves the create path and the add path alike — and serves
+/// `tests/all/flow_name_addressed_sub_resource_tags.rs`, which drives the same rows through
+/// the tag members of the sub-resources that have no ARN of their own.
+pub(crate) struct TagMemberCase {
+    pub(crate) case: &'static str,
+    pub(crate) tags: Value,
+    pub(crate) status: u16,
+    pub(crate) code: Option<&'static str>,
 }
 
 /// The bounds a tag map a request carries is subject to, as a table: the pair lengths come
 /// from the tag member's own documentation (`mc::MAX_TAG_KEY_LENGTH` /
 /// `mc::MAX_TAG_VALUE_LENGTH`) and the count from the tags-per-resource bound
 /// (`mc::MAX_TAGS_PER_RESOURCE`), each exercised AT the bound and one past it.
-fn tag_member_cases() -> Vec<TagMemberCase> {
+pub(crate) fn tag_member_cases() -> Vec<TagMemberCase> {
     let at_key_bound = filler(mc::MAX_TAG_KEY_LENGTH, 3);
     let past_key_bound = filler(mc::MAX_TAG_KEY_LENGTH + 1, 3);
     let at_value_bound = filler(mc::MAX_TAG_VALUE_LENGTH, 7);
@@ -577,7 +579,7 @@ fn tag_member_cases() -> Vec<TagMemberCase> {
 }
 
 /// The tag map a case expects a resource to carry, from the map its request carried.
-fn expected_tags(tags: &Value) -> BTreeMap<String, String> {
+pub(crate) fn expected_tags(tags: &Value) -> BTreeMap<String, String> {
     tags.as_object()
         .cloned()
         .unwrap_or_default()
