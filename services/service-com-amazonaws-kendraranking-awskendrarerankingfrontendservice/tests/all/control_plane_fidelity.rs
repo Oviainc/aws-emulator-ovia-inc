@@ -6,8 +6,10 @@
 //! 1. A request outside a modelled constraint is refused with this service's validation
 //!    report: the violation count, then one `Value at '<member>' failed to satisfy
 //!    constraint: <requirement>` clause per violation — the offending value never
-//!    rendered, and a `@pattern` quoted without the `^` / `$` anchors the model spells
-//!    it with.
+//!    rendered, and a `@pattern` quoted without the whole-value `^` / `$` pair the model
+//!    wraps the expression in (`tests/all/pattern_requirement_rendering.rs` carries that
+//!    rendering's own table, including the one expression whose anchors are its branches'
+//!    rather than a wrapping).
 //! 2. A rescore-execution-plan id that names no plan this service holds is answered with
 //!    the CONSTANT not-found message, whichever operation looked it up and whether the
 //!    plan never existed or was deleted.
@@ -193,9 +195,11 @@ async fn a_constraint_violation_is_reported_without_the_value_and_without_the_pa
 async fn a_pattern_requirement_never_carries_the_anchors_the_model_spells_it_with() {
     let router = emulator();
 
-    // The same rule, stated as the invariant it is, over every member of this service
-    // whose model carries a `@pattern` that a request can violate: whatever expression
-    // the report quotes, it starts with neither `^` nor ends with `$`.
+    // The same rule, stated as the invariant it is, over the members whose model wraps
+    // the expression in the whole-value pair: whatever expression the report quotes, it
+    // starts with neither `^` nor ends with `$`. A member whose expression anchors its own
+    // BRANCHES is quoted as the model declares it, pair included, and is covered by
+    // `tests/all/pattern_requirement_rendering.rs` instead.
     let violating: Vec<(&str, &str, Value)> = vec![
         (
             "Name",

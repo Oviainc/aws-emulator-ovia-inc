@@ -168,8 +168,10 @@ pub fn plan_mutation_conflict(plan_id: &str, status: &str, verb: &str) -> Confli
 //
 // * a clause names WHERE the offending value was and WHAT it had to satisfy, and
 //   never renders the value itself;
-// * a `@pattern` requirement quotes the expression WITHOUT the `^` / `$` the model
-//   spells it with, which is the expression the service advertises;
+// * a `@pattern` requirement quotes the expression WITHOUT the whole-value `^` / `$`
+//   pair the model writes around it, which is the expression the service advertises —
+//   and, where the expression anchors its own branches, as the model declares it (see
+//   `unanchored`);
 // * the whole report fits the modelled length of the `Message` member that carries
 //   it (see `MAX_ERROR_MESSAGE_CHARS`), however many positions the request offended
 //   in.
@@ -187,22 +189,24 @@ pub const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// while a caller-supplied value interpolated before it might.
 const CONSTRAINT_SEPARATOR: &str = " failed to satisfy constraint: ";
 
-/// A `@pattern` expression without the anchors a model may spell it with. A `$` escaped
-/// by a backslash is a literal dollar sign inside the expression, not the end anchor, so
-/// it stays.
-fn unanchored(pattern: &str) -> &str {
-    let body = pattern.strip_prefix('^').unwrap_or(pattern);
-    match body.strip_suffix('$') {
-        Some(trimmed) => {
-            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
-            if backslashes % 2 == 0 {
-                trimmed
-            } else {
-                body
-            }
-        }
-        None => body,
-    }
+/// A `@pattern` expression as this service advertises it: without the whole-value
+/// `^` / `$` pair the model writes around an expression to make the match total.
+///
+/// The pair is what the MODEL adds, so dropping it is the inverse of that wrapping — and
+/// only where the expression inside it carries no anchor of its own. An expression whose
+/// branches anchor THEMSELVES is already a whole-value expression before any wrapping:
+/// its first and last characters are two different branches' anchors, so dropping them
+/// states a requirement of neither branch, leaving an alternative that is a bare
+/// end-of-input anchor every value satisfies while the branch the other anchor belonged
+/// to goes unstated. Such an expression is quoted as the model declares it, so whatever
+/// the clause advertises is an expression a caller can apply to the value that was
+/// refused. A `$` escaped by a backslash is a literal dollar sign, not the end anchor,
+/// so nothing is dropped for it either.
+///
+/// The rule is the shared rendering's, CALLED rather than restated here, so this service
+/// and every other one wording its own refusals cannot disagree on it.
+fn unanchored(pattern: &str) -> String {
+    ::service_common::validation::unanchored_keeping_inner_anchors(pattern)
 }
 
 /// One clause of the validation report: WHERE the offending value was, and WHAT it had
@@ -287,7 +291,7 @@ fn violation_clause(violation: &Violation) -> String {
     let advertised = match &violation.kind {
         ViolationKind::Pattern(pattern) => Violation {
             path: violation.path.clone(),
-            kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
+            kind: ViolationKind::Pattern(unanchored(pattern)),
             value: violation.value.clone(),
         },
         _ => violation.clone(),

@@ -27,6 +27,8 @@ mod handler_list_ceiling_report;
 mod harness;
 #[path = "all/list_plans_page_bound.rs"]
 mod list_plans_page_bound;
+#[path = "all/pattern_requirement_rendering.rs"]
+mod pattern_requirement_rendering;
 #[path = "all/plan_capacity_quota.rs"]
 mod plan_capacity_quota;
 #[path = "all/plan_capacity_units.rs"]

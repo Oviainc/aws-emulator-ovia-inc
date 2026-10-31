@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `validation::unanchored_keeping_inner_anchors`: the shared rendering of a `@pattern`
+# requirement this service's refusals quote, rather than a copy of that rule here.
+service-common = { path = "../common" }
 # Snowball stemming, so a query term and a document's inflected forms of it fold together.
 rust-stemmers = "1.2"
 # The published function-word (stop-word) lists, so the content-bearing terms of a query
@@ -33,6 +36,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The maintained regex engine, so a test can APPLY the expression a refusal advertises to
+# the value that was refused instead of only comparing its text.
+regex = "1.13"
 
 [lints]
 workspace = true
