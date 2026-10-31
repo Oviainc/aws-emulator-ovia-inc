@@ -261,8 +261,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing here: this execution is already ABORTED, and the stop it reports is
         // the stop of the execution.
         if let Some(parked) = stopped.parked {
-            let (call, request) =
-                crate::state::integration::stopping(parked.api, parked.job, &parked.job_id);
+            let (call, request) = crate::state::integration::stopping(
+                parked.api,
+                parked.job,
+                &parked.job_id,
+                &parked.naming,
+            );
             let _answered = crate::state::integration::call_api(
                 ctx.callback(),
                 &parked.region,

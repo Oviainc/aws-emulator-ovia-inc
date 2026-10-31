@@ -503,6 +503,10 @@ mod fis_execution_role_trust;
 mod forecast_signing_name_routing;
 #[path = "all/glue_jobs_are_regional_while_their_role_is_global.rs"]
 mod glue_jobs_are_regional_while_their_role_is_global;
+// Declared beside the other Glue suite rather than at the head or the tail of this file:
+// both of those are where every concurrently landing suite puts its line.
+#[path = "all/sfn_glue_run_a_job_sync.rs"]
+mod sfn_glue_run_a_job_sync;
 // Declared HERE, in the sorted list at its own name, rather than at the head or the tail
 // of this file: both of those are where every concurrently landing suite puts its line, so
 // a declaration there conflicts with all of them, while these neighbouring lines are

@@ -94,7 +94,8 @@ async fn poll<Eng: Send + Sync + 'static>(
             return;
         };
 
-        let (call, request) = integration::describing(task.api, task.job, &task.job_id);
+        let (call, request) =
+            integration::describing(task.api, task.job, &task.job_id, &task.naming);
         let reported = integration::call_api(callback, &task.region, &call, &request).await;
         let outcome = match reported {
             Ok(report) => match task.job.outcome_of(&report, task.parsed_output) {

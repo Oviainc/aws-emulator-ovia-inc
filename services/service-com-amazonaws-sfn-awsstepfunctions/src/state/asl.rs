@@ -760,6 +760,10 @@ pub struct ParkedJob {
     pub parsed_output: bool,
     /// The job's own identifier, as the call that started it reported it.
     pub job_id: String,
+    /// What the starting call's own request said the job belongs to, for an
+    /// integration whose reporting and stopping calls do not name it by its
+    /// identifier alone ([`super::integration::RunAJob::naming`]).
+    pub naming: super::integration::JobNaming,
     /// The document that call answered, which is what the task reports as its
     /// SUBMISSION.
     pub submitted: Value,
@@ -4393,6 +4397,11 @@ impl Interpreter<'_> {
                         api: call.api,
                         parsed_output: call.parsed_output,
                         job_id: job_id.to_string(),
+                        // The job is reported and stopped through calls of its own
+                        // service, which for some integrations name it by a member of
+                        // the request that STARTED it beside the identifier that call
+                        // answered.
+                        naming: job.naming(&request),
                         submitted: result.clone(),
                         at,
                         timeout_seconds: within.map(|within| within.as_secs()),

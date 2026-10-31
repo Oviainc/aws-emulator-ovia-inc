@@ -1273,6 +1273,11 @@ pub struct JobTask {
     pub parsed_output: bool,
     /// The job's own identifier, as the call that started it reported it.
     pub job_id: String,
+    /// What the call that STARTED the job said it belongs to, which the calls that
+    /// report and stop it carry beside the identifier for an integration whose job
+    /// that identifier does not name on its own
+    /// ([`integration::RunAJob::names_job_with`]).
+    pub naming: integration::JobNaming,
     /// The Region the calls that report and stop the job are made in: the
     /// execution's own, which is the Region its state machine's ARN names.
     pub region: String,
@@ -1302,6 +1307,16 @@ impl JobTask {
     }
 }
 
+/// The bytes a job's naming holds, counted as every other stored text is: the member
+/// names are this crate's own constants, so what a store retains for one is the text
+/// the starting request named the job with.
+fn naming_bytes(naming: &integration::JobNaming) -> usize {
+    naming
+        .iter()
+        .map(|(member, value)| member.len() + value.len())
+        .sum()
+}
+
 /// The job a planned run parked at, ready for the store to record: this is
 /// [`asl::ParkedJob`] with the walk's offset turned into an instant against the
 /// execution's own start.
@@ -1313,6 +1328,7 @@ pub struct PlannedJob {
     pub api: &'static integration::Api,
     pub parsed_output: bool,
     pub job_id: String,
+    pub naming: integration::JobNaming,
     pub parked_at: SystemTime,
     pub timeout_seconds: Option<u64>,
 }
@@ -1326,6 +1342,7 @@ impl PlannedJob {
             + self.state_name.len()
             + self.state_input.len()
             + self.job_id.len()
+            + naming_bytes(&self.naming)
             // The two history events resolving the job appends to the execution
             // waiting at it: the one that reports the job's outcome and the one the
             // execution ends on.
@@ -2766,6 +2783,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             api: planned.api,
             parsed_output: planned.parsed_output,
             job_id: planned.job_id,
+            naming: planned.naming,
             region: region.to_string(),
             parked_at: planned.parked_at,
             timeout_seconds: planned.timeout_seconds,
@@ -2776,6 +2794,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             + task.state_name.len()
             + task.state_input.len()
             + task.job_id.len()
+            + naming_bytes(&task.naming)
             + task.region.len();
         self.retained_bytes = self.retained_bytes.saturating_add(task.retained_bytes);
         self.job_tasks.insert(execution_arn.to_string(), task);
@@ -6997,6 +7016,7 @@ fn plan_from_run(
                 api: parked.api,
                 parsed_output: parked.parsed_output,
                 job_id: parked.job_id,
+                naming: parked.naming,
                 parked_at: after(start, parked.at),
                 timeout_seconds: parked.timeout_seconds,
             }),

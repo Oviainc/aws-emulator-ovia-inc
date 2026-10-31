@@ -68,7 +68,10 @@
 //! job is. [`RUN_A_JOB`] carries, per integration, the three calls that pattern is
 //! made of — the one that starts the job, the one that reports it and the one that
 //! stops it — plus where the job's identifier, its status and the reason it failed
-//! sit in those documents. The walk makes the starting call, records what came back
+//! sit in those documents, which members of the STARTING request those two calls
+//! carry beside the identifier for an integration whose job the identifier does not
+//! name on its own, and the shape that stopping call types the identifier as.
+//! The walk makes the starting call, records what came back
 //! as the task's submission and PARKS there ([`super::asl::ParkedJob`]); the job is
 //! then polled through its own reporting call until it reaches a terminal status,
 //! which is what resolves the task ([`super::run_a_job`]). Nothing is synthesised:
@@ -417,6 +420,19 @@ pub const APIS: &[Api] = &[
         // `RunTask`'s input: `cluster`, `taskDefinition`, `overrides`.
         member_case: MemberCase::LowerCamel,
     },
+    // `services/service-com-amazonaws-glue-awsglue/smithy-model/
+    // com-amazonaws-glue-awsglue.json`: awsJson1_1, sigv4Name `glue`, endpointPrefix
+    // `glue`, sdkId `Glue`, service shape `AWSGlue`.
+    Api {
+        namespace: "glue",
+        signing_name: "glue",
+        endpoint_prefix: "glue",
+        target_prefix: "AWSGlue",
+        json_version: "1.1",
+        sdk_id: "Glue",
+        // `StartJobRun`'s input: `JobName`, `Arguments`, `Timeout`.
+        member_case: MemberCase::Pascal,
+    },
 ];
 
 /// One integration call: the service's API, and the operation of it the `Resource`'s
@@ -630,9 +646,46 @@ pub struct RunAJob {
     /// identifier goes in.
     pub stop: &'static str,
     pub stop_member: &'static str,
+    /// Whether the stopping call's identifier member is a LIST of identifiers, as
+    /// that operation's own model types it — a batch stop takes the ids of several
+    /// jobs, and the one job a task started is a batch of one.
+    pub stops_in_batch: bool,
+    /// The members of the STARTING call's REQUEST that the reporting and stopping
+    /// calls carry BESIDE the job's identifier, because those operations do not name
+    /// the job by that identifier alone: each is a member of the job's own identity
+    /// rather than of the run the identifier names. Named in the integration's own
+    /// PascalCase, and empty for a job its identifier names on its own.
+    pub names_job_with: &'static [&'static str],
 }
 
+/// The members of the starting request that name the job, beside its own identifier
+/// ([`RunAJob::names_job_with`]), as the calls that report and stop it carry them.
+pub type JobNaming = ::std::collections::BTreeMap<String, String>;
+
 impl RunAJob {
+    /// The members of the starting call's `request` that the calls which REPORT and
+    /// STOP the job carry beside its identifier.
+    ///
+    /// Each is read under both spellings a definition may write it in — the
+    /// integration's own PascalCase and the invoked model's ([`MemberCase`]) — since
+    /// either reaches the operation ([`wire_request`]), and is carried on under the
+    /// name this entry gives it. A member the request did not carry is not invented:
+    /// the invoked operation answers for a request that omits one, which is its own
+    /// answer to give.
+    pub fn naming(&self, request: &Value) -> JobNaming {
+        let mut naming = JobNaming::new();
+        for member in self.names_job_with {
+            let named = [MemberCase::Pascal, MemberCase::LowerCamel]
+                .into_iter()
+                .find_map(|case| request.get(case.spell(member)))
+                .and_then(Value::as_str);
+            if let Some(value) = named {
+                naming.insert((*member).to_string(), value.to_string());
+            }
+        }
+        naming
+    }
+
     /// Whether `status` is one the job ENDED on, and whether it ended having done its
     /// work: `None` while the job is still running.
     fn finished(&self, status: &str) -> Option<bool> {
@@ -755,6 +808,10 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         json_text_at: &[&["input"], &["output"]],
         stop: "StopExecution",
         stop_member: "executionArn",
+        stops_in_batch: false,
+        // `DescribeExecution` and `StopExecution` each name the execution by its own
+        // ARN alone.
+        names_job_with: &[],
     },
     // An Athena query: `StartQueryExecution` answers `QueryExecutionId`,
     // `GetQueryExecution` reports `QueryExecution.Status.State`
@@ -776,6 +833,37 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         json_text_at: &[],
         stop: "StopQueryExecution",
         stop_member: "QueryExecutionId",
+        stops_in_batch: false,
+        // `GetQueryExecution` and `StopQueryExecution` each name the query by its own
+        // id alone.
+        names_job_with: &[],
+    },
+    // A Glue job run: `StartJobRun` answers `JobRunId`, `GetJobRun` reports
+    // `JobRun.JobRunState` (`JobRunState`: STARTING, RUNNING, STOPPING, STOPPED,
+    // SUCCEEDED, FAILED, TIMEOUT, ERROR, WAITING, EXPIRED) beside
+    // `JobRun.ErrorMessage`, and `BatchStopJobRun` stops it. Both of those name the
+    // run by the `JobName` of the job it is a run of — `@required` on each of them —
+    // beside the run's own id, which `GetJobRun` takes as `RunId` and
+    // `BatchStopJobRun` as the `JobRunIds` LIST
+    // (`smithy_query(query="operation",operation="StartJobRun,GetJobRun,
+    // BatchStopJobRun",model_path="services/service-com-amazonaws-glue-awsglue/
+    // smithy-model/com-amazonaws-glue-awsglue.json")`).
+    RunAJob {
+        starts: "glue:startJobRun",
+        job_id: "JobRunId",
+        describe: "GetJobRun",
+        describe_member: "RunId",
+        status_at: &["JobRun", "JobRunState"],
+        succeeded: &["SUCCEEDED"],
+        // The `JobRunState` values a run never moves out of again; `STARTING`,
+        // `RUNNING`, `STOPPING` and `WAITING` each still owe a further state.
+        failed: &["STOPPED", "FAILED", "TIMEOUT", "ERROR", "EXPIRED"],
+        failure_cause_at: &["JobRun", "ErrorMessage"],
+        json_text_at: &[],
+        stop: "BatchStopJobRun",
+        stop_member: "JobRunIds",
+        stops_in_batch: true,
+        names_job_with: &["JobName"],
     },
 ];
 
@@ -995,51 +1083,75 @@ fn members_of(
 }
 
 /// The call that reports the job `job` started under `job_id`, and its request.
-pub fn describing(api: &'static Api, job: &'static RunAJob, job_id: &str) -> (Call, Value) {
-    let mut request = Map::new();
-    request.insert(
-        job.describe_member.to_string(),
-        Value::String(job_id.to_string()),
-    );
+///
+/// `naming` is what the starting call's own request said the job belongs to
+/// ([`RunAJob::naming`]), which this call carries beside the identifier for an
+/// integration whose reporting operation needs it.
+pub fn describing(
+    api: &'static Api,
+    job: &'static RunAJob,
+    job_id: &str,
+    naming: &JobNaming,
+) -> (Call, Value) {
     (
-        Call {
-            api,
-            operation: job.describe.to_string(),
-            job: None,
-            parsed_output: false,
-            json_text: &[],
-            // The job's REPORT is read, not reported as a task's own result, so it
-            // carries no integration envelope.
-            sdk_envelope: false,
-            epoch_millis: &[],
-            targets: None,
-        },
-        Value::Object(request),
+        pattern_call(api, job.describe),
+        job_request(
+            job.describe_member,
+            Value::String(job_id.to_string()),
+            naming,
+        ),
     )
 }
 
 /// The call that STOPS the job `job` started under `job_id`, and its request.
-pub fn stopping(api: &'static Api, job: &'static RunAJob, job_id: &str) -> (Call, Value) {
-    let mut request = Map::new();
-    request.insert(
-        job.stop_member.to_string(),
-        Value::String(job_id.to_string()),
-    );
+///
+/// `naming` is as [`describing`]'s. The identifier goes in as the stopping operation
+/// types that member: a batch stop takes a LIST of ids, and the one job a task started
+/// is a batch of one ([`RunAJob::stops_in_batch`]).
+pub fn stopping(
+    api: &'static Api,
+    job: &'static RunAJob,
+    job_id: &str,
+    naming: &JobNaming,
+) -> (Call, Value) {
+    let identifier = match job.stops_in_batch {
+        true => Value::Array(vec![Value::String(job_id.to_string())]),
+        false => Value::String(job_id.to_string()),
+    };
     (
-        Call {
-            api,
-            operation: job.stop.to_string(),
-            job: None,
-            parsed_output: false,
-            json_text: &[],
-            // As the reporting call: this one is made to END the job, not to produce
-            // a task's result.
-            sdk_envelope: false,
-            epoch_millis: &[],
-            targets: None,
-        },
-        Value::Object(request),
+        pattern_call(api, job.stop),
+        job_request(job.stop_member, identifier, naming),
     )
+}
+
+/// The request one of a run-a-job pattern's own calls is made with: the job's
+/// identifier under `member`, beside every member of the starting request that names
+/// the job it belongs to.
+fn job_request(member: &str, identifier: Value, naming: &JobNaming) -> Value {
+    let mut request = Map::new();
+    request.insert(member.to_string(), identifier);
+    for (member, value) in naming {
+        request.insert(member.clone(), Value::String(value.clone()));
+    }
+    Value::Object(request)
+}
+
+/// The call one of a run-a-job pattern's own calls is made as.
+///
+/// The job's REPORT and its STOP are READ, not reported as a task's own result, so
+/// neither parks at a job of its own, converts a member of its answer or carries the
+/// integration's response envelope.
+fn pattern_call(api: &'static Api, operation: &str) -> Call {
+    Call {
+        api,
+        operation: operation.to_string(),
+        job: None,
+        parsed_output: false,
+        json_text: &[],
+        sdk_envelope: false,
+        epoch_millis: &[],
+        targets: None,
+    }
 }
 
 /// The operation name an action names: an action is the operation's name in

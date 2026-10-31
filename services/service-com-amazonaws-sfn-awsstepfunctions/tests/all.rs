@@ -91,6 +91,8 @@ mod refusal_vocabulary;
 mod resource_tags;
 #[path = "all/response_request_id.rs"]
 mod response_request_id;
+#[path = "all/run_a_job_pattern_calls.rs"]
+mod run_a_job_pattern_calls;
 #[path = "all/sdk_response_envelope.rs"]
 mod sdk_response_envelope;
 #[path = "all/send_task_failure.rs"]
