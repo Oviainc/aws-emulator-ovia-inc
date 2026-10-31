@@ -10,6 +10,11 @@
 //! removes only the keys it names; and an ARN that names no stored resource is refused
 //! `ResourceNotFoundException` (404) by all three operations.
 //!
+//! One further rule is about which tags a request may supply at all: neither half of a
+//! caller-supplied entry may open with the prefix AWS keeps for the tags it applies
+//! itself, so a request naming one is refused `ValidationException` (400) and writes
+//! nothing, whichever operation carried the tags.
+//!
 //! So the tables below span what that rule generalises over — entry count, key and
 //! value form, the length and entry bounds the model publishes, which call wrote the
 //! tag, and which keys a later call mentions — rather than re-running one recorded
@@ -94,6 +99,11 @@ fn encode(value: &str) -> String {
     out
 }
 
+/// The `message` member of a failure body.
+fn message(body: &Value) -> String {
+    body["message"].as_str().unwrap_or_default().to_string()
+}
+
 /// The wire error code of a failure body (`__type`), without its namespace.
 fn error_code(body: &Value) -> String {
     body["__type"]
@@ -105,18 +115,27 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// `POST /graphs` with `tags`, as the service answered it.
+async fn create_graph_answer(
+    router: &MultiServiceRouter,
+    name: &str,
+    tags: &BTreeMap<String, String>,
+) -> (u16, Value) {
+    let body = json!({
+        "graphName": name,
+        "provisionedMemory": MIN_PROVISIONED_MEMORY,
+        "tags": tags,
+    });
+    call(router, "POST", "/graphs", Some(body)).await
+}
+
 /// `POST /graphs` with `tags`, returning the created graph's ARN.
 async fn create_graph(
     router: &MultiServiceRouter,
     name: &str,
     tags: &BTreeMap<String, String>,
 ) -> String {
-    let body = json!({
-        "graphName": name,
-        "provisionedMemory": MIN_PROVISIONED_MEMORY,
-        "tags": tags,
-    });
-    let (status, created) = call(router, "POST", "/graphs", Some(body)).await;
+    let (status, created) = create_graph_answer(router, name, tags).await;
     assert_eq!(
         status, 201,
         "case {name:?}: expected 201 from CreateGraph, got {status}: {created}"
@@ -542,4 +561,175 @@ async fn each_resource_carries_its_own_tag_set() {
         BTreeMap::new(),
         "case the second graph: expected no tags, got {actual_second:?}"
     );
+}
+
+/// The prefix AWS keeps for the tags it applies itself, restated here independently of
+/// the service: the member documentation says a key and a value alike "can't be prefixed
+/// with `aws:`" (`smithy_query(query="doc",shape="TagResourceInput",member="tags")`).
+const RESERVED_PREFIX: &str = "aws:";
+
+/// Whether one half of a tag entry lies in the reserved namespace — the rule restated
+/// for this suite, so the expectations below do not come from the service's own helper.
+/// The prefix is matched however it is cased, since a cased spelling of it still reads as
+/// a tag AWS applied itself.
+fn is_reserved(text: &str) -> bool {
+    text.to_lowercase().starts_with(RESERVED_PREFIX)
+}
+
+/// (case, the tags a request carries, whether the service may store them).
+///
+/// The rows differ along which half of an entry carries the reserved prefix, how that
+/// prefix is cased, where in the text it sits, and whether allowed entries travel beside
+/// a reserved one — which is what the rule generalises over. Every key here is inside
+/// `TagKey`'s modelled alphabet (`smithy_query(query="shape",shape="TagKey")`:
+/// `^[a-zA-Z+-=._:/]+$`), so no row can be refused by the boundary walk instead.
+fn reserved_namespace_cases() -> Vec<(&'static str, BTreeMap<String, String>, bool)> {
+    vec![
+        ("neither half in the reserved namespace", tags(&[("owner", "finance")]), true),
+        ("a key in the reserved namespace", tags(&[("aws:owner", "finance")]), false),
+        ("a value in the reserved namespace", tags(&[("owner", "aws:finance")]), false),
+        (
+            "both halves in the reserved namespace",
+            tags(&[("aws:owner", "aws:finance")]),
+            false,
+        ),
+        ("the key's prefix upper-cased", tags(&[("AWS:owner", "finance")]), false),
+        ("the key's prefix mixed-cased", tags(&[("Aws:owner", "finance")]), false),
+        ("the value's prefix upper-cased", tags(&[("owner", "AWS:finance")]), false),
+        ("a key that is exactly the prefix", tags(&[("aws:", "finance")]), false),
+        (
+            "a reserved key beside allowed ones",
+            tags(&[("env", "prod"), ("aws:cloudformation:stack-name", "s"), ("tier", "gold")]),
+            false,
+        ),
+        (
+            "a reserved value beside allowed ones",
+            tags(&[("env", "prod"), ("owner", "aws:finance")]),
+            false,
+        ),
+        ("the prefix later in the key", tags(&[("my:aws:owner", "finance")]), true),
+        ("the prefix later in the value", tags(&[("owner", "my-aws:finance")]), true),
+        ("the prefix's letters without the colon", tags(&[("awsome", "awsome")]), true),
+        ("the prefix's letters as the whole value", tags(&[("team", "aws")]), true),
+        (
+            "a colon in a key outside the reserved namespace",
+            tags(&[("team:graphs", "owned")]),
+            true,
+        ),
+        ("a key shorter than the prefix", tags(&[("a", "b")]), true),
+    ]
+}
+
+/// Assert a refusal of a reserved tag: the modelled 400 `ValidationException`, whose
+/// message is the whole clause the rule calls for, inside the envelope this service
+/// reports a broken constraint in. The expectation is built here from `supplied` and the
+/// rule restated above, not read out of the service.
+fn assert_reserved_refusal(
+    case: &str,
+    operation: &str,
+    supplied: &BTreeMap<String, String>,
+    status: u16,
+    body: &Value,
+) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400 from {operation}, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(body),
+        "ValidationException",
+        "case {case:?}: expected ValidationException from {operation}, got {body}"
+    );
+    let requirement = format!("Member must not be prefixed with {RESERVED_PREFIX}");
+    // A reserved KEY is refused before a reserved value, and a key's clause sits at the
+    // member the map itself occupies, because a map's keys reach no clause of their own;
+    // a value's clause sits at its entry's path. `BTreeMap` iterates in key order, which
+    // is the order the refusal picks its offending entry in.
+    let clause = if let Some(key) = supplied.keys().find(|key| is_reserved(key)) {
+        format!(
+            "Value '{key}' at 'tags' failed to satisfy constraint: Map keys must satisfy \
+             constraint: [{requirement}]"
+        )
+    } else {
+        let (key, value) = supplied
+            .iter()
+            .find(|(_, value)| is_reserved(value))
+            .unwrap_or_else(|| panic!("case {case:?}: no reserved half in {supplied:?}"));
+        format!("Value '{value}' at 'tags.{key}' failed to satisfy constraint: {requirement}")
+    };
+    let expected = format!("1 validation error detected: {clause}");
+    let actual = message(body);
+    assert_eq!(
+        actual, expected,
+        "case {case:?}: expected the {operation} refusal to read {expected:?}, \
+         got {actual:?}"
+    );
+}
+
+#[tokio::test]
+async fn tag_resource_refuses_a_tag_in_the_reserved_namespace_and_writes_nothing() {
+    let router = emulator();
+
+    for (index, (case, supplied, storable)) in reserved_namespace_cases().iter().enumerate() {
+        // The graph starts with one tag of its own, so a refused call is seen to leave
+        // the stored set exactly as it was rather than merely leaving it empty.
+        let stored = tags(&[("created-with", "a tag")]);
+        let arn = create_graph(&router, &format!("reserved-tag-graph-{index}"), &stored).await;
+
+        let (status, body) = tag(&router, &arn, supplied).await;
+        let mut expected = stored.clone();
+        if *storable {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200 from TagResource, got {status}: {body}"
+            );
+            expected.extend(supplied.clone());
+        } else {
+            assert_reserved_refusal(case, "TagResource", supplied, status, &body);
+        }
+        let actual = stored_tags(&router, &arn).await;
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?} after TagResource, got {actual:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_graph_refuses_a_tag_in_the_reserved_namespace_and_creates_nothing() {
+    let router = emulator();
+
+    for (index, (case, supplied, storable)) in reserved_namespace_cases().iter().enumerate() {
+        let name = format!("reserved-tag-create-{index}");
+        let (status, body) = create_graph_answer(&router, &name, supplied).await;
+        if *storable {
+            assert_eq!(
+                status, 201,
+                "case {case:?}: expected 201 from CreateGraph, got {status}: {body}"
+            );
+            let arn = body["arn"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no arn in {body}"))
+                .to_string();
+            let actual = stored_tags(&router, &arn).await;
+            assert_eq!(
+                actual, *supplied,
+                "case {case:?}: expected {supplied:?} on the new graph, got {actual:?}"
+            );
+            continue;
+        }
+        assert_reserved_refusal(case, "CreateGraph", supplied, status, &body);
+
+        // The refused create stored nothing: the name it asked for is still free, which
+        // a second create of the same name — with tags this service may store — proves
+        // by being accepted rather than conflicting.
+        let kept = tags(&[("env", "prod")]);
+        let arn = create_graph(&router, &name, &kept).await;
+        let actual = stored_tags(&router, &arn).await;
+        assert_eq!(
+            actual, kept,
+            "case {case:?}: expected {kept:?} on the graph created after the refusal, \
+             got {actual:?}"
+        );
+    }
 }

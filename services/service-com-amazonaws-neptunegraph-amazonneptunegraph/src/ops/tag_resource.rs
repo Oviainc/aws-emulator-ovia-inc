@@ -2,7 +2,9 @@
 
 //! @op TagResource
 //! IMPLEMENTED: merges the supplied tags into the tag set stored on the resource the
-//! ARN names. This is the ONLY file to touch for this operation.
+//! ARN names, after refusing a tags map this service may not store — too many entries,
+//! an over-long key or value, or either half of an entry drawn from the namespace AWS
+//! reserves for its own tags. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,10 +150,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Nothing caller-sized reaches the store unchecked — the per-entry bound on what
-        // one record's tags may hold is stated once, in `crate::state`. The clause goes
-        // through the one envelope every constraint refusal of this service is reported
-        // in, so the same broken bound reads the same whichever operation caught it.
+        // Nothing a caller sends reaches the store unchecked — what one record's tags
+        // may hold, and the namespace they may not be drawn from, are stated once in
+        // `crate::state`. The clause goes through the one envelope every constraint
+        // refusal of this service is reported in, so the same broken rule reads the same
+        // whichever operation caught it.
         if let Err(clause) = crate::state::bound_tags(&input.tags) {
             return Err(TagResourceErrorModeled::ValidationException(ValidationException {
                 message: crate::state::validation_envelope(&[clause]),

@@ -2542,6 +2542,31 @@ pub const MAX_TAGS: usize = 50;
 /// this condition. Set well above any realistic use of a local emulator.
 pub const MAX_PRIVATE_GRAPH_ENDPOINTS: usize = 100;
 
+/// The prefix AWS keeps for the tags it applies itself, which a caller-supplied tag may
+/// carry on neither half.
+///
+/// The service documents the rule on the member that carries caller tags, once for each
+/// half of an entry (`smithy_query(query="doc",shape="TagResourceInput",member="tags")`:
+/// a key "can't be prefixed with `aws:`", and a value "can't be prefixed with `aws:`"),
+/// and it is AWS's tagging rule for every taggable resource. The modelled traits cannot
+/// express it — `TagKey`'s `@pattern` admits `:` anywhere and `TagValue` carries no
+/// pattern at all (`smithy_query(query="shape",shape="TagKey,TagValue")`) — so it is a
+/// rule the boundary walk leaves to the service, enforced for every operation that
+/// accepts tags by [`bound_tags`].
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// Whether `text` — one half of a tag entry, a key or a value — lies in the namespace
+/// [`RESERVED_TAG_PREFIX`] reserves.
+///
+/// Compared WITHOUT regard to case: a differently cased spelling of the prefix would
+/// otherwise store a tag that still reads as one AWS applied itself. `get(..)` rather
+/// than slicing, so a value whose prefix-length byte boundary falls inside a multi-byte
+/// character is simply not reserved instead of panicking.
+pub fn is_reserved_tag_text(text: &str) -> bool {
+    text.get(..RESERVED_TAG_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_PREFIX))
+}
+
 /// From the modelled `TagKey`: `@length(1..128)`.
 pub const MAX_TAG_KEY_CHARS: usize = 128;
 
@@ -3404,16 +3429,20 @@ pub fn bound_tag_count(total: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuse a `tags` map that would put more into one stored record than it may hold
-/// ([`MAX_TAGS`] entries of at most [`MAX_TAG_KEY_CHARS`] / [`MAX_TAG_VALUE_CHARS`]
-/// characters).
+/// Refuse a `tags` map a request may not store: more entries than one record may hold
+/// ([`MAX_TAGS`]), a key or value longer than its modelled bound ([`MAX_TAG_KEY_CHARS`] /
+/// [`MAX_TAG_VALUE_CHARS`] characters), or a key or value in the namespace AWS reserves
+/// for its own tags ([`RESERVED_TAG_PREFIX`]).
 ///
-/// Reached by every operation that accepts a `tags` map (`CreateGraph`, `TagResource`),
-/// so the bound on what one record stores is stated once. The model's own `@length`
-/// traits on `TagMap`/`TagKey`/`TagValue` refuse the entry count and the values at the
-/// boundary too; the check is repeated at the growth site so the bound lives beside the
-/// write that stores it, and a key is bounded HERE alone, because the boundary's walk
-/// treats a map key as the entry's name rather than as a constrained value.
+/// Reached by every operation that accepts a `tags` map (`CreateGraph`,
+/// `CreateGraphSnapshot`, `CreateGraphUsingImportTask`, `RestoreGraphFromSnapshot`,
+/// `StartExportTask`, `TagResource`), so what a caller's tags must satisfy is stated
+/// once. The model's own `@length` traits on `TagMap`/`TagKey`/`TagValue` refuse the
+/// entry count and the values at the boundary too; the check is repeated at the growth
+/// site so the bound lives beside the write that stores it, and a key is bounded HERE
+/// alone, because the boundary's walk treats a map key as the entry's name rather than
+/// as a constrained value. The reserved namespace carries no modelled trait on either
+/// half, so this is the only place it is refused at all.
 ///
 /// Every `Err` is a CLAUSE in the one form this service states a constraint violation
 /// in: the entry count through [`bound_tag_count`]; a KEY against the member the map sits
@@ -3421,7 +3450,9 @@ pub fn bound_tag_count(total: usize) -> Result<(), String> {
 /// because no boundary clause for a key exists to read like; and a VALUE at the entry's
 /// own path, which is where the boundary states a constraint an entry's value broke. A
 /// key or value that broke a length bound is exactly what must not be echoed, so those
-/// clauses state the member and the requirement and nothing else ([`length_clause`]).
+/// clauses state the member and the requirement and nothing else ([`length_clause`]); a
+/// half refused for the reserved prefix is short and is what the caller has to change,
+/// so that clause carries it.
 ///
 /// The keys are checked before the values, and the offending entry is the first in key
 /// order, so one map that breaks either bound twice is refused identically every time
@@ -3447,6 +3478,29 @@ pub fn bound_tags(tags: &HashMap<String, String>) -> Result<(), String> {
         return Err(length_clause(
             &format!("{TAGS_MEMBER}.{key}"),
             &max_length_requirement(MAX_TAG_VALUE_CHARS),
+        ));
+    }
+    // A tag in the reserved namespace is one AWS applies itself, so neither half of an
+    // entry a caller sends may carry the prefix. Reported like the bounds above: a key
+    // against the member the map sits at, a value at its own entry's path, and the
+    // first offender in key order either way.
+    let reserved_key = tags.keys().filter(|key| is_reserved_tag_text(key)).min();
+    if let Some(key) = reserved_key {
+        return Err(constraint_clause(
+            TAGS_MEMBER,
+            Some(key),
+            &map_key_requirement(&[reserved_prefix_requirement()]),
+        ));
+    }
+    let reserved_value = tags
+        .iter()
+        .filter(|(_, value)| is_reserved_tag_text(value))
+        .min_by_key(|(key, _)| *key);
+    if let Some((key, value)) = reserved_value {
+        return Err(constraint_clause(
+            &format!("{TAGS_MEMBER}.{key}"),
+            Some(value),
+            &reserved_prefix_requirement(),
         ));
     }
     Ok(())
@@ -3527,6 +3581,16 @@ pub fn max_length_requirement(max: impl ::std::fmt::Display) -> String {
 /// must satisfy, and a caller fixing one key wants all of it.
 pub fn map_key_requirement(requirements: &[String]) -> String {
     format!("Map keys must satisfy constraint: [{}]", requirements.join(", "))
+}
+
+/// The requirement clause for a half of a tag entry drawn from the namespace AWS keeps
+/// for its own tags: the prefix it may not open with.
+///
+/// Worded by a builder like every other requirement this service states, so the rule
+/// reads the same whichever half of an entry broke it and whichever operation carried
+/// the tags. See [`RESERVED_TAG_PREFIX`] for where the rule comes from.
+pub fn reserved_prefix_requirement() -> String {
+    format!("Member must not be prefixed with {RESERVED_TAG_PREFIX}")
 }
 
 /// The `ValidationException` message over one or more clauses: how many constraints were
@@ -4659,6 +4723,67 @@ mod tests {
                 actual.err(),
                 expected,
                 "case {case:?}: expected {expected:?}"
+            );
+        }
+    }
+
+    /// Either half of a tag entry is refused when it opens with the reserved prefix,
+    /// however that prefix is cased, and accepted when the prefix merely occurs
+    /// somewhere else in the text — stating the clause in the same form the bounds above
+    /// do: a key against the member the map sits at, a value at its own entry's path.
+    #[test]
+    fn a_tag_in_the_reserved_namespace_is_refused_on_either_half() {
+        let map = |key: &str, value: &str| -> HashMap<String, String> {
+            [(key.to_string(), value.to_string())].into_iter().collect()
+        };
+        // The prefix rule restated independently of the service, so the expectations
+        // below are not read out of the implementation under test.
+        let reserved = |text: &str| text.to_lowercase().starts_with("aws:");
+
+        // (case, key, value). The rows differ along which half carries the prefix, how
+        // that prefix is cased, and where in the text it sits; what each row must answer
+        // follows from the rule, so no row carries a hand-written verdict.
+        let cases: Vec<(&str, &str, &str)> = vec![
+            ("neither half reserved", "owner", "finance"),
+            ("the key is reserved", "aws:owner", "finance"),
+            ("the value is reserved", "owner", "aws:finance"),
+            ("both halves reserved", "aws:owner", "aws:finance"),
+            ("the prefix upper-cased", "AWS:owner", "finance"),
+            ("the prefix mixed-cased", "Aws:owner", "finance"),
+            ("the value's prefix upper-cased", "owner", "AWS:finance"),
+            ("the key is exactly the prefix", "aws:", "finance"),
+            ("the prefix inside the key, not at its start", "my:aws:owner", "finance"),
+            ("the prefix inside the value, not at its start", "owner", "my-aws:finance"),
+            ("the letters without the colon", "awsome", "awsome"),
+            ("a key shorter than the prefix", "a", "b"),
+            ("an empty value", "owner", ""),
+            (
+                "halves whose prefix-length byte boundary falls inside a character",
+                "tāā",
+                "ā✓",
+            ),
+        ];
+        for (case, key, value) in cases {
+            // A reserved KEY is refused before a reserved value: the entry cannot be
+            // stored under that name at all.
+            let expected = if reserved(key) {
+                Some(format!(
+                    "Value '{key}' at 'tags' failed to satisfy constraint: Map keys must \
+                     satisfy constraint: [Member must not be prefixed with aws:]"
+                ))
+            } else if reserved(value) {
+                Some(format!(
+                    "Value '{value}' at 'tags.{key}' failed to satisfy constraint: Member \
+                     must not be prefixed with aws:"
+                ))
+            } else {
+                None
+            };
+            let actual = bound_tags(&map(key, value));
+            assert_eq!(
+                actual.clone().err(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

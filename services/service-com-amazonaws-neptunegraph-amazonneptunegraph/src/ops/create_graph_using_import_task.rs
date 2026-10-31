@@ -301,9 +301,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Nothing caller-sized reaches the store unchecked — the bound on what one
-        // record's tags may hold is stated once, in `crate::state`, and is reached by
-        // every operation that accepts a `tags` map.
+        // Nothing a caller sends reaches the store unchecked — what one record's tags
+        // may hold, and the namespace they may not be drawn from, are stated once in
+        // `crate::state`, reached by every operation that accepts a `tags` map.
         if let Some(tags) = input.tags.as_ref() {
             if let Err(clause) = crate::state::bound_tags(tags) {
                 violations.push(clause);
