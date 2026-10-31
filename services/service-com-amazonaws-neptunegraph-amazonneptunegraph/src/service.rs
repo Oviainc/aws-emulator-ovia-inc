@@ -83,9 +83,7 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
         ViolationKind::MinLength(min) => crate::state::min_length_requirement(min),
         ViolationKind::MaxLength(max) => crate::state::max_length_requirement(max),
         ViolationKind::MinValue(min) => crate::state::min_value_requirement(min),
-        ViolationKind::MaxValue(max) => {
-            format!("Member must have value less than or equal to {max}")
-        }
+        ViolationKind::MaxValue(max) => crate::state::max_value_requirement(max),
         ViolationKind::Pattern(pattern) => crate::state::pattern_requirement(pattern),
         ViolationKind::EnumValue(allowed) => {
             format!("Member must satisfy enum value set: [{}]", allowed.join(", "))

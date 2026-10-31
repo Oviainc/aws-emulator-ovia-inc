@@ -124,6 +124,55 @@ pub fn graph_encryption_key(requested: Option<String>) -> String {
 /// when the request omits it, whatever value the call could otherwise have inherited.
 pub const DEFAULT_REPLICA_COUNT: i32 = 1;
 
+/// The member path a refusal of a vector-search dimension is reported at: the
+/// configuration member, then the dimension inside it, spelled the way the walk in front
+/// of a handler spells a path into a nested structure member (lowerCamel segments joined
+/// by dots).
+const VECTOR_SEARCH_DIMENSION_MEMBER: &str = "vectorSearchConfiguration.dimension";
+
+/// The most dimensions a vector-search configuration may ask a graph for, from the
+/// member's own documentation: "Specifies the number of dimensions for vector embeddings
+/// that will be loaded into the graph. The value is specified as `dimension=`value. Max =
+/// 65,535"
+/// (`smithy_query(query="doc",shape="CreateGraphInput",member="vectorSearchConfiguration")`,
+/// and the structure itself publishes the same number —
+/// `smithy_query(query="shape",shape="VectorSearchConfiguration")` -> "Max = 65535").
+///
+/// The modelled `@range` on `VectorSearchDimension` is `min: 1, max: 65536` — one ABOVE
+/// the number both of those sentences publish — so the boundary validator admits a
+/// dimension the service documents as out of range, and the published maximum is the
+/// bound enforced here ([`vector_search_dimension_clause`]). The minimum (1) and every
+/// value past the modelled maximum are already refused at the boundary by the `@range`
+/// trait, so this is the only part of the documented range nothing else applies.
+pub const MAX_VECTOR_SEARCH_DIMENSION: i32 = 65_535;
+
+/// The `ValidationException` clause a `vectorSearchConfiguration` fails, or `None` when
+/// its dimension is within the documented bound ([`MAX_VECTOR_SEARCH_DIMENSION`]).
+///
+/// Stated ONCE here and reached by every operation whose input carries a
+/// `vectorSearchConfiguration` (`CreateGraph`, `CreateGraphUsingImportTask`), so the two
+/// cannot drift into different acceptance sets for one documented member and no graph
+/// record can be minted holding a dimension the service's own documentation puts out of
+/// range — which is also what keeps it out of what a later read, a snapshot's captured
+/// configuration and a restore from that snapshot report.
+///
+/// The clause is the one the boundary validator renders for a `@range` maximum on the
+/// same member — the value, its member path, and the bound as the requirement — so a
+/// caller cannot tell the bound this handler applies from the bound the model carries.
+pub fn vector_search_dimension_clause(
+    configuration: Option<&VectorSearchConfiguration>,
+) -> Option<String> {
+    let dimension = configuration?.dimension;
+    if dimension > MAX_VECTOR_SEARCH_DIMENSION {
+        return Some(constraint_clause(
+            VECTOR_SEARCH_DIMENSION_MEMBER,
+            Some(&dimension.to_string()),
+            &max_value_requirement(MAX_VECTOR_SEARCH_DIMENSION),
+        ));
+    }
+    None
+}
+
 /// The build a graph record reports for the software serving it: "The build number of
 /// the graph software"
 /// (`smithy_query(query="doc",shape="CreateGraphOutput",member="buildNumber")`).
@@ -3606,6 +3655,17 @@ pub fn pattern_requirement(pattern: &str) -> String {
 /// states are not always the same numeric type.
 pub fn min_value_requirement(min: impl ::std::fmt::Display) -> String {
     format!("Member must have value greater than or equal to {min}")
+}
+
+/// The requirement clause for a MAXIMUM-VALUE violation: the largest value the member
+/// accepts.
+///
+/// The upper-bound sibling of [`min_value_requirement`], and here for the same reason: a
+/// bound the boundary validator refuses from the model and one an operation enforces
+/// because the member's documentation publishes it read identically, so a caller cannot
+/// tell which side of the boundary measured the value.
+pub fn max_value_requirement(max: impl ::std::fmt::Display) -> String {
+    format!("Member must have value less than or equal to {max}")
 }
 
 /// The requirement clause for a MINIMUM-LENGTH violation: the shortest the member

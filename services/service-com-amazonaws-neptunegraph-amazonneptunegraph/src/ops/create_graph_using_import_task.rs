@@ -310,6 +310,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The dimension a vector index is built with is the one member whose own
+        // documentation publishes a maximum NARROWER than the modelled `@range` it is
+        // refused by at the boundary, so the published bound is applied here — stated
+        // once in `crate::state::vector_search_dimension_clause` and reached by every
+        // operation whose input carries a `vectorSearchConfiguration` (`CreateGraph`
+        // too), so neither can store a configuration the other refuses.
+        if let Some(clause) = crate::state::vector_search_dimension_clause(
+            input.vector_search_configuration.as_ref(),
+        ) {
+            violations.push(clause);
+        }
+
         if !violations.is_empty() {
             return Err(CreateGraphUsingImportTaskErrorModeled::ValidationException(
                 ValidationException {

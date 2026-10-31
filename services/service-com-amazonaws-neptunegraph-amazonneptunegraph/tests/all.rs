@@ -117,3 +117,5 @@ mod tag_bound_refusal_wording;
 mod task_namespace_refusals;
 #[path = "all/unissued_page_token_refusal.rs"]
 mod unissued_page_token_refusal;
+#[path = "all/vector_search_dimension_rule.rs"]
+mod vector_search_dimension_rule;
