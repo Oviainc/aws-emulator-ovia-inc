@@ -1217,3 +1217,371 @@ async fn the_stores_own_bounds_admit_the_bound_and_refuse_what_is_past_it() {
         assert_firewall(&emulator, case, name, &want).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// The address families the instance has
+// ---------------------------------------------------------------------------
+
+/// What the service does with one `portInfo`.
+#[derive(Debug, Clone)]
+enum Outcome {
+    /// The request is refused, and the refusal's message names this member.
+    Refused(&'static str),
+    /// The request is accepted, and the firewall then holds this rule.
+    Stored(Rule),
+}
+
+/// One `portInfo` that names addresses EXPLICITLY, the `ipAddressType` of the
+/// instance it is sent to, and what the service does with it.
+///
+/// The rows differ along everything the rule generalises over: which family the
+/// named addresses are of, which families the instance's own address type gives
+/// it, how an address is written (a whole family, a block, a bare address,
+/// several of them, both families at once), and the protocol the rule opens —
+/// including the two whose ports are an ICMP type and code.
+struct FamilyRow {
+    case: &'static str,
+    /// The `ipAddressType` the instance is created with, from the modelled
+    /// `IpAddressType` enum.
+    ip_address_type: &'static str,
+    /// The `portInfo` the request carries, verbatim.
+    port_info: Value,
+    outcome: Outcome,
+}
+
+/// The table.
+fn family_rows() -> Vec<FamilyRow> {
+    vec![
+        FamilyRow {
+            case: "every IPv6 address, on an instance that has only IPv4",
+            ip_address_type: "ipv4",
+            port_info: json!({
+                "fromPort": 443,
+                "toPort": 443,
+                "protocol": "tcp",
+                "ipv6Cidrs": ["::/0"],
+            }),
+            outcome: Outcome::Refused("ipv6Cidrs"),
+        },
+        FamilyRow {
+            case: "one IPv6 block, on an instance that has only IPv4",
+            ip_address_type: "ipv4",
+            port_info: json!({
+                "fromPort": 5000,
+                "toPort": 5100,
+                "protocol": "udp",
+                "ipv6Cidrs": ["2001:DB8::/32"],
+            }),
+            outcome: Outcome::Refused("ipv6Cidrs"),
+        },
+        FamilyRow {
+            case: "a bare IPv6 address, on an instance that has only IPv4",
+            ip_address_type: "ipv4",
+            port_info: json!({
+                "fromPort": 8080,
+                "toPort": 8080,
+                "protocol": "tcp",
+                "ipv6Cidrs": ["2001:DB8:0:0:0:0:0:1"],
+            }),
+            outcome: Outcome::Refused("ipv6Cidrs"),
+        },
+        FamilyRow {
+            case: "both families at once, on an instance that has only IPv4",
+            ip_address_type: "ipv4",
+            port_info: json!({
+                "fromPort": 3000,
+                "toPort": 3000,
+                "protocol": "tcp",
+                "cidrs": ["192.0.2.0/24"],
+                "ipv6Cidrs": ["2001:DB8::/32", "2001:DB8:1::/48"],
+            }),
+            outcome: Outcome::Refused("ipv6Cidrs"),
+        },
+        FamilyRow {
+            case: "an ICMPv6 rule naming IPv6 addresses, on an instance that has only IPv4",
+            ip_address_type: "ipv4",
+            port_info: json!({
+                "fromPort": 128,
+                "toPort": 0,
+                "protocol": "icmpv6",
+                "ipv6Cidrs": ["::/0"],
+            }),
+            outcome: Outcome::Refused("ipv6Cidrs"),
+        },
+        FamilyRow {
+            case: "every IPv4 address, on an instance that has only IPv6",
+            ip_address_type: "ipv6",
+            port_info: json!({
+                "fromPort": 80,
+                "toPort": 80,
+                "protocol": "tcp",
+                "cidrs": ["0.0.0.0/0"],
+            }),
+            outcome: Outcome::Refused("cidrs"),
+        },
+        FamilyRow {
+            case: "several IPv4 blocks, on an instance that has only IPv6",
+            ip_address_type: "ipv6",
+            port_info: json!({
+                "fromPort": 0,
+                "toPort": 65535,
+                "protocol": "all",
+                "cidrs": ["192.0.2.0/24", "198.51.100.7/32", "203.0.113.9"],
+            }),
+            outcome: Outcome::Refused("cidrs"),
+        },
+        FamilyRow {
+            case: "an ICMP rule naming IPv4 addresses, on an instance that has only IPv6",
+            ip_address_type: "ipv6",
+            port_info: json!({
+                "fromPort": 8,
+                "toPort": -1,
+                "protocol": "icmp",
+                "cidrs": ["0.0.0.0/0"],
+            }),
+            outcome: Outcome::Refused("cidrs"),
+        },
+        // The same addresses, on an instance that DOES have the family: the rule
+        // refuses what the instance cannot be reached on and nothing else.
+        FamilyRow {
+            case: "every IPv6 address, on an instance that has both families",
+            ip_address_type: "dualstack",
+            port_info: json!({
+                "fromPort": 443,
+                "toPort": 443,
+                "protocol": "tcp",
+                "ipv6Cidrs": ["::/0"],
+            }),
+            outcome: Outcome::Stored(Rule::new(443, 443, "tcp", &[], &["::/0"])),
+        },
+        FamilyRow {
+            case: "one IPv6 block, on an instance that has only IPv6",
+            ip_address_type: "ipv6",
+            port_info: json!({
+                "fromPort": 5000,
+                "toPort": 5100,
+                "protocol": "udp",
+                "ipv6Cidrs": ["2001:DB8::/32"],
+            }),
+            outcome: Outcome::Stored(Rule::new(5000, 5100, "udp", &[], &["2001:DB8::/32"])),
+        },
+        FamilyRow {
+            case: "a bare IPv4 address, on an instance that has only IPv4",
+            ip_address_type: "ipv4",
+            port_info: json!({
+                "fromPort": 8080,
+                "toPort": 8080,
+                "protocol": "tcp",
+                "cidrs": ["192.0.2.44"],
+            }),
+            outcome: Outcome::Stored(Rule::new(8080, 8080, "tcp", &["192.0.2.44"], &[])),
+        },
+        FamilyRow {
+            case: "every IPv4 address, on an instance that has both families",
+            ip_address_type: "dualstack",
+            port_info: json!({
+                "fromPort": 80,
+                "toPort": 80,
+                "protocol": "tcp",
+                "cidrs": ["0.0.0.0/0"],
+            }),
+            outcome: Outcome::Stored(Rule::new(80, 80, "tcp", &["0.0.0.0/0"], &[])),
+        },
+        FamilyRow {
+            case: "the console's RDP/SSH client alias, on an instance that has only IPv6",
+            ip_address_type: "ipv6",
+            port_info: json!({
+                "fromPort": 22,
+                "toPort": 22,
+                "protocol": "tcp",
+                "cidrListAliases": ["lightsail-connect"],
+            }),
+            outcome: Outcome::Stored(
+                Rule::new(22, 22, "tcp", &[], &[]).with_aliases(&["lightsail-connect"]),
+            ),
+        },
+    ]
+}
+
+/// RULE: a firewall rule may admit only address families the instance itself
+/// has, so a `portInfo` naming an address of a family its `ipAddressType` gives
+/// it none of is refused with the modelled `InvalidInputException` — whichever of
+/// the three public-ports operations carried it — and the firewall is left
+/// exactly as it was; an address of a family the instance DOES have is stored
+/// and reported.
+#[tokio::test]
+async fn a_rule_may_only_name_addresses_of_a_family_the_instance_has() {
+    let emulator = Emulator::new();
+
+    for (index, row) in family_rows().into_iter().enumerate() {
+        let case = row.case;
+        let name = format!("firewall-family-{index}");
+        create_instance(&emulator, &name, Some(row.ip_address_type)).await;
+
+        // Before the call, the firewall is the platform's own defaults, which
+        // already carry only the families this instance has.
+        let mut want = default_rules(row.ip_address_type);
+        assert_firewall(&emulator, case, &name, &want).await;
+
+        match row.outcome {
+            Outcome::Stored(rule) => {
+                let answered = emulator
+                    .ok(
+                        "OpenInstancePublicPorts",
+                        json!({"instanceName": name, "portInfo": row.port_info}),
+                    )
+                    .await;
+                assert_operation(
+                    case,
+                    &answered["operation"],
+                    "OpenInstancePublicPorts",
+                    &name,
+                );
+                upsert(&mut want, rule);
+                assert_firewall(&emulator, case, &name, &want).await;
+            }
+            Outcome::Refused(member) => {
+                for (operation, body) in [
+                    (
+                        "OpenInstancePublicPorts",
+                        json!({"instanceName": name, "portInfo": row.port_info.clone()}),
+                    ),
+                    (
+                        "CloseInstancePublicPorts",
+                        json!({"instanceName": name, "portInfo": row.port_info.clone()}),
+                    ),
+                    (
+                        // A whole-set replacement carrying one unacceptable entry
+                        // must leave the set alone, so the acceptable entry
+                        // beside it is not applied either.
+                        "PutInstancePublicPorts",
+                        json!({
+                            "instanceName": name,
+                            "portInfos": [
+                                {"fromPort": 3100, "toPort": 3100, "protocol": "tcp"},
+                                row.port_info.clone(),
+                            ],
+                        }),
+                    ),
+                ] {
+                    let case = format!("{case} via {operation}");
+                    let (status, answered) = emulator.call(operation, body).await;
+                    assert_eq!(
+                        status, 400,
+                        "case {case}: expected the modelled InvalidInputException status, \
+                         got {status} {answered:?}"
+                    );
+                    assert_eq!(
+                        error_code(&answered),
+                        "InvalidInputException",
+                        "case {case}: expected InvalidInputException, got {answered:?}"
+                    );
+                    let message = answered["message"].as_str().unwrap_or_default();
+                    assert!(
+                        message.contains(member),
+                        "case {case}: expected the message to name {member}, got \
+                         {answered:?}"
+                    );
+                    assert!(
+                        message.contains(row.ip_address_type),
+                        "case {case}: expected the message to name the instance's \
+                         ipAddressType {}, got {answered:?}",
+                        row.ip_address_type
+                    );
+                    assert_firewall(&emulator, &case, &name, &want).await;
+                }
+            }
+        }
+    }
+}
+
+/// RULE: the families a rule may name are the instance's CURRENT ones — so
+/// narrowing an instance's `ipAddressType` narrows the rules it accepts from
+/// then on, while the rules it already holds are kept verbatim.
+#[tokio::test]
+async fn the_families_a_rule_may_name_follow_the_instances_current_address_type() {
+    let emulator = Emulator::new();
+    let name = "firewall-narrowed";
+    create_instance(&emulator, name, Some("dualstack")).await;
+
+    // While the instance has both families, a rule naming both is stored.
+    let both = Rule::new(3000, 3000, "tcp", &["192.0.2.0/24"], &["2001:DB8::/32"]);
+    emulator
+        .ok(
+            "OpenInstancePublicPorts",
+            json!({
+                "instanceName": name,
+                "portInfo": {
+                    "fromPort": 3000,
+                    "toPort": 3000,
+                    "protocol": "tcp",
+                    "cidrs": ["192.0.2.0/24"],
+                    "ipv6Cidrs": ["2001:DB8::/32"],
+                },
+            }),
+        )
+        .await;
+    let mut want = default_rules("dualstack");
+    upsert(&mut want, both);
+    assert_firewall(&emulator, "a dualstack instance", name, &want).await;
+
+    emulator
+        .ok(
+            "SetIpAddressType",
+            json!({
+                "resourceType": "Instance",
+                "resourceName": name,
+                "ipAddressType": "ipv4",
+            }),
+        )
+        .await;
+
+    // The rules the firewall already holds are what the caller asked for, kept
+    // verbatim: the change rewrites none of them.
+    assert_firewall(&emulator, "after narrowing to ipv4", name, &want).await;
+
+    // A NEW rule naming the family the instance no longer has is refused.
+    let (status, answered) = emulator
+        .call(
+            "OpenInstancePublicPorts",
+            json!({
+                "instanceName": name,
+                "portInfo": {
+                    "fromPort": 443,
+                    "toPort": 443,
+                    "protocol": "tcp",
+                    "ipv6Cidrs": ["::/0"],
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case a narrowed instance: expected the modelled InvalidInputException status, got \
+         {status} {answered:?}"
+    );
+    assert_eq!(
+        error_code(&answered),
+        "InvalidInputException",
+        "case a narrowed instance: expected InvalidInputException, got {answered:?}"
+    );
+    assert_firewall(&emulator, "a refused open on a narrowed instance", name, &want).await;
+
+    // The family it DOES still have is accepted over the same ports.
+    emulator
+        .ok(
+            "OpenInstancePublicPorts",
+            json!({
+                "instanceName": name,
+                "portInfo": {
+                    "fromPort": 443,
+                    "toPort": 443,
+                    "protocol": "tcp",
+                    "cidrs": ["0.0.0.0/0"],
+                },
+            }),
+        )
+        .await;
+    upsert(&mut want, Rule::new(443, 443, "tcp", &["0.0.0.0/0"], &[]));
+    assert_firewall(&emulator, "an accepted open on a narrowed instance", name, &want).await;
+}

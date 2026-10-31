@@ -10,7 +10,8 @@
 //! The request is nonetheless checked in FULL, addresses included, by the same
 //! `crate::state::port_rule_from_request` an open goes through: all three
 //! public-ports operations carry the same modelled `PortInfo`, so a malformed
-//! address is a malformed request whichever of them carries it. That is
+//! address — or one of a family the instance does not have — is a bad request
+//! whichever of them carries it. That is
 //! deliberate — a close naming a rule the firewall holds IS refused when its
 //! address members are malformed, even though the close itself would ignore
 //! them.
@@ -188,8 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 };
                 // The request is checked the same way an open is, DELIBERATELY:
                 // all three public-ports operations carry the same modelled
-                // `PortInfo`, so a malformed address is a malformed request
-                // whichever of them carries it, and one check keeps one rule.
+                // `PortInfo`, so a malformed address — or one of a family the
+                // instance does not have — is a bad request whichever of them
+                // carries it, and one check keeps one rule.
                 // Only the rule's own key — its ports and protocol — decides
                 // what is closed; the addresses select nothing, because closing
                 // a port closes it to everyone.

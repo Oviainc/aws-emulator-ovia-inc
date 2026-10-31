@@ -5230,8 +5230,9 @@ fn anywhere_cidrs(ip_address_type: &str) -> (Vec<String>, Vec<String>) {
 ///
 /// What the model cannot express is checked here: the protocol must be one of
 /// the modelled `NetworkProtocol` values, a port RANGE must run forwards, each
-/// address must be in the notation its own member takes, and an alias must be
-/// one Lightsail publishes. A rule that names no address at all is taken as open
+/// address must be in the notation its own member takes, each address must be of
+/// a family `ip_address_type` gives the instance, and an alias must be one
+/// Lightsail publishes. A rule that names no address at all is taken as open
 /// to anywhere — Lightsail's own default rules are, and a rule admitting nothing
 /// would open a port nothing can reach.
 pub fn port_rule_from_request(
@@ -5264,14 +5265,18 @@ pub fn port_rule_from_request(
             port_info.from_port, port_info.to_port
         ));
     }
+    // Each address member's own path, spelled once: both the notation check and
+    // the family check below name the member the caller has to fix.
+    let cidrs_member = format!("{member}.cidrs");
+    let ipv6_cidrs_member = format!("{member}.ipv6Cidrs");
     let cidrs = checked_cidrs(
-        &format!("{member}.cidrs"),
+        &cidrs_member,
         port_info.cidrs.as_deref().unwrap_or_default(),
         is_ipv4_cidr,
         "an IPv4 address or an IPv4 range in CIDR notation",
     )?;
     let ipv6_cidrs = checked_cidrs(
-        &format!("{member}.ipv6Cidrs"),
+        &ipv6_cidrs_member,
         port_info.ipv6_cidrs.as_deref().unwrap_or_default(),
         is_ipv6_cidr,
         "an IPv6 address or an IPv6 range in CIDR notation",
@@ -5281,6 +5286,22 @@ pub fn port_rule_from_request(
         port_info.cidr_list_aliases.as_deref().unwrap_or_default(),
         |alias| alias == CIDR_LIST_ALIAS_LIGHTSAIL_CONNECT,
         "the only alias this service publishes, 'lightsail-connect'",
+    )?;
+    // Each address member is checked against the families the INSTANCE has, not
+    // only against its own notation: a rule cannot admit an address family the
+    // instance does not have, so an address of a family `ip_address_type` gives
+    // the instance none of admits nothing, and is refused rather than stored.
+    // That is the same rule the substitution below applies to a request naming
+    // no address, and the one [`default_port_rules`] applies to a new instance's
+    // firewall. `cidrListAliases` names no address family of its own: it is a
+    // preconfigured range Lightsail publishes, so it is left to its own check
+    // above.
+    check_family_the_instance_has(&cidrs_member, &cidrs, ip_address_type, AddressFamily::Ipv4)?;
+    check_family_the_instance_has(
+        &ipv6_cidrs_member,
+        &ipv6_cidrs,
+        ip_address_type,
+        AddressFamily::Ipv6,
     )?;
     let (cidrs, ipv6_cidrs) =
         if cidrs.is_empty() && ipv6_cidrs.is_empty() && cidr_list_aliases.is_empty() {
@@ -5302,6 +5323,59 @@ pub fn port_rule_from_request(
 /// than the ends of a port range, from those members' own documentation.
 fn protocol_ports_are_icmp(protocol: &str) -> bool {
     matches!(protocol, "icmp" | "icmpv6")
+}
+
+/// One of the two address families a firewall rule's addresses can be of: the
+/// family `cidrs` carries, and the one `ipv6Cidrs` carries.
+#[derive(Debug, Clone, Copy)]
+enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl AddressFamily {
+    /// Whether an instance with `ip_address_type` has an address of this family,
+    /// asked of the ONE predicate per family this service already keeps.
+    fn given_by(self, ip_address_type: &str) -> bool {
+        match self {
+            Self::Ipv4 => ip_address_type_has_ipv4(ip_address_type),
+            Self::Ipv6 => ip_address_type_has_ipv6(ip_address_type),
+        }
+    }
+
+    /// The family's name, as a refusal names it.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "IPv4",
+            Self::Ipv6 => "IPv6",
+        }
+    }
+}
+
+/// `Ok(())` when `entries` names no address at all or an instance with
+/// `ip_address_type` has an address of `family`, and otherwise a refusal naming
+/// `member`, that family and the address type that gives the instance none of it.
+///
+/// An instance is reachable only on the families its `ip_address_type` gives it,
+/// so a rule naming an address of any other family would admit nothing — see
+/// [`anywhere_cidrs`], which leaves out the same family for the same reason. The
+/// family decides BOTH halves of the check, so the predicate asked and the name
+/// reported cannot disagree.
+fn check_family_the_instance_has(
+    member: &str,
+    entries: &[String],
+    ip_address_type: &str,
+    family: AddressFamily,
+) -> Result<(), String> {
+    if entries.is_empty() || family.given_by(ip_address_type) {
+        return Ok(());
+    }
+    let family = family.label();
+    Err(format!(
+        "{member} names {family} addresses, but the instance's ipAddressType \
+         '{ip_address_type}' gives it no {family} address: a rule cannot admit an address \
+         family the instance does not have"
+    ))
 }
 
 /// `entries` when every one of them satisfies `accepted` and the list is within
