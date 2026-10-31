@@ -23,52 +23,10 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use crate::harness::{call, create_active_plan, emulator};
-
-/// The range `RescoreResultItem$Score` models (`Float`, range -100000..100000).
-const SCORE_MIN: f64 = -100_000.0;
-/// See [`SCORE_MIN`].
-const SCORE_MAX: f64 = 100_000.0;
-
-/// Two scores are the same score: the wire carries a `Float`, so they are compared with
-/// a tolerance rather than bit for bit.
-const SCORE_TOLERANCE: f64 = 1e-6;
-
-/// The `(DocumentId, Score)` pairs of a `Rescore` answer, in the order the service
-/// returned them.
-fn result_items(body: &Value) -> Vec<(String, f64)> {
-    body["ResultItems"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|item| {
-            (
-                item["DocumentId"].as_str().unwrap_or_default().to_string(),
-                item["Score"].as_f64().unwrap_or(f64::NAN),
-            )
-        })
-        .collect()
-}
-
-/// A `Rescore` call against `plan` for `query` over `documents`.
-async fn rescore(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    plan: &str,
-    query: &str,
-    documents: &Value,
-) -> (u16, Value) {
-    call(
-        router,
-        "Rescore",
-        json!({
-            "RescoreExecutionPlanId": plan,
-            "SearchQuery": query,
-            "Documents": documents.clone(),
-        }),
-    )
-    .await
-}
+use crate::harness::{
+    create_active_plan, emulator, rescore, rescore_items as result_items, SCORE_MAX, SCORE_MIN,
+    SCORE_TOLERANCE,
+};
 
 /// One row of the grouping table: a query and the documents submitted under it, some of
 /// which carry a `GroupId`.

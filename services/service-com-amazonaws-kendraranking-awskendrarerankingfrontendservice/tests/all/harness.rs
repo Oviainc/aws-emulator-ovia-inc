@@ -84,6 +84,53 @@ pub async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> 
     call_in(router, DEFAULT_TEST_REGION, operation, body).await
 }
 
+/// The range `RescoreResultItem$Score` models (`Float`, range -100000..100000).
+pub const SCORE_MIN: f64 = -100_000.0;
+/// See [`SCORE_MIN`].
+pub const SCORE_MAX: f64 = 100_000.0;
+
+/// Two scores are the same score: the wire carries a `Float`, so they are compared with
+/// a tolerance rather than bit for bit.
+pub const SCORE_TOLERANCE: f64 = 1e-6;
+
+/// A `Rescore` call against `plan` for `query` over `documents`. Shared because every
+/// suite that drives the data plane reaches it the same way; they differ in the rules
+/// they assert.
+pub async fn rescore(
+    router: &MultiServiceRouter,
+    plan: &str,
+    query: &str,
+    documents: &Value,
+) -> (u16, Value) {
+    call(
+        router,
+        "Rescore",
+        json!({
+            "RescoreExecutionPlanId": plan,
+            "SearchQuery": query,
+            "Documents": documents.clone(),
+        }),
+    )
+    .await
+}
+
+/// The `(DocumentId, Score)` pairs of a `Rescore` answer, in the order the service
+/// returned them.
+pub fn rescore_items(body: &Value) -> Vec<(String, f64)> {
+    body["ResultItems"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|item| {
+            (
+                item["DocumentId"].as_str().unwrap_or_default().to_string(),
+                item["Score"].as_f64().unwrap_or(f64::NAN),
+            )
+        })
+        .collect()
+}
+
 /// The wire error code of an error body (`__type`), without any namespace prefix.
 pub fn error_code(body: &Value) -> String {
     let raw = body["__type"].as_str().unwrap_or_default();

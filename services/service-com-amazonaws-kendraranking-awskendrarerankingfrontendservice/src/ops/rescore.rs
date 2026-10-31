@@ -27,6 +27,23 @@
 //! range the model gives `Score`, a deterministic answer for one input, and a plan that
 //! must exist.
 //!
+//! What is faithful about the magnitude is its DIRECTION. The answer carries "documents
+//! with new relevancy scores" (`RescoreResult$ResultItems`) and the submitted
+//! `OriginalScore` is "the original document score or rank from the search service"
+//! which "Amazon Kendra Intelligent Ranking gives a new score or rank based on its
+//! intelligent search algorithm" (`Document$OriginalScore`): a new score is the
+//! ranking's own view of how well the document answers the query, not a small
+//! perturbation of the score the search service arrived with. So relevance carries the
+//! larger share of the blend here, is measured over the query's CONTENT-bearing terms
+//! (see [`query_content_terms`]) and is expressed on the scale the request's own scores
+//! are on (see [`relevance_scale`]). That is what lets a document whose text answers the
+//! query be lifted materially above the `OriginalScore` it arrived with — the whole
+//! reason a caller re-ranks — and ahead of the documents the query says nothing about,
+//! whatever scores those arrived with, while the original score still orders the
+//! documents the query says nothing about. The one document that cannot be lifted above
+//! its own original score is the one carrying the largest magnitude in the request,
+//! which is the scale everything else is measured against.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -308,13 +325,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             PlanState::Ready(rescore_id) => rescore_id,
         };
 
-        let query_terms = distinct_query_terms(&input.search_query);
+        let query_terms = query_content_terms(&input.search_query);
+        let units = scoring_units(&input.documents);
+        // The scale this request's scores are on, which the relevance component is
+        // expressed on too. See [`relevance_scale`].
+        let scale = relevance_scale(&units);
         // One score per scoring unit, so a group of documents is ranked as the one
         // document it is processed as, and each of its members reports that score.
-        let mut ranked: Vec<(f32, Vec<String>)> = scoring_units(&input.documents)
+        let mut ranked: Vec<(f32, Vec<String>)> = units
             .into_iter()
             .map(|mut unit| {
-                let score = unit_score(&query_terms, &unit);
+                let score = unit_score(&query_terms, &unit, scale);
                 // Inside one unit the members are listed by document id, the same
                 // tie-break the ordering below applies between units.
                 unit.member_ids.sort();
@@ -371,12 +392,14 @@ const TITLE_MEMBER: &str = "Title";
 /// See [`TITLE_MEMBER`].
 const TOKENIZED_TITLE_MEMBER: &str = "TokenizedTitle";
 
-/// How much of the blended score the document's own original score contributes.
-/// Emulator-chosen: see the caveat in this module's documentation.
-const ORIGINAL_SCORE_WEIGHT: f32 = 0.5;
-/// How much of the blended score the query/document term overlap contributes.
-/// Emulator-chosen.
-const RELEVANCE_WEIGHT: f32 = 0.5;
+/// How much of the blended score the document's own original score contributes: the
+/// SMALLER share, so a document the search service under-scored is not held down by it.
+/// Emulator-chosen magnitude, serving the direction this module's documentation states.
+const ORIGINAL_SCORE_WEIGHT: f32 = 0.4;
+/// How much of the blended score the query/document term overlap contributes: the LARGER
+/// share, because what the operation answers is a NEW relevancy score. Emulator-chosen
+/// magnitude, like [`ORIGINAL_SCORE_WEIGHT`].
+const RELEVANCE_WEIGHT: f32 = 0.6;
 /// Share of the overlap measured against the document's title. Emulator-chosen.
 const TITLE_WEIGHT: f32 = 0.7;
 /// Share of the overlap measured against the document's body. Emulator-chosen.
@@ -458,20 +481,54 @@ fn scoring_units(documents: &[Document]) -> Vec<ScoringUnit> {
 
 /// The score this service gives one scoring unit for a query carrying `query_terms`.
 ///
-/// It blends the unit's `OriginalScore` with the share of the query's distinct terms the
-/// unit's text carries, weighting the title above the body, and stays inside the range
-/// the model gives `Score`.
+/// It blends the unit's `OriginalScore` with the share of the query's CONTENT-bearing
+/// terms the unit's text carries, weighting the title above the body, taking the
+/// relevance share on `scale` (the scale this request's scores are on, see
+/// [`relevance_scale`]), and stays inside the range the model gives `Score`.
 ///
 /// The weights are the EMULATOR's, not the service's: Amazon Kendra Intelligent Ranking
 /// re-ranks with a semantic model, which this emulator cannot run, so this is a
-/// deterministic lexical stand-in. Its guarantees are ordinal, not absolute — a unit
-/// whose text carries more of the query outranks one that carries less at the same
-/// original score, and the same input always yields the same ranking.
-fn unit_score(query_terms: &[String], unit: &ScoringUnit) -> f32 {
+/// deterministic lexical stand-in. Its guarantees are ordinal and directional, not
+/// absolute — a unit whose text carries more of the query outranks one that carries
+/// less at the same original score, a unit whose text carries the query's content terms
+/// is scored materially above the original score it arrived with, and the same input
+/// always yields the same ranking.
+fn unit_score(query_terms: &[String], unit: &ScoringUnit, scale: f32) -> f32 {
     let relevance = TITLE_WEIGHT * coverage(query_terms, &unit.title_terms)
         + BODY_WEIGHT * coverage(query_terms, &unit.body_terms);
-    (ORIGINAL_SCORE_WEIGHT * unit.original_score + RELEVANCE_WEIGHT * relevance)
+    (ORIGINAL_SCORE_WEIGHT * unit.original_score + RELEVANCE_WEIGHT * relevance * scale)
         .clamp(SCORE_MIN, SCORE_MAX)
+}
+
+/// The scale one request's scores are on: the largest magnitude its scoring units carry,
+/// and never less than one.
+///
+/// A search service's scores have no fixed scale — `OriginalScore` is modelled over
+/// -100000..100000, and a lexical search engine's scores commonly run in the tens —
+/// while the share of a query a document's text carries is a fraction of one. Blending
+/// the two as if they were one scale would let any batch whose scores are not already on
+/// the unit scale swamp the relevance share and hand the submitted order straight back,
+/// which is the opposite of re-ranking. So the relevance share is taken on the scale of
+/// the scores the request itself carries, which is the only evidence of the caller's
+/// scale a request holds, with a floor of one so a batch already on the unit scale is
+/// left where it is.
+fn relevance_scale(units: &[ScoringUnit]) -> f32 {
+    units
+        .iter()
+        .map(|unit| unit.original_score.abs())
+        .fold(1.0, f32::max)
+}
+
+/// The English function words, lowercased: the published ISO list the `stop-words` crate
+/// carries, rather than a list written out here. Built once and shared.
+fn function_words() -> &'static BTreeSet<String> {
+    static FUNCTION_WORDS: ::std::sync::OnceLock<BTreeSet<String>> = ::std::sync::OnceLock::new();
+    FUNCTION_WORDS.get_or_init(|| {
+        ::stop_words::get(::stop_words::LANGUAGE::English)
+            .into_iter()
+            .map(|word| word.to_lowercase())
+            .collect()
+    })
 }
 
 /// The terms of one document field, from its text form or its pre-tokenized form
@@ -497,19 +554,64 @@ fn coverage(query_terms: &[String], document_terms: &BTreeSet<String>) -> f32 {
     matched as f32 / query_terms.len() as f32
 }
 
-/// The query's distinct terms, in first-seen order.
-fn distinct_query_terms(search_query: &str) -> Vec<String> {
+/// The query's CONTENT-bearing terms, without repeats and in first-seen order.
+///
+/// What the answer carries is a relevancy score, so the measure of relevance is taken
+/// over the words the query ASKS ABOUT. A query's function words ask about nothing —
+/// they are carried by no document's text in particular — so counting them would only
+/// shrink the share of the query any document can ever cover, however completely the
+/// document answers it. A query made of nothing BUT function words keeps them all, so it
+/// still ranks its documents by the words it has rather than by none.
+fn query_content_terms(search_query: &str) -> Vec<String> {
+    let function_words = function_words();
+    let words = words_of(search_query);
+    let content: Vec<&String> = words
+        .iter()
+        .filter(|word| !function_words.contains(*word))
+        .collect();
+    let kept: Vec<&String> = if content.is_empty() {
+        // A query of nothing BUT function words: keep them, so it ranks its documents
+        // by the words it has.
+        words.iter().collect()
+    } else {
+        content
+    };
     let mut seen = BTreeSet::new();
-    terms_of(search_query)
+    stems_of(kept.into_iter())
         .into_iter()
         .filter(|term| seen.insert(term.clone()))
         .collect()
 }
 
-/// Fold text into comparable terms: lowercase runs of alphanumeric characters.
+/// Fold text into comparable terms: lowercase runs of alphanumeric characters, each
+/// folded to its stem.
 fn terms_of(text: &str) -> Vec<String> {
+    stems_of(words_of(text).iter())
+}
+
+/// Split text into words: lowercase runs of alphanumeric characters, unstemmed, because
+/// a function word is named in the published list by the word itself.
+fn words_of(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
-        .filter(|term| !term.is_empty())
+        .filter(|word| !word.is_empty())
         .map(str::to_lowercase)
         .collect()
+}
+
+/// The stems of already-lowercased `words`, under the Snowball English stemmer.
+///
+/// A term is compared by its stem on BOTH sides, query and document, so a query term
+/// matches whichever inflected form a document spells it in — a document about
+/// "batteries" answers a query about a "battery" — which is what a measure of relevance
+/// over a document's words has to do to mean anything.
+fn stems_of<'words>(words: impl Iterator<Item = &'words String>) -> Vec<String> {
+    let stemmer = stemmer();
+    words.map(|word| stemmer.stem(word).into_owned()).collect()
+}
+
+/// The Snowball English stemmer, built once and shared like [`function_words`].
+fn stemmer() -> &'static ::rust_stemmers::Stemmer {
+    static STEMMER: ::std::sync::OnceLock<::rust_stemmers::Stemmer> =
+        ::std::sync::OnceLock::new();
+    STEMMER.get_or_init(|| ::rust_stemmers::Stemmer::create(::rust_stemmers::Algorithm::English))
 }

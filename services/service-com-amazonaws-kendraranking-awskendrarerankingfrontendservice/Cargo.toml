@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Snowball stemming, so a query term and a document's inflected forms of it fold together.
+rust-stemmers = "1.2"
+# The published function-word (stop-word) lists, so the content-bearing terms of a query
+# are told from its function words without a list hand-maintained here.
+stop-words = "0.8"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
