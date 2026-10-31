@@ -24,7 +24,15 @@ pub struct CreateCodeInterpreterInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#CreateCodeInterpreterResponse")]
+/// `CreateCodeInterpreterResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation", operation="CreateCodeInterpreter")`),
+/// and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct CreateCodeInterpreterOutput {
     pub code_interpreter_id: String,
@@ -32,4 +40,30 @@ pub struct CreateCodeInterpreterOutput {
     pub created_at: ::aws_smithy_types::DateTime,
     pub status: String,
 }
+
+agentcore_schema_and_codec!(
+    CreateCodeInterpreterOutput,
+    CREATE_CODE_INTERPRETER_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#CreateCodeInterpreterResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "CreateCodeInterpreterResponse",
+    (
+        M_CODE_INTERPRETER_ID,
+        code_interpreter_id,
+        "codeInterpreterId",
+        0,
+        req,
+        string
+    ),
+    (
+        M_CODE_INTERPRETER_ARN,
+        code_interpreter_arn,
+        "codeInterpreterArn",
+        1,
+        req,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 2, req, date_time),
+    (M_STATUS, status, "status", 3, req, string),
+);
 

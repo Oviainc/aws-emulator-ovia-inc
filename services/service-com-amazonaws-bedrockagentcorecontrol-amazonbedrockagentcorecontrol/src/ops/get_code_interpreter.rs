@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCodeInterpreter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCodeInterpreter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCodeInterpreter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -175,20 +166,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCodeInterpreter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCodeInterpreterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCodeInterpreter"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCodeInterpreterErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the code interpreter store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A code interpreter whose accepted deletion the clock has already made
+        // due is gone before this read looks for it — the removal was due at
+        // this instant whether or not anybody called.
+        store.expire_deleted_code_interpreters(now);
+
+        // The store is keyed by the `codeInterpreterId` the create minted; an id
+        // naming no stored interpreter is the modelled 404 rather than an empty
+        // envelope.
+        let record = store
+            .code_interpreters
+            .get(&input.code_interpreter_id)
+            .ok_or_else(|| {
+                GetCodeInterpreterErrorModeled::ResourceNotFoundException(
+                    crate::state::code_interpreter_not_found(&input.code_interpreter_id),
+                )
+            })?;
+
+        Ok(record.get_output(now))
     }
 }

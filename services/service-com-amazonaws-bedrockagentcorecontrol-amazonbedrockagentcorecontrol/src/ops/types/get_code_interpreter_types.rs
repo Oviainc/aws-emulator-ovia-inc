@@ -17,7 +17,15 @@ pub struct GetCodeInterpreterInput {
     pub code_interpreter_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#GetCodeInterpreterResponse")]
+/// `GetCodeInterpreterResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `lastUpdatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="operation", operation="GetCodeInterpreter")`),
+/// and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetCodeInterpreterOutput {
     pub code_interpreter_id: String,
@@ -33,4 +41,73 @@ pub struct GetCodeInterpreterOutput {
     pub created_at: ::aws_smithy_types::DateTime,
     pub last_updated_at: ::aws_smithy_types::DateTime,
 }
+
+agentcore_schema_and_codec!(
+    GetCodeInterpreterOutput,
+    GET_CODE_INTERPRETER_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#GetCodeInterpreterResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "GetCodeInterpreterResponse",
+    (
+        M_CODE_INTERPRETER_ID,
+        code_interpreter_id,
+        "codeInterpreterId",
+        0,
+        req,
+        string
+    ),
+    (
+        M_CODE_INTERPRETER_ARN,
+        code_interpreter_arn,
+        "codeInterpreterArn",
+        1,
+        req,
+        string
+    ),
+    (M_NAME, name, "name", 2, req, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (
+        M_EXECUTION_ROLE_ARN,
+        execution_role_arn,
+        "executionRoleArn",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_NETWORK_CONFIGURATION,
+        network_configuration,
+        "networkConfiguration",
+        5,
+        req,
+        struct_of(CodeInterpreterNetworkConfiguration)
+    ),
+    (M_STATUS, status, "status", 6, req, string),
+    (
+        M_CERTIFICATES,
+        certificates,
+        "certificates",
+        7,
+        opt,
+        list_of_struct(Certificate)
+    ),
+    (
+        M_FILESYSTEM_CONFIGURATIONS,
+        filesystem_configurations,
+        "filesystemConfigurations",
+        8,
+        opt,
+        list_of_union(ToolsFileSystemConfiguration)
+    ),
+    (M_FAILURE_REASON, failure_reason, "failureReason", 9, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 10, req, date_time),
+    (
+        M_LAST_UPDATED_AT,
+        last_updated_at,
+        "lastUpdatedAt",
+        11,
+        req,
+        date_time
+    ),
+);
 

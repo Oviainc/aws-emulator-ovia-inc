@@ -25,6 +25,11 @@
 //!   the configuration `CreateBrowser` persisted and the statuses the clock owes
 //!   it, so `GetBrowser` reports exactly that and `DeleteBrowser` reports what it
 //!   is removing;
+//! * the code interpreter (`/code-interpreters/`): one
+//!   [`CodeInterpreterRecord`] per `codeInterpreterId`, holding the
+//!   configuration `CreateCodeInterpreter` persisted and the statuses the clock
+//!   owes it, so `GetCodeInterpreter` reports exactly that and
+//!   `DeleteCodeInterpreter` reports what it is removing;
 //! * the token vault ([`TokenVaults`]): the KMS configuration each vault of the
 //!   account is encrypted under, so `SetTokenVaultCMK` and `GetTokenVault`
 //!   answer from one store;
@@ -50,6 +55,8 @@ use crate::ops::types::{
     BrowserEnterprisePolicy, BrowserNetworkConfiguration, BrowserSigningConfigOutput,
     CapacityProviderConfiguration, Certificate, CertificateConfiguration, Code,
     ComponentConfiguration,
+    CodeInterpreterNetworkConfiguration, CreateCodeInterpreterOutput, DeleteCodeInterpreterOutput,
+    GetCodeInterpreterOutput,
     CreateBrowserOutput, CreateGatewayOutput, DeleteBrowserOutput, GetBrowserOutput,
     RecordingConfig, ToolsFileSystemConfiguration,
     CreateGatewayTargetOutput, CredentialProviderConfiguration, CustomTransformConfiguration,
@@ -1636,6 +1643,164 @@ impl BrowserRecord {
     }
 }
 
+/// The modelled not-found error for a code interpreter this account does not
+/// hold.
+///
+/// This control plane words a missing code interpreter in terms of the id the
+/// request named: "Code interpreter with ID <codeInterpreterId> does not exist"
+/// — the sentence around the identifier is fixed, and the identifier itself is
+/// the caller's own value, exactly as [`browser_not_found`] words the sibling
+/// resource. Shared by the handlers rather than written per operation, so one
+/// code interpreter cannot be reported missing in two different sentences by two
+/// operations.
+pub fn code_interpreter_not_found(code_interpreter_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Code interpreter with ID {code_interpreter_id} does not exist"
+        )),
+    }
+}
+
+/// The ARN resource type a code interpreter THIS SERVICE CREATED carries.
+/// `CodeInterpreterArn` is
+/// `…:code-interpreter(-custom)?/(aws\.codeinterpreter\.v1|…)` (`smithy_query
+/// shape=CodeInterpreterArn`), whose `arnReference` names
+/// `AWS::BedrockAgentCore::CodeInterpreterCustom`: the `-custom` spelling is the
+/// customer-created interpreter, and the bare one the service-provided tool
+/// (`aws.codeinterpreter.v1`), which no operation mints.
+pub const CODE_INTERPRETER_ARN_RESOURCE: &str = "code-interpreter-custom";
+
+/// `CodeInterpreterStatus` members this service drives. The enum's full value
+/// list is `CREATING | CREATE_FAILED | READY | DELETING | DELETE_FAILED |
+/// DELETED` (`smithy_query shape=CodeInterpreterStatus`).
+pub const CODE_INTERPRETER_STATUS_CREATING: &str = "CREATING";
+pub const CODE_INTERPRETER_STATUS_READY: &str = "READY";
+pub const CODE_INTERPRETER_STATUS_DELETING: &str = "DELETING";
+
+/// How long a freshly created code interpreter stays `CREATING` before the clock
+/// owes it `READY`, and how long an accepted deletion leaves it `DELETING`
+/// before the record is gone.
+///
+/// AWS documents no duration for either transition, so the span is chosen: long
+/// enough that a caller acting straight after the call still observes the
+/// transient status, short enough to keep a client script quick.
+pub const CODE_INTERPRETER_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// How many code interpreters this emulator will hold.
+///
+/// `CreateCodeInterpreter` models `ServiceQuotaExceededException` (HTTP 402) for
+/// exceeding the real service's quota; this number is not a fidelity claim about
+/// that quota but the emulator's own ceiling, set generously so no realistic
+/// workflow meets it, so a caller looping on create cannot grow this process's
+/// memory without bound.
+pub const MAX_CODE_INTERPRETERS: usize = 1_000;
+
+/// The member path `CreateCodeInterpreter` refuses a VPC-mode network
+/// configuration for when it carries no VPC configuration, and why.
+///
+/// The model states the rule in prose on the member itself — "This configuration
+/// is required when the network mode is set to `VPC`" (`smithy_query
+/// shape=CodeInterpreterNetworkConfiguration`) — so the framework's constraint
+/// walk cannot refuse it.
+pub const CODE_INTERPRETER_VPC_CONFIG_MEMBER: &str = "networkConfiguration.vpcConfig";
+
+/// `CodeInterpreterNetworkMode` for an interpreter that connects to a
+/// caller-supplied VPC. The enum's full value list is `PUBLIC | SANDBOX | VPC`
+/// (`smithy_query shape=CodeInterpreterNetworkMode`).
+pub const CODE_INTERPRETER_NETWORK_MODE_VPC: &str = "VPC";
+
+/// One custom code interpreter: everything `CreateCodeInterpreter` persisted for
+/// it, and the statuses the clock owes it.
+///
+/// Every read of the interpreter reports this record, so a create and a later
+/// read cannot disagree about its configuration or status.
+#[derive(Debug, Clone)]
+pub struct CodeInterpreterRecord {
+    pub code_interpreter_id: String,
+    pub code_interpreter_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub execution_role_arn: Option<String>,
+    pub network_configuration: CodeInterpreterNetworkConfiguration,
+    pub certificates: Option<Vec<Certificate>>,
+    pub filesystem_configurations: Option<Vec<ToolsFileSystemConfiguration>>,
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The status the interpreter reports until [`Self::settles_at`].
+    pub transient_status: String,
+    /// The status it reports from then on.
+    pub settled_status: String,
+    /// When the clock owes the move from one to the other. Stored, never slept
+    /// on: a read materialises the transition the clock already made due.
+    pub settles_at: SystemTime,
+    /// The instant an accepted deletion removes this record, once
+    /// `DeleteCodeInterpreter` has accepted one; `None` for an interpreter
+    /// nobody has deleted. Stored, never slept on, like
+    /// [`BrowserRecord::removal_due_at`](BrowserRecord#structfield.removal_due_at).
+    pub removal_due_at: Option<SystemTime>,
+}
+
+impl CodeInterpreterRecord {
+    /// The status at `now`: the transient one until the clock owes the
+    /// transition, the settled one from then on. No read performs it — it is due
+    /// at that instant whether or not anybody looks.
+    pub fn status_at(&self, now: SystemTime) -> &str {
+        if now < self.settles_at {
+            &self.transient_status
+        } else {
+            &self.settled_status
+        }
+    }
+
+    /// Whether a deletion has been accepted for this code interpreter: it
+    /// reports `DELETING` and the clock owes its removal.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// What the create of this code interpreter reports: the four members
+    /// `CreateCodeInterpreterResponse` declares, every one of them off the
+    /// record just written.
+    pub fn create_output(&self, now: SystemTime) -> CreateCodeInterpreterOutput {
+        CreateCodeInterpreterOutput {
+            code_interpreter_id: self.code_interpreter_id.clone(),
+            code_interpreter_arn: self.code_interpreter_arn.clone(),
+            created_at: timestamp(self.created_at),
+            status: self.status_at(now).to_string(),
+        }
+    }
+
+    /// What a read of this code interpreter reports.
+    pub fn get_output(&self, now: SystemTime) -> GetCodeInterpreterOutput {
+        GetCodeInterpreterOutput {
+            code_interpreter_id: self.code_interpreter_id.clone(),
+            code_interpreter_arn: self.code_interpreter_arn.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            execution_role_arn: self.execution_role_arn.clone(),
+            network_configuration: self.network_configuration.clone(),
+            status: self.status_at(now).to_string(),
+            certificates: self.certificates.clone(),
+            filesystem_configurations: self.filesystem_configurations.clone(),
+            // Reported only for a status that HAS a reason; a code interpreter
+            // this emulator drives reaches READY, which has none.
+            failure_reason: None,
+            created_at: timestamp(self.created_at),
+            last_updated_at: timestamp(self.updated_at),
+        }
+    }
+
+    /// What the deletion of this code interpreter reports.
+    pub fn delete_output(&self, now: SystemTime) -> DeleteCodeInterpreterOutput {
+        DeleteCodeInterpreterOutput {
+            code_interpreter_id: self.code_interpreter_id.clone(),
+            status: self.status_at(now).to_string(),
+            last_updated_at: timestamp(self.updated_at),
+        }
+    }
+}
+
 /// The resource noun [`resource_not_found`] names for a configuration bundle.
 pub const RESOURCE_CONFIGURATION_BUNDLE: &str = "configuration bundle";
 
@@ -1840,6 +2005,8 @@ impl ConfigurationBundleRecord {
 /// [`MAX_HARNESSES`] the harnesses (and with them their 1:1 name index),
 /// [`MAX_REGISTRIES`] the registries (and with them their 1:1 name index),
 /// [`MAX_BROWSERS`] the browsers (and with them their 1:1 name index),
+/// [`MAX_CODE_INTERPRETERS`] the code interpreters (and with them their 1:1
+/// name index),
 /// [`MAX_CONFIGURATION_BUNDLES`] the configuration bundles (and with them their
 /// 1:1 name index), [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`] the versions one
 /// bundle accumulates and
@@ -1961,6 +2128,23 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// The keys of [`Self::browser_idempotency`] in the order they were first
     /// recorded, so the oldest record is the one evicted at the ceiling.
     browser_idempotency_order: VecDeque<String>,
+    /// Every custom code interpreter, keyed by `codeInterpreterId` — the
+    /// identifier every code-interpreter route addresses it by. The key order is
+    /// the deterministic list order a code-interpreter listing pages over.
+    pub code_interpreters: BTreeMap<String, CodeInterpreterRecord>,
+    /// `name` -> `codeInterpreterId`, so a duplicate name at create time is a
+    /// `ConflictException` ("The name must be unique within your account").
+    /// One entry per stored code interpreter.
+    pub code_interpreter_names: BTreeMap<String, String>,
+    /// `<operation>/<clientToken>` -> the code interpreter that token first
+    /// produced, so a replayed `CreateCodeInterpreter` answers with its first
+    /// result instead of minting a second interpreter. Separate from the maps
+    /// above because the record is validated against a different store; the key
+    /// carries the operation for the same reason as there.
+    code_interpreter_idempotency: BTreeMap<String, String>,
+    /// The keys of [`Self::code_interpreter_idempotency`] in the order they were
+    /// first recorded, so the oldest record is the one evicted at the ceiling.
+    code_interpreter_idempotency_order: VecDeque<String>,
     /// Every configuration bundle, keyed by `bundleId` — the identifier every
     /// configuration-bundle route addresses it by. The key order is the
     /// deterministic list order a bundle listing pages over.
@@ -2494,6 +2678,92 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
             .retain(|token| live.contains_key(token));
     }
 
+    /// Mint a `codeInterpreterId` for `name` that no stored code interpreter
+    /// holds: the name + `-` + 10 alphanumerics, per `CodeInterpreterId`'s
+    /// pattern
+    /// `^(aws\.codeinterpreter\.v1|[a-zA-Z][a-zA-Z0-9_]{0,47}-[a-zA-Z0-9]{10})$`.
+    ///
+    /// `SandboxName` is `^[a-zA-Z][a-zA-Z0-9_]{0,47}$`, which is exactly the
+    /// stem that pattern admits, so the name needs no reshaping. The other
+    /// alternative, `aws.codeinterpreter.v1`, is the service-provided code
+    /// interpreter tool, which no create mints.
+    pub fn mint_code_interpreter_id(&mut self, name: &str, at: SystemTime) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = format!("{name}-{}", suffix_for(name, self.mint_counter, at));
+            if !self.code_interpreters.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// The code interpreter a previous request to `operation` carrying this
+    /// `clientToken` produced, if the record is still held and the interpreter
+    /// still exists.
+    pub fn replayed_code_interpreter_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<String> {
+        let code_interpreter_id = self
+            .code_interpreter_idempotency
+            .get(&token_key(operation, client_token?))?;
+        self.code_interpreters
+            .contains_key(code_interpreter_id)
+            .then(|| code_interpreter_id.clone())
+    }
+
+    /// Record what a `clientToken` produced for `operation`, evicting the oldest
+    /// record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held, for the same
+    /// reason [`Self::remember_browser_client_token`] does.
+    pub fn remember_code_interpreter_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        code_interpreter_id: &str,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        remember_token(
+            &mut self.code_interpreter_idempotency,
+            &mut self.code_interpreter_idempotency_order,
+            token_key(operation, &token),
+            code_interpreter_id.to_string(),
+        );
+    }
+
+    /// Drop the idempotency records naming a code interpreter that no longer
+    /// exists, for the same reason [`Self::forget_client_tokens_for`] does.
+    fn forget_code_interpreter_client_tokens_for(&mut self, code_interpreter_id: &str) {
+        self.code_interpreter_idempotency
+            .retain(|_, id| id != code_interpreter_id);
+        let live = &self.code_interpreter_idempotency;
+        self.code_interpreter_idempotency_order
+            .retain(|token| live.contains_key(token));
+    }
+
+    /// Remove every code interpreter whose accepted deletion the clock has made
+    /// due, and the name index entry and idempotency records naming it, on the
+    /// same clock-owed rule as [`Self::expire_deleted_browsers`]:
+    /// `DeleteCodeInterpreter` ACCEPTS the deletion (202) and reports the
+    /// interpreter `DELETING`, and the record itself goes when the span it owes
+    /// passes, so a caller polling it sees `DELETING` and then the modelled 404.
+    pub fn expire_deleted_code_interpreters(&mut self, now: SystemTime) {
+        let due: Vec<String> = self
+            .code_interpreters
+            .iter()
+            .filter(|(_, record)| record.removal_due_at.is_some_and(|at| now >= at))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            if let Some(record) = self.code_interpreters.remove(&id) {
+                self.code_interpreter_names.remove(&record.name);
+                self.forget_code_interpreter_client_tokens_for(&record.code_interpreter_id);
+            }
+        }
+    }
+
     /// Remove every browser whose accepted deletion the clock has made due, and
     /// the name index entry and idempotency records naming it.
     ///
@@ -2829,6 +3099,16 @@ pub fn browser_arn(region: &str, browser_id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{BROWSER_ARN_RESOURCE}/{browser_id}"),
+    )
+}
+
+/// `arn:aws:bedrock-agentcore:{region}:{account}:code-interpreter-custom/{codeInterpreterId}`
+/// — the customer-created alternative of `CodeInterpreterArn`'s pattern.
+pub fn code_interpreter_arn(region: &str, code_interpreter_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{CODE_INTERPRETER_ARN_RESOURCE}/{code_interpreter_id}"),
     )
 }
 

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCodeInterpreter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCodeInterpreter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCodeInterpreter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +174,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCodeInterpreter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCodeInterpreterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCodeInterpreter"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCodeInterpreterErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the code interpreter store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The model states this rule in prose on the member itself, so the
+        // framework's constraint walk cannot refuse it: the VPC configuration
+        // "is required when the network mode is set to VPC". The other modes
+        // need no caller-supplied network of their own.
+        if input.network_configuration.network_mode
+            == crate::state::CODE_INTERPRETER_NETWORK_MODE_VPC
+            && input.network_configuration.vpc_config.is_none()
+        {
+            return Err(CreateCodeInterpreterErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    crate::state::CODE_INTERPRETER_VPC_CONFIG_MEMBER,
+                    &format!(
+                        "is required when networkMode is {}",
+                        crate::state::CODE_INTERPRETER_NETWORK_MODE_VPC
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // A code interpreter whose earlier deletion the clock has already made
+        // due is gone before this call looks at the names this account holds.
+        store.expire_deleted_code_interpreters(now);
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // code interpreter that token first produced, rather than minting a
+        // second one: "If this token matches a previous request, Amazon Bedrock
+        // AgentCore ignores the request but does not return an error."
+        if let Some(code_interpreter_id) =
+            store.replayed_code_interpreter_result(Self::NAME, input.client_token.as_deref())
+        {
+            // `replayed_code_interpreter_result` answers only for an interpreter
+            // the store still holds, so this lookup cannot miss.
+            if let Some(record) = store.code_interpreters.get(&code_interpreter_id) {
+                return Ok(record.create_output(now));
+            }
+        }
+
+        // "The name must be unique within your account", so a repeated name is a
+        // conflict, not a second interpreter later reads cannot tell apart.
+        if let Some(existing) = store.code_interpreter_names.get(&input.name) {
+            return Err(CreateCodeInterpreterErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "a code interpreter named {} already exists (codeInterpreterId {existing})",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if store.code_interpreters.len() >= crate::state::MAX_CODE_INTERPRETERS {
+            return Err(
+                CreateCodeInterpreterErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} code interpreters",
+                            crate::state::MAX_CODE_INTERPRETERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let code_interpreter_id = store.mint_code_interpreter_id(&input.name, now);
+        let record = crate::state::CodeInterpreterRecord {
+            code_interpreter_arn: crate::state::code_interpreter_arn(&region, &code_interpreter_id),
+            code_interpreter_id: code_interpreter_id.clone(),
+            name: input.name,
+            description: input.description,
+            execution_role_arn: input.execution_role_arn,
+            network_configuration: input.network_configuration,
+            certificates: input.certificates,
+            filesystem_configurations: input.filesystem_configurations,
+            tags: crate::state::sorted_map(input.tags),
+            created_at: now,
+            updated_at: now,
+            // A new code interpreter is created, not ready: the transition to
+            // READY is owed by the clock, not by this call.
+            transient_status: crate::state::CODE_INTERPRETER_STATUS_CREATING.to_string(),
+            settled_status: crate::state::CODE_INTERPRETER_STATUS_READY.to_string(),
+            settles_at: now + crate::state::CODE_INTERPRETER_SETTLE_DELAY,
+            // Nobody has deleted this interpreter, so the clock owes no removal.
+            removal_due_at: None,
+        };
+        let output = record.create_output(now);
+
+        store
+            .code_interpreter_names
+            .insert(record.name.clone(), code_interpreter_id.clone());
+        store.remember_code_interpreter_client_token(
+            Self::NAME,
+            input.client_token,
+            &code_interpreter_id,
+        );
+        store.code_interpreters.insert(code_interpreter_id, record);
+
+        Ok(output)
     }
 }

@@ -19,6 +19,8 @@ mod browser_lifecycle;
 mod capacity_provider_runtime_versions;
 #[path = "all/code_artifact_object.rs"]
 mod code_artifact_object;
+#[path = "all/code_interpreter_lifecycle.rs"]
+mod code_interpreter_lifecycle;
 #[path = "all/configuration_bundle_lifecycle.rs"]
 mod configuration_bundle_lifecycle;
 #[path = "all/control_plane_preconditions.rs"]
