@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/content_reads_shared_rules.rs"]
 mod content_reads_shared_rules;
+#[path = "all/content_type_reporting.rs"]
+mod content_type_reporting;
 #[path = "all/datastore_delete_refusal_texts.rs"]
 mod datastore_delete_refusal_texts;
 #[path = "all/datastore_deleted_window.rs"]

@@ -20,11 +20,12 @@
 //! SOP instance) or collapses a level of the hierarchy, so the document can only ever name
 //! the records it was built from.
 //!
-//! The document is JSON, written into the blob as it stands: `contentType` states the
-//! format a client reads it as ([`METADATA_CONTENT_TYPE`]), and `contentEncoding` — "the
-//! compression format in which image set metadata attributes are returned" — is absent,
-//! because nothing compressed it. The response never names a compression the blob is not
-//! in, so a client decodes the blob from the response alone.
+//! The document is JSON, written into the blob as it stands, and `contentType` — "the format
+//! in which the study metadata is returned to the customer" — reports the format that member
+//! documents this operation returns it in ([`METADATA_CONTENT_TYPE`]), not a format chosen
+//! here. `contentEncoding` — "the compression format in which image set metadata attributes
+//! are returned" — is absent, because nothing compressed it. The response never names a
+//! compression the blob is not in, so a client decodes the blob from the response alone.
 //!
 //! `version` names ONE version of the image set, and the document reports the DICOM
 //! attributes THAT version holds: the latest version's are the attributes the image set
@@ -108,14 +109,23 @@ use crate::state::{
     METADATA_SCHEMA_VERSION_KEY, METADATA_SERIES_KEY, METADATA_STUDY_KEY,
 };
 
-/// The `contentType` this operation reports: the document in the blob is JSON.
-pub const METADATA_CONTENT_TYPE: &str = "application/json";
+/// The `contentType` this operation reports for the study metadata it serves: the format
+/// the response member's own documentation names for it —
+/// `smithy_query(query="doc",shape="GetImageSetMetadataResponse",member="contentType")`,
+/// "The format in which the study metadata is returned to the customer. Default is
+/// `text/plain`."
+///
+/// That documentation distinguishes no case, unlike the `GetImageFrame` member's
+/// per-transfer-syntax catalog ([`crate::state::image_frame_content_type`]), so the
+/// documented default is the format every answer reports — whatever the document it
+/// aggregates holds. The blob's own serialisation is unaffected: the document written into
+/// it is the JSON one `metadata_document` builds.
+pub const METADATA_CONTENT_TYPE: &str = "text/plain";
 
 // `contentEncoding` — "the compression format in which image set metadata attributes are
 // returned" — is REPORTED BY ABSENCE here: this handler writes the document into the blob
-// uncompressed, so there is no compression format to name, and a client reads the blob as
-// the `contentType` below describes it. Nothing in the response may claim a compression
-// that was not applied, which is why no constant for one exists.
+// uncompressed, so there is no compression format to name. Nothing in the response may
+// claim a compression that was not applied, which is why no constant for one exists.
 
 /// The version of the aggregated-metadata document this handler writes, carried in the
 /// document's own `SchemaVersion` member so a reader can tell which shape it is reading.

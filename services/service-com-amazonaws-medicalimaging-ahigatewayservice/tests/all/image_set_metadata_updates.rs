@@ -64,8 +64,11 @@ pub(crate) const SOP_UID: &str = "1.2.840.113619.2.1.1.4";
 /// this one's.
 pub(crate) const STUDY_UID: &str = "1.2.840.113619.2.1.9.1";
 
-/// The `contentType` `GetImageSetMetadata` serves the document with.
-const METADATA_CONTENT_TYPE: &str = "application/json";
+/// The `contentType` `GetImageSetMetadata` serves the document with: the format its
+/// response member documents
+/// (`smithy_query(query="doc",shape="GetImageSetMetadataResponse",member="contentType")`
+/// — "Default is `text/plain`"), which nothing an update writes can move.
+const METADATA_CONTENT_TYPE: &str = "text/plain";
 
 /// The DICOM attributes a seeded image set starts from: every modelled member filled, so
 /// a case can write one, remove one, and still tell what it did not touch.
