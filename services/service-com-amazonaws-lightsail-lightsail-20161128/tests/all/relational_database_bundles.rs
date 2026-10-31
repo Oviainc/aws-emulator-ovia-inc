@@ -60,15 +60,18 @@ const BUNDLE_MEMBERS: &[&str] = &[
 /// One published Lightsail managed-database plan.
 ///
 /// SOURCE: the managed-database plan table of the Lightsail pricing page — a
-/// standard plan at $15 a month with 1 GB RAM, 1 vCPU and 40 GB of SSD storage,
-/// $30 with 2 GB / 1 vCPU / 80 GB, $60 with 4 GB / 2 vCPUs / 120 GB and $115
-/// with 8 GB / 2 vCPUs / 240 GB, 100 GB of included data transfer on the first
-/// three and 200 GB on the 8 GB plan — beside the high-availability column of
-/// the same table, which sells the same hardware with a standby in a second
-/// Availability Zone for twice the standard price. Written out here
-/// independently of the service's own `RELATIONAL_DATABASE_BUNDLE_SPECS`, so
-/// these rows pin the published figures rather than restating whatever the code
-/// happens to hold.
+/// standard plan at $15 a month with 1 GB RAM, 2 vCPUs and 40 GB of SSD storage,
+/// $30 with 2 GB / 2 vCPUs / 80 GB, $60 with 4 GB / 2 vCPUs / 120 GB, $115 with
+/// 8 GB / 2 vCPUs / 240 GB, $230 with 16 GB / 4 vCPUs / 480 GB and $460 with
+/// 32 GB / 8 vCPUs / 960 GB, 100 GB of included data transfer on the three
+/// smallest plans, 200 GB on the 8 GB plan, 300 GB on the 16 GB one and 400 GB
+/// on the largest, the price doubling with the plan above the 8 GB one — beside
+/// the high-availability column of the same table, which sells the same hardware
+/// with a standby in a second Availability Zone for twice the standard price. The plans are the `2_0` generation the service publishes;
+/// the superseded `1_0` generation is retired, so it is not reported unless a
+/// call asks for inactive plans. Written out here independently of the service's
+/// own `RELATIONAL_DATABASE_BUNDLE_SPECS`, so these rows pin the published
+/// figures rather than restating whatever the code happens to hold.
 struct Plan {
     /// The standard (single-database) plan's bundle id.
     bundle_id: &'static str,
@@ -85,30 +88,30 @@ struct Plan {
 
 const PUBLISHED_PLANS: &[Plan] = &[
     Plan {
-        bundle_id: "micro_1_0",
-        ha_bundle_id: "micro_ha_1_0",
+        bundle_id: "micro_2_0",
+        ha_bundle_id: "micro_ha_2_0",
         name: "Micro",
         ha_name: "Micro with High Availability",
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 1.0,
         disk_size_in_gb: 40,
         transfer_per_month_in_gb: 100,
         price: 15.0,
     },
     Plan {
-        bundle_id: "small_1_0",
-        ha_bundle_id: "small_ha_1_0",
+        bundle_id: "small_2_0",
+        ha_bundle_id: "small_ha_2_0",
         name: "Small",
         ha_name: "Small with High Availability",
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 2.0,
         disk_size_in_gb: 80,
         transfer_per_month_in_gb: 100,
         price: 30.0,
     },
     Plan {
-        bundle_id: "medium_1_0",
-        ha_bundle_id: "medium_ha_1_0",
+        bundle_id: "medium_2_0",
+        ha_bundle_id: "medium_ha_2_0",
         name: "Medium",
         ha_name: "Medium with High Availability",
         cpu_count: 2,
@@ -118,8 +121,8 @@ const PUBLISHED_PLANS: &[Plan] = &[
         price: 60.0,
     },
     Plan {
-        bundle_id: "large_1_0",
-        ha_bundle_id: "large_ha_1_0",
+        bundle_id: "large_2_0",
+        ha_bundle_id: "large_ha_2_0",
         name: "Large",
         ha_name: "Large with High Availability",
         cpu_count: 2,
@@ -127,6 +130,28 @@ const PUBLISHED_PLANS: &[Plan] = &[
         disk_size_in_gb: 240,
         transfer_per_month_in_gb: 200,
         price: 115.0,
+    },
+    Plan {
+        bundle_id: "xlarge_2_0",
+        ha_bundle_id: "xlarge_ha_2_0",
+        name: "Xlarge",
+        ha_name: "Xlarge with High Availability",
+        cpu_count: 4,
+        ram_size_in_gb: 16.0,
+        disk_size_in_gb: 480,
+        transfer_per_month_in_gb: 300,
+        price: 230.0,
+    },
+    Plan {
+        bundle_id: "2xlarge_2_0",
+        ha_bundle_id: "2xlarge_ha_2_0",
+        name: "2Xlarge",
+        ha_name: "2Xlarge with High Availability",
+        cpu_count: 8,
+        ram_size_in_gb: 32.0,
+        disk_size_in_gb: 960,
+        transfer_per_month_in_gb: 400,
+        price: 460.0,
     },
 ];
 
@@ -319,7 +344,7 @@ async fn every_published_plan_is_reported_with_its_own_specs_and_price() {
 
     // An id the catalog does not publish resolves to nothing — the lookup answers
     // from the catalog rather than from the shape of what it is asked.
-    for absent in ["micro_2_0", "tiny_1_0", "micro", "MICRO_1_0", "micro_ha", ""] {
+    for absent in ["micro_9_9", "tiny_1_0", "micro", "MICRO_1_0", "micro_ha", ""] {
         assert!(
             relational_database_bundle_spec(absent).is_none(),
             "case {absent:?}: an id the catalog does not publish must not resolve"
@@ -799,10 +824,10 @@ async fn a_page_token_that_names_no_bundle_is_refused() {
     // wrong case, an opaque cursor from elsewhere, and whitespace.
     for token in [
         "tiny_1_0",
-        "micro_2_0",
+        "micro_9_9",
         "micro",
         "micro_ha",
-        "MICRO_1_0",
+        "MICRO_2_0",
         "AAAAAAAA",
         " ",
     ] {

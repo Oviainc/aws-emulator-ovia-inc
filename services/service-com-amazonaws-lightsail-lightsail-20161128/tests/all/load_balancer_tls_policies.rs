@@ -13,10 +13,10 @@
 //! requests rather than one recorded call:
 //!
 //! * every reported policy's members are its catalog entry's — the name, whether
-//!   it is the default, the protocol versions it negotiates and the cipher suites
-//!   it offers in order of preference — and exactly one published policy is the
-//!   default;
-//! * the description is DERIVED from the policy's own protocols and ciphers, so a
+//!   it is the default, the `Protocol-` prefixed protocol versions it enables and
+//!   the cipher suites it offers in order of preference — and exactly one
+//!   published policy is the default;
+//! * the description is DERIVED from the policy's own protocol versions, so a
 //!   policy added to the catalog is described the same way;
 //! * a page is the catalog from the policy `pageToken` names onward, bounded by
 //!   the page size, with `nextPageToken` present only while policies remain — so
@@ -56,39 +56,45 @@ const PAGE_SIZE: usize = state::LOAD_BALANCER_TLS_POLICY_PAGE_SIZE;
 /// spelling. A reported policy carries exactly these and nothing else.
 const POLICY_MEMBERS: &[&str] = &["ciphers", "description", "isDefault", "name", "protocols"];
 
-/// The TLS protocol versions a policy may negotiate, oldest first.
+/// The TLS protocol versions a policy may enable, oldest first.
 ///
-/// SOURCE: the protocol spellings the load-balancing service reports for an SSL
-/// policy, which `LoadBalancerTlsPolicy$protocols` ("The protocols used in a
-/// given TLS security policy") carries.
-const TLS_VERSIONS: &[&str] = &["TLSv1", "TLSv1.1", "TLSv1.2"];
+/// SOURCE: the protocol tokens the recorded `GetLoadBalancerTlsPolicies` answer
+/// reports, which `LoadBalancerTlsPolicy$protocols` ("The protocols used in a
+/// given TLS security policy") carries — the `Protocol-` prefixed form of each
+/// version, in the recorded capitalisation.
+const TLS_VERSIONS: &[&str] = &["Protocol-TLSv1", "Protocol-TLSV1.1", "Protocol-TLSv1.2"];
 
 /// One expected published policy, written out here independently of the
 /// service's own `LOAD_BALANCER_TLS_POLICY_SPECS` so these rows pin the
 /// published data rather than restating whatever the code happens to hold.
 ///
 /// SOURCE: the Lightsail TLS security policies of "Configuring TLS security
-/// policies on your Amazon Lightsail load balancers" in the Developer Guide —
-/// the default `TLS-2016-08` policy and the forward-secrecy (`FS`) policies,
-/// whose names carry the protocol floor (`1-1`, `1-2`), the restricted cipher
-/// set (`Res`) and the policy's date; each is the load-balancing service's own
-/// security policy of that name, whose protocol versions and ordered cipher
-/// suites these rows are. The rows span what the rule generalises over: the
-/// default policy against the forward-secrecy ones, each protocol floor (1.0,
-/// 1.1 and 1.2), and each published cipher set (full, forward secrecy,
-/// restricted, and authenticated-encryption only).
+/// policies on your Amazon Lightsail load balancers" in the Developer Guide, as
+/// the recorded answer reports them — the default `TLS-2016-08` policy and the
+/// restricted forward-secrecy (`FS`) policy, whose name carries the protocol
+/// floor (`1-2`), the restricted cipher set (`Res`) and the policy's date; each
+/// is the load-balancing service's own security policy of that name, whose
+/// protocol versions and ordered cipher suites these rows are. The rows span
+/// what the rules generalise over: the default policy against the
+/// forward-secrecy one, a policy that enables three protocol versions against
+/// one that enables a single version, and each published cipher set (full and
+/// restricted).
 struct Expected {
     name: &'static str,
     is_default: bool,
     protocols: &'static [&'static str],
     ciphers: &'static [&'static str],
+    /// The sentence the policy's description carries: which TLS versions it
+    /// enables.
+    description: &'static str,
 }
 
 const EXPECTED: &[Expected] = &[
     Expected {
         name: "TLS-2016-08",
         is_default: true,
-        protocols: &["TLSv1", "TLSv1.1", "TLSv1.2"],
+        protocols: &["Protocol-TLSv1", "Protocol-TLSV1.1", "Protocol-TLSv1.2"],
+        description: "Enables TLS versions 1, 1.1, and 1.2",
         ciphers: &[
             "ECDHE-ECDSA-AES128-GCM-SHA256",
             "ECDHE-RSA-AES128-GCM-SHA256",
@@ -111,66 +117,10 @@ const EXPECTED: &[Expected] = &[
         ],
     },
     Expected {
-        name: "TLS-FS-2018-06",
-        is_default: false,
-        protocols: &["TLSv1", "TLSv1.1", "TLSv1.2"],
-        ciphers: &[
-            "ECDHE-ECDSA-AES128-GCM-SHA256",
-            "ECDHE-RSA-AES128-GCM-SHA256",
-            "ECDHE-ECDSA-AES128-SHA256",
-            "ECDHE-RSA-AES128-SHA256",
-            "ECDHE-ECDSA-AES128-SHA",
-            "ECDHE-RSA-AES128-SHA",
-            "ECDHE-ECDSA-AES256-GCM-SHA384",
-            "ECDHE-RSA-AES256-GCM-SHA384",
-            "ECDHE-ECDSA-AES256-SHA384",
-            "ECDHE-RSA-AES256-SHA384",
-            "ECDHE-ECDSA-AES256-SHA",
-            "ECDHE-RSA-AES256-SHA",
-        ],
-    },
-    Expected {
-        name: "TLS-FS-1-1-2019-08",
-        is_default: false,
-        protocols: &["TLSv1.1", "TLSv1.2"],
-        ciphers: &[
-            "ECDHE-ECDSA-AES128-GCM-SHA256",
-            "ECDHE-RSA-AES128-GCM-SHA256",
-            "ECDHE-ECDSA-AES128-SHA256",
-            "ECDHE-RSA-AES128-SHA256",
-            "ECDHE-ECDSA-AES128-SHA",
-            "ECDHE-RSA-AES128-SHA",
-            "ECDHE-ECDSA-AES256-GCM-SHA384",
-            "ECDHE-RSA-AES256-GCM-SHA384",
-            "ECDHE-ECDSA-AES256-SHA384",
-            "ECDHE-RSA-AES256-SHA384",
-            "ECDHE-ECDSA-AES256-SHA",
-            "ECDHE-RSA-AES256-SHA",
-        ],
-    },
-    Expected {
-        name: "TLS-FS-1-2-2019-08",
-        is_default: false,
-        protocols: &["TLSv1.2"],
-        ciphers: &[
-            "ECDHE-ECDSA-AES128-GCM-SHA256",
-            "ECDHE-RSA-AES128-GCM-SHA256",
-            "ECDHE-ECDSA-AES128-SHA256",
-            "ECDHE-RSA-AES128-SHA256",
-            "ECDHE-ECDSA-AES128-SHA",
-            "ECDHE-RSA-AES128-SHA",
-            "ECDHE-ECDSA-AES256-GCM-SHA384",
-            "ECDHE-RSA-AES256-GCM-SHA384",
-            "ECDHE-ECDSA-AES256-SHA384",
-            "ECDHE-RSA-AES256-SHA384",
-            "ECDHE-ECDSA-AES256-SHA",
-            "ECDHE-RSA-AES256-SHA",
-        ],
-    },
-    Expected {
         name: "TLS-FS-1-2-Res-2019-08",
         is_default: false,
-        protocols: &["TLSv1.2"],
+        protocols: &["Protocol-TLSv1.2"],
+        description: "Enables only TLS version 1.2",
         ciphers: &[
             "ECDHE-ECDSA-AES128-GCM-SHA256",
             "ECDHE-RSA-AES128-GCM-SHA256",
@@ -180,17 +130,6 @@ const EXPECTED: &[Expected] = &[
             "ECDHE-RSA-AES256-GCM-SHA384",
             "ECDHE-ECDSA-AES256-SHA384",
             "ECDHE-RSA-AES256-SHA384",
-        ],
-    },
-    Expected {
-        name: "TLS-FS-1-2-Res-2020-10",
-        is_default: false,
-        protocols: &["TLSv1.2"],
-        ciphers: &[
-            "ECDHE-ECDSA-AES128-GCM-SHA256",
-            "ECDHE-RSA-AES128-GCM-SHA256",
-            "ECDHE-ECDSA-AES256-GCM-SHA384",
-            "ECDHE-RSA-AES256-GCM-SHA384",
         ],
     },
 ];
@@ -254,15 +193,6 @@ fn policy<'a>(policies: &'a [Value], name: &str) -> &'a Value {
         })
 }
 
-/// Whether every cipher suite of `ciphers` uses an ephemeral key exchange, which
-/// is what makes a policy a forward-secrecy one.
-fn is_forward_secrecy(ciphers: &[&str]) -> bool {
-    !ciphers.is_empty()
-        && ciphers
-            .iter()
-            .all(|cipher| cipher.starts_with("ECDHE-") || cipher.starts_with("DHE-"))
-}
-
 // ---------------------------------------------------------------------------
 // The reported members
 // ---------------------------------------------------------------------------
@@ -311,28 +241,14 @@ async fn every_published_policy_reports_its_own_protocols_and_ciphers() {
             reported["ciphers"]
         );
 
-        // The description states this policy's own properties: the protocol
-        // versions it negotiates, how many suites it offers, and whether all of
-        // them provide forward secrecy.
-        let description = reported["description"].as_str().unwrap_or_default();
-        for protocol in expected.protocols {
-            assert!(
-                description.contains(protocol),
-                "case {case}: expected the description to name {protocol}, got \
-                 {description:?}"
-            );
-        }
-        assert!(
-            description.contains(&expected.ciphers.len().to_string()),
-            "case {case}: expected the description to state the {} cipher suites, got \
-             {description:?}",
-            expected.ciphers.len()
-        );
+        // The description states which TLS versions this policy enables, and
+        // nothing else.
         assert_eq!(
-            description.contains("forward secrecy"),
-            is_forward_secrecy(expected.ciphers),
-            "case {case}: the forward-secrecy clause must follow the policy's own ciphers, got \
-             {description:?}"
+            reported["description"].as_str(),
+            Some(expected.description),
+            "case {case}: expected the description {:?}, got {:?}",
+            expected.description,
+            reported["description"]
         );
 
         // Exactly the modelled members, so nothing is reported that the shape
@@ -442,54 +358,44 @@ async fn the_catalog_has_one_default_and_every_policy_negotiates_tls_1_2() {
     }
 }
 
-/// The description is DERIVED from the policy's own protocols and ciphers: the
-/// rows differ along how many protocol versions it negotiates (none, one, two,
-/// three), how many cipher suites it offers (none, one, several) and whether all
-/// of them use an ephemeral key exchange.
+/// The description is DERIVED from the policy's own protocol versions: the rows
+/// differ along how many versions the policy enables (none, one, two, three) and
+/// which, so the English list, the singular "only" form and the serial comma are
+/// each exercised. The version is read out of the `Protocol-` prefixed token,
+/// whichever capitalisation it carries.
 #[test]
-fn the_description_states_the_policys_protocols_and_cipher_count() {
-    let rows: &[(&str, &[&str], &[&str], &str)] = &[
+fn the_description_states_the_tls_versions_the_policy_enables() {
+    let rows: &[(&str, &[&str], &str)] = &[
         (
-            "three protocol versions and a mixed cipher set",
-            &["TLSv1", "TLSv1.1", "TLSv1.2"],
-            &["ECDHE-RSA-AES128-GCM-SHA256", "AES128-SHA"],
-            "Negotiates TLSv1, TLSv1.1 and TLSv1.2 with 2 cipher suites",
+            "the three versions of the default policy",
+            &["Protocol-TLSv1", "Protocol-TLSV1.1", "Protocol-TLSv1.2"],
+            "Enables TLS versions 1, 1.1, and 1.2",
         ),
         (
-            "two protocol versions, every cipher ephemeral",
-            &["TLSv1.1", "TLSv1.2"],
-            &["ECDHE-RSA-AES128-GCM-SHA256", "DHE-RSA-AES128-GCM-SHA256"],
-            "Negotiates TLSv1.1 and TLSv1.2 with 2 cipher suites, every one of which provides \
-             forward secrecy",
+            "a floor of TLS 1.1",
+            &["Protocol-TLSV1.1", "Protocol-TLSv1.2"],
+            "Enables TLS versions 1.1 and 1.2",
         ),
         (
-            "one protocol version and one ephemeral cipher",
-            &["TLSv1.2"],
-            &["ECDHE-RSA-AES256-GCM-SHA384"],
-            "Negotiates TLSv1.2 with 1 cipher suite, every one of which provides forward secrecy",
+            "TLS 1.2 only",
+            &["Protocol-TLSv1.2"],
+            "Enables only TLS version 1.2",
         ),
         (
-            "one protocol version and one static-RSA cipher",
-            &["TLSv1.2"],
-            &["AES256-GCM-SHA384"],
-            "Negotiates TLSv1.2 with 1 cipher suite",
+            "a single older version",
+            &["Protocol-TLSv1"],
+            "Enables only TLS version 1",
         ),
         (
-            "no cipher suite at all",
-            &["TLSv1.2"],
-            &[],
-            "Negotiates TLSv1.2 with 0 cipher suites",
+            "a version beyond the published ones",
+            &["Protocol-TLSv1.2", "Protocol-TLSv1.3"],
+            "Enables TLS versions 1.2 and 1.3",
         ),
-        (
-            "no protocol version at all",
-            &[],
-            &[],
-            "Negotiates no TLS protocol version with 0 cipher suites",
-        ),
+        ("no protocol version at all", &[], "Enables no TLS version"),
     ];
 
-    for (case, protocols, ciphers, expected) in rows {
-        let described = state::load_balancer_tls_policy_description(protocols, ciphers);
+    for (case, protocols, expected) in rows {
+        let described = state::load_balancer_tls_policy_description(protocols);
         assert_eq!(
             described, *expected,
             "case {case}: expected {expected:?}, got {described:?}"
@@ -576,11 +482,11 @@ async fn a_page_token_that_names_no_published_policy_is_refused() {
     }
 
     // A token that IS a published name opens a page at it.
-    let (resumed, _) = page(&emulator, json!({"pageToken": "TLS-FS-1-2-Res-2020-10"})).await;
+    let (resumed, _) = page(&emulator, json!({"pageToken": "TLS-FS-1-2-Res-2019-08"})).await;
     assert_eq!(
         names(&resumed).first().map(String::as_str),
-        Some("TLS-FS-1-2-Res-2020-10"),
-        "case pageToken TLS-FS-1-2-Res-2020-10: expected the page to open at it, got {resumed:?}"
+        Some("TLS-FS-1-2-Res-2019-08"),
+        "case pageToken TLS-FS-1-2-Res-2019-08: expected the page to open at it, got {resumed:?}"
     );
 }
 
@@ -664,7 +570,7 @@ fn a_paged_walk_reports_every_policy_once_at_any_page_size() {
     let synthetic = state::load_balancer_tls_policies_from(&state::LOAD_BALANCER_TLS_POLICY_SPECS
         [..1]);
     assert!(
-        state::load_balancer_tls_policy_page(&synthetic, 2, Some("TLS-FS-1-2-Res-2020-10"))
+        state::load_balancer_tls_policy_page(&synthetic, 2, Some("TLS-FS-1-2-Res-2019-08"))
             .is_none(),
         "case a one-entry catalog: a name outside it opens no page"
     );
@@ -734,7 +640,7 @@ async fn reporting_the_catalog_changes_nothing_a_later_caller_sees() {
     let requests = [
         json!({}),
         json!({"pageToken": ""}),
-        json!({"pageToken": "TLS-FS-1-2-Res-2020-10"}),
+        json!({"pageToken": "TLS-FS-1-2-Res-2019-08"}),
     ];
 
     let mut first = Vec::new();

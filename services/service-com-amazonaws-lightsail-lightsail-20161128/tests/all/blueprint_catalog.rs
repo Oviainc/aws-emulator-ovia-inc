@@ -10,15 +10,17 @@
 //! The rules under test, asserted over the WHOLE catalog and over sets of
 //! requests rather than one recorded call:
 //!
-//! * every reported blueprint's members are DERIVED from its catalog entry: the
-//!   friendly `name` is the id title-cased (the derivation
-//!   `Instance$blueprintName` reports, so an instance created from the blueprint
-//!   carries the same name), `group` is the id's family — the id with its version
-//!   words removed and underscores written as hyphens, as `Blueprint$group`'s own
-//!   `amazon-linux` example shows — `version` is the id's version words joined
-//!   with dots (absent when the id names none), `platform` is `WINDOWS` for
-//!   exactly the Windows images and `LINUX_UNIX` otherwise, and `minPower` is 0,
-//!   "the blueprint runs on all instance sizes";
+//! * every reported blueprint's members are its catalog entry's: the friendly
+//!   `name` is the id title-cased (the derivation `Instance$blueprintName`
+//!   reports, so an instance created from the blueprint carries the same name),
+//!   `group` is the family name the catalog publishes for the entry, `version` is
+//!   the id's version words joined with dots (absent when the id names none),
+//!   `platform` is `WINDOWS` for exactly the Windows images and `LINUX_UNIX`
+//!   otherwise, `minPower` is the power of the smallest plan the image runs on
+//!   (the `micro` plan's for a Windows image, 0 — "the blueprint runs on all
+//!   instance sizes" — for the others), `versionCode` is the published revision
+//!   of the image, and a vendor link the catalog publishes is reported as an
+//!   absolute `https` URL;
 //! * `includeInactive` is what widens the answer from the active entries to every
 //!   published one, and an absent flag reports the active ones only;
 //! * `appCategory` selects the catalog: a request naming a category reports the
@@ -67,10 +69,11 @@ const PLATFORMS: &[&str] = &["LINUX_UNIX", "WINDOWS"];
 ///
 /// Source: the blueprint ids this service publishes (`state::BLUEPRINTS`, whose
 /// own source is the Lightsail instance-image list), chosen to span the class the
-/// derivations generalise over: an operating system and an application stack, a
-/// Windows image and Linux/Unix ones, an id whose version is one word, two words
-/// and three, an id carrying no version at all, and a retired (inactive) entry.
-/// None of these entries is one the issue cited.
+/// rules generalise over: an operating system and an application stack, Windows
+/// images and Linux/Unix ones, an id whose version is one word, two words and
+/// three, an id carrying no version at all, a retired (inactive) entry, and both
+/// an entry whose vendor publishes product and licence links and entries that
+/// publish neither.
 struct Expected {
     blueprint_id: &'static str,
     blueprint_type: &'static str,
@@ -81,9 +84,29 @@ struct Expected {
     version: Option<&'static str>,
     platform: &'static str,
     is_active: bool,
+    /// `Blueprint$minPower`: the power of the smallest instance plan the image
+    /// runs on.
+    min_power: i64,
+    /// Whether the catalog publishes this image's vendor product page, and
+    /// whether it publishes the licence terms the vendor sets for it — which the
+    /// recorded Windows entries carry both of.
+    publishes_product_url: bool,
+    publishes_license_url: bool,
 }
 
 const EXPECTED: &[Expected] = &[
+    Expected {
+        blueprint_id: "windows_server_2025",
+        blueprint_type: "os",
+        name: "Windows Server 2025",
+        group: "windows_2025",
+        version: Some("2025"),
+        platform: "WINDOWS",
+        is_active: true,
+        min_power: 500,
+        publishes_product_url: true,
+        publishes_license_url: true,
+    },
     Expected {
         blueprint_id: "amazon_linux_2023",
         blueprint_type: "os",
@@ -92,6 +115,9 @@ const EXPECTED: &[Expected] = &[
         version: Some("2023"),
         platform: "LINUX_UNIX",
         is_active: true,
+        min_power: 0,
+        publishes_product_url: true,
+        publishes_license_url: false,
     },
     Expected {
         blueprint_id: "centos_stream_9",
@@ -101,6 +127,9 @@ const EXPECTED: &[Expected] = &[
         version: Some("9"),
         platform: "LINUX_UNIX",
         is_active: true,
+        min_power: 0,
+        publishes_product_url: true,
+        publishes_license_url: false,
     },
     Expected {
         blueprint_id: "ubuntu_22_04",
@@ -110,6 +139,9 @@ const EXPECTED: &[Expected] = &[
         version: Some("22.04"),
         platform: "LINUX_UNIX",
         is_active: true,
+        min_power: 0,
+        publishes_product_url: true,
+        publishes_license_url: false,
     },
     Expected {
         blueprint_id: "ubuntu_18_04",
@@ -119,6 +151,9 @@ const EXPECTED: &[Expected] = &[
         version: Some("18.04"),
         platform: "LINUX_UNIX",
         is_active: false,
+        min_power: 0,
+        publishes_product_url: true,
+        publishes_license_url: false,
     },
     Expected {
         blueprint_id: "debian_10",
@@ -128,15 +163,21 @@ const EXPECTED: &[Expected] = &[
         version: Some("10"),
         platform: "LINUX_UNIX",
         is_active: false,
+        min_power: 0,
+        publishes_product_url: true,
+        publishes_license_url: false,
     },
     Expected {
         blueprint_id: "windows_server_2019",
         blueprint_type: "os",
         name: "Windows Server 2019",
-        group: "windows-server",
+        group: "windows_2019",
         version: Some("2019"),
         platform: "WINDOWS",
         is_active: true,
+        min_power: 500,
+        publishes_product_url: true,
+        publishes_license_url: true,
     },
     Expected {
         blueprint_id: "wordpress",
@@ -146,6 +187,9 @@ const EXPECTED: &[Expected] = &[
         version: None,
         platform: "LINUX_UNIX",
         is_active: true,
+        min_power: 0,
+        publishes_product_url: true,
+        publishes_license_url: true,
     },
     Expected {
         blueprint_id: "lamp_8_bitnami",
@@ -155,6 +199,9 @@ const EXPECTED: &[Expected] = &[
         version: Some("8"),
         platform: "LINUX_UNIX",
         is_active: true,
+        min_power: 0,
+        publishes_product_url: true,
+        publishes_license_url: true,
     },
     Expected {
         blueprint_id: "plesk_ubuntu_18_0_35",
@@ -164,6 +211,9 @@ const EXPECTED: &[Expected] = &[
         version: Some("18.0.35"),
         platform: "LINUX_UNIX",
         is_active: true,
+        min_power: 0,
+        publishes_product_url: true,
+        publishes_license_url: true,
     },
     Expected {
         blueprint_id: "cpanel_whm_almalinux",
@@ -173,6 +223,9 @@ const EXPECTED: &[Expected] = &[
         version: None,
         platform: "LINUX_UNIX",
         is_active: true,
+        min_power: 0,
+        publishes_product_url: true,
+        publishes_license_url: true,
     },
 ];
 
@@ -184,15 +237,6 @@ const EXPECTED: &[Expected] = &[
 /// digit.
 fn is_version_word(word: &str) -> bool {
     word.starts_with(|first: char| first.is_ascii_digit())
-}
-
-/// The family of a blueprint id: its non-version words, hyphen-joined.
-fn want_group(blueprint_id: &str) -> String {
-    blueprint_id
-        .split('_')
-        .filter(|word| !word.is_empty() && !is_version_word(word))
-        .collect::<Vec<_>>()
-        .join("-")
 }
 
 /// The version a blueprint id names: its version words, dot-joined, or `None`.
@@ -227,6 +271,23 @@ fn want_platform(blueprint_id: &str) -> &'static str {
         "WINDOWS"
     } else {
         "LINUX_UNIX"
+    }
+}
+
+/// The minimum bundle power an image of `platform` requires: a Windows image
+/// does not run on the smallest plan, so its floor is the power of the `micro`
+/// plan; every other published image runs on all sizes, which 0 states.
+fn want_min_power(platform: &str) -> i64 {
+    if platform == "WINDOWS" {
+        i64::from(
+            state::BUNDLE_SPECS
+                .iter()
+                .find(|spec| spec.size == "micro")
+                .expect("the published plan catalog carries the micro plan")
+                .power,
+        )
+    } else {
+        0
     }
 }
 
@@ -331,10 +392,9 @@ async fn every_reported_blueprint_derives_its_members_from_its_catalog_entry() {
             want_name(&case),
             "case {case:?}: name must be the id title-cased, got {blueprint:?}"
         );
-        assert_eq!(
-            member(blueprint, "group"),
-            want_group(&case),
-            "case {case:?}: group must be the id's family, got {blueprint:?}"
+        assert!(
+            !member(blueprint, "group").is_empty(),
+            "case {case:?}: group must name the entry's published family, got {blueprint:?}"
         );
         assert_eq!(
             blueprint["version"].as_str().map(str::to_string),
@@ -361,9 +421,9 @@ async fn every_reported_blueprint_derives_its_members_from_its_catalog_entry() {
         );
         assert_eq!(
             blueprint["minPower"],
-            json!(0),
-            "case {case:?}: every published blueprint runs on all instance sizes, which \
-             minPower 0 states, got {blueprint:?}"
+            json!(want_min_power(&platform)),
+            "case {case:?}: minPower must be the power of the smallest plan the image runs \
+             on, got {blueprint:?}"
         );
 
         // The description is derived from the entry's own name and type, so it
@@ -383,16 +443,26 @@ async fn every_reported_blueprint_derives_its_members_from_its_catalog_entry() {
             "case {case:?}: expected a {expected_kind} description, got {description:?}"
         );
 
-        // Lightsail's per-image revision code and its product and licence links
-        // are not data this catalog publishes, and all three members are
-        // optional: they must be ABSENT rather than invented.
-        for absent in ["versionCode", "productUrl", "licenseUrl", "appCategory"] {
-            assert!(
-                blueprint[absent].is_null(),
-                "case {case:?}: {absent} is not published by this catalog, so it must be \
-                 absent, got {blueprint:?}"
-            );
+        // The image's published revision is reported, and a vendor link the
+        // catalog publishes is an absolute `https` URL. `appCategory` belongs to
+        // the Research catalog alone, so this listing reports none.
+        assert!(
+            !member(blueprint, "versionCode").is_empty(),
+            "case {case:?}: expected the published versionCode, got {blueprint:?}"
+        );
+        for link in ["productUrl", "licenseUrl"] {
+            if let Some(url) = blueprint[link].as_str() {
+                assert!(
+                    url.starts_with("https://"),
+                    "case {case:?}: {link} must be an absolute https URL, got {url:?}"
+                );
+            }
         }
+        assert!(
+            blueprint["appCategory"].is_null(),
+            "case {case:?}: appCategory is the Research catalog's, so it must be absent, \
+             got {blueprint:?}"
+        );
     }
 }
 
@@ -441,6 +511,21 @@ async fn the_published_sample_entries_report_their_expected_members() {
             json!(want.is_active),
             "case {case:?}: wrong isActive, got {found:?}"
         );
+        assert_eq!(
+            found["minPower"],
+            json!(want.min_power),
+            "case {case:?}: wrong minPower, got {found:?}"
+        );
+        for (link, published) in [
+            ("productUrl", want.publishes_product_url),
+            ("licenseUrl", want.publishes_license_url),
+        ] {
+            assert_eq!(
+                found[link].is_string(),
+                published,
+                "case {case:?}: wrong {link} publication, got {found:?}"
+            );
+        }
     }
 }
 
@@ -729,28 +814,43 @@ async fn a_page_token_that_names_no_reported_blueprint_is_refused() {
 const SYNTHETIC: &[state::BlueprintSpec] = &[
     state::BlueprintSpec {
         blueprint_id: "synthetic_os_1",
+        group: "synthetic-os",
         blueprint_type: state::BLUEPRINT_TYPE_OS,
         is_active: true,
+        product_url: "",
+        license_url: "",
     },
     state::BlueprintSpec {
         blueprint_id: "synthetic_os_2",
+        group: "synthetic-os",
         blueprint_type: state::BLUEPRINT_TYPE_OS,
         is_active: false,
+        product_url: "",
+        license_url: "",
     },
     state::BlueprintSpec {
         blueprint_id: "synthetic_app",
+        group: "synthetic-app",
         blueprint_type: state::BLUEPRINT_TYPE_APP,
         is_active: true,
+        product_url: "https://example.invalid/synthetic",
+        license_url: "https://example.invalid/synthetic/licence",
     },
     state::BlueprintSpec {
         blueprint_id: "windows_synthetic_2030",
+        group: "windows_2030",
         blueprint_type: state::BLUEPRINT_TYPE_OS,
         is_active: true,
+        product_url: "",
+        license_url: "",
     },
     state::BlueprintSpec {
         blueprint_id: "synthetic_retired_3",
+        group: "synthetic-retired",
         blueprint_type: state::BLUEPRINT_TYPE_APP,
         is_active: false,
+        product_url: "",
+        license_url: "",
     },
 ];
 

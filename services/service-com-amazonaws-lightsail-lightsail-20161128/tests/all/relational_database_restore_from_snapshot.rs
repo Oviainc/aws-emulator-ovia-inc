@@ -248,7 +248,7 @@ fn rows() -> Vec<Row> {
             case: "mysql, nothing optional at all: the source's own plan and an unsigned call",
             source_name: "src-mysql",
             source_blueprint_id: "mysql_8_4",
-            source_bundle_id: "micro_1_0",
+            source_bundle_id: "micro_2_0",
             master_database_name: "appdb",
             master_username: "dbadmin",
             region: None,
@@ -260,13 +260,13 @@ fn rows() -> Vec<Row> {
             publicly_accessible: None,
             tags: &[],
             reported_region: DEFAULT_REGION,
-            want_bundle_id: "micro_1_0",
+            want_bundle_id: "micro_2_0",
         },
         Row {
             case: "postgres 13, restored onto a larger plan in a named zone, public, two tags",
             source_name: "src-postgres",
             source_blueprint_id: "postgres_13",
-            source_bundle_id: "micro_1_0",
+            source_bundle_id: "micro_2_0",
             master_database_name: "orders",
             master_username: "orders_admin",
             region: Some("us-west-2"),
@@ -274,18 +274,18 @@ fn rows() -> Vec<Row> {
             snapshot_name: "src-postgres-snap",
             restored_name: "restored_postgres",
             restore_zone: Some("us-west-2c"),
-            restore_bundle_id: Some("large_1_0"),
+            restore_bundle_id: Some("large_2_0"),
             publicly_accessible: Some(true),
             tags: &[("stage", Some("prod")), ("owner", Some("platform"))],
             reported_region: "us-west-2",
-            want_bundle_id: "large_1_0",
+            want_bundle_id: "large_2_0",
         },
         Row {
             case: "mysql restored onto the high-availability twin of the source's plan: a standby \
                    zone appears",
             source_name: "src-ha-target",
             source_blueprint_id: "mysql_8_4",
-            source_bundle_id: "small_1_0",
+            source_bundle_id: "small_2_0",
             master_database_name: "billing",
             master_username: "billing_rw",
             region: Some("eu-west-1"),
@@ -293,20 +293,20 @@ fn rows() -> Vec<Row> {
             snapshot_name: "src-ha-target-snap",
             restored_name: "restored-ha",
             restore_zone: Some("eu-west-1b"),
-            // Same hardware as `small_1_0`, with a standby: not a SMALLER
+            // Same hardware as `small_2_0`, with a standby: not a SMALLER
             // bundle, so the restore is legal.
-            restore_bundle_id: Some("small_ha_1_0"),
+            restore_bundle_id: Some("small_ha_2_0"),
             publicly_accessible: Some(false),
             tags: &[("key-only", None)],
             reported_region: "eu-west-1",
-            want_bundle_id: "small_ha_1_0",
+            want_bundle_id: "small_ha_2_0",
         },
         Row {
             case: "postgres 17 on a high-availability source restored onto the standard plan of \
                    the same size, zone picked by the service",
             source_name: "src-ha-source",
             source_blueprint_id: "postgres_17",
-            source_bundle_id: "medium_ha_1_0",
+            source_bundle_id: "medium_ha_2_0",
             master_database_name: "analytics_2",
             master_username: "analyst",
             region: Some("ap-northeast-1"),
@@ -314,13 +314,13 @@ fn rows() -> Vec<Row> {
             snapshot_name: "src-ha-source-snap",
             restored_name: "restored-standard",
             restore_zone: None,
-            // Same hardware as `medium_ha_1_0` without the standby: again not
+            // Same hardware as `medium_ha_2_0` without the standby: again not
             // smaller, so dropping high availability on a restore is legal.
-            restore_bundle_id: Some("medium_1_0"),
+            restore_bundle_id: Some("medium_2_0"),
             publicly_accessible: Some(true),
             tags: &[("app", Some("reports"))],
             reported_region: "ap-northeast-1",
-            want_bundle_id: "medium_1_0",
+            want_bundle_id: "medium_2_0",
         },
     ]
 }

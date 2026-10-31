@@ -96,7 +96,7 @@ const ROWS: &[Row] = &[
             usage_type: "BundleUsage:nano_3_0",
             pricing_unit: "Bundles",
             unit: 1.0,
-            cost: 3.5,
+            cost: 5.0,
         }],
     },
     Row {
@@ -107,7 +107,7 @@ const ROWS: &[Row] = &[
             usage_type: "BundleUsage:nano_win_3_0",
             pricing_unit: "Bundles",
             unit: 1.0,
-            cost: 8.0,
+            cost: 9.5,
         }],
     },
     Row {
@@ -516,9 +516,9 @@ async fn the_estimate_scales_with_the_length_of_the_window() {
         )
         .await;
 
-    // SOURCE: the Lightsail price list — the small Linux/Unix instance plan is $10
+    // SOURCE: the Lightsail price list — the small Linux/Unix instance plan is $12
     // a month, and block storage is $0.10 per GB-month.
-    let plan_usd_per_month = 10.0;
+    let plan_usd_per_month = 12.0;
     let disk_usd_per_gb_month = 0.10;
     let disk_gigabytes = 8.0;
 
@@ -593,8 +593,8 @@ async fn only_the_hours_the_resource_has_existed_for_are_billed() {
         .as_f64()
         .expect("a created instance reports when it was created");
 
-    // SOURCE: the Lightsail price list — the nano Linux/Unix plan is $3.50 a month.
-    let plan_usd_per_month = 3.5;
+    // SOURCE: the Lightsail price list — the nano Linux/Unix plan is $5 a month.
+    let plan_usd_per_month = 5.0;
     let hour = 3_600.0;
 
     // (case, window start, window end, the hours of it that are billable)

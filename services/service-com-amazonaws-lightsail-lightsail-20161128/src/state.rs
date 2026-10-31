@@ -1243,50 +1243,52 @@ pub struct BundleSpec {
 /// Every instance plan size this service serves, smallest first.
 ///
 /// SOURCE: the Lightsail instance-plan table (the "Instances" plans of the
-/// Lightsail pricing page, which `GetBundles` answers from) — each step doubles
-/// RAM while the vCPU count, SSD size and monthly data transfer follow the plan
-/// table, the Linux/Unix monthly price doubles with the plan from the $5 micro
-/// plan up, and the Windows price of the same size adds that platform's licence.
-/// The `power` values are the ones Lightsail publishes for its plans: they rise
-/// with the plan, from 300 for the smallest through 500 for `micro` (the value
-/// the modelled `Blueprint$minPower` documentation's own example names) and then
-/// a further 1000 per doubling step.
+/// Lightsail pricing page, which `GetBundles` answers from), at the generation
+/// [`BUNDLE_GENERATION`] publishes. Each step doubles RAM while the SSD size and
+/// the monthly data transfer follow the plan table; every plan up to and
+/// including the 8 GB one carries two vCPUs, after which the vCPU count doubles
+/// with the plan; the Linux/Unix monthly price is the plan table's, and the
+/// Windows plan of the same size costs more because it carries that platform's
+/// licence. The `power` values are the ones Lightsail publishes for its plans:
+/// 298 for the smallest, 500 for `micro` (the value the modelled
+/// `Blueprint$minPower` documentation's own example names) and then a further
+/// 1000 per doubling step.
 ///
 /// Lightsail has retired none of these sizes, so every entry is active.
 pub const BUNDLE_SPECS: &[BundleSpec] = &[
     BundleSpec {
         size: "nano",
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 0.5,
         disk_size_in_gb: 20,
         transfer_gb_per_month: 1_024,
-        power: 300,
-        price_usd_per_month: 3.5,
-        windows_price_usd_per_month: 8.0,
+        power: 298,
+        price_usd_per_month: 5.0,
+        windows_price_usd_per_month: 9.5,
         is_active: true,
         app_categories: &[],
     },
     BundleSpec {
         size: "micro",
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 1.0,
         disk_size_in_gb: 40,
         transfer_gb_per_month: 2_048,
         power: 500,
-        price_usd_per_month: 5.0,
-        windows_price_usd_per_month: 12.0,
+        price_usd_per_month: 7.0,
+        windows_price_usd_per_month: 16.0,
         is_active: true,
         app_categories: &[],
     },
     BundleSpec {
         size: "small",
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 2.0,
         disk_size_in_gb: 60,
         transfer_gb_per_month: 3_072,
         power: 1_000,
-        price_usd_per_month: 10.0,
-        windows_price_usd_per_month: 20.0,
+        price_usd_per_month: 12.0,
+        windows_price_usd_per_month: 26.0,
         is_active: true,
         app_categories: &[],
     },
@@ -1297,8 +1299,8 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         disk_size_in_gb: 80,
         transfer_gb_per_month: 4_096,
         power: 2_000,
-        price_usd_per_month: 20.0,
-        windows_price_usd_per_month: 40.0,
+        price_usd_per_month: 24.0,
+        windows_price_usd_per_month: 46.0,
         is_active: true,
         app_categories: &[],
     },
@@ -1309,8 +1311,8 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         disk_size_in_gb: 160,
         transfer_gb_per_month: 5_120,
         power: 3_000,
-        price_usd_per_month: 40.0,
-        windows_price_usd_per_month: 70.0,
+        price_usd_per_month: 44.0,
+        windows_price_usd_per_month: 86.0,
         is_active: true,
         app_categories: &[],
     },
@@ -1321,8 +1323,8 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         disk_size_in_gb: 320,
         transfer_gb_per_month: 6_144,
         power: 4_000,
-        price_usd_per_month: 80.0,
-        windows_price_usd_per_month: 120.0,
+        price_usd_per_month: 84.0,
+        windows_price_usd_per_month: 166.0,
         is_active: true,
         app_categories: &[],
     },
@@ -1333,8 +1335,8 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         disk_size_in_gb: 640,
         transfer_gb_per_month: 7_168,
         power: 5_000,
-        price_usd_per_month: 160.0,
-        windows_price_usd_per_month: 240.0,
+        price_usd_per_month: 164.0,
+        windows_price_usd_per_month: 326.0,
         is_active: true,
         app_categories: &[],
     },
@@ -1345,8 +1347,8 @@ pub const BUNDLE_SPECS: &[BundleSpec] = &[
         disk_size_in_gb: 1_280,
         transfer_gb_per_month: 8_192,
         power: 6_000,
-        price_usd_per_month: 320.0,
-        windows_price_usd_per_month: 480.0,
+        price_usd_per_month: 324.0,
+        windows_price_usd_per_month: 646.0,
         is_active: true,
         app_categories: &[],
     },
@@ -1426,17 +1428,20 @@ pub fn bundle_id(size: &str, platform: &str, generation: &str) -> String {
 /// the bundle (`Micro`)".
 ///
 /// DERIVED from the size token, as that documented example shows (`micro` ->
-/// `Micro`): the token title-cased, with an `xlarge` token written `XLarge`
-/// because its leading `x` abbreviates "extra" rather than starting a word
-/// (`2xlarge` -> `2XLarge`).
+/// `Micro`): the token with its first LETTER upper-cased, so a size token that
+/// opens with a multiplier capitalises the letter after it (`2xlarge` ->
+/// `2Xlarge`) — the form the recorded plan names carry.
 pub fn bundle_size_name(size: &str) -> String {
-    if let Some(multiplier) = size.strip_suffix("xlarge") {
-        return format!("{multiplier}XLarge");
-    }
-    let mut chars = size.chars();
+    let Some(first_letter) = size.find(char::is_alphabetic) else {
+        return size.to_string();
+    };
+    let (multiplier, word) = size.split_at(first_letter);
+    let mut chars = word.chars();
     match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => String::new(),
+        Some(first) => {
+            multiplier.to_string() + &first.to_uppercase().collect::<String>() + chars.as_str()
+        }
+        None => multiplier.to_string(),
     }
 }
 
@@ -1515,15 +1520,21 @@ pub fn bundle_catalog(app_category: Option<&str>) -> &'static [BundleSpec] {
 /// Every member of a reported bundle is the entry's own — the request selects the
 /// catalog and the slice, and nothing it carries is reported back as plan data.
 ///
-/// The order is `specs`' own, each size's platforms in [`BUNDLE_PLATFORMS`]'
-/// order, so two reads answer identically. Taking the catalog as an argument is
-/// what lets the slice rule be exercised against a catalog that holds a retired
-/// plan, which the published one does not.
+/// The order is by PLATFORM first — every plan of a platform in
+/// [`BUNDLE_PLATFORMS`]' order, each platform's plans in `specs`' own order — so
+/// the Linux/Unix plans of every size precede the Windows ones, which is the
+/// order the catalog is published in. Two reads answer identically. Taking the
+/// catalog as an argument is what lets the slice rule be exercised against a
+/// catalog that holds a retired plan, which the published one does not.
 pub fn bundles_from(specs: &[BundleSpec], include_inactive: bool) -> Vec<Bundle> {
-    specs
+    BUNDLE_PLATFORMS
         .iter()
-        .filter(|spec| include_inactive || spec.is_active)
-        .flat_map(|spec| BUNDLE_PLATFORMS.iter().map(|platform| spec.view(platform)))
+        .flat_map(|platform| {
+            specs
+                .iter()
+                .filter(|spec| include_inactive || spec.is_active)
+                .map(|spec| spec.view(platform))
+        })
         .collect()
 }
 
@@ -2374,6 +2385,14 @@ pub struct BlueprintSpec {
     /// `Blueprint$blueprintId`: the id a `CreateInstances` request names
     /// (`amazon_linux_2023`, `wordpress`).
     pub blueprint_id: &'static str,
+    /// `Blueprint$group` — "The group name of the blueprint (`amazon-linux`)".
+    ///
+    /// The group is PUBLISHED per entry rather than derived from the id: the
+    /// catalog groups an image family under the name the service gives that
+    /// family, which is not always the id's own words — the recorded
+    /// `windows_server_2025` entry is grouped `windows_2025`, where its family
+    /// carries the release and drops the `server` word.
+    pub group: &'static str,
     /// `Blueprint$type`, one of the modelled `BlueprintType` enum's two values
     /// (`smithy_query(query="shape",shape="BlueprintType")`): `os` for an
     /// operating-system image, `app` for an application stack.
@@ -2384,6 +2403,14 @@ pub struct BlueprintSpec {
     /// `CreateInstances$blueprintId` says "Use active blueprints when creating
     /// new instances", so only an active entry can be created from.
     pub is_active: bool,
+    /// `Blueprint$productUrl` — "The product URL to learn more about the image
+    /// or blueprint", the page the image's VENDOR publishes about it, or empty
+    /// where the catalog publishes none and the member is reported absent.
+    pub product_url: &'static str,
+    /// `Blueprint$licenseUrl` — "The end-user license agreement URL for the
+    /// image or blueprint", the licence terms that vendor publishes, or empty
+    /// where the catalog publishes none and the member is reported absent.
+    pub license_url: &'static str,
 }
 
 /// One value of the modelled `BlueprintType` enum: an operating-system image.
@@ -2392,177 +2419,327 @@ pub const BLUEPRINT_TYPE_OS: &str = "os";
 /// One value of the modelled `BlueprintType` enum: an application stack.
 pub const BLUEPRINT_TYPE_APP: &str = "app";
 
+/// The pages Microsoft publishes about Windows Server and about the licence
+/// terms its images are offered under — `Blueprint$productUrl` and
+/// `Blueprint$licenseUrl` of every Windows entry of [`BLUEPRINTS`], which the
+/// recorded answer reports both of.
+const WINDOWS_SERVER_PRODUCT_URL: &str = "https://www.microsoft.com/en-us/windows-server";
+/// See [`WINDOWS_SERVER_PRODUCT_URL`].
+const WINDOWS_SERVER_LICENSE_URL: &str =
+    "https://www.microsoft.com/licensing/docs/view/Product-Terms";
+
+/// The licence agreement Bitnami publishes for the application stacks it
+/// packages — `Blueprint$licenseUrl` of every Bitnami-packaged entry of
+/// [`BLUEPRINTS`].
+const BITNAMI_LICENSE_URL: &str = "https://bitnami.com/agreement";
+
+/// `Blueprint$versionCode` — "The version code" — of every entry of
+/// [`BLUEPRINTS`]: Lightsail's own revision counter for the image it publishes
+/// at that version, which starts at the first revision and is the value the
+/// recorded entries carry.
+pub const BLUEPRINT_VERSION_CODE: &str = "1";
+
+/// `Blueprint$minPower` of a Windows image — "The minimum bundle power required
+/// to run this blueprint".
+///
+/// A Windows image does not run on the smallest instance plan, so its floor is
+/// the next plan's power: the `micro` plan's [`BundleSpec::power`], which is the
+/// value the recorded Windows entries report. A Linux/Unix image this catalog
+/// publishes runs on every plan, which `0` states — "`0` indicates that the
+/// blueprint runs on all instance sizes".
+pub const WINDOWS_BLUEPRINT_MIN_POWER: i32 = 500;
+
+/// `Blueprint$minPower` of an image that runs on every plan this service
+/// publishes. See [`WINDOWS_BLUEPRINT_MIN_POWER`].
+pub const BLUEPRINT_MIN_POWER_ANY_SIZE: i32 = 0;
+
 /// The instance blueprints this service publishes — the catalog `GetBlueprints`
 /// reports and `CreateInstances` resolves `blueprintId` against.
 ///
 /// SOURCE: the blueprint ids Lightsail's instance-image list publishes (the
 /// Lightsail console's "Select a blueprint" catalog, which `GetBlueprints`
-/// answers from): the operating-system families `amazon_linux`, `ubuntu`,
-/// `debian`, `almalinux`, `centos_stream`, `freebsd`, `opensuse` and
-/// `windows_server`, each at the releases Lightsail offers, plus the
+/// answers from): the operating-system families `windows_server`,
+/// `amazon_linux`, `ubuntu`, `debian`, `almalinux`, `centos_stream`, `freebsd`
+/// and `opensuse`, each at the releases Lightsail offers, plus the
 /// Bitnami-packaged and hosting-panel application stacks. An entry whose
 /// upstream release has reached end of life stays in the catalog but is marked
 /// inactive, which is the state Lightsail keeps a retired image in so existing
 /// instances still resolve it while a new instance cannot be launched from it.
+///
+/// The ORDER is the catalog's published one, which `GetBlueprints` walks: the
+/// Windows images first, newest release first, then the Linux/Unix operating
+/// systems and last the application stacks — the order the recorded answer
+/// reports, whose first two entries are `windows_server_2025` and
+/// `windows_server_2022`.
 pub const BLUEPRINTS: &[BlueprintSpec] = &[
-    // Operating systems.
+    // Windows Server operating systems, newest release first.
     BlueprintSpec {
-        blueprint_id: "amazon_linux_2",
+        blueprint_id: "windows_server_2025",
+        group: "windows_2025",
         blueprint_type: BLUEPRINT_TYPE_OS,
         is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "amazon_linux_2023",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "almalinux_9",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "centos_stream_9",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "debian_10",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        // Debian 10 is past its upstream end of life.
-        is_active: false,
-    },
-    BlueprintSpec {
-        blueprint_id: "debian_11",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "debian_12",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "freebsd_14",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "opensuse_15",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "ubuntu_18_04",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        // Ubuntu 18.04 LTS is past its upstream end of standard support.
-        is_active: false,
-    },
-    BlueprintSpec {
-        blueprint_id: "ubuntu_20_04",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "ubuntu_22_04",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "ubuntu_24_04",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "windows_server_2016",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "windows_server_2019",
-        blueprint_type: BLUEPRINT_TYPE_OS,
-        is_active: true,
+        product_url: WINDOWS_SERVER_PRODUCT_URL,
+        license_url: WINDOWS_SERVER_LICENSE_URL,
     },
     BlueprintSpec {
         blueprint_id: "windows_server_2022",
+        group: "windows_2022",
         blueprint_type: BLUEPRINT_TYPE_OS,
         is_active: true,
+        product_url: WINDOWS_SERVER_PRODUCT_URL,
+        license_url: WINDOWS_SERVER_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "windows_server_2019",
+        group: "windows_2019",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: WINDOWS_SERVER_PRODUCT_URL,
+        license_url: WINDOWS_SERVER_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "windows_server_2016",
+        group: "windows_2016",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: WINDOWS_SERVER_PRODUCT_URL,
+        license_url: WINDOWS_SERVER_LICENSE_URL,
+    },
+    // Linux/Unix operating systems.
+    BlueprintSpec {
+        blueprint_id: "amazon_linux_2023",
+        group: "amazon-linux",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://aws.amazon.com/linux/amazon-linux-2023/",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "amazon_linux_2",
+        group: "amazon-linux",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://aws.amazon.com/amazon-linux-2/",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "ubuntu_24_04",
+        group: "ubuntu",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://ubuntu.com/server",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "ubuntu_22_04",
+        group: "ubuntu",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://ubuntu.com/server",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "ubuntu_20_04",
+        group: "ubuntu",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://ubuntu.com/server",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "ubuntu_18_04",
+        group: "ubuntu",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        // Ubuntu 18.04 LTS is past its upstream end of standard support.
+        is_active: false,
+        product_url: "https://ubuntu.com/server",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "debian_12",
+        group: "debian",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://www.debian.org/",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "debian_11",
+        group: "debian",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://www.debian.org/",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "debian_10",
+        group: "debian",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        // Debian 10 is past its upstream end of life.
+        is_active: false,
+        product_url: "https://www.debian.org/",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "almalinux_9",
+        group: "almalinux",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://almalinux.org/",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "centos_stream_9",
+        group: "centos-stream",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://www.centos.org/centos-stream/",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "freebsd_14",
+        group: "freebsd",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://www.freebsd.org/",
+        license_url: "",
+    },
+    BlueprintSpec {
+        blueprint_id: "opensuse_15",
+        group: "opensuse",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+        product_url: "https://www.opensuse.org/",
+        license_url: "",
     },
     // Application stacks.
     BlueprintSpec {
-        blueprint_id: "cpanel_whm_almalinux",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "django",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "drupal",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "ghost_bitnami",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "gitlab",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "joomla",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "lamp_8_bitnami",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "magento",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "mean",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "nginx",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "nodejs",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "plesk_ubuntu_18_0_35",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
-        blueprint_id: "redmine",
-        blueprint_type: BLUEPRINT_TYPE_APP,
-        is_active: true,
-    },
-    BlueprintSpec {
         blueprint_id: "wordpress",
+        group: "wordpress",
         blueprint_type: BLUEPRINT_TYPE_APP,
         is_active: true,
+        product_url: "https://bitnami.com/stack/wordpress",
+        license_url: BITNAMI_LICENSE_URL,
     },
     BlueprintSpec {
         blueprint_id: "wordpress_multisite",
+        group: "wordpress-multisite",
         blueprint_type: BLUEPRINT_TYPE_APP,
         is_active: true,
+        product_url: "https://bitnami.com/stack/wordpress-multisite",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "lamp_8_bitnami",
+        group: "lamp-bitnami",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/lamp",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "nodejs",
+        group: "nodejs",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/nodejs",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "joomla",
+        group: "joomla",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/joomla",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "drupal",
+        group: "drupal",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/drupal",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "magento",
+        group: "magento",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/magento",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "mean",
+        group: "mean",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/mean",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "ghost_bitnami",
+        group: "ghost-bitnami",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/ghost",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "redmine",
+        group: "redmine",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/redmine",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "nginx",
+        group: "nginx",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/nginx",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "django",
+        group: "django",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/django",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "gitlab",
+        group: "gitlab",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/gitlab",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "prestashop",
+        group: "prestashop",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://bitnami.com/stack/prestashop",
+        license_url: BITNAMI_LICENSE_URL,
+    },
+    BlueprintSpec {
+        blueprint_id: "cpanel_whm_almalinux",
+        group: "cpanel-whm-almalinux",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://cpanel.net/",
+        license_url: "https://cpanel.net/legal/",
+    },
+    BlueprintSpec {
+        blueprint_id: "plesk_ubuntu_18_0_35",
+        group: "plesk-ubuntu",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+        product_url: "https://www.plesk.com/",
+        license_url: "https://www.plesk.com/legal/",
     },
 ];
 
@@ -2620,19 +2797,6 @@ fn is_version_word(word: &str) -> bool {
 }
 
 impl BlueprintSpec {
-    /// `Blueprint$group` — "The group name of the blueprint (`amazon-linux`)".
-    ///
-    /// The group is the blueprint FAMILY: the id with its version words removed
-    /// and its underscores written as hyphens, which is exactly the derivation
-    /// that documented example shows (`amazon_linux_2023` -> `amazon-linux`).
-    pub fn group(&self) -> String {
-        self.blueprint_id
-            .split('_')
-            .filter(|word| !word.is_empty() && !is_version_word(word))
-            .collect::<Vec<_>>()
-            .join("-")
-    }
-
     /// `Blueprint$version` — "The version number of the operating system,
     /// application, or stack (`2016.03.0`)".
     ///
@@ -2679,32 +2843,44 @@ impl BlueprintSpec {
         }
     }
 
+    /// `Blueprint$minPower` — "The minimum bundle power required to run this
+    /// blueprint".
+    ///
+    /// The power of the smallest instance plan the image runs on: a Windows
+    /// image does not run on the smallest plan
+    /// ([`WINDOWS_BLUEPRINT_MIN_POWER`]), and a Linux/Unix image this catalog
+    /// publishes runs on every plan, which `0` states
+    /// ([`BLUEPRINT_MIN_POWER_ANY_SIZE`]).
+    pub fn min_power(&self) -> i32 {
+        if self.platform() == PLATFORM_WINDOWS {
+            WINDOWS_BLUEPRINT_MIN_POWER
+        } else {
+            BLUEPRINT_MIN_POWER_ANY_SIZE
+        }
+    }
+
     /// This entry as the modelled `Blueprint`.
     ///
     /// `name` is [`blueprint_name`], the same derivation `Instance$blueprintName`
     /// reports, so the catalog's name for a blueprint is the name an instance
     /// created from it carries.
     pub fn view(&self) -> Blueprint {
+        // `productUrl` and `licenseUrl` are optional, and an entry whose vendor
+        // publishes neither carries neither: an empty link in the catalog is
+        // reported as the ABSENT member rather than as an empty string.
+        let link = |url: &'static str| (!url.is_empty()).then(|| url.to_string());
         Blueprint {
             blueprint_id: Some(self.blueprint_id.to_string()),
             name: Some(blueprint_name(self.blueprint_id)),
-            group: Some(self.group()),
+            group: Some(self.group.to_string()),
             r#type: Some(self.blueprint_type.to_string()),
             description: Some(self.description()),
             is_active: Some(self.is_active),
-            // `minPower` is "The minimum bundle power required to run this
-            // blueprint ... `0` indicates that the blueprint runs on all instance
-            // sizes". Every blueprint this catalog publishes runs on every plan
-            // [`BUNDLE_SPECS`] serves, which is what that 0 states.
-            min_power: Some(0),
+            min_power: Some(self.min_power()),
             version: self.version(),
-            // `versionCode` is Lightsail's own revision counter for an image, and
-            // `productUrl`/`licenseUrl` are per-image links. This catalog
-            // publishes none of the three and all three members are optional, so
-            // they are left ABSENT rather than carrying an invented value.
-            version_code: None,
-            product_url: None,
-            license_url: None,
+            version_code: Some(BLUEPRINT_VERSION_CODE.to_string()),
+            product_url: link(self.product_url),
+            license_url: link(self.license_url),
             platform: Some(self.platform().to_string()),
             // Only a Lightsail for Research blueprint carries a category, and it
             // is the category of the catalog the entry came from, so
@@ -2839,6 +3015,18 @@ pub struct RelationalDatabaseBlueprintSpec {
     pub major_version: &'static str,
     /// The full engine version the major version is served at (`8.0.41`).
     pub engine_version: &'static str,
+    /// The revision label the engine's releases carry in their version
+    /// description, or empty where that engine's releases carry none.
+    ///
+    /// A managed PostgreSQL release is published as a REVISION of its community
+    /// version (`R1` being the first revision of that version), which is what
+    /// the recorded `engineVersionDescription` of every PostgreSQL blueprint
+    /// ends with; a MySQL release carries no such label, and the recorded MySQL
+    /// blueprint's description ends at its version. So the label belongs to the
+    /// ENGINE rather than to the description, and
+    /// [`RelationalDatabaseBlueprintSpec::view`] appends it when the engine has
+    /// one.
+    pub engine_version_revision: &'static str,
     /// Whether this is the engine's default version — true for exactly one
     /// blueprint per engine.
     pub is_engine_default: bool,
@@ -2868,6 +3056,7 @@ pub const RELATIONAL_DATABASE_BLUEPRINTS: &[RelationalDatabaseBlueprintSpec] = &
         engine_description: "MySQL Community Edition",
         major_version: "8.4",
         engine_version: "8.4.11",
+        engine_version_revision: "",
         is_engine_default: true,
     },
     RelationalDatabaseBlueprintSpec {
@@ -2875,7 +3064,8 @@ pub const RELATIONAL_DATABASE_BLUEPRINTS: &[RelationalDatabaseBlueprintSpec] = &
         engine_display: "PostgreSQL",
         engine_description: "PostgreSQL",
         major_version: "13",
-        engine_version: "13.21",
+        engine_version: "13.23-rds.20260514",
+        engine_version_revision: POSTGRES_ENGINE_VERSION_REVISION,
         is_engine_default: false,
     },
     RelationalDatabaseBlueprintSpec {
@@ -2883,7 +3073,8 @@ pub const RELATIONAL_DATABASE_BLUEPRINTS: &[RelationalDatabaseBlueprintSpec] = &
         engine_display: "PostgreSQL",
         engine_description: "PostgreSQL",
         major_version: "14",
-        engine_version: "14.18",
+        engine_version: "14.24",
+        engine_version_revision: POSTGRES_ENGINE_VERSION_REVISION,
         is_engine_default: false,
     },
     RelationalDatabaseBlueprintSpec {
@@ -2891,7 +3082,8 @@ pub const RELATIONAL_DATABASE_BLUEPRINTS: &[RelationalDatabaseBlueprintSpec] = &
         engine_display: "PostgreSQL",
         engine_description: "PostgreSQL",
         major_version: "15",
-        engine_version: "15.13",
+        engine_version: "15.19",
+        engine_version_revision: POSTGRES_ENGINE_VERSION_REVISION,
         is_engine_default: false,
     },
     RelationalDatabaseBlueprintSpec {
@@ -2899,7 +3091,8 @@ pub const RELATIONAL_DATABASE_BLUEPRINTS: &[RelationalDatabaseBlueprintSpec] = &
         engine_display: "PostgreSQL",
         engine_description: "PostgreSQL",
         major_version: "16",
-        engine_version: "16.9",
+        engine_version: "16.15",
+        engine_version_revision: POSTGRES_ENGINE_VERSION_REVISION,
         is_engine_default: false,
     },
     RelationalDatabaseBlueprintSpec {
@@ -2907,18 +3100,25 @@ pub const RELATIONAL_DATABASE_BLUEPRINTS: &[RelationalDatabaseBlueprintSpec] = &
         engine_display: "PostgreSQL",
         engine_description: "PostgreSQL",
         major_version: "17",
-        engine_version: "17.5",
-        is_engine_default: true,
+        engine_version: "17.11",
+        engine_version_revision: POSTGRES_ENGINE_VERSION_REVISION,
+        is_engine_default: false,
     },
     RelationalDatabaseBlueprintSpec {
         engine: "postgres",
         engine_display: "PostgreSQL",
         engine_description: "PostgreSQL",
         major_version: "18",
-        engine_version: "18.1",
-        is_engine_default: false,
+        engine_version: "18.5",
+        engine_version_revision: POSTGRES_ENGINE_VERSION_REVISION,
+        is_engine_default: true,
     },
 ];
+
+/// The revision label every managed PostgreSQL release this service serves is
+/// published at: the first revision of its community version. See
+/// [`RelationalDatabaseBlueprintSpec::engine_version_revision`].
+const POSTGRES_ENGINE_VERSION_REVISION: &str = "R1";
 
 /// How many blueprints one `GetRelationalDatabaseBlueprints` page carries.
 ///
@@ -2955,6 +3155,20 @@ impl RelationalDatabaseBlueprintSpec {
         self.major_version_numbers() > other.major_version_numbers()
     }
 
+    /// `RelationalDatabaseBlueprint$engineVersionDescription`: the engine named
+    /// beside the version it is served at, followed by that release's revision
+    /// label where the engine's releases carry one (`PostgreSQL 13.23-R1`,
+    /// `MySQL 8.4.11`). See [`Self::engine_version_revision`].
+    pub fn engine_version_description(&self) -> String {
+        let version = &self.engine_version;
+        let engine = &self.engine_display;
+        if self.engine_version_revision.is_empty() {
+            format!("{engine} {version}")
+        } else {
+            format!("{engine} {version}-{}", self.engine_version_revision)
+        }
+    }
+
     /// This entry as the modelled `RelationalDatabaseBlueprint`.
     pub fn view(&self) -> crate::ops::types::RelationalDatabaseBlueprint {
         crate::ops::types::RelationalDatabaseBlueprint {
@@ -2962,12 +3176,11 @@ impl RelationalDatabaseBlueprintSpec {
             engine: Some(self.engine.to_string()),
             engine_version: Some(self.engine_version.to_string()),
             engine_description: Some(self.engine_description.to_string()),
-            // `engineVersionDescription` describes the version the way the engine
-            // itself is named beside it: "MySQL 5.7.44".
-            engine_version_description: Some(format!(
-                "{} {}",
-                self.engine_display, self.engine_version
-            )),
+            // `engineVersionDescription` describes the version the way the
+            // engine itself is named beside it ("MySQL 5.7.44"), followed by the
+            // revision label the engine's releases carry, where it has one
+            // ([`Self::engine_version_revision`]).
+            engine_version_description: Some(self.engine_version_description()),
             is_engine_default: Some(self.is_engine_default),
         }
     }
@@ -3067,31 +3280,38 @@ pub struct RelationalDatabaseBundleSpec {
     pub is_active: bool,
 }
 
-/// Every managed-database plan this service publishes: the four standard
-/// (single-database) plans cheapest first, then the four high-availability plans
-/// cheapest first.
+/// Every managed-database plan this service publishes: the standard
+/// (single-database) plans of the generation it serves, cheapest first, then
+/// their high-availability twins, then the plans of the generation it has
+/// retired.
 ///
 /// SOURCE: the managed-database plan table of the Lightsail pricing page — a
-/// standard plan at $15 a month with 1 GB RAM, 1 vCPU and 40 GB of SSD storage,
-/// $30 with 2 GB / 1 vCPU / 80 GB, $60 with 4 GB / 2 vCPUs / 120 GB and $115
-/// with 8 GB / 2 vCPUs / 240 GB, with 100 GB of data transfer included on the
-/// first three plans and 200 GB on the 8 GB plan — and the high-availability
-/// column of the same table, which offers the same hardware with a standby in a
-/// second Availability Zone for twice the standard plan's price ($30, $60, $120
-/// and $230). Lightsail encrypts managed-database storage and its automatic
+/// standard plan at $15 a month with 1 GB RAM, 2 vCPUs and 40 GB of SSD storage,
+/// $30 with 2 GB / 2 vCPUs / 80 GB, $60 with 4 GB / 2 vCPUs / 120 GB, $115 with
+/// 8 GB / 2 vCPUs / 240 GB, $230 with 16 GB / 4 vCPUs / 480 GB and $460 with
+/// 32 GB / 8 vCPUs / 960 GB, with 100 GB of data transfer included on the three
+/// smallest plans, 200 GB on the 8 GB plan, 300 GB on the 16 GB one and 400 GB
+/// on the largest — the price doubling with the plan above the 8 GB one — and
+/// the high-availability column of the same table, which offers the same
+/// hardware with a standby in a second Availability Zone for twice the standard
+/// plan's price. Lightsail encrypts managed-database storage and its automatic
 /// snapshots at rest on every plan, so every entry is encrypted.
 ///
-/// Lightsail has retired no database plan, so every published plan is active; a
-/// retired generation belongs here with `is_active: false`.
+/// The GENERATION is a property of the catalog, as it is for an instance plan:
+/// the plans published today are the `2_0` generation, and the superseded `1_0`
+/// generation stays here as INACTIVE — a database created on it still resolves
+/// its hardware, and `GetRelationalDatabaseBundles` reports it only when asked
+/// to include inactive bundles.
 ///
 /// The ORDER is this slice's own (cheapest first, standard plans before
-/// high-availability ones): it is what the paged walk reports, and it is stable
-/// so two reads answer identically.
+/// high-availability ones, the published generation before the retired one): it
+/// is what the paged walk reports, and it is stable so two reads answer
+/// identically.
 pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
     RelationalDatabaseBundleSpec {
-        bundle_id: "micro_1_0",
+        bundle_id: "micro_2_0",
         name: "Micro",
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 1.0,
         disk_size_in_gb: 40,
         transfer_per_month_in_gb: 100,
@@ -3100,9 +3320,9 @@ pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
         is_active: true,
     },
     RelationalDatabaseBundleSpec {
-        bundle_id: "small_1_0",
+        bundle_id: "small_2_0",
         name: "Small",
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 2.0,
         disk_size_in_gb: 80,
         transfer_per_month_in_gb: 100,
@@ -3111,7 +3331,7 @@ pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
         is_active: true,
     },
     RelationalDatabaseBundleSpec {
-        bundle_id: "medium_1_0",
+        bundle_id: "medium_2_0",
         name: "Medium",
         cpu_count: 2,
         ram_size_in_gb: 4.0,
@@ -3122,7 +3342,7 @@ pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
         is_active: true,
     },
     RelationalDatabaseBundleSpec {
-        bundle_id: "large_1_0",
+        bundle_id: "large_2_0",
         name: "Large",
         cpu_count: 2,
         ram_size_in_gb: 8.0,
@@ -3133,9 +3353,31 @@ pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
         is_active: true,
     },
     RelationalDatabaseBundleSpec {
-        bundle_id: "micro_ha_1_0",
+        bundle_id: "xlarge_2_0",
+        name: "Xlarge",
+        cpu_count: 4,
+        ram_size_in_gb: 16.0,
+        disk_size_in_gb: 480,
+        transfer_per_month_in_gb: 300,
+        price_usd_per_month: 230.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "2xlarge_2_0",
+        name: "2Xlarge",
+        cpu_count: 8,
+        ram_size_in_gb: 32.0,
+        disk_size_in_gb: 960,
+        transfer_per_month_in_gb: 400,
+        price_usd_per_month: 460.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "micro_ha_2_0",
         name: "Micro with High Availability",
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 1.0,
         disk_size_in_gb: 40,
         transfer_per_month_in_gb: 100,
@@ -3144,9 +3386,9 @@ pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
         is_active: true,
     },
     RelationalDatabaseBundleSpec {
-        bundle_id: "small_ha_1_0",
+        bundle_id: "small_ha_2_0",
         name: "Small with High Availability",
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 2.0,
         disk_size_in_gb: 80,
         transfer_per_month_in_gb: 100,
@@ -3155,7 +3397,7 @@ pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
         is_active: true,
     },
     RelationalDatabaseBundleSpec {
-        bundle_id: "medium_ha_1_0",
+        bundle_id: "medium_ha_2_0",
         name: "Medium with High Availability",
         cpu_count: 2,
         ram_size_in_gb: 4.0,
@@ -3166,7 +3408,7 @@ pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
         is_active: true,
     },
     RelationalDatabaseBundleSpec {
-        bundle_id: "large_ha_1_0",
+        bundle_id: "large_ha_2_0",
         name: "Large with High Availability",
         cpu_count: 2,
         ram_size_in_gb: 8.0,
@@ -3175,6 +3417,118 @@ pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
         price_usd_per_month: 230.0,
         is_encrypted: true,
         is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "xlarge_ha_2_0",
+        name: "Xlarge with High Availability",
+        cpu_count: 4,
+        ram_size_in_gb: 16.0,
+        disk_size_in_gb: 480,
+        transfer_per_month_in_gb: 300,
+        price_usd_per_month: 460.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "2xlarge_ha_2_0",
+        name: "2Xlarge with High Availability",
+        cpu_count: 8,
+        ram_size_in_gb: 32.0,
+        disk_size_in_gb: 960,
+        transfer_per_month_in_gb: 400,
+        price_usd_per_month: 920.0,
+        is_encrypted: true,
+        is_active: true,
+    },
+    // The superseded first generation: still resolvable for a database created
+    // on it, and reported only when a call asks for inactive bundles.
+    RelationalDatabaseBundleSpec {
+        bundle_id: "micro_1_0",
+        name: "Micro",
+        cpu_count: 1,
+        ram_size_in_gb: 1.0,
+        disk_size_in_gb: 40,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 15.0,
+        is_encrypted: true,
+        is_active: false,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "small_1_0",
+        name: "Small",
+        cpu_count: 1,
+        ram_size_in_gb: 2.0,
+        disk_size_in_gb: 80,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 30.0,
+        is_encrypted: true,
+        is_active: false,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "medium_1_0",
+        name: "Medium",
+        cpu_count: 2,
+        ram_size_in_gb: 4.0,
+        disk_size_in_gb: 120,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 60.0,
+        is_encrypted: true,
+        is_active: false,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "large_1_0",
+        name: "Large",
+        cpu_count: 2,
+        ram_size_in_gb: 8.0,
+        disk_size_in_gb: 240,
+        transfer_per_month_in_gb: 200,
+        price_usd_per_month: 115.0,
+        is_encrypted: true,
+        is_active: false,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "micro_ha_1_0",
+        name: "Micro with High Availability",
+        cpu_count: 1,
+        ram_size_in_gb: 1.0,
+        disk_size_in_gb: 40,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 30.0,
+        is_encrypted: true,
+        is_active: false,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "small_ha_1_0",
+        name: "Small with High Availability",
+        cpu_count: 1,
+        ram_size_in_gb: 2.0,
+        disk_size_in_gb: 80,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 60.0,
+        is_encrypted: true,
+        is_active: false,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "medium_ha_1_0",
+        name: "Medium with High Availability",
+        cpu_count: 2,
+        ram_size_in_gb: 4.0,
+        disk_size_in_gb: 120,
+        transfer_per_month_in_gb: 100,
+        price_usd_per_month: 120.0,
+        is_encrypted: true,
+        is_active: false,
+    },
+    RelationalDatabaseBundleSpec {
+        bundle_id: "large_ha_1_0",
+        name: "Large with High Availability",
+        cpu_count: 2,
+        ram_size_in_gb: 8.0,
+        disk_size_in_gb: 240,
+        transfer_per_month_in_gb: 200,
+        price_usd_per_month: 230.0,
+        is_encrypted: true,
+        is_active: false,
     },
 ];
 
@@ -4123,8 +4477,16 @@ pub struct RegionSpec {
     /// The place the Region is named after, as `Region$displayName` reports it.
     pub display_name: &'static str,
     /// The area the Region is recommended for: the clause `Region$description`
-    /// puts after "This region is recommended to serve users in".
+    /// puts after "is recommended to serve users in".
     pub serves: &'static str,
+    /// Whether this Region is an OPT-IN Region — one AWS leaves disabled until an
+    /// account enables it, which every Region introduced after the opt-in
+    /// mechanism was published is.
+    ///
+    /// It is the description that carries this: the sentence of an opt-in Region
+    /// opens by saying so ([`RegionSpec::description`]), and this response has no
+    /// other member that tells a caller the Region is disabled by default.
+    pub is_opt_in: bool,
     /// The zone letters of this Region's Availability Zones, in order: a zone
     /// name is the Region's name followed by one of these letters, the format
     /// `AvailabilityZone$zoneName` documents ("The format is `us-east-2a`
@@ -4138,12 +4500,16 @@ pub struct RegionSpec {
 
 impl RegionSpec {
     /// The sentence `Region$description` carries, in the form that member's own
-    /// documentation shows.
+    /// documentation shows: what the Region is recommended for, opened by the
+    /// opt-in clause where the Region is one an account must enable
+    /// ([`Self::is_opt_in`]).
     pub fn description(&self) -> String {
-        format!(
-            "This region is recommended to serve users in {}",
-            self.serves
-        )
+        let opening = if self.is_opt_in {
+            "This opt-in Region (Region that is disabled by default)"
+        } else {
+            "This region"
+        };
+        format!("{opening} is recommended to serve users in {}", self.serves)
     }
 
     /// The Availability Zones this Region publishes, as `GetRegions` reports
@@ -4226,13 +4592,14 @@ impl RegionSpec {
 ///
 /// `display_name` is the city, state or country AWS names each Region after
 /// (ASCII, as AWS reports it: `Sao Paulo`). `serves` is the geography that
-/// Region is the closest one to — the clause after the sentence stem
-/// `Region$description` documents. `us-east-1`, `us-east-2`, `us-west-2`,
-/// `ap-northeast-1` and `ap-northeast-2` carry the clause AWS's own answer gives
-/// for them (the two eastern US Regions share one clause); the rest name the
-/// geography the Lightsail documentation recommends that Region for, because the
-/// per-Region clause AWS writes follows no rule the model or the documentation
-/// states.
+/// Region is recommended for — the clause after the sentence stem
+/// `Region$description` documents, as AWS's own answer gives it for that Region
+/// (`eu-west-1` and `eu-west-2` share one clause, and `eu-central-1`'s names a
+/// whole set of continents). `is_opt_in` marks the Regions AWS leaves disabled
+/// until an account enables them — the Regions introduced after the opt-in
+/// mechanism was published (`ap-east-1`, `ap-southeast-3`, `ap-southeast-5` and
+/// `eu-south-2` of this catalog) — whose description opens with the opt-in
+/// clause instead.
 ///
 /// `availability_zone_letters` is the Availability Zones the Lightsail user
 /// guide's "Regions and Availability Zones" table lists for each Region: six in
@@ -4244,114 +4611,133 @@ pub const REGION_SPECS: &[RegionSpec] = &[
         name: "us-east-1",
         display_name: "Virginia",
         serves: "the eastern United States",
+        is_opt_in: false,
         availability_zone_letters: "abcdef",
     },
     RegionSpec {
         name: "us-east-2",
         display_name: "Ohio",
         serves: "the eastern United States",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "us-west-2",
         display_name: "Oregon",
         serves: "the northwestern United States, Alaska, and western Canada",
+        is_opt_in: false,
         availability_zone_letters: "abcd",
     },
     RegionSpec {
         name: "ap-south-1",
         display_name: "Mumbai",
         serves: "India",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "ap-northeast-2",
         display_name: "Seoul",
         serves: "South Korea",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "ap-southeast-1",
         display_name: "Singapore",
         serves: "Singapore and southeast Asia",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "ap-southeast-2",
         display_name: "Sydney",
         serves: "Australia and New Zealand",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "ap-northeast-1",
         display_name: "Tokyo",
         serves: "Japan",
+        is_opt_in: false,
         availability_zone_letters: "acd",
     },
     RegionSpec {
         name: "ca-central-1",
         display_name: "Montreal",
         serves: "Canada",
+        is_opt_in: false,
         availability_zone_letters: "ab",
     },
     RegionSpec {
         name: "eu-central-1",
         display_name: "Frankfurt",
-        serves: "Germany and central Europe",
+        serves: "Europe, the Middle East, and Africa",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "eu-west-1",
         display_name: "Ireland",
-        serves: "Ireland and western Europe",
+        serves: "Ireland, the United Kingdom, and Iceland",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "eu-west-2",
         display_name: "London",
-        serves: "the United Kingdom",
+        serves: "Ireland, the United Kingdom, and Iceland",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "eu-west-3",
         display_name: "Paris",
         serves: "France",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "eu-north-1",
         display_name: "Stockholm",
-        serves: "the Nordic countries",
+        serves: "Stockholm and north Europe",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "sa-east-1",
         display_name: "Sao Paulo",
         serves: "Brazil and eastern South America",
+        is_opt_in: false,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "ap-east-1",
         display_name: "Hong Kong",
-        serves: "Hong Kong and southern China",
+        serves: "Hong Kong",
+        is_opt_in: true,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "eu-south-2",
         display_name: "Spain",
-        serves: "Spain and Portugal",
+        serves: "Spain",
+        is_opt_in: true,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "ap-southeast-3",
         display_name: "Jakarta",
         serves: "Indonesia",
+        is_opt_in: true,
         availability_zone_letters: "abc",
     },
     RegionSpec {
         name: "ap-southeast-5",
         display_name: "Malaysia",
         serves: "Malaysia",
+        is_opt_in: true,
         availability_zone_letters: "abc",
     },
 ];
@@ -8780,7 +9166,7 @@ pub const CONTAINER_API_METADATA_LIGHTSAILCTL_VERSION: &str = "lightsailctlVersi
 /// The lightsailctl plugin release this emulator's container API publishes, as
 /// that plugin's `major.minor.patch` version. It is the version a client compares
 /// its locally installed plugin against before pushing a container image.
-pub const LIGHTSAILCTL_VERSION: &str = "1.0.6";
+pub const LIGHTSAILCTL_VERSION: &str = "1.0.7";
 
 /// The container-API metadata catalog, as `(name, value)` pairs in the order the
 /// service reports them.
@@ -11916,27 +12302,29 @@ use crate::ops::types::LoadBalancerTlsPolicy;
 /// CHOSEN: Lightsail publishes no page size for this operation, only that "a next
 /// page token is not returned if there are no more results to display". Matches
 /// [`LOAD_BALANCER_PAGE_SIZE`], so every listing of this slice pages the same
-/// way, and it is below the number of policies this service publishes, so the
-/// catalog really does page.
+/// way, and it is at least the number of policies this service publishes, so the
+/// catalog is answered whole in one page — as AWS answers it — while the paging
+/// walk still holds for a catalog that outgrows it.
 pub const LOAD_BALANCER_TLS_POLICY_PAGE_SIZE: usize = 5;
 
 /// The protocol versions a published policy may negotiate, oldest first.
 ///
-/// SOURCE: the spellings the load-balancing service reports for an SSL policy's
-/// protocol versions (`TLSv1`, `TLSv1.1`, `TLSv1.2`), which is what
-/// `LoadBalancerTlsPolicy$protocols` — "The protocols used in a given TLS
-/// security policy" — carries.
-const TLS_PROTOCOL_1_0: &str = "TLSv1";
+/// SOURCE: the wire tokens the recorded `GetLoadBalancerTlsPolicies` answer
+/// carries for a policy's protocol versions — the `Protocol-` prefixed form of
+/// each TLS version, which is the value a client echoes back when configuring a
+/// load balancer, so `LoadBalancerTlsPolicy$protocols` ("The protocols used in a
+/// given TLS security policy") is not interchangeable with the bare version
+/// name. The capitalisation is the recorded one, which differs between the
+/// tokens.
+const TLS_PROTOCOL_1_0: &str = "Protocol-TLSv1";
 /// See [`TLS_PROTOCOL_1_0`].
-const TLS_PROTOCOL_1_1: &str = "TLSv1.1";
+const TLS_PROTOCOL_1_1: &str = "Protocol-TLSV1.1";
 /// See [`TLS_PROTOCOL_1_0`].
-const TLS_PROTOCOL_1_2: &str = "TLSv1.2";
+const TLS_PROTOCOL_1_2: &str = "Protocol-TLSv1.2";
 
 /// Every protocol version a policy that still accepts TLS 1.0 negotiates.
 const TLS_PROTOCOLS_1_0_AND_LATER: &[&str] =
     &[TLS_PROTOCOL_1_0, TLS_PROTOCOL_1_1, TLS_PROTOCOL_1_2];
-/// The protocol versions a policy whose floor is TLS 1.1 negotiates.
-const TLS_PROTOCOLS_1_1_AND_LATER: &[&str] = &[TLS_PROTOCOL_1_1, TLS_PROTOCOL_1_2];
 /// The only protocol version a TLS 1.2 policy negotiates.
 const TLS_PROTOCOLS_1_2_ONLY: &[&str] = &[TLS_PROTOCOL_1_2];
 
@@ -11969,28 +12357,12 @@ const TLS_DEFAULT_CIPHERS: &[&str] = &[
     "AES256-SHA",
 ];
 
-/// The cipher suites a forward-secrecy policy offers: the ephemeral-key
-/// (`ECDHE`) suites of [`TLS_DEFAULT_CIPHERS`], in the same order of preference,
-/// and none of its static-RSA ones — a session key those cannot leak with the
-/// server's private key is what forward secrecy means.
-const TLS_FORWARD_SECRECY_CIPHERS: &[&str] = &[
-    "ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-AES128-GCM-SHA256",
-    "ECDHE-ECDSA-AES128-SHA256",
-    "ECDHE-RSA-AES128-SHA256",
-    "ECDHE-ECDSA-AES128-SHA",
-    "ECDHE-RSA-AES128-SHA",
-    "ECDHE-ECDSA-AES256-GCM-SHA384",
-    "ECDHE-RSA-AES256-GCM-SHA384",
-    "ECDHE-ECDSA-AES256-SHA384",
-    "ECDHE-RSA-AES256-SHA384",
-    "ECDHE-ECDSA-AES256-SHA",
-    "ECDHE-RSA-AES256-SHA",
-];
-
 /// The cipher suites a RESTRICTED forward-secrecy policy offers: the
-/// [`TLS_FORWARD_SECRECY_CIPHERS`] whose handshake and record MAC use SHA-256 or
-/// SHA-384, so the SHA-1 suites are left out.
+/// ephemeral-key (`ECDHE`) suites of [`TLS_DEFAULT_CIPHERS`], in the same order
+/// of preference and without its static-RSA ones — a session key those cannot
+/// leak with the server's private key is what forward secrecy means — kept to
+/// the suites whose handshake and record MAC use SHA-256 or SHA-384, so the
+/// SHA-1 suites are left out.
 const TLS_FORWARD_SECRECY_RESTRICTED_CIPHERS: &[&str] = &[
     "ECDHE-ECDSA-AES128-GCM-SHA256",
     "ECDHE-RSA-AES128-GCM-SHA256",
@@ -12000,16 +12372,6 @@ const TLS_FORWARD_SECRECY_RESTRICTED_CIPHERS: &[&str] = &[
     "ECDHE-RSA-AES256-GCM-SHA384",
     "ECDHE-ECDSA-AES256-SHA384",
     "ECDHE-RSA-AES256-SHA384",
-];
-
-/// The cipher suites the NEWEST restricted forward-secrecy policy offers: the
-/// [`TLS_FORWARD_SECRECY_RESTRICTED_CIPHERS`] that are authenticated-encryption
-/// (`GCM`) suites, so the CBC ones are left out too.
-const TLS_FORWARD_SECRECY_GCM_CIPHERS: &[&str] = &[
-    "ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-AES128-GCM-SHA256",
-    "ECDHE-ECDSA-AES256-GCM-SHA384",
-    "ECDHE-RSA-AES256-GCM-SHA384",
 ];
 
 /// One TLS security policy a load balancer of this service can be given: the
@@ -12042,16 +12404,18 @@ pub struct LoadBalancerTlsPolicySpec {
 }
 
 /// Every TLS security policy this service publishes, the default first and then
-/// the forward-secrecy policies from the most permissive protocol floor to the
-/// most restrictive.
+/// the forward-secrecy policy.
 ///
 /// SOURCE: the Lightsail TLS security policies of the Developer Guide's
-/// "Configuring TLS security policies on your Amazon Lightsail load balancers" —
-/// the default `TLS-2016-08` policy and the forward-secrecy (`FS`) policies,
-/// whose names carry the protocol floor (`1-1`, `1-2`), the restricted cipher
-/// set (`Res`) and the date of the policy. Each one is the load-balancing
-/// service's own security policy of that name, so its protocol versions and its
-/// ordered cipher suites are that policy's.
+/// "Configuring TLS security policies on your Amazon Lightsail load balancers",
+/// which the recorded `GetLoadBalancerTlsPolicies` answer reports — the default
+/// `TLS-2016-08` policy and the restricted forward-secrecy (`FS`) policy, whose
+/// name carries the protocol floor (`1-2`), the restricted cipher set (`Res`)
+/// and the date of the policy. A policy the service does not publish has no row
+/// here: a client offering one would configure a policy the service does not
+/// have. Each row is the load-balancing service's own security policy of that
+/// name, so its protocol versions and its ordered cipher suites are that
+/// policy's.
 pub const LOAD_BALANCER_TLS_POLICY_SPECS: &[LoadBalancerTlsPolicySpec] = &[
     LoadBalancerTlsPolicySpec {
         name: "TLS-2016-08",
@@ -12060,92 +12424,63 @@ pub const LOAD_BALANCER_TLS_POLICY_SPECS: &[LoadBalancerTlsPolicySpec] = &[
         ciphers: TLS_DEFAULT_CIPHERS,
     },
     LoadBalancerTlsPolicySpec {
-        name: "TLS-FS-2018-06",
-        is_default: false,
-        protocols: TLS_PROTOCOLS_1_0_AND_LATER,
-        ciphers: TLS_FORWARD_SECRECY_CIPHERS,
-    },
-    LoadBalancerTlsPolicySpec {
-        name: "TLS-FS-1-1-2019-08",
-        is_default: false,
-        protocols: TLS_PROTOCOLS_1_1_AND_LATER,
-        ciphers: TLS_FORWARD_SECRECY_CIPHERS,
-    },
-    LoadBalancerTlsPolicySpec {
-        name: "TLS-FS-1-2-2019-08",
-        is_default: false,
-        protocols: TLS_PROTOCOLS_1_2_ONLY,
-        ciphers: TLS_FORWARD_SECRECY_CIPHERS,
-    },
-    LoadBalancerTlsPolicySpec {
         name: "TLS-FS-1-2-Res-2019-08",
         is_default: false,
         protocols: TLS_PROTOCOLS_1_2_ONLY,
         ciphers: TLS_FORWARD_SECRECY_RESTRICTED_CIPHERS,
     },
-    LoadBalancerTlsPolicySpec {
-        name: "TLS-FS-1-2-Res-2020-10",
-        is_default: false,
-        protocols: TLS_PROTOCOLS_1_2_ONLY,
-        ciphers: TLS_FORWARD_SECRECY_GCM_CIPHERS,
-    },
 ];
 
-/// The protocol versions of a policy, as one English list.
-fn protocol_list(protocols: &[&str]) -> String {
-    match protocols {
+/// The TLS version a protocol token names, without the wire prefix the token
+/// carries: the token from its first digit onward (`Protocol-TLSv1.2` -> `1.2`).
+fn tls_protocol_version(protocol: &str) -> &str {
+    protocol
+        .find(|character: char| character.is_ascii_digit())
+        .map_or(protocol, |first_digit| &protocol[first_digit..])
+}
+
+/// The TLS versions of a policy, as one English list: the items separated by
+/// commas with `and` before the last, and the serial comma once there are three
+/// or more.
+fn tls_version_list(versions: &[&str]) -> String {
+    match versions {
         [] => String::new(),
         [only] => (*only).to_string(),
-        [leading @ .., last] => format!("{} and {last}", leading.join(", ")),
+        [first, last] => format!("{first} and {last}"),
+        [leading @ .., last] => format!("{}, and {last}", leading.join(", ")),
     }
 }
 
 /// The description a policy reports.
 ///
-/// DERIVED from the policy's own protocol versions and cipher suites rather than
-/// carried per entry, so a policy added to [`LOAD_BALANCER_TLS_POLICY_SPECS`] is
-/// described the same way: the sentence states the protocol versions the policy
-/// negotiates, how many suites it offers, and whether EVERY one of them uses an
-/// ephemeral key exchange — which is what makes a policy a forward-secrecy one.
-///
-/// The wording is this emulator's: the model documents the member only as "The
-/// description of the TLS security policy", so what it has to carry is the
-/// policy's own published properties and nothing from the request.
-pub fn load_balancer_tls_policy_description(protocols: &[&str], ciphers: &[&str]) -> String {
-    let negotiated = if protocols.is_empty() {
-        "no TLS protocol version".to_string()
-    } else {
-        protocol_list(protocols)
-    };
-    let forward_secrecy = !ciphers.is_empty()
-        && ciphers
-            .iter()
-            .all(|cipher| cipher.starts_with("ECDHE-") || cipher.starts_with("DHE-"));
-    format!(
-        "Negotiates {negotiated} with {} cipher suite{}{}",
-        ciphers.len(),
-        if ciphers.len() == 1 { "" } else { "s" },
-        if forward_secrecy {
-            ", every one of which provides forward secrecy"
-        } else {
-            ""
-        }
-    )
+/// DERIVED from the policy's own protocol versions rather than carried per
+/// entry, so a policy added to [`LOAD_BALANCER_TLS_POLICY_SPECS`] is described
+/// the same way: the sentence states which TLS versions the policy enables, the
+/// one fact the recorded descriptions carry — `Enables TLS versions 1, 1.1, and
+/// 1.2` for the policy that admits all three, and `Enables only TLS version 1.2`
+/// for one that admits a single version.
+pub fn load_balancer_tls_policy_description(protocols: &[&str]) -> String {
+    let versions: Vec<&str> = protocols
+        .iter()
+        .map(|protocol| tls_protocol_version(protocol))
+        .collect();
+    match versions.as_slice() {
+        [] => "Enables no TLS version".to_string(),
+        [only] => format!("Enables only TLS version {only}"),
+        several => format!("Enables TLS versions {}", tls_version_list(several)),
+    }
 }
 
 impl LoadBalancerTlsPolicySpec {
     /// This policy as the modelled `LoadBalancerTlsPolicy`.
     ///
     /// `description` is DERIVED by [`load_balancer_tls_policy_description`] from
-    /// this entry's protocols and ciphers rather than carried a second time.
+    /// this entry's protocols rather than carried a second time.
     pub fn view(&self) -> LoadBalancerTlsPolicy {
         LoadBalancerTlsPolicy {
             name: Some(self.name.to_string()),
             is_default: Some(self.is_default),
-            description: Some(load_balancer_tls_policy_description(
-                self.protocols,
-                self.ciphers,
-            )),
+            description: Some(load_balancer_tls_policy_description(self.protocols)),
             protocols: Some(self.protocols.iter().map(|p| (*p).to_string()).collect()),
             ciphers: Some(self.ciphers.iter().map(|c| (*c).to_string()).collect()),
         }

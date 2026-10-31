@@ -136,7 +136,7 @@ fn rows() -> Vec<Row> {
             reported_region: DEFAULT_REGION,
             availability_zone: None,
             blueprint_id: "mysql_8_4",
-            bundle_id: "micro_1_0",
+            bundle_id: "micro_2_0",
             master_database_name: "appdb".to_string(),
             master_username: "dbadmin".to_string(),
             master_user_password: None,
@@ -152,7 +152,7 @@ fn rows() -> Vec<Row> {
             reported_region: "us-west-2",
             availability_zone: Some("us-west-2b"),
             blueprint_id: "postgres_13",
-            bundle_id: "medium_1_0",
+            bundle_id: "medium_2_0",
             // 36 characters and 60 characters: both outside the MySQL limits
             // (64-character database name, 16-character user name, 41-character
             // password) and inside PostgreSQL's (63, 63, 128), so this row
@@ -172,7 +172,7 @@ fn rows() -> Vec<Row> {
             reported_region: "eu-west-1",
             availability_zone: Some("eu-west-1a"),
             blueprint_id: "mysql_8_4",
-            bundle_id: "micro_ha_1_0",
+            bundle_id: "micro_ha_2_0",
             master_database_name: "orders".to_string(),
             master_username: "root_user".to_string(),
             // The shortest password either engine admits.
@@ -189,7 +189,7 @@ fn rows() -> Vec<Row> {
             reported_region: "ap-northeast-1",
             availability_zone: None,
             blueprint_id: "postgres_17",
-            bundle_id: "large_ha_1_0",
+            bundle_id: "large_ha_2_0",
             master_database_name: "analytics_2".to_string(),
             master_username: "analyst".to_string(),
             master_user_password: Some(password_of(41)),
@@ -207,7 +207,7 @@ fn rows() -> Vec<Row> {
             reported_region: "us-east-2",
             availability_zone: Some("us-east-2a"),
             blueprint_id: "mysql_8_4",
-            bundle_id: "small_1_0",
+            bundle_id: "small_2_0",
             // The upper bound of each MySQL limit: 64, 16 and 41.
             master_database_name: identifier_of(64),
             master_username: identifier_of(16),

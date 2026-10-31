@@ -14,7 +14,8 @@
 //!   `RegionName` enum admits but the service does not operate in (`us-west-1`)
 //!   is not reported at all;
 //! * every reported Region describes itself: display name, the documented
-//!   description sentence, and the continent code its name's geography implies;
+//!   description sentence — opened by the opt-in clause for a Region that is
+//!   disabled by default — and the continent code its name's geography implies;
 //! * both Availability Zone list members are ALWAYS present — empty, never
 //!   absent — whatever the two include flags say; and
 //! * a zone list carries zones only for the Region the request was served in,
@@ -77,6 +78,26 @@ const SERVED_REGIONS: &[(&str, &str, &str)] = &[
 /// The sentence stem `Region$description` documents ("This region is recommended
 /// to serve users in the eastern United States and eastern Canada").
 const DESCRIPTION_STEM: &str = "This region is recommended to serve users in ";
+
+/// The stem the description of an OPT-IN Region carries instead — a Region AWS
+/// leaves disabled until an account enables it, which this response says in its
+/// description and nowhere else.
+const OPT_IN_DESCRIPTION_STEM: &str =
+    "This opt-in Region (Region that is disabled by default) is recommended to serve users in ";
+
+/// The Regions of [`SERVED_REGIONS`] that are opt-in Regions: the ones
+/// introduced after the opt-in mechanism was published, which an account has to
+/// enable before it can use them.
+const OPT_IN_REGIONS: &[&str] = &["ap-east-1", "ap-southeast-3", "ap-southeast-5", "eu-south-2"];
+
+/// The stem the description of `name` opens with.
+fn description_stem(name: &str) -> &'static str {
+    if OPT_IN_REGIONS.contains(&name) {
+        OPT_IN_DESCRIPTION_STEM
+    } else {
+        DESCRIPTION_STEM
+    }
+}
 
 /// The two zone list members of the modelled `Region`, with the request member
 /// that asks for each.
@@ -311,10 +332,19 @@ async fn every_reported_region_describes_itself() {
         let description = region["description"]
             .as_str()
             .unwrap_or_else(|| panic!("case {name}: expected a description, got {region:?}"));
-        // The form the modelled `Region$description` documentation shows.
+        // The form the modelled `Region$description` documentation shows, opened
+        // by the opt-in clause where the Region is disabled by default.
+        let stem = description_stem(name);
         assert!(
-            description.starts_with(DESCRIPTION_STEM) && description.len() > DESCRIPTION_STEM.len(),
-            "case {name}: expected the documented description form, got {description:?}"
+            description.starts_with(stem) && description.len() > stem.len(),
+            "case {name}: expected the documented description form {stem:?}, got {description:?}"
+        );
+        // And only an opt-in Region says so: the clause is not boilerplate.
+        assert_eq!(
+            description.contains("opt-in Region"),
+            OPT_IN_REGIONS.contains(name),
+            "case {name}: the opt-in clause belongs to exactly the Regions disabled by \
+             default, got {description:?}"
         );
 
         // `Region$continentCode` is "the continent code (NA, meaning North
@@ -347,7 +377,11 @@ async fn the_regions_with_a_known_description_report_it() {
     // (region, the clause AWS reports after the sentence stem)
     //
     // SOURCE: AWS's own answers for these Regions. The two eastern US Regions
-    // share one clause.
+    // share one clause, and so do the two Regions AWS recommends for Ireland,
+    // the United Kingdom and Iceland. The rows span a Region whose clause names
+    // a country, one naming a city and an area, one naming several continents,
+    // two Regions sharing one clause, and an opt-in Region, whose sentence opens
+    // with the opt-in clause instead.
     let known: &[(&str, &str)] = &[
         ("us-east-1", "the eastern United States"),
         ("us-east-2", "the eastern United States"),
@@ -357,13 +391,18 @@ async fn the_regions_with_a_known_description_report_it() {
         ),
         ("ap-northeast-1", "Japan"),
         ("ap-northeast-2", "South Korea"),
+        ("eu-central-1", "Europe, the Middle East, and Africa"),
+        ("eu-west-1", "Ireland, the United Kingdom, and Iceland"),
+        ("eu-west-2", "Ireland, the United Kingdom, and Iceland"),
+        ("eu-north-1", "Stockholm and north Europe"),
+        ("eu-south-2", "Spain"),
     ];
 
     for (name, serves) in known {
         let region = regions
             .get(*name)
             .unwrap_or_else(|| panic!("case {name}: expected this served region to be reported"));
-        let expected = format!("{DESCRIPTION_STEM}{serves}");
+        let expected = format!("{}{serves}", description_stem(name));
         assert_eq!(
             region["description"].as_str(),
             Some(expected.as_str()),

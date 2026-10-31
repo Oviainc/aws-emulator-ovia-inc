@@ -279,6 +279,8 @@ mod operations_for_resource;
 mod operations_log;
 #[path = "all/paging.rs"]
 mod paging;
+#[path = "all/published_catalog_contents.rs"]
+mod published_catalog_contents;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
 #[path = "all/relational_database_blueprints.rs"]

@@ -236,7 +236,7 @@ const ROWS: &[Row] = &[
         health_check_path: Some("/"),
         ip_address_type: Some("ipv6"),
         tags: &[("env", "prod"), ("team", "payments"), ("tier", "edge")],
-        tls_policy_name: Some("TLS-FS-1-2-Res-2020-10"),
+        tls_policy_name: Some("TLS-FS-1-2-Res-2019-08"),
         certificate: None,
     },
     Row {

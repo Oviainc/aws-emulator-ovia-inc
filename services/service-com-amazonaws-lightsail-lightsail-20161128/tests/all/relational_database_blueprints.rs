@@ -62,7 +62,9 @@ const SERVED_ENGINES: &[&str] = &["mysql", "postgres"];
 /// engines in Amazon Lightsail" lists for a managed database — MySQL 8.4 and
 /// PostgreSQL 13 through 18 — each at the patch release the service serves that
 /// series at, with `mysql_8_4` the recorded first entry and MySQL's default
-/// version. `postgres_14`, `postgres_15` and `postgres_18` are entries the issue
+/// version. A managed PostgreSQL release is published as a revision of its
+/// community version, so its version description ends with that revision label,
+/// which a MySQL release carries none of. `postgres_18` is an entry the issue
 /// cited nothing about.
 struct Expected {
     blueprint_id: &'static str,
@@ -86,49 +88,49 @@ const EXPECTED_CATALOG: &[Expected] = &[
         blueprint_id: "postgres_13",
         engine: "postgres",
         major_version: "13",
-        engine_version: "13.21",
-        engine_version_description: "PostgreSQL 13.21",
+        engine_version: "13.23-rds.20260514",
+        engine_version_description: "PostgreSQL 13.23-rds.20260514-R1",
         is_engine_default: false,
     },
     Expected {
         blueprint_id: "postgres_14",
         engine: "postgres",
         major_version: "14",
-        engine_version: "14.18",
-        engine_version_description: "PostgreSQL 14.18",
+        engine_version: "14.24",
+        engine_version_description: "PostgreSQL 14.24-R1",
         is_engine_default: false,
     },
     Expected {
         blueprint_id: "postgres_15",
         engine: "postgres",
         major_version: "15",
-        engine_version: "15.13",
-        engine_version_description: "PostgreSQL 15.13",
+        engine_version: "15.19",
+        engine_version_description: "PostgreSQL 15.19-R1",
         is_engine_default: false,
     },
     Expected {
         blueprint_id: "postgres_16",
         engine: "postgres",
         major_version: "16",
-        engine_version: "16.9",
-        engine_version_description: "PostgreSQL 16.9",
+        engine_version: "16.15",
+        engine_version_description: "PostgreSQL 16.15-R1",
         is_engine_default: false,
     },
     Expected {
         blueprint_id: "postgres_17",
         engine: "postgres",
         major_version: "17",
-        engine_version: "17.5",
-        engine_version_description: "PostgreSQL 17.5",
-        is_engine_default: true,
+        engine_version: "17.11",
+        engine_version_description: "PostgreSQL 17.11-R1",
+        is_engine_default: false,
     },
     Expected {
         blueprint_id: "postgres_18",
         engine: "postgres",
         major_version: "18",
-        engine_version: "18.1",
-        engine_version_description: "PostgreSQL 18.1",
-        is_engine_default: false,
+        engine_version: "18.5",
+        engine_version_description: "PostgreSQL 18.5-R1",
+        is_engine_default: true,
     },
 ];
 
@@ -286,7 +288,7 @@ async fn every_blueprint_derives_its_id_and_descriptions_from_its_engine_and_ver
             "case {case:?}: expected a non-empty engineDescription, got {engine_description:?}"
         );
         assert!(
-            engine_version_description.ends_with(&engine_version)
+            engine_version_description.contains(&engine_version)
                 && engine_version_description.len() > engine_version.len(),
             "case {case:?}: expected engineVersionDescription to name the engine beside \
              {engine_version:?}, got {engine_version_description:?}"

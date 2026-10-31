@@ -64,8 +64,8 @@ const WINDOWS: &str = "WINDOWS";
 ///
 /// SOURCE: the Lightsail instance-plan table (the "Instances" plans of the
 /// Lightsail pricing page, which `GetBundles` answers from) — each step doubles
-/// RAM while the vCPU count, SSD size and monthly transfer follow the plan table,
-/// the Linux/Unix price doubles with the plan from the $5 `micro` plan up, and the
+/// RAM while the SSD size and monthly transfer follow the plan table, the vCPU
+/// count is two up to the 8 GB plan and doubles with the plan above it, and the
 /// Windows plan of a size costs more because it carries an operating-system
 /// licence. The rows span what the rule generalises over: the smallest plan, a
 /// mid-sized one, the two largest (whose size token carries a multiplier) and
@@ -89,12 +89,12 @@ const EXPECTED: &[Expected] = &[
         instance_type: "nano",
         name: "Nano",
         platform: LINUX_UNIX,
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 0.5,
         disk_size_in_gb: 20,
         transfer_per_month_in_gb: 1_024,
-        power: 300,
-        price: 3.5,
+        power: 298,
+        price: 5.0,
     },
     Expected {
         bundle_id: "medium_3_0",
@@ -106,55 +106,55 @@ const EXPECTED: &[Expected] = &[
         disk_size_in_gb: 80,
         transfer_per_month_in_gb: 4_096,
         power: 2_000,
-        price: 20.0,
+        price: 24.0,
     },
     Expected {
         bundle_id: "2xlarge_3_0",
         instance_type: "2xlarge",
-        name: "2XLarge",
+        name: "2Xlarge",
         platform: LINUX_UNIX,
         cpu_count: 8,
         ram_size_in_gb: 32.0,
         disk_size_in_gb: 640,
         transfer_per_month_in_gb: 7_168,
         power: 5_000,
-        price: 160.0,
+        price: 164.0,
     },
     Expected {
         bundle_id: "4xlarge_3_0",
         instance_type: "4xlarge",
-        name: "4XLarge",
+        name: "4Xlarge",
         platform: LINUX_UNIX,
         cpu_count: 16,
         ram_size_in_gb: 64.0,
         disk_size_in_gb: 1_280,
         transfer_per_month_in_gb: 8_192,
         power: 6_000,
-        price: 320.0,
+        price: 324.0,
     },
     Expected {
         bundle_id: "micro_win_3_0",
         instance_type: "micro",
         name: "Micro",
         platform: WINDOWS,
-        cpu_count: 1,
+        cpu_count: 2,
         ram_size_in_gb: 1.0,
         disk_size_in_gb: 40,
         transfer_per_month_in_gb: 2_048,
         power: 500,
-        price: 12.0,
+        price: 16.0,
     },
     Expected {
         bundle_id: "xlarge_win_3_0",
         instance_type: "xlarge",
-        name: "XLarge",
+        name: "Xlarge",
         platform: WINDOWS,
         cpu_count: 4,
         ram_size_in_gb: 16.0,
         disk_size_in_gb: 320,
         transfer_per_month_in_gb: 6_144,
         power: 4_000,
-        price: 120.0,
+        price: 166.0,
     },
 ];
 
@@ -517,8 +517,9 @@ async fn the_windows_plan_of_a_size_costs_more_than_its_linux_plan() {
 /// rows span the published sizes and sizes the published catalog does not carry.
 ///
 /// SOURCE of the derivation: `Bundle$name`, "A friendly name for the bundle
-/// (`Micro`)" — the size token title-cased, with an `xlarge` token written
-/// `XLarge` because its leading `x` abbreviates "extra".
+/// (`Micro`)" — the size token with its first letter upper-cased, so a token that
+/// opens with a multiplier capitalises the letter after it (`2xlarge` ->
+/// `2Xlarge`), the form the recorded plan names carry.
 #[test]
 fn the_friendly_name_is_the_size_token_title_cased() {
     let rows: &[(&str, &str)] = &[
@@ -527,13 +528,13 @@ fn the_friendly_name_is_the_size_token_title_cased() {
         ("small", "Small"),
         ("medium", "Medium"),
         ("large", "Large"),
-        ("xlarge", "XLarge"),
-        ("2xlarge", "2XLarge"),
-        ("4xlarge", "4XLarge"),
+        ("xlarge", "Xlarge"),
+        ("2xlarge", "2Xlarge"),
+        ("4xlarge", "4Xlarge"),
         // Sizes the published catalog does not carry: the derivation is the rule,
         // not a lookup table of the sizes served today.
-        ("8xlarge", "8XLarge"),
-        ("16xlarge", "16XLarge"),
+        ("8xlarge", "8Xlarge"),
+        ("16xlarge", "16Xlarge"),
         ("tiny", "Tiny"),
         ("", ""),
     ];
@@ -679,13 +680,14 @@ fn the_slice_rule_reports_an_inactive_plan_only_when_asked_for_it() {
         let case = row.case;
         for (include_inactive, expected) in [(false, row.active_only), (true, row.everything)] {
             let reported = state::bundles_from(&row.catalog, include_inactive);
-            // One entry per size and platform, in the catalog's own order.
-            let want: Vec<String> = expected
+            // One entry per platform and size: the plans of a platform in the
+            // catalog's own order, the platforms in the published order.
+            let want: Vec<String> = state::BUNDLE_PLATFORMS
                 .iter()
-                .flat_map(|size| {
-                    state::BUNDLE_PLATFORMS
-                        .iter()
-                        .map(move |platform| state::bundle_id(size, platform, state::BUNDLE_GENERATION))
+                .flat_map(|platform| {
+                    expected.iter().map(move |size| {
+                        state::bundle_id(size, platform, state::BUNDLE_GENERATION)
+                    })
                 })
                 .collect();
             let got: Vec<String> = reported
