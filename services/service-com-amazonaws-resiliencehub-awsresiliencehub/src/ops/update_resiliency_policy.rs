@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResiliencyPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResiliencyPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResiliencyPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a PARTIAL update of the policy record held in
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::policies`] — every
+//! member the request carries replaces the stored one in full, every member it omits is
+//! left alone, and `estimatedCostTier` is recomputed from the stored disruption set, so
+//! the response and every later `DescribeResiliencyPolicy` read agree with the write.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +173,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResiliencyPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResiliencyPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResiliencyPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // The boundary constraint validator already refused every modeled
+        // constraint on this input, `tier`'s and `dataLocationConstraint`'s value
+        // sets and `FailurePolicy`'s `@range(min: 0)` included. What it does NOT
+        // walk is a map's KEY, so `DisruptionPolicy`'s `DisruptionType` keys are
+        // checked here — the same check `CreateResiliencyPolicy` makes, because a
+        // disruption set reaches the store through either operation.
+        if let Some(disruption_policy) = input.policy.as_ref() {
+            // NOT the model's: `DisruptionPolicy` carries no `@length(min: 1)`, so
+            // this is the service's own rule — a resiliency policy that names no
+            // disruption type states no objective at all, so an update cannot leave
+            // one holding an empty set either.
+            if disruption_policy.is_empty() {
+                return Err(invalid(
+                    "policy: a resiliency policy must carry a failure policy for at least one \
+                     disruption type",
+                ));
+            }
+            // Sorted, so the refusal a request earns does not depend on hash order.
+            let mut disruption_types: Vec<&String> = disruption_policy.keys().collect();
+            disruption_types.sort();
+            for disruption_type in disruption_types {
+                if let Some(message) = crate::state::enum_violation(
+                    &format!("policy.{disruption_type}"),
+                    disruption_type,
+                    DISRUPTION_TYPE_VALUES,
+                ) {
+                    return Err(invalid(message));
+                }
+            }
+        }
+
+        let mut store = state.lock();
+        let Some(stored) = store.policies.get_mut(&input.policy_arn) else {
+            return Err(policy_not_found(&input.policy_arn));
+        };
+
+        // PARTIAL update: a member the request carries replaces the stored value in
+        // full, a member it omits leaves the stored value alone.
+        if let Some(policy_name) = input.policy_name {
+            stored.policy_name = Some(policy_name);
+        }
+        if let Some(policy_description) = input.policy_description {
+            stored.policy_description = Some(policy_description);
+        }
+        if let Some(data_location_constraint) = input.data_location_constraint {
+            stored.data_location_constraint = Some(data_location_constraint);
+        }
+        if let Some(tier) = input.tier {
+            stored.tier = Some(tier);
+        }
+        if let Some(disruption_policy) = input.policy {
+            // `estimatedCostTier` is the service's own derivation from the
+            // disruption set, so it is recomputed from what is now stored rather
+            // than carried over from the record the update replaced.
+            stored.estimated_cost_tier = Some(crate::state::estimated_cost_tier(&disruption_policy));
+            stored.policy = Some(disruption_policy);
+        }
+
+        Ok(UpdateResiliencyPolicyOutput {
+            policy: stored.clone(),
+        })
     }
+}
+
+/// A 400 `ValidationException` carrying `message`.
+///
+/// The MODELED error, not `crate::scaffolded::Scaffolded::validation`: this
+/// operation declares `ValidationException`, so the modeled shape is what a client
+/// deserializes (see the note in `crate::scaffolded`).
+fn invalid(message: impl Into<String>) -> UpdateResiliencyPolicyError {
+    UpdateResiliencyPolicyErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> UpdateResiliencyPolicyError {
+    UpdateResiliencyPolicyErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for a `policyArn` no `CreateResiliencyPolicy`
+/// ever minted, or one a `DeleteResiliencyPolicy` has since removed.
+fn policy_not_found(policy_arn: &str) -> UpdateResiliencyPolicyError {
+    UpdateResiliencyPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("ResiliencyPolicy {policy_arn} not found")),
+        resource_id: Some(policy_arn.to_string()),
+        resource_type: Some("ResiliencyPolicy".to_string()),
+    })
+    .into()
 }

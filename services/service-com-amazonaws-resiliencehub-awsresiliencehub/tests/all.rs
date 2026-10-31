@@ -31,5 +31,7 @@ mod publish_app_version;
 mod reported_output_members;
 #[path = "all/resiliency_policy_deletion.rs"]
 mod resiliency_policy_deletion;
+#[path = "all/resiliency_policy_update.rs"]
+mod resiliency_policy_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
