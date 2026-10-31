@@ -393,8 +393,10 @@ async fn an_entry_that_cannot_be_deleted_fails_on_its_own_and_changes_nothing() 
     /// The `Failure$reason` for an entry that names nothing in this account: the ECS
     /// "API failure reasons" list's `MISSING`.
     const MISSING: &str = "MISSING";
-    /// The `Failure$reason` for an entry naming a revision that was never deregistered.
-    const NOT_INACTIVE: &str = "Task definition must be in INACTIVE status to be deleted.";
+    /// The `Failure$reason` for an entry naming a revision that was never deregistered:
+    /// Amazon ECS names the status that blocks the delete and the step that clears it.
+    const NOT_INACTIVE: &str = "The specified task definition is still in ACTIVE status. \
+                                Please deregister the target and try again.";
 
     // The rows span the ways ONE entry can fail: a revision that is still ACTIVE (in
     // both reference forms), a revision number the family never minted, a revision of a

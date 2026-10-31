@@ -344,6 +344,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A deployment configuration this request NAMES has to be one a deployment could
+        // run: its percentages are percentages of the service's `desiredCount`, so a
+        // value outside the range its member admits is refused and nothing of the update
+        // is written — the same check the create of a service makes.
+        if let Some(configuration) = input.deployment_configuration.as_ref() {
+            if let Some(message) = crate::state::deployment_configuration_violation(configuration) {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         // "The platform version that your tasks in the service run on ... If one isn't
         // specified, the LATEST platform version is used": a version this service does
         // not know names no platform, which is what `PlatformUnknownException` is

@@ -323,8 +323,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(RunTaskErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(
-                        "launchType must be omitted when capacityProviderStrategy is \
-                         specified"
+                        crate::state::LAUNCH_TYPE_WITH_CAPACITY_PROVIDER_STRATEGY_MESSAGE
                             .to_string(),
                     ),
                 },

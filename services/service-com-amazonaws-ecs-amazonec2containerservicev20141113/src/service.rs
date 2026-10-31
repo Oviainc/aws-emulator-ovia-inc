@@ -89,13 +89,69 @@ const INVALID_PARAMETER_MESSAGE: &str =
     "The specified parameter isn't valid. Review the available parameters for the API \
      request.";
 
+/// Whether `violation` is a `tags` entry whose key or value carries a character the tag
+/// character set does not admit.
+///
+/// The offending value sits under the `tags` member the request carried it in, and what it
+/// failed is that member's `@pattern` — the one constraint on a tag that is about its
+/// CHARACTERS, which is what Amazon ECS answers its own tag sentence for. A tag that is
+/// too long fails a length bound instead and keeps the framework's clause.
+fn is_invalid_tag_character(violation: &Violation) -> bool {
+    matches!(violation.kind, ViolationKind::Pattern(_))
+        && violation
+            .path
+            .split('.')
+            .next()
+            .is_some_and(|member| member == TAGS_MEMBER)
+}
+
+/// The member a request carries its caller-supplied tag set in.
+const TAGS_MEMBER: &str = "tags";
+
+/// The sentence a capacity-provider-strategy entry's `base` or `weight` outside its
+/// modelled range earns, or `None` when `violation` is about something else.
+///
+/// Amazon ECS words these two in the strategy's own terms
+/// ([`crate::state::capacity_provider_strategy_value_message`]), so the refusal is keyed
+/// on the position the value sits in: an entry of a member whose name ENDS in the strategy
+/// shape's own name — `capacityProviderStrategy` on the operations that place tasks, and
+/// `defaultCapacityProviderStrategy` on the ones that set a cluster's default — and the
+/// member of that entry that crossed a numeric bound.
+fn capacity_provider_strategy_bound(violation: &Violation) -> Option<String> {
+    if !matches!(
+        violation.kind,
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+    ) {
+        return None;
+    }
+    let list = violation.path.split('.').next()?;
+    if !list
+        .to_ascii_lowercase()
+        .ends_with(CAPACITY_PROVIDER_STRATEGY_SUFFIX)
+    {
+        return None;
+    }
+    let member = violation.path.rsplit('.').next()?;
+    let value = violation.value.as_deref()?;
+    crate::state::capacity_provider_strategy_value_message(member, value)
+}
+
+/// The tail every member carrying a capacity provider strategy shares, lowercased so the
+/// comparison is about the SHAPE the member holds and not about how the member spells its
+/// own prefix.
+const CAPACITY_PROVIDER_STRATEGY_SUFFIX: &str = "capacityproviderstrategy";
+
 /// How this service words the refusal of a request whose values failed the rules the
 /// model declares.
 ///
-/// Three cases, in the order they are decided. A cluster read that asks for an unknown
+/// The cases, in the order they are decided. A cluster read that asks for an unknown
 /// `include` field is the one such refusal Amazon ECS states in its own sentence
-/// ([`INVALID_CLUSTER_IDENTIFIER`]). A value outside an ENUM's value set is worded from
-/// the request — the member in Amazon ECS's own words and the values it accepts
+/// ([`INVALID_CLUSTER_IDENTIFIER`]). A tag whose characters are outside the set a tag
+/// admits, and a capacity-provider-strategy `base` or `weight` outside its range, are
+/// conditions Amazon ECS words in DOMAIN terms rather than in the model's — one fixed
+/// sentence about the tag set, and the strategy member with its whole range — so neither
+/// keeps the generic clause. A value outside an ENUM's value set is worded from the
+/// request — the member in Amazon ECS's own words and the values it accepts
 /// ([`crate::state::enum_value_message`]), the sentence the corpus records for
 /// `assignPublicIp`; when more than one value is outside its set, the sentence names the
 /// FIRST of them, which is the one member the caller has to change first, as every other
@@ -106,6 +162,12 @@ const INVALID_PARAMETER_MESSAGE: &str =
 fn refusal_message(violations: &[Violation]) -> String {
     if violations.iter().any(is_unknown_cluster_field) {
         return INVALID_CLUSTER_IDENTIFIER.to_string();
+    }
+    if violations.iter().any(is_invalid_tag_character) {
+        return crate::state::INVALID_TAG_CHARACTERS_MESSAGE.to_string();
+    }
+    if let Some(message) = violations.iter().find_map(capacity_provider_strategy_bound) {
+        return message;
     }
     let outside_an_enum = violations.iter().find_map(|violation| match &violation.kind {
         ViolationKind::EnumValue(accepted) => Some((&violation.path, accepted)),

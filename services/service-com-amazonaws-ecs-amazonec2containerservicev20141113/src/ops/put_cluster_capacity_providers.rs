@@ -187,9 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the ECS store is unavailable".to_string()),
             })
         })?;
-        let _ = ctx;
-
         let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
+        let region = crate::state::request_region(ctx);
 
         // The caller chooses both list lengths, and every check below walks one against
         // the other, so the magnitudes are capped BEFORE any of that work: Amazon ECS
@@ -300,6 +299,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // Every name the request carries has to resolve to a capacity provider this
+        // account holds — one a caller created, or one of the providers Amazon ECS
+        // manages: "If specifying a capacity provider that uses an Auto Scaling group,
+        // the capacity provider must already be created." A name that resolves to
+        // nothing is refused BEFORE the association is written, so the cluster is never
+        // left pointing at a provider that cannot exist. Both lists are checked, in the
+        // order the request declares them.
+        let named_providers = input.capacity_providers.iter().chain(
+            input
+                .default_capacity_provider_strategy
+                .iter()
+                .map(|item| &item.capacity_provider),
+        );
+        for name in named_providers {
+            if guard.capacity_provider(name, &region).is_none() {
+                return Err(
+                    PutClusterCapacityProvidersErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
         }
 
         // "Any existing capacity providers that are associated with a cluster that are

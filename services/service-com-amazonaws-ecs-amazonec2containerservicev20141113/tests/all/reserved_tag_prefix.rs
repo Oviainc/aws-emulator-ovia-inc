@@ -36,7 +36,7 @@ const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
 /// implemented — the set the rule has to hold over, not just the one the report named.
 /// (The remaining `tags`-carrying operations — `CreateTaskSet`, `StartTask`,
 /// `CreateGateway`, `CreateDaemon`, `RegisterDaemonTaskDefinition` — still answer 501.)
-const TAGGING_OPERATIONS: [&str; 7] = [
+pub(crate) const TAGGING_OPERATIONS: [&str; 7] = [
     "CreateCapacityProvider",
     "CreateCluster",
     "CreateService",
@@ -49,7 +49,12 @@ const TAGGING_OPERATIONS: [&str; 7] = [
 /// A request body for `operation` carrying `tags`, identifying whatever resource that
 /// operation needs by `name` (and, for `TagResource`, by the ARN of a cluster that is
 /// already there).
-fn request_with_tags(operation: &str, name: &str, cluster_arn: &str, tags: &Value) -> Value {
+pub(crate) fn request_with_tags(
+    operation: &str,
+    name: &str,
+    cluster_arn: &str,
+    tags: &Value,
+) -> Value {
     match operation {
         "CreateCapacityProvider" => json!({
             "name": name,
@@ -92,7 +97,7 @@ fn request_with_tags(operation: &str, name: &str, cluster_arn: &str, tags: &Valu
 /// operation's own reader — empty when the refusal created nothing. `RunTask`,
 /// `RegisterContainerInstance` and `TagResource` name no new record of their own, so they
 /// are checked by the cluster-wide counts in the test body instead.
-async fn created(
+pub(crate) async fn created(
     router: &MultiServiceRouter,
     operation: &str,
     name: &str,
@@ -403,7 +408,7 @@ async fn cluster_listing(router: &MultiServiceRouter, operation: &str, case: &st
 
 /// A router with this service mounted, the cluster the in-cluster resources live in, the
 /// capacity a placed task needs, and one task-definition revision to run.
-async fn service_with_setup() -> MultiServiceRouter {
+pub(crate) async fn service_with_setup() -> MultiServiceRouter {
     let router = crate::ecs_wire::service();
     setup(&router).await;
     router

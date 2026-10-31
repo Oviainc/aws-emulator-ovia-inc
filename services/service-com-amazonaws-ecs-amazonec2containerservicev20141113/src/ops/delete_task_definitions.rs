@@ -238,10 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // revision that is still `ACTIVE` is reported as a failure of its own entry,
             // and left exactly as it was stored.
             if record.status == crate::state::TASK_DEFINITION_ACTIVE {
-                failures.push(crate::state::not_inactive_failure(
-                    &record.arn,
-                    &record.status,
-                ));
+                failures.push(crate::state::active_task_definition_failure(&record.arn));
                 continue;
             }
             // "When you delete a task definition revision, it is immediately transitions

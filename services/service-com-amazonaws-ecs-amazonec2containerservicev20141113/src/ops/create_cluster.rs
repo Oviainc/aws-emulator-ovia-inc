@@ -270,8 +270,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Both capacity-provider lists are caller-supplied and every entry below costs a
+        // lookup in the provider store, so their magnitudes are capped BEFORE the store is
+        // locked, at the same Amazon ECS quota for capacity providers per cluster the
+        // later association is capped at ([`crate::ops::put_cluster_capacity_providers`]).
+        for (entries, len) in [
+            (
+                "capacity providers",
+                input.capacity_providers.as_ref().map_or(0, Vec::len),
+            ),
+            (
+                "default capacity provider strategy entries",
+                input
+                    .default_capacity_provider_strategy
+                    .as_ref()
+                    .map_or(0, Vec::len),
+            ),
+        ] {
+            if len > crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS {
+                return Err(CreateClusterErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::at_most_items_message(
+                            entries,
+                            crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
+
+        // A `capacityProviders` list associates providers with the cluster as it is
+        // created, so every name it carries — and every one its default strategy names —
+        // has to resolve to a provider this account holds, exactly as a later
+        // association requires ([`crate::ops::put_cluster_capacity_providers`]).
+        let region = crate::state::request_region(ctx);
+        let named_providers = input
+            .capacity_providers
+            .iter()
+            .flatten()
+            .chain(
+                input
+                    .default_capacity_provider_strategy
+                    .iter()
+                    .flatten()
+                    .map(|item| &item.capacity_provider),
+            );
+        for name in named_providers {
+            if guard.capacity_provider(name, &region).is_none() {
+                return Err(CreateClusterErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
 
         // A cluster name identifies the cluster, so creating one that already exists is
         // not a second cluster: the stored record is reported back unchanged. A DELETED
@@ -303,7 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = crate::state::ClusterRecord {
             name: name.clone(),
-            arn: crate::state::cluster_arn(&crate::state::request_region(ctx), &name),
+            arn: crate::state::cluster_arn(&region, &name),
             status: crate::state::CLUSTER_ACTIVE.to_string(),
             tags: input.tags.clone().unwrap_or_default(),
             settings: input.settings.clone().unwrap_or_default(),

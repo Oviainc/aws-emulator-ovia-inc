@@ -560,6 +560,13 @@ pub const MAX_CAPACITY_PROVIDERS: usize = 64;
 /// [`validate_cluster_settings`].
 pub const CLUSTER_SETTING_VALUES: [&str; 3] = ["enhanced", "enabled", "disabled"];
 
+/// `InvalidParameterException$message` for a `ClusterSetting` whose `value` is not one of
+/// [`CLUSTER_SETTING_VALUES`]. Amazon ECS names the MEMBER of the setting structure that
+/// is wrong in one fixed sentence, and echoes neither the value the request carried nor
+/// the set it was checked against.
+pub const INVALID_CLUSTER_SETTING_VALUE_MESSAGE: &str = "Invalid setting 'value'";
+
+
 /// `ExecuteCommandConfiguration$logging` value that carries its own destination — the
 /// member's doc: "OVERRIDE: Specify the logging details as a part of logConfiguration."
 pub const EXECUTE_COMMAND_LOGGING_OVERRIDE: &str = "OVERRIDE";
@@ -966,6 +973,64 @@ pub const DEFAULT_VALIDATED_LAUNCH_TYPES: [&str; 3] = ["EXTERNAL", "EC2", LAUNCH
 /// [`CAPACITY_PROVIDER_RESERVED_PREFIXES`]) and exist whether or not anybody asked, so
 /// they are resolved rather than stored ([`managed_capacity_provider`]).
 pub const MANAGED_CAPACITY_PROVIDERS: [&str; 2] = ["FARGATE", "FARGATE_SPOT"];
+
+/// `InvalidParameterException$message` for a request that names a capacity provider this
+/// account holds none of — neither a created one nor one of
+/// [`MANAGED_CAPACITY_PROVIDERS`]. `CapacityProviderStrategyItem`: "If specifying a
+/// capacity provider that uses an Auto Scaling group, the capacity provider must already
+/// be created." One fixed sentence that names no provider, answered by every operation
+/// that resolves a provider by name.
+pub const CAPACITY_PROVIDER_NOT_FOUND_MESSAGE: &str =
+    "The specified capacity provider was not found. Specify a valid capacity provider and \
+     try again.";
+
+/// `InvalidParameterException$message` for a request that supplies BOTH a `launchType` and
+/// a `capacityProviderStrategy`. The two members name the same thing two ways — where the
+/// tasks run — so a request that carries both says it twice: "If a
+/// `capacityProviderStrategy` is specified, the `launchType` parameter must be omitted."
+/// One fixed sentence, naming neither member's value, answered by every operation that
+/// takes the pair.
+pub const LAUNCH_TYPE_WITH_CAPACITY_PROVIDER_STRATEGY_MESSAGE: &str =
+    "Specifying both a launch type and capacity provider strategy is not supported. Remove \
+     one and try again.";
+
+/// The inclusive range `CapacityProviderStrategyItem$base` admits, from the member's own
+/// `@range` trait and its doc ("The valid range is 0 to 100,000").
+pub const CAPACITY_PROVIDER_STRATEGY_BASE_RANGE: (i64, i64) = (0, 100_000);
+
+/// The inclusive range `CapacityProviderStrategyItem$weight` admits, from the member's own
+/// `@range` trait and its doc ("The valid range is 0 to 1,000").
+pub const CAPACITY_PROVIDER_STRATEGY_WEIGHT_RANGE: (i64, i64) = (0, 1_000);
+
+/// `InvalidParameterException$message` for a capacity-provider-strategy entry whose
+/// `base` or `weight` is outside the range that member admits, or `None` when `member` is
+/// not one of those two.
+///
+/// Amazon ECS speaks in the strategy's own terms rather than in the model's: it names the
+/// member, the offending value AS THE REQUEST SENT IT, and the whole range the member
+/// takes — not the one bound that was crossed and no member path.
+pub fn capacity_provider_strategy_value_message(member: &str, value: &str) -> Option<String> {
+    let (min, max) = match member {
+        "base" => CAPACITY_PROVIDER_STRATEGY_BASE_RANGE,
+        "weight" => CAPACITY_PROVIDER_STRATEGY_WEIGHT_RANGE,
+        _ => return None,
+    };
+    Some(format!(
+        "The specified {member} value '{value}' is invalid. Specify an integer between \
+         {min} and {max} and try again."
+    ))
+}
+
+/// `InvalidParameterException$message` for a `tags` entry whose key or value carries a
+/// character outside the set a tag admits. The `Tag` doc: "Generally allowed characters
+/// are: letters, numbers, and spaces representable in UTF-8, and the following
+/// characters: + - = . _ : / @" — the same set the `TagKey`/`TagValue` `@pattern` states.
+/// ONE fixed sentence: it names the set, and neither the member that carried the
+/// character nor the value it was in.
+pub const INVALID_TAG_CHARACTERS_MESSAGE: &str =
+    "Some tags contain invalid characters. Valid characters: UTF-8 letters, spaces, numbers \
+     and _ . / = + - : @.";
+
 
 /// The `OSFamily` a revision that declares no `runtimePlatform` runs on. `RuntimePlatform
 /// $operatingSystemFamily` is "The operating system", whose `OSFamily` enum
@@ -1618,6 +1683,53 @@ pub const DAEMON_MAXIMUM_PERCENT: i32 = 100;
 /// Services SDKs, and the APIs".
 pub const DAEMON_MINIMUM_HEALTHY_PERCENT: i32 = 0;
 
+/// The smallest `minimumHealthyPercent` a deployment configuration may name. The member
+/// is "a lower limit on the number of your service's tasks that must remain in the
+/// RUNNING state during a deployment, AS A PERCENTAGE of the desiredCount": a percentage
+/// of a count is never negative.
+pub const MIN_MINIMUM_HEALTHY_PERCENT: i32 = 0;
+
+/// The largest `minimumHealthyPercent` a deployment configuration may name: the member
+/// bounds how much of the `desiredCount` has to stay RUNNING, and all of it is 100% —
+/// which is also the value its own doc gives as the replica default ("The default value
+/// for a replica service for minimumHealthyPercent is 100%"), the top of the range.
+pub const MAX_MINIMUM_HEALTHY_PERCENT: i32 = 100;
+
+/// `InvalidParameterException$message` for a `minimumHealthyPercent` outside its range.
+/// Amazon ECS states the member and the ONE bound the value crossed, and echoes neither
+/// the value the request carried nor the other bound.
+fn minimum_healthy_percent_message(bound: &str, limit: i32) -> String {
+    format!("minimumHealthyPercent must be at {bound} {limit}")
+}
+
+/// The refusal a requested `deploymentConfiguration` earns when a percentage it names is
+/// outside the range that percentage admits, or `None` when every member is in range.
+///
+/// Only `minimumHealthyPercent` is bounded here: `maximumPercent` is an UPPER limit on
+/// the tasks a deployment may run, which its own doc puts above the desired count ("a
+/// maximumPercent value of 200%"), so a value over 100 is one the member is for.
+///
+/// Spelled once for every operation that takes a deployment configuration, so a
+/// configuration one of them refuses cannot be written by another.
+pub fn deployment_configuration_violation(
+    configuration: &DeploymentConfiguration,
+) -> Option<String> {
+    let percent = configuration.minimum_healthy_percent?;
+    if percent < MIN_MINIMUM_HEALTHY_PERCENT {
+        return Some(minimum_healthy_percent_message(
+            "least",
+            MIN_MINIMUM_HEALTHY_PERCENT,
+        ));
+    }
+    if percent > MAX_MINIMUM_HEALTHY_PERCENT {
+        return Some(minimum_healthy_percent_message(
+            "most",
+            MAX_MINIMUM_HEALTHY_PERCENT,
+        ));
+    }
+    None
+}
+
 /// `stopCode` for a task the service scheduler stopped (scaling in, or replacing the
 /// task set of a superseded deployment), from the `TaskStopCode` enum.
 pub const STOP_CODE_SERVICE_SCHEDULER: &str = "ServiceSchedulerInitiated";
@@ -1823,15 +1935,46 @@ pub fn invalid_container_setting_message(member: &str, container_name: &str) -> 
     format!("Invalid '{member}' setting for container '{container_name}'.")
 }
 
+/// `ClientException$message` for a container definition whose SOFT memory limit is above
+/// its HARD one. The `memoryReservation` doc: a container "can consume more memory when
+/// it needs to, up to either the hard limit specified with the `memory` parameter", and
+/// "if you specify both, `memory` must be greater than `memoryReservation`" — so a
+/// reservation above the hard limit reserves memory the container may never use. The
+/// sentence names the container the request gave the pair on and the two members, and
+/// carries neither value; the limit it states is the one Amazon ECS enforces, so a pair
+/// that is EQUAL is accepted.
+pub fn container_memory_below_reservation_message(container_name: &str) -> String {
+    format!(
+        "Invalid setting for container '{container_name}'. 'memory' must be greater than \
+         or equal to 'memoryReservation'."
+    )
+}
+
+/// `ClientException$message` for a container definition that leaves a member a runnable
+/// container cannot be built without — its `name`, which identifies it inside the
+/// revision, or its `image`, which is what runs — unset or empty. Amazon ECS states the
+/// member of the container structure in ONE fixed sentence per member, naming no position
+/// in the list and echoing none of the request's values.
+pub fn container_member_required_message(member: &str) -> String {
+    format!("Container.{member} should not be null or empty.")
+}
+
+/// `ClientException$message` for a registration whose `containerDefinitions` describe no
+/// container at all: "A list of container definitions ... that describe the different
+/// containers that make up your task" — a task is made of containers, so an empty list
+/// describes no task. One fixed sentence, carrying nothing of the request.
+pub const EMPTY_CONTAINER_LIST_MESSAGE: &str = "Container list cannot be empty.";
+
 /// The first of ONE container definition's numeric resource reservations that names a
 /// value outside the range its unit admits, stated as
 /// [`invalid_container_setting_message`] states it, or `None` when every one of them is in
 /// range.
 ///
 /// The members are examined in a FIXED order — the CPU count, then the hard memory amount,
-/// then the soft one — so the refusal a definition earns never depends on anything but its
-/// values. Spelled once for every registration that carries container definitions, so the
-/// refusal cannot drift between the plain and the daemon task definition.
+/// then the soft one, then the two memory amounts AGAINST each other — so the refusal a
+/// definition earns never depends on anything but its values. Spelled once for every
+/// registration that carries container definitions, so the refusal cannot drift between
+/// the plain and the daemon task definition.
 pub fn container_reservation_violation(
     container_name: &str,
     cpu: i32,
@@ -1847,6 +1990,13 @@ pub fn container_reservation_violation(
     ] {
         if amount.is_some_and(|mib| mib < MIN_CONTAINER_MEMORY_MIB) {
             return Some(invalid_container_setting_message(member, container_name));
+        }
+    }
+    // Each is in range on its own; they are only usable TOGETHER when the hard limit is
+    // at least the soft one.
+    if let (Some(memory), Some(reservation)) = (memory, memory_reservation) {
+        if memory < reservation {
+            return Some(container_memory_below_reservation_message(container_name));
         }
     }
     None
@@ -8309,20 +8459,23 @@ impl ClusterFields {
 /// a task definition revision before you delete it", which is also why the operation
 /// reports it per entry rather than refusing the whole batch — one entry of a request may
 /// be deletable while another is not.
-pub fn not_inactive_failure(arn: &str, status: &str) -> Failure {
+///
+/// The entry carries the ARN of the revision the entry named and the reason, and NOTHING
+/// else: the status the revision is in is what the reason already states.
+pub fn active_task_definition_failure(arn: &str) -> Failure {
     Failure {
         arn: Some(arn.to_string()),
-        reason: Some(TASK_DEFINITION_NOT_INACTIVE_REASON.to_string()),
-        // "The details of the failure": the status the revision is actually in, which is
-        // what tells the caller whether to deregister it or to wait for a delete already
-        // under way.
-        detail: Some(format!("The task definition is in {status} status.")),
+        reason: Some(TASK_DEFINITION_ACTIVE_FAILURE_REASON.to_string()),
+        detail: None,
     }
 }
 
-/// `Failure$reason` for a revision a delete cannot act on because it is not `INACTIVE`.
-pub const TASK_DEFINITION_NOT_INACTIVE_REASON: &str =
-    "Task definition must be in INACTIVE status to be deleted.";
+/// `Failure$reason` for a revision a delete cannot act on because it is still `ACTIVE`.
+/// Amazon ECS states the status that blocks the delete and the step that clears it, in
+/// one fixed sentence carrying none of the request's values.
+pub const TASK_DEFINITION_ACTIVE_FAILURE_REASON: &str =
+    "The specified task definition is still in ACTIVE status. Please deregister the target \
+     and try again.";
 
 /// A `Failure` for an id that names nothing: `reason: "MISSING"`.
 pub fn missing_failure(arn: &str) -> Failure {
@@ -8515,10 +8668,7 @@ pub fn validate_cluster_settings(settings: &[ClusterSetting]) -> Result<(), Stri
     for setting in settings {
         let value = setting.value.as_deref().unwrap_or_default();
         if !CLUSTER_SETTING_VALUES.contains(&value) {
-            return Err(format!(
-                "settings value must be one of {}; got {value:?}",
-                CLUSTER_SETTING_VALUES.join(", ")
-            ));
+            return Err(INVALID_CLUSTER_SETTING_VALUE_MESSAGE.to_string());
         }
     }
     Ok(())

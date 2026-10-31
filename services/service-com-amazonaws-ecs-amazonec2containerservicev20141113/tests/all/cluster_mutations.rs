@@ -953,12 +953,26 @@ async fn a_capacity_provider_strategy_must_name_associated_providers() {
     );
     // The Amazon ECS quota "Capacity providers per cluster" is 20, and a strategy
     // entry must name one of the associated providers, so neither list may be longer:
-    // the published bound is accepted and one past it is refused.
+    // the published bound is accepted and one past it is refused. Every name is a
+    // provider this account actually holds, since an association only takes providers
+    // that exist.
     let at_bound: Vec<String> = (0..MAX_CLUSTER_CAPACITY_PROVIDERS)
         .map(|index| format!("provider-{index}"))
         .collect();
     let mut past_bound = at_bound.clone();
     past_bound.push("provider-too-many".to_string());
+    for name in &past_bound {
+        ok(
+            &router,
+            "CreateCapacityProvider",
+            json!({
+                "name": name,
+                "autoScalingGroupProvider": { "autoScalingGroupArn": format!("asg-{name}") },
+            }),
+            "the providers the association names",
+        )
+        .await;
+    }
     ok(
         &router,
         "PutClusterCapacityProviders",

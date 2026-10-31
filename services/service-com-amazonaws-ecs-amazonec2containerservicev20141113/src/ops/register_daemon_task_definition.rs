@@ -216,10 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.container_definitions.is_empty() {
             return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
                 ClientException {
-                    message: Some(
-                        "containerDefinitions must describe at least one container"
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::EMPTY_CONTAINER_LIST_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -239,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every container is identified by its name within the definition, and needs an
         // image to be runnable.
         let mut names = ::std::collections::HashSet::new();
-        for (index, definition) in input.container_definitions.iter().enumerate() {
+        for definition in &input.container_definitions {
             let Some(name) = definition
                 .name
                 .as_deref()
@@ -247,10 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             else {
                 return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
                     ClientException {
-                        message: Some(format!(
-                            "Invalid setting for containerDefinitions[{index}]: 'name' is \
-                             required"
-                        )),
+                        message: Some(crate::state::container_member_required_message("name")),
                     },
                 )
                 .into());
@@ -258,9 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if definition.image.trim().is_empty() {
                 return Err(RegisterDaemonTaskDefinitionErrorModeled::ClientException(
                     ClientException {
-                        message: Some(format!(
-                            "Invalid setting for container '{name}': 'image' is required"
-                        )),
+                        message: Some(crate::state::container_member_required_message("image")),
                     },
                 )
                 .into());

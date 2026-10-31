@@ -422,8 +422,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(
-                        "launchType must be omitted when capacityProviderStrategy is \
-                         specified"
+                        crate::state::LAUNCH_TYPE_WITH_CAPACITY_PROVIDER_STRATEGY_MESSAGE
                             .to_string(),
                     ),
                 },
@@ -465,6 +464,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A deployment configuration this request NAMES has to be one a deployment could
+        // run: its percentages are percentages of the service's `desiredCount`, so a
+        // value outside the range its member admits is refused and no service is created
+        // — the same check an update of a service makes.
+        if let Some(configuration) = input.deployment_configuration.as_ref() {
+            if let Some(message) = crate::state::deployment_configuration_violation(configuration) {
+                return Err(CreateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
         }
 
         // "A task definition must be specified if the service uses either the ECS or

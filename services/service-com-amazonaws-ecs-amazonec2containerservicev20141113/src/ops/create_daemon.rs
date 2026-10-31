@@ -319,10 +319,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(provider) = guard.capacity_provider(&name, &region) else {
                 return Err(CreateDaemonErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "capacityProviderArns names capacity provider {name:?}, which \
-                             this account does not hold"
-                        )),
+                        message: Some(
+                            crate::state::CAPACITY_PROVIDER_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());
