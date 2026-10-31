@@ -109,14 +109,17 @@ service's operations.
 ## Seeding the event trackers and datasets this service ingests into
 
 This service is pure ingestion and models no control-plane operation: a `trackingId`
-comes from `CreateEventTracker` and a `datasetArn` from `CreateDataset`, both in the
-*Amazon Personalize* service (`service-com-amazonaws-personalize-amazonpersonalize`),
-not here. So all five operations serve only a target that is in this crate's registry,
-and refuse anything else — `ResourceNotFoundException` (404) where the operation models
-it, `InvalidInputException` (400) for `PutEvents`, which does not.
+comes from `CreateEventTracker` — or, for an Action interactions dataset, from
+`CreateDataset`, which provides one with the dataset — and a `datasetArn` from
+`CreateDataset`, all in the *Amazon Personalize* service
+(`service-com-amazonaws-personalize-amazonpersonalize`), not here. So all five
+operations serve only a target that is in this crate's registry and refuse anything
+else: a metadata put answers `InvalidInputException` (400) for a `datasetArn` that
+resolves to no dataset (`Invalid datasetArn`) or to a dataset of another type
+(`<arn> is not a valid <TYPE> dataset.`), and the event streams refuse an unresolvable
+`trackingId`.
 
-A test, or a sibling Personalize emulator sharing the same engine, seeds the registry
-through the two seam methods on the state struct:
+The registry is seeded through the two seam methods on the state struct:
 
 ```rust
 let state = engine.state::<ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState>();
@@ -125,9 +128,13 @@ state.lock().register_dataset("arn:aws:personalize:us-east-1:123456789012:datase
 ```
 
 Both are idempotent and never discard what was already ingested; each answers `None`
-once the store holds its documented maximum. Until the Personalize control-plane crate
-calls them from `CreateEventTracker` / `CreateDataset` (a follow-up this crate cannot
-make, since it cannot reach that service's handlers — filed as
-`issues/things-that-do-not-work/20261022T000000Z-personalize-control-plane-does-not-register-event-trackers-or-datasets-for-ingestion.md`),
-an SDK client talking to the running emulator has no wire path to register a target, so
-seeding is in-process only. `tests/all/ingestion.rs` shows the whole flow.
+once the store holds its documented maximum, and `forget_dataset` / `forget_event_tracker`
+drop a target whose resource is gone. The Personalize control plane calls them over the
+SAME shared engine: `CreateDataset` registers the dataset ARN it mints (and the tracking
+id of an Action interactions dataset) and `DeleteDataset` forgets them, so a client
+talking to the running emulator creates its target over the wire. `CreateEventTracker`
+is still a scaffolded 501 there, so a tracker of its own has no wire path yet (filed as
+`issues/things-that-do-not-work/20261022T000000Z-personalize-control-plane-does-not-register-event-trackers-or-datasets-for-ingestion.md`).
+`tests/all/ingestion.rs` drives this service alone, and
+`core/router/tests/all/personalize_ingestion_targets.rs` drives the whole create-then-ingest
+path over the wire.

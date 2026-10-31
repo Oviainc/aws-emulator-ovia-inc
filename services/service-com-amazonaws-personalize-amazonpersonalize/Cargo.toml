@@ -23,6 +23,12 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Renders the opaque `nextToken` payload as the ASCII text the model's pattern allows.
 hex = { workspace = true }
+# The tracking id Amazon Personalize provides with an Action interactions dataset, in the
+# UUID form its own ids take — minted by the maintained crate, not laid out by hand.
+uuid = { version = "1", features = ["v4"] }
+# The ingestion registry `CreateDataset` seeds and `DeleteDataset` clears, so a dataset
+# created over the wire is a target Amazon Personalize Events can ingest into.
+service-com-amazonaws-personalizeevents-amazonpersonalizeevents = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

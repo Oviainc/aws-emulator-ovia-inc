@@ -653,6 +653,11 @@ mod logs_emf_extraction_policy_scope;
 mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]
 mod personalize_signing_name_routing;
+// Declared HERE, beside the sibling Personalize suite, for the reason the entries around it
+// record: the appended tail at the end of this file and the head of the list are both regions
+// every concurrently landing router suite puts its line in.
+#[path = "all/personalize_ingestion_targets.rs"]
+mod personalize_ingestion_targets;
 // Declared HERE, in this quiet span of the sorted list, for the reason the entries around
 // it record: the appended tail at the end of this file and the head of the list are both
 // regions every concurrently landing router suite puts its line in.

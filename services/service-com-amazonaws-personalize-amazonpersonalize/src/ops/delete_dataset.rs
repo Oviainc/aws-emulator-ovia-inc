@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The record goes, so a following `DescribeDataset` answers
         // `ResourceNotFoundException` and `ListDatasets` no longer reports it.
         let mut state = state.lock();
-        if state.datasets.remove(&input.dataset_arn).is_none() {
+        let Some(deleted) = state.datasets.remove(&input.dataset_arn) else {
             return Err(DeleteDatasetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -168,6 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        };
+
+        // The dataset no longer exists, so the ingestion registry stops resolving the
+        // targets it was created with — its ARN, and the tracking id an Action
+        // interactions dataset carries: a put against a deleted dataset is refused again.
+        if let Some(registry) = crate::state::ingestion_registry(&*self.engine) {
+            let mut registry = registry.lock();
+            registry.forget_dataset(&input.dataset_arn);
+            if let Some(tracking_id) = &deleted.tracking_id {
+                registry.forget_event_tracker(tracking_id);
+            }
         }
 
         Ok(DeleteDatasetOutput)

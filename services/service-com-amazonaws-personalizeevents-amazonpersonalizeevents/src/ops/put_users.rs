@@ -7,11 +7,12 @@
 //! [`crate::state`] are the whole result of the call.
 //!
 //! A repeated `userId` REPLACES the record stored for it — the latest call for an id is
-//! that record, not a second one. The `datasetArn` must name a dataset this emulator
-//! knows (`ResourceNotFoundException`, 404, when it does not; `ResourceInUseException`,
-//! 409, when it is marked in use), that dataset must be a USERS dataset — the type the
-//! ARN's last segment names — (`InvalidInputException`, 400, for a dataset of any other
-//! type), and `properties` must be a JSON object
+//! that record, not a second one. The `datasetArn` must resolve to a dataset this
+//! emulator knows (`InvalidInputException`, 400, "Invalid datasetArn", when it does not),
+//! that dataset must be a USERS dataset — the type the ARN's last segment names —
+//! (`InvalidInputException`, 400, "<arn> is not a valid USERS dataset.", for a dataset of
+//! any other type), and a dataset marked in use is `ResourceInUseException`, 409.
+//! `properties` must be a JSON object
 //! (`InvalidInputException`, 400). User metadata documents no reserved property keys —
 //! that rule belongs to the two event streams. The behaviour itself lives in
 //! `crate::state::put_metadata_records`, which `PutItems` and `PutActions` share.
@@ -189,11 +190,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &records,
         )
         .map_err(|failure| match failure {
-            crate::state::MetadataPutError::NotFound => {
-                PutUsersErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!("No dataset with the ARN {} exists.", input.dataset_arn)),
-                })
-            }
             crate::state::MetadataPutError::InUse => {
                 PutUsersErrorModeled::ResourceInUseException(ResourceInUseException {
                     message: Some(format!(

@@ -23,8 +23,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_personalizeevents_amazonpersonalizeevents::state::{
     ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState as PersonalizeEventsState, Dataset,
     DatasetType, MetadataKind, Record, StoredActionInteraction, StoredEvent,
-    MAX_ACTION_INTERACTIONS_PER_TRACKER, MAX_EVENTS_PER_TRACKER, MAX_EVENT_TRACKERS,
-    MAX_RECORDS_PER_DATASET_COLLECTION, RESERVED_PROPERTY_KEYS,
+    INVALID_DATASET_ARN_MESSAGE, MAX_ACTION_INTERACTIONS_PER_TRACKER, MAX_EVENTS_PER_TRACKER,
+    MAX_EVENT_TRACKERS, MAX_RECORDS_PER_DATASET_COLLECTION, RESERVED_PROPERTY_KEYS,
 };
 use service_com_amazonaws_personalizeevents_amazonpersonalizeevents::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -475,12 +475,15 @@ async fn a_batch_with_one_unusable_record_ingests_none_of_it() {
 }
 
 #[tokio::test]
-async fn an_unregistered_target_is_refused_by_every_operation_that_models_not_found() {
+async fn an_unregistered_target_is_refused_by_every_operation() {
     let emulator = Emulator::new();
 
-    // Every operation that models `ResourceNotFoundException`, with a target this
-    // emulator does not know. The dataset rows vary the ARN along its pattern
-    // (partition, region, account, resource path); the tracker row varies the id form.
+    // Every operation whose target this emulator must resolve, with a target it does not
+    // know. The dataset rows vary the ARN along its pattern (partition, region, account,
+    // resource path); the tracker row varies the id form.
+    //
+    // A `datasetArn` that resolves to no dataset is an INPUT fault, not a not-found, and
+    // the refusal names the member rather than echoing the ARN.
     let unknown_datasets = [
         "arn:aws:personalize:us-east-1:123456789012:dataset/unknown/ITEMS",
         "arn:aws-cn:personalize:cn-north-1:210987654321:dataset/other/USERS",
@@ -503,7 +506,14 @@ async fn an_unregistered_target_is_refused_by_every_operation_that_models_not_fo
         ] {
             let case = format!("{route} datasetArn={dataset_arn}");
             let reply = emulator.post(route, &body).await;
-            assert_refused(&case, &reply, 404, "ResourceNotFoundException");
+            assert_refused(&case, &reply, 400, "InvalidInputException");
+            assert!(
+                reply.body.contains(INVALID_DATASET_ARN_MESSAGE)
+                    && !reply.body.contains(dataset_arn),
+                "case {case:?}: expected the message {INVALID_DATASET_ARN_MESSAGE:?} and no \
+                 echo of the submitted ARN, got {:?}",
+                reply.body
+            );
         }
     }
 
@@ -528,7 +538,7 @@ async fn an_unregistered_target_is_refused_by_every_operation_that_models_not_fo
 
     // The target is resolved first: a request that is wrong about BOTH the target and a
     // record answers for the target, the stronger and more specific fault.
-    for (case, route, body) in [
+    for (case, route, body, status, error_type) in [
         (
             "/items unknown dataset and malformed properties",
             "/items",
@@ -536,6 +546,8 @@ async fn an_unregistered_target_is_refused_by_every_operation_that_models_not_fo
                 "datasetArn": "arn:aws:personalize:us-east-1:123456789012:dataset/unknown/ITEMS",
                 "items": [{ "itemId": "item-1", "properties": "{" }],
             }),
+            400,
+            "InvalidInputException",
         ),
         (
             "/users unknown dataset and malformed properties",
@@ -544,6 +556,8 @@ async fn an_unregistered_target_is_refused_by_every_operation_that_models_not_fo
                 "datasetArn": "arn:aws:personalize:us-east-1:123456789012:dataset/unknown/USERS",
                 "users": [{ "userId": "user-1", "properties": "not json" }],
             }),
+            400,
+            "InvalidInputException",
         ),
         (
             "/action-interactions unknown tracker and a reserved properties key",
@@ -558,10 +572,12 @@ async fn an_unregistered_target_is_refused_by_every_operation_that_models_not_fo
                     "properties": r#"{"sessionId":"x"}"#,
                 }],
             }),
+            404,
+            "ResourceNotFoundException",
         ),
     ] {
         let reply = emulator.post(route, &body).await;
-        assert_refused(case, &reply, 404, "ResourceNotFoundException");
+        assert_refused(case, &reply, status, error_type);
     }
 
     // Registering the targets is the only difference, and each now ingests through the
@@ -1372,7 +1388,7 @@ async fn the_reported_ingestion_sequence_works_end_to_end() {
             }),
         )
         .await;
-    assert_refused("PutItems unknown dataset", &unknown, 404, "ResourceNotFoundException");
+    assert_refused("PutItems unknown dataset", &unknown, 400, "InvalidInputException");
 }
 
 // ---------------------------------------------------------------------------
@@ -2100,18 +2116,17 @@ async fn a_metadata_put_serves_only_a_dataset_whose_type_matches_its_records() {
                     "case {case_label:?}: a refused put must store nothing, got {:?}",
                     stored.keys().collect::<Vec<_>>()
                 );
-                if let Some(dataset_type) = expected_type {
-                    // Both types come from the request, so the refusal names both.
-                    assert!(
-                        reply.body.contains(dataset_type.as_str())
-                            && reply.body.contains(records_type.as_str()),
-                        "case {case_label:?}: expected the message to name the dataset's type \
-                         {:?} and the records' type {:?}, got {:?}",
-                        dataset_type.as_str(),
-                        records_type.as_str(),
-                        reply.body
-                    );
-                }
+                // The refusal names the dataset the caller addressed and the type the
+                // operation serves, whatever type (or non-type) the ARN names.
+                let expected = format!(
+                    "{dataset_arn} is not a valid {} dataset.",
+                    records_type.as_str().to_ascii_uppercase()
+                );
+                assert!(
+                    reply.body.contains(&expected),
+                    "case {case_label:?}: expected the message {expected:?}, got {:?}",
+                    reply.body
+                );
             }
         }
     }

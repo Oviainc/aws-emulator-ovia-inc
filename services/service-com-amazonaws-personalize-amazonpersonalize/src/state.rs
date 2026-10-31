@@ -18,7 +18,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Dataset, DatasetGroup, DatasetGroupSummary, DatasetSchema, DatasetSummary, Tag,
+    Dataset, DatasetGroup, DatasetGroupSummary, DatasetSchema, DatasetSchemaSummary,
+    DatasetSummary, Tag,
 };
 
 /// What `CreateSchema` persists, and what `DescribeSchema` reconstructs a
@@ -68,6 +69,13 @@ pub struct DatasetRecord {
     /// The canonical spelling of the dataset type (see [`canonical_dataset_type`]).
     pub dataset_type: String,
     pub schema_arn: String,
+    /// The tracking id Amazon Personalize provides for an ACTION INTERACTIONS dataset and
+    /// for no other type: "The ID of the event tracker for an Action interactions
+    /// dataset. You specify the tracker's ID in the `PutActionInteractions` API
+    /// operation" (`smithy_query(query="doc", shape="Dataset", member="trackingId")`).
+    /// Minted once by the create and kept, so every read of the dataset reports the same
+    /// id.
+    pub tracking_id: Option<String>,
     pub creation_date_time: SystemTime,
     pub last_updated_date_time: SystemTime,
     /// The instant the clock owes this dataset its `ACTIVE` status.
@@ -95,6 +103,37 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsPersonalizeAmazonpersonalizeState>)
+}
+
+/// The INGESTION registry in the shared engine: call it with a handler's `&*self.engine`.
+///
+/// A `datasetArn` is minted HERE (`CreateDataset`) and used by Amazon Personalize Events,
+/// whose own API carries no dataset definition: a `PutItems` names an ARN and nothing
+/// else. So that data plane can resolve the ARN only because this service recorded it, in
+/// the registry that crate's store already reads
+/// ([`::service_com_amazonaws_personalizeevents_amazonpersonalizeevents::ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState`]).
+/// The engine keys state by TYPE, so a copy of its own inside
+/// [`ComAmazonawsPersonalizeAmazonpersonalizeState`] would be invisible to that reader.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this registry second, and the
+/// ingestion handlers take only their own store, so the order cannot invert.
+///
+/// Answers `None` only for an engine that is not the shared in-memory one; the
+/// registration is an aid to another service, so leave it unwritten then.
+pub fn ingestion_registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<
+        ::service_com_amazonaws_personalizeevents_amazonpersonalizeevents::ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState,
+    >,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_com_amazonaws_personalizeevents_amazonpersonalizeevents::ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState,
+            >,
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +298,22 @@ pub fn dataset_schema_of(record: &SchemaRecord) -> DatasetSchema {
     }
 }
 
+/// The `DatasetSchemaSummary` `ListSchemas` returns for a stored record.
+///
+/// A summary is the describe answer without the schema document itself: "Provides a
+/// summary of the properties of a dataset schema. For a complete listing, call the
+/// DescribeSchema API" (`smithy_query(query="doc", shape="DatasetSchemaSummary")`), so a
+/// listing never carries the Avro document a describe serves.
+pub fn schema_summary_of(record: &SchemaRecord) -> DatasetSchemaSummary {
+    DatasetSchemaSummary {
+        name: Some(record.name.clone()),
+        schema_arn: Some(record.schema_arn.clone()),
+        creation_date_time: Some(timestamp_of(record.creation_date_time)),
+        last_updated_date_time: Some(timestamp_of(record.last_updated_date_time)),
+        domain: record.domain.clone(),
+    }
+}
+
 /// The `DatasetGroup` `DescribeDatasetGroup` returns for a stored record.
 pub fn dataset_group_of(record: &DatasetGroupRecord) -> DatasetGroup {
     DatasetGroup {
@@ -303,9 +358,8 @@ pub fn dataset_of(record: &DatasetRecord) -> Dataset {
         // `UpdateDataset` is not implemented, so no dataset has been updated and there
         // is no latest update to describe.
         latest_dataset_update: None,
-        // A tracking id belongs to an event tracker, which `CreateEventTracker` mints;
-        // that operation is still a 501, so no dataset has one.
-        tracking_id: None,
+        // Only an Action interactions dataset has a tracking id, minted with it.
+        tracking_id: record.tracking_id.clone(),
     }
 }
 
@@ -401,4 +455,22 @@ pub fn canonical_dataset_type(value: &str) -> Option<&'static str> {
         .iter()
         .find(|candidate| candidate.eq_ignore_ascii_case(value))
         .copied()
+}
+
+/// The one dataset type Amazon Personalize provides a tracking id with: an Action
+/// interactions dataset, whose `trackingId` a caller "specif[ies] in the
+/// `PutActionInteractions` API operation"
+/// (`smithy_query(query="doc", shape="Dataset", member="trackingId")`). Every other type
+/// is addressed by its ARN alone.
+pub const DATASET_TYPE_WITH_TRACKING_ID: &str = "Action_Interactions";
+
+/// The tracking id a new Action interactions dataset is given.
+///
+/// Amazon Personalize hands out a fresh identifier per tracker and documents no format
+/// for it beyond `TrackingId`'s length (0..256), so it is a version-4 UUID from the
+/// maintained `uuid` crate — the form the service's own ids take. Minted ONCE, at the
+/// create, and stored on the record: the value is per-run, never derived from the
+/// request, and stable for every later read of that dataset.
+pub fn mint_tracking_id() -> String {
+    ::uuid::Uuid::new_v4().hyphenated().to_string()
 }

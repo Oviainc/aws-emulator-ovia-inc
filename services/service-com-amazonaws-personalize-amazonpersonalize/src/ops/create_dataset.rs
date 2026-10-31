@@ -158,8 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            active_at, canonical_dataset_type, creation_status, dataset_arn, DatasetRecord,
-            DATASET_TYPE_VALUES, MAX_DATASETS, STATUS_ACTIVE,
+            active_at, canonical_dataset_type, creation_status, dataset_arn, mint_tracking_id,
+            DatasetRecord, DATASET_TYPE_VALUES, DATASET_TYPE_WITH_TRACKING_ID, MAX_DATASETS,
+            STATUS_ACTIVE,
         };
         use std::time::SystemTime;
 
@@ -243,6 +244,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = SystemTime::now();
+
+        // An ACTION INTERACTIONS dataset is addressed on the data plane by a TRACKING ID,
+        // which Amazon Personalize provides with the dataset ("The ID of the event tracker
+        // for an Action interactions dataset. You specify the tracker's ID in the
+        // PutActionInteractions API operation"); every other type is addressed by its ARN
+        // alone, so only this type is given one.
+        let tracking_id = (dataset_type == DATASET_TYPE_WITH_TRACKING_ID).then(mint_tracking_id);
+
+        // The dataset is minted here but INGESTED INTO by Amazon Personalize Events, a
+        // different service whose API carries no dataset definition, so each target this
+        // create mints — the ARN, and the tracking id when there is one — is recorded in
+        // the registry that service reads before the record is kept here: a target the
+        // control plane reports is a target the data plane can serve. Registering is
+        // idempotent and never discards what was already ingested.
+        //
+        // The target is recorded as soon as its identifier EXISTS, not when the create's
+        // clock completes: the ingestion API models no error for a dataset whose create is
+        // still in progress, and whether a dataset is ready is what this service's own
+        // `DescribeDataset` reports, so ingestion is not refused for a status the data
+        // plane cannot express.
+        if let Some(registry) = crate::state::ingestion_registry(&*self.engine) {
+            let mut registry = registry.lock();
+            // Registering is idempotent, so an ARN the registry already holds keeps
+            // everything ingested into it — and only a registration THIS create added is
+            // withdrawn again when the next one cannot be made.
+            let was_registered = registry.dataset_mut(&arn).is_some();
+            if registry.register_dataset(&arn).is_none() {
+                return Err(ingestion_capacity_reached(
+                    "datasets",
+                    ::service_com_amazonaws_personalizeevents_amazonpersonalizeevents::state::MAX_DATASETS,
+                ));
+            }
+            if let Some(tracking_id) = &tracking_id {
+                if registry
+                    .register_event_tracker(tracking_id, Some(input.dataset_group_arn.clone()))
+                    .is_none()
+                {
+                    if !was_registered {
+                        registry.forget_dataset(&arn);
+                    }
+                    return Err(ingestion_capacity_reached(
+                        "event trackers",
+                        ::service_com_amazonaws_personalizeevents_amazonpersonalizeevents::state::MAX_EVENT_TRACKERS,
+                    ));
+                }
+            }
+        }
         state.datasets.insert(
             arn.clone(),
             DatasetRecord {
@@ -251,6 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 dataset_group_arn: input.dataset_group_arn.clone(),
                 dataset_type: dataset_type.to_string(),
                 schema_arn: input.schema_arn.clone(),
+                tracking_id,
                 creation_date_time: now,
                 last_updated_date_time: now,
                 // Like its group, a dataset is not created ready: "CREATE PENDING >
@@ -264,6 +313,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dataset_arn: Some(arn),
         })
     }
+}
+
+/// The modelled `LimitExceededException` (409) for an ingestion registry that holds as
+/// many `targets` as this emulator keeps: the create cannot be served, because a dataset
+/// the data plane could not resolve would be a dataset the control plane reports and
+/// nothing can ingest into.
+fn ingestion_capacity_reached(targets: &str, capacity: usize) -> CreateDatasetError {
+    CreateDatasetErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(format!(
+            "This emulator ingests into at most {capacity} {targets}; delete one before \
+             creating another."
+        )),
+    })
+    .into()
 }
 
 /// This operation's modelled `InvalidInputException`, carrying `message`.

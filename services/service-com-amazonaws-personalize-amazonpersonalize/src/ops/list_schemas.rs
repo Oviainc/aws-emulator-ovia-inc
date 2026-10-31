@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSchemas
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSchemas`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSchemas::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the schemas this service holds — "the list of schemas associated with the
+//! account" — as the `DatasetSchemaSummary` of each stored record, in `schemaArn` order.
+//! A reporting operation: it writes nothing, so two callers listing at the same instant
+//! see the same schemas, and an account holding no schema is answered with a 200 and an
+//! empty list rather than an error.
+//!
+//! Paging is the codec every `List*` in this service shares
+//! ([`crate::state::encode_next_token`]): `maxResults` bounds the page, the `nextToken`
+//! carries the ARN the previous page ended on, and a token this listing did not issue is
+//! refused with the modelled `InvalidNextTokenException` (400) rather than read as "from
+//! the start".
 //!
 //! ## Shape of an operation
 //!
@@ -139,20 +142,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSchemas` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSchemasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSchemas"))
+        use crate::state::{
+            decode_next_token, encode_next_token, page_size, schema_summary_of, take_page,
+        };
+
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented("ListSchemas"));
+        };
+
+        let page_size = page_size(input.max_results);
+
+        // A `nextToken` carries the ARN of the last schema the previous page emitted, so
+        // this page resumes at the next key in order. A token this operation did not
+        // issue is refused rather than silently read as "from the start".
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_next_token(TOKEN_KIND, token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListSchemasErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some("The token supplied was invalid.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let state = state.lock();
+        let matching: Vec<DatasetSchemaSummary> = state
+            .schemas
+            .iter()
+            .filter(|(arn, _)| resume_after.as_ref().is_none_or(|after| *arn > after))
+            .map(|(_, record)| schema_summary_of(record))
+            .collect();
+
+        let (schemas, next_token) = take_page(matching, page_size, |summary| {
+            encode_next_token(TOKEN_KIND, summary.schema_arn.as_deref().unwrap_or_default())
+        });
+
+        Ok(ListSchemasOutput {
+            schemas: Some(schemas),
+            next_token,
+        })
     }
 }
+
+/// The kind tag this operation's `nextToken` carries, so a token issued by another
+/// paginated operation is refused rather than resumed against the wrong collection.
+const TOKEN_KIND: &str = "schemas";
+

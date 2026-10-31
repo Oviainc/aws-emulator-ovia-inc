@@ -1198,7 +1198,10 @@ async fn create_dataset_refuses_an_unknown_reference_an_unknown_type_and_a_pendi
 ///
 /// Asserts the pagination invariants as it goes: a page never exceeds the requested size,
 /// the final page carries no token, and no item is reported twice.
-async fn list_all(
+///
+/// `pub(crate)` so the `ListSchemas` suite pages through its listing with the SAME
+/// invariants rather than re-implementing them.
+pub(crate) async fn list_all(
     emulator: &Emulator,
     operation: &str,
     items_member: &str,

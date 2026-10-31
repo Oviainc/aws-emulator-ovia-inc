@@ -12,22 +12,25 @@
 //!
 //! ## What is "known"
 //!
-//! A `trackingId` is minted by `CreateEventTracker` and a `datasetArn` by
-//! `CreateDataset` — both live in the Amazon Personalize control plane, which is a
-//! DIFFERENT service (`personalize`), not this one. So this crate keeps an explicit
-//! registry ([`ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState::register_event_tracker`]
+//! A `trackingId` and a `datasetArn` are both minted in the Amazon Personalize control
+//! plane, which is a DIFFERENT service (`personalize`), not this one: `CreateDataset`
+//! mints the dataset ARN and the tracking id of an Action interactions dataset, and
+//! `CreateEventTracker` mints a tracker's. So this crate keeps an explicit registry
+//! ([`ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState::register_event_tracker`]
 //! / [`ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState::register_dataset`])
-//! that a test, or a sibling Personalize emulator sharing this engine, seeds — rather
-//! than accepting any string. EVERY operation refuses a target that is not in it, each
-//! with the strongest error it models: `ResourceNotFoundException` (404) for `PutItems`,
-//! `PutUsers`, `PutActions` and `PutActionInteractions`, and `InvalidInputException`
-//! (400) for `PutEvents`, whose model declares no not-found error.
+//! that the control plane — or a test standing in for it — seeds, rather than accepting
+//! any string. EVERY operation refuses a target that is not in it.
 //!
 //! A registered dataset also carries its [`DatasetType`], derived from the ARN the
 //! control plane minted (`dataset/<dataset group>/<DATASET_TYPE>`), because a dataset's
 //! type is what decides which metadata put it serves: `PutItems` serves an Items
-//! dataset, `PutUsers` a Users dataset and `PutActions` an Actions dataset, and anything
-//! else is `InvalidInputException` (400).
+//! dataset, `PutUsers` a Users dataset and `PutActions` an Actions dataset.
+//!
+//! A metadata put asks two things of its `datasetArn` — does it resolve, and does it
+//! resolve to a dataset of the type this operation serves? — and each failure is an INPUT
+//! fault, `InvalidInputException` (400) and never a not-found: an ARN resolving to no
+//! dataset is refused with [`INVALID_DATASET_ARN_MESSAGE`], one resolving to a dataset of
+//! another type with [`not_a_valid_dataset_message`].
 //!
 //! ## What this store retains
 //!
@@ -388,6 +391,26 @@ impl MetadataKind {
     }
 }
 
+/// What a metadata put answers for a `datasetArn` that resolves to no dataset at all.
+///
+/// The whole sentence is fixed: Amazon Personalize names the member that cannot be
+/// resolved and nothing else, so the refusal never echoes the ARN the caller submitted
+/// (and never reveals whether some other account holds it).
+pub const INVALID_DATASET_ARN_MESSAGE: &str = "Invalid datasetArn";
+
+/// What a metadata put answers when its `datasetArn` resolves to a dataset that is NOT
+/// of the type the operation serves.
+///
+/// The dataset type is named the way a dataset ARN's last segment spells it (upper case),
+/// so the only variable parts are the ARN from the request and the type the operation
+/// serves.
+pub fn not_a_valid_dataset_message(dataset_arn: &str, required: DatasetType) -> String {
+    format!(
+        "{dataset_arn} is not a valid {} dataset.",
+        required.as_str().to_ascii_uppercase()
+    )
+}
+
 impl Dataset {
     /// The collection `kind` names, for reading.
     pub fn records(&self, kind: MetadataKind) -> &BTreeMap<String, Record> {
@@ -412,8 +435,6 @@ impl Dataset {
 /// the modelled error of its own operation, which is the same triple for all three.
 #[derive(Debug, Clone)]
 pub enum MetadataPutError {
-    /// The dataset ARN names no registered dataset — `ResourceNotFoundException` (404).
-    NotFound,
     /// The dataset is marked in use — `ResourceInUseException` (409).
     InUse,
     /// A record in the batch is not usable, or would take the collection past
@@ -436,12 +457,15 @@ pub enum MetadataPutError {
 /// Replacing a record already stored never grows the collection, so it is accepted at
 /// the cap.
 ///
-/// The dataset must be of the TYPE these records are ([`MetadataKind::dataset_type`]):
-/// a batch of users is not a batch of items, so a put whose dataset names another type —
-/// or no published type at all — is refused with `InvalidInputException` (400) and stores
-/// nothing.
+/// The `datasetArn` must resolve, and it must resolve to a dataset of the TYPE these
+/// records are ([`MetadataKind::dataset_type`]) — two input faults, both
+/// `InvalidInputException` (400) and neither a not-found: an ARN that resolves to no
+/// dataset is [`INVALID_DATASET_ARN_MESSAGE`], and one that resolves to a dataset of
+/// another type (or of no published type at all) is
+/// [`not_a_valid_dataset_message`] — a batch of users is not a batch of items. Neither
+/// stores anything.
 ///
-/// The target is resolved FIRST, so a request that names an unknown (or busy) dataset
+/// The target is resolved FIRST, so a request that names an unusable (or busy) dataset
 /// and also carries an unusable record answers for the target rather than for the
 /// record: the stronger, more specific fault is the one the caller has to fix.
 pub fn put_metadata_records(
@@ -451,39 +475,23 @@ pub fn put_metadata_records(
     member: &str,
     records: &[(&str, Option<&str>)],
 ) -> Result<(), MetadataPutError> {
-    let dataset = state
-        .dataset_mut(dataset_arn)
-        .ok_or(MetadataPutError::NotFound)?;
+    let records_type = kind.dataset_type();
+
+    let dataset = state.dataset_mut(dataset_arn).ok_or_else(|| {
+        MetadataPutError::InvalidInput(INVALID_DATASET_ARN_MESSAGE.to_string())
+    })?;
     if dataset.in_use {
         return Err(MetadataPutError::InUse);
     }
 
-    // The records' type against the dataset's: both come from the request (the operation
-    // decides the records' type, the `datasetArn` the dataset's), so the message names
-    // both.
-    let records_type = kind.dataset_type();
-    match dataset.dataset_type {
-        Some(dataset_type) if dataset_type == records_type => {}
-        Some(dataset_type) => {
-            return Err(MetadataPutError::InvalidInput(format!(
-                "The dataset {dataset_arn} is a {} dataset, so it does not take {} records.",
-                dataset_type.as_str(),
-                records_type.as_str()
-            )));
-        }
-        None => {
-            return Err(MetadataPutError::InvalidInput(format!(
-                "The dataset {dataset_arn} names the dataset type {:?}, which is not one of {}; \
-                 it takes no {} records.",
-                dataset_type_segment(dataset_arn),
-                DatasetType::ALL
-                    .iter()
-                    .map(|candidate| candidate.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                records_type.as_str()
-            )));
-        }
+    // The records' type against the dataset's: the operation decides the records' type
+    // and the `datasetArn` the dataset's, and a dataset that is not of the records' type
+    // is not a dataset this put can serve.
+    if dataset.dataset_type != Some(records_type) {
+        return Err(MetadataPutError::InvalidInput(not_a_valid_dataset_message(
+            dataset_arn,
+            records_type,
+        )));
     }
 
     let mut parsed = Vec::with_capacity(records.len());
@@ -583,6 +591,15 @@ impl ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState {
         self.event_trackers.get_mut(tracking_id)
     }
 
+    /// Drop the tracker `tracking_id` and the streams ingested through it: whoever
+    /// registered it reports it gone, so this service stops ingesting through it.
+    ///
+    /// Forgetting a tracking id that was never registered changes nothing, so a repeated
+    /// delete is harmless.
+    pub fn forget_event_tracker(&mut self, tracking_id: &str) {
+        self.event_trackers.remove(tracking_id);
+    }
+
     /// Register the dataset `dataset_arn`, or return the one already registered with
     /// its records intact.
     ///
@@ -610,6 +627,17 @@ impl ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState {
     /// The dataset `dataset_arn`, or `None` when it was never registered.
     pub fn dataset_mut(&mut self, dataset_arn: &str) -> Option<&mut Dataset> {
         self.datasets.get_mut(dataset_arn)
+    }
+
+    /// Drop the dataset `dataset_arn` and everything put into it: whoever registered it
+    /// reports it gone, so this service stops ingesting into it and a metadata put naming
+    /// it is refused as the unresolvable `datasetArn` it now is
+    /// ([`INVALID_DATASET_ARN_MESSAGE`]).
+    ///
+    /// Forgetting a dataset that was never registered changes nothing, so a repeated
+    /// delete is harmless.
+    pub fn forget_dataset(&mut self, dataset_arn: &str) {
+        self.datasets.remove(dataset_arn);
     }
 }
 

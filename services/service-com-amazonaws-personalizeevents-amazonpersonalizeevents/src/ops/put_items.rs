@@ -7,11 +7,13 @@
 //! [`crate::state`] are the whole result of the call.
 //!
 //! A repeated `itemId` REPLACES the record stored for it — the latest call for an id is
-//! that record, not a second one. The `datasetArn` must name a dataset this emulator
-//! knows (`ResourceNotFoundException`, 404, when it does not; `ResourceInUseException`,
-//! 409, when it is marked in use), that dataset must be an ITEMS dataset — the type the
-//! ARN's last segment names — (`InvalidInputException`, 400, for a dataset of any other
-//! type), and `properties` must be a JSON object (`InvalidInputException`, 400). Item metadata documents no reserved property keys —
+//! that record, not a second one. The `datasetArn` must resolve to a dataset this
+//! emulator knows (`InvalidInputException`, 400, "Invalid datasetArn", when it does not),
+//! that dataset must be an ITEMS dataset — the type the ARN's last segment names —
+//! (`InvalidInputException`, 400, "<arn> is not a valid ITEMS dataset.", for a dataset of
+//! any other type), and a dataset marked in use is `ResourceInUseException`, 409.
+//! `properties` must be a JSON object
+//! (`InvalidInputException`, 400). Item metadata documents no reserved property keys —
 //! that rule belongs to the two event streams — so a key named like an event field is
 //! accepted here. The behaviour itself lives in `crate::state::put_metadata_records`,
 //! which `PutUsers` and `PutActions` share.
@@ -189,11 +191,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &records,
         )
         .map_err(|failure| match failure {
-            crate::state::MetadataPutError::NotFound => {
-                PutItemsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!("No dataset with the ARN {} exists.", input.dataset_arn)),
-                })
-            }
             crate::state::MetadataPutError::InUse => {
                 PutItemsErrorModeled::ResourceInUseException(ResourceInUseException {
                     message: Some(format!(
