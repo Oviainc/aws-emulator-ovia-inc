@@ -547,10 +547,12 @@ async fn two_moves_of_one_label_from_the_same_version_leave_a_single_winner() {
                         .and_then(Value::as_str)
                         .unwrap_or_default();
                     let code = code.split('#').next_back().unwrap_or(code).to_string();
-                    assert!(
-                        code == "InvalidRequestException" || code == "InvalidParameterException",
-                        "case {case:?}: expected the loser to be refused as an invalid request, \
-                         got {code:?} with body {parsed}"
+                    // What the loser has to correct is the VALUE it sent in
+                    // `RemoveFromVersionId`, so the refusal is the parameter one.
+                    assert_eq!(
+                        code, "InvalidParameterException",
+                        "case {case:?}: expected the loser to be refused for the value it sent \
+                         in RemoveFromVersionId, got {code:?} with body {parsed}"
                     );
                     losers.push(target.clone());
                 }
