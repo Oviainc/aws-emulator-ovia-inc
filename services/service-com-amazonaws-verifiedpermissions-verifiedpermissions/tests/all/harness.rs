@@ -233,6 +233,23 @@ pub async fn user_pool_in(router: &MultiServiceRouter, region: &str, name: &str)
         .to_string()
 }
 
+/// The `(path, message)` pairs a fault's `fieldList` carries, in the order the
+/// response carries them. A fault that carries none maps to the empty list.
+pub fn field_list(body: &Value) -> Vec<(String, String)> {
+    body.get("fieldList")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|field| {
+            (
+                field["path"].as_str().unwrap_or_default().to_string(),
+                field["message"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
 /// The `message` an awsJson1_0 fault carries. The modelled member is `message`;
 /// `Message` is accepted too, so an assertion is about the TEXT rather than
 /// about which spelling the protocol layer emitted.

@@ -21,7 +21,12 @@
 //! * `encryptionSettings` (EncryptionSettings) — `kmsEncryptionSettings` (a
 //!   customer-managed KMS `key`, with an optional `encryptionContext`) or
 //!   `default` (an AWS owned key); absent means `default`.
-//! * `tags` (TagMap, len ..200)
+//! * `tags` (TagMap, len ..200) — the tag set the new store STARTS OUT holding,
+//!   so it is admitted only if a resource may hold it: a map carrying more than
+//!   [`crate::state::MAX_TAGS_PER_RESOURCE`] tags is refused and no store is
+//!   created. The modelled length (..200) bounds one request's map; the
+//!   per-resource quota bounds what a resource ends up holding, and this request
+//!   decides that set, exactly as a `TagResource` merge does.
 //!
 //! ## Output
 //!
@@ -32,6 +37,12 @@
 //! * `ConflictException` (HTTP 409) — the same `clientToken` was replayed with
 //!   different parameters.
 //! * `ServiceQuotaExceededException` (HTTP 402).
+//! * `ValidationException` (HTTP 400) — a request member does not satisfy its
+//!   constraint requirements, with `fieldList` naming the member. This operation
+//!   does NOT model `TooManyTagsException` — only `TagResource` does — so an
+//!   over-limit `tags` map is refused as what it is here: a request member this
+//!   operation cannot accept, reported at [`crate::ops::paths::TAGS`] with the
+//!   same 400 status the tagging path answers for the same rule.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -44,13 +55,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 /// cannot be reached, which is a server fault and not a bad request.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#CreatePolicyStore",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum CreatePolicyStoreErrorModeled {
     ConflictException(ConflictException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it.
@@ -152,6 +164,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The request's `tags` map is the tag set the new store would start out
+        // holding, so it is admitted only if a resource may hold it: the limit is
+        // on what a resource ENDS UP holding, and this request decides that set
+        // outright. Refused before anything is read or minted, so a request that
+        // cannot be served leaves no store behind — one that the tagging path
+        // would then treat as permanently over the limit.
+        if let Some(tags) = input.tags.as_ref() {
+            if crate::ops::tags_over_the_per_resource_limit(tags.len()) {
+                return Err(CreatePolicyStoreErrorModeled::ValidationException(
+                    crate::ops::validation_exception([crate::ops::too_many_tags_in_request(
+                        crate::ops::paths::TAGS,
+                    )]),
+                )
+                .into());
+            }
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::Modeled(
                 CreatePolicyStoreErrorModeled::InternalServerException(InternalServerException {

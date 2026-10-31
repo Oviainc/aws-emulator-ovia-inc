@@ -105,7 +105,10 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// associate as many as 50 tags with a resource") and `TooManyTagsException`'s
 /// ("No more tags be added because the limit (50) has been reached"). It is NOT
 /// the same bound as `TagMap`'s modelled length (..200), which bounds ONE
-/// request's map; this bounds what a resource ends up holding.
+/// request's map; this bounds what a resource ends up holding, so every path
+/// that leaves a resource holding a tag set — a create carrying `tags`, a
+/// `TagResource` merge — decides it through the one predicate
+/// [`crate::ops::tags_over_the_per_resource_limit`].
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The Cedar language version a policy store is created with, one of

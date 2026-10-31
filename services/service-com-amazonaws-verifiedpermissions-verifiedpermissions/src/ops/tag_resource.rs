@@ -12,8 +12,11 @@
 //! * a key the resource does not carry is APPENDED; a key it already carries
 //!   takes the request's value, replacing the previous one;
 //! * the merge is refused with `TooManyTagsException` when it would leave the
-//!   resource holding more than [`crate::state::MAX_TAGS_PER_RESOURCE`] tags,
-//!   and then NOTHING is persisted — the resource keeps the tags it had;
+//!   resource holding more than [`crate::state::MAX_TAGS_PER_RESOURCE`] tags —
+//!   decided by [`crate::ops::tags_over_the_per_resource_limit`], the same
+//!   predicate a create carrying `tags` applies to the set the new resource
+//!   would start out holding — and then NOTHING is persisted: the resource keeps
+//!   the tags it had;
 //! * the only taggable Verified Permissions resource is a policy store, so an
 //!   ARN no live store carries is `ResourceNotFoundException`.
 //!
@@ -172,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
-        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+        if crate::ops::tags_over_the_per_resource_limit(merged.len()) {
             // The refusal carries `TooManyTagsException`'s one fixed message and
             // reports the resource at the limit in the modelled `resourceName`,
             // so nothing of the request (the count, the offending key) is

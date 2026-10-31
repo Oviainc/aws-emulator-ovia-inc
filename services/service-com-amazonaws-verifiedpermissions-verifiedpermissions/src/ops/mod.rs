@@ -377,6 +377,13 @@ pub mod paths {
     /// An `entityList` item's tag map.
     pub const ENTITY_LIST_TAGS: &str = "/entities/entityList/tags";
 
+    /// The `tags` map a create operation of this service takes
+    /// (`CreatePolicyStore`), which is the tag set the new resource starts out
+    /// holding. A `TagResource` request's own `tags` member is never refused
+    /// through a pointer: that operation models `TooManyTagsException`, which
+    /// reports the resource instead.
+    pub const TAGS: &str = "/tags";
+
     /// A batch operation's request list. One member of one request in it is
     /// named by [`super::InvalidInput::within_batch_request`].
     pub const REQUESTS: &str = "/requests";
@@ -753,6 +760,41 @@ pub fn conflict(
         message: crate::state::CONFLICT_MESSAGE.to_string(),
         resources: resources.into_iter().collect(),
     }
+}
+
+/// Whether a tag set of `tag_count` entries is MORE than one resource of this
+/// service may hold ([`crate::state::MAX_TAGS_PER_RESOURCE`]).
+///
+/// ONE home for the per-resource tag rule, because the limit is on what a
+/// resource ENDS UP holding and every path that leaves a resource holding a tag
+/// set has to decide it the same way: a create request carrying `tags` (the tag
+/// set the new resource starts out with) and a `TagResource` merge (the set the
+/// resource would be left with). The ERROR each path refuses with is the one its
+/// own operation models — `TooManyTagsException` where the model declares it, the
+/// modelled `ValidationException` where it does not — but the decision is this
+/// one predicate, so neither path can admit a tag set the other treats as over
+/// the limit.
+pub fn tags_over_the_per_resource_limit(tag_count: usize) -> bool {
+    tag_count > crate::state::MAX_TAGS_PER_RESOURCE
+}
+
+/// The `fieldList` entry for a request whose tag map, at `path`, carries more
+/// tags than one resource may hold.
+///
+/// It names the member and states the quota as the reason, which is the split
+/// [`validation_exception`] documents: the summary stays this service's fixed
+/// sentence and the specifics are machine-readable. Used by the paths that
+/// refuse an over-limit tag set with the modelled `ValidationException` because
+/// their operation does not model `TooManyTagsException`, so that refusal is
+/// worded in one place however many operations take create-time tags.
+pub fn too_many_tags_in_request(path: &str) -> InvalidInput {
+    InvalidInput::new(
+        path,
+        format!(
+            "it must not carry more than {} tags, the most one resource may hold",
+            crate::state::MAX_TAGS_PER_RESOURCE
+        ),
+    )
 }
 
 /// The modelled `TooManyTagsException` for a tagging request that would take

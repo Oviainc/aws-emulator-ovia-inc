@@ -19,6 +19,8 @@ mod batch_get_policy;
 mod batch_is_authorized;
 #[path = "all/batch_is_authorized_with_token.rs"]
 mod batch_is_authorized_with_token;
+#[path = "all/create_time_tag_limit.rs"]
+mod create_time_tag_limit;
 #[path = "all/date_time_wire_format.rs"]
 mod date_time_wire_format;
 #[path = "all/delete_policy_idempotency.rs"]
