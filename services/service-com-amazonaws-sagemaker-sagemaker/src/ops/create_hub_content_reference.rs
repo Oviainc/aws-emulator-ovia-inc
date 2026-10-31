@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHubContentReference
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHubContentReference`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHubContentReference::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the public hub content the request's
+//! `SageMakerPublicHubContentArn` names in `crate::state`, then records a
+//! `ModelReference` content version in the hub the request names, carrying the resolved
+//! content's metadata, the source ARN, the `MinVersion` the reference accepts and the
+//! request's tags. A hub that does not exist and a source that resolves to no stored
+//! content version are refused; a reference this hub already holds at that version is
+//! refused with the modelled `ResourceInUse`. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +82,49 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `HubContentType` of the content a reference points AT.
+///
+/// `SageMakerPublicHubContentArn`'s pattern admits one content type —
+/// `…:hub-content/<hub>/Model/<name>` — so the source of a reference is always a MODEL in
+/// a public hub.
+const SOURCE_CONTENT_TYPE: &str = "Model";
+
+/// The `HubContentType` the record this call writes carries: the modelled
+/// `ModelReference` member (`smithy_query(query="shape",shape="HubContentType")`), which
+/// is what a content that references a model in another hub is.
+const REFERENCE_CONTENT_TYPE: &str = "ModelReference";
+
+/// The `HubContentStatus` a stored reference carries.
+///
+/// A reference records a POINTER to content another hub holds — nothing is imported, so
+/// there is no import for the clock to finish and no transient status to leave: the record
+/// is complete at the call that wrote it, which is what `Available` states. (The import
+/// statuses `HubContentStatus` also models — `PendingImport`, `Importing` — belong to
+/// `ImportHubContent`, which copies a document into the hub.)
+const REFERENCE_STATUS: &str = "Available";
+
+/// The public hub and the model name a `SageMakerPublicHubContentArn` addresses, or `None`
+/// when the value is not one.
+///
+/// The ARN's resource path is `hub-content/<hub>/Model/<name>`: the hub holding the content
+/// and the content's own name, which with [`SOURCE_CONTENT_TYPE`] is what identifies one
+/// hub content. The modelled pattern already refuses anything else before this handler
+/// runs, so this parse only reads the two segments out.
+fn public_source(arn: &str) -> Option<(&str, &str)> {
+    let path = arn
+        .split_once(&format!(":{}/", crate::state::HUB_CONTENT_KIND))?
+        .1;
+    let mut segments = path.split('/');
+    let hub_name = segments.next()?;
+    let content_type = segments.next()?;
+    let content_name = segments.next()?;
+    (segments.next().is_none()
+        && content_type == SOURCE_CONTENT_TYPE
+        && !hub_name.is_empty()
+        && !content_name.is_empty())
+        .then_some((hub_name, content_name))
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +195,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHubContentReference` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHubContentReferenceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let (source_hub, source_name) = public_source(&input.sage_maker_public_hub_content_arn)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(crate::state::SOURCE_ARN_NOT_FOUND)
+            })?;
+        // `MinVersion` is "the minimum version of the hub content to reference", so it is a
+        // FLOOR on which stored version the reference resolves to, compared by its dotted
+        // components rather than as text.
+        let min_version = input.min_version.as_deref().map(crate::state::version_key);
+        // `HubName` is a `HubNameOrArn`, so either form addresses the same stored hub.
+        let hub_name = crate::state::name_from_arn_or_name(&input.hub_name).to_string();
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+
+        // The SOURCE is resolved FIRST, before the hub the reference would be added to:
+        // recorded wire behaviour refuses a request whose `SageMakerPublicHubContentArn`
+        // resolves to no stored hub content with the source refusal even when the hub does
+        // not exist either.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHubContentReference"))
+        // The reference resolves to the GREATEST stored version at or above the floor: a
+        // reference points at the current revision of the content it references, and
+        // `MinVersion` only rules the older ones out. The store is keyed by the parsed
+        // dotted components, so iterating from the back reaches the greatest one first.
+        let resolved = store
+            .hub_contents
+            .iter()
+            .filter(|(key, _)| {
+                key.hub_name == source_hub
+                    && key.hub_content_type == SOURCE_CONTENT_TYPE
+                    && key.hub_content_name == source_name
+            })
+            .map(|(_, content)| content)
+            .rfind(|content| {
+                min_version.is_none_or(|floor| crate::state::version_key(&content.version) >= floor)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(crate::state::SOURCE_ARN_NOT_FOUND)
+            })?;
+
+        // The hub the reference is added to has to exist: there is nothing to add the
+        // content to otherwise. Recorded wire behaviour answers this one with
+        // `ValidationException` and HTTP 400 rather than the `ResourceNotFound` the model
+        // lists, so it goes out through the validation channel, worded the way every
+        // operation that resolves a hub words it.
+        let hub_arn = store
+            .hubs
+            .get(&hub_name)
+            .map(|hub| hub.arn.clone())
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(crate::state::hub_not_found(&hub_name))
+            })?;
+
+        // `HubContentName` is optional: a reference the caller did not name carries the
+        // name of the content it references, which is the only name the request supplied.
+        let content_name = input
+            .hub_content_name
+            .clone()
+            .unwrap_or_else(|| resolved.name.clone());
+        let key = crate::state::HubContentKey {
+            hub_name: hub_name.clone(),
+            hub_content_type: REFERENCE_CONTENT_TYPE.to_string(),
+            hub_content_name: content_name.clone(),
+            version: crate::state::version_key(&resolved.version),
+            version_text: resolved.version.clone(),
+        };
+        // A content version already in the hub is refused, never overwritten: otherwise
+        // the caller reads a 200 for a reference it did not create. This operation models
+        // `ResourceInUse` for exactly that collision, and it is decided BEFORE the quota: a
+        // call that would add no record cannot be over the limit.
+        if store.hub_contents.contains_key(&key) {
+            return Err(CreateHubContentReferenceErrorModeled::ResourceInUse(ResourceInUse {
+                // Worded for the hub CONTENT in the family of the hub's own collision
+                // refusal: the resource, the name the request submitted, the hub holding
+                // it, and what the caller should do instead.
+                message: Some(format!(
+                    "A hub content with name {content_name} and version {} already exists \
+                     in hub {hub_name}. Please use a different name and try again.",
+                    resolved.version,
+                )),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `HubContentName` cannot grow one hub
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        let held = store.hub_contents_held(&hub_name);
+        if held >= crate::state::HUB_CONTENT_QUOTA {
+            return Err(CreateHubContentReferenceErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The service limit for hub contents in hub {hub_name} is {}, with \
+                         current utilization of {held} and a request delta of 1.",
+                        crate::state::HUB_CONTENT_QUOTA,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::hub_content_arn(
+            &region,
+            &hub_name,
+            REFERENCE_CONTENT_TYPE,
+            &content_name,
+            &resolved.version,
+        );
+        store.hub_contents.insert(
+            key,
+            crate::state::HubContent {
+                name: content_name,
+                arn: arn.clone(),
+                content_type: REFERENCE_CONTENT_TYPE.to_string(),
+                // The version, the schema version and the descriptive members are the
+                // RESOLVED content's: a reference reports the content it points at, so a
+                // reader of the private hub sees the same metadata as a reader of the
+                // public one rather than values this call made up.
+                version: resolved.version.clone(),
+                document_schema_version: resolved.document_schema_version.clone(),
+                display_name: resolved.display_name.clone(),
+                description: resolved.description.clone(),
+                support_status: resolved.support_status.clone(),
+                search_keywords: resolved.search_keywords.clone(),
+                status: REFERENCE_STATUS.to_string(),
+                creation_time: ::std::time::SystemTime::now(),
+                // `OriginalCreationTime` is when the content was created "before any
+                // updates or revisions": this reference has had none, so it has no earlier
+                // creation to report.
+                original_creation_time: None,
+                sage_maker_public_hub_content_arn: Some(
+                    input.sage_maker_public_hub_content_arn.clone(),
+                ),
+                reference_min_version: input.min_version.clone(),
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateHubContentReferenceOutput {
+            hub_arn,
+            hub_content_arn: arn,
+        })
     }
 }

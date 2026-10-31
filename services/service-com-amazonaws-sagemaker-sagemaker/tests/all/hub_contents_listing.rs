@@ -224,6 +224,11 @@ pub(crate) fn seed(emulator: &Emulator, hub: &str, contents: &[Seeded<'_>]) {
                 creation_time: seeded_at(content.created_after_base),
                 original_creation_time: Some(seeded_at(0)),
                 sage_maker_public_hub_content_arn: content.public_arn.map(str::to_string),
+                // A seeded content carries no `MinVersion` and no tags: both are what
+                // `CreateHubContentReference` stores, and these records stand in for the
+                // writers that are still scaffold stubs.
+                reference_min_version: None,
+                tags: Vec::new(),
             },
         );
     }

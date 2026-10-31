@@ -1182,15 +1182,16 @@ fn hub_content_entity(
             // A revised content's last modification is the creation of THIS version.
             crate::state::timestamp(content.creation_time)
         }),
-        // The document, the markdown, the dependencies and the minimum referenced version
-        // are stored by the import operations, each its own open issue; a failure reason
-        // belongs to an import that failed.
+        // The document, the markdown and the dependencies are stored by the import
+        // operations, each its own open issue; a failure reason belongs to an import that
+        // failed. The minimum referenced version and the tags ARE stored (by
+        // `CreateHubContentReference`), so they are reported from the record.
         hub_content_markdown: None,
         hub_content_document: None,
-        reference_min_version: None,
+        reference_min_version: content.reference_min_version.clone(),
         hub_content_dependencies: None,
         failure_reason: None,
-        tags: None,
+        tags: tag_list(&content.tags),
     })
 }
 

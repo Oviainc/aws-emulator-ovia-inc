@@ -69,6 +69,8 @@ mod experiment_not_found_refusal;
 mod feature_group_deletion;
 #[path = "all/feature_group_lifecycle.rs"]
 mod feature_group_lifecycle;
+#[path = "all/hub_content_references.rs"]
+mod hub_content_references;
 #[path = "all/hub_contents_listing.rs"]
 mod hub_contents_listing;
 #[path = "all/hub_registry.rs"]

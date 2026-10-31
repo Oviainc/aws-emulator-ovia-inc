@@ -945,14 +945,6 @@ pub const TAGGED_RESOURCE_ENTITY: &str = "Resource";
 /// resources is refused with [`does_not_exist`], which is the refusal for an ARN this
 /// resolution holds no TAG SET for:
 ///
-/// * `hub_contents` — AWS does tag these, but the
-///   only writer that could carry a `Tags` list into the record is still a scaffold stub
-///   here (`import_hub_content.rs` /
-///   `create_hub_content_reference.rs`), so the record carries
-///   no `tags` field yet. (A test may seed one; the refusal is then approximate for that
-///   seeded record.) Contrast `hubs`, whose `CreateHub` IS implemented and stores
-///   `Tags`, and which is therefore in the list — and `partner_apps`, whose
-///   `CreatePartnerApp` stores the `Tags` it carried and which is in the list too.
 /// * `lineage_groups` — materialised by [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`]
 ///   rather than created by a request, and SageMaker models no `Tags` anywhere on a
 ///   lineage group.
@@ -1024,6 +1016,7 @@ tag_accessors!(
     experiments,
     feature_groups,
     hubs,
+    hub_contents,
     images,
     inference_components,
     inference_recommendations_jobs,
@@ -1071,9 +1064,10 @@ pub struct HubContentKey {
 
 /// One version of a hub content, as `ListHubContents` summarises it.
 ///
-/// The members are `HubContentInfo`'s (the summary shape `ListHubContents` returns);
-/// `ImportHubContent`, `CreateHubContentReference` and `DescribeHubContent` (each its own
-/// open issue) extend this record with the document, markdown and dependencies they store.
+/// The members are `HubContentInfo`'s (the summary shape `ListHubContents` returns), plus
+/// what the writer of a reference stores beside them; `ImportHubContent` and
+/// `DescribeHubContent` (each its own open issue) extend this record with the document,
+/// markdown and dependencies they store.
 #[derive(Debug, Clone)]
 pub struct HubContent {
     pub name: String,
@@ -1099,6 +1093,13 @@ pub struct HubContent {
     pub original_creation_time: Option<SystemTime>,
     /// The public hub content this one references, for a `ModelReference`.
     pub sage_maker_public_hub_content_arn: Option<String>,
+    /// The lowest version of the referenced public content this reference accepts
+    /// (`ReferenceMinVersion`), as the request that created the reference named it, and
+    /// absent on a content that references nothing.
+    pub reference_min_version: Option<String>,
+    /// The tags attached to this content version — `CreateHubContentReference$Tags` as
+    /// sent, then whatever the tag operations added or removed. See [`tag_accessors`].
+    pub tags: Vec<Tag>,
 }
 
 /// A dotted `<major>.<minor>.<patch>` version (`HubContentVersion`,
@@ -3129,6 +3130,15 @@ impl ComAmazonawsSagemakerSagemakerState {
         self.hubs.len() < HUB_QUOTA
     }
 
+    /// How many content VERSIONS the hub `hub_name` holds, across every
+    /// `HubContentType`: what [`HUB_CONTENT_QUOTA`] bounds.
+    pub fn hub_contents_held(&self, hub_name: &str) -> usize {
+        self.hub_contents
+            .keys()
+            .filter(|key| key.hub_name == hub_name)
+            .count()
+    }
+
     /// Whether another hyperparameter tuning job fits, i.e. the store is below
     /// [`HYPER_PARAMETER_TUNING_JOB_QUOTA`].
     pub fn tuning_jobs_below_quota(&self) -> bool {
@@ -3937,6 +3947,47 @@ pub const HUB_KIND: &str = "hub";
 pub fn hub_not_found(hub_name: &str) -> String {
     format!("Hub with name {hub_name} does not exist.")
 }
+
+/// The ARN resource kind a hub content carries, i.e. the `<kind>` in [`resource_arn`], as
+/// the modelled `SageMakerPublicHubContentArn` pattern spells it
+/// (`^arn:…:sagemaker:\w+(?:-\w+)+:aws:hub-content\/…`).
+pub const HUB_CONTENT_KIND: &str = "hub-content";
+
+/// The ARN of ONE version of one hub content:
+/// `arn:aws:sagemaker:<region>:<account>:hub-content/<hub>/<type>/<name>/<version>`.
+///
+/// The hub, the `HubContentType` and the name are what identify a hub content (they are
+/// the three members every hub-content operation requires) and the version segment is what
+/// makes the ARN name one VERSION of it, which is what the store holds one record per.
+pub fn hub_content_arn(
+    region: &str,
+    hub_name: &str,
+    content_type: &str,
+    content_name: &str,
+    version: &str,
+) -> String {
+    resource_arn(
+        region,
+        HUB_CONTENT_KIND,
+        &format!("{hub_name}/{content_type}/{content_name}/{version}"),
+    )
+}
+
+/// How this service refuses a `SageMakerPublicHubContentArn` that resolves to no stored
+/// hub content: recorded wire behaviour, carried on `ValidationException` and HTTP 400.
+///
+/// The sentence carries NOTHING from the request — the service answers the same words
+/// whatever ARN arrived — and it is answered BEFORE the hub a reference would be added to
+/// is resolved, so a request that names neither a stored source nor an existing hub is
+/// refused for the source. Stated once here so every operation that resolves a referenced
+/// source cannot word the same fact differently.
+pub const SOURCE_ARN_NOT_FOUND: &str = "Requested source ARN does not exist.";
+
+/// The most content versions one hub holds, after which a write that would add another is
+/// refused with the modelled `ResourceLimitExceeded`. The emulator's OWN bound, for the
+/// reason given on [`MODEL_QUOTA`], and per HUB because that is the resource whose contents
+/// grow.
+pub const HUB_CONTENT_QUOTA: usize = 1_000;
 
 /// The ARN resource kind a model card carries, i.e. the `<kind>` in [`resource_arn`], as
 /// the modelled `ModelCardArn` pattern spells it
