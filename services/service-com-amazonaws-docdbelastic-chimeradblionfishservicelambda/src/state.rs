@@ -55,6 +55,16 @@ impl ComAmazonawsDocdbelasticChimeradblionfishservicelambdaState {
             .map(|cluster| &cluster.tags)
             .or_else(|| self.snapshots.get(arn).map(|snapshot| &snapshot.tags))
     }
+
+    /// The same lookup as [`tags_of`](Self::tags_of), for the tagging operations that
+    /// WRITE the map: the tags live on the resource's own record, so adding and
+    /// removing them is an edit of that record and never of a map beside it.
+    pub fn tags_of_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(cluster) = self.clusters.get_mut(arn) {
+            return Some(&mut cluster.tags);
+        }
+        self.snapshots.get_mut(arn).map(|snapshot| &mut snapshot.tags)
+    }
 }
 
 /// One persisted elastic cluster.
@@ -898,12 +908,7 @@ pub fn validate_tags(
     tags: &::std::collections::HashMap<String, String>,
 ) -> Result<(), ValidationException> {
     let label = member_label(member);
-    if tags.len() > MAX_TAGS {
-        return Err(invalid_input(
-            member,
-            &format!("{label} must not contain more than {MAX_TAGS} entries."),
-        ));
-    }
+    ensure_tag_capacity(member, tags.len())?;
     for (key, value) in tags {
         if key.is_empty() || key.chars().count() > MAX_TAG_KEY_LEN {
             return Err(invalid_input(
@@ -919,6 +924,24 @@ pub fn validate_tags(
         }
     }
     Ok(())
+}
+
+/// Refuse a tag count past [`MAX_TAGS`].
+///
+/// `total` is how many DISTINCT keys the resource would carry once the request is
+/// applied, so a request that only overwrites keys the resource already has is not
+/// refused for a count it does not change.
+pub fn ensure_tag_capacity(member: &str, total: usize) -> Result<(), ValidationException> {
+    if total <= MAX_TAGS {
+        return Ok(());
+    }
+    Err(invalid_input(
+        member,
+        &format!(
+            "{} must not contain more than {MAX_TAGS} entries.",
+            member_label(member)
+        ),
+    ))
 }
 
 /// Refuse a `subnetIds` / `vpcSecurityGroupIds` list longer than

@@ -25,6 +25,8 @@ mod maintenance_and_restore;
 mod not_found_wording;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/resource_tag_writes.rs"]
+mod resource_tag_writes;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
